@@ -761,6 +761,14 @@ impl Compactor for TrackingCompactor {
         32
     }
 
+    fn prepare_for_summarization(
+        &self,
+        messages: &[meerkat_core::types::Message],
+        _budget: Option<meerkat_core::compact::SummarizationSourceBudget>,
+    ) -> Vec<meerkat_core::types::Message> {
+        meerkat_core::types::materialize_latest_system_prompt_versions(messages)
+    }
+
     fn rebuild_history(
         &self,
         messages: &[meerkat_core::types::Message],

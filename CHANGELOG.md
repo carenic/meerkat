@@ -35,6 +35,40 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `Compactor::prepare_for_summarization` takes the
+  summarization source budget, `(messages: &[Message], budget:
+  Option<SummarizationSourceBudget>)`, and has no default implementation:
+  every compactor states how it bounds the transcript it sends to the model
+  that writes the summary. The budget is that model's
+  (`SummarizationSourceBudget::for_summary_model`), `None` when the model
+  declares no context window. The implementors in this repository
+  (`DefaultCompactor` and the test compactors) are updated; no published
+  example implements the trait.
+
+### Added
+
+- `meerkat-core`: `SummarizationSourceBudget`, the serialized-byte budget for
+  the transcript a compactor sends to the summarizing model.
+  `for_summary_model` derives it from that model's context window and
+  `from_compaction_threshold` from a compaction threshold.
+
+### Changed
+
+- The compaction summary is sized for the model that writes it: the
+  session's active model (after any model fallback) or the admitted
+  controller's. Its source may take two bytes per token of that model's
+  context window left after `max_summary_tokens` (capped by a declared input
+  ceiling, at least 4 KiB), instead of a quarter of the compaction threshold.
+  With the model-aware default threshold that is about ten times more (for a
+  200,000-token window, about 390 KB instead of 40 KB), so a summary call can
+  cost more input tokens as the model window grows; it never costs more than
+  the history being compacted, because the source is never larger than that
+  history. A model with a small window and a large explicit threshold no
+  longer gets a summary request larger than its window. A model that declares
+  no context window keeps the threshold rule.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

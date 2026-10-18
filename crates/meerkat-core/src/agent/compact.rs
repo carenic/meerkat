@@ -655,6 +655,10 @@ pub(crate) struct CompactionInvocation<'a> {
     pub(crate) window: CompactionWindow<'a>,
     pub(crate) request_pressure: Option<crate::ProviderRequestPressure>,
     pub(crate) parent_revision: String,
+    /// Source budget of the client this attempt summarizes on, from its
+    /// registry-owned limits; `None` when that model declares no context
+    /// window.
+    pub(crate) summarization_budget: Option<crate::compact::SummarizationSourceBudget>,
 }
 
 /// Exact canonical unmeasured transcript subset incorporated by this attempt.
@@ -766,6 +770,7 @@ where
         window,
         request_pressure,
         parent_revision,
+        summarization_budget,
     } = invocation;
     let CompactionWindow {
         messages,
@@ -841,7 +846,8 @@ where
         let compaction_prompt = compactor.compaction_prompt();
         let max_summary_tokens = compactor.max_summary_tokens();
 
-        let mut compaction_messages = compactor.prepare_for_summarization(model_messages);
+        let mut compaction_messages =
+            compactor.prepare_for_summarization(model_messages, summarization_budget);
         compaction_messages.push(Message::User(crate::types::UserMessage::text(
             compaction_prompt.to_string(),
         )));
@@ -1292,6 +1298,14 @@ mod tests {
         fn max_summary_tokens(&self) -> u32 {
             100
         }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
         fn rebuild_history(
             &self,
             messages: &[Message],
@@ -1444,6 +1458,7 @@ mod tests {
                 },
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
+                summarization_budget: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -1736,6 +1751,7 @@ mod tests {
                 },
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
+                summarization_budget: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),

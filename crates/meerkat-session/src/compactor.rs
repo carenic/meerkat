@@ -4,7 +4,7 @@
 
 use meerkat_core::compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionResult,
-    CompactionSummary, Compactor,
+    CompactionSummary, Compactor, SummarizationSourceBudget,
 };
 use meerkat_core::types::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, Message,
@@ -24,16 +24,8 @@ Include:
 
 Be concise and structured. Prioritize information the next context needs to act, not narrate.";
 
-/// Fraction of the normal compaction threshold available to the source
-/// excerpt sent to the summarization model.
-///
-/// The threshold is normally 4/5 of the model context window. Capping the raw
-/// UTF-8 excerpt at 1/4 of that threshold leaves room for JSON escaping, the
-/// compaction prompt, and the summary response even when a single tool result
-/// jumps from a healthy request to beyond the context window in one boundary.
-const SUMMARIZATION_SOURCE_BUDGET_DENOMINATOR: u64 = 4;
 const RETAINED_HISTORY_BUDGET_DENOMINATOR: u64 = 2;
-const MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES: u64 = 4 * 1024;
+const MIN_RETAINED_HISTORY_BUDGET_BYTES: u64 = 4 * 1024;
 /// The smallest a trimmed text is cut to while bounding a summarization
 /// source; below it, the next role is trimmed instead.
 const MIN_TRIMMED_TEXT_BYTES: usize = 512;
@@ -51,13 +43,17 @@ impl DefaultCompactor {
         Self { config }
     }
 
-    fn summarization_source_budget_bytes(&self) -> usize {
-        let budget = self
-            .config
-            .auto_compact_threshold
-            .div_ceil(SUMMARIZATION_SOURCE_BUDGET_DENOMINATOR)
-            .max(MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES);
-        usize::try_from(budget).unwrap_or(usize::MAX)
+    /// The serialized-byte budget of the summarization source: `budget`, the
+    /// summarizing model's, or this compactor's threshold rule when that
+    /// model declares no context window.
+    fn summarization_source_budget_bytes(
+        &self,
+        budget: Option<SummarizationSourceBudget>,
+    ) -> usize {
+        let budget = budget.unwrap_or_else(|| {
+            SummarizationSourceBudget::from_compaction_threshold(self.config.auto_compact_threshold)
+        });
+        usize::try_from(budget.bytes()).unwrap_or(usize::MAX)
     }
 
     fn retained_history_budget_bytes(
@@ -68,7 +64,7 @@ impl DefaultCompactor {
             .config
             .auto_compact_threshold
             .div_ceil(RETAINED_HISTORY_BUDGET_DENOMINATOR)
-            .max(MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES);
+            .max(MIN_RETAINED_HISTORY_BUDGET_BYTES);
         if let Some(pressure) = pressure
             && let Some(request_cap) = pressure.effective_cap(self.config.max_request_bytes)
         {
@@ -515,11 +511,15 @@ impl Compactor for DefaultCompactor {
         input_trigger || history_trigger || byte_trigger || forecast_trigger
     }
 
-    fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        budget: Option<SummarizationSourceBudget>,
+    ) -> Vec<Message> {
         let messages = materialize_latest_system_prompt_versions(messages);
         bound_summarization_projection(
             project_messages_for_summarization(&messages),
-            self.summarization_source_budget_bytes(),
+            self.summarization_source_budget_bytes(budget),
         )
     }
 
@@ -1302,7 +1302,7 @@ mod tests {
             Message::User(UserMessage::text("recent turn")),
         ];
 
-        let summary_input = c.prepare_for_summarization(&messages);
+        let summary_input = c.prepare_for_summarization(&messages, None);
         assert!(summary_input.iter().all(
             |message| !matches!(message, Message::System(system) if system.content == "version one")
         ));
@@ -1796,6 +1796,54 @@ mod tests {
         assert!(matches!(&result[1], ContentBlock::Text { text } if text == "two"));
     }
 
+    /// The summarizing model's budget bounds the source, not this
+    /// compactor's threshold rule: a large model budget passes a source the
+    /// threshold rule trims, and a small one trims it.
+    #[test]
+    fn prepare_for_summarization_bounds_the_source_by_the_given_budget() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 1_000,
+            ..make_config()
+        });
+        let middle = "MARKER-IN-THE-MIDDLE";
+        let half = "x".repeat(15_000);
+        let messages = vec![Message::User(UserMessage::text(format!(
+            "{half}{middle}{half}"
+        )))];
+        let source_bytes = serde_json::to_vec(&messages).unwrap().len();
+
+        let by_threshold = c.prepare_for_summarization(&messages, None);
+        let threshold_bytes = c.summarization_source_budget_bytes(None);
+        assert!(serde_json::to_vec(&by_threshold).unwrap().len() <= threshold_bytes);
+        assert!(
+            !serde_json::to_string(&by_threshold)
+                .unwrap()
+                .contains(middle)
+        );
+
+        let large = SummarizationSourceBudget::from_compaction_threshold(400_000);
+        assert!(source_bytes <= usize::try_from(large.bytes()).unwrap());
+        let by_large_budget = c.prepare_for_summarization(&messages, Some(large));
+        assert!(
+            serde_json::to_string(&by_large_budget)
+                .unwrap()
+                .contains(middle),
+            "a source within the budget is kept whole"
+        );
+
+        let small = SummarizationSourceBudget::from_compaction_threshold(40_000);
+        let by_small_budget = c.prepare_for_summarization(&messages, Some(small));
+        assert!(
+            serde_json::to_vec(&by_small_budget).unwrap().len()
+                <= usize::try_from(small.bytes()).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&by_small_budget)
+                .unwrap()
+                .contains(middle)
+        );
+    }
+
     #[test]
     fn prepare_for_summarization_projects_user_and_tool_media() {
         use meerkat_core::types::ToolResult;
@@ -1823,7 +1871,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         assert_eq!(prepared.len(), 2);
 
         // User message: text preserved, image replaced
@@ -1863,8 +1911,8 @@ mod tests {
         use meerkat_core::types::ToolResult;
 
         let config = CompactionConfig {
-            // Production scaling uses 4/5 of the active model context. A
-            // 100k threshold gives this test a 25k raw source budget.
+            // Without the summarizing model's budget, a 100k threshold gives
+            // this test a 25k source budget.
             auto_compact_threshold: 100_000,
             ..make_config()
         };
@@ -1879,7 +1927,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         assert_eq!(
             prepared.len(),
             messages.len(),
@@ -1898,9 +1946,9 @@ mod tests {
         assert!(text.contains("trimmed for the compaction source"));
         let bounded = serde_json::to_vec(&prepared).unwrap().len();
         assert!(
-            bounded <= c.summarization_source_budget_bytes(),
+            bounded <= c.summarization_source_budget_bytes(None),
             "bounded source was {bounded} bytes for a {} byte budget",
-            c.summarization_source_budget_bytes()
+            c.summarization_source_budget_bytes(None)
         );
 
         // The last-resort source (user requests only) is bounded in the same
@@ -1911,7 +1959,7 @@ mod tests {
             auto_compact_threshold: 1_000,
             ..make_config()
         });
-        let budget = c.summarization_source_budget_bytes();
+        let budget = c.summarization_source_budget_bytes(None);
         let messages: Vec<Message> = (0..8)
             .map(|n| {
                 Message::User(UserMessage::text(format!(
@@ -1921,7 +1969,7 @@ mod tests {
             })
             .collect();
         assert!(serde_json::to_vec(&messages).unwrap().len() > budget);
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.len() <= budget,
@@ -1971,7 +2019,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
 
         match &prepared[0] {
             Message::User(user) => {
@@ -2345,7 +2393,7 @@ mod tests {
             )),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         assert_eq!(prepared.len(), 2);
 
         if let Message::BlockAssistant(a) = &prepared[1] {
@@ -2380,7 +2428,7 @@ mod tests {
             Message::User(UserMessage::text("Second".to_string())),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         assert_eq!(
             prepared.len(),
             2,
@@ -2583,17 +2631,17 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None);
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.contains(request),
             "the middle request reaches the summarizer source"
         );
         assert!(
-            source.len() <= c.summarization_source_budget_bytes(),
+            source.len() <= c.summarization_source_budget_bytes(None),
             "the source ({} bytes) stays within its budget ({} bytes)",
             source.len(),
-            c.summarization_source_budget_bytes()
+            c.summarization_source_budget_bytes(None)
         );
     }
 }

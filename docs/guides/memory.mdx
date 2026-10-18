@@ -127,8 +127,11 @@ When compaction triggers:
     Without a curator, a provider-safe projection of the current history plus
     the compaction prompt is sent to the LLM with no tools and
     `max_summary_tokens` as the response limit. Media and reasoning are
-    projected for summarization, and an oversized source projection is bounded
-    to a head/tail handoff excerpt. With a curator, this LLM call is skipped.
+    projected for summarization. A source larger than the summarizing model can
+    take (two bytes per token of its context window left after
+    `max_summary_tokens`, or a quarter of `auto_compact_threshold` for a model
+    that declares no window) is trimmed: large tool results first, user
+    requests last. With a curator, this LLM call is skipped.
   </Step>
   <Step title="Handle result">
     **On ordinary failure**: a CompactionFailed event is emitted and the session is not mutated (safe failure).

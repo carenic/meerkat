@@ -3569,6 +3569,25 @@ where
                         });
                         let outcome = match compaction_source {
                             Ok((parent_revision, observation_source)) => {
+                                // Compaction of the admitted controller's own
+                                // context is its housekeeping: it runs on the
+                                // retained controller client (still authorized
+                                // per request as Compaction). Any other
+                                // compactor route keeps the session client.
+                                let controller = self.bound_controller_client();
+                                // The summary's source is sized for the client
+                                // that writes it: the controller's registry
+                                // witness, or the active model's, which a model
+                                // fallback replaces.
+                                let summarization_budget = self
+                                    .request_model_profile(controller.is_some())
+                                    .and_then(|model| {
+                                        crate::compact::SummarizationSourceBudget::for_summary_model(
+                                            &model,
+                                            compactor.max_summary_tokens(),
+                                            compactor.compaction_prompt(),
+                                        )
+                                    });
                                 let invocation = crate::agent::compact::CompactionInvocation {
                                     authorization: self.model_request_authorization(
                                         self.tool_dispatch_context.run_id().cloned(),
@@ -3584,6 +3603,7 @@ where
                                     },
                                     request_pressure: provider_request_pressure,
                                     parent_revision,
+                                    summarization_budget,
                                 };
                                 // The compactor's warnings (a bounded source,
                                 // a rewrite keeping no complete turn) name the
@@ -3592,12 +3612,7 @@ where
                                     "compaction",
                                     session_id = %self.session.id()
                                 );
-                                // Compaction of the admitted controller's own
-                                // context is its housekeeping: it runs on the
-                                // retained controller client (still authorized
-                                // per request as Compaction). Any other
-                                // compactor route keeps the session client.
-                                let attempt = match self.bound_controller_client() {
+                                let attempt = match controller {
                                     Some(controller) => {
                                         crate::agent::compact::run_compaction(
                                             controller.as_ref(),
@@ -10550,6 +10565,14 @@ mod tests {
             32
         }
 
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
+
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             CompactionResult {
                 messages: messages.to_vec(),
@@ -10596,6 +10619,14 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10789,6 +10820,14 @@ mod tests {
             32
         }
 
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
+
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             let last_user = messages
                 .iter()
@@ -10864,6 +10903,14 @@ mod tests {
             32
         }
 
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
+
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             DiscardingCompactor::new(0).rebuild_history(messages, summary)
         }
@@ -10882,6 +10929,14 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10931,6 +10986,14 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -14994,6 +15057,14 @@ mod tests {
         fn max_summary_tokens(&self) -> u32 {
             32
         }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             let tail_start = messages
                 .iter()
@@ -16828,6 +16899,139 @@ mod tests {
             .await
             .expect("primary request should succeed");
         assert_eq!(primary.seen_max_tokens(), vec![8192]);
+    }
+
+    /// Records the summarization source budget each compaction hands it.
+    struct BudgetRecordingCompactor {
+        compact_on_boundary: u64,
+        seen_budgets: Mutex<Vec<Option<crate::compact::SummarizationSourceBudget>>>,
+    }
+
+    impl Compactor for BudgetRecordingCompactor {
+        fn should_compact(&self, ctx: &CompactionContext) -> bool {
+            ctx.session_boundary_index == self.compact_on_boundary
+        }
+
+        fn compaction_prompt(&self) -> &'static str {
+            "COMPACT NOW"
+        }
+
+        fn max_summary_tokens(&self) -> u32 {
+            32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> Vec<Message> {
+            self.seen_budgets.lock().unwrap().push(budget);
+            crate::types::materialize_latest_system_prompt_versions(messages)
+        }
+
+        fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
+            CompactionResult {
+                messages: messages.to_vec(),
+                summary: test_compaction_summary(0, summary),
+                retained: identity_compaction_retentions(messages),
+                discarded: Vec::new(),
+            }
+        }
+    }
+
+    /// `primary` with a 128,000-token window and `backup` with 16,000.
+    fn summary_window_test_registry() -> Arc<crate::ModelRegistry> {
+        let mut config = crate::Config::default();
+        for (model, context_window) in [("primary", 128_000), ("backup", 16_000)] {
+            config.models.custom.insert(
+                model.to_string(),
+                crate::config::CustomModelConfig {
+                    provider: crate::Provider::OpenAI,
+                    display_name: None,
+                    context_window: Some(context_window),
+                    max_input_tokens: None,
+                    max_output_tokens: Some(2_048),
+                    vision: Some(false),
+                    web_search: Some(false),
+                    call_timeout_secs: None,
+                },
+            );
+        }
+        let empty_catalog = crate::ModelCatalog {
+            entries: &[],
+            capabilities: &[],
+            provider_defaults: &[],
+            image_generation_models: &[],
+            providers: &[],
+            default_models: &[],
+            image_generation_defaults: &[],
+            global_default_model: "",
+            provider_priority: &[],
+        };
+        Arc::new(
+            crate::ModelRegistry::from_config(&config, empty_catalog)
+                .expect("summary window test registry"),
+        )
+    }
+
+    /// The compaction summary is written by the session's active model, and
+    /// its source is sized for that model: after the session switches to a
+    /// model with a smaller window (a model fallback replaces the active
+    /// profile the same way), the next compaction gets that model's budget.
+    #[tokio::test]
+    async fn compaction_summary_budget_follows_the_active_model() {
+        let registry = summary_window_test_registry();
+        let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
+        let backup = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let compactor = Arc::new(BudgetRecordingCompactor {
+            compact_on_boundary: 1,
+            seen_budgets: Mutex::new(Vec::new()),
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(2_048)
+                .compactor(compactor.clone())
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(primary.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        agent
+            .run("on primary".into())
+            .await
+            .expect("the primary turn should succeed");
+        agent
+            .hot_swap_llm_identity(
+                backup.clone(),
+                explicit_hot_swap_identity("backup"),
+                explicit_hot_swap_policy("backup"),
+            )
+            .expect("primary to backup hot-swap should commit");
+        agent
+            .run("on backup".into())
+            .await
+            .expect("the backup turn should succeed");
+
+        let budget_for = |model: &str| {
+            let witness = registry
+                .profile_witness_for_provider(crate::Provider::OpenAI, model)
+                .expect("registry witness");
+            crate::compact::SummarizationSourceBudget::for_summary_model(
+                &witness,
+                32,
+                "COMPACT NOW",
+            )
+        };
+        assert_ne!(budget_for("backup"), budget_for("primary"));
+        assert_eq!(
+            compactor.seen_budgets.lock().unwrap().clone(),
+            vec![budget_for("backup")],
+            "the summary written on the backup model is sized for its window"
+        );
     }
 
     #[tokio::test]

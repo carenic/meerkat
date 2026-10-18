@@ -222,6 +222,14 @@ impl meerkat_core::compact::Compactor for NoopCompactor {
         1
     }
 
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        _budget: Option<meerkat_core::compact::SummarizationSourceBudget>,
+    ) -> Vec<Message> {
+        meerkat_core::types::materialize_latest_system_prompt_versions(messages)
+    }
+
     fn rebuild_history(
         &self,
         messages: &[Message],

@@ -334,6 +334,79 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Serialized source bytes a model-derived summarization budget allows per
+/// token of the summarizing model's input window: half the transcript
+/// estimator's four bytes per token, so a source that tokenizes densely
+/// (code, JSON, non-Latin scripts) still fits the window.
+const SUMMARIZATION_SOURCE_BYTES_PER_TOKEN: u64 = 2;
+/// Fraction of the compaction threshold available to the source when the
+/// summarizing model declares no context window. The threshold is normally
+/// four-fifths of a context window; a quarter of it leaves room for JSON
+/// escaping, the compaction prompt and the summary response, even when one
+/// tool result jumps from a healthy request past the window in a single
+/// boundary.
+const THRESHOLD_SUMMARIZATION_SOURCE_DENOMINATOR: u64 = 4;
+/// The smallest summarization source budget.
+const MIN_SUMMARIZATION_SOURCE_BYTES: u64 = 4 * 1024;
+
+/// Serialized-byte budget for the transcript a compactor sends to the model
+/// that writes the compaction summary.
+///
+/// This type is the one owner of the summarization source arithmetic. The
+/// agent's compaction seam derives it from the summarizing client's
+/// registry-owned limits ([`Self::for_summary_model`]); for a model that
+/// declares no context window a compactor falls back to its compaction
+/// threshold ([`Self::from_compaction_threshold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummarizationSourceBudget {
+    bytes: u64,
+}
+
+impl SummarizationSourceBudget {
+    /// The budget for a summary written by `model`: the input side of its
+    /// context window (the window less the `max_summary_tokens` output
+    /// reserve, capped by a separately declared input ceiling) at two
+    /// serialized bytes per token, less the `prompt` sent after the source,
+    /// and at least 4 KiB. `None` when `model` declares no context window.
+    #[must_use]
+    pub fn for_summary_model(
+        model: &crate::ModelProfileWitness,
+        max_summary_tokens: u32,
+        prompt: &str,
+    ) -> Option<Self> {
+        let window = u64::from(model.context_window()?);
+        let mut input_tokens = window.saturating_sub(u64::from(max_summary_tokens));
+        if let Some(ceiling) = model.max_input_tokens() {
+            input_tokens = input_tokens.min(u64::from(ceiling));
+        }
+        let prompt_bytes = u64::try_from(prompt.len()).unwrap_or(u64::MAX);
+        Some(Self::at_least_minimum(
+            input_tokens
+                .saturating_mul(SUMMARIZATION_SOURCE_BYTES_PER_TOKEN)
+                .saturating_sub(prompt_bytes),
+        ))
+    }
+
+    /// The budget when the summarizing model declares no context window: a
+    /// quarter of the compaction `threshold`, at least 4 KiB.
+    #[must_use]
+    pub fn from_compaction_threshold(threshold: u64) -> Self {
+        Self::at_least_minimum(threshold.div_ceil(THRESHOLD_SUMMARIZATION_SOURCE_DENOMINATOR))
+    }
+
+    fn at_least_minimum(bytes: u64) -> Self {
+        Self {
+            bytes: bytes.max(MIN_SUMMARIZATION_SOURCE_BYTES),
+        }
+    }
+
+    /// The budget in serialized bytes of the source messages.
+    #[must_use]
+    pub fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
 /// Provider-agnostic compaction strategy.
 ///
 /// Determines when to compact and how to rebuild the history after summarization.
@@ -368,14 +441,19 @@ pub trait Compactor: Send + Sync {
     ///
     /// Called before sending the history to the LLM for summarization.
     /// Implementations may strip content that is not suitable for the
-    /// summarization pass (e.g. base64-encoded images).
+    /// summarization pass (e.g. base64-encoded images), and should drop
+    /// superseded versions of typed keyed system prompts
+    /// ([`crate::types::materialize_latest_system_prompt_versions`]).
     ///
-    /// The default implementation removes only superseded versions of typed
-    /// keyed system prompts. Every unkeyed System row and latest keyed version
-    /// remains byte-identical and ordered.
-    fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
-        crate::types::materialize_latest_system_prompt_versions(messages)
-    }
+    /// `budget` is the serialized size the model that writes the summary can
+    /// take for its source ([`SummarizationSourceBudget::for_summary_model`]);
+    /// `None` when that model declares no context window. A source larger
+    /// than the budget makes the summary request exceed the model's window.
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        budget: Option<SummarizationSourceBudget>,
+    ) -> Vec<Message>;
 
     /// Rebuild history while carrying the exact provider request pressure that
     /// triggered compaction, when available.
@@ -514,6 +592,81 @@ mod tests {
         let summary = CuratedCompactionSummary::new("curated summary").unwrap();
         assert_eq!(summary.as_str(), "curated summary");
         assert_eq!(summary.into_string(), "curated summary");
+    }
+
+    fn summary_model(
+        context_window: Option<u32>,
+        max_input_tokens: Option<u32>,
+    ) -> crate::ModelProfileWitness {
+        let mut config = crate::Config::default();
+        config.models.custom.insert(
+            "summary-budget-model".to_string(),
+            crate::config::CustomModelConfig {
+                provider: crate::Provider::OpenAI,
+                display_name: None,
+                context_window,
+                max_input_tokens,
+                max_output_tokens: Some(8_192),
+                vision: None,
+                web_search: None,
+                call_timeout_secs: None,
+            },
+        );
+        crate::ModelRegistry::from_config(
+            &config,
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        )
+        .unwrap()
+        .profile_witness_for_provider(crate::Provider::OpenAI, "summary-budget-model")
+        .unwrap()
+    }
+
+    #[test]
+    fn summarization_source_budget_is_two_bytes_per_token_of_the_input_window() {
+        // The window less the summary's output reserve, less the prompt.
+        let budget = SummarizationSourceBudget::for_summary_model(
+            &summary_model(Some(200_000), None),
+            4_096,
+            "summarize",
+        )
+        .unwrap();
+        assert_eq!(budget.bytes(), (200_000 - 4_096) * 2 - 9);
+
+        // A separate input ceiling caps the input side.
+        let budget = SummarizationSourceBudget::for_summary_model(
+            &summary_model(Some(200_000), Some(50_000)),
+            4_096,
+            "",
+        )
+        .unwrap();
+        assert_eq!(budget.bytes(), 50_000 * 2);
+
+        // An output reserve that fills the window leaves the 4 KiB floor.
+        let budget = SummarizationSourceBudget::for_summary_model(
+            &summary_model(Some(4_000), None),
+            4_096,
+            "",
+        )
+        .unwrap();
+        assert_eq!(budget.bytes(), 4 * 1024);
+
+        // A model without a declared window has no model budget.
+        assert_eq!(
+            SummarizationSourceBudget::for_summary_model(&summary_model(None, None), 4_096, ""),
+            None
+        );
+    }
+
+    #[test]
+    fn summarization_source_budget_from_the_threshold_is_a_quarter_with_a_floor() {
+        assert_eq!(
+            SummarizationSourceBudget::from_compaction_threshold(160_000).bytes(),
+            40_000
+        );
+        assert_eq!(
+            SummarizationSourceBudget::from_compaction_threshold(1_000).bytes(),
+            4 * 1024
+        );
     }
 
     #[test]
