@@ -16939,10 +16939,10 @@ mod tests {
         }
     }
 
-    /// `primary` with a 128,000-token window and `backup` with 16,000.
-    fn summary_window_test_registry() -> Arc<crate::ModelRegistry> {
+    /// Custom OpenAI `models`, each with its context window.
+    fn summary_window_test_registry(models: &[(&str, u32)]) -> Arc<crate::ModelRegistry> {
         let mut config = crate::Config::default();
-        for (model, context_window) in [("primary", 128_000), ("backup", 16_000)] {
+        for &(model, context_window) in models {
             config.models.custom.insert(
                 model.to_string(),
                 crate::config::CustomModelConfig {
@@ -16980,7 +16980,7 @@ mod tests {
     /// profile the same way), the next compaction gets that model's budget.
     #[tokio::test]
     async fn compaction_summary_budget_follows_the_active_model() {
-        let registry = summary_window_test_registry();
+        let registry = summary_window_test_registry(&[("primary", 128_000), ("backup", 16_000)]);
         let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
         let backup = Arc::new(HotSwapLimitRecordingClient::new("backup"));
         let compactor = Arc::new(BudgetRecordingCompactor {
@@ -33282,6 +33282,99 @@ mod tests {
             assert!(
                 session_client.requests.lock().unwrap().is_empty(),
                 "nothing of the controller's work entered the session client"
+            );
+        }
+
+        /// The retained controller client writes the summary of the admitted
+        /// controller's context, so the source is sized for the controller's
+        /// model, not for the session's active model.
+        #[tokio::test]
+        async fn controller_compaction_summary_budget_is_sized_for_the_controller_model() {
+            let registry =
+                summary_window_test_registry(&[("primary", 128_000), ("fixture-model", 16_000)]);
+            let fixture = || {
+                Arc::new(FixtureClient {
+                    requests: Mutex::new(Vec::new()),
+                    tool_first: false,
+                    authorizations: Mutex::new(Vec::new()),
+                    hosted_default: false,
+                })
+            };
+            let controller = Arc::new(ControllerProbe {
+                inner: fixture(),
+                compactions: AtomicUsize::new(0),
+            });
+            let policy = Arc::new(FixturePolicy {
+                hosted_denials: AtomicUsize::new(0),
+                compaction_denials: AtomicUsize::new(0),
+            });
+            let compactor = Arc::new(BudgetRecordingCompactor {
+                compact_on_boundary: 1,
+                seen_budgets: Mutex::new(Vec::new()),
+            });
+            let mut agent = with_test_turn_state_handle_for_session(
+                AgentBuilder::new()
+                    .model("primary")
+                    .compactor(compactor.clone())
+                    .with_effective_model_registry(Arc::clone(&registry)),
+                explicit_hot_swap_session("primary"),
+            )
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(fixture(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+            assert_eq!(
+                agent
+                    .active_model_profile
+                    .as_ref()
+                    .map(crate::ModelProfileWitness::model),
+                Some("primary"),
+                "the session's active model is not the controller's"
+            );
+            let context = WorkAuthorizationContext::new(
+                policy.clone(),
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                controller.clone(),
+            ))
+            .unwrap();
+            for input in ["first retained input", "second input"] {
+                let (tx, mut rx) = mpsc::channel(128);
+                agent
+                    .run_with_events_and_work_authorization(
+                        input.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(context.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                assert_completed_without_failure(&mut rx);
+            }
+            assert_eq!(
+                controller.compactions.load(Ordering::Relaxed),
+                1,
+                "the compaction request reached the retained controller client"
+            );
+
+            let budget_for = |model: &str| {
+                let witness = registry
+                    .profile_witness_for_provider(crate::Provider::OpenAI, model)
+                    .expect("registry witness");
+                crate::compact::SummarizationSourceBudget::for_summary_model(
+                    &witness,
+                    32,
+                    "COMPACT NOW",
+                )
+            };
+            assert_ne!(budget_for("fixture-model"), budget_for("primary"));
+            assert_eq!(
+                compactor.seen_budgets.lock().unwrap().clone(),
+                vec![budget_for("fixture-model")],
+                "the controller's summary is sized for the controller's window"
             );
         }
 
