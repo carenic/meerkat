@@ -76,7 +76,7 @@ use meerkat_core::{
     ControllerModelClient, OperationAuthorizationError, OperationRefusalKind, OperationRefused,
     PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
 };
-use meerkat_runtime::input::Input;
+use meerkat_runtime::input::{ExternalEventInput, Input};
 use meerkat_runtime::meerkat_machine::{
     AuthenticatedOriginal, AuthenticatedOriginalSource, ScopedInvocation, bind_scoped_original,
 };
@@ -774,6 +774,20 @@ impl StockGovernance {
             ));
         }
         self.bind_original(machine, session_id, input, controller, Requesting::Operator)
+            .await
+    }
+
+    /// Bind one external event through which the local operator's own
+    /// process reports the outcome of an administrative command, for
+    /// `session_id`, as [`Self::bind_prompt`] binds an input of the operator.
+    pub async fn bind_host_outcome(
+        &self,
+        machine: &MeerkatMachine,
+        session_id: &SessionId,
+        event: ExternalEventInput,
+        controller: ControllerModelClient,
+    ) -> Result<(Input, PendingOriginal), StockGovernanceError> {
+        self.bind_prompt(machine, session_id, Input::ExternalEvent(event), controller)
             .await
     }
 
