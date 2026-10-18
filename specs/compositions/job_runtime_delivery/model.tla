@@ -1688,6 +1688,7 @@ job_terminal_requires_delivery == (IF ((job_phase # "Succeeded") /\ (job_phase #
 job_notification_identity_and_sequence_cardinality_match == ((Cardinality(job_notification_ids) = Cardinality(job_notification_idempotency_keys)) /\ (DOMAIN job_notification_id_by_key = job_notification_idempotency_keys) /\ (DOMAIN job_notification_delivery_ids = job_notification_ids) /\ (DOMAIN job_notification_sequences = job_notification_ids))
 job_applied_notifications_are_committed == (Cardinality(job_notification_applied) <= Cardinality(job_notification_ids))
 job_nonterminal_has_no_terminal_delivery == (IF (job_phase = "Succeeded") THEN TRUE ELSE (IF (job_phase = "Failed") THEN TRUE ELSE (IF (job_phase = "Cancelled") THEN TRUE ELSE (IF (job_phase = "WorkerLost") THEN TRUE ELSE (IF (job_phase = "NeedsAttention") THEN TRUE ELSE ((job_terminal_kind = None) /\ (job_terminal_delivery_sequence = 0) /\ (job_terminal_delivery_applied = FALSE)))))))
+job_terminal_delivery_follows_every_notification == (IF (job_terminal_kind = None) THEN TRUE ELSE (\A id \in DOMAIN job_notification_sequences : ((IF "value" \in DOMAIN (IF (id \in DOMAIN job_notification_sequences) THEN Some((IF id \in DOMAIN job_notification_sequences THEN job_notification_sequences[id] ELSE 0)) ELSE None) THEN (IF (id \in DOMAIN job_notification_sequences) THEN Some((IF id \in DOMAIN job_notification_sequences THEN job_notification_sequences[id] ELSE 0)) ELSE None)["value"] ELSE None) < job_terminal_delivery_sequence)))
 
 runtime_delivery__runtime_delivery_recipient_outcomes_after_set(current, recipient, outcome) ==
     MapSet(current, recipient, outcome)
@@ -3098,6 +3099,7 @@ THEOREM Spec => []job_terminal_requires_delivery
 THEOREM Spec => []job_notification_identity_and_sequence_cardinality_match
 THEOREM Spec => []job_applied_notifications_are_committed
 THEOREM Spec => []job_nonterminal_has_no_terminal_delivery
+THEOREM Spec => []job_terminal_delivery_follows_every_notification
 THEOREM Spec => []runtime_delivery_delivery_maps_cover_exactly_the_committed_ids
 THEOREM Spec => []runtime_delivery_applied_cursor_does_not_pass_committed_sequence
 THEOREM Spec => []runtime_delivery_empty_delivery_set_has_zero_sequence

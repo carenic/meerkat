@@ -1641,6 +1641,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                         "applied_notifications_are_committed",
                         "terminal_requires_delivery",
                         "nonterminal_has_no_terminal_delivery",
+                        "terminal_delivery_follows_every_notification",
                     ]),
             )],
             &[

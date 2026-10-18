@@ -1277,6 +1277,17 @@ them.
   (`callback_specification_unreadable`) instead of being skipped on every
   pass. In 0.9.2 any route that registered a tool of the same name and
   runner took the job.
+- `DetachedJobMachine` declares the generated invariant
+  `terminal_delivery_follows_every_notification`: every notification is
+  sequenced before the job's terminal delivery. It is why the terminal and
+  notification `MarkDeliveryApplied` arms never both match, even for a
+  notification whose id is `terminal` (#1811). TLC checks it, and the job
+  stores refuse a row that breaks it, on write and on every read, as
+  `DetachedJobError::Store` naming the invariant
+  (`DetachedJobMachineAuthority::recover_from_state` itself returns
+  `RecoveredStateInvariantRejected`). No state written by any release breaks
+  it (the sequence rules are unchanged since the machine first shipped in
+  0.8.8), so existing stores load unchanged.
 
 ### Deprecated
 

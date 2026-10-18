@@ -599,3 +599,124 @@ async fn predicate_crossing_replay_after_notification_commit_does_not_lose_or_du
     assert_eq!(later.snapshot.outbox[0].delivery_sequence, 1);
     assert_eq!(later.snapshot.outbox[1].delivery_sequence, 2);
 }
+
+#[tokio::test]
+async fn terminal_named_notification_and_terminal_delivery_are_acked_by_their_own_arms() {
+    let memory = Arc::new(MemoryDetachedJobStore::new());
+    let service = DetachedJobService::new(memory.clone());
+    let job_id = service
+        .submit(monitor_spec("terminal-named-notification"))
+        .await
+        .expect("submit")
+        .job_id;
+    let claim = service
+        .claim_attempt(
+            &job_id,
+            AttemptClaim::new(
+                WorkerId::new("worker-a").expect("worker"),
+                100,
+                10_000,
+                RunnerHandleRef::new("terminal-named-handle").expect("handle"),
+            ),
+        )
+        .await
+        .expect("claim");
+    let write = AttemptWriteAuthority::from(&claim);
+    let emitted = service
+        .emit_notification(
+            &job_id,
+            write.clone(),
+            200,
+            JobNotification::new(
+                "terminal",
+                "terminal:named",
+                "Named like the terminal delivery",
+                "A notification whose id equals the terminal delivery id",
+            )
+            .expect("notification"),
+        )
+        .await
+        .expect("a notification may carry the terminal delivery's id");
+    let completed = service
+        .complete_attempt(&job_id, write, 300, None)
+        .await
+        .expect("complete");
+
+    // Both outbox entries carry the delivery id "terminal"; their sequences
+    // and runtime delivery ids differ.
+    assert_eq!(completed.outbox.len(), 2);
+    let notification_sequence = emitted.delivery_sequence;
+    let notification_entry = completed
+        .outbox
+        .iter()
+        .find(|entry| matches!(entry.payload, JobOutboxPayload::Notification(_)))
+        .expect("notification entry");
+    let terminal_entry = completed
+        .outbox
+        .iter()
+        .find(|entry| matches!(entry.payload, JobOutboxPayload::Terminal(_)))
+        .expect("terminal entry");
+    assert_eq!(notification_entry.delivery_id, "terminal");
+    assert_eq!(terminal_entry.delivery_id, "terminal");
+    assert_eq!(notification_entry.delivery_sequence, notification_sequence);
+    let terminal_sequence = terminal_entry.delivery_sequence;
+    assert!(notification_sequence < terminal_sequence);
+    assert_eq!(
+        notification_entry.runtime_delivery_id(),
+        format!("{job_id}:notification:terminal")
+    );
+    assert_eq!(terminal_entry.runtime_delivery_id(), job_id.to_string());
+
+    let applied = |snapshot: &meerkat_jobs::JobSnapshot, sequence: u64| {
+        snapshot
+            .outbox
+            .iter()
+            .find(|entry| entry.delivery_sequence == sequence)
+            .expect("outbox entry")
+            .applied
+    };
+
+    // The terminal delivery is acknowledged by the terminal arm only.
+    let after_terminal = service
+        .mark_delivery_applied(&job_id, terminal_sequence)
+        .await
+        .expect("terminal acknowledgement");
+    assert!(applied(&after_terminal, terminal_sequence));
+    assert!(!applied(&after_terminal, notification_sequence));
+    let state = memory
+        .get(&job_id)
+        .await
+        .expect("load")
+        .expect("job")
+        .machine_state;
+    assert!(state.terminal_delivery_applied);
+    assert!(state.notification_applied.is_empty());
+
+    // The notification is acknowledged by the notification arm only.
+    let after_notification = service
+        .mark_delivery_applied(&job_id, notification_sequence)
+        .await
+        .expect("notification acknowledgement");
+    assert!(applied(&after_notification, notification_sequence));
+    assert!(applied(&after_notification, terminal_sequence));
+    let state = memory
+        .get(&job_id)
+        .await
+        .expect("load")
+        .expect("job")
+        .machine_state;
+    assert!(state.terminal_delivery_applied);
+    assert_eq!(
+        state.notification_applied.iter().collect::<Vec<_>>(),
+        vec!["terminal"]
+    );
+
+    // Replays reach the already-applied arms and change nothing.
+    for sequence in [terminal_sequence, notification_sequence] {
+        let replayed = service
+            .mark_delivery_applied(&job_id, sequence)
+            .await
+            .expect("replayed acknowledgement");
+        assert_eq!(replayed.outbox, after_notification.outbox);
+    }
+}

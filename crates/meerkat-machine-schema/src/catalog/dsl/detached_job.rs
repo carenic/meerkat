@@ -306,6 +306,16 @@ machine! {
             )
         }
 
+        // Every notification is sequenced before the terminal delivery, so
+        // the terminal and notification `MarkDeliveryApplied` arms are told
+        // apart by sequence, even for a notification that carries the
+        // terminal delivery's id.
+        invariant terminal_delivery_follows_every_notification {
+            self.terminal_kind == None
+                || for_all(id in self.notification_sequences.keys(),
+                    self.notification_sequences.get_cloned(id).get("value") < self.terminal_delivery_sequence)
+        }
+
         disposition JobSubmitted => local seam SurfaceResultAlignment,
         disposition AttemptClaimed => local seam SurfaceResultAlignment,
         disposition LeaseRenewed => local seam SurfaceResultAlignment,
