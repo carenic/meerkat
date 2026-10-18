@@ -3147,11 +3147,11 @@ mod tests {
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =
             serde_json::to_value(StoredInputState::new_accepted(InputId::new())).unwrap();
-        for rejected in [2, 7] {
+        for rejected in [2, 8] {
             fixture["stored_input_state_version"] = serde_json::json!(rejected);
             let error = serde_json::from_value::<StoredInputState>(fixture.clone())
                 .expect_err("unknown historical and future versions must fail closed");
-            assert!(error.to_string().contains("expected current 6"));
+            assert!(error.to_string().contains("expected current 7"));
         }
 
         // 0.8.10 accepted still-retained v3 input rows lazily, so a supported
