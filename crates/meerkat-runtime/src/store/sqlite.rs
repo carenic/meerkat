@@ -4686,7 +4686,10 @@ END";
             Err(_) if runtime_database_absent(path) => return Ok(None),
             Err(error) => return Err(map_shared_sqlite_error(error)),
         };
-        let provisioned = meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
+        // Decided from the version this check verifies, in one snapshot: a
+        // row stamped after the open's preflight (by another process,
+        // possibly a newer binary) is checked before it counts.
+        let provisioned = meerkat_sqlite::preflight_domain_version(&conn, &RUNTIME_DELIVERY_DOMAIN)
             .map_err(map_shared_sqlite_error)?
             .is_some();
         Ok(provisioned.then_some(RuntimeConn {
@@ -25596,6 +25599,74 @@ ORDER BY runtime_id";
                     .is_empty()
             );
             assert!(!database.exists(), "a released read still creates nothing");
+        }
+
+        /// Two processes race their first durable delivery write: the open
+        /// whose schema preflight straddles the other's provisioning commit
+        /// sees the delivery domain whole or not at all, never its tables
+        /// without its ledger row.
+        #[test]
+        fn a_delivery_write_open_racing_the_first_provisioning_succeeds() {
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let racing = path.clone();
+            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = std::rc::Rc::clone(&ran);
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                drop(
+                    open_runtime_delivery_write_connection(&racing)
+                        .expect("the racing first write provisions the delivery domain"),
+                );
+                seen.set(true);
+            });
+
+            drop(
+                open_runtime_delivery_write_connection(&path)
+                    .expect("an open whose preflight straddles that provisioning succeeds"),
+            );
+
+            assert!(
+                ran.get(),
+                "the racing provisioning committed inside the preflight"
+            );
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name).unwrap(),
+                Some(RUNTIME_DELIVERY_DOMAIN.supported_version())
+            );
+        }
+
+        /// A delivery read decides whether the domain is provisioned from the
+        /// version its own check verified. A delivery domain that a newer
+        /// binary stamps after the read's open preflight is refused, never
+        /// read as provisioned.
+        #[test]
+        fn a_delivery_read_refuses_a_future_domain_stamped_after_its_open_check() {
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let stamping = path.clone();
+            let future = RUNTIME_DELIVERY_DOMAIN.supported_version() + 1;
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                Connection::open(&stamping)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO main.meerkat_schema (domain, version) VALUES (?1, ?2)",
+                        params![RUNTIME_DELIVERY_DOMAIN.name, future],
+                    )
+                    .unwrap();
+            });
+
+            let read = open_runtime_delivery_read_connection(&path);
+
+            assert!(
+                matches!(
+                    &read,
+                    Err(RuntimeStoreError::SchemaFromTheFuture { domain, found, .. })
+                        if domain == RUNTIME_DELIVERY_DOMAIN.name && *found == future
+                ),
+                "a future delivery domain is refused, not read: provisioned={:?}",
+                read.as_ref().map(Option::is_some)
+            );
         }
 
         #[tokio::test]

@@ -496,6 +496,30 @@ pub fn domain_version(conn: &Connection, domain: &str) -> Result<Option<i64>, Sq
     read_version(conn, domain)
 }
 
+/// Run `read` with every read it makes in one snapshot of `conn`.
+///
+/// Outside a transaction the reads share one DEFERRED read transaction. In
+/// WAL mode it keeps the snapshot its first read takes; in rollback-journal
+/// mode it holds the SHARED lock until it ends. A schema change another
+/// connection commits meanwhile is therefore seen whole or not at all. The
+/// transaction only reads and has ended when this returns, before a caller's
+/// mutating pragma. A caller already inside a transaction has its snapshot
+/// already, so the reads run in that transaction and none is nested.
+fn with_read_snapshot<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T, SqliteStoreError>,
+) -> Result<T, SqliteStoreError> {
+    if !conn.is_autocommit() {
+        return read(conn);
+    }
+    let snapshot = conn.unchecked_transaction()?;
+    let result = read(&snapshot);
+    let ended = snapshot.rollback();
+    let value = result?;
+    ended?;
+    Ok(value)
+}
+
 /// Establish read-only schema eligibility before a profile's mutating
 /// pragmas: current and released predecessor rows must match their exact
 /// catalog fingerprints; future, pre-floor, gap, and unledgered-owned shapes
@@ -510,36 +534,81 @@ pub fn domain_version(conn: &Connection, domain: &str) -> Result<Option<i64>, Sq
 /// database file itself is not written. A missing row passes only when the
 /// domain owns zero catalog objects; the pinned in-transaction re-check in
 /// [`apply_domain_migrations`] remains the migration-time authority.
+///
+/// The ledger and the catalog it judges are read in one snapshot, so a
+/// domain that another process creates meanwhile is seen whole (its row and
+/// its objects) or not at all, never as objects without a row.
 pub fn preflight_schema_eligibility(
     conn: &Connection,
     domain: &SchemaDomain,
 ) -> Result<(), SqliteStoreError> {
+    preflight_domain_version(conn, domain).map(|_| ())
+}
+
+/// [`preflight_schema_eligibility`], returning the ledger version it found:
+/// `Ok(None)` is a fresh domain (no ledger row and no owned objects).
+///
+/// A caller that decides on the version, for example whether a lazily
+/// provisioned domain exists yet, decides on exactly what was checked,
+/// never on a later read of a row the check did not see.
+pub fn preflight_domain_version(
+    conn: &Connection,
+    domain: &SchemaDomain,
+) -> Result<Option<i64>, SqliteStoreError> {
     domain.validate()?;
     let supported = domain.supported_version();
-    match domain_version(conn, domain.name)? {
-        Some(found) if found > supported => {
-            return Err(SqliteStoreError::SchemaFromTheFuture {
+    with_read_snapshot(conn, |conn| {
+        let found = domain_version(conn, domain.name)?;
+        after_preflight_ledger_read();
+        match found {
+            Some(found) if found > supported => Err(SqliteStoreError::SchemaFromTheFuture {
                 domain: domain.name.to_string(),
                 found,
                 supported,
-            });
-        }
-        Some(found) if !domain.accepts_existing_version(found) => {
-            return Err(unsupported_predecessor(domain, found));
-        }
-        Some(found) => domain.verify_stamped_version(conn, found)?,
-        None => {
-            let objects = find_owned_objects(conn, domain)?;
-            if !objects.is_empty() {
-                return Err(SqliteStoreError::UnledgeredDomainObjects {
-                    domain: domain.name.to_string(),
-                    objects,
-                    bridgeable: domain.bridge_eligibility(conn),
-                });
+            }),
+            Some(found) if !domain.accepts_existing_version(found) => {
+                Err(unsupported_predecessor(domain, found))
+            }
+            Some(found) => domain
+                .verify_stamped_version(conn, found)
+                .map(|()| Some(found)),
+            None => {
+                let objects = find_owned_objects(conn, domain)?;
+                if objects.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(SqliteStoreError::UnledgeredDomainObjects {
+                        domain: domain.name.to_string(),
+                        objects,
+                        bridgeable: domain.bridge_eligibility(conn),
+                    })
+                }
             }
         }
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+std::thread_local! {
+    static PREFLIGHT_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test support: run `probe` once, on this thread, at the next schema
+/// preflight's point between its ledger read and the reads that follow it
+/// (the owned-object scan or the stamped catalog's verification). A test
+/// commits a concurrent schema change inside exactly that window.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn arm_preflight_probe_for_test(probe: impl FnOnce() + 'static) {
+    PREFLIGHT_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+}
+
+fn after_preflight_ledger_read() {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(probe) = PREFLIGHT_PROBE.with(|slot| slot.borrow_mut().take()) {
+        probe();
     }
-    Ok(())
 }
 
 /// Check an already installed current schema against the expected catalog
@@ -548,66 +617,72 @@ pub fn preflight_schema_eligibility(
 /// refused. The check waits for the expected-catalog cache mutex, a leaf
 /// lock: no other lock is acquired while its guard is held, so callers may
 /// already hold native custody or a BEGIN IMMEDIATE transaction outside it.
-/// This administrative path never migrates or adopts older records.
+/// This administrative path never migrates or adopts older records. The
+/// ledger version and the catalog are read in one snapshot: the caller's own
+/// transaction when it holds one, otherwise a read transaction of its own.
 pub fn try_preflight_current_schema(
     conn: &Connection,
     domain: &SchemaDomain,
 ) -> Result<(), SqliteStoreError> {
     domain.validate()?;
     let supported = domain.supported_version();
-    match domain_version(conn, domain.name)? {
-        Some(found) if found > supported => {
-            return Err(SqliteStoreError::SchemaFromTheFuture {
-                domain: domain.name.to_string(),
-                found,
-                supported,
-            });
+    with_read_snapshot(conn, |conn| {
+        let found = domain_version(conn, domain.name)?;
+        after_preflight_ledger_read();
+        match found {
+            Some(found) if found > supported => {
+                return Err(SqliteStoreError::SchemaFromTheFuture {
+                    domain: domain.name.to_string(),
+                    found,
+                    supported,
+                });
+            }
+            Some(found) if found == supported => {}
+            _ => {
+                return Err(SqliteStoreError::OpenRefused {
+                    path: std::path::PathBuf::from(conn.path().unwrap_or(":memory:")),
+                    profile: "online-existing-writer",
+                    detail: "administration requires the installed current schema".to_string(),
+                });
+            }
         }
-        Some(found) if found == supported => {}
-        _ => {
-            return Err(SqliteStoreError::OpenRefused {
-                path: std::path::PathBuf::from(conn.path().unwrap_or(":memory:")),
-                profile: "online-existing-writer",
-                detail: "administration requires the installed current schema".to_string(),
-            });
-        }
-    }
-    let expected = try_cached_current_catalog(
-        EXPECTED_CURRENT_CATALOGS.get(),
-        &current_catalog_cache_key(domain),
-    )
-    .map_err(|cause| SqliteStoreError::CurrentCatalogUnavailable {
-        domain: domain.name.to_string(),
-        cause,
-    })?
-    .map_err(|detail| SqliteStoreError::SchemaFingerprintMismatch {
-        domain: domain.name.to_string(),
-        version: supported,
-        detail,
-    })?;
-    let actual = compact_catalog_fingerprint(conn, domain, domain.owned_objects);
-    if actual.as_ref().is_ok_and(|actual| actual == &expected) {
-        return Ok(());
-    }
-    let detail = actual.map_or_else(
-        |error| error,
-        |actual| format!("current owned catalog differs: expected {expected}, found {actual}"),
-    );
-    // Preserve the canonical typed mismatch and its object-level diagnostics.
-    // As in ordinary open, the private in-memory oracle runs only on refusal.
-    Err(match current_catalog_diff(conn, domain) {
-        Ok(diff) if !diff.is_empty() => SqliteStoreError::CurrentSchemaMismatch {
+        let expected = try_cached_current_catalog(
+            EXPECTED_CURRENT_CATALOGS.get(),
+            &current_catalog_cache_key(domain),
+        )
+        .map_err(|cause| SqliteStoreError::CurrentCatalogUnavailable {
             domain: domain.name.to_string(),
-            version: supported,
-            missing_objects: diff.missing,
-            unexpected_objects: diff.unexpected,
-            changed_objects: diff.changed,
-        },
-        _ => SqliteStoreError::SchemaFingerprintMismatch {
+            cause,
+        })?
+        .map_err(|detail| SqliteStoreError::SchemaFingerprintMismatch {
             domain: domain.name.to_string(),
             version: supported,
             detail,
-        },
+        })?;
+        let actual = compact_catalog_fingerprint(conn, domain, domain.owned_objects);
+        if actual.as_ref().is_ok_and(|actual| actual == &expected) {
+            return Ok(());
+        }
+        let detail = actual.map_or_else(
+            |error| error,
+            |actual| format!("current owned catalog differs: expected {expected}, found {actual}"),
+        );
+        // Preserve the canonical typed mismatch and its object-level diagnostics.
+        // As in ordinary open, the private in-memory oracle runs only on refusal.
+        Err(match current_catalog_diff(conn, domain) {
+            Ok(diff) if !diff.is_empty() => SqliteStoreError::CurrentSchemaMismatch {
+                domain: domain.name.to_string(),
+                version: supported,
+                missing_objects: diff.missing,
+                unexpected_objects: diff.unexpected,
+                changed_objects: diff.changed,
+            },
+            _ => SqliteStoreError::SchemaFingerprintMismatch {
+                domain: domain.name.to_string(),
+                version: supported,
+                detail,
+            },
+        })
     })
 }
 
@@ -3825,5 +3900,193 @@ mod tests {
         assert_eq!(reports.iter().filter(|report| report.migrated()).count(), 1);
         assert!(reports.iter().all(|report| report.to_version == 2));
         preflight_schema_eligibility(&conn, &DOMAIN_V2).expect("verified upgraded catalog");
+    }
+
+    /// A schema preflight judges the ledger and the catalog from one
+    /// snapshot, so a domain another connection creates meanwhile is seen
+    /// whole (its row and its objects) or not at all. The probe commits that
+    /// create between the preflight's ledger read and the reads after it.
+    mod preflight_snapshot {
+        use std::cell::{Cell, RefCell};
+        use std::path::Path;
+        use std::rc::Rc;
+        use std::sync::mpsc;
+        use std::thread::JoinHandle;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::profile::{OpenOptions, open_with};
+
+        /// A co-tenant domain. Stamping it creates the ledger table, as a
+        /// runtime store's own domain does before its lazily created
+        /// delivery domain.
+        const FOREIGN_DOMAIN: SchemaDomain = SchemaDomain {
+            name: "foreign-domain",
+            migrations: &[Migration {
+                version: 1,
+                name: "base",
+                apply: create_foreign,
+            }],
+            initialize_current: create_foreign,
+            allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[],
+            released_predecessors: &[],
+            owned_objects: &[SchemaObject {
+                kind: SchemaObjectKind::Table,
+                name: "foreign_t",
+            }],
+            retired_objects: &[],
+        };
+
+        fn create_foreign(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS foreign_t (x INTEGER)")
+        }
+
+        type PendingWriter = (JoinHandle<Result<LedgerReport, SqliteStoreError>>, bool);
+
+        fn open_preflighted(
+            path: &Path,
+            profile: ConnectionProfile,
+        ) -> Result<Connection, SqliteStoreError> {
+            open_with(
+                path,
+                profile,
+                OpenOptions {
+                    schema_preflight: &[&DOMAIN_V1],
+                    ..OpenOptions::default()
+                },
+            )
+        }
+
+        /// Arm the probe to create `DOMAIN_V1` through a second connection
+        /// and commit it before the probe returns. Answers whether it ran.
+        fn arm_concurrent_create(path: &Path) -> Rc<Cell<bool>> {
+            let ran = Rc::new(Cell::new(false));
+            let seen = Rc::clone(&ran);
+            let path = path.to_path_buf();
+            arm_preflight_probe_for_test(move || {
+                let mut writer =
+                    open(&path, ConnectionProfile::PRIMARY).expect("concurrent writer");
+                let report = apply_domain_migrations(&mut writer, &DOMAIN_V1)
+                    .expect("the concurrent create commits");
+                assert!(
+                    report.migrated(),
+                    "the concurrent writer creates the domain"
+                );
+                seen.set(true);
+            });
+            ran
+        }
+
+        #[test]
+        fn a_domain_created_between_the_ledger_and_catalog_reads_is_not_half_seen() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("db.sqlite3");
+            let mut seed = open(&path, ConnectionProfile::PRIMARY).expect("WAL file");
+            apply_domain_migrations(&mut seed, &FOREIGN_DOMAIN).expect("co-tenant stamped");
+            drop(seed);
+            let ran = arm_concurrent_create(&path);
+
+            let conn = open_preflighted(&path, ConnectionProfile::Primary { create: false })
+                .expect("the preflight sees the concurrent domain whole or not at all");
+
+            assert!(ran.get(), "the probe committed inside the preflight");
+            assert_eq!(
+                domain_version(&conn, DOMAIN_V1.name).expect("ledger"),
+                Some(1),
+                "the concurrent create is visible once the preflight's snapshot ends"
+            );
+        }
+
+        #[test]
+        fn a_domain_created_before_any_ledger_table_exists_is_not_half_seen() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("db.sqlite3");
+            drop(open(&path, ConnectionProfile::PRIMARY).expect("empty WAL file"));
+            let ran = arm_concurrent_create(&path);
+
+            let conn = open_preflighted(&path, ConnectionProfile::Primary { create: false })
+                .expect("the preflight sees the concurrent domain whole or not at all");
+
+            assert!(ran.get(), "the probe committed inside the preflight");
+            assert_eq!(
+                domain_version(&conn, DOMAIN_V1.name).expect("ledger"),
+                Some(1),
+                "the concurrent create is visible once the preflight's snapshot ends"
+            );
+        }
+
+        #[test]
+        fn a_rollback_journal_preflight_holds_a_concurrent_commit_until_it_ends() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("db.sqlite3");
+            let mut seed = Connection::open(&path).expect("rollback-journal file");
+            apply_domain_migrations(&mut seed, &FOREIGN_DOMAIN).expect("co-tenant stamped");
+            let mode: String = seed
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("journal mode");
+            assert_eq!(mode, "delete");
+            drop(seed);
+            let pending: Rc<RefCell<Option<PendingWriter>>> = Rc::default();
+            let slot = Rc::clone(&pending);
+            let writer_path = path.clone();
+            arm_preflight_probe_for_test(move || {
+                let (done, finished) = mpsc::channel();
+                // Not joined here: while the preflight holds its SHARED lock
+                // the writer's commit waits, and joining would deadlock.
+                let writer = std::thread::spawn(move || {
+                    let mut writer = Connection::open(&writer_path)?;
+                    writer.busy_timeout(Duration::from_secs(30))?;
+                    let report = apply_domain_migrations(&mut writer, &DOMAIN_V1);
+                    let _ = done.send(());
+                    report
+                });
+                let committed_inside = finished.recv_timeout(Duration::from_millis(1500)).is_ok();
+                *slot.borrow_mut() = Some((writer, committed_inside));
+            });
+
+            let conn = open_preflighted(&path, ConnectionProfile::ReadOnly)
+                .expect("the preflight sees the concurrent domain whole or not at all");
+
+            let (writer, committed_inside) = pending
+                .borrow_mut()
+                .take()
+                .expect("the probe ran inside the preflight");
+            assert!(
+                !committed_inside,
+                "the writer committed while the preflight was between its reads"
+            );
+            let report = writer
+                .join()
+                .expect("writer thread")
+                .expect("the writer commits once the preflight has ended");
+            assert!(report.migrated());
+            drop(conn);
+            let reader = Connection::open(&path).expect("reopen");
+            assert_eq!(
+                domain_version(&reader, DOMAIN_V1.name).expect("ledger"),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn a_preflight_inside_a_callers_transaction_reads_that_transaction() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("db.sqlite3");
+            let mut conn = open(&path, ConnectionProfile::PRIMARY).expect("open");
+            apply_domain_migrations(&mut conn, &DOMAIN_V1).expect("current domain");
+            let tx = conn.transaction().expect("the caller's transaction");
+
+            assert_eq!(
+                preflight_domain_version(&tx, &DOMAIN_V1).expect("checked in that transaction"),
+                Some(1)
+            );
+            preflight_schema_eligibility(&tx, &DOMAIN_V1).expect("checked again in it");
+            assert!(
+                !tx.is_autocommit(),
+                "the caller's transaction is still open"
+            );
+            tx.commit().expect("the caller ends its own transaction");
+        }
     }
 }

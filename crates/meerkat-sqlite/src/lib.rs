@@ -62,11 +62,14 @@ pub use error::{
 };
 pub use fence::{ExclusiveFence, OperationGuard, fence_lock_path};
 pub use json_column::JsonColumnBytes;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use ledger::arm_preflight_probe_for_test;
 pub use ledger::{
     LedgerReport, MaintenanceBridgeReport, MaintenancePrepareFn, MaintenancePrepareReport,
     MaintenanceRecordRefusal, Migration, SchemaDomain, SchemaObject, SchemaObjectKind,
     SchemaPredecessor, apply_domain_migrations, bridge_unledgered_domain, domain_version,
-    preflight_schema_eligibility, verify_released_schema_fingerprint,
+    preflight_domain_version, preflight_schema_eligibility, verify_released_schema_fingerprint,
     verify_released_schema_structure,
 };
 pub use profile::{
