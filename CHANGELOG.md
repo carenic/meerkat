@@ -50,7 +50,8 @@ them.
     `description`, `version`, a `metadata` value, a capability) serde_yaml
     dropped the tag and kept the value; on an extension value it was refused
     already;
-  - nesting deeper than 64 levels, the parser's default budget;
+  - nesting deeper than 64 levels, or 100 or more aliases that outnumber
+    their anchors more than ten to one: the parser's default budget;
   - a `...` document end marker line, because serde-saphyr 2.0.0 ignores
     whatever follows one (malformed text included).
 
@@ -59,7 +60,8 @@ them.
   the frontmatter: the frontmatter was cut before that line break, so a
   `description: |` written last lost its trailing newline. Unchanged: YAML
   1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
-  and refusal of a second document and alias expansion bombs.
+  and refusal of a second document. An alias expansion bomb is still
+  refused; ordinary aliases now count against the budget above.
 
 ### Security
 

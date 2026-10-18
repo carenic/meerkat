@@ -131,9 +131,10 @@ The frontmatter is delimited by `---` markers. The body (everything after the cl
 The frontmatter is one YAML 1.2 document. `yes`, `on` and `off` stay strings,
 and `<<` is an ordinary key, not a merge. The parser refuses a key given twice
 at any level, a null (`~` or an empty value) where text is expected, an
-unrecognized tag, a `...` document end marker, and nesting deeper than 64
-levels. A block scalar keeps its line breaks as YAML specifies, also at the end
-of the frontmatter.
+unrecognized tag, a `...` document end marker, nesting deeper than 64 levels,
+and 100 or more aliases that outnumber their anchors more than ten to one. A
+block scalar keeps its line breaks as YAML specifies, also at the end of the
+frontmatter.
 
 ## Capability gating
 

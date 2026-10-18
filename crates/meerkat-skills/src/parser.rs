@@ -898,6 +898,21 @@ body";
         assert!(parse_with_frontmatter(&nested(64)).is_err());
     }
 
+    /// The parser budget's alias heuristic: 100 or more aliases that outnumber
+    /// their anchors more than ten to one are refused, even when the expansion
+    /// is small.
+    #[test]
+    fn test_rejects_aliases_past_the_budget_ratio() {
+        let aliases = |count: usize| {
+            format!(
+                "vendor.version: '1'\nvendor.anchor: &a x\nvendor.uses: [{}]\n",
+                vec!["*a"; count].join(", ")
+            )
+        };
+        assert!(parse_with_frontmatter(&aliases(99)).is_ok());
+        assert!(parse_with_frontmatter(&aliases(101)).is_err());
+    }
+
     /// A block scalar that ends the frontmatter keeps its final line break, as
     /// YAML specifies and as it does anywhere else in the frontmatter: `|` and
     /// `>` clip to one line break, `|+` keeps every trailing one, `|-` strips.
