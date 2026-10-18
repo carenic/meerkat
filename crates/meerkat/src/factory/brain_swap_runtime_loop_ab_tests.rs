@@ -706,10 +706,22 @@ impl AbHarness {
     async fn cold_restart(self) -> Self {
         let environment = Arc::clone(&self.environment);
         let session_id = self.session_id.clone();
-        self.adapter
-            .unregister_session(&session_id)
+        // A restart reattaches the same session, so it must observe terminal
+        // teardown of the exact original registration first. The plain
+        // unregister bounds its wait by a caller grace and answers the
+        // retryable `UnregisterInProgress` while a slow teardown (under load)
+        // is still running.
+        let registration = self
+            .adapter
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("the original attachment has a current registration");
+        let torn_down = self
+            .adapter
+            .unregister_session_registration_until_terminal_if_current(&registration)
             .await
             .expect("tear down the original runtime attachment");
+        assert!(torn_down, "the original registration was still current");
         drop(self);
         attach_harness(environment, Some(session_id)).await
     }
@@ -1344,6 +1356,51 @@ async fn whole_blob_cold_restart_bootstraps_from_requested_b_when_a_is_unavailab
 #[tokio::test]
 async fn head_canonical_cold_restart_bootstraps_from_requested_b_when_a_is_unavailable() {
     cold_restart_realizes_with_a_unavailable(PersistenceProfile::HeadCanonical).await;
+}
+
+/// A cold restart must not depend on the teardown finishing inside the plain
+/// unregister's caller grace. Under load the coordinator-owned teardown can
+/// outlast that grace, and the grace-bounded unregister then answers the
+/// retryable `UnregisterInProgress`. Here the teardown is held past a
+/// shortened grace, which makes that window deterministic: the restart has
+/// to wait for the held teardown and still come back on the same identity.
+async fn cold_restart_outlasts_the_unregister_caller_grace(profile: PersistenceProfile) {
+    let harness = build_harness(profile).await;
+    let before = harness.durable_identity().await;
+    harness
+        .adapter
+        .test_set_unregister_caller_wait_grace(std::time::Duration::from_millis(20));
+    let (entered, release) = harness.adapter.test_hold_next_unregister_saga();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let releaser = tokio::spawn({
+        let released = Arc::clone(&released);
+        async move {
+            entered.await.expect("the teardown reaches its hold");
+            // Release only well after the shortened caller grace elapsed.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = release.send(());
+        }
+    });
+
+    let harness = harness.cold_restart().await;
+    assert!(
+        released.load(std::sync::atomic::Ordering::SeqCst),
+        "the restart reattached only after the held teardown was released"
+    );
+    releaser.await.expect("the releaser finishes");
+    assert_eq!(harness.durable_identity().await, before);
+    assert_eq!(harness.live_identity().await.model, before.model);
+}
+
+#[tokio::test]
+async fn whole_blob_cold_restart_outlasts_the_unregister_caller_grace() {
+    cold_restart_outlasts_the_unregister_caller_grace(PersistenceProfile::WholeBlob).await;
+}
+
+#[tokio::test]
+async fn head_canonical_cold_restart_outlasts_the_unregister_caller_grace() {
+    cold_restart_outlasts_the_unregister_caller_grace(PersistenceProfile::HeadCanonical).await;
 }
 
 async fn unavailable_b_holds_the_real_next_input(profile: PersistenceProfile) {
