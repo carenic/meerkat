@@ -12,7 +12,9 @@
 # MEERKAT_CRATE_INDEX_TIMEOUT seconds per level (default 600).
 #
 # Failure semantics are those of the sequential publisher, per level: an
-# already published version is skipped, a rate limit is retried, and once a
+# already published version is skipped, a rate limit is retried, a crates.io
+# server error (5xx) is retried after MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF
+# (seconds per retry, default "30 60 120 240"), and once a
 # crate fails no further crate starts (the level's crates already in flight
 # finish), and the publication stops with the status of the first failed
 # crate in canonical order (124 after MEERKAT_CRATE_PUBLISH_TIMEOUT); no
@@ -52,6 +54,13 @@ if ! [[ "$INDEX_TIMEOUT" =~ ^[0-9]+$ && "$INDEX_POLL" =~ ^[0-9]+$ ]]; then
   echo "MEERKAT_CRATE_INDEX_TIMEOUT and MEERKAT_CRATE_INDEX_POLL_SECONDS must be integers" >&2
   exit 2
 fi
+read -r -a SERVER_ERROR_BACKOFF <<<"${MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF-30 60 120 240}"
+for seconds in "${SERVER_ERROR_BACKOFF[@]}"; do
+  if ! [[ "$seconds" =~ ^[0-9]+$ ]]; then
+    echo "MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF must list whole seconds, got ${seconds}" >&2
+    exit 2
+  fi
+done
 
 publish_one() {
   local crate="$1"
@@ -97,6 +106,11 @@ publish_one() {
     if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || ((max_attempts < 1)); then
       max_attempts=12
     fi
+    # A server error (v0.9.3 met a 503 Heroku "Application Error" page) is
+    # retried after the next SERVER_ERROR_BACKOFF delay, on a budget of its
+    # own. An upload that landed despite the error answers "already uploaded"
+    # on the retry and is skipped below; the level still waits for the index.
+    local server_errors=0
 
     set +e
     while true; do
@@ -112,8 +126,20 @@ publish_one() {
           > >(tee "$output_file") 2> >(tee -a "$output_file" >&2)
         rc=$?
       fi
+      [[ $rc -eq 0 ]] && break
 
-      if [[ $rc -eq 0 ]] || ! grep -q "Too Many Requests" "$output_file" || ((attempt >= max_attempts)); then
+      # cargo reports a JSON API error as "(status 5NN ...)" and any other
+      # body as "got 5NN".
+      if grep -Eq "failed to get a 200 OK response, got 5[0-9][0-9]|\(status 5[0-9][0-9][ )]" "$output_file"; then
+        ((server_errors < ${#SERVER_ERROR_BACKOFF[@]})) || break
+        local backoff="${SERVER_ERROR_BACKOFF[$server_errors]}"
+        server_errors=$((server_errors + 1))
+        echo "  ${crate}: crates.io server error, publish retry ${server_errors}/${#SERVER_ERROR_BACKOFF[@]} in ${backoff}s" >&2
+        sleep "$backoff"
+        continue
+      fi
+
+      if ! grep -q "Too Many Requests" "$output_file" || ((attempt >= max_attempts)); then
         break
       fi
 

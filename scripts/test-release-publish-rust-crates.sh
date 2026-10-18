@@ -11,7 +11,8 @@
 # already published version is skipped; the first failing crate stops the
 # publication with its exit status before any later level starts; a crate
 # that never reaches the index fails the level once
-# MEERKAT_CRATE_INDEX_TIMEOUT has passed.
+# MEERKAT_CRATE_INDEX_TIMEOUT has passed; crates.io server errors are retried
+# on their own bounded budget, separate from the rate limit's.
 
 set -euo pipefail
 
@@ -54,7 +55,69 @@ now_ms() { date +%s%3N; }
 } 9>"${STATE}/lock"
 sleep 0.1
 behaviour="$(cat "${STATE}/behaviour/${crate}" 2>/dev/null || echo ok)"
+attempt="$({
+  flock 9
+  count=$(( $(cat "${STATE}/attempts.${crate}" 2>/dev/null || echo 0) + 1 ))
+  echo "${count}" >"${STATE}/attempts.${crate}"
+  echo "${count}"
+} 9>"${STATE}/lock")"
+# Server-error behaviours answer their first attempts as crates.io did for
+# v0.9.3, then publish: server-error-once (one HTML 503), server-error-json
+# (one JSON 500), server-error-landed (a 503 for an upload that did land, so
+# the retry finds it published), rate-limit-then-server-error (a 429 that
+# names the next second, a 503, then the upload), server-error (always 503).
+server_error() {
+  cat >&2 <<EOF
+error: failed to publish ${crate} v${VERSION} to registry at https://crates.io
+
+Caused by:
+  failed to get a 200 OK response, got 503
+  headers:
+  	HTTP/2 503
+  	server: Heroku
+  body:
+  <title>Application Error</title>
+EOF
+  status=101
+}
+upload() {
+  echo "    Uploaded ${crate} v${VERSION} to registry \`crates-io\`"
+  if [[ "${dry_run}" == "false" ]]; then
+    name="${crate,,}"
+    path="${name:0:2}/${name:2:2}/${name}"
+    mkdir -p "${INDEX_DIR}/$(dirname "${path}")"
+    printf '{"name":"%s","vers":"%s"}\n' "${crate}" "${VERSION}" >>"${INDEX_DIR}/${path}"
+  fi
+}
 status=0
+case "${behaviour}:${attempt}" in
+  server-error-once:1 | rate-limit-then-server-error:2 | server-error:*)
+    server_error
+    ;;
+  server-error-json:1)
+    echo "error: failed to publish ${crate} v${VERSION} to registry at https://crates.io" >&2
+    echo "Caused by:" >&2
+    echo "  the remote server responded with an error (status 500 Internal Server Error): internal error" >&2
+    status=101
+    ;;
+  server-error-landed:1)
+    upload
+    server_error
+    ;;
+  server-error-landed:*)
+    echo "error: crate version \`${VERSION}\` is already uploaded" >&2
+    status=101
+    ;;
+  rate-limit-then-server-error:1)
+    echo "error: failed to publish ${crate} v${VERSION} to registry at https://crates.io" >&2
+    echo "Caused by:" >&2
+    echo "  the remote server responded with an error (status 429 Too Many Requests): You have published too many updates to existing crates in a short period of time. Please try again after $(date -u -d '+1 second' '+%a, %d %b %Y %H:%M:%S GMT') and see https://crates.io/docs/rate-limits for more details." >&2
+    status=101
+    ;;
+  server-error-once:* | server-error-json:* | rate-limit-then-server-error:*)
+    upload
+    ;;
+esac
 case "${behaviour}" in
   ok|hidden)
     echo "    Uploaded ${crate} v${VERSION} to registry \`crates-io\`"
@@ -217,5 +280,70 @@ if awk -F '\t' '$1 > 0 { print $2 }' <<<"${LEVELS}" | grep -Fxq -f - <(started i
   fail "invisible: level 1 started although level 0 is not in the index"
 fi
 echo "ok: a crate missing from the index fails its level after MEERKAT_CRATE_INDEX_TIMEOUT"
+
+level_crate() {
+  awk -F '\t' -v level="$1" '$1 == level { print $2; exit }' <<<"${LEVELS}"
+}
+attempts() {
+  cat "${TEST_ROOT}/$1/attempts.$2"
+}
+
+# 6. crates.io server errors are retried after the configured delays, on a
+#    budget separate from the rate limit's: an HTML 503, a JSON 500, a 503 for
+#    an upload that landed (the retry finds it published and skips it), and a
+#    429 followed by a 503 all end published, with every level in order.
+once_crate="$(level_crate 0)"
+json_crate="$(level_crate 1)"
+landed_crate="$(level_crate 2)"
+mixed_crate="$(level_crate 3)"
+prepare server-errors "${once_crate}" server-error-once
+prepare server-errors "${json_crate}" server-error-json
+prepare server-errors "${landed_crate}" server-error-landed
+prepare server-errors "${mixed_crate}" rate-limit-then-server-error
+publish server-errors 0 MEERKAT_CRATE_PUBLISH_JOBS=4 MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF="0 0"
+[[ "$(started server-errors | sort -u)" == "${all_crates}" ]] || fail "server-errors: not every crate was published"
+check_level_order server-errors
+for crate in "${once_crate}" "${json_crate}" "${landed_crate}"; do
+  [[ "$(attempts server-errors "${crate}")" == 2 ]] ||
+    fail "server-errors: ${crate} took $(attempts server-errors "${crate}") attempts, expected 2"
+done
+[[ "$(attempts server-errors "${mixed_crate}")" == 3 ]] ||
+  fail "server-errors: ${mixed_crate} took $(attempts server-errors "${mixed_crate}") attempts, expected 3 (429, 503, upload)"
+for crate in "${once_crate}" "${json_crate}" "${landed_crate}" "${mixed_crate}"; do
+  grep -Fq "${crate}: crates.io server error, publish retry 1/2 in 0s" "${TEST_ROOT}/server-errors/out.log" ||
+    fail "server-errors: ${crate} reported no server-error retry"
+done
+grep -Fq "${landed_crate}: already published, skipping" "${TEST_ROOT}/server-errors/out.log" ||
+  fail "server-errors: the upload that landed before its 503 was not skipped"
+grep -Fq "${mixed_crate}: crates.io rate limited publish attempt 1/12" "${TEST_ROOT}/server-errors/out.log" ||
+  fail "server-errors: ${mixed_crate}'s 429 did not take the rate-limit path"
+grep -Fq "Every release crate is published" "${TEST_ROOT}/server-errors/out.log" || fail "server-errors: no completion line"
+echo "ok: an HTML 503, a JSON 500, a 503 for a landed upload and a 429 then 503 are retried and published"
+
+# 7. Server errors that outlast the budget fail the crate as any failure does:
+#    1 + 2 attempts, its status, and no later level.
+budget_level=4
+budget_crate="$(level_crate "${budget_level}")"
+prepare server-error-budget "${budget_crate}" server-error
+publish server-error-budget 101 MEERKAT_CRATE_PUBLISH_JOBS=1 MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF="0 0"
+[[ "$(attempts server-error-budget "${budget_crate}")" == 3 ]] ||
+  fail "server-error-budget: ${budget_crate} took $(attempts server-error-budget "${budget_crate}") attempts, expected 3"
+later="$(awk -F '\t' -v level="${budget_level}" '$1 > level { print $2 }' <<<"${LEVELS}" | sort)"
+if comm -12 <(started server-error-budget | sort -u) <(printf '%s\n' "${later}") | grep -q .; then
+  fail "server-error-budget: a later level started after ${budget_crate} failed"
+fi
+grep -Fq "Level ${budget_level}: ${budget_crate} failed (exit 101)" "${TEST_ROOT}/server-error-budget/out.log" ||
+  fail "server-error-budget: the failing crate is not named"
+echo "ok: ${budget_crate}'s server errors outlast 2 retries and stop the publication with exit 101"
+
+# 8. An empty delay list retries nothing; a malformed one refuses to start.
+prepare server-error-off "${once_crate}" server-error-once
+publish server-error-off 101 MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF=""
+[[ "$(attempts server-error-off "${once_crate}")" == 1 ]] || fail "server-error-off: an empty delay list retried"
+publish server-error-malformed 2 MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF="30 soon"
+[[ ! -s "${TEST_ROOT}/server-error-malformed/events" ]] || fail "server-error-malformed: a crate started"
+grep -Fq "MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF must list whole seconds, got soon" "${TEST_ROOT}/server-error-malformed/out.log" ||
+  fail "server-error-malformed: the bad delay is not named"
+echo "ok: an empty server-error delay list disables the retry and a malformed one refuses to start"
 
 echo "level-parallel publisher contract holds"
