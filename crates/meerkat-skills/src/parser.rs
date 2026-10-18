@@ -175,12 +175,15 @@ fn yaml_serializer_options() -> serde_saphyr::SerializerOptions {
 /// <https://github.com/bourumir-wyngs/serde-saphyr/pull/230>. Remove this
 /// guard at the bump to a release with that fix, and decide then whether a
 /// marker with nothing after it stays refused (`test_rejects_document_end_marker`
-/// pins both).
+/// pins both). Lines break where YAML breaks them: at LF, CRLF and a lone CR.
 fn reject_document_end_marker(frontmatter: &str) -> Result<(), SkillError> {
-    let marker_line = frontmatter.lines().position(|line| {
-        line.strip_prefix("...")
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
-    });
+    let marker_line = frontmatter
+        .replace("\r\n", "\n")
+        .split(['\n', '\r'])
+        .position(|line| {
+            line.strip_prefix("...")
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+        });
     match marker_line {
         Some(index) => Err(SkillError::Parse(
             format!(
@@ -940,18 +943,27 @@ body";
     }
 
     /// A `...` document end marker is refused: serde-saphyr 2.0.0 ignores
-    /// whatever follows one, malformed text included. In a block scalar,
+    /// whatever follows one, malformed text included. YAML breaks lines at a
+    /// lone CR too, and the reported line counts CRLF once. In a block scalar,
     /// `...` is text.
     #[test]
     fn test_rejects_document_end_marker() {
-        for (case, extra) in [
-            ("malformed text after the marker", "...\n]]] not yaml\n"),
-            ("a comment after the marker", "... # end\n"),
-            ("the marker alone", "...\n"),
+        for (case, extra, line) in [
+            ("malformed text after the marker", "...\n]]] not yaml\n", 3),
+            ("a comment after the marker", "... # end\n", 3),
+            ("the marker alone", "...\n", 3),
+            (
+                "a lone CR around the marker",
+                "vendor.note: x\r...\r]]] not yaml\n",
+                4,
+            ),
+            ("CRLF line breaks", "vendor.note: x\r\n...\r\n", 4),
         ] {
-            let error = parse_with_frontmatter(extra).unwrap_err();
+            let error = parse_with_frontmatter(extra).unwrap_err().to_string();
             assert!(
-                error.to_string().contains("document end marker"),
+                error.contains(&format!(
+                    "document end marker is not allowed (frontmatter line {line})"
+                )),
                 "{case}: {error}"
             );
         }
