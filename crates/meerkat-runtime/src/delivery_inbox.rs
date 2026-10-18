@@ -613,10 +613,10 @@ pub struct RuntimeDeliveryInbox {
     /// Whether a [`RuntimeDeliveryOwnership`] is outstanding, shared by all
     /// clones.
     owner_claimed: Arc<AtomicBool>,
-    /// Test support: fail the next submit through any clone, shared by all
-    /// clones.
+    /// Test support: how many of the next submits through any clone fail,
+    /// shared by all clones.
     #[cfg(any(test, feature = "test-support"))]
-    fail_next_submit: Arc<AtomicBool>,
+    failing_submits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The generated authority's verdict for one delivery id.
@@ -815,17 +815,17 @@ impl RuntimeDeliveryInbox {
             committed_runtimes: Arc::new(Mutex::new(HashSet::new())),
             owner_claimed: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-support"))]
-            fail_next_submit: Arc::new(AtomicBool::new(false)),
+            failing_submits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    /// Test support: the next submit through this inbox or any clone fails
-    /// with a store write error before it touches the store, as a failed
-    /// delivery write does.
+    /// Test support: the next `count` submits through this inbox or any
+    /// clone fail with a store write error before they touch the store, as
+    /// failed delivery writes do. Zero stops failing them.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn fail_next_submit_for_test(&self) {
-        self.fail_next_submit.store(true, Ordering::Release);
+    pub fn fail_next_submits_for_test(&self, count: usize) {
+        self.failing_submits.store(count, Ordering::Release);
     }
 
     /// Claim exclusive delivery ownership of this inbox.
@@ -930,7 +930,13 @@ impl RuntimeDeliveryInbox {
         acknowledge: bool,
     ) -> Result<RuntimeDeliveryReceipt, RuntimeDeliveryError> {
         #[cfg(any(test, feature = "test-support"))]
-        if self.fail_next_submit.swap(false, Ordering::AcqRel) {
+        if self
+            .failing_submits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Err(RuntimeStoreError::WriteFailed(
                 "injected delivery write failure (test support)".to_string(),
             )
