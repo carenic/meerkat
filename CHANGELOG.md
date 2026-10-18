@@ -35,6 +35,20 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `SessionAgentMandate::new` drops its `catalog` argument: it is now
+  `new(executor, servers, represented_subject)`. `SessionAgentMandate::catalog_lineage`
+  and the stock realm's `AgentGrantRefs::catalog_lineage` are removed. Nothing
+  read the mandate's catalog lineage: the agent's tool catalog is base work,
+  whose lineage the work's authority basis selects
+  (`AgentGrantRefs::prompt_selection` still places the catalog grant there). A
+  mandate now selects at least one MCP server (`AgentMandateError::NoSelection`
+  otherwise, whose message now says so). A stock selection that grants only
+  the catalog therefore binds no session agent: every configured MCP server
+  stays unavailable, as before, and the registration's binding stays free for
+  a server mandate.
+
 ### Changed
 
 - `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,

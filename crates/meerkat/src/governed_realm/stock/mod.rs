@@ -468,13 +468,16 @@ impl StockGovernance {
     /// the trusted host, before the session's agent is built: its executor;
     /// every MCP server the agent's selection names, each with exactly the
     /// lineage selected for it, whether or not the session configures it (so
-    /// a live add of a selected server can be decided); for an older
+    /// a live add of a selected server can be decided); and for an older
     /// selection's single worker grant, only the session's configured MCP
-    /// `servers`; plus the catalog's. Until bound (or without a selection)
-    /// every MCP server of the session is unavailable, and a server with no
-    /// selected grant stays unavailable. Each selection is resolved for its
-    /// own server at every decision, never combined with another's. The
-    /// selection is the one read when the realm opened.
+    /// `servers`. A selection that names no server binds nothing: the
+    /// agent's catalog grant is base work, which its prompts' work basis
+    /// selects ([`issuance::AgentGrantRefs::prompt_selection`]), not the
+    /// registration. Until bound (or without a selection) every MCP server of
+    /// the session is unavailable, and a server with no selected grant stays
+    /// unavailable. Each selection is resolved for its own server at every
+    /// decision, never combined with another's. The selection is the one
+    /// read when the realm opened.
     pub async fn bind_session_agent<'a>(
         &self,
         machine: &MeerkatMachine,
@@ -501,8 +504,7 @@ impl StockGovernance {
             }
         }
         let servers = selected;
-        let catalog = refs.catalog_lineage().map(|lineage| vec![lineage.clone()]);
-        if servers.is_empty() && catalog.is_none() {
+        if servers.is_empty() {
             return Ok(());
         }
         let registration = machine
@@ -514,7 +516,6 @@ impl StockGovernance {
         let mandate = meerkat_runtime::meerkat_machine::SessionAgentMandate::new(
             self.principals.executor.clone(),
             servers,
-            catalog,
             None,
         )
         .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;

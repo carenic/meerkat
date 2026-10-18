@@ -379,7 +379,6 @@ impl Fixture {
                     self.executor.clone(),
                     servers,
                     None,
-                    None,
                 )
                 .expect("mandate"),
             )

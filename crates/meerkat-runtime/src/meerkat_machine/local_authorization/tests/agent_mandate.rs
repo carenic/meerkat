@@ -383,7 +383,7 @@ impl Fixture {
         self.machine
             .bind_session_agent_mandate(
                 witness,
-                SessionAgentMandate::new(who(agent), servers, None, None).expect("mandate"),
+                SessionAgentMandate::new(who(agent), servers, None).expect("mandate"),
             )
             .await
     }
@@ -827,7 +827,7 @@ async fn a_registration_binds_once_and_a_replacement_starts_unbound() {
 #[test]
 fn a_mandate_needs_a_selection() {
     assert_eq!(
-        SessionAgentMandate::new(who("agent-a"), Default::default(), None, None).map(|_| ()),
+        SessionAgentMandate::new(who("agent-a"), Default::default(), None).map(|_| ()),
         Err(AgentMandateError::NoSelection)
     );
 }
