@@ -37,21 +37,23 @@ them.
 
 ### Added
 
-- `meerkat-sqlite`: `preflight_domain_version` returns the ledger version
-  that the open-time schema eligibility check verified, read in the same
-  snapshot as the check.
+- `meerkat-sqlite`: `preflight_domain_version` runs the schema eligibility
+  check that `preflight_schema_eligibility` runs and returns the ledger
+  version it verified (`None` for a fresh domain), read in the same snapshot
+  as the check.
 
 ### Fixed
 
 - Stores no longer refuse to open with "schema domain ... has no ledger row
   but already owns objects" when another process creates the same schema
-  domain at that moment. The open-time check now reads the schema ledger and
-  the catalog in one snapshot, so a domain created concurrently is seen
-  whole or not at all. Two processes racing their first durable delivery
-  write (`runtime-delivery`) hit this most often. A durable delivery read
-  also decides whether that domain exists from the version its own check
-  verified, so a domain stamped after the read opened, possibly by a newer
-  binary, is checked before it is read.
+  domain at that moment (the 0.9.3 known issue "First concurrent durable
+  delivery"). The open-time check now reads the schema ledger and the
+  catalog in one snapshot, so a domain created concurrently is seen whole or
+  not at all. Two processes racing their first durable delivery write
+  (`runtime-delivery`) hit this most often. A durable delivery read also
+  decides from the version its own check verified whether that domain
+  exists and which of its tables to read, so a domain stamped after the read
+  opened, possibly by a newer binary, is checked before it is read.
 
 ## [0.9.3] - 2026-10-18
 

@@ -488,6 +488,10 @@ impl MaintenanceBridgeReport {
 /// the domain owns zero objects before treating it as fresh.
 /// A ledger table that fails the pinned-shape or version validation yields
 /// [`SqliteStoreError::LedgerMalformed`], never a healed reading.
+///
+/// To decide anything on the version, use [`preflight_domain_version`]: it
+/// returns the version the schema eligibility check verified, read in the
+/// same snapshot as the check.
 pub fn domain_version(conn: &Connection, domain: &str) -> Result<Option<i64>, SqliteStoreError> {
     if !ledger_table_exists(conn)? {
         return Ok(None);
