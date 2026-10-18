@@ -13,8 +13,9 @@
 #
 # Failure semantics are those of the sequential publisher, per level: an
 # already published version is skipped, a rate limit is retried, a crates.io
-# server error (5xx) is retried after MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF
-# (seconds per retry, default "30 60 120 240"), and once a
+# server error (5xx) or a network error is retried after
+# MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF (seconds per retry, default
+# "30 60 120 240"), and once a
 # crate fails no further crate starts (the level's crates already in flight
 # finish), and the publication stops with the status of the first failed
 # crate in canonical order (124 after MEERKAT_CRATE_PUBLISH_TIMEOUT); no
@@ -106,10 +107,11 @@ publish_one() {
     if ! [[ "$max_attempts" =~ ^[0-9]+$ ]] || ((max_attempts < 1)); then
       max_attempts=12
     fi
-    # A server error (v0.9.3 met a 503 Heroku "Application Error" page) is
-    # retried after the next SERVER_ERROR_BACKOFF delay, on a budget of its
-    # own. An upload that landed despite the error answers "already uploaded"
-    # on the retry and is skipped below; the level still waits for the index.
+    # A server error (v0.9.3 met a 503 Heroku "Application Error" page) or a
+    # network error is retried after the next SERVER_ERROR_BACKOFF delay, on
+    # a budget of its own. An upload that landed despite the error answers
+    # "already uploaded" on the retry and is skipped below; the level still
+    # waits for the index.
     local server_errors=0
 
     set +e
@@ -132,12 +134,21 @@ publish_one() {
       # body as "got 5NN", except a non-JSON 503 that arrives 29 s or more
       # into the upload (the crates.io router's 30 s timeout, after which
       # the upload most likely landed): that one reads "Request timed out
-      # after 30 seconds".
+      # after 30 seconds". A network error is curl's code and text, such as
+      # "[28] Timeout was reached": a proxy or host name that did not
+      # resolve, a refused, reset or dropped connection, a failed TLS
+      # handshake or a broken HTTP/2 stream.
+      local failure=""
       if grep -Eq "failed to get a 200 OK response, got 5[0-9][0-9]|\(status 5[0-9][0-9][ )]|Request timed out after 30 seconds" "$output_file"; then
+        failure="crates.io server error"
+      elif grep -Eq "\[(5|6|7|16|18|28|35|52|55|56|92)\] [A-Z]" "$output_file"; then
+        failure="network error"
+      fi
+      if [[ -n "$failure" ]]; then
         ((server_errors < ${#SERVER_ERROR_BACKOFF[@]})) || break
         local backoff="${SERVER_ERROR_BACKOFF[$server_errors]}"
         server_errors=$((server_errors + 1))
-        echo "  ${crate}: crates.io server error, publish retry ${server_errors}/${#SERVER_ERROR_BACKOFF[@]} in ${backoff}s" >&2
+        echo "  ${crate}: ${failure}, publish retry ${server_errors}/${#SERVER_ERROR_BACKOFF[@]} in ${backoff}s" >&2
         sleep "$backoff"
         continue
       fi

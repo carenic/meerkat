@@ -12,8 +12,8 @@
 # publication with its exit status before any later level starts; a crate
 # that never reaches the index fails the level once
 # MEERKAT_CRATE_INDEX_TIMEOUT has passed; crates.io server errors, cargo's
-# 30-second timeout report included, are retried on their own bounded budget,
-# separate from the rate limit's.
+# 30-second timeout report included, and network errors are retried on their
+# own bounded budget, separate from the rate limit's.
 
 set -euo pipefail
 
@@ -66,9 +66,10 @@ attempt="$({
 # v0.9.3, then publish: server-error-once (one HTML 503), server-error-json
 # (one JSON 500), server-error-landed (a 503 for an upload that did land, so
 # the retry finds it published), timeout-landed (the same, reported as cargo
-# reports a 503 that arrives 29 s or more into the upload),
-# rate-limit-then-server-error (a 429 that names the next second, a 503, then
-# the upload), server-error (always 503).
+# reports a 503 that arrives 29 s or more into the upload), network-landed
+# (curl's timeout for an upload that did land), rate-limit-then-server-error
+# (a 429 that names the next second, a 503, then the upload), server-error
+# (always 503).
 server_error() {
   cat >&2 <<EOF
 error: failed to publish ${crate} v${VERSION} to registry at https://crates.io
@@ -118,7 +119,12 @@ Caused by:
 EOF
     status=101
     ;;
-  server-error-landed:* | timeout-landed:*)
+  network-landed:1)
+    upload
+    printf 'error: failed to publish to registry at https://crates.io\n\nCaused by:\n  [28] Timeout was reached (Operation timed out after 30000 milliseconds with 0 bytes received)\n' >&2
+    status=101
+    ;;
+  server-error-landed:* | timeout-landed:* | network-landed:*)
     echo "error: crate version \`${VERSION}\` is already uploaded" >&2
     status=101
     ;;
@@ -305,22 +311,24 @@ attempts() {
 # 6. crates.io server errors are retried after the configured delays, on a
 #    budget separate from the rate limit's: an HTML 503, a JSON 500, a 503 for
 #    an upload that landed (the retry finds it published and skips it), cargo's
-#    timeout report for one, and a 429 followed by a 503 all end published,
-#    with every level in order.
+#    timeout report for one, curl's timeout for one, and a 429 followed by a
+#    503 all end published, with every level in order.
 once_crate="$(level_crate 0)"
 json_crate="$(level_crate 1)"
 landed_crate="$(level_crate 2)"
 mixed_crate="$(level_crate 3)"
 timeout_crate="$(level_crate 4)"
+network_crate="$(level_crate 5)"
 prepare server-errors "${once_crate}" server-error-once
 prepare server-errors "${json_crate}" server-error-json
 prepare server-errors "${landed_crate}" server-error-landed
 prepare server-errors "${mixed_crate}" rate-limit-then-server-error
 prepare server-errors "${timeout_crate}" timeout-landed
+prepare server-errors "${network_crate}" network-landed
 publish server-errors 0 MEERKAT_CRATE_PUBLISH_JOBS=4 MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF="0 0"
 [[ "$(started server-errors | sort -u)" == "${all_crates}" ]] || fail "server-errors: not every crate was published"
 check_level_order server-errors
-for crate in "${once_crate}" "${json_crate}" "${landed_crate}" "${timeout_crate}"; do
+for crate in "${once_crate}" "${json_crate}" "${landed_crate}" "${timeout_crate}" "${network_crate}"; do
   [[ "$(attempts server-errors "${crate}")" == 2 ]] ||
     fail "server-errors: ${crate} took $(attempts server-errors "${crate}") attempts, expected 2"
 done
@@ -330,14 +338,16 @@ for crate in "${once_crate}" "${json_crate}" "${landed_crate}" "${mixed_crate}" 
   grep -Fq "${crate}: crates.io server error, publish retry 1/2 in 0s" "${TEST_ROOT}/server-errors/out.log" ||
     fail "server-errors: ${crate} reported no server-error retry"
 done
-for crate in "${landed_crate}" "${timeout_crate}"; do
+grep -Fq "${network_crate}: network error, publish retry 1/2 in 0s" "${TEST_ROOT}/server-errors/out.log" ||
+  fail "server-errors: ${network_crate} reported no network-error retry"
+for crate in "${landed_crate}" "${timeout_crate}" "${network_crate}"; do
   grep -Fq "${crate}: already published, skipping" "${TEST_ROOT}/server-errors/out.log" ||
     fail "server-errors: ${crate}'s upload that landed before its error was not skipped"
 done
 grep -Fq "${mixed_crate}: crates.io rate limited publish attempt 1/12" "${TEST_ROOT}/server-errors/out.log" ||
   fail "server-errors: ${mixed_crate}'s 429 did not take the rate-limit path"
 grep -Fq "Every release crate is published" "${TEST_ROOT}/server-errors/out.log" || fail "server-errors: no completion line"
-echo "ok: an HTML 503, a JSON 500, a 503 for a landed upload, cargo's timeout report for one and a 429 then 503 are retried and published"
+echo "ok: an HTML 503, a JSON 500, a 503 for a landed upload, cargo's and curl's timeouts for one and a 429 then 503 are retried and published"
 
 # 7. Server errors that outlast the budget fail the crate as any failure does:
 #    1 + 2 attempts, its status, and no later level.

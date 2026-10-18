@@ -948,7 +948,9 @@ failure and the server-error retry.
 crates.io's own publish rate limit for new versions (a burst, then about one
 per minute) still bounds a full release. A crates.io server error (5xx, or
 cargo's "Request timed out after 30 seconds", its report of a 503 that
-arrives late in an upload) is retried after each delay of
+arrives late in an upload) or a network error (curl's code and text, such
+as "[28] Timeout was reached": an unresolved host, a refused, reset or
+dropped connection, a failed TLS handshake) is retried after each delay of
 `MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF` (default `30 60 120 240`
 seconds), on a budget separate from the rate limit's; an upload that landed
 despite the error is skipped as published.
