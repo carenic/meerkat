@@ -14392,17 +14392,10 @@ ORDER BY runtime_id";
             let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
                 return Ok(0);
             };
-            // A version-1 delivery file not yet migrated by a write has no
-            // counter yet; its first delivery write migrates it.
-            let counted: bool = conn
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = \
-                     'runtime_delivery_generation')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-            if !counted {
+            // A delivery file below version 3 (the counter's migration) not
+            // yet migrated by a write has no counter yet; its first delivery
+            // write migrates it. Decided on the version the open verified.
+            if conn.version < 3 {
                 return Ok(0);
             }
             let generation: i64 = conn
@@ -25733,6 +25726,65 @@ ORDER BY runtime_id";
             assert!(
                 matches!(binding, Ok(None)),
                 "a version-1 delivery file holds no bindings: {binding:?}"
+            );
+        }
+
+        /// The delivery generation is read only when the version the read's
+        /// open verified has the counter. The domain is at version 2 (no
+        /// counter) when the read opens; right after the read's check
+        /// another writer migrates it to the current version and counts a
+        /// commit. The read answers from version 2, never from a counter its
+        /// check did not see.
+        #[tokio::test]
+        async fn a_generation_read_decides_on_the_version_its_open_verified() {
+            const DELIVERY_V2: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+                name: RUNTIME_DELIVERY_DOMAIN.name,
+                migrations: &[
+                    meerkat_sqlite::Migration {
+                        version: 1,
+                        name: "delivery-inbox",
+                        apply: migration_0001_runtime_delivery_inbox,
+                    },
+                    meerkat_sqlite::Migration {
+                        version: 2,
+                        name: "continuation-ledger",
+                        apply: migration_0002_runtime_continuation_ledger,
+                    },
+                ],
+                initialize_current: build_runtime_delivery_v2_schema,
+                allowed_existing_versions: &[2],
+                bridge_recoverable_versions: &[],
+                released_predecessors: &[],
+                owned_objects: RUNTIME_DELIVERY_V2_OBJECTS,
+                retired_objects: &[],
+            };
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let mut seed = Connection::open(&path).unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut seed, &DELIVERY_V2)
+                .expect("a version-2 delivery domain");
+            drop(seed);
+            let writer = path.clone();
+            // As in the continuation case, the second probe runs in the check
+            // whose version the read keeps.
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                    let conn = open_runtime_delivery_write_connection(&writer)
+                        .expect("the other writer migrates to the current version");
+                    conn.execute(
+                        "UPDATE runtime_delivery_generation SET generation = generation + 1 \
+                         WHERE singleton = 1",
+                        [],
+                    )
+                    .unwrap();
+                });
+            });
+
+            let generation = store.load_delivery_generation().await;
+
+            assert!(
+                matches!(generation, Ok(0)),
+                "a version-2 delivery file has no counter yet: {generation:?}"
             );
         }
 
