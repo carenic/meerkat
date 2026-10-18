@@ -640,11 +640,16 @@ function assertArchivedLanes(plan, label) {
     ["[profile]\ndefault.retries = 1\n", `[profile]\ndefault.retries = 1\ndefault.${filter}\n`],
     ["[profile]\n", `[profile]\ndefault = { ${filter} }\n`],
     ["[[profile.default.overrides]]\nfilter = 'test(a)'\n", `[[profile.default.overrides]]\nfilter = 'test(a)'\n  ${filter}\n`],
+    // A value that spans lines: a dotted key's multi-line string or array.
+    ["profile.default.default-filter = '''\nnot test(/a/)\n'''\n", "profile.default.default-filter = '''\nnot test(/b/)\n'''\n"],
+    ['[profile]\ndefault.default-filter = """\nnot test(/a/)\n"""\n', '[profile]\ndefault.default-filter = """\nnot test(/b/)\n"""\n'],
+    ["profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(b)' },\n]\n", "profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(c)' },\n]\n"],
   ]) {
     assert.notEqual(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection sees ${JSON.stringify(after)}`);
   }
   for (const [before, after] of [
     ["profile.ci-unit.retries = 1\n", `profile.ci-unit.${filter}\n`],
+    ["profile.ci-unit.default-filter = '''\nnot test(/a/)\n'''\n", "profile.ci-unit.default-filter = '''\nnot test(/b/)\n'''\n"],
     ["[profile]\nci-unit.retries = 1\n", `[profile]\nci-unit.${filter}\n`],
     ["[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 2\n", "[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 4\n"],
     ["[ profile.default ]\n# one\nretries = 1\n", "[ profile.default ]\n# two\nretries = 1\n"],
