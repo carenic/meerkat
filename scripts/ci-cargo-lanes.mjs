@@ -691,20 +691,27 @@ export function confinementMakeDefinition(text) {
 }
 
 // What decides the default nextest profile's selection: its
-// [profile.default] table and every default override that sets a (platform)
-// default-filter, without comment and blank lines.
+// [profile.default] table, every default override that sets a (platform)
+// default-filter, and the keys that reach the default profile from a
+// [profile] table or from top-level dotted keys, in any TOML spelling
+// (whitespace or quotes in headers and keys, indented keys), without comment
+// and blank lines.
 export function nextestDefaultSelection(text) {
-  return text
-    .split(/^(?=\[)/m)
-    .filter((section) => {
-      const header = section.split("\n", 1)[0].replace(/#.*/, "").trim();
-      return (
-        header === "[profile.default]" ||
-        (header === "[[profile.default.overrides]]" && /^default-filter\s*=/m.test(section))
-      );
+  const bare = (part) => part.replace(/#.*/, "").replace(/["'\s]/g, "");
+  const key = (line) => bare(line.split("=")[0]);
+  const sections = [{ header: "", lines: [] }];
+  for (const line of text.split("\n")) {
+    if (/^\s*\[\[?[\w.\s"'-]+\]\]?\s*(#.*)?$/.test(line)) sections.push({ header: bare(line), lines: [line] });
+    else sections.at(-1).lines.push(line);
+  }
+  return sections
+    .flatMap(({ header, lines }) => {
+      if (header === "[profile.default]") return lines;
+      if (header === "[[profile.default.overrides]]") return lines.some((line) => key(line) === "default-filter") ? lines : [];
+      if (header === "[profile]") return lines.filter((line) => /^default(\.|$)/.test(key(line)));
+      if (header === "") return lines.filter((line) => /^profile(\.default(\.|$)|$)/.test(key(line)));
+      return [];
     })
-    .join("")
-    .split("\n")
     .filter((line) => !/^\s*(#.*)?$/.test(line))
     .join("\n");
 }

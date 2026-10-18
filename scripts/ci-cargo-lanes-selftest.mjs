@@ -31,6 +31,7 @@ import {
   WAVE_FIRST_SECONDS,
   WAVE_LANES,
   lockScope,
+  nextestDefaultSelection,
   parseCargoLock,
   readRowDurations,
   compiledInDocKeys,
@@ -625,6 +626,31 @@ function assertArchivedLanes(plan, label) {
   assert.equal(unknown.diff, "no diff base supplied");
   assert.deepEqual(unknown.guard_definitions_changed, Object.keys(GUARD_LANE_INPUTS), "no diff: every definition may have changed");
   for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(unknown[lane], true, `no diff: ${lane} runs`);
+}
+
+// The default nextest profile's selection in every TOML spelling: a change to
+// it changes the extract the planner compares, and a change elsewhere (another
+// profile, an override's threads, a comment) does not.
+{
+  const filter = "default-filter = 'not test(/confinement/)'";
+  for (const [before, after] of [
+    ["[ profile.default ]\nretries = 1\n", `[ profile.default ]\nretries = 1\n${filter}\n`],
+    ['["profile"."default"]\nretries = 1\n', `["profile"."default"]\nretries = 1\n${filter}\n`],
+    ["profile.default.retries = 1\n", `profile.default.retries = 1\nprofile.default.${filter}\n`],
+    ["[profile]\ndefault.retries = 1\n", `[profile]\ndefault.retries = 1\ndefault.${filter}\n`],
+    ["[profile]\n", `[profile]\ndefault = { ${filter} }\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\n", `[[profile.default.overrides]]\nfilter = 'test(a)'\n  ${filter}\n`],
+  ]) {
+    assert.notEqual(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection sees ${JSON.stringify(after)}`);
+  }
+  for (const [before, after] of [
+    ["profile.ci-unit.retries = 1\n", `profile.ci-unit.${filter}\n`],
+    ["[profile]\nci-unit.retries = 1\n", `[profile]\nci-unit.${filter}\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 2\n", "[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 4\n"],
+    ["[ profile.default ]\n# one\nretries = 1\n", "[ profile.default ]\n# two\nretries = 1\n"],
+  ]) {
+    assert.equal(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection ignores ${JSON.stringify(after)}`);
+  }
 }
 
 // No chain exception: meerkat-rpc's default-feature unit row (its MCP restart
