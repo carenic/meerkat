@@ -35,6 +35,41 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-skills` parses SKILL.md
+  frontmatter with serde-saphyr 2.0 (pure Rust, no `unsafe`) instead of
+  serde_yaml 0.9, and refuses frontmatter serde_yaml accepted:
+  - a key given twice, at any level: a top-level extension key (however it
+    is spelled) or a metadata key, where serde_yaml kept the last value. A
+    duplicated known field or key inside a structured value was refused
+    already;
+  - a null (`~` or an empty value) as the `description` or a `metadata`
+    value, which serde_yaml stored as the text `~` or an empty string;
+  - nesting deeper than 64 levels, the parser's default budget;
+  - a `...` document end marker line, because serde-saphyr 2.0.0 ignores
+    whatever follows one (malformed text included).
+
+  A block scalar (`|`, `|+`, `>`) that ends the frontmatter now keeps its
+  final line break, as YAML specifies and as it already did anywhere else in
+  the frontmatter: the frontmatter was cut before that line break, so a
+  `description: |` written last lost its trailing newline. Unchanged: YAML
+  1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
+  and refusal of custom tags, a second document and alias expansion bombs.
+
+### Changed
+
+- `SkillDocument.extensions` values are a projection of the frontmatter's
+  YAML data, now rendered by serde-saphyr, and the field's doc says so. A
+  structured value's block YAML uses double quotes where a string needs
+  quoting (`'1.10'` is now `"1.10"`), a signed exponent (`6.02e23` is now
+  `6.02e+23`, `1e16` is `1.0e+16`) and a quoted `<<` key; the data is
+  unchanged. Untyped scalars that serde_yaml kept as text, or refused, now
+  resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, an integer past
+  u64 is a float, `1e999` is `.inf`, `tRUE` is `true`, and a `!!binary`
+  value is decoded. Other scalars keep serde_yaml's text (`1.10` is `1.1`,
+  `0x1F` is `31`, `~` is `null`).
+
 ### Fixed
 
 - `make check-rust-release-packaging` no longer checks an archive left by an

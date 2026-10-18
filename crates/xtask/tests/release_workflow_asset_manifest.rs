@@ -36,10 +36,22 @@ fn provenance_verifier_path() -> PathBuf {
     path
 }
 
-fn read_workflow(path: &Path) -> serde_yaml::Value {
+/// The YAML rules the frontmatter parser uses (meerkat-skills): YAML 1.2
+/// booleans, `<<` an ordinary key, duplicate keys and unknown tags refused.
+fn workflow_yaml_options() -> serde_saphyr::Options {
+    let mut options = serde_saphyr::Options::default();
+    options.strict_booleans = true;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.reject_unsupported_tags = true;
+    options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
+    options
+}
+
+fn read_workflow(path: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-    serde_yaml::from_str(&text)
+    serde_saphyr::from_str_with_options(&text, workflow_yaml_options())
         .unwrap_or_else(|error| panic!("cannot parse {} as YAML: {error}", path.display()))
 }
 
@@ -85,7 +97,7 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
     let workflow = read_workflow(&release_path);
     for job in rust_jobs {
         let steps = workflow["jobs"][job]["steps"]
-            .as_sequence()
+            .as_array()
             .unwrap_or_else(|| panic!("release job {job} must contain steps"));
         let expected = if tooling_jobs.contains(&job) {
             TOOLING_SETUP
@@ -139,9 +151,9 @@ fn release_workflows_use_the_repository_pinned_rust_toolchain() {
     );
 }
 
-fn job_steps<'a>(workflow: &'a serde_yaml::Value, job: &str) -> &'a [serde_yaml::Value] {
+fn job_steps<'a>(workflow: &'a serde_json::Value, job: &str) -> &'a [serde_json::Value] {
     workflow["jobs"][job]["steps"]
-        .as_sequence()
+        .as_array()
         .unwrap_or_else(|| panic!("release job {job} must contain steps"))
 }
 
@@ -197,7 +209,7 @@ fn buildbuddy_binary_build_runs_the_workflows_own_setup() {
         .join("actions/setup-buildbuddy-ci/action.yml");
     let action = read_workflow(&action_path);
     let runs: Vec<&str> = action["runs"]["steps"]
-        .as_sequence()
+        .as_array()
         .expect("setup-buildbuddy-ci must contain steps")
         .iter()
         .filter_map(|step| step["run"].as_str())
@@ -253,19 +265,19 @@ fn buildbuddy_release_validation_refuses_a_release_tag() {
 }
 
 fn workflow_step<'a>(
-    workflow: &'a serde_yaml::Value,
+    workflow: &'a serde_json::Value,
     path: &Path,
     job_name: &str,
     step_name: &str,
-) -> &'a serde_yaml::Value {
+) -> &'a serde_json::Value {
     workflow
         .get("jobs")
         .and_then(|jobs| jobs.get(job_name))
         .and_then(|job| job.get("steps"))
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_json::Value::as_array)
         .and_then(|steps| {
             steps.iter().find(|step| {
-                step.get("name").and_then(serde_yaml::Value::as_str) == Some(step_name)
+                step.get("name").and_then(serde_json::Value::as_str) == Some(step_name)
             })
         })
         .unwrap_or_else(|| {
@@ -277,14 +289,14 @@ fn workflow_step<'a>(
 }
 
 fn step_script<'a>(
-    workflow: &'a serde_yaml::Value,
+    workflow: &'a serde_json::Value,
     path: &Path,
     job_name: &str,
     step_name: &str,
 ) -> &'a str {
     workflow_step(workflow, path, job_name, step_name)
         .get("run")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| {
             panic!(
                 "{} must define {job_name:?} step {step_name:?} with a run script",
@@ -314,13 +326,13 @@ fn published_assets_are_manifest_authority_on_reruns() {
     assert_eq!(
         critical_inputs
             .get("overwrite_files")
-            .and_then(serde_yaml::Value::as_bool),
+            .and_then(serde_json::Value::as_bool),
         Some(false),
         "critical archives are uploaded add-only"
     );
     let critical_files = critical_inputs
         .get("files")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .expect("critical publisher must declare files");
     assert!(
         !critical_files.contains("checksums.sha256") && !critical_files.contains("index.json"),
@@ -371,7 +383,7 @@ fn published_assets_are_manifest_authority_on_reruns() {
     )
     .get("with")
     .and_then(|inputs| inputs.get("files"))
-    .and_then(serde_yaml::Value::as_str)
+    .and_then(serde_json::Value::as_str)
     .expect("manifest publisher must declare files");
     assert_eq!(
         manifest_files.lines().collect::<Vec<_>>(),

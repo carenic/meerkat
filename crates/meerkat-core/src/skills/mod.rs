@@ -769,7 +769,11 @@ pub struct SkillDocument {
     pub descriptor: SkillDescriptor,
     pub body: String,
     /// Author-defined extension metadata. Keys are typed `namespace.key`
-    /// owners; values stay open-ended `String` author metadata.
+    /// owners; values stay open-ended `String` author metadata, a projection
+    /// of the frontmatter's YAML data: a string as written, any other value as
+    /// the YAML text the parser renders for its resolved value (`1.10` is
+    /// `1.1`; a mapping or sequence is block YAML). The rendering is not the
+    /// author's source text; parse a structured value as YAML to read it.
     pub extensions: IndexMap<SkillExtensionKey, String>,
 }
 

@@ -1,13 +1,17 @@
 //! SKILL.md frontmatter parser.
 //!
-//! Uses `serde_yaml` for robust YAML parsing of the frontmatter block.
+//! Uses `serde-saphyr` (pure Rust, no `unsafe`) for YAML parsing of the
+//! frontmatter block, under the rules in [`yaml_options`].
+
+use std::fmt;
 
 use indexmap::IndexMap;
 use meerkat_core::skills::{
     CapabilityId, SkillDescriptor, SkillDocument, SkillError, SkillExtensionKey, SkillKey,
     SkillName, SkillScope,
 };
-use serde_yaml::Value;
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
 /// Parsed frontmatter from a SKILL.md file.
 #[derive(Debug, serde::Deserialize)]
@@ -21,7 +25,168 @@ struct Frontmatter {
     #[serde(default)]
     version: Option<String>,
     #[serde(flatten)]
-    extensions: IndexMap<String, Value>,
+    extensions: IndexMap<String, ExtensionValue>,
+}
+
+/// The YAML value of one author extension field. Mapping entries keep their
+/// source order; keys may be any YAML value, as in the source.
+#[derive(Debug)]
+enum ExtensionValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Sequence(Vec<ExtensionValue>),
+    Mapping(Vec<(ExtensionValue, ExtensionValue)>),
+}
+
+impl<'de> Deserialize<'de> for ExtensionValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ExtensionValueVisitor;
+
+        impl<'de> Visitor<'de> for ExtensionValueVisitor {
+            type Value = ExtensionValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a YAML value")
+            }
+
+            fn visit_unit<E>(self) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::Null)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<ExtensionValue, D2::Error> {
+                ExtensionValue::deserialize(deserializer)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::Int(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::UInt(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::Float(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<ExtensionValue, E> {
+                Ok(ExtensionValue::String(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ExtensionValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(ExtensionValue::Sequence(items))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ExtensionValue, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(ExtensionValue::Mapping(entries))
+            }
+        }
+
+        deserializer.deserialize_any(ExtensionValueVisitor)
+    }
+}
+
+impl Serialize for ExtensionValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Int(value) => serializer.serialize_i64(*value),
+            Self::UInt(value) => serializer.serialize_u64(*value),
+            Self::Float(value) => serializer.serialize_f64(*value),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Sequence(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Self::Mapping(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// The YAML rules for frontmatter.
+///
+/// - Booleans are YAML 1.2's: `yes`, `on`, `off`, `y` and `n` stay strings.
+/// - `<<` is an ordinary key, never a merge.
+/// - A duplicated key, at any level, and an unrecognized tag are refused.
+/// - `.inf`, `-.inf` and `.nan` stay floats.
+/// - The parser's default budget bounds nesting depth (64), nodes, events and
+///   alias expansion.
+fn yaml_options() -> serde_saphyr::Options {
+    let mut options = serde_saphyr::Options::default();
+    options.strict_booleans = true;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.reject_unsupported_tags = true;
+    options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
+    options.with_snippet = false;
+    options
+}
+
+/// Block YAML for a structured extension value: YAML 1.2 quoting, no
+/// directive, and no folding of long lines.
+fn yaml_serializer_options() -> serde_saphyr::SerializerOptions {
+    let mut options = serde_saphyr::SerializerOptions::default();
+    options.yaml_12 = true;
+    options.no_lang_directive = true;
+    options.folded_wrap_chars = usize::MAX;
+    options
+}
+
+/// Refuse a `...` document end marker. Frontmatter is one YAML document, and
+/// serde-saphyr 2.0.0 stops at the marker and ignores what follows it, even
+/// malformed text.
+fn reject_document_end_marker(frontmatter: &str) -> Result<(), SkillError> {
+    let marker_line = frontmatter.lines().position(|line| {
+        line.strip_prefix("...")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    });
+    match marker_line {
+        Some(index) => Err(SkillError::Parse(
+            format!(
+                "frontmatter parse error: a `...` document end marker is not allowed (frontmatter line {})",
+                index + 1
+            )
+            .into(),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Parse a SKILL.md file into a `SkillDocument`.
@@ -32,7 +197,8 @@ pub fn parse_skill_md(
     expected_skill_name: Option<&str>,
 ) -> Result<SkillDocument, SkillError> {
     let (frontmatter_str, body) = split_frontmatter(content)?;
-    let fm: Frontmatter = serde_yaml::from_str(&frontmatter_str)
+    reject_document_end_marker(&frontmatter_str)?;
+    let fm: Frontmatter = serde_saphyr::from_str_with_options(&frontmatter_str, yaml_options())
         .map_err(|e| SkillError::Parse(format!("frontmatter parse error: {e}").into()))?;
     validate_frontmatter(&fm, expected_skill_name)?;
 
@@ -89,21 +255,23 @@ fn validate_frontmatter(
 /// Each key is parsed into a [`SkillExtensionKey`] once, fail-closed: any
 /// non-namespaced or malformed key (the only frontmatter fields that reach the
 /// `#[serde(flatten)]` catch-all) errors here rather than silently surviving as
-/// a re-split string. Values stay open-ended author metadata; scalars are kept
-/// verbatim and structured values are serialized. A structured (non-scalar)
-/// value is policy-bearing and must declare a companion `<namespace>.version`,
-/// enforced over the typed key set.
+/// a re-split string. Values stay open-ended author metadata, stored as a
+/// projection of the YAML data: a string as written, any other value as the
+/// YAML text of its resolved value (`1.10` is the float `1.1`, a structured
+/// value block YAML). A structured (non-scalar) value is policy-bearing and
+/// must declare a companion `<namespace>.version`, enforced over the typed key
+/// set.
 fn parse_extensions(
-    raw: IndexMap<String, Value>,
+    raw: IndexMap<String, ExtensionValue>,
 ) -> Result<IndexMap<SkillExtensionKey, String>, SkillError> {
-    let mut typed: IndexMap<SkillExtensionKey, (Value, String)> =
+    let mut typed: IndexMap<SkillExtensionKey, (ExtensionValue, String)> =
         IndexMap::with_capacity(raw.len());
     for (k, value) in raw {
         let key = SkillExtensionKey::parse(&k)?;
-        let serialized = if let Some(s) = value.as_str() {
-            s.to_string()
+        let serialized = if let ExtensionValue::String(s) = &value {
+            s.clone()
         } else {
-            serde_yaml::to_string(&value)
+            serde_saphyr::to_string_with_options(&value, yaml_serializer_options())
                 .map_err(|e| SkillError::Parse(format!("extension serialize error: {e}").into()))?
                 .trim()
                 .to_string()
@@ -115,7 +283,10 @@ fn parse_extensions(
         if key.is_version() {
             continue;
         }
-        let nontrivial = matches!(value, Value::Mapping(_) | Value::Sequence(_));
+        let nontrivial = matches!(
+            value,
+            ExtensionValue::Mapping(_) | ExtensionValue::Sequence(_)
+        );
         if nontrivial && !typed.contains_key(&key.version_companion()) {
             return Err(SkillError::Parse(
                 format!(
@@ -134,6 +305,9 @@ fn parse_extensions(
 }
 
 /// Split content into frontmatter and body, separated by `---` delimiters.
+///
+/// The frontmatter keeps its final line break, so a block scalar that ends it
+/// keeps its own as YAML specifies (`|` clips to one, `|+` keeps all).
 fn split_frontmatter(content: &str) -> Result<(String, &str), SkillError> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let trimmed = content.trim_start();
@@ -155,7 +329,7 @@ fn split_frontmatter(content: &str) -> Result<(String, &str), SkillError> {
             let frontmatter = &after_first[..offset];
             let body = &after_first[offset + line.len()..];
             return Ok((
-                frontmatter.trim_end_matches(['\r', '\n']).to_string(),
+                frontmatter.to_string(),
                 body.trim_start_matches(['\r', '\n']),
             ));
         }
@@ -252,7 +426,7 @@ Body";
 
         assert_eq!(
             doc.descriptor.description,
-            "first line\n---\nstill description"
+            "first line\n---\nstill description\n"
         );
         assert_eq!(doc.body, "Body");
     }
@@ -550,6 +724,200 @@ body";
         assert!(
             error.to_string().contains("invalid extension key '<<'"),
             "{error}"
+        );
+    }
+
+    /// A key given twice is refused at every level, because which value was
+    /// meant is ambiguous: a top-level extension key (however it is spelled)
+    /// and a metadata key. A duplicated known field or key inside a
+    /// structured value was refused already.
+    #[test]
+    fn test_rejects_duplicate_keys_at_every_level() {
+        let accepted: Vec<&str> = [
+            ("extension key", "vendor.flag: one\nvendor.flag: two\n"),
+            (
+                "extension key spelled two ways",
+                "vendor.flag: one\n\"vendor.flag\": two\n",
+            ),
+            ("metadata key", "metadata:\n  owner: a\n  owner: b\n"),
+        ]
+        .into_iter()
+        .filter(|(_, extra)| parse_with_frontmatter(extra).is_ok())
+        .map(|(case, _)| case)
+        .collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    /// A null where a string field expects text is an authoring error, and is
+    /// refused: `~` or an empty value for the description or a metadata
+    /// value. (A null capability was refused already, as an invalid slug.)
+    #[test]
+    fn test_rejects_null_in_string_fields() {
+        let accepted: Vec<&str> = [
+            ("description tilde", "metadata: {}\n", "description: ~\n"),
+            ("metadata tilde", "metadata:\n  owner: ~\n", ""),
+            ("metadata empty", "metadata:\n  owner:\n", ""),
+        ]
+        .into_iter()
+        .filter(|(_, extra, description)| {
+            let content = if description.is_empty() {
+                format!("---\nname: test-skill\ndescription: d\n{extra}---\nbody")
+            } else {
+                format!("---\nname: test-skill\n{description}{extra}---\nbody")
+            };
+            parse_skill_md(test_key("test-skill"), SkillScope::Builtin, &content, None).is_ok()
+        })
+        .map(|(case, _, _)| case)
+        .collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+        assert!(parse_with_frontmatter("requires_capabilities: [~]\n").is_err());
+    }
+
+    /// A structured extension value renders as YAML 1.2 block text: double
+    /// quotes where a string needs quoting, a signed exponent, and a quoted
+    /// `<<` key. The data is what the author wrote; only the rendering
+    /// changed from serde_yaml 0.9's (`'1.10'`, `6.02e23`, `<<:`).
+    #[test]
+    fn test_structured_extension_rendering() {
+        let doc = parse_with_frontmatter(concat!(
+            "vendor.version: '1'\n",
+            "vendor.policy:\n",
+            "  quoted: '1.10'\n",
+            "  empty: ''\n",
+            "  colon: 'a: b'\n",
+            "  big: 6.02e23\n",
+            "  huge: 1e16\n",
+            "  <<: {x: 1}\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            extension_value(&doc, "vendor.policy"),
+            Some(concat!(
+                "quoted: \"1.10\"\n",
+                "empty: \"\"\n",
+                "colon: \"a: b\"\n",
+                "big: 6.02e+23\n",
+                "huge: 1.0e+16\n",
+                "\"<<\":\n",
+                "  x: 1",
+            ))
+        );
+    }
+
+    /// Untyped scalars that serde_yaml 0.9 kept as text, or refused, resolve
+    /// as YAML values now: `1_000` and `017` are numbers, an integer past u64
+    /// is a float, `1e999` is infinity, `tRUE` is a boolean, and `!!binary`
+    /// is decoded.
+    #[test]
+    fn test_extension_scalar_edge_cases() {
+        let doc = parse_with_frontmatter(concat!(
+            "vendor.underscore: 1_000\n",
+            "vendor.leading_zero: 017\n",
+            "vendor.overflow: 1e999\n",
+            "vendor.mixed_case: tRUE\n",
+            "vendor.binary: !!binary aGVsbG8=\n",
+        ))
+        .unwrap();
+        let mismatched: Vec<(&str, Option<&str>)> = [
+            ("vendor.underscore", "1000"),
+            ("vendor.leading_zero", "17.0"),
+            ("vendor.overflow", ".inf"),
+            ("vendor.mixed_case", "true"),
+            ("vendor.binary", "hello"),
+        ]
+        .into_iter()
+        .filter(|(key, expected)| extension_value(&doc, key) != Some(*expected))
+        .map(|(key, _)| (key, extension_value(&doc, key)))
+        .collect();
+        assert!(mismatched.is_empty(), "mismatched: {mismatched:?}");
+
+        let past_u64 =
+            parse_with_frontmatter("vendor.past_u64: 123456789012345678901234\n").unwrap();
+        assert_eq!(
+            extension_value(&past_u64, "vendor.past_u64"),
+            Some("1.2345678901234569e+23")
+        );
+    }
+
+    /// Nesting deeper than the parser budget's 64 levels (the frontmatter
+    /// mapping included) is refused.
+    #[test]
+    fn test_rejects_nesting_deeper_than_the_budget() {
+        let nested = |depth: usize| {
+            format!(
+                "vendor.version: '1'\nvendor.deep: {}{}\n",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        assert!(parse_with_frontmatter(&nested(63)).is_ok());
+        assert!(parse_with_frontmatter(&nested(64)).is_err());
+    }
+
+    /// A block scalar that ends the frontmatter keeps its final line break, as
+    /// YAML specifies and as it does anywhere else in the frontmatter: `|` and
+    /// `>` clip to one line break, `|+` keeps every trailing one, `|-` strips.
+    /// The frontmatter used to be cut before that line break.
+    #[test]
+    fn test_block_scalar_ending_the_frontmatter_keeps_its_line_break() {
+        let ending = |key: &str, block: &str| {
+            let content = format!(
+                "---\nname: test-skill\ndescription: d\nvendor.version: '1'\n{key}: {block}\n  first\n  second\n\n---\nbody"
+            );
+            let doc = parse_skill_md(test_key("test-skill"), SkillScope::Builtin, &content, None)
+                .unwrap();
+            extension_value(&doc, key).map(str::to_owned)
+        };
+        let mismatched: Vec<(&str, Option<String>)> = [
+            ("|", "first\nsecond\n"),
+            (">", "first second\n"),
+            ("|+", "first\nsecond\n\n"),
+            ("|-", "first\nsecond"),
+        ]
+        .into_iter()
+        .filter(|(block, expected)| ending("vendor.note", block).as_deref() != Some(*expected))
+        .map(|(block, _)| (block, ending("vendor.note", block)))
+        .collect();
+        assert!(mismatched.is_empty(), "mismatched: {mismatched:?}");
+
+        let last = parse_skill_md(
+            test_key("test-skill"),
+            SkillScope::Builtin,
+            "---\nname: test-skill\ndescription: |\n  first\n  second\n---\nbody",
+            None,
+        )
+        .unwrap();
+        let not_last = parse_skill_md(
+            test_key("test-skill"),
+            SkillScope::Builtin,
+            "---\nname: test-skill\ndescription: |\n  first\n  second\nvendor.flag: x\n---\nbody",
+            None,
+        )
+        .unwrap();
+        assert_eq!(last.descriptor.description, "first\nsecond\n");
+        assert_eq!(not_last.descriptor.description, last.descriptor.description);
+    }
+
+    /// A `...` document end marker is refused: serde-saphyr 2.0.0 ignores
+    /// whatever follows one, malformed text included. In a block scalar,
+    /// `...` is text.
+    #[test]
+    fn test_rejects_document_end_marker() {
+        for (case, extra) in [
+            ("malformed text after the marker", "...\n]]] not yaml\n"),
+            ("a comment after the marker", "... # end\n"),
+            ("the marker alone", "...\n"),
+        ] {
+            let error = parse_with_frontmatter(extra).unwrap_err();
+            assert!(
+                error.to_string().contains("document end marker"),
+                "{case}: {error}"
+            );
+        }
+        let doc = parse_with_frontmatter("vendor.note: |\n  first\n  ...\n  last\n").unwrap();
+        assert_eq!(
+            extension_value(&doc, "vendor.note"),
+            Some("first\n...\nlast\n")
         );
     }
 }
