@@ -377,7 +377,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   every lane that compiles the meerkat-mob chain or sweeps the
   reverse-dependency closure to the push and names it (`deferred_to_push`,
   printed by the gate): the `closure-tests` rows, `closure-check`,
-  `feature-check`, `governed-jsonl`, `mcp-confinement-positive`, the
+  `feature-check`, `governed-jsonl` and `mcp-confinement-positive` (unless
+  it touches their own inputs or changes their definition), the
   integration suites whose package compiles meerkat-mob, the feature suites
   marked `pullRequest: false`, the mob-chain packages' test-target Clippy,
   and the whole Clippy of the chain heads rkat, meerkat-integration-tests and
@@ -526,10 +527,27 @@ and its CI must be green before a release tag (`require_ci_green`):
   an input or the stack), and credits only whole-workspace rows.
 - `closure-check` (push only): `cargo check --all-features` (lib and bin
   targets) over the reverse-dependency closure of the changed packages.
-- `governed-jsonl` and `mcp-confinement-positive` (push only): the three
-  non-MCP governed JSONL tests of meerkat-rpc, and the Linux positive
-  confinement cases (`make test-mcp-confinement-positive`), on every Rust
-  change.
+- `governed-jsonl` and `mcp-confinement-positive` (push; a pull request
+  runs a lane when it touches the lane's inputs, `GUARD_LANE_INPUTS` in
+  `scripts/ci-cargo-lanes.mjs` (the files that define its selected cases,
+  and their crates' manifests), when it changes the lane's definition
+  between its base and head, `GUARD_LANE_DEFINITIONS` (its ci.yml job
+  without comment and blank lines, with the governed step's expected list
+  and command; the Makefile's CONFINEMENT_* assignments and the
+  test-mcp-confinement-positive recipe with its cargo flags; the selection
+  of the default nextest profile that recipe runs, `.config/nextest.toml`'s
+  `[profile.default]` and any default override that sets a `default-filter`;
+  the attributes and `mod` line declaring each module that holds selected
+  cases), and when its diff is unknown.
+  `scripts/ci-guard-lane-inputs-selftest.mjs` resolves every selected case
+  to the files that define it and fails when such a file or its crate's
+  manifest is not an input, when one of those declarations differs from
+  its pin, or when a second module name ends in governed_jsonl. Neither
+  watches the parent modules' declarations, the scripts the recipe calls or
+  other global build configuration): exactly the non-MCP governed JSONL
+  tests of meerkat-rpc that the step's expected list names, and exactly the
+  Linux positive confinement cases of `make test-mcp-confinement-positive`
+  (its CONFINEMENT_* filters and counts), on every Rust change.
 - `feature-check` (push only; two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
   shard's packages under the feature sets the Bazel graph builds them with
   (`--no-default-features` plus exactly the set their generated
@@ -649,7 +667,7 @@ release semver gate; PR and manual artifacts are previews.
 | `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags whose attestation does not prove its lanes ran, while the self-hosted graph is off | Validate release state through the selected lane; tag runs whose attestation covers those lanes (or with the graph on) reuse exact-tree CI and skip both jobs |
 | `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on), or with the graph off pass on a verified attestation that covers the Cargo validation lanes (`release_validate_cargo` otherwise); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
 | `release_semver_gate` | Tags and full/package dispatches | After `require_ci_green`, verifies unexpired exact-tree, exact-version main-push readiness evidence on the normal tag/explicit-tag path; narrower manual measurement/recovery exceptions are described in the release guide |
-| `release_prebuild` | Tag runs | Finds a usable pre-tag prebuild of exactly the tag commit (`scripts/release-find-prebuild`: a `release.yml` dispatch on main at that commit whose `Release prebuild gate` passed, so its critical binaries and Web SDK package are ready while its trailing lanes may still run, and whose critical artifacts have not expired; a gate that has not concluded is waited for); when found, the build jobs below are skipped and the publishers use that run's artifacts |
+| `release_prebuild` | Tag runs | Finds a usable pre-tag prebuild of exactly the tag commit (`scripts/release-find-prebuild`: a `release.yml` dispatch on main at that commit whose `Release prebuild gate` passed, so its critical binaries and Web SDK package are ready while its trailing lanes may still run, and whose critical artifacts have not expired; a gate that has not concluded is waited for, unless a job it needs already failed, timed out or was cancelled); when found, the build jobs below are skipped and the publishers use that run's artifacts |
 | `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_critical_gate` | Tags without a prebuild, manual asset recovery, or a prebuild dispatch | The selected BuildBuddy or GitHub-hosted lane builds the critical platforms (Linux x86_64 and aarch64, macOS arm64); each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the critical gate requires the selected lane (or, when the archives come from a prebuild or `assets_run_id`, that every build job was skipped) |
 | `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_macos_x86_cross` / `build_binaries_gate` | Same | The trailing platforms on either backend: Windows cross-compiled from Linux with cargo-xwin and run on windows-latest, Intel macOS cross-compiled on Apple silicon (`macos-15`); the full gate requires the selected critical lane plus every trailing job |
 | `build_web_sdk_package` | Tags without a prebuild, package/Web recovery without a reused artifact, or a prebuild dispatch | After `require_ci_green`, beside the release validation and the semver gate, builds the `@rkat/web` package artifact, stamps it with its commit, package and tarball digest, and attests it; Cargo runs four jobs while the tree's `scripts/release-web-sdk-rustc-wrapper` keeps the memory-heavy wasm32 crates off the catalog's rustc, or one job for a tree without a matching wrapper |
@@ -691,7 +709,8 @@ artifacts and package metadata to the selected existing tag.
 
 **Pre-tag prebuild** (`make release-prebuild VERSION=vX.Y.Z`, dry run with
 `RELEASE_WORKFLOW_DRY_RUN=true`): once the release commit is on `main`,
-dispatch `release.yml` with `prebuild_release_artifacts=true` on `main`. It
+dispatch `release.yml` with `prebuild_release_artifacts=true` on `main`, on
+the backend its tag run will select (the request refuses another). It
 builds, stamps, attests and uploads every release binary and the Web SDK
 package of that commit while CI and semver readiness run, and publishes
 nothing. The tag run of exactly that commit then skips every build and
@@ -924,10 +943,17 @@ only hand-written enumeration; `make check-rust-release-config` fails when a
 release crate depends on one listed after it, and
 `scripts/test-release-publish-rust-crates.sh` (part of
 `make check-rust-release-packaging-contract`) proves the level order, the
-bounded overlap, the skip of a published version and the stop at the first
-failure.
+bounded overlap, the skip of a published version, the stop at the first
+failure and the server-error retry.
 crates.io's own publish rate limit for new versions (a burst, then about one
-per minute) still bounds a full release.
+per minute) still bounds a full release. A crates.io server error (5xx, or
+cargo's "Request timed out after 30 seconds", its report of a 503 that
+arrives late in an upload) or a network error (curl's code and text, such
+as "[28] Timeout was reached": an unresolved host, a refused, reset or
+dropped connection, a failed TLS handshake) is retried after each delay of
+`MEERKAT_CRATE_PUBLISH_SERVER_ERROR_BACKOFF` (default `30 60 120 240`
+seconds), on a budget separate from the rate limit's; an upload that landed
+despite the error is skipped as published.
 
 ### Key Rules for AI Agents
 

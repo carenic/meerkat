@@ -5,7 +5,7 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +23,7 @@ import {
 } from "./ci-hook-coverage.mjs";
 import {
   GOVERNANCE_DOC_PATTERNS,
+  GUARD_LANE_INPUTS,
   MOB_CHAIN_CLIPPY_HEADS,
   MOB_CHAIN_INVALIDATED,
   ROW_DURATIONS,
@@ -34,6 +35,7 @@ import {
   readRowDurations,
   compiledInDocKeys,
   readerRows,
+  touchesGuardLane,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 import { durationsOf, rowOf } from "./ci-row-durations.mjs";
@@ -241,11 +243,16 @@ function assertEventSplit(plan, label) {
   assert.deepEqual(plan.closure_test_rows, [], `${label}: no closure-tests row in a pull request`);
   assert.deepEqual(plan.feature_check_jobs, [], `${label}: no feature-combination job in a pull request`);
   assert.equal(plan.closure_check, false, `${label}: no closure check in a pull request`);
-  assert.equal(plan.governed_jsonl, false, `${label}: no governed JSONL lane in a pull request`);
-  assert.equal(plan.mcp_confinement_positive, false, `${label}: no confinement lane in a pull request`);
+  // An exact-profile lane runs in a pull request exactly when it touches
+  // that lane's own inputs or changes its definition; otherwise the push
+  // runs it.
+  for (const lane of ["governed_jsonl", "mcp_confinement_positive"]) {
+    const runs =
+      plan.rust_changed && (touchesGuardLane(lane, plan.changed_paths) || plan.guard_definitions_changed.includes(lane));
+    assert.equal(plan[lane], runs, `${label}: ${lane} runs in a pull request only on its own inputs or definition`);
+    assert.equal(deferred[lane], plan.rust_changed && !runs, `${label}: ${lane} deferral`);
+  }
   assert.equal(deferred.closure_check, plan.rust_changed);
-  assert.equal(deferred.governed_jsonl, plan.rust_changed);
-  assert.equal(deferred.mcp_confinement_positive, plan.rust_changed);
   for (const suite of plan.integration_suites) {
     assert.equal(chain(suite.packages[0]), false, `${label}: integration suite ${suite.name} compiles meerkat-mob`);
   }
@@ -523,6 +530,100 @@ function assertArchivedLanes(plan, label) {
     "the matrix carries each canary row's partition, and only theirs",
   );
   assertLanes(plan, "workspace with exceptions");
+}
+
+// Exact-profile lanes on a pull request: a change to one of a lane's inputs
+// runs that lane (and the other only on its own inputs); a change elsewhere
+// in the same crates leaves both to the push, which runs them on every Rust
+// change.
+{
+  for (const [lane, inputs] of Object.entries(GUARD_LANE_INPUTS)) {
+    for (const input of inputs) {
+      const path = input.endsWith("/")
+        ? join(input, readdirSync(resolve(root, input)).filter((name) => name.endsWith(".rs")).sort()[0])
+        : input;
+      const plan = planFor([path], ["--event", "pull_request"]);
+      assert.equal(plan[lane], true, `a pull request touching ${path} runs ${lane}`);
+      assert.equal(plan.deferred_to_push[lane], false, `a pull request touching ${path} leaves ${lane} to no push`);
+      for (const other of Object.keys(GUARD_LANE_INPUTS).filter((name) => name !== lane)) {
+        assert.equal(plan[other], touchesGuardLane(other, [path]), `a pull request touching ${path} runs ${other} only on its inputs`);
+      }
+    }
+  }
+  // Their neighbours (unchanged definitions: the working tree is the base)
+  // run neither.
+  for (const path of [
+    "crates/meerkat-rpc/src/lib.rs",
+    "crates/meerkat-mcp/src/connection.rs",
+    "crates/meerkat-sandbox/src/lib.rs",
+    "crates/meerkat-tools/src/builtin/shell/mod.rs",
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request", "--base-tree", root]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(plan[lane], false, `a pull request touching only ${path} leaves ${lane} to the push`);
+      assert.equal(plan.deferred_to_push[lane], true, `a pull request touching only ${path} names ${lane} as deferred`);
+    }
+    const push = planFor([path]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(push[lane], true, `the push of ${path} runs ${lane}`);
+    }
+  }
+}
+
+// A pull request that changes an exact-profile lane's definition
+// (GUARD_LANE_DEFINITIONS: its ci.yml job, the confinement rule and
+// assignments in the Makefile, a selected module's declaration) runs that
+// lane; an edit elsewhere in the same file, or to a comment or blank line of
+// a lane's job, does not. Each base is the working tree's file with one edit
+// (--base-tree). Without a base copy every listed definition file differs,
+// and without a diff every lane runs.
+{
+  const baseTree = mkdtempSync(join(tmpdir(), "ci-lanes-guard-definitions-"));
+  try {
+    for (const [path, from, to, lanes] of [
+      [".github/workflows/ci.yml", '"governed_jsonl::tests::rpc_runtimes_compose_the_realms_own_schedule_service",\n', "", ["governed_jsonl"]],
+      [".github/workflows/ci.yml", "run: make test-mcp-confinement-positive\n", "run: make test-mcp-confinement-positive || true\n", ["mcp_confinement_positive"]],
+      [".github/workflows/ci.yml", "  bazel-graph:\n    name: ", "  bazel-graph:\n    name: Old ", []],
+      [".github/workflows/ci.yml", "    # Native dependency changes must retain", "    # Native dependency changes keep", []],
+      [".github/workflows/ci.yml", "          # No --nocapture: libtest captures", "          # Without --nocapture libtest captures", []],
+      [".github/workflows/ci.yml", "    # step before the tests prints the restriction", "\n    # step before the tests prints its restriction", []],
+      ["Makefile", "CONFINEMENT_SHELL_POSITIVE_COUNT := 4\n", "CONFINEMENT_SHELL_POSITIVE_COUNT := 3\n", ["mcp_confinement_positive"]],
+      ["Makefile", "--no-tests=fail --no-fail-fast -E", "--no-tests=fail -E", ["mcp_confinement_positive"]],
+      ["Makefile", "test-mob-dense-topology:\n", "test-mob-dense-topology: build\n", []],
+      [".config/nextest.toml", "[profile.default]\n", "[profile.default]\ndefault-filter = 'not test(/confinement/)'\n", ["mcp_confinement_positive"]],
+      [
+        ".config/nextest.toml",
+        "[profile.ci-unit]\n",
+        "[[profile.default.overrides]]\nplatform = 'cfg(target_os = \"linux\")'\ndefault-filter = 'not test(/confinement/)'\n\n[profile.ci-unit]\n",
+        ["mcp_confinement_positive"],
+      ],
+      [".config/nextest.toml", "artifacts)'\nthreads-required = \"num-cpus\"", "artifacts)'\nthreads-required = 2", []],
+      [".config/nextest.toml", "# Archived lanes (ci.yml main-unit", "# Archived lanes (the main-unit job", []],
+      ["crates/meerkat-mcp/src/connection.rs", "#[cfg(test)]\n#[path = \"process_confinement_tests.rs\"]", "#[cfg(all(test, target_os = \"macos\"))]\n#[path = \"process_confinement_tests.rs\"]", ["mcp_confinement_positive"]],
+      ["crates/meerkat-rpc/src/lib.rs", "#[cfg(feature = \"local-authorization\")]\npub mod governed_jsonl;", "pub mod governed_jsonl;", ["governed_jsonl"]],
+      ["crates/meerkat-rpc/src/lib.rs", "pub mod handlers;\n", "pub mod handlers;\npub mod retired_neighbour;\n", []],
+    ]) {
+      const text = readFileSync(resolve(root, path), "utf8");
+      assert.equal(text.split(from).length, 2, `${path} holds ${JSON.stringify(from)} once`);
+      mkdirSync(dirname(join(baseTree, path)), { recursive: true });
+      writeFileSync(join(baseTree, path), text.replace(from, to));
+      const label = `a pull request that edits ${JSON.stringify(from)} in ${path}`;
+      const plan = planFor([path], ["--event", "pull_request", "--base-tree", baseTree]);
+      assert.deepEqual(plan.guard_definitions_changed, lanes, `${label}: changed definitions`);
+      for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(plan[lane], lanes.includes(lane), `${label}: ${lane}`);
+      assertLanes(plan, label);
+    }
+  } finally {
+    rmSync(baseTree, { recursive: true, force: true });
+  }
+  const noBase = planFor(["Makefile"], ["--event", "pull_request"]);
+  assert.deepEqual(noBase.guard_definitions_changed, ["mcp_confinement_positive"], "no base copy: the Makefile's lane");
+  const noDiff = run(["--format", "json", "--event", "pull_request"]);
+  assert.equal(noDiff.status, 0, noDiff.stderr);
+  const unknown = JSON.parse(noDiff.stdout);
+  assert.equal(unknown.diff, "no diff base supplied");
+  assert.deepEqual(unknown.guard_definitions_changed, Object.keys(GUARD_LANE_INPUTS), "no diff: every definition may have changed");
+  for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(unknown[lane], true, `no diff: ${lane} runs`);
 }
 
 // No chain exception: meerkat-rpc's default-feature unit row (its MCP restart

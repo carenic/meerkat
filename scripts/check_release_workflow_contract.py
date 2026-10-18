@@ -1297,6 +1297,7 @@ PREBUILD_INPUT = "prebuild_release_artifacts"
 PREBUILD_LOOKUP_JOB = "release_prebuild"
 PREBUILD_GATE_JOB = "release_prebuild_gate"
 PREBUILD_LOOKUP_SCRIPT = "scripts/release-find-prebuild"
+PREBUILD_BACKEND_REFUSAL = "A release prebuild builds with the backend its tag run selects"
 PROVENANCE_VERIFIER = "scripts/verify-release-asset-provenance"
 BINARY_BUILD_JOBS = (
     "build_binaries",
@@ -1651,6 +1652,40 @@ def check_prebuild(text: str) -> list[str]:
             f"job `{WEB_SDK_PUBLISH_JOB}` must verify the prebuilt package's attestation "
             f"(`gh attestation verify ... --source-ref refs/heads/main`) before publishing on {reused.label}"
         )
+
+    # 7. A prebuild builds with the backend its tag run selects: on the other
+    #    one its critical lanes queue behind other runners and miss the tag's
+    #    bounded wait. The request refuses the other backend, for the owner
+    #    and for others, with MEERKAT_RELEASE_BUILDBUDDY true, 1, false and
+    #    unset; the tag's choice is read from whether its GitHub-hosted
+    #    critical lane runs.
+    if len(requests) == 1:
+        request = requests[0]
+        for actor in ("lukacf", "release-bot"):
+            for flag in ("true", "1", "false", ""):
+                variables = {"MEERKAT_RELEASE_BUILDBUDDY": flag} if flag else {}
+                tag_run = EventContext(**{**fresh.__dict__, "actor": actor, "variables": variables})
+                selected = "github-hosted" if _job_runs(text, "build_binaries", tag_run) else "buildbuddy"
+                for backend in ("github-hosted", "buildbuddy"):
+                    context = EventContext(
+                        **{
+                            **prebuild.__dict__,
+                            "label": (
+                                f"a prebuild by {actor} with release_backend={backend} "
+                                f"(MEERKAT_RELEASE_BUILDBUDDY {flag or 'unset'})"
+                            ),
+                            "actor": actor,
+                            "variables": variables,
+                            "inputs": {**prebuild.inputs, "release_backend": backend},
+                        }
+                    )
+                    status, output = _run_gate_script(request, context)
+                    refused = status != 0 and PREBUILD_BACKEND_REFUSAL in output
+                    if refused != (backend != selected):
+                        violations.append(
+                            f"step `{request.name}` {'refuses' if refused else 'accepts'} {context.label}, "
+                            f"whose tag run builds on {selected}"
+                        )
     return violations
 
 SEMVER_BASELINE_JOB = "publish_semver_baseline"

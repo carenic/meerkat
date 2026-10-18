@@ -423,6 +423,25 @@ elif name == "prebuild-web-unverified":
     if match is None:
         raise SystemExit(f"fixture `{name}` expects the Web SDK verification step")
     text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-any-backend":
+    # The request no longer checks the backend, so a GitHub-hosted prebuild
+    # can race a BuildBuddy tag run (v0.9.3).
+    replace_once(
+        '          if [[ "${RELEASE_BACKEND}" != "${TAG_RUN_BACKEND}" ]]; then\n'
+        '            echo "A release prebuild builds with the backend its tag run selects (${TAG_RUN_BACKEND}), '
+        'got release_backend=${RELEASE_BACKEND}: dispatch it with make release-prebuild or '
+        'release_backend=${TAG_RUN_BACKEND}." >&2\n'
+        '            exit 1\n'
+        '          fi\n',
+        "",
+    )
+elif name == "prebuild-backend-fixed":
+    # The request pins BuildBuddy instead of the tag run's own selection.
+    replace_once(
+        "          TAG_RUN_BACKEND: ${{ github.actor == 'lukacf' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || "
+        "vars.MEERKAT_RELEASE_BUILDBUDDY == '1') && 'buildbuddy' || 'github-hosted' }}\n",
+        "          TAG_RUN_BACKEND: buildbuddy\n",
+    )
 elif name == "prebuild-gate-renamed":
     replace_once("    name: Release prebuild gate\n", "    name: Prebuild complete\n")
 elif name == "prebuild-lookup-if-reflowed":
@@ -1042,6 +1061,12 @@ expect_fail_named prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-fu
 mutate prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml"
 expect_fail_named prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml" \
   "job \`publish_web_sdk\` publishes on a tag push with a prebuild found and \`release_validate_gate\` failed" prebuild
+mutate prebuild-any-backend "${TEST_ROOT}/prebuild-any-backend.yml"
+expect_fail_named prebuild-any-backend "${TEST_ROOT}/prebuild-any-backend.yml" \
+  "accepts a prebuild by lukacf with release_backend=github-hosted (MEERKAT_RELEASE_BUILDBUDDY true), whose tag run builds on buildbuddy" prebuild
+mutate prebuild-backend-fixed "${TEST_ROOT}/prebuild-backend-fixed.yml"
+expect_fail_named prebuild-backend-fixed "${TEST_ROOT}/prebuild-backend-fixed.yml" \
+  "refuses a prebuild by lukacf with release_backend=github-hosted (MEERKAT_RELEASE_BUILDBUDDY unset), whose tag run builds on github-hosted" prebuild
 mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild
