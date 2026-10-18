@@ -735,10 +735,11 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     .ok_or("stored_input_state_version is not an unsigned integer")?;
                 match version {
                     3 => {}
-                    // A row a 0.8.11 to 0.8.51 binary wrote is carried to the
-                    // current encoding through the generic decode, re-encode
-                    // and loss check below; only its version stamp changes.
-                    5 if target_current => {}
+                    // A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0
+                    // to 0.9.3 binary wrote (v6), is carried to the current
+                    // encoding through the generic decode, re-encode and loss
+                    // check below; only its version stamp changes.
+                    5 | 6 if target_current => {}
                     version
                         if target_current
                             && version
