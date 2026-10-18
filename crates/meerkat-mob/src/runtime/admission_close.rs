@@ -17,8 +17,9 @@
 //! any close is refused. Closing never stops
 //! admitted work: the ordinary Stop, Shutdown and Destroy remain the teardown
 //! path. An admitted Shutdown closes admission itself, before its teardown;
-//! so do an admitted Destroy and a durability fail-stop, so every exit the
-//! actor takes on its own closes admission first. A Stop leaves it open.
+//! so do an admitted Destroy and a durability fail-stop, and a lost actor
+//! task closes it from its spawn wrapper, so no actor exit leaves admission
+//! open. A Stop leaves it open.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +46,9 @@ pub enum MobAdmissionCloseReason {
     /// command: a durable mutation's outcome stayed uncertain, or its durable
     /// recovery failed before it admitted a command.
     DurabilityFailStop,
+    /// The actor task ended without its loop returning (a panic or an
+    /// abort), so the mob takes no further command.
+    ActorLost,
 }
 
 impl std::fmt::Display for MobAdmissionCloseReason {
@@ -56,6 +60,7 @@ impl std::fmt::Display for MobAdmissionCloseReason {
             Self::Shutdown => f.write_str("shutdown"),
             Self::Destroyed => f.write_str("destroyed"),
             Self::DurabilityFailStop => f.write_str("durability fail-stop"),
+            Self::ActorLost => f.write_str("actor lost"),
         }
     }
 }

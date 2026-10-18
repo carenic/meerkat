@@ -328,7 +328,7 @@ re-paired.
 | `McpServerAccess` / `McpStdioConfig.secret_env` / `HttpEgressRefusal` | MCP server access ceilings, realm service secrets for stdio servers, and typed HTTP egress refusals |
 | `ToolAudience` (`ToolDef.audience`) | Model and/or app tool visibility for MCP Apps hosts (`AgentFactory` `mcp_apps` flag, default off) |
 | `HookEngine::mandatory_topology` / `HookModelOperationScope` | Required attested mandatory-hook topology; model-request Guardrails withhold only the dependent operation |
-| `MemberDeliveryScope` / `MobError::{StaleDeliveryScope, AdmissionClosed}` / `MobAdmissionCloseReason` | Scope-bound mob delivery and mob admission close (`IdleClose`, `LastOwnerReleased`, `StandDown`, `Shutdown`, `Destroyed`, `DurabilityFailStop`) |
+| `MemberDeliveryScope` / `MobError::{StaleDeliveryScope, AdmissionClosed}` / `MobAdmissionCloseReason` | Scope-bound mob delivery and mob admission close (`IdleClose`, `LastOwnerReleased`, `StandDown`, `Shutdown`, `Destroyed`, `DurabilityFailStop`, `ActorLost`) |
 
 ## Agent Loop And Turn Phases
 

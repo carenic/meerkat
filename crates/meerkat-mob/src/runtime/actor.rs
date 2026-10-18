@@ -4190,6 +4190,27 @@ pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
     std::sync::Mutex::new(None);
+/// Test seam: the actor loop of this mob panics at the top of its next turn.
+#[cfg(test)]
+static PANIC_ACTOR_LOOP_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
+    if let Ok(mut target) = PANIC_ACTOR_LOOP_FOR_MOB.lock() {
+        *target = Some(mob_id.clone());
+    }
+}
+
+#[cfg(test)]
+fn take_actor_loop_panic_for_test(mob_id: &MobId) -> bool {
+    PANIC_ACTOR_LOOP_FOR_MOB.lock().is_ok_and(|mut target| {
+        let armed = target.as_ref() == Some(mob_id);
+        if armed {
+            *target = None;
+        }
+        armed
+    })
+}
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
@@ -28909,6 +28930,10 @@ impl MobActor {
         // their first tick. Awaiting a startup tick on wasm would therefore
         // park the actor for the five-minute identity safety cadence.
         'actor: loop {
+            #[cfg(test)]
+            if take_actor_loop_panic_for_test(&self.definition.id) {
+                panic!("test seam: the mob actor loop panics");
+            }
             // Detached completion paths can re-enter through `continue` or
             // `SkipBoundary`, bypassing the ordinary post-command boundary.
             // Honor fail-stop before polling any new work so a confirmed

@@ -707,6 +707,33 @@ async fn a_durability_fail_stop_closes_admission() {
     crash_stop_and_release_routes(handle).await;
 }
 
+/// A lost actor task (here, a panic in its loop) takes no further command,
+/// so the mob grants no owner lease either: the task's spawn wrapper closes
+/// admission with its own reason before it reports the task lost.
+#[tokio::test]
+async fn a_lost_actor_task_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-actor-lost");
+    let (handle, _service) = create_test_mob(definition).await;
+    let observer = handle.observer();
+    let mut task = handle.actor_task_watch();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    crate::runtime::actor::panic_actor_loop_for_test(handle.mob_id());
+    // Any wake takes the loop to its next turn, where the seam panics.
+    let _phase = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await;
+    assert_eq!(task.wait().await, crate::runtime::MobActorTaskWait::Lost);
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::ActorLost)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a lost actor grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::ActorLost),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

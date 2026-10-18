@@ -137,8 +137,9 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
   `close_if_idle()` closes an idle mob and `close_admission(reason)` closes
   unconditionally. An admitted `shutdown()` closes it too
   (`MobAdmissionCloseReason::Shutdown`), before its teardown; a Stop leaves
-  it open. An admitted `destroy()` closes it with `Destroyed`, and a
-  durability fail-stop with `DurabilityFailStop`. Later mutating commands and
+  it open. An admitted `destroy()` closes it with `Destroyed`, a durability
+  fail-stop with `DurabilityFailStop`, and a lost actor task with
+  `ActorLost`, so no actor exit leaves it open. Later mutating commands and
   `acquire_owner()` are refused with
   `MobError::AdmissionClosed`. Closing tears nothing down, so keep a
   `MobHandle` clone for as long as the mob must admit work.
