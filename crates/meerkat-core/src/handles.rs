@@ -1319,6 +1319,35 @@ pub struct TurnStateSnapshot {
     pub llm_retry_selected_delay_ms: u64,
 }
 
+/// The scalar facts of a [`TurnStateSnapshot`], read without its
+/// collections and without the terminality classification it carries. Each
+/// field means exactly the snapshot field of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnStateScalars {
+    pub turn_phase: TurnPhase,
+    pub cancel_after_boundary: bool,
+    pub has_barrier_ops: bool,
+    pub extraction_active: bool,
+    pub terminal_outcome: Option<TurnTerminalOutcome>,
+    pub terminal_cause_kind: Option<TurnTerminalCauseKind>,
+    pub extraction_attempts: u64,
+}
+
+impl TurnStateScalars {
+    /// The scalar facts of a full snapshot.
+    pub fn from_snapshot(snapshot: &TurnStateSnapshot) -> Self {
+        Self {
+            turn_phase: snapshot.turn_phase,
+            cancel_after_boundary: snapshot.cancel_after_boundary,
+            has_barrier_ops: snapshot.has_barrier_ops,
+            extraction_active: snapshot.extraction_active,
+            terminal_outcome: snapshot.terminal_outcome,
+            terminal_cause_kind: snapshot.terminal_cause_kind,
+            extraction_attempts: snapshot.extraction_attempts,
+        }
+    }
+}
+
 /// Turn-execution DSL handle.
 pub trait TurnStateHandle: Send + Sync {
     /// Mint a fresh process-local authority for one noncommitting live bridge
@@ -1445,6 +1474,14 @@ pub trait TurnStateHandle: Send + Sync {
     /// read the phase without building the rest of it.
     fn turn_phase(&self) -> TurnPhase {
         self.snapshot().turn_phase
+    }
+
+    /// The scalar turn-state facts alone, from the same authority
+    /// [`Self::snapshot`] reads. The default reads the whole snapshot; an
+    /// implementation may read them without the collections and the
+    /// terminality classification a snapshot builds.
+    fn scalars(&self) -> TurnStateScalars {
+        TurnStateScalars::from_snapshot(&self.snapshot())
     }
 
     /// Apply one typed turn-execution input and return its effects with the

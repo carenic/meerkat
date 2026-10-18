@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use meerkat_core::handles::{DslTransitionError, TurnStateHandle, TurnStateSnapshot};
+use meerkat_core::handles::{
+    DslTransitionError, TurnStateHandle, TurnStateScalars, TurnStateSnapshot,
+};
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::ops::{AsyncOpRef, OperationId, WaitPolicy};
 use meerkat_core::retry::LlmRetrySchedule;
@@ -481,6 +483,10 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             .with_state_lock(|state| map_turn_phase(state.turn_phase))
     }
 
+    fn scalars(&self) -> TurnStateScalars {
+        self.dsl.with_state_lock(project_turn_scalars)
+    }
+
     fn start_conversation_run(
         &self,
         run_id: RunId,
@@ -731,6 +737,19 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             snapshot.active_run_id = current_run_id;
         }
         snapshot
+    }
+}
+
+/// The scalar facts of [`project_turn_state`], from a borrowed DSL state.
+fn project_turn_scalars(state: &mm_dsl::MeerkatMachineState) -> TurnStateScalars {
+    TurnStateScalars {
+        turn_phase: map_turn_phase(state.turn_phase),
+        cancel_after_boundary: state.cancel_after_boundary,
+        has_barrier_ops: state.has_barrier_ops,
+        extraction_active: state.extraction_active,
+        terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
+        terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
+        extraction_attempts: state.extraction_attempts,
     }
 }
 
@@ -1982,14 +2001,19 @@ mod tests {
                 CancelAfterBoundary(3),
                 BoundaryComplete(3),
             ],
+            // The agent's order: every extraction reply drains a boundary
+            // and re-enters Extracting before it is validated.
             vec![
                 Start(4),
                 PrimitiveApplied(4),
                 LlmTerminal(4),
                 EnterExtraction(4),
                 ExtractionStart(4),
+                LlmTerminal(4),
+                EnterExtraction(4),
                 ExtractionRejected(4),
-                ExtractionStart(4),
+                LlmTerminal(4),
+                EnterExtraction(4),
                 ExtractionPassed(4),
                 BoundaryComplete(4),
             ],
@@ -2222,5 +2246,44 @@ mod tests {
             }
         }
         assert!(compared >= 40, "only {compared} inputs were accepted");
+    }
+
+    /// #24 P3: the borrowed scalar read equals the scalars of the copying
+    /// projection after every generated input of the walk, accepted or
+    /// refused, and the walk gives every scalar field a non-default value at
+    /// least once, so a field read from the wrong source is observable.
+    #[test]
+    fn borrowed_scalars_equal_copying_projection_scalars_on_every_input() {
+        let mut seen = [false; 6];
+        let mut compared = 0_usize;
+        for script in oracle_scripts() {
+            let handle = RuntimeTurnStateHandle::ephemeral();
+            let mut check = |step: Option<OracleStep>| {
+                let scalars = handle.scalars();
+                assert_eq!(
+                    scalars,
+                    TurnStateScalars::from_snapshot(&legacy_snapshot(&handle)),
+                    "after {step:?}"
+                );
+                seen[0] |= scalars.cancel_after_boundary;
+                seen[1] |= scalars.has_barrier_ops;
+                seen[2] |= scalars.extraction_active;
+                seen[3] |= scalars.terminal_outcome.is_some();
+                seen[4] |= scalars.terminal_cause_kind.is_some();
+                seen[5] |= scalars.extraction_attempts > 0;
+                compared += 1;
+            };
+            check(None);
+            for step in script {
+                let _ = apply_oracle_step(&handle, step);
+                check(Some(step));
+            }
+        }
+        assert_eq!(
+            seen, [true; 6],
+            "cancel_after_boundary, has_barrier_ops, extraction_active, terminal_outcome, \
+             terminal_cause_kind, extraction_attempts must each be non-default once"
+        );
+        assert!(compared >= 50, "only {compared} reads were compared");
     }
 }

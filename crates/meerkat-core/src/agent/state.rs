@@ -2210,12 +2210,13 @@ where
 
     fn turn_cancel_after_boundary(&self) -> Result<bool, AgentError> {
         Ok(self
-            .runtime_turn_authority_snapshot()?
+            .runtime_turn_authority()?
+            .scalars()
             .cancel_after_boundary)
     }
 
     fn turn_has_barrier_ops(&self) -> Result<bool, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.has_barrier_ops)
+        Ok(self.runtime_turn_authority()?.scalars().has_barrier_ops)
     }
 
     fn turn_barrier_operation_ids(&self) -> Result<Vec<crate::ops::OperationId>, AgentError> {
@@ -2236,7 +2237,7 @@ where
         // transitions and run start). The former derivation from the
         // loop-local `extraction_state.primary_output` scratch was shell
         // shadow truth with a divergence window during retry rounds.
-        Ok(self.runtime_turn_authority_snapshot()?.extraction_active)
+        Ok(self.runtime_turn_authority()?.scalars().extraction_active)
     }
 
     fn turn_terminal_outcome(&self) -> Result<TurnTerminalOutcome, AgentError> {
@@ -2246,18 +2247,19 @@ where
         // the in-handle `None` to `TurnTerminalOutcome::None` per the
         // DSL contract (see `TurnStateSnapshot::terminal_outcome` doc).
         Ok(self
-            .runtime_turn_authority_snapshot()?
+            .runtime_turn_authority()?
+            .scalars()
             .terminal_outcome
             .unwrap_or(TurnTerminalOutcome::None))
     }
 
     fn turn_terminal_cause_kind(&self) -> Result<Option<TurnTerminalCauseKind>, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.terminal_cause_kind)
+        Ok(self.runtime_turn_authority()?.scalars().terminal_cause_kind)
     }
 
     fn turn_extraction_attempts(&self) -> Result<u32, AgentError> {
-        let snapshot = self.runtime_turn_authority_snapshot()?;
-        u32::try_from(snapshot.extraction_attempts).map_err(|_| {
+        let scalars = self.runtime_turn_authority()?.scalars();
+        u32::try_from(scalars.extraction_attempts).map_err(|_| {
             AgentError::InternalError(
                 "runtime turn-state authority projected extraction_attempts outside u32 range"
                     .to_string(),
