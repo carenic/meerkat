@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
+  member's exact runtime registration, so every
+  `MemberRuntimeRegistrationHook` call names the registration it is made
+  for: the one a new member's provision prepared, or the current one of a
+  member whose actor is recovered. A host binds what it decides to that
+  registration instead of to an identity it derives from the member's
+  session id or labels; a later registration of the same session is a
+  different registration.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
