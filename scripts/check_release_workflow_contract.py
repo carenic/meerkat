@@ -2055,7 +2055,8 @@ TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml"
 # semver gate's measurement): nothing on main saves their keys, so a
 # restore could only return an entry some other run wrote. The semver
 # measurement builds through repo-cargo in a per-run target directory, so a
-# target cache never reached it.
+# target cache never reached it. release-semver-readiness.yml's measurement,
+# which builds the same way, restores none either, on any of its triggers.
 RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
@@ -2678,7 +2679,8 @@ def check_release_caches(text: str) -> list[str]:
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
     `contents: write`) runs no cache step; no release job restores a cache,
-    on a tag or a dispatch (RELEASE_RESTORE_JOBS is empty); and a job that
+    on a tag or a dispatch (RELEASE_RESTORE_JOBS is empty), and no job of
+    release-semver-readiness.yml restores one on any of its triggers; and a job that
     mints OIDC tokens or attests
     artifacts
     (`id-token` or `attestations: write`) restores only caches that no
@@ -2765,6 +2767,22 @@ def check_release_caches(text: str) -> list[str]:
             report(f"{trusted}, a workflow whose runs a tag trusts, is missing; update TAG_TRUSTED_WORKFLOWS")
     for workflow, source in sorted(sources.items()):
         triggers = _workflow_triggers(source)
+        if workflow == READINESS_WORKFLOW.name:
+            for trigger in sorted(triggers):
+                frame = OpenFrame(
+                    label=f"a {trigger} run",
+                    event_name=None if trigger == "workflow_call" else trigger,
+                )
+                for job in _job_names(source):
+                    uses = _job_cache_uses(source, workflow, job, frame, root)
+                    if uses is None:
+                        report(f"{workflow} job `{job}` calls a reusable workflow, whose caches this check does not read")
+                    for use in uses or []:
+                        for spec in use.key_specs()[0] if use.may_restore() else []:
+                            report(
+                                f"{workflow} {use.where} restores `{spec[1]}` on {frame.label}; "
+                                "the semver measurement restores no cache"
+                            )
         # release.yml's own jobs are checked on a dispatch above.
         guarded = [] if workflow == DEFAULT_WORKFLOW.name else [
             reason

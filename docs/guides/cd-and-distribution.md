@@ -535,8 +535,9 @@ which writes the semver attestation) and any workflow that checks out a
 ref its inputs choose save no cache on a dispatch-like run either. No
 release job restores a cache, on a tag or on a dispatch (a prebuild, a
 recovery or the semver gate's measurement, which builds in a per-run
-target directory like the readiness workflow's and runs no rust-cache step
-either): the release jobs run no
+target directory), and neither does `release-semver-readiness.yml`'s
+measurement, which builds the same way, on any of its triggers: the
+release jobs run no
 rust-cache step, `build-windows-cross` restores the Windows SDK cache only
 for a caller that saves it (release.yml does not), the BuildBuddy release
 jobs pass `repository-cache: "false"` and the full-graph validation
