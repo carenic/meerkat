@@ -16,6 +16,7 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const IMAGE_DIGEST = `sha256:${"ab".repeat(32)}`;
 const goodRenovate = {
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  vulnerabilityAlerts: { automerge: false },
   packageRules: [
     { matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "7 days" },
     { matchManagers: ["github-actions"], matchUpdateTypes: ["digest"], dependencyDashboardApproval: true },
@@ -303,6 +304,21 @@ try {
       "a later rule that clears the release age",
       { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["npm"], minimumReleaseAge: null }] },
       "packageRules[3] can shorten the release age of updates packageRules[0] automerges",
+    ],
+    [
+      "a preset whose rules the check cannot read",
+      { ...goodRenovate, extends: [...goodRenovate.extends, ":automergeMinor"] },
+      'extends names ":automergeMinor"',
+    ],
+    [
+      "the legacy spelling of the release age",
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["npm"], stabilityDays: 0 }] },
+      "packageRules[3].stabilityDays",
+    ],
+    [
+      "vulnerability fixes left to the patch automerge",
+      Object.fromEntries(Object.entries(goodRenovate).filter(([key]) => key !== "vulnerabilityAlerts")),
+      "vulnerabilityAlerts does not turn automerge off",
     ],
   ]) {
     const problems = renovateProblems(config);

@@ -5,6 +5,9 @@
   "branchConcurrentLimit": 1,
   "prConcurrentLimit": 1,
   "prHourlyLimit": 1,
+  "vulnerabilityAlerts": {
+    "automerge": false
+  },
   "customManagers": [
     {
       "customType": "regex",
@@ -35,7 +38,7 @@
       "groupSlug": "routine-dependencies"
     },
     {
-      "description": "Patch updates automerge without a review, so each waits until its release is a week old (scripts/ci-action-pins.mjs requires the age on every automerge rule): a version without a release date is held (minimumReleaseAgeBehaviour defaults to timestamp-required), a version still within the week is skipped for the newest one past it (internalChecksFilter defaults to strict), and vulnerability fixes are not held (vulnerabilityAlerts sets no minimumReleaseAge).",
+      "description": "Patch updates automerge without a review, so each waits until its release is a week old (scripts/ci-action-pins.mjs requires the age on every automerge rule): a version without a release date is held (minimumReleaseAgeBehaviour defaults to timestamp-required), a version still within the week is skipped for the newest one past it (internalChecksFilter defaults to strict). Vulnerability fixes are not held (vulnerabilityAlerts sets no minimumReleaseAge), so vulnerabilityAlerts turns automerge off: a security fix arrives at once as a pull request for review.",
       "matchUpdateTypes": ["patch"],
       "automerge": true,
       "minimumReleaseAge": "7 days"
