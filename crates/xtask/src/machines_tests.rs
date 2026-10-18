@@ -89,25 +89,32 @@ fn semantic_coverage_rejects_all_anchor_all_scenario_entries() {
     );
 }
 
+/// The workflow and its anti-drift checks are the same for every selection,
+/// so this unit test runs them over a small canonical machine and a
+/// composition that contains it. The largest pair (`meerkat_machine` with
+/// `meerkat_mob_seam`) takes minutes in an unoptimized build; the
+/// xtask integration suite's
+/// `drift_check_reports_missing_and_stale_generated_files_for_canonical_selection`
+/// covers it.
 #[test]
 fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
     let registry = CanonicalRegistry::load();
     let selection = registry
         .select(&SelectionArgs {
             all: false,
-            machines: vec!["meerkat_machine".to_string()],
-            compositions: vec!["meerkat_mob_seam".to_string()],
+            machines: vec!["runtime_delivery".to_string()],
+            compositions: vec!["job_runtime_delivery".to_string()],
         })
         .expect("selection should resolve representative canonical workflow artifacts");
     let dir = tempdir().expect("tempdir");
     let selected_machine_dir = dir
         .path()
-        .join("specs/machines/meerkat_machine")
+        .join("specs/machines/runtime_delivery")
         .display()
         .to_string();
     let selected_composition_dir = dir
         .path()
-        .join("specs/compositions/meerkat_mob_seam")
+        .join("specs/compositions/job_runtime_delivery")
         .display()
         .to_string();
 
@@ -134,10 +141,10 @@ fn machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts() {
         "generated workflow artifacts should satisfy the anti-drift contract: {clean:#?}"
     );
 
-    let machine_model = dir.path().join("specs/machines/meerkat_machine/model.tla");
+    let machine_model = dir.path().join("specs/machines/runtime_delivery/model.tla");
     let composition_model = dir
         .path()
-        .join("specs/compositions/meerkat_mob_seam/model.tla");
+        .join("specs/compositions/job_runtime_delivery/model.tla");
     assert!(machine_model.exists(), "machine model should be generated");
     assert!(
         composition_model.exists(),
