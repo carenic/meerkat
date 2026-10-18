@@ -348,9 +348,9 @@ pins whatever digests it then carries.
 `prebuild_release_artifacts=true`. The run refuses any other ref, any
 publishing or recovery input, a version whose tag already exists, and a
 `release_backend` other than the one its tag run will select (BuildBuddy for
-the owner while `MEERKAT_RELEASE_BUILDBUDDY` is set): on the other backend its
-critical lanes queue behind other runners and miss the tag run's wait, as
-v0.9.3's GitHub-hosted prebuild did. `make release-prebuild` reads that
+the owner while `MEERKAT_RELEASE_BUILDBUDDY` is `true` or `1`): on the other
+backend its critical lanes queue behind other runners and miss the tag run's
+wait, as v0.9.3's GitHub-hosted prebuild did. `make release-prebuild` reads that
 backend from the repository variable. It
 does not wait for CI: it builds every release binary (the critical Linux and
 macOS arm64 ones on BuildBuddy or the GitHub-hosted lane, Intel macOS

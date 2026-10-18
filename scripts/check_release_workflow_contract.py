@@ -1656,12 +1656,13 @@ def check_prebuild(text: str) -> list[str]:
     # 7. A prebuild builds with the backend its tag run selects: on the other
     #    one its critical lanes queue behind other runners and miss the tag's
     #    bounded wait. The request refuses the other backend, for the owner
-    #    and for others, with BuildBuddy release builds on and off; the tag's
-    #    choice is read from whether its GitHub-hosted critical lane runs.
+    #    and for others, with MEERKAT_RELEASE_BUILDBUDDY true, 1, false and
+    #    unset; the tag's choice is read from whether its GitHub-hosted
+    #    critical lane runs.
     if len(requests) == 1:
         request = requests[0]
         for actor in ("lukacf", "release-bot"):
-            for flag in ("true", ""):
+            for flag in ("true", "1", "false", ""):
                 variables = {"MEERKAT_RELEASE_BUILDBUDDY": flag} if flag else {}
                 tag_run = EventContext(**{**fresh.__dict__, "actor": actor, "variables": variables})
                 selected = "github-hosted" if _job_runs(text, "build_binaries", tag_run) else "buildbuddy"

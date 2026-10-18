@@ -136,9 +136,9 @@ jobs:
       # release_prebuild). It runs on main only, because only main's
       # attestations are trusted by the tag run, and takes no publishing or
       # recovery input. It builds with the backend its tag run will select
-      # (the owner's BuildBuddy lane while MEERKAT_RELEASE_BUILDBUDDY is set):
-      # on the other backend its critical lanes queue behind other runners
-      # and miss the tag run's bounded wait, as v0.9.3's GitHub-hosted
+      # (the owner's BuildBuddy lane while MEERKAT_RELEASE_BUILDBUDDY is true
+      # or 1): on the other backend its critical lanes queue behind other
+      # runners and miss the tag run's bounded wait, as v0.9.3's GitHub-hosted
       # prebuild did, so the tag run built everything again.
       - name: Verify release prebuild request
         id: prebuild_request

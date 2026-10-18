@@ -40,9 +40,10 @@ Environment equivalents:
   RELEASE_WORKFLOW_DRY_RUN   true/false to print the gh command without dispatching.
   MEERKAT_BUILDBUDDY         When RELEASE_BACKEND=auto (prebuild mode excepted),
                               true selects buildbuddy and false/0 selects
-                              github-hosted. If unset, auto honors
-                              MEERKAT_RELEASE_BUILDBUDDY=true only for the lukacf
-                              GitHub account.
+                              github-hosted. If unset, auto selects buildbuddy
+                              only for the lukacf GitHub account, and only while
+                              the repository's MEERKAT_RELEASE_BUILDBUDDY is true
+                              or 1 (any case), as release.yml does.
 EOF
 }
 
@@ -149,8 +150,10 @@ repo_release_buildbuddy_enabled() {
     gh api repos/lukacf/meerkat/actions/variables/MEERKAT_RELEASE_BUILDBUDDY \
       --jq '.value' 2>/dev/null || true
   )"
-  case "${value}" in
-    1|true|TRUE|yes|YES|on|ON|buildbuddy)
+  # release.yml selects BuildBuddy when the variable is 'true' or '1', and
+  # GitHub's expression comparisons ignore case.
+  case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+    1|true)
       return 0
       ;;
     *)
