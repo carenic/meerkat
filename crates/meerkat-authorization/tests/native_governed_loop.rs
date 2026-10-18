@@ -854,6 +854,9 @@ mod s3_scoped_context;
 #[path = "native_governed_loop/s1_scoped_original.rs"]
 mod s1_scoped_original;
 
+#[path = "native_governed_loop/owner_change_wait.rs"]
+mod owner_change_wait;
+
 #[cfg(unix)]
 #[path = "native_governed_loop/connector_call_context.rs"]
 mod connector_call_context;

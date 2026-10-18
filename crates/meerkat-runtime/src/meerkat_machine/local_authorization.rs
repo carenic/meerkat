@@ -710,6 +710,14 @@ struct NativeRunAuthorization {
 }
 
 impl WorkAuthorization for NativeRunAuthorization {
+    /// A waiting hint only: no run custody or permission is checked or
+    /// implied.
+    fn owner_change_in_progress(
+        &self,
+    ) -> Option<meerkat_core::authorization::OwnerChangeInProgress> {
+        self.inner.owner_change_in_progress()
+    }
+
     /// Historical, like an outcome: forwarded to the retained audited owner
     /// without re-checking current run or grant permission.
     fn observe_mandatory_hook_withholding(

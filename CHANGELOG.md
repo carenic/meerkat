@@ -35,6 +35,39 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat_core::authorization::OwnerChangeChurn`, with `OwnerChangeWait`,
+  `OwnerChangeInProgress`, `OWNER_CHANGE_WAIT_BOUND` (2 s) and
+  `OWNER_CHANGE_FREE_REBUILDS` (3): one bounded wait, for a site that rebuilds
+  an operation after a `ReprepareRequired` refusal, until an owner change in
+  progress on the work's own authorization publication completes.
+  `WorkAuthorization::owner_change_in_progress` (provided, default `None`)
+  reports such a change as a waiting hint, never a permission;
+  `LocalAuthorizationPublication::change_in_progress` answers it for the local
+  owners, and the native run and audit wrappers forward it.
+
+### Fixed
+
+- A model request of the agent loop no longer returns to the controller with
+  an `operation_refused` notice, or fails the turn, because an owner change
+  was still in progress on its work's own publication. An owner that holds a
+  change across its storage commit outlasted both built-in rebuilds, the
+  preparation's and the request's own. On such a `ReprepareRequired` refusal
+  the request now waits for the change to complete, then rebuilds under the
+  same operation without spending its own rebuild. The wait is bounded: one
+  wall-clock deadline per model call, set at its first wait to 2 s or to the
+  remaining run budget if that is less, so the rebuilds in between count
+  against it; at most 3 such free rebuilds per call; and a free rebuild only
+  once no change is in progress. Past those bounds the refusal takes its
+  ordinary path (one rebuild, then the controller feedback request), as does
+  a refusal with no change in progress, any other refusal kind, and a refusal
+  about another publication. The run budget is checked after every wait, so a
+  turn whose budget runs out during one ends with the time-budget terminal,
+  not a refusal. Each refused attempt keeps its own audit record, and a
+  `debug` event `meerkat::authz::owner_change_wait` (operation id,
+  `waited_ms`, `settled`) marks each wait.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

@@ -37,6 +37,12 @@ pub(crate) struct AuditedWorkAuthorization {
 }
 
 impl WorkAuthorization for AuditedWorkAuthorization {
+    fn owner_change_in_progress(
+        &self,
+    ) -> Option<meerkat_core::authorization::OwnerChangeInProgress> {
+        self.inner.owner_change_in_progress()
+    }
+
     fn run_if_current_within(
         &self,
         binding: &PreparedAuthorizationBinding,
