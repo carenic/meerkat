@@ -20,7 +20,8 @@
 //   that moved, which the age does not hold back) for dependency dashboard
 //   approval, and end with a github-actions rule that turns automerge off,
 //   after every rule that could turn it on for them; a custom.regex rule
-//   does the same for what its customManagers pin; nothing outside
+//   does the same for what its customManagers pin, and a cargo rule for
+//   each crate in NEVER_AUTOMERGED_CRATES (the YAML parser); nothing outside
 //   packageRules may turn automerge on (vulnerabilityAlerts, an update
 //   type's settings). A `docker://` action, a `container:` or `image:`
 //   value in .github, and a `docker://` reference in the Bazel files under
@@ -70,6 +71,10 @@ const MANAGER = "github-actions";
 const CUSTOM_MANAGER = "custom.regex";
 const PIN_PRESET = "helpers:pinGitHubActionDigests";
 const MINIMUM_RELEASE_AGE = "7 days";
+// Crates whose updates are never automerged: the YAML parser, which reads
+// SKILL.md frontmatter that arrives from HTTP and git sources.
+export const NEVER_AUTOMERGED_CRATES = ["serde-saphyr", "granit-parser"];
+const CARGO_MANAGER = "cargo";
 
 function workflowFiles(dir) {
   const out = [];
@@ -285,16 +290,34 @@ function coversAllDigests(rule) {
   );
 }
 
+// Does a rule apply to some, or to every, cargo update of one crate? A
+// package name pattern (a regex or glob) may match it, so it counts as some.
+function crateRuleScope(rule, crate) {
+  const managers = rule.matchManagers;
+  if (Array.isArray(managers) && !managers.includes(CARGO_MANAGER)) return { some: false, all: false };
+  const names = rule.matchPackageNames;
+  const exact = Array.isArray(names) && names.includes(crate);
+  const patterned = Array.isArray(names) && names.some((name) => /^[/!]|[*?]/.test(name));
+  if (Array.isArray(names) && !exact && !patterned) return { some: false, all: false };
+  const criteria = Object.keys(rule).filter((key) => key.startsWith("match") || key.startsWith("exclude"));
+  const onlyManagerAndName = criteria.every((key) => key === "matchManagers" || key === "matchPackageNames");
+  return {
+    some: true,
+    all: onlyManagerAndName && exact && Array.isArray(managers) && managers.length === 1,
+  };
+}
+
 // A manager's updates are never automerged: a rule for all of them turns
 // automerge off after every rule that could turn it on for some, and one
-// for all of them sets the release age.
-function managerRuleProblems(rules, manager) {
+// for all of them sets the release age. `scopeOf` narrows a rule to one
+// crate's updates instead.
+function managerRuleProblems(rules, manager, scopeOf = (rule) => ruleScope(rule, manager)) {
   const problems = [];
   let lastOff = -1;
   let lastOn = -1;
   let age = false;
   rules.forEach((rule, index) => {
-    const scope = ruleScope(rule, manager);
+    const scope = scopeOf(rule);
     if (!scope.some) return;
     if (rule.automerge === true) lastOn = index;
     if (rule.automerge === false && scope.all) lastOff = index;
@@ -327,6 +350,10 @@ export function renovateProblems(config) {
   // What the customManagers pin (container digests, a tool release) is
   // never automerged either.
   if ((config.customManagers ?? []).length > 0) problems.push(...managerRuleProblems(rules, CUSTOM_MANAGER));
+  // Nor is the YAML parser.
+  for (const crate of NEVER_AUTOMERGED_CRATES) {
+    problems.push(...managerRuleProblems(rules, `${CARGO_MANAGER} ${crate}`, (rule) => crateRuleScope(rule, crate)));
+  }
   let digestHeld = -1;
   let digestReleased = -1;
   rules.forEach((rule, index) => {
@@ -368,7 +395,7 @@ function main(argv) {
     return 1;
   }
   process.stdout.write(
-    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins\n",
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action, what a customManager pins, or the YAML parser crates\n",
   );
   return 0;
 }

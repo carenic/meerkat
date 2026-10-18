@@ -14,11 +14,18 @@ const here = dirname(fileURLToPath(import.meta.url));
 const checker = resolve(here, "ci-action-pins.mjs");
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const IMAGE_DIGEST = `sha256:${"ab".repeat(32)}`;
+const yamlParserRule = {
+  matchManagers: ["cargo"],
+  matchPackageNames: ["serde-saphyr", "granit-parser"],
+  minimumReleaseAge: "7 days",
+  automerge: false,
+};
 const goodRenovate = {
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
   packageRules: [
     { matchUpdateTypes: ["patch"], automerge: true },
     { matchManagers: ["github-actions"], matchUpdateTypes: ["digest"], dependencyDashboardApproval: true },
+    yamlParserRule,
     { matchManagers: ["github-actions"], automerge: false, minimumReleaseAge: "7 days" },
   ],
 };
@@ -308,9 +315,46 @@ try {
   }
   // A rule for other managers may automerge after the github-actions rule.
   assert.deepEqual(
-    renovateProblems({ ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["cargo"], automerge: true }] }),
+    renovateProblems({ ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["npm"], automerge: true }] }),
     [],
   );
+  // The YAML parser crates are never automerged: a cargo rule for exactly
+  // those crates turns automerge off after anything that could turn it on
+  // for them, with the release age.
+  {
+    const withoutParserRule = goodRenovate.packageRules.filter((rule) => rule !== yamlParserRule);
+    for (const [label, packageRules, message] of [
+      ["no parser rule", withoutParserRule, "no packageRule turns automerge off for every cargo serde-saphyr update"],
+      [
+        "a cargo automerge after it",
+        [...goodRenovate.packageRules, { matchManagers: ["cargo"], automerge: true }],
+        "can turn automerge on for cargo serde-saphyr",
+      ],
+      [
+        "a package pattern automerge after it",
+        [...goodRenovate.packageRules, { matchPackageNames: ["/^granit/"], automerge: true }],
+        "can turn automerge on for cargo granit-parser",
+      ],
+      [
+        "a parser rule for some updates only",
+        [...withoutParserRule, { ...yamlParserRule, matchUpdateTypes: ["major"] }],
+        "no packageRule turns automerge off for every cargo serde-saphyr update",
+      ],
+      [
+        "a parser rule for one crate only",
+        [...withoutParserRule, { ...yamlParserRule, matchPackageNames: ["serde-saphyr"] }],
+        "no packageRule turns automerge off for every cargo granit-parser update",
+      ],
+      [
+        "no release age",
+        [...withoutParserRule, { matchManagers: ["cargo"], matchPackageNames: ["serde-saphyr", "granit-parser"], automerge: false }],
+        "cargo serde-saphyr updates lack a minimumReleaseAge",
+      ],
+    ]) {
+      const problems = renovateProblems({ ...goodRenovate, packageRules });
+      assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);
+    }
+  }
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }

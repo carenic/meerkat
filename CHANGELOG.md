@@ -61,6 +61,16 @@ them.
   1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
   and refusal of a second document and alias expansion bombs.
 
+### Security
+
+- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
+  (deprecated) and the archived unsafe-libyaml it brought in
+  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
+  including from the `@rkat/web` wasm module, and `deny.toml` no longer
+  ignores that advisory. serde-saphyr and its parser granit-parser are
+  pinned exactly, and Renovate never automerges an update of them
+  (`scripts/ci-action-pins.mjs` fails a configuration that could).
+
 ### Changed
 
 - `SkillDocument.extensions` values are a projection of the frontmatter's
