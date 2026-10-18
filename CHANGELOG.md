@@ -1847,6 +1847,10 @@ them.
   an `std::io::Error` of kind `WouldBlock` (EAGAIN) now ends with a `hint:`
   line naming the usual causes and the variable that set the worker count,
   in `rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp` and `rkat-mob-mcp`.
+- The push-only exact-selection lanes count this release's new cases: the
+  Linux positive confinement lane expects seven MCP supported-native tests
+  (the stdio stderr-tail case is new) and the governed JSONL lane expects
+  five tests (the two schedule-composition cases are new). CI only.
 
 ### Known limitations
 
