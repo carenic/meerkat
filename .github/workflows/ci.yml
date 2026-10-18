@@ -1196,7 +1196,10 @@ jobs:
           ) != ["5 tests, 0 benchmarks"]:
               sys.exit(f"governed JSONL list must contain exactly the five required tests: {names!r}")
 
-          result = run("run", ["--nocapture", "--test-threads=1", "--color", "never"])
+          # No --nocapture: libtest captures each test's output, so every
+          # outcome is its own `test NAME ... ok` line (a test that prints
+          # splits that line under --nocapture); a failure still prints it.
+          result = run("run", ["--test-threads=1", "--color", "never"])
           outcomes = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$", result, re.MULTILINE)
           if sorted(outcomes) != [(name, "ok") for name in expected]:
               sys.exit(f"governed JSONL must pass all exact names with zero ignored: {outcomes!r}")
