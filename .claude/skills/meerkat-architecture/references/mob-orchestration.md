@@ -137,7 +137,8 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
   `close_if_idle()` closes an idle mob and `close_admission(reason)` closes
   unconditionally. An admitted `shutdown()` closes it too
   (`MobAdmissionCloseReason::Shutdown`), before its teardown; a Stop leaves
-  it open. Later mutating commands and `acquire_owner()` are refused with
+  it open. An admitted `destroy()` closes it with `Destroyed`. Later
+  mutating commands and `acquire_owner()` are refused with
   `MobError::AdmissionClosed`. Closing tears nothing down, so keep a
   `MobHandle` clone for as long as the mob must admit work.
 - `MobHandle::member(identity)` → `MemberHandle` — per-member handle. `MemberHandle::internal_turn(content)` is the in-process direct turn write (no peer comms, no handling-mode selection); it is distinct from `mob/turn_start` (RPC turn with overrides via the bridge session) and `mob/member_send` (peer delivery over comms into the member's inbox). Keep the three delivery paths separate.

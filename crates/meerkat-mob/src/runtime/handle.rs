@@ -14317,6 +14317,14 @@ impl MobHandle {
     }
 
     /// Retire active members, clear persisted mob storage, and terminate the actor.
+    ///
+    /// Once the destroy is admitted (its durable destroy marker is written)
+    /// admission closes, before any destroy cleanup (D67; the reason is
+    /// [`MobAdmissionCloseReason::Destroyed`](crate::runtime::MobAdmissionCloseReason::Destroyed)
+    /// unless admission had already closed): [`Self::acquire_owner`] and every
+    /// command the Closing state refuses then fail with
+    /// [`MobError::AdmissionClosed`]. A destroy left incomplete after its
+    /// admission keeps admission closed; retry the destroy.
     pub async fn destroy(&self) -> Result<MobDestroyReport, MobDestroyError> {
         match self
             .execute_destroy_machine_command(MobMachineCommand::Destroy)

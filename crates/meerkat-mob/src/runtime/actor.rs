@@ -18518,7 +18518,8 @@ impl MobActor {
     }
 
     /// Close admission because the actor is about to take no more commands:
-    /// an admitted Shutdown, before its teardown.
+    /// - an admitted Shutdown, before its teardown;
+    /// - an admitted Destroy, once its durable marker is written.
     ///
     /// Nothing is then handed an owner lease on an actor that will take no
     /// further command. Unconditional, keeping the first reason (D67); it
@@ -48541,6 +48542,9 @@ impl MobActor {
             report.push_error(format!("destroy marker append failed: {error}"));
             return Err(MobDestroyError::Incomplete { report });
         }
+        // The destroy is admitted (its durable marker is written, now or by
+        // an earlier attempt): admission closes before any destroy cleanup.
+        self.close_admission_for_exit(MobAdmissionCloseReason::Destroyed);
         Ok(DestroyAdmission {
             report,
             destroy_input_needed,

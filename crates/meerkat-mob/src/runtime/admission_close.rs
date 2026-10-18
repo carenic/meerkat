@@ -16,8 +16,8 @@
 //! with owners and admitted work present, by design) and an acquisition after
 //! any close is refused. Closing never stops
 //! admitted work: the ordinary Stop, Shutdown and Destroy remain the teardown
-//! path. An admitted Shutdown closes admission itself, before its teardown;
-//! a Stop leaves it open.
+//! path. An admitted Shutdown closes admission itself, before its teardown,
+//! and so does an admitted Destroy. A Stop leaves it open.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +37,9 @@ pub enum MobAdmissionCloseReason {
     /// closes admission before its teardown, and the actor accepts no more
     /// commands once the Shutdown completes.
     Shutdown,
+    /// The mob's destroy was admitted (its durable destroy marker is
+    /// written): the actor exits once the destroy completes.
+    Destroyed,
 }
 
 impl std::fmt::Display for MobAdmissionCloseReason {
@@ -46,6 +49,7 @@ impl std::fmt::Display for MobAdmissionCloseReason {
             Self::LastOwnerReleased => f.write_str("last public owner released"),
             Self::StandDown => f.write_str("stand down"),
             Self::Shutdown => f.write_str("shutdown"),
+            Self::Destroyed => f.write_str("destroyed"),
         }
     }
 }

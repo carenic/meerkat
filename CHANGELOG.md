@@ -48,6 +48,12 @@ them.
   waited for the Shutdown or ran. `MobHandle::acquire_owner` after the
   Shutdown's admission is refused the same way where it granted an owner
   lease.
+- Behaviour-only (not measured by the gate): once a destroy is admitted (its
+  durable destroy marker is written), `MobHandle::acquire_owner` is refused
+  with `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::Destroyed`) where it granted an owner lease, and a
+  command the Closing state refuses gets that error before the destroyed
+  mob's own refusal (see Fixed).
 
 ### Fixed
 
@@ -63,6 +69,14 @@ them.
   closed mob as gone kept treating the shut-down mob as live. A Shutdown that
   fails after its admission leaves admission closed; Stop, Shutdown and
   Destroy stay available. A Stop, the resumable pause, leaves admission open.
+- `MobHandle::destroy` closes the mob's admission once the destroy is
+  admitted (its durable destroy marker is written, by this attempt or an
+  earlier one), before any destroy cleanup, with the new
+  `MobAdmissionCloseReason::Destroyed` (it displays as "destroyed"); an
+  earlier close keeps its reason. Before, a destroyed mob's actor exited with
+  admission open, so `acquire_owner` still handed out owner leases and
+  `admission_closed()` stayed `None`. A destroy left incomplete after its
+  admission keeps admission closed; retrying the destroy stays available.
 
 ## [0.9.3] - 2026-10-18
 

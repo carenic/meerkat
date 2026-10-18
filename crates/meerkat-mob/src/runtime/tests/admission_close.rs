@@ -601,6 +601,65 @@ async fn shutdown_closes_admission_before_its_teardown() {
         .expect("shutdown succeeds");
 }
 
+/// After `destroy()` the actor has exited, so the mob grants no owner lease
+/// either: the admitted destroy closed admission with its own reason.
+#[tokio::test]
+async fn destroy_closes_admission_and_refuses_later_owners() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    handle.destroy().await.expect("destroy");
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a destroyed mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+}
+
+/// The destroy closes admission when it is admitted (its durable marker),
+/// not when it finishes: a destroy left incomplete after its admission keeps
+/// admission closed.
+#[tokio::test]
+async fn an_incomplete_admitted_destroy_keeps_admission_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-destroy-incomplete");
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(
+            events.clone(),
+            Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+        ),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    handle
+        .spawn_spec(worker_spec("d67-destroy-incomplete-worker"))
+        .await
+        .expect("spawn worker");
+    events.fail_appends_for("MemberRetired").await;
+
+    match handle.destroy().await {
+        Err(crate::runtime::handle::MobDestroyError::Incomplete { .. }) => {}
+        other => panic!("expected an incomplete destroy, got {other:?}"),
+    }
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob with an admitted destroy grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {
