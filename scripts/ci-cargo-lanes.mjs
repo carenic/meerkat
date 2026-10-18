@@ -47,7 +47,9 @@
 // pull-request Clippy lints lib and bin targets only; their tests run on
 // main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
 // the change invalidates meerkat-mob's build (always in workspace mode), and
-// the wasm lanes that only the reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// the browser example and WASM timer lanes that only the reverse-dependency
+// closure selected (wasm-check runs for every crate the wasm build compiles).
+// On 4-vCPU hosted runners each of those needs 9-30 minutes
 // (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
@@ -2198,7 +2200,8 @@ function plan(args) {
     result.reason = workspaceReason;
     result.packages = allNames;
     result.closure = allNames;
-    // A pull request runs the wasm lanes for their own inputs only.
+    // A push runs every wasm lane; a pull request runs wasm-check (below),
+    // and the example lanes for their own inputs only.
     if (!deferToPush) result.wasm = true;
   } else if (seeds.size > 0) {
     result.rust_changed = true;
@@ -2235,6 +2238,14 @@ function plan(args) {
   if (!deferToPush && result.closure.includes("meerkat-web-runtime")) {
     result.wasm = true;
     result.example_web = true;
+  }
+  // wasm-check compiles the web runtime and every workspace crate it links
+  // (its dependency closure, which the wasm32 target does not narrow), so a
+  // pull request that changes one of them runs it too (#1108): a provider
+  // crate that stops compiling for wasm32 fails before the merge.
+  const wasmBuild = closures.get("meerkat-web-runtime");
+  if (result.packages.some((name) => name === "meerkat-web-runtime" || wasmBuild?.has(name))) {
+    result.wasm = true;
   }
 
   if (result.rust_changed) {

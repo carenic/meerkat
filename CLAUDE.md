@@ -559,11 +559,13 @@ and its CI must be green before a release tag (`require_ci_green`):
   metadata, so a renamed feature fails the plan.
 - `wasm-check` (`make wasm-check`: wasm32 check and clippy of the web
   runtime and the crates it links): every Rust-relevant push, and pull
-  requests that change the web runtime, `meerkat-contracts` or the CLI web
-  template (a push also for every change whose closure reaches
-  `meerkat-web-runtime`). `example-web` and `wasm-timers` follow the same
-  rule for their own inputs (`sdks/web/`, the runtime, the contracts,
-  examples 031-033); `example-web` also runs the Web SDK's `npm test` (type
+  requests that change the web runtime or a workspace crate it compiles
+  (its dependency closure in the cargo graph, the provider crates
+  included), plan the whole workspace, or change the CLI web template.
+  `example-web` and `wasm-timers` run on a pull request only for their
+  own inputs (`sdks/web/`, the runtime, the contracts, examples 031-033),
+  and on a push also for every change whose closure reaches
+  `meerkat-web-runtime`; `example-web` also runs the Web SDK's `npm test` (type
   tests over the generated events, node unit suites).
 - `push: main` only (no budget): `main-unit` over the whole workspace (the
   unit lane's rows verbatim, then the rest of the workspace in packed

@@ -415,10 +415,11 @@ function assertArchivedLanes(plan, label) {
   assert.deepEqual(plan.unit_deferred, []);
   assert.equal(plan.wasm, true, "core is in the wasm runtime closure: the push runs the wasm lanes");
   assert.equal(plan.machine_authority, false);
-  // A pull request runs the wasm lanes only for their own inputs.
+  // Core is a crate the wasm build compiles, so a pull request runs
+  // wasm-check too; the example web suites only for their own inputs.
   const pr = planFor(["crates/meerkat-core/src/lib.rs"], ["--event", "pull_request"]);
-  assert.equal(pr.wasm, false, "a pull request does not run wasm-check for a closure that reaches the runtime");
-  assert.equal(pr.example_web, false, "nor the example web suites");
+  assert.equal(pr.wasm, true, "a pull request runs wasm-check for a crate the web runtime compiles");
+  assert.equal(pr.example_web, false, "but not the example web suites");
   assert.deepEqual(pr.unit_shards.map((shard) => shard.packages), [["meerkat-core"]], "core runs its unit tests in the pull request");
   assertLanes(pr, "core touch (pull request)");
 }
@@ -854,8 +855,8 @@ for (const path of [
   assert.ok(!shardOf("surface-build-fixtures").packages.includes("meerkat-integration-tests"));
   assert.deepEqual(pr.deferred_to_push.integration_suites.sort(), ["gpt-live-replay", "machine-codegen", "rpc-configured-turn-limit"]);
   assert.deepEqual(pr.deferred_to_push.unit_feature_suites.sort(), ["meerkat[experimental-gpt-live]", "meerkat[openai-live]"]);
-  assert.equal(pr.wasm, false, "a workspace pull request runs the wasm lanes only for their own inputs");
-  assert.equal(pr.example_web, false);
+  assert.equal(pr.wasm, true, "a workspace pull request runs wasm-check: the web runtime is one of its packages");
+  assert.equal(pr.example_web, false, "and the example web suites only for their own inputs");
   const github = run(["--format", "github", "--event", "pull_request", "--", "Cargo.toml"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
@@ -933,6 +934,21 @@ for (const path of [
     const web = planFor([path], ["--event", "pull_request"]);
     assert.equal(web.example_web, true, `${path} runs the example web suites in the pull request`);
     if (!path.startsWith("sdks/")) assert.equal(web.wasm, true, `${path} runs wasm-check in the pull request`);
+  }
+  // wasm-check runs for every crate the wasm build compiles (the web
+  // runtime's dependency closure in the cargo graph), the provider crates
+  // included (#1108), and for no crate outside it.
+  for (const [path, wasm] of [
+    ["crates/meerkat-openai/src/lib.rs", true],
+    ["crates/meerkat-anthropic/src/lib.rs", true],
+    ["crates/meerkat-models/src/lib.rs", true],
+    ["crates/meerkat-rest/src/lib.rs", false],
+    ["crates/meerkat-rpc/src/lib.rs", false],
+    ["crates/meerkat-cli/src/main.rs", false],
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request"]);
+    assert.equal(plan.wasm, wasm, `a pull request that changes ${path} ${wasm ? "runs" : "leaves"} wasm-check`);
+    assert.equal(plan.example_web, false, `${path}: the example web suites keep to their own inputs`);
   }
   assert.notEqual(run(["--event", "merge_group", "--", "Cargo.toml"]).status, 0, "an unknown event fails");
 }
