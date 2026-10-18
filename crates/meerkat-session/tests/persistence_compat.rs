@@ -158,15 +158,18 @@ fn stored_input_state_version_is_pinned_to_current() {
     // The runtime crate owns `StoredInputState` serde; this pins the shared
     // constant so the rejection tests there and the authority here agree.
     // v5 adds the exact durable completion outcome; v6 adds the protected
-    // mandatory-hook withholding audit record. A supported 0.8.10 deployment
-    // may still contain retained v3 rows, so the generated authority admits
-    // v3, v4 and v5 into current v6.
-    assert_eq!(STORED_INPUT_STATE_VERSION, 6);
-    assert_eq!(restore_stored_input_state_version(3), Ok(6));
-    assert_eq!(restore_stored_input_state_version(4), Ok(6));
-    assert_eq!(restore_stored_input_state_version(5), Ok(6));
-    assert_eq!(restore_stored_input_state_version(6), Ok(6));
-    assert!(restore_stored_input_state_version(7).is_err());
+    // mandatory-hook withholding audit record; v7 is the 0.9.4 encoding,
+    // whose additions the runtime decoder refuses in an older row. A
+    // supported 0.8.10 deployment may still contain retained v3 rows, so the
+    // generated authority admits v3, v4, v5 and the v6 rows 0.9.0 to 0.9.3
+    // wrote into current v7.
+    assert_eq!(STORED_INPUT_STATE_VERSION, 7);
+    assert_eq!(restore_stored_input_state_version(3), Ok(7));
+    assert_eq!(restore_stored_input_state_version(4), Ok(7));
+    assert_eq!(restore_stored_input_state_version(5), Ok(7));
+    assert_eq!(restore_stored_input_state_version(6), Ok(7));
+    assert_eq!(restore_stored_input_state_version(7), Ok(7));
+    assert!(restore_stored_input_state_version(8).is_err());
     assert_eq!(SESSION_VERSION, 4);
     assert_eq!(SESSION_METADATA_SCHEMA_VERSION, 2);
 }

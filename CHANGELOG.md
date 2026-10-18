@@ -35,6 +35,21 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Stored input state is now version 7, assigned by the generated persistence
+  version authority. A 0.9.4 binary writes every input row it stores at
+  version 7, including a row it read at an older one; it still reads rows at
+  versions 3 to 6 (0.9.0 to 0.9.3 wrote version 6). A 0.9.3 or older binary
+  refuses a version 7 row before installing state and leaves the stored
+  bytes in place, so there is no downgrade to 0.9.3 once a 0.9.4 binary has
+  written any input row. Upgrade every process that shares a runtime store
+  together.
+- `meerkat-machine-schema`: a new public field on an exhaustively
+  constructible struct (struct literals need it):
+  `SessionPersistenceVersionAuthorityMachineState` gains
+  `stored_input_state_migration_v6`.
+
 ### Added
 
 - `meerkat_core::authorization::OwnerChangeChurn`, with `OwnerChangeWait`,
