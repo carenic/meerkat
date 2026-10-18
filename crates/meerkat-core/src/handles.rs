@@ -1439,6 +1439,25 @@ pub trait TurnStateHandle: Send + Sync {
     fn run_cancelled(&self, run_id: RunId) -> Result<(), DslTransitionError>;
 
     fn snapshot(&self) -> TurnStateSnapshot;
+
+    /// The turn phase alone, from the same authority [`Self::snapshot`]
+    /// reads. The default reads the whole snapshot; an implementation may
+    /// read the phase without building the rest of it.
+    fn turn_phase(&self) -> TurnPhase {
+        self.snapshot().turn_phase
+    }
+
+    /// Apply one typed turn-execution input and return its effects with the
+    /// turn phase the authority holds after it. An implementation observes
+    /// that phase in the same critical section as the transition; the
+    /// default applies the input and then reads the phase.
+    fn apply_turn_input_observing_phase(
+        &self,
+        input: TurnExecutionInput,
+    ) -> Result<(Vec<TurnExecutionEffect>, TurnPhase), DslTransitionError> {
+        let effects = self.apply_turn_input(input)?;
+        Ok((effects, self.turn_phase()))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2165,6 +2165,12 @@ where
     /// a silent default) as a fail-loud error rather than an
     /// `unwrap_or_default` silent-drop.
     fn runtime_turn_authority_snapshot(&self) -> Result<crate::TurnStateSnapshot, AgentError> {
+        Ok(self.runtime_turn_authority()?.snapshot())
+    }
+
+    /// The attached runtime-backed turn-state authority, after the checks
+    /// every turn-state read makes.
+    fn runtime_turn_authority(&self) -> Result<&dyn crate::TurnStateHandle, AgentError> {
         let handle = self.turn_state_handle.as_deref().ok_or_else(|| {
             AgentError::InternalError(
                 "runtime turn-state handle missing: agent was built without \
@@ -2181,7 +2187,7 @@ where
                     .to_string(),
             ));
         }
-        Ok(handle.snapshot())
+        Ok(handle)
     }
 
     fn turn_active_run_id(&self) -> Result<Option<RunId>, AgentError> {
@@ -2189,7 +2195,7 @@ where
     }
 
     pub(super) fn turn_phase(&self) -> Result<TurnPhase, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.turn_phase)
+        Ok(self.runtime_turn_authority()?.turn_phase())
     }
 
     /// Mirror the machine-owned turn-terminality verdict.
@@ -3181,9 +3187,15 @@ where
         input: TurnExecutionInput,
     ) -> Result<TurnExecutionTransition, AgentError> {
         validate_turn_input_failure_reason(&input)?;
-        let prev_phase = self.turn_phase()?;
-        let effects = self.apply_turn_input_via_runtime_handle(&input)?;
-        let next_phase = self.turn_phase()?;
+        let handle = self.runtime_turn_authority()?;
+        let prev_phase = handle.turn_phase();
+        let (effects, next_phase) = handle
+            .apply_turn_input_observing_phase(input.clone())
+            .map_err(|err| {
+                AgentError::InternalError(format!(
+                    "runtime turn-state handle rejected {input:?}: {err}"
+                ))
+            })?;
 
         Ok(TurnExecutionTransition {
             prev_phase,

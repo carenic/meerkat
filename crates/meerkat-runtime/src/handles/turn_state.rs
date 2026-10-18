@@ -198,15 +198,14 @@ fn map_generated_turn_effect(
     }))
 }
 
-impl TurnStateHandle for RuntimeTurnStateHandle {
-    fn isolated_live_bridge_child(&self) -> Result<Arc<dyn TurnStateHandle>, DslTransitionError> {
-        Ok(Arc::new(Self::isolated_live_bridge()))
-    }
-
-    fn apply_turn_input(
+impl RuntimeTurnStateHandle {
+    /// Apply one typed turn input and run `sample` over the state that input
+    /// produced, in the same authority critical section as the transition.
+    fn apply_turn_input_sampling<S>(
         &self,
         input: TurnExecutionInput,
-    ) -> Result<Vec<TurnExecutionEffect>, DslTransitionError> {
+        sample: impl FnOnce(&mm_dsl::MeerkatMachineState) -> S,
+    ) -> Result<(Vec<TurnExecutionEffect>, S), DslTransitionError> {
         let context = "TurnStateHandle::apply_turn_input";
         let standalone_run_id = match &input {
             TurnExecutionInput::StartConversationRun { run_id, .. }
@@ -444,12 +443,42 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             }
             TurnExecutionInput::ForceCancelNoRun => mm_dsl::MeerkatMachineInput::ForceCancelNoRun,
         };
-        self.dsl
-            .apply_input_with_effects(dsl_input, context)?
+        let (transition, sampled) = self
+            .dsl
+            .apply_input_with_transition_and_sample(dsl_input, context, sample)?;
+        let effects = transition
+            .into_effects()
             .into_iter()
             .map(|effect| map_generated_turn_effect(effect, context))
             .filter_map(Result::transpose)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((effects, sampled))
+    }
+}
+
+impl TurnStateHandle for RuntimeTurnStateHandle {
+    fn isolated_live_bridge_child(&self) -> Result<Arc<dyn TurnStateHandle>, DslTransitionError> {
+        Ok(Arc::new(Self::isolated_live_bridge()))
+    }
+
+    fn apply_turn_input(
+        &self,
+        input: TurnExecutionInput,
+    ) -> Result<Vec<TurnExecutionEffect>, DslTransitionError> {
+        self.apply_turn_input_sampling(input, |_| ())
+            .map(|(effects, ())| effects)
+    }
+
+    fn apply_turn_input_observing_phase(
+        &self,
+        input: TurnExecutionInput,
+    ) -> Result<(Vec<TurnExecutionEffect>, TurnPhase), DslTransitionError> {
+        self.apply_turn_input_sampling(input, |state| map_turn_phase(state.turn_phase))
+    }
+
+    fn turn_phase(&self) -> TurnPhase {
+        self.dsl
+            .with_state_lock(|state| map_turn_phase(state.turn_phase))
     }
 
     fn start_conversation_run(
@@ -2061,5 +2090,137 @@ mod tests {
         );
         assert!(legacy_classify_turn_terminal(&unrecoverable));
         assert!(classify_turn_terminal(unrecoverable));
+    }
+
+    /// The typed turn input of one oracle step.
+    fn oracle_input(step: OracleStep) -> TurnExecutionInput {
+        match step {
+            OracleStep::Start(n) => TurnExecutionInput::StartConversationRun {
+                run_id: oracle_run(n),
+                primitive_kind: TurnPrimitiveKind::ConversationTurn,
+                admitted_content_shape: ContentShape::Conversation,
+                vision_enabled: n % 2 == 0,
+                image_tool_results_enabled: n % 3 == 0,
+                max_extraction_retries: 2,
+            },
+            OracleStep::ImmediateAppend(n) => TurnExecutionInput::StartImmediateAppend {
+                run_id: oracle_run(n),
+            },
+            OracleStep::PrimitiveApplied(n) => TurnExecutionInput::PrimitiveApplied {
+                run_id: oracle_run(n),
+            },
+            OracleStep::ToolCalls(n, count) => TurnExecutionInput::LlmReturnedToolCalls {
+                run_id: oracle_run(n),
+                tool_count: u32::try_from(count).unwrap(),
+            },
+            OracleStep::RegisterOps(n) => {
+                let (refs, barrier) = oracle_ops();
+                TurnExecutionInput::RegisterPendingOps {
+                    run_id: oracle_run(n),
+                    op_refs: refs.into_iter().collect(),
+                    barrier_operation_ids: barrier.into_iter().collect(),
+                    has_barrier_ops: true,
+                }
+            }
+            OracleStep::ToolsResolved(n) => TurnExecutionInput::ToolCallsResolved {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BarrierSatisfied(n) => TurnExecutionInput::OpsBarrierSatisfied {
+                run_id: oracle_run(n),
+                operation_ids: oracle_ops().1.into_iter().collect(),
+            },
+            OracleStep::BoundaryContinue(n) => TurnExecutionInput::BoundaryContinue {
+                run_id: oracle_run(n),
+            },
+            OracleStep::LlmTerminal(n) => TurnExecutionInput::LlmReturnedTerminal {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BoundaryComplete(n) => TurnExecutionInput::BoundaryComplete {
+                run_id: oracle_run(n),
+            },
+            OracleStep::EnterExtraction(n) => TurnExecutionInput::EnterExtraction {
+                run_id: oracle_run(n),
+                max_retries: 2,
+            },
+            OracleStep::ExtractionStart(n) => TurnExecutionInput::ExtractionStart {
+                run_id: oracle_run(n),
+            },
+            OracleStep::ExtractionRejected(n) => TurnExecutionInput::ExtractionValidationFailed {
+                run_id: oracle_run(n),
+                error: "schema mismatch".into(),
+            },
+            OracleStep::ExtractionPassed(n) => TurnExecutionInput::ExtractionValidationPassed {
+                run_id: oracle_run(n),
+            },
+            OracleStep::Recoverable(n, attempt) => TurnExecutionInput::RecoverableFailure {
+                run_id: oracle_run(n),
+                retry: retry_schedule(attempt),
+            },
+            OracleStep::Retry(n, attempt) => TurnExecutionInput::RetryRequested {
+                run_id: oracle_run(n),
+                retry_attempt: attempt,
+            },
+            OracleStep::Fatal(n) => TurnExecutionInput::FatalFailure {
+                run_id: oracle_run(n),
+                failure: failure_source(TurnFailureSourceKind::Llm, "fatal provider failure"),
+            },
+            OracleStep::CancelNow(n) => TurnExecutionInput::CancelNow {
+                run_id: oracle_run(n),
+            },
+            OracleStep::CancellationObserved(n) => TurnExecutionInput::CancellationObserved {
+                run_id: oracle_run(n),
+            },
+            OracleStep::CancelAfterBoundary(n) => TurnExecutionInput::CancelAfterBoundary {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BudgetExhausted(n) => TurnExecutionInput::BudgetExhausted {
+                run_id: oracle_run(n),
+            },
+            OracleStep::TimeBudgetExceeded(n) => TurnExecutionInput::TimeBudgetExceeded {
+                run_id: oracle_run(n),
+            },
+            OracleStep::TurnLimit(n) => TurnExecutionInput::TurnLimitReached {
+                run_id: oracle_run(n),
+                turn_count: 4,
+                max_turns: 4,
+            },
+            OracleStep::ForceCancelNoRun => TurnExecutionInput::ForceCancelNoRun,
+        }
+    }
+
+    /// #24 P2: applying a typed input while observing the phase yields the
+    /// same effects and the same next phase as applying it and then reading
+    /// the projection, on every generated input of the walk, and the phase
+    /// read alone equals the projection's phase before every input.
+    #[test]
+    fn observing_apply_matches_apply_then_read_on_every_input() {
+        let mut compared = 0_usize;
+        for script in oracle_scripts() {
+            let observing = RuntimeTurnStateHandle::ephemeral();
+            let reading = RuntimeTurnStateHandle::ephemeral();
+            for step in script {
+                assert_eq!(
+                    observing.turn_phase(),
+                    reading.snapshot().turn_phase,
+                    "before {step:?}"
+                );
+                let observed = observing.apply_turn_input_observing_phase(oracle_input(step));
+                let read = reading
+                    .apply_turn_input(oracle_input(step))
+                    .map(|effects| (effects, reading.snapshot().turn_phase));
+                match (observed, read) {
+                    (Ok(observed), Ok(read)) => {
+                        assert_eq!(observed, read, "after {step:?}");
+                        compared += 1;
+                    }
+                    (Err(_), Err(_)) => {}
+                    (observed, read) => {
+                        panic!("{step:?}: observing {observed:?}, reading {read:?}")
+                    }
+                }
+                assert_eq!(observing.snapshot(), reading.snapshot(), "after {step:?}");
+            }
+        }
+        assert!(compared >= 40, "only {compared} inputs were accepted");
     }
 }
