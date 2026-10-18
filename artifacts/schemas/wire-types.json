@@ -135277,6 +135277,24 @@
           "response_id"
         ],
         "type": "object"
+      },
+      {
+        "description": "session discards everything the response staged.",
+        "properties": {
+          "response_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "assistant_turn_failed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "response_id"
+        ],
+        "title": "1883: the provider ended the response without completing it; the",
+        "type": "object"
       }
     ],
     "title": "RealtimeTranscriptEvent"
@@ -167081,6 +167099,24 @@
               "response_id"
             ],
             "type": "object"
+          },
+          {
+            "description": "session discards everything the response staged.",
+            "properties": {
+              "response_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_turn_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id"
+            ],
+            "title": "1883: the provider ended the response without completing it; the",
+            "type": "object"
           }
         ]
       },
@@ -167965,6 +168001,45 @@
           }
         ]
       },
+      "WireLiveResponseFailure": {
+        "description": "Wire mirror of [`LiveResponseFailure`]: how a live response ended without\ncompleting. Route on `status`; `reason`, `code` and `message` repeat what\nthe provider said and are diagnostics only.",
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/$defs/WireLiveResponseFailureStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "WireLiveResponseFailureStatus": {
+        "description": "Wire mirror of [`LiveResponseFailureStatus`].",
+        "enum": [
+          "failed",
+          "incomplete",
+          "in_progress"
+        ],
+        "type": "string"
+      },
       "WireProvider": {
         "description": "Wire-safe projection of [`meerkat_core::Provider`].\n\n`WireProvider` pins each provider's canonical wire name with an explicit\n`#[serde(rename)]` (`\"openai\"`, `\"anthropic\"`, `\"gemini\"`, …). The core\n`Provider` enum now agrees (its `OpenAI` variant carries an explicit\n`#[serde(rename = \"openai\")]` so `rename_all = \"snake_case\"` can no longer\nmangle it into `\"open_a_i\"`); `WireProvider` exists as the dedicated wire\nmirror so SDK consumers get a stable, explicitly-named contract plus the\nfail-loud `Unknown` sentinel below, per the wire-mirror dogma used\nthroughout this module.",
         "oneOf": [
@@ -168601,6 +168676,40 @@
           "observation",
           "debug"
         ],
+        "type": "object"
+      },
+      {
+        "description": "terminal: the channel stays open and the next turn proceeds. Nothing\nof the response is committed and it is not retried. `usage` is the\nresponse's usage when the provider sent one; absent means the\nprovider reported none.",
+        "properties": {
+          "failure": {
+            "$ref": "#/$defs/WireLiveResponseFailure"
+          },
+          "observation": {
+            "const": "turn_failed",
+            "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireTurnUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "failure"
+        ],
+        "title": "1883: the provider ended a response without completing it. Not",
         "type": "object"
       }
     ],

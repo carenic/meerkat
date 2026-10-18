@@ -35,6 +35,69 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-llm-core`: `RealtimeSessionEvent` gains the variant
+  `TurnFailed { response_id, failure, accounting }` (#1883). The enum is
+  exhaustive, so a `match` over it needs the new arm.
+- `meerkat-core`: `RealtimeTranscriptEvent` gains the variant
+  `AssistantTurnFailed { response_id }` (#1883). The enum is exhaustive.
+- `meerkat-core` and `meerkat-machine-kernels`: the generated
+  `RealtimeTranscriptStopReasonKind` gains the variant `Failed`, appended
+  after `Other` (#1883). Both generated copies are exhaustive.
+- `meerkat-live`: `LiveProjectionSink` gains the required method
+  `signal_turn_failed(session_id, response_id, failure, accounting)` (#1883).
+  It has no default body: every sink decides what a failed response
+  discards and records.
+- Storage: a HeadCanonical session that records a failed realtime response
+  writes realtime sidecar event schema 4 (#1883). Meerkat 0.9.3 and earlier
+  refuse such a session with "unsupported realtime event schema 4", so a
+  session cannot be opened by an older binary once a failed realtime response
+  has been recorded in it.
+
+### Added
+
+- `meerkat-core`: `LiveAdapterObservation::TurnFailed`, `LiveResponseFailure`,
+  `LiveResponseFailureStatus` (`failed`, `incomplete`, `in_progress`) and
+  `LiveResponseAccounting` (`measured` usage or the `unmeasured` fact) for a
+  live response that ended without completing (#1883). The wire mirrors are
+  `WireLiveAdapterObservation::TurnFailed` (observation `turn_failed`),
+  `WireLiveResponseFailure`, `WireLiveResponseFailureStatus` and
+  `WireRealtimeTranscriptEvent::AssistantTurnFailed` (event
+  `assistant_turn_failed`). `meerkat-live` routes the observation as
+  `ObservationRouting::SignalTurnFailed` and reports
+  `ObservationOutcome::TurnFailureProjected`. The session seam that records
+  the accounting is `record_live_turn_accounting` on the ephemeral and
+  persistent session services and on the RPC `SessionRuntime`, backed by the
+  provided `SessionAgent::record_external_turn_usage`.
+
+### Fixed
+
+- `meerkat-openai`, `meerkat-live`, `meerkat` and `meerkat-rpc`: an OpenAI
+  realtime response that ends without completing is now a typed failure, not
+  a finished turn (#1883). A `response.done` with status `failed`,
+  `in_progress`, or `incomplete` for a reason other than `max_output_tokens`
+  or `content_filter` used to surface as a completed turn with stop reason
+  `end_turn`, so the session committed the failed response's partial text as
+  an ordinary assistant reply, and a failed response without usage closed the
+  whole live channel. It now surfaces as the `turn_failed` observation with
+  the typed status; the provider's reason, code and message are diagnostics
+  only. The observation is not terminal: the channel stays open, the next
+  turn proceeds, and Meerkat sends no cancel. Both projection sinks commit
+  nothing of the failed response: they record `AssistantTurnFailed`, which
+  discards everything the response staged on every lane, and drop its
+  display-text buffer, so a barge-in after the failure never targets it. A
+  playback terminal waiting on the failed response settles at the failure.
+  The response's usage is charged to the session and the budget when the
+  provider reported it; when it did not, the session event stream carries
+  `turn_usage_accounting_unmeasured` and no counter advances. A failed
+  response is not retried automatically: the client receives the typed
+  failure and decides whether to ask again. The `max_output_tokens`,
+  `content_filter` and cancellation mappings are unchanged. SDKs older than
+  this release do not know the `turn_failed` observation or the
+  `assistant_turn_failed` transcript event, and a decoder that validates the
+  observation type rejects them; upgrade the SDK with the server.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

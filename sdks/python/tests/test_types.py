@@ -6792,6 +6792,7 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
         WireLiveAdapterObservationError,
         WireLiveAdapterObservationReady,
         WireLiveAdapterObservationStatusChanged,
+        WireLiveAdapterObservationTurnFailed,
         WireLiveAdapterObservationTurnInterrupted,
         WireLiveAdapterObservationUserContentCommitted,
     )
@@ -6805,6 +6806,10 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     assert WireLiveAdapterObservationStatusChanged in union_members
     assert WireLiveAdapterObservationTurnInterrupted in union_members
     assert WireLiveAdapterObservationUserContentCommitted in union_members
+    # #1883: a response that ended without completing is its own variant.
+    assert WireLiveAdapterObservationTurnFailed in union_members
+    failed_hints = get_type_hints(WireLiveAdapterObservationTurnFailed)
+    assert get_args(failed_hints["observation"]) == ("turn_failed",)
     # Sanity: each variant is tagged on `observation` with the snake_case
     # discriminator value.
     audio_hints = get_type_hints(WireLiveAdapterObservationAssistantAudioChunk)

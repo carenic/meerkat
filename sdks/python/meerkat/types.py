@@ -175,6 +175,7 @@ from .generated.types import (
     RealtimeTranscriptEventAssistantTranscriptFinalText as RealtimeTranscriptEventAssistantTranscriptFinalText,
     RealtimeTranscriptEventAssistantTurnCompleted as RealtimeTranscriptEventAssistantTurnCompleted,
     RealtimeTranscriptEventAssistantTurnInterrupted as RealtimeTranscriptEventAssistantTurnInterrupted,
+    RealtimeTranscriptEventAssistantTurnFailed as RealtimeTranscriptEventAssistantTurnFailed,
     RealtimeTranscriptRole as RealtimeTranscriptRole,
     # CC5/CC6: typed wire mirrors for the live `capabilities` + `continuity`
     # shapes. Re-exported alongside `LiveOpenResult` so SDK consumers can
@@ -213,6 +214,7 @@ from .generated.types import (
     WireLiveAdapterObservationStatusChanged as WireLiveAdapterObservationStatusChanged,
     WireLiveAdapterObservationError as WireLiveAdapterObservationError,
     WireLiveAdapterObservationCommandRejected as WireLiveAdapterObservationCommandRejected,
+    WireLiveAdapterObservationTurnFailed as WireLiveAdapterObservationTurnFailed,
     WireLiveAdapterStatus as WireLiveAdapterStatus,
     WireLiveAdapterErrorCode as WireLiveAdapterErrorCode,
     WireLiveConfigRejectionReason as WireLiveConfigRejectionReason,

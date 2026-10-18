@@ -489,6 +489,7 @@ export type {
   RealtimeTranscriptEventAssistantTranscriptFinalText,
   RealtimeTranscriptEventAssistantTurnCompleted,
   RealtimeTranscriptEventAssistantTurnInterrupted,
+  RealtimeTranscriptEventAssistantTurnFailed,
   RealtimeTranscriptRole,
   // CC5/CC6: typed wire mirrors for `LiveOpenResult.capabilities` /
   // `.continuity`. Re-exported from the SDK root so TS consumers can do
@@ -521,6 +522,7 @@ export type {
   WireLiveAdapterObservationStatusChanged,
   WireLiveAdapterObservationError,
   WireLiveAdapterObservationCommandRejected,
+  WireLiveAdapterObservationTurnFailed,
   WireLiveAdapterStatus,
   WireLiveAdapterErrorCode,
   WireLiveConfigRejectionReason,

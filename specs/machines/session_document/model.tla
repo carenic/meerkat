@@ -42,7 +42,7 @@ resume_reject_provider_requires_model(provider_override_present, model_override_
 tail_has_pending_boundary(session_tail) == (IF (session_tail = "User") THEN TRUE ELSE (session_tail = "ToolResults"))
 realtime_stop_reason_records_completion(stop_reason) == (stop_reason = "Other")
 realtime_stop_reason_removes_completion(stop_reason) == (stop_reason = "ToolUse")
-realtime_stop_reason_discards(stop_reason) == (stop_reason = "Cancelled")
+realtime_stop_reason_discards(stop_reason) == (IF (stop_reason = "Cancelled") THEN TRUE ELSE (stop_reason = "Failed"))
 realtime_should_mark_ready_after_write(response_completed, text_after_write_present) == (response_completed /\ text_after_write_present)
 realtime_lane_accepts(item_has_text, current_lane, requested_lane) == (IF (current_lane = requested_lane) THEN TRUE ELSE (item_has_text = FALSE))
 realtime_delta_is_duplicate(delta_id_present, delta_id_seen) == (delta_id_present /\ delta_id_seen)

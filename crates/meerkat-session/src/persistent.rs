@@ -8079,6 +8079,31 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(())
     }
 
+    /// Record the accounting of a live response that ended without
+    /// completing (#1883). Measured usage advances the session, which is then
+    /// persisted; an unmeasured response only publishes its fact.
+    pub async fn record_live_turn_accounting(
+        &self,
+        id: &SessionId,
+        accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+    ) -> Result<(), SessionError> {
+        if !matches!(
+            accounting,
+            meerkat_core::live_adapter::LiveResponseAccounting::Measured { .. }
+        ) {
+            return self.inner.record_live_turn_accounting(id, accounting).await;
+        }
+        let _mutation_guard = self.live_persist_mutation_guard(id).await?;
+        self.inner
+            .record_live_turn_accounting(id, accounting)
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn append_realtime_transcript_event(
         &self,
         id: &SessionId,

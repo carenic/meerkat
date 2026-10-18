@@ -6692,6 +6692,18 @@ impl SessionRuntime {
             .await
     }
 
+    /// Record the accounting of a live response that ended without
+    /// completing (#1883): its usage, or the routed unmeasured fact.
+    pub async fn record_live_turn_accounting(
+        &self,
+        session_id: &SessionId,
+        accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+    ) -> Result<(), SessionError> {
+        self.service
+            .record_live_turn_accounting(session_id, accounting)
+            .await
+    }
+
     /// Record a live transport output-audio delivery degradation, routing
     /// the typed fact onto the session's owned event stream via the canonical
     /// [`SessionService::record_live_output_audio_degraded`] seam (K16).

@@ -944,6 +944,15 @@ impl SessionAgent for FactoryAgent {
         Ok(assistant_message_id)
     }
 
+    fn record_external_turn_usage(
+        &mut self,
+        usage: meerkat_core::TurnUsage,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        self.agent.session_mut().record_turn_usage(&usage);
+        self.agent.budget().record_turn_usage(&usage);
+        Ok(())
+    }
+
     fn append_realtime_transcript_event(
         &mut self,
         event: meerkat_core::RealtimeTranscriptEvent,

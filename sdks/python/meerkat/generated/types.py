@@ -5686,7 +5686,11 @@ class RealtimeTranscriptEventAssistantTurnInterrupted(TypedDict, total=False):
     response_id: Required[str]
     type: Required[Literal['assistant_turn_interrupted']]
 
-RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted
+class RealtimeTranscriptEventAssistantTurnFailed(TypedDict, total=False):
+    response_id: Required[str]
+    type: Required[Literal['assistant_turn_failed']]
+
+RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted | RealtimeTranscriptEventAssistantTurnFailed
 
 # Provider-neutral role for a realtime transcript item.
 RealtimeTranscriptRole = Literal['user', 'assistant']
@@ -6022,7 +6026,13 @@ class WireLiveAdapterObservationUnknown(TypedDict, total=False):
     debug: Required[str]
     observation: Required[Literal['unknown']]
 
-WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown
+class WireLiveAdapterObservationTurnFailed(TypedDict, total=False):
+    failure: Required[dict[str, Any]]
+    observation: Required[Literal['turn_failed']]
+    response_id: NotRequired[Optional[str]]
+    usage: NotRequired[Optional[dict[str, Any]]]
+
+WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown | WireLiveAdapterObservationTurnFailed
 
 @dataclass
 class RuntimeAcceptResult:

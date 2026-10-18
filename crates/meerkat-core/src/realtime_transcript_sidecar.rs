@@ -35,6 +35,10 @@ use std::sync::Arc;
 pub const REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1: u16 = 1;
 pub const REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V2: u16 = 2;
 pub const REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3: u16 = 3;
+/// Schema 4 adds [`RealtimeTranscriptEvent::AssistantTurnFailed`] (#1883). A
+/// reader that predates it refuses the whole sidecar rather than replay a
+/// failed response as anything else.
+pub const REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4: u16 = 4;
 
 /// Exceptional operation that authorizes a full realtime projection reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -234,6 +238,7 @@ impl SessionRealtimeTranscriptProjection {
                     REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1
                         | REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V2
                         | REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3
+                        | REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4
                 ) {
                     return Err(RealtimeTranscriptSidecarError::Incoherent(format!(
                         "unsupported realtime event schema {schema}"
@@ -418,6 +423,9 @@ fn serialize_record(
 }
 
 fn record_schema(record: &RealtimeTranscriptSidecarRecord) -> u16 {
+    if record_carries_failed_turn(record) {
+        return REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4;
+    }
     match record {
         RealtimeTranscriptSidecarRecord::ObservationEventV3 { .. } => {
             REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3
@@ -436,6 +444,20 @@ fn record_schema(record: &RealtimeTranscriptSidecarRecord) -> u16 {
             REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V2
         }
         _ => REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1,
+    }
+}
+
+fn record_carries_failed_turn(record: &RealtimeTranscriptSidecarRecord) -> bool {
+    match record {
+        RealtimeTranscriptSidecarRecord::EventV1 { event }
+        | RealtimeTranscriptSidecarRecord::ChannelEventV2 { event, .. }
+        | RealtimeTranscriptSidecarRecord::ObservationEventV3 { event, .. } => matches!(
+            event.payload(),
+            RealtimeTranscriptEvent::AssistantTurnFailed { .. }
+        ),
+        RealtimeTranscriptSidecarRecord::SnapshotV1 { .. }
+        | RealtimeTranscriptSidecarRecord::PendingUserContentBlobStagedV1 { .. }
+        | RealtimeTranscriptSidecarRecord::PendingUserContentBlobClearedV1 { .. } => false,
     }
 }
 
@@ -1139,6 +1161,88 @@ mod tests {
                 .acknowledge_suffix(&prepared, &different)
                 .is_err(),
             "a different committed successor must not be laundered as a retry"
+        );
+    }
+
+    #[test]
+    fn failed_turn_round_trips_under_schema_v4() {
+        let session_id = SessionId::new();
+        let mut producer = SessionRealtimeTranscriptProjection::empty(&session_id);
+        let _ = producer
+            .apply_event(RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "partial speech".to_string(),
+            })
+            .expect("stage speech");
+        let _ = producer
+            .apply_event(RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".to_string(),
+            })
+            .expect("record the failure");
+        let suffix = producer.prepare_suffix().expect("prepare").expect("suffix");
+        assert_eq!(
+            suffix.events()[0].schema_version(),
+            REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1
+        );
+        assert_eq!(
+            suffix.events()[1].schema_version(),
+            REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4
+        );
+        assert!(
+            suffix.events()[1]
+                .decode_payload::<RealtimeTranscriptSidecarRecord>(
+                    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3
+                )
+                .is_err(),
+            "a schema 3 reader must refuse a failed-turn record"
+        );
+        let verified = verified_sequence(suffix.successor().clone(), suffix.events());
+        let restored =
+            SessionRealtimeTranscriptProjection::from_verified_sequence(&session_id, &verified)
+                .expect("schema 4 replay");
+        assert!(
+            realtime_transcript_revision::in_flight_realtime_assistant_response_ids(
+                restored.state()
+            )
+            .is_empty(),
+            "the replayed failure still discards the response"
+        );
+    }
+
+    #[test]
+    fn failed_turn_stamped_with_schema_v3_is_refused() {
+        let session_id = SessionId::new();
+        let mis_stamped = SerializedComponentEvent::canonical_json(
+            REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3,
+            &RealtimeTranscriptSidecarRecord::EventV1 {
+                event: RealtimeTranscriptEvent::AssistantTurnFailed {
+                    response_id: "resp_failed".to_string(),
+                },
+            },
+        )
+        .expect("serialize a mis-stamped record");
+        let crafted = PreparedComponentEventSuffix::prepare(
+            ComponentEventPrefixAuthority::empty(
+                session_id.clone(),
+                SessionComponentKind::Realtime,
+            ),
+            vec![mis_stamped],
+        )
+        .expect("syntactically valid sequence");
+        let verified = verified_sequence(crafted.successor().clone(), crafted.events());
+        let refused =
+            SessionRealtimeTranscriptProjection::from_verified_sequence(&session_id, &verified);
+        assert!(
+            matches!(
+                refused,
+                Err(RealtimeTranscriptSidecarError::Incoherent(ref message))
+                    if message.contains("does not match schema")
+            ),
+            "{refused:?}"
         );
     }
 

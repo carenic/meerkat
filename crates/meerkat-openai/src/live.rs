@@ -9,6 +9,9 @@ use meerkat_contracts::{
     RealtimeAudioChunk, RealtimeAudioFormat, RealtimeCapabilities, RealtimeInputChunk,
     RealtimeInputKind, RealtimeOutputKind, RealtimeTurningMode,
 };
+use meerkat_core::live_adapter::{
+    LiveResponseAccounting, LiveResponseFailure, LiveResponseFailureStatus,
+};
 use meerkat_core::realtime_transcript::{AppendRealtimeTranscript, TranscriptLane};
 use meerkat_core::{
     ContentBlock, ImageData, InteractionId, Message, Provider, RealtimeOpenProjectionAdmission,
@@ -16,7 +19,7 @@ use meerkat_core::{
     RealtimeUserContentIdentity, RealtimeUserContentTombstone, ToolCallId, ToolDef, ToolName,
     ToolResult,
 };
-use meerkat_core::{StopReason, TurnUsage, types::Usage};
+use meerkat_core::{StopReason, TurnUsage, UnmeasuredTurnUsageAccounting, types::Usage};
 use meerkat_llm_core::LlmError;
 use meerkat_llm_core::realtime_session::{
     RealtimeExternalSessionTarget, RealtimeSession, RealtimeSessionEvent, RealtimeSessionFactory,
@@ -2750,26 +2753,41 @@ impl OpenAiRealtimeSession {
                     "response.done surfaced status={:?} observed_tool_call={observed_tool_call}",
                     response.status
                 ));
-                let stop_reason = openai_response_stop_reason(&response, observed_tool_call);
                 let response_id = response.id.clone();
-                let turn_completed = RealtimeSessionEvent::TurnCompleted {
-                    response_id,
-                    stop_reason,
-                    usage: openai_response_usage(
-                        response.usage.as_ref(),
-                        self.current_model_id
-                            .as_deref()
-                            .unwrap_or(OPENAI_CANONICAL_REALTIME_MODEL),
-                    )?,
-                };
-                if matches!(
-                    response.status,
-                    oai_rt_rs::protocol::models::ResponseStatus::Cancelled
-                ) {
-                    Some(self.normalize_cancelled_response_terminal(&response)?)
-                } else {
-                    self.response_interrupt_emitted = false;
-                    Some(turn_completed)
+                let model = self
+                    .current_model_id
+                    .as_deref()
+                    .unwrap_or(OPENAI_CANONICAL_REALTIME_MODEL);
+                match openai_response_outcome(&response, observed_tool_call) {
+                    // #1883: a response that ended without completing is a
+                    // typed failure, never a finished turn. A failed
+                    // response's missing usage is the unmeasured fact, not
+                    // a reason to close the channel, and nothing retries it.
+                    Err(failure) => {
+                        let accounting = openai_response_accounting(response.usage.as_ref(), model);
+                        self.response_interrupt_emitted = false;
+                        Some(RealtimeSessionEvent::TurnFailed {
+                            response_id,
+                            failure,
+                            accounting,
+                        })
+                    }
+                    Ok(stop_reason) => {
+                        let turn_completed = RealtimeSessionEvent::TurnCompleted {
+                            response_id,
+                            stop_reason,
+                            usage: openai_response_usage(response.usage.as_ref(), model)?,
+                        };
+                        if matches!(
+                            response.status,
+                            oai_rt_rs::protocol::models::ResponseStatus::Cancelled
+                        ) {
+                            Some(self.normalize_cancelled_response_terminal(&response)?)
+                        } else {
+                            self.response_interrupt_emitted = false;
+                            Some(turn_completed)
+                        }
+                    }
                 }
             }
             ServerEvent::ResponseCancelled { response, .. } => {
@@ -3942,10 +3960,16 @@ impl RealtimeSession for OpenAiRealtimeSession {
     }
 }
 
-fn openai_response_stop_reason(
+/// How one `response.done` ended: the stop reason of a completed turn, or the
+/// typed failure of a response that ended without completing (#1883).
+///
+/// Only `max_output_tokens` and `content_filter` make an incomplete response a
+/// completed turn; any other reason, a failed status and a response still
+/// reported in progress are failures.
+fn openai_response_outcome(
     response: &oai_rt_rs::protocol::models::Response,
     observed_tool_call: bool,
-) -> StopReason {
+) -> Result<StopReason, LiveResponseFailure> {
     use oai_rt_rs::protocol::models::ResponseStatus;
 
     match response.status {
@@ -3957,22 +3981,64 @@ fn openai_response_stop_reason(
                     })
                 });
             if has_tool_calls {
-                StopReason::ToolUse
+                Ok(StopReason::ToolUse)
             } else {
-                StopReason::EndTurn
+                Ok(StopReason::EndTurn)
             }
         }
-        ResponseStatus::Cancelled => StopReason::Cancelled,
+        ResponseStatus::Cancelled => Ok(StopReason::Cancelled),
         ResponseStatus::Incomplete => match response
             .status_details
             .as_ref()
             .and_then(|details| details.reason.as_deref())
         {
-            Some("max_output_tokens") => StopReason::MaxTokens,
-            Some("content_filter") => StopReason::ContentFilter,
-            _ => StopReason::EndTurn,
+            Some("max_output_tokens") => Ok(StopReason::MaxTokens),
+            Some("content_filter") => Ok(StopReason::ContentFilter),
+            _ => Err(openai_response_failure(
+                response,
+                LiveResponseFailureStatus::Incomplete,
+            )),
         },
-        ResponseStatus::Failed | ResponseStatus::InProgress => StopReason::EndTurn,
+        ResponseStatus::Failed => Err(openai_response_failure(
+            response,
+            LiveResponseFailureStatus::Failed,
+        )),
+        ResponseStatus::InProgress => Err(openai_response_failure(
+            response,
+            LiveResponseFailureStatus::InProgress,
+        )),
+    }
+}
+
+/// The typed failure of `response`. The provider's reason, error code and
+/// message are carried as diagnostics only.
+fn openai_response_failure(
+    response: &oai_rt_rs::protocol::models::Response,
+    status: LiveResponseFailureStatus,
+) -> LiveResponseFailure {
+    let details = response.status_details.as_ref();
+    let error = details.and_then(|details| details.error.as_ref());
+    LiveResponseFailure {
+        status,
+        reason: details.and_then(|details| details.reason.clone()),
+        code: error.and_then(|error| error.code.clone()),
+        message: error.map(|error| error.message.clone()),
+    }
+}
+
+/// The accounting of a failed response: its usage when the provider sent
+/// one, otherwise the fact that it sent none.
+fn openai_response_accounting(
+    usage: Option<&oai_rt_rs::protocol::models::Usage>,
+    model: &str,
+) -> LiveResponseAccounting {
+    match usage {
+        Some(usage) => LiveResponseAccounting::Measured {
+            usage: openai_turn_usage(usage, model),
+        },
+        None => LiveResponseAccounting::Unmeasured {
+            unmeasured: UnmeasuredTurnUsageAccounting::new(Provider::OpenAI, model),
+        },
     }
 }
 
@@ -3983,6 +4049,10 @@ fn openai_response_usage(
     let usage = usage.ok_or_else(|| LlmError::IncompleteResponse {
         message: "openai realtime terminal response omitted usage accounting".to_string(),
     })?;
+    Ok(openai_turn_usage(usage, model))
+}
+
+fn openai_turn_usage(usage: &oai_rt_rs::protocol::models::Usage, model: &str) -> TurnUsage {
     let raw = Usage {
         input_tokens: u64::from(usage.input_tokens),
         output_tokens: u64::from(usage.output_tokens),
@@ -3991,10 +4061,10 @@ fn openai_response_usage(
         reasoning_tokens: None,
         provider_accounting: None,
     };
-    Ok(TurnUsage::new(
+    TurnUsage::new(
         raw,
         meerkat_core::ProviderTokenAccounting::openai(model, u64::from(usage.input_tokens)),
-    ))
+    )
 }
 
 /// Provider-neutral realtime session factory backed by OpenAI sideband sessions.
@@ -4602,7 +4672,8 @@ fn realtime_transcript_payload_bytes(event: &RealtimeTranscriptEvent) -> usize {
         | RealtimeTranscriptEvent::AssistantPlaybackTerminalObserved { .. }
         | RealtimeTranscriptEvent::AssistantPlaybackTerminalSettled { .. }
         | RealtimeTranscriptEvent::AssistantTurnCompleted { .. }
-        | RealtimeTranscriptEvent::AssistantTurnInterrupted { .. } => 0,
+        | RealtimeTranscriptEvent::AssistantTurnInterrupted { .. }
+        | RealtimeTranscriptEvent::AssistantTurnFailed { .. } => 0,
     }
 }
 
@@ -4623,6 +4694,12 @@ fn control_observation_payload_bytes(observation: &LiveAdapterObservation) -> us
         }
         LiveAdapterObservation::Error { message, .. }
         | LiveAdapterObservation::CommandRejected { message, .. } => message.len(),
+        LiveAdapterObservation::TurnFailed { failure, .. } => {
+            [&failure.reason, &failure.code, &failure.message]
+                .into_iter()
+                .map(|text| text.as_deref().map_or(0, str::len))
+                .sum()
+        }
         _ => 0,
     }
 }
@@ -6356,6 +6433,15 @@ fn translate_realtime_event(event: RealtimeSessionEvent) -> LiveAdapterObservati
             stop_reason,
             usage,
         },
+        RealtimeSessionEvent::TurnFailed {
+            response_id,
+            failure,
+            accounting,
+        } => LiveAdapterObservation::TurnFailed {
+            response_id: Some(response_id),
+            failure,
+            accounting,
+        },
         RealtimeSessionEvent::Interrupted { response_id } => {
             // G4 (P1): plumb the in-flight provider response id through so
             // the projection sink can bind the truncation to the right
@@ -6437,6 +6523,9 @@ mod tests {
     use meerkat_contracts::{
         RealtimeAudioChunk, RealtimeInputChunk, RealtimeInputKind, RealtimeOutputKind,
         RealtimeTextChunk, RealtimeTurningMode,
+    };
+    use meerkat_core::live_adapter::{
+        LiveResponseAccounting, LiveResponseFailure, LiveResponseFailureStatus,
     };
     use meerkat_core::{Message, Provider, SessionLlmIdentity, ToolDef, ToolResult};
     use meerkat_llm_core::realtime_session::{
@@ -10487,6 +10576,345 @@ mod tests {
         );
     }
 
+    /// #1883: map one `response.done` for the current turn. The response is
+    /// made current by `response.created` first, then ends with `status` and
+    /// `status_details`; `with_usage` false omits its usage block.
+    fn map_terminal_response_done(
+        status: ResponseStatus,
+        status_details: Option<oai_rt_rs::protocol::models::ResponseStatusDetails>,
+        with_usage: bool,
+    ) -> (
+        OpenAiRealtimeSession,
+        Result<Option<RealtimeSessionEvent>, LlmError>,
+    ) {
+        let mut session = OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                next_events: Arc::new(Mutex::new(VecDeque::new())),
+            }),
+            RealtimeTurningMode::ProviderManaged,
+        );
+        let _ = session
+            .map_server_event(ServerEvent::ResponseCreated {
+                event_id: "evt_created".to_string(),
+                response: fake_response("resp_terminal", ResponseStatus::InProgress),
+            })
+            .expect("response.created should map");
+        let mut response = fake_response("resp_terminal", status);
+        response.status_details = status_details;
+        if !with_usage {
+            response.usage = None;
+        }
+        let done = session.map_server_event(ServerEvent::ResponseDone {
+            event_id: "evt_done".to_string(),
+            response,
+        });
+        (session, done)
+    }
+
+    fn provider_failure_details() -> oai_rt_rs::protocol::models::ResponseStatusDetails {
+        oai_rt_rs::protocol::models::ResponseStatusDetails {
+            reason: None,
+            error: Some(ServerError {
+                error_type: ApiErrorType::ServerError,
+                code: Some("server_error".to_string()),
+                message: "The server had an error while processing the response".to_string(),
+                param: None,
+                event_id: None,
+            }),
+        }
+    }
+
+    fn incomplete_details(reason: &str) -> oai_rt_rs::protocol::models::ResponseStatusDetails {
+        oai_rt_rs::protocol::models::ResponseStatusDetails {
+            reason: Some(reason.to_string()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn failed_response_done_is_not_reported_as_a_completed_turn() {
+        let (_, done) = map_terminal_response_done(
+            ResponseStatus::Failed,
+            Some(provider_failure_details()),
+            true,
+        );
+        let done = done.expect("a failed response.done maps without closing the channel");
+        assert!(
+            !matches!(done, Some(RealtimeSessionEvent::TurnCompleted { .. })),
+            "a failed response is not a completed turn: {done:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_response_done_for_an_unmapped_reason_is_not_reported_as_a_completed_turn() {
+        let (_, done) = map_terminal_response_done(
+            ResponseStatus::Incomplete,
+            Some(incomplete_details("reason_meerkat_does_not_map")),
+            true,
+        );
+        let done = done.expect("an incomplete response.done maps without closing the channel");
+        assert!(
+            !matches!(done, Some(RealtimeSessionEvent::TurnCompleted { .. })),
+            "an incomplete response with an unmapped reason is not a completed turn: {done:?}"
+        );
+    }
+
+    #[test]
+    fn in_progress_response_done_is_not_reported_as_a_completed_turn() {
+        let (_, done) = map_terminal_response_done(ResponseStatus::InProgress, None, true);
+        let done = done.expect("an in_progress response.done maps without closing the channel");
+        assert!(
+            !matches!(done, Some(RealtimeSessionEvent::TurnCompleted { .. })),
+            "a response that ended in progress is not a completed turn: {done:?}"
+        );
+    }
+
+    #[test]
+    fn failed_response_done_without_usage_keeps_the_channel_open() {
+        let (_, done) = map_terminal_response_done(
+            ResponseStatus::Failed,
+            Some(provider_failure_details()),
+            false,
+        );
+        assert!(
+            done.is_ok(),
+            "a failed response without usage must not become a terminal channel error: {done:?}"
+        );
+    }
+
+    #[test]
+    fn incomplete_response_done_for_mapped_reasons_keeps_its_stop_reason() {
+        for (reason, expected) in [
+            ("max_output_tokens", StopReason::MaxTokens),
+            ("content_filter", StopReason::ContentFilter),
+        ] {
+            let (_, done) = map_terminal_response_done(
+                ResponseStatus::Incomplete,
+                Some(incomplete_details(reason)),
+                true,
+            );
+            match done.expect("incomplete response.done maps") {
+                Some(RealtimeSessionEvent::TurnCompleted { stop_reason, .. }) => {
+                    assert_eq!(stop_reason, expected, "{reason}");
+                }
+                other => panic!("{reason} must stay a completed turn: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn failed_response_done_surfaces_a_typed_turn_failure_and_the_next_turn_proceeds() {
+        let (mut session, done) = map_terminal_response_done(
+            ResponseStatus::Failed,
+            Some(provider_failure_details()),
+            true,
+        );
+        match done.expect("failed response.done maps") {
+            Some(RealtimeSessionEvent::TurnFailed {
+                response_id,
+                failure,
+                accounting,
+            }) => {
+                assert_eq!(response_id, "resp_terminal");
+                assert_eq!(
+                    failure,
+                    LiveResponseFailure {
+                        status: LiveResponseFailureStatus::Failed,
+                        reason: None,
+                        code: Some("server_error".to_string()),
+                        message: Some(
+                            "The server had an error while processing the response".to_string()
+                        ),
+                    }
+                );
+                let LiveResponseAccounting::Measured { usage } = accounting else {
+                    panic!("the usage the provider sent is measured: {accounting:?}");
+                };
+                assert_eq!(usage.accounting().provider, Provider::OpenAI);
+                assert_eq!(usage.accounting().model, OPENAI_CANONICAL_REALTIME_MODEL);
+            }
+            other => panic!("a failed response.done surfaces TurnFailed: {other:?}"),
+        }
+        assert!(
+            !session.response_interrupt_emitted,
+            "the barge-in latch resets at a failed terminal"
+        );
+
+        let _ = session
+            .map_server_event(ServerEvent::ResponseCreated {
+                event_id: "evt_created_next".to_string(),
+                response: fake_response("resp_next", ResponseStatus::InProgress),
+            })
+            .expect("the next response.created maps");
+        let next = session
+            .map_server_event(ServerEvent::ResponseDone {
+                event_id: "evt_done_next".to_string(),
+                response: fake_response("resp_next", ResponseStatus::Completed),
+            })
+            .expect("the next response.done maps");
+        assert!(
+            matches!(
+                next,
+                Some(RealtimeSessionEvent::TurnCompleted {
+                    ref response_id,
+                    stop_reason: StopReason::EndTurn,
+                    ..
+                }) if response_id == "resp_next"
+            ),
+            "the next turn completes normally: {next:?}"
+        );
+    }
+
+    #[test]
+    fn failed_response_done_without_usage_reports_unmeasured_accounting() {
+        let (_, done) = map_terminal_response_done(
+            ResponseStatus::Failed,
+            Some(provider_failure_details()),
+            false,
+        );
+        match done.expect("failed response.done maps") {
+            Some(RealtimeSessionEvent::TurnFailed { accounting, .. }) => assert_eq!(
+                accounting,
+                LiveResponseAccounting::Unmeasured {
+                    unmeasured: UnmeasuredTurnUsageAccounting::new(
+                        Provider::OpenAI,
+                        OPENAI_CANONICAL_REALTIME_MODEL,
+                    ),
+                }
+            ),
+            other => panic!("a failed response.done surfaces TurnFailed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_and_in_progress_terminals_surface_typed_failures() {
+        for (status, details, expected) in [
+            (
+                ResponseStatus::Incomplete,
+                Some(incomplete_details("reason_meerkat_does_not_map")),
+                LiveResponseFailure {
+                    status: LiveResponseFailureStatus::Incomplete,
+                    reason: Some("reason_meerkat_does_not_map".to_string()),
+                    code: None,
+                    message: None,
+                },
+            ),
+            (
+                ResponseStatus::InProgress,
+                None,
+                LiveResponseFailure {
+                    status: LiveResponseFailureStatus::InProgress,
+                    reason: None,
+                    code: None,
+                    message: None,
+                },
+            ),
+        ] {
+            let (_, done) = map_terminal_response_done(status, details, true);
+            match done.expect("terminal response.done maps") {
+                Some(RealtimeSessionEvent::TurnFailed { failure, .. }) => {
+                    assert_eq!(failure, expected);
+                }
+                other => panic!("{status:?} surfaces TurnFailed: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn turn_failed_translates_to_a_turn_failed_observation() {
+        let failure = LiveResponseFailure {
+            status: LiveResponseFailureStatus::Failed,
+            reason: None,
+            code: Some("server_error".to_string()),
+            message: Some("provider failed".to_string()),
+        };
+        let accounting = LiveResponseAccounting::Unmeasured {
+            unmeasured: UnmeasuredTurnUsageAccounting::new(
+                Provider::OpenAI,
+                OPENAI_CANONICAL_REALTIME_MODEL,
+            ),
+        };
+        assert_eq!(
+            translate_realtime_event(RealtimeSessionEvent::TurnFailed {
+                response_id: "resp_failed".to_string(),
+                failure: failure.clone(),
+                accounting: accounting.clone(),
+            }),
+            LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".to_string()),
+                failure,
+                accounting,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn barge_in_after_a_failed_response_never_targets_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut session = OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::clone(&seen),
+                next_events: Arc::new(Mutex::new(VecDeque::new())),
+            }),
+            RealtimeTurningMode::ProviderManaged,
+        );
+        let _ = session
+            .map_server_event(ServerEvent::ResponseCreated {
+                event_id: "evt_created".to_string(),
+                response: fake_response("resp_failed", ResponseStatus::InProgress),
+            })
+            .expect("response.created maps");
+        let _ = session
+            .map_server_event(ServerEvent::ResponseOutputAudioDelta {
+                event_id: "evt_audio".to_string(),
+                response_id: "resp_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                output_index: 0,
+                content_index: 0,
+                delta: "AAEC".to_string(),
+            })
+            .expect("audio delta maps");
+        let mut failed = fake_response("resp_failed", ResponseStatus::Failed);
+        failed.status_details = Some(provider_failure_details());
+        let done = session
+            .map_server_event(ServerEvent::ResponseDone {
+                event_id: "evt_done".to_string(),
+                response: failed,
+            })
+            .expect("failed response.done maps");
+        assert!(
+            matches!(done, Some(RealtimeSessionEvent::TurnFailed { .. })),
+            "{done:?}"
+        );
+
+        let speech = session
+            .map_server_event(ServerEvent::InputAudioBufferSpeechStarted {
+                event_id: "evt_speech".to_string(),
+                audio_start_ms: 10,
+                item_id: "item_user".to_string(),
+            })
+            .expect("speech_started maps");
+        assert!(
+            !matches!(speech, Some(RealtimeSessionEvent::Interrupted { .. })),
+            "user speech after a failed response interrupts nothing: {speech:?}"
+        );
+        session.interrupt().await.expect("interrupt sends");
+        let seen = seen.lock().await;
+        let cancel_targets: Vec<Option<String>> = seen
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::ResponseCancel { response_id, .. } => Some(response_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancel_targets,
+            vec![None],
+            "a barge-in after a failed response never targets it"
+        );
+    }
+
     #[tokio::test]
     async fn stale_response_done_after_new_commit_is_suppressed_until_new_response_starts() {
         let mut session = OpenAiRealtimeSession::new(
@@ -10645,12 +11073,12 @@ mod tests {
     fn observed_tool_call_forces_tool_use_stop_reason_when_response_output_is_empty() {
         let response = fake_response("resp_tool", ResponseStatus::Completed);
         assert_eq!(
-            openai_response_stop_reason(&response, true),
-            StopReason::ToolUse
+            openai_response_outcome(&response, true),
+            Ok(StopReason::ToolUse)
         );
         assert_eq!(
-            openai_response_stop_reason(&response, false),
-            StopReason::EndTurn
+            openai_response_outcome(&response, false),
+            Ok(StopReason::EndTurn)
         );
     }
 

@@ -894,7 +894,7 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RealtimeTranscriptStopReasonKind",
-                &["Cancelled", "ToolUse", "Other"],
+                &["Cancelled", "ToolUse", "Other", "Failed"],
             ),
             NamedTypeBinding::string_enum(
                 "RealtimeTranscriptMaterializeDecision",

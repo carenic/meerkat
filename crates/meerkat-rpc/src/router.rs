@@ -15188,6 +15188,133 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         assert_eq!(origin.provider_item_ids(), ["item_spoken".to_string()]);
     }
 
+    /// #1883: through the production RPC sink, a failed response commits
+    /// nothing it staged and records its accounting, and the next response
+    /// on the same channel commits normally.
+    #[tokio::test]
+    async fn live_host_failed_response_commits_nothing_through_the_rpc_sink() {
+        let (router, _notif_rx) = test_router().await;
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({"prompt": "live fixture session"}),
+            ))
+            .await
+            .expect("session/create response");
+        assert!(create.error.is_none(), "session/create failed: {create:?}");
+        let session_id = SessionId::parse(
+            result_value(&create)["session_id"]
+                .as_str()
+                .expect("session_id"),
+        )
+        .expect("canonical session id");
+
+        let host = meerkat_live::LiveAdapterHost::new(Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        ));
+        let channel_id = meerkat_live::LiveChannelId::random_uuid();
+        let identity = meerkat_core::SessionLlmIdentity {
+            model: "gpt-realtime-2".to_string(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        };
+        let authority = router
+            .runtime_adapter
+            .resolve_live_open_admission(&session_id, &channel_id, &identity)
+            .await
+            .expect("machine admits fixture channel");
+        host.open_channel_with_authority(
+            authority
+                .channel_open_authority()
+                .expect("generated host open handoff"),
+        )
+        .await
+        .expect("open live channel");
+
+        let spoken = |response_id: &str, item_id: &str, delta: &str| {
+            meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id: Some(item_id.to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some(response_id.to_string()),
+                delta_id: Some(format!("{item_id}-delta")),
+                delta: delta.to_string(),
+            }
+        };
+        host.apply_observation(
+            &channel_id,
+            &spoken("resp_failed", "item_failed", "partial speech"),
+        )
+        .await
+        .expect("spoken delta applies");
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".to_string()),
+                failure: meerkat_core::live_adapter::LiveResponseFailure {
+                    status: meerkat_core::live_adapter::LiveResponseFailureStatus::Incomplete,
+                    reason: Some("provider_reason".to_string()),
+                    code: None,
+                    message: None,
+                },
+                accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                    unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                    ),
+                },
+            },
+        )
+        .await
+        .expect("a failed response projects through the RPC sink");
+        host.apply_observation(
+            &channel_id,
+            &spoken("resp_next", "item_next", "next answer"),
+        )
+        .await
+        .expect("the next response stages");
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnCompleted {
+                response_id: Some("resp_next".to_string()),
+                stop_reason: meerkat_core::types::StopReason::EndTurn,
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Other,
+                    "rpc-turn-failed-test",
+                    meerkat_core::types::Usage::default(),
+                ),
+            },
+        )
+        .await
+        .expect("the next response completes");
+
+        let history = router
+            .runtime
+            .read_session_history_rich(
+                &session_id,
+                meerkat_core::service::SessionHistoryQuery {
+                    offset: 0,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("history reads")
+            .expect("session exists");
+        let rendered = serde_json::to_string(&history.messages).expect("history serializes");
+        assert!(
+            !rendered.contains("partial speech"),
+            "nothing of the failed response is committed: {rendered}"
+        );
+        assert!(
+            rendered.contains("next answer"),
+            "the next response commits normally: {rendered}"
+        );
+    }
+
     /// Create a real, materialized session through `session/create` (its
     /// initial turn runs against the mock LLM). This is the state every live
     /// channel's session is in by the time `live/open` admits a channel:

@@ -371,6 +371,15 @@ event with `reason.kind: "stream_lagged"` and `reason.dropped`, then continues
 from the retained tail. This reports a gap in that subscriber's view, not a
 truncated transcript or durable event log.
 
+A response the provider ends without completing it arrives as a
+`turn_failed` observation. Route on `failure.status` (`failed`, `incomplete`
+or `in_progress`); the provider's `reason`, `code` and `message` are
+diagnostics only. It is not terminal: the channel stays open and the next turn
+proceeds. Nothing of the failed response is committed to the transcript, and
+Meerkat does not retry it; the client decides whether to ask again. Its
+`usage`, when present, is charged to the session; when it is absent, the
+session event stream carries `turn_usage_accounting_unmeasured` instead.
+
 Built-in realm-backed persistent sessions can feed a separate durable event
 audit projector through an unbounded queue independent of the UI ring. The
 audit projection is asynchronous derived state, so when event evidence matters,

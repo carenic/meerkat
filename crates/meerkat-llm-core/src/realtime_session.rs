@@ -8,6 +8,7 @@ use meerkat_contracts::{
     RealtimeAudioChunk, RealtimeCapabilities, RealtimeInputChunk, RealtimeTurningMode,
     RealtimeVideoChunk,
 };
+use meerkat_core::live_adapter::{LiveResponseAccounting, LiveResponseFailure};
 use meerkat_core::{
     Provider, RealtimeTranscriptEvent, RealtimeUserContentIdentity, RealtimeUserContentTombstone,
     ToolResult,
@@ -159,6 +160,17 @@ pub enum RealtimeSessionEvent {
         text: String,
         stop_reason: StopReason,
         usage: Usage,
+    },
+    /// #1883: the provider ended a response without completing it (OpenAI:
+    /// `response.done` with status `failed`, `in_progress`, or `incomplete`
+    /// for a reason that maps to no stop reason). Not a finished turn, and
+    /// not terminal for the session: nothing of the response is committed
+    /// and nothing retries it. `accounting` is the response's usage when the
+    /// provider sent one, otherwise the fact that it sent none.
+    TurnFailed {
+        response_id: String,
+        failure: LiveResponseFailure,
+        accounting: LiveResponseAccounting,
     },
 }
 
