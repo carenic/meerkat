@@ -35,6 +35,20 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- `meerkat`: `StockGovernance::bind_prompt` no longer documents itself as
+  binding "one CLI prompt". It binds one input of the local operator: a
+  prompt from the CLI or a governed JSONL connection, or an external event
+  through which the operator's own process reports the outcome of an
+  administrative command the operator ran. Its doc now states what the
+  original records for every input: the operator as requester, under the
+  prompt labels (`prompt-<event>`, `prompt-events`, `rkat-prompt-<event>`).
+  For an administrative outcome, that requester stands for the operator's
+  authority, not for new consent or typed human input, and the event
+  carries only the outcome that process retained. An uncertain delivery is
+  retried by resubmitting the bound input, never by binding again.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

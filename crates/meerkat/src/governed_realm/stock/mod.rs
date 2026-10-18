@@ -25,7 +25,9 @@
 //! - the session's canonical destination ([`destination`]) and the actual
 //!   pinned controller ([`controller::StockControllerPin`]).
 //!
-//! A CLI prompt reaches the governed runtime only through
+//! An input of the local operator (a prompt from the CLI or a governed JSONL
+//! connection, or the outcome of an administrative command its own process
+//! reports) reaches the governed runtime only through
 //! [`StockGovernance::bind_prompt`], and a host-authenticated caller's input
 //! only through [`StockGovernance::bind_caller_prompt`]: the session is bound
 //! to its destination, the original is authenticated and recorded, and the
@@ -730,17 +732,34 @@ impl StockGovernance {
         })
     }
 
-    /// Bind one CLI prompt of the local operator for `session_id` to an
+    /// Bind one input of the local operator for `session_id` to an
     /// authenticated original on the realm's machine `machine`, with the
-    /// session's actual pinned controller `controller`. The session is first
-    /// bound to its canonical destination. The returned input is submitted
-    /// through the ordinary runtime accept, and the returned candidate
-    /// original is then admitted ([`PendingOriginal::admit`]) once the
-    /// runtime accepted that exact input; dropping it withdraws the
-    /// candidate. Every refusal here is local and typed, before any
-    /// submission. A host-authenticated composition refuses it
-    /// ([`StockGovernanceError::RequesterUnsupported`]): its operator is no
-    /// requester.
+    /// session's actual pinned controller `controller`. The input is a
+    /// prompt (the CLI's, or a governed JSONL connection's,
+    /// [`Self::bind_jsonl_input`]) or an external event through which the
+    /// operator's own process reports the outcome of an administrative
+    /// command the operator ran. The session is first bound to its canonical
+    /// destination. The returned input is submitted through the ordinary
+    /// runtime accept, and the returned candidate original is then admitted
+    /// ([`PendingOriginal::admit`]) once the runtime accepted that exact
+    /// input; dropping it withdraws the candidate. Every refusal here is
+    /// local and typed, before any submission. A host-authenticated
+    /// composition refuses it ([`StockGovernanceError::RequesterUnsupported`]):
+    /// its operator is no requester.
+    ///
+    /// Whatever the input's kind, the original names the operator (a human
+    /// principal) as its requester, authenticated by this process, under the
+    /// prompt labels: occurrence `prompt-<event>`, root event `prompt-events`
+    /// and idempotency key `rkat-prompt-<event>`. For an administrative
+    /// outcome that requester stands for the operator's authority under
+    /// which the process reports its own outcome: it is neither new consent
+    /// nor typed human input, and the event projects as a system notice, not
+    /// as the operator's message. Such an event carries only the outcome that
+    /// process retained (such as a
+    /// [`finalize::ReviewedConnectorFinalization`]), nothing from another
+    /// source. Each call is a new occurrence: an uncertain delivery is
+    /// retried by resubmitting the exact input returned here, never by
+    /// binding again.
     pub async fn bind_prompt(
         &self,
         machine: &MeerkatMachine,
@@ -766,7 +785,7 @@ impl StockGovernance {
     /// the host's exact-target decision) is asked before the session's
     /// binding changes, and the binding commits only while that decision is
     /// still current, held current through the commit
-    /// ([`Self::bind_caller_session`]); native admission and every operation
+    /// (`Self::bind_caller_session`); native admission and every operation
     /// ask again. A refused caller
     /// ([`StockGovernanceError::CallerNotAdmitted`]: Denied for the operator
     /// named as a caller, otherwise the host's Denied verdict or
