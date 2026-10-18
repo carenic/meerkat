@@ -35,6 +35,16 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `LocalGrantAuthority::resolve_lineage_observed`,
+  `resolve_controller_lineage_observed` and
+  `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
+  its own observation of the grant publication, and return
+  `LineageResolutionRefusal`: `Changed` when an owner change published
+  during the resolution, which that caller classifies as a stale read, or
+  `Refused` with the refusal the standalone resolution reports.
+
 ### Fixed
 
 - A command sent to a mob while its actor is exiting after a shutdown now
@@ -50,6 +60,30 @@ them.
   channel close. A caller that observes `ActorCommandChannelClosed` still
   does so only after the actor has quiesced and dropped. Pre-existing in
   0.9.2 and 0.9.3.
+- A grant resolution read inside an enclosing observation of the grant
+  publication that meets an owner change published during the resolution
+  is now that observation's stale read, as for any other concurrent owner
+  change, instead of an unavailable grant authority. A grant-backed
+  operation preparation refuses it as
+  `OperationRefusalKind::ReprepareRequired` and rebuilds once, for the
+  work's own grant and for the contributor ceilings of work that names
+  other originals (a helper's source); controller admission refuses it as
+  `ReprepareRequired`. A review read, which reads its material once by
+  design, is not rebuilt: when the stock governed realm's review mandate or
+  a contributor ceiling meets such a change, the review now refuses as
+  stale (`ToolError::AuthorizationRefused` with `ReprepareRequired`)
+  instead of reporting an unavailable review context, and a fresh attempt
+  reads it again. The per-agent grant check of a configured MCP attachment
+  (`AgentInstallationGrant`) reports such a change while it reads the
+  agent's lineage as `McpAttachmentRefusal::NotCurrent`, as it already did
+  for one published after the read, instead of `Unavailable`. A poisoned
+  publication still answers `Unavailable` and is never retried. Failed
+  durable grant custody and a clock failure still answer `Unavailable`,
+  except that one the resolution meets while an owner change publishes is
+  discarded with that stale read; a preparation's one rebuild then answers
+  `Unavailable` if the failure persists. A standalone
+  `LocalGrantAuthority::resolve_lineage` still reports a concurrent change
+  as `GrantRefusal::Unavailable`.
 
 ## [0.9.3] - 2026-10-18
 
