@@ -9996,23 +9996,31 @@ mod tests {
 
     #[tokio::test]
     async fn exact_released_0810_corpus_imports_and_fully_loads_current_session() {
+        // The workspace root: `MEERKAT_WORKSPACE_ROOT` (scripts/repo-cargo),
+        // the working directory when it holds the fixture (Bazel runs the
+        // test from its runfiles root), or two levels above this crate's
+        // manifest. A plain `cargo test` runs from `crates/meerkat-store`,
+        // whose own `Cargo.toml` must not make it the root.
+        let fixture = Path::new(
+            "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
+        );
+        let holds_fixture = |root: &Path| root.join(fixture).is_file();
         let workspace_root = std::env::var_os("MEERKAT_WORKSPACE_ROOT")
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::current_dir()
                     .ok()
-                    .filter(|root| root.join("Cargo.toml").is_file())
+                    .filter(|root| holds_fixture(root))
             })
-            .unwrap_or_else(|| {
+            .or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .expect("meerkat-store manifest has a workspace parent")
-                    .to_path_buf()
-            });
-        let source = workspace_root.join(
-            "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
-        );
+                    .ancestors()
+                    .nth(2)
+                    .filter(|root| holds_fixture(root))
+                    .map(Path::to_path_buf)
+            })
+            .expect("a workspace root holding the released 0.8.10 corpus fixture");
+        let source = workspace_root.join(fixture);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sessions.sqlite3");
         std::fs::copy(&source, &path).expect("copy exact released 0.8.10 corpus database");
