@@ -28848,9 +28848,12 @@ impl MobActor {
     /// reservation. A bare drop drains once and leaves such a command, with
     /// its reply sender, in the channel for as long as any handle lives, so
     /// its caller waits for a reply that never comes. Each command received
-    /// here is dropped: its caller sees its reply channel close. Every
-    /// reservation is written in the poll that takes it, so this ends as
-    /// soon as the senders already under way have written.
+    /// here is dropped: its caller sees its reply channel close.
+    ///
+    /// Every reservation of this channel must be written in the poll that
+    /// takes it. This waits for every outstanding reservation, so a holder
+    /// that awaited the actor between reserve and send would hang the
+    /// actor's exit.
     async fn close_and_drain_commands(mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
         command_rx.close();
         while command_rx.recv().await.is_some() {}
