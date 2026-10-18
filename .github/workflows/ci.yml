@@ -1117,7 +1117,7 @@ jobs:
     timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
-      RUST_MIN_STACK: "33554432"
+      RUST_MIN_STACK: "8388608"
       CARGO_TERM_COLOR: never
     steps:
       - name: Checkout
@@ -1544,7 +1544,7 @@ jobs:
           # the test-thread stack.
           # shellcheck disable=SC2206
           selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")
-          # The hook ran every lane on a 32 MiB test-thread stack.
+          # The hook runs every lane on an 8 MiB test-thread stack.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
           # Tests of crates that dev-depend on mcp-test-server spawn this exact
           # fixture and fail without it (mcp_test_server::fixture_binary).

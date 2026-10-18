@@ -285,7 +285,14 @@ function assertEventSplit(plan, label) {
   );
 }
 
-const HOOK_STACK = 32 * 1024 * 1024;
+const HOOK_STACK = 8 * 1024 * 1024;
+// The rows' stack is the one the hook exports for its lanes.
+{
+  const hook = readFileSync(resolve(root, "scripts/pre-push-unit.sh"), "utf8");
+  const exported = [...hook.matchAll(/^export RUST_MIN_STACK="\$\{RUST_MIN_STACK:-(\d+)\}"$/gm)];
+  assert.equal(exported.length, 1, "scripts/pre-push-unit.sh exports one default RUST_MIN_STACK");
+  assert.equal(Number(exported[0][1]), HOOK_STACK, "the hook's lanes run on the closure rows' stack");
+}
 const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
 
 // The closure-tests rows: the deterministic workspace lanes' coverage
@@ -2479,7 +2486,7 @@ for (const path of [
   const mapping = "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: ${{ matrix.rust_min_stack }}\n";
   const remapped = mutated(mapping, "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: 1048576\n");
   assert.ok(remapped.some((error) => error.includes("step env MIN_STACK")), "an altered MIN_STACK mapping is refused");
-  const stackExport = '          # The hook ran every lane on a 32 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
+  const stackExport = '          # The hook runs every lane on an 8 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
   const reexported = mutated(stackExport, stackExport.replace('RUST_MIN_STACK="${MIN_STACK}"', "RUST_MIN_STACK=1048576"));
   assert.ok(reexported.some((error) => error.includes("job closure-tests: the step runs")), "an altered RUST_MIN_STACK export is refused");
   const unexported = mutated(stackExport, "");

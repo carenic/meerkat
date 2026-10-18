@@ -289,8 +289,10 @@ export const UNIT_SOLO_PACKAGES = ["xtask"];
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Hook-parity rows (see the header). Every row runs on the hook's test-thread
-// stack: scripts/pre-push-unit.sh exports 32 MiB for all of its lanes.
-export const HOOK_TEST_STACK = 32 * 1024 * 1024;
+// stack: scripts/pre-push-unit.sh exports 8 MiB for all of its lanes, the
+// workspace floor of .cargo/config.toml and the hosts' worker stack budget,
+// which every closure-row test fits in a debug build (#301).
+export const HOOK_TEST_STACK = 8 * 1024 * 1024;
 export const CLOSURE_TESTS_PER_ROW = 12;
 // Nested-Cargo canaries: the tests .config/nextest.toml puts in this test
 // group each build a fixture crate with a nested `cargo` and run one at a time
@@ -324,9 +326,10 @@ const LIB_TARGET_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]
 // instead of silently dropping the suite.
 //
 // 22 of the facade's GPT Live tests overflow the 8 MiB test-thread stack that
-// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33);
-// they pass at the 32 MiB the pre-push hook and the BuildBuddy unit lane use.
-// Their rows carry that stack until the frames fit 8 MiB.
+// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33)
+// and pass at 32 MiB. Their rows, like the --all-features test lane
+// (scripts/run-build-backend-lane test-all), carry that stack until the
+// frames fit 8 MiB.
 //
 // A suite with `pullRequest: false` runs on the push only: the facade's two
 // GPT Live suites compile its lib test under the realtime features, 1089 s
