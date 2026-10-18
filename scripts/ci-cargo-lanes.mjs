@@ -661,13 +661,18 @@ export const GUARD_LANE_DEFINITIONS = {
   ],
 };
 
-// A workflow job: its `  id:` line up to the next job or top-level key.
+// A workflow job: its `  id:` line up to the next job or top-level key,
+// without blank lines and comment lines (those of its run scripts included),
+// so an edit to a comment alone changes no definition.
 export function workflowJob(text, id) {
   const lines = text.split("\n");
   const start = lines.indexOf(`  ${id}:`);
   if (start < 0) return null;
   const end = lines.findIndex((line, index) => index > start && /^ {0,2}\S/.test(line));
-  return lines.slice(start, end < 0 ? lines.length : end).join("\n").trimEnd();
+  return lines
+    .slice(start, end < 0 ? lines.length : end)
+    .filter((line) => !/^\s*(#.*)?$/.test(line))
+    .join("\n");
 }
 
 // The confinement lane in the Makefile: every CONFINEMENT_* assignment and

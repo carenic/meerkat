@@ -573,9 +573,10 @@ function assertArchivedLanes(plan, label) {
 // A pull request that changes an exact-profile lane's definition
 // (GUARD_LANE_DEFINITIONS: its ci.yml job, the confinement rule and
 // assignments in the Makefile, a selected module's declaration) runs that
-// lane; an edit elsewhere in the same file does not. Each base is the working
-// tree's file with one edit (--base-tree). Without a base copy every listed
-// definition file differs, and without a diff every lane runs.
+// lane; an edit elsewhere in the same file, or to a comment or blank line of
+// a lane's job, does not. Each base is the working tree's file with one edit
+// (--base-tree). Without a base copy every listed definition file differs,
+// and without a diff every lane runs.
 {
   const baseTree = mkdtempSync(join(tmpdir(), "ci-lanes-guard-definitions-"));
   try {
@@ -583,6 +584,9 @@ function assertArchivedLanes(plan, label) {
       [".github/workflows/ci.yml", '"governed_jsonl::tests::rpc_runtimes_compose_the_realms_own_schedule_service",\n', "", ["governed_jsonl"]],
       [".github/workflows/ci.yml", "run: make test-mcp-confinement-positive\n", "run: make test-mcp-confinement-positive || true\n", ["mcp_confinement_positive"]],
       [".github/workflows/ci.yml", "  bazel-graph:\n    name: ", "  bazel-graph:\n    name: Old ", []],
+      [".github/workflows/ci.yml", "    # Native dependency changes must retain", "    # Native dependency changes keep", []],
+      [".github/workflows/ci.yml", "          # No --nocapture: libtest captures", "          # Without --nocapture libtest captures", []],
+      [".github/workflows/ci.yml", "    # step before the tests prints the restriction", "\n    # step before the tests prints its restriction", []],
       ["Makefile", "CONFINEMENT_SHELL_POSITIVE_COUNT := 4\n", "CONFINEMENT_SHELL_POSITIVE_COUNT := 3\n", ["mcp_confinement_positive"]],
       ["Makefile", "--no-tests=fail --no-fail-fast -E", "--no-tests=fail -E", ["mcp_confinement_positive"]],
       ["Makefile", "test-mob-dense-topology:\n", "test-mob-dense-topology: build\n", []],

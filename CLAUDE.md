@@ -531,11 +531,12 @@ and its CI must be green before a release tag (`require_ci_green`):
   runs a lane when it touches the lane's inputs, `GUARD_LANE_INPUTS` in
   `scripts/ci-cargo-lanes.mjs` (the files that define its selected cases,
   and their crates' manifests), when it changes the lane's definition
-  between its base and head, `GUARD_LANE_DEFINITIONS` (its ci.yml job,
-  with the governed step's expected list and command; the Makefile's
-  CONFINEMENT_* assignments and the test-mcp-confinement-positive recipe
-  with its cargo flags; the attributes and `mod` line declaring each module
-  that holds selected cases), and when its diff is unknown.
+  between its base and head, `GUARD_LANE_DEFINITIONS` (its ci.yml job
+  without comment and blank lines, with the governed step's expected list
+  and command; the Makefile's CONFINEMENT_* assignments and the
+  test-mcp-confinement-positive recipe with its cargo flags; the
+  attributes and `mod` line declaring each module that holds selected
+  cases), and when its diff is unknown.
   `scripts/ci-guard-lane-inputs-selftest.mjs` resolves every selected case
   to the files that define it and fails when such a file or its crate's
   manifest is not an input, when one of those declarations differs from
