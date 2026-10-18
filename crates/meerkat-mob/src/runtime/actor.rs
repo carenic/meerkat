@@ -18519,7 +18519,9 @@ impl MobActor {
 
     /// Close admission because the actor is about to take no more commands:
     /// - an admitted Shutdown, before its teardown;
-    /// - an admitted Destroy, once its durable marker is written.
+    /// - an admitted Destroy, once its durable marker is written;
+    /// - a durability fail-stop, before the actor quiesces and exits, and a
+    ///   durable recovery that fail-stops before command admission.
     ///
     /// Nothing is then handed an owner lease on an actor that will take no
     /// further command. Unconditional, keeping the first reason (D67); it
@@ -28874,6 +28876,8 @@ impl MobActor {
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
         if !boxed_arm_future(|| self.prepare_actor_run()).await {
+            // Durable recovery fail-stopped before command admission.
+            self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             return;
         }
@@ -28910,6 +28914,7 @@ impl MobActor {
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
             if self.durable_uncertainty_fail_stop {
+                self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
                     "durable mutation outcome remained uncertain; crash-quiescing and terminating mob actor for cold replay"
@@ -29152,6 +29157,7 @@ impl MobActor {
                 ActorLoopControl::BreakActor => break,
             }
             if self.durable_uncertainty_fail_stop {
+                self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
                     "durable mutation outcome remained uncertain; crash-quiescing and terminating mob actor for cold replay"

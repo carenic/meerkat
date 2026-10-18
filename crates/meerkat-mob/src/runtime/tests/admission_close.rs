@@ -660,6 +660,53 @@ async fn an_incomplete_admitted_destroy_keeps_admission_closed() {
     }
 }
 
+/// A durability fail-stop exits the actor, so the mob grants no owner lease
+/// either: admission closes with the fail-stop's own reason before the actor
+/// quiesces and closes its mailbox.
+#[tokio::test]
+async fn a_durability_fail_stop_closes_admission() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "d67-durability-fail-stop");
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(
+            Arc::new(InMemoryMobEventStore::new()),
+            runtime_metadata.clone(),
+        ),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    runtime_metadata.lose_nth_compare_supervisor_completion_with_unreadable_reread(2);
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("an unreadable reconciliation fail-stops the actor");
+    assert!(
+        error
+            .to_string()
+            .contains("fail-stopping for cold recovery"),
+        "unexpected reconciliation error: {error}"
+    );
+    wait_for_actor_fail_stop(&handle).await;
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DurabilityFailStop)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a fail-stopped mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DurabilityFailStop),
+    }
+    drop(observer);
+    crash_stop_and_release_routes(handle).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

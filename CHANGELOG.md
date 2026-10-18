@@ -54,6 +54,10 @@ them.
   `MobAdmissionCloseReason::Destroyed`) where it granted an owner lease, and a
   command the Closing state refuses gets that error before the destroyed
   mob's own refusal (see Fixed).
+- Behaviour-only (not measured by the gate): after a durability fail-stop,
+  `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
+  (reason `MobAdmissionCloseReason::DurabilityFailStop`) where it granted an
+  owner lease on the exited actor (see Fixed).
 
 ### Fixed
 
@@ -77,6 +81,13 @@ them.
   admission open, so `acquire_owner` still handed out owner leases and
   `admission_closed()` stayed `None`. A destroy left incomplete after its
   admission keeps admission closed; retrying the destroy stays available.
+- A durability fail-stop (a durable mutation whose outcome stayed uncertain,
+  or a durable recovery that fails before the actor admits a command) closes
+  the mob's admission before the actor quiesces and exits, with the new
+  `MobAdmissionCloseReason::DurabilityFailStop` (it displays as "durability
+  fail-stop"); an earlier close keeps its reason. With the Shutdown and
+  Destroy closes above, every exit the mob actor takes on its own closes
+  admission first.
 
 ## [0.9.3] - 2026-10-18
 
