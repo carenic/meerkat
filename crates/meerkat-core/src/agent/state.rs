@@ -2859,14 +2859,11 @@ where
                             )
                             .await
                     {
-                        tracing::debug!(
-                            target: "meerkat::authz::owner_change_wait",
-                            operation_id = authorization
+                        wait.trace(
+                            "model_request",
+                            authorization
                                 .as_ref()
-                                .map(|auth| tracing::field::display(auth.operation_id())),
-                            waited_ms = u64::try_from(wait.waited().as_millis()).unwrap_or(u64::MAX),
-                            settled = wait.settled(),
-                            "model request waited for an owner change"
+                                .map(crate::LlmRequestAuthorization::operation_id),
                         );
                         if let Some(exceeded) = self.budget.observe().exceeded() {
                             return Err(exceeded.to_agent_error());
@@ -3607,6 +3604,7 @@ where
                                         crate::authorization::ModelAuthorizationUse::Compaction,
                                         crate::OperationId::new(),
                                     ),
+                                    budget: Some(&self.budget),
                                     model_messages: &model_messages,
                                     observation_source,
                                     window: crate::compact::CompactionWindow {
@@ -32030,10 +32028,11 @@ mod tests {
 
         /// The session's model and its retained controller. Each attempt
         /// takes `delay` (a slow rebuild), then prepares and checks its
-        /// operation at send.
+        /// operation at send; a compaction summary does the same at once.
         struct ChurnClient {
             delay: std::time::Duration,
             operations: Mutex<Vec<crate::OperationId>>,
+            summaries: Mutex<Vec<crate::OperationId>>,
         }
 
         impl ChurnClient {
@@ -32041,6 +32040,7 @@ mod tests {
                 Arc::new(Self {
                     delay,
                     operations: Mutex::new(Vec::new()),
+                    summaries: Mutex::new(Vec::new()),
                 })
             }
 
@@ -32121,6 +32121,37 @@ mod tests {
                 _provider_params: Option<&ProviderParamsOverride>,
             ) -> Result<crate::LlmStreamResult, AgentError> {
                 panic!("governed execution must not use the raw provider path")
+            }
+
+            async fn stream_response_authorized(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                let authorization =
+                    authorization.expect("a governed compaction summary keeps its work");
+                assert!(authorization.usage() == ModelAuthorizationUse::Compaction);
+                self.summaries
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
+                authorization
+                    .prepare(fixture_model_facts(false))
+                    .map_err(AgentError::from)?
+                    .current()
+                    .map_err(AgentError::from)?;
+                Ok(crate::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "summary of the first input".into(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                ))
             }
 
             fn provider(&self) -> crate::Provider {
@@ -32426,6 +32457,80 @@ mod tests {
             );
             assert!(policy.prepared_after_first(2) >= std::time::Duration::from_millis(50));
             assert_completed_without_failure(&mut run.events);
+        }
+
+        /// A compaction summary refused while an owner change is in progress
+        /// on the work's own publication waits for it and asks again under
+        /// the same operation: the compaction completes, and the controller
+        /// sees no refusal.
+        #[tokio::test(start_paused = true)]
+        async fn a_compaction_summary_waits_out_an_owner_change_in_progress() {
+            // The first run answers; the second compacts first, and its
+            // summary meets a change in progress.
+            let policy = ChurnPolicy::new([
+                ChurnStep::Allow,
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .build_standalone(
+                    Arc::clone(&client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(&policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(&client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            for (prompt, events) in [("first retained input", false), ("second input", true)] {
+                let (tx, mut rx) = mpsc::channel(1024);
+                agent
+                    .run_with_events_and_work_authorization(
+                        prompt.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(work.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                if events {
+                    let mut completed = 0;
+                    while let Ok(event) = rx.try_recv() {
+                        assert!(
+                            !matches!(event, crate::AgentEvent::CompactionFailed { .. }),
+                            "{event:?}"
+                        );
+                        if matches!(event, crate::AgentEvent::CompactionCompleted { .. }) {
+                            completed += 1;
+                        }
+                    }
+                    assert_eq!(completed, 1, "the compaction completed");
+                }
+            }
+            let summaries = client.summaries.lock().unwrap().clone();
+            assert_eq!(summaries.len(), 2, "one refused summary, one more");
+            assert_eq!(summaries[0], summaries[1], "the same compaction operation");
+            assert!(
+                policy
+                    .prepared_after_first(2)
+                    .saturating_sub(policy.prepared_after_first(1))
+                    >= std::time::Duration::from_millis(30),
+                "the summary waited for the change to complete"
+            );
+            let transcript = serde_json::to_string(agent.session().messages()).unwrap();
+            assert!(!transcript.contains("operation_refused"));
         }
 
         /// A PreLlm gate fixture. It denies every ordinary request and,

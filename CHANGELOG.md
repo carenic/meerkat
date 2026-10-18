@@ -46,6 +46,7 @@ them.
   reports such a change as a waiting hint, never a permission;
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners, and the native run and audit wrappers forward it.
+  `OwnerChangeWait::trace` records one wait as the debug event below.
 
 ### Fixed
 
@@ -61,12 +62,29 @@ them.
   against it; at most 3 such free rebuilds per call; and a free rebuild only
   once no change is in progress. Past those bounds the refusal takes its
   ordinary path (one rebuild, then the controller feedback request), as does
-  a refusal with no change in progress, any other refusal kind, and a refusal
-  about another publication. The run budget is checked after every wait, so a
+  any other refusal kind and a refusal while the work's own publication has
+  no change in progress. The run budget is checked after every wait, so a
   turn whose budget runs out during one ends with the time-budget terminal,
   not a refusal. Each refused attempt keeps its own audit record, and a
   `debug` event `meerkat::authz::owner_change_wait` (operation id,
   `waited_ms`, `settled`) marks each wait.
+- The same bounded wait covers the other operations that rebuild after a
+  `ReprepareRequired` refusal. A compaction summary no longer fails its
+  compaction with a refusal. A governed tool dispatch waits at its prepared
+  entry and again at its body entry, each with its own deadline and free
+  rebuilds, inside the tool's timeout; the review check point runs on the
+  decision prepared after the wait, so a reviewed tool whose decision changed
+  meanwhile still refuses as a changed context and no review is reused. The
+  `web_search` tool's helper model request asks again under the same
+  delegate operation. The debug event names the site (`model_request`,
+  `compaction_summary`, `tool_dispatch`, `tool_entry`,
+  `web_search_delegate`).
+- A governed helper admission fence and a helper child issuance answer
+  `Unavailable` instead of `Denied` when their check refuses to rebuild
+  (`ReprepareRequired`), on the prepared path and on the dispatch path alike:
+  under the owner-change exclusion they cannot wait, and a refusal to rebuild
+  is no verdict on the operation, so a later attempt may succeed. A denial
+  and malformed facts stay `Denied`.
 
 ## [0.9.3] - 2026-10-18
 

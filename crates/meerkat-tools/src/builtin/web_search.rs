@@ -99,7 +99,7 @@ impl BuiltinTool for WebSearchTool {
     }
 
     async fn call(&self, args: Value) -> Result<ToolOutput, BuiltinToolError> {
-        self.search(args, None).await
+        self.search(args, None, None).await
     }
 
     /// A governed call prepares its helper's own model request as the typed
@@ -122,15 +122,19 @@ impl BuiltinTool for WebSearchTool {
             )
             .map_err(|error| BuiltinToolError::EntryRefused(Box::new(error)))?
             .map(meerkat_core::LlmRequestAuthorization::for_tool_delegate);
-        self.search(args, authorization).await
+        self.search(args, authorization, context.work_authorization())
+            .await
     }
 }
 
 impl WebSearchTool {
+    /// `work` is the call's admitted work, whose owner change in progress a
+    /// refused delegate request waits out.
     async fn search(
         &self,
         args: Value,
         authorization: Option<meerkat_core::LlmRequestAuthorization>,
+        work: Option<&meerkat_core::WorkAuthorizationContext>,
     ) -> Result<ToolOutput, BuiltinToolError> {
         let args: WebSearchToolArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;
@@ -143,33 +147,56 @@ impl WebSearchTool {
             .as_deref()
             .map(parse_search_provider)
             .transpose()?;
-        let result = self
-            .executor
-            .execute_web_search_authorized(
-                WebSearchRequest {
-                    query,
-                    provider,
-                    provider_params: None,
-                    context: args.context.filter(|value| !value.trim().is_empty()),
-                },
-                authorization,
-            )
-            .await
-            .map_err(|err| match err {
-                meerkat_llm_core::LlmError::OperationRefused { refusal } => {
-                    BuiltinToolError::OperationRefused { refusal }
+        let request = WebSearchRequest {
+            query,
+            provider,
+            provider_params: None,
+            context: args.context.filter(|value| !value.trim().is_empty()),
+        };
+        // A delegate request refused because an owner change is still in
+        // progress on the work's own publication waits for it (bounded) and
+        // asks again under the same operation.
+        let mut owner_change_churn = meerkat_core::authorization::OwnerChangeChurn::new();
+        let result = loop {
+            let result = self
+                .executor
+                .execute_web_search_authorized(request.clone(), authorization.clone())
+                .await;
+            if let Err(meerkat_llm_core::LlmError::OperationRefused { refusal }) = &result
+                && refusal.kind()
+                    == meerkat_core::authorization::OperationRefusalKind::ReprepareRequired
+                && let Some(work) = work
+                && let Some(wait) = owner_change_churn
+                    .wait_for_settled_change(work.authorization().as_ref(), None)
+                    .await
+            {
+                wait.trace(
+                    "web_search_delegate",
+                    authorization
+                        .as_ref()
+                        .map(meerkat_core::LlmRequestAuthorization::operation_id),
+                );
+                if wait.settled() {
+                    continue;
                 }
-                meerkat_llm_core::LlmError::OperationObservationUnavailable => {
-                    BuiltinToolError::OperationObservationUnavailable
-                }
-                meerkat_llm_core::LlmError::OperationAuthorizationUnavailable => {
-                    BuiltinToolError::OperationAuthorizationUnavailable
-                }
-                meerkat_llm_core::LlmError::OperationReviewRefused { refusal } => {
-                    BuiltinToolError::EntryRefused(Box::new(refusal.into()))
-                }
-                other => BuiltinToolError::execution_failed(other.to_string()),
-            })?;
+            }
+            break result;
+        }
+        .map_err(|err| match err {
+            meerkat_llm_core::LlmError::OperationRefused { refusal } => {
+                BuiltinToolError::OperationRefused { refusal }
+            }
+            meerkat_llm_core::LlmError::OperationObservationUnavailable => {
+                BuiltinToolError::OperationObservationUnavailable
+            }
+            meerkat_llm_core::LlmError::OperationAuthorizationUnavailable => {
+                BuiltinToolError::OperationAuthorizationUnavailable
+            }
+            meerkat_llm_core::LlmError::OperationReviewRefused { refusal } => {
+                BuiltinToolError::EntryRefused(Box::new(refusal.into()))
+            }
+            other => BuiltinToolError::execution_failed(other.to_string()),
+        })?;
         serde_json::to_value(result)
             .map(ToolOutput::Json)
             .map_err(|err| BuiltinToolError::execution_failed(err.to_string()))
@@ -666,5 +693,140 @@ mod tests {
         .await
         .expect("ungoverned search keeps its existing behavior");
         assert_eq!(recording.seen.lock().await.len(), 1);
+    }
+
+    /// Work whose publication changes under the helper: its first helper
+    /// model preparation begins an owner change that completes after 30 ms
+    /// and refuses, and every preparation while the change is in progress
+    /// refuses to rebuild. The call's own tool operation is allowed.
+    #[derive(Default)]
+    struct ChurningHelperWork {
+        sequence: Arc<std::sync::atomic::AtomicU64>,
+        began: std::sync::atomic::AtomicBool,
+        model_prepares: std::sync::atomic::AtomicUsize,
+    }
+
+    impl meerkat_core::authorization::WorkAuthorization for ChurningHelperWork {
+        fn owner_change_in_progress(
+            &self,
+        ) -> Option<meerkat_core::authorization::OwnerChangeInProgress> {
+            let sequence = self.sequence.load(std::sync::atomic::Ordering::SeqCst);
+            (sequence % 2 == 1).then(|| {
+                meerkat_core::authorization::OwnerChangeInProgress::new(uuid::Uuid::nil(), sequence)
+            })
+        }
+
+        fn prepare(
+            &self,
+            binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            use std::sync::atomic::Ordering;
+            let refused = || {
+                meerkat_core::authorization::OperationRefused::new(
+                    meerkat_core::authorization::OperationRefusalKind::ReprepareRequired,
+                )
+                .into()
+            };
+            if let meerkat_core::authorization::AuthorizationOperation::Model(_) =
+                &binding.facts().operation
+            {
+                self.model_prepares.fetch_add(1, Ordering::SeqCst);
+                let sequence = self.sequence.load(Ordering::SeqCst);
+                if sequence % 2 == 1 {
+                    return Err(refused());
+                }
+                if !self.began.swap(true, Ordering::SeqCst) {
+                    let odd = sequence + 1;
+                    self.sequence.store(odd, Ordering::SeqCst);
+                    let completes = Arc::clone(&self.sequence);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                        completes.store(odd + 1, Ordering::SeqCst);
+                    });
+                    return Err(refused());
+                }
+            }
+            Ok(Arc::new(Allowed))
+        }
+    }
+
+    /// Prepares and checks its helper request with the authorization it is
+    /// handed, as a provider adapter does, and reports a refusal as the
+    /// adapter does.
+    #[derive(Default)]
+    struct CheckingHelper {
+        operations: Mutex<Vec<meerkat_core::OperationId>>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl WebSearchExecutor for CheckingHelper {
+        async fn execute_web_search(
+            &self,
+            _request: WebSearchRequest,
+        ) -> Result<WebSearchResult, meerkat_llm_core::LlmError> {
+            Err(meerkat_llm_core::LlmError::InvalidRequest {
+                message: "a governed search binds its helper".to_string(),
+            })
+        }
+
+        async fn execute_web_search_authorized(
+            &self,
+            request: WebSearchRequest,
+            authorization: Option<meerkat_core::LlmRequestAuthorization>,
+        ) -> Result<WebSearchResult, meerkat_llm_core::LlmError> {
+            let authorization = authorization.expect("a governed search binds its helper");
+            self.operations
+                .lock()
+                .await
+                .push(authorization.operation_id().clone());
+            authorization
+                .prepare(helper_facts())
+                .and_then(|check| check.current())
+                .map_err(meerkat_llm_core::LlmError::from_operation_authorization)?;
+            Ok(WebSearchResult {
+                status: WebSearchStatus::Completed,
+                query: request.query,
+                provider: Some(Provider::OpenAI),
+                model: Some(ModelId::new("search-model")),
+                answer: Some("answer".to_string()),
+                evidence: Vec::new(),
+                native_events: Vec::new(),
+                error: None,
+                checked_at: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// The helper request refused while an owner change is in progress on
+    /// the call's work waits for it and asks again under the same delegate
+    /// operation: the search completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_helper_request_waits_out_an_owner_change_in_progress() {
+        let work = Arc::new(ChurningHelperWork::default());
+        let helper = Arc::new(CheckingHelper::default());
+        let started = tokio::time::Instant::now();
+        let outcome = governed_dispatch(
+            helper.clone(),
+            meerkat_core::WorkAuthorizationContext::new(
+                work.clone(),
+                meerkat_core::exact_operation::OperationExecutionScope::Domain,
+            ),
+        )
+        .await
+        .expect("the search completes once the change does");
+        assert!(!outcome.result.is_error, "{:?}", outcome.result);
+        let operations = helper.operations.lock().await;
+        assert_eq!(operations.len(), 2, "one refused request, one more");
+        assert_eq!(operations[0], operations[1], "the same delegate operation");
+        assert_eq!(
+            work.model_prepares
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(30));
     }
 }
