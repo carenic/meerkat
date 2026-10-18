@@ -171,7 +171,11 @@ fn yaml_serializer_options() -> serde_saphyr::SerializerOptions {
 
 /// Refuse a `...` document end marker. Frontmatter is one YAML document, and
 /// serde-saphyr 2.0.0 stops at the marker and ignores what follows it, even
-/// malformed text.
+/// malformed text: upstream issue #228, fixed after 2.0.0 by
+/// <https://github.com/bourumir-wyngs/serde-saphyr/pull/230>. Remove this
+/// guard at the bump to a release with that fix, and decide then whether a
+/// marker with nothing after it stays refused (`test_rejects_document_end_marker`
+/// pins both).
 fn reject_document_end_marker(frontmatter: &str) -> Result<(), SkillError> {
     let marker_line = frontmatter.lines().position(|line| {
         line.strip_prefix("...")
