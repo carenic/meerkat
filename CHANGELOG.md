@@ -35,6 +35,22 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- A command sent to a mob while its actor is exiting after a shutdown now
+  settles instead of going unanswered (`meerkat-mob`). The actor dropped its
+  command channel without waiting for a send that had already reserved
+  capacity, so a command written just after that drop stayed queued, with
+  its reply sender, for as long as any handle to the mob lived: an unbounded
+  caller waited forever, and `MobMcpState::close_admission` or `stand_down`
+  called right after shutting a managed mob down waited out its deadline and
+  reported "admission close not answered before the deadline". The exiting
+  actor now closes the channel and receives until it is empty, after it has
+  dropped itself, so such a command is dropped and its caller sees the reply
+  channel close. A caller that observes `ActorCommandChannelClosed` still
+  does so only after the actor has quiesced and dropped. Pre-existing in
+  0.9.2 and 0.9.3.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
