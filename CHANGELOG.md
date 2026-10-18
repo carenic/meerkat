@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,
+  which nothing called any more (a browser opens through
+  `HostLaunchExemption::browser_opener`). Builds drop it and its platform
+  subtree (`jni`, `objc2`, `ndk-context` and related crates). The launch-site
+  scanner and Clippy's `webbrowser::open` entries stay, so a reintroduced call
+  is still caught.
+
 ### Fixed
 
 - The `meerkat-contracts`, `meerkat-runtime` and `rkat` packages build their
