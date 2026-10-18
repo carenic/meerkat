@@ -28931,9 +28931,10 @@ impl MobActor {
         // park the actor for the five-minute identity safety cadence.
         'actor: loop {
             #[cfg(test)]
-            if take_actor_loop_panic_for_test(&self.definition.id) {
-                panic!("test seam: the mob actor loop panics");
-            }
+            assert!(
+                !take_actor_loop_panic_for_test(&self.definition.id),
+                "test seam: the mob actor loop panics"
+            );
             // Detached completion paths can re-enter through `continue` or
             // `SkipBoundary`, bypassing the ordinary post-command boundary.
             // Honor fail-stop before polling any new work so a confirmed
