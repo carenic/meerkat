@@ -335,6 +335,9 @@ surface, not the old live-adapter/docs-refresh snapshot:
     `Compactor`s implement the new `prepare_for_summarization`.
   - Governed realms: `bind_prompt` binds only operator prompts; host-reported
     outcomes use `bind_host_outcome`.
+  - The tool configuration change bit is `settled`, not `persisted` (rows
+    stored before 0.9.4 keep `persisted`); a 0.9.3 SDK against a 0.9.4
+    `rkat-rpc` fails on `tool_config_changed`, so upgrade SDKs together.
 - **0.9.0 (2026-10-13).** Breaking changes and an upgrade checklist are in
   `references/migration_0_9.md`. In short:
   - MobKit is now Meta in Core's public surface, with no aliases: JSON-RPC

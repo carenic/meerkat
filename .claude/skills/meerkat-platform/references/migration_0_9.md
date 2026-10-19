@@ -210,8 +210,13 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   in place). Stop every process that shares a runtime store and start 0.9.4 on
   all of them together.
 - 0.9.3 also cannot read back a session event log that holds a
-  content-filtered `run_failed` event, or restore a grant owner whose journal
-  holds an owner-scoped resource-domain restriction (`RestartRequired`).
+  content-filtered `run_failed` event, a transcript holding a tool-scope,
+  deferred-catalog or failed-closed notice that 0.9.4 wrote, or restore a
+  grant owner whose journal holds an owner-scoped resource-domain restriction
+  (`RestartRequired`).
+- Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
+  every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds (only possible
+  with an overridden binary path).
 
 ### Breaking changes
 
@@ -235,6 +240,19 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   (`reason_type: content_filtered`), no longer `null`. OpenAI refusal text is
   never committed as an answer. `web_search` reports a refused, filtered,
   context-full or cancelled search as `failed`.
+- Tool configuration changes: the lifecycle bit is `settled`, not
+  `persisted` (`tool_config_changed` payloads, stored `tool_config` notices,
+  `mcp` notice blocks); rows stored before 0.9.4 keep `persisted`, so readers
+  accept either key. SDKs expose `ToolConfigChangedPayload.settled`; Rust reads
+  `ToolConfigChangedPayload::settled()` and
+  `SystemNoticeBlock::lifecycle_settled()`. The `persisted` result of
+  `mcp/add`, `mcp/remove` and `mcp/reload` is unchanged.
+- Child tool bundle opt-in (Rust hosts): a child mob's inline profile mounts
+  a bundle the host offers with the new `ChildToolBundleAvailability::ChildOffered`
+  by naming it in `tools.bundles` (an unoffered name is refused with
+  `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
+  gain `bundles`; `ChildToolBundleAvailability` and
+  `ChildMcpServerRegistrationError` are non-exhaustive.
 - Rust: `LlmDoneOutcome::Success` is non-exhaustive (build it with
   `LlmDoneOutcome::success(..)` / `success_with_detail(..)`);
   `AgentError::ContentFiltered` gains `stop` and `detail`; `AgentErrorReason`
@@ -254,12 +272,16 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `SessionAgentMandate::new(executor, servers, represented_subject)` must
   select an MCP server. `ExecutionRestrictions.resource_domains` is a
   `DomainRestriction` (`unrestricted`, `exact`, `owned_by`, `unresolved`).
-  `AuditObservation` is non-exhaustive.
+  `AuditObservation` is non-exhaustive. `OperationRefused` equality includes
+  `dispatch()` (whether the tool code ran); compare `kind()` and `dispatch()`.
 - Runtime (Rust hosts): MCP attachment providers take the exact
   `RuntimeSessionRegistrationWitness`; `retained_original` becomes
   `retained_custody` (`RetainedCustody`); `ContinuationAdmitError` and
   `BlockedDeliveryReason` gain `NotReady(..)`; the wire readiness failure gains
-  `original_admission_pending`. New fields on generated machine state structs
+  `original_admission_pending`; `RuntimeDeliveryOwnerRetirement::join`
+  returns a `#[must_use]` report. GPT Live adapter enums gain
+  `FinishedPending`, `NoteDelegationFinishedContext` and
+  `InstructionsContextAppendWithdrawn`. New fields on generated machine state structs
   (`stored_input_state_migration_v6`, `identity_generation_highwater`,
   `identity_generation_highwater_sealed`).
 
@@ -276,11 +298,18 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Fixed: the 0.9.3 known issue "First concurrent durable delivery" (a store
   refusing to open while another process creates the same schema domain);
   macOS FSEvents registration no longer stalls the first mob storage open.
+- Governed tool refusals: the `operation_refused` tool result carries
+  `data` `{"kind", "tool_invoked"}` for the model; a mob member upcall
+  refusal with no known kind reads as `operation_authorization_unavailable`.
+- Fixed: the SQLite session store lays out a whole-blob session compacted more
+  than `history_retained_rewrites` times; `@rkat/sdk` `close()` no longer
+  keeps Node alive for 5 seconds; public GPT Live sends a finished notice for
+  a delegation result held behind the user's question.
 
 ### Checklist
 
 1. Back up, stop every process that shares a runtime store, and upgrade
-   everything together.
+   everything together, SDKs included.
 2. Fix skill frontmatter the new parser refuses.
 3. Handle `AdmissionClosed` and `ShutdownInProgress`; add wildcard arms.
 4. Read `content_filtered` failures by their typed reason.

@@ -58,7 +58,8 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
 ## Upgrading to 0.9.4
 
 This section is for systems running 0.9.3. The full list of changes is in
-the CHANGELOG under `## [0.9.4]`.
+the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
+0.9.3: on 0.8.x, read their CHANGELOG sections as well.
 
 ### Before you upgrade
 
@@ -72,7 +73,14 @@ the CHANGELOG under `## [0.9.4]`.
     (see [Refusals and content filters](#refusals-and-content-filters));
   - an authorization grant journal that holds an owner-scoped resource-domain
     restriction (0.9.3 refuses to restore that grant owner with
-    `RestartRequired`).
+    `RestartRequired`);
+  - a session transcript that holds a tool-configuration notice 0.9.4 wrote
+    (a tool-scope, deferred-catalog or failed-closed notice; see
+    [Tool configuration events](#tool-configuration-events)).
+- **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
+  fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. The
+  SDKs fetch their own matching `rkat-rpc`, so this happens only when you
+  point an SDK at another binary.
 - **Upgrade every process that shares a runtime store together**, and take a
   backup first (step 2 of [How to upgrade](#how-to-upgrade)).
 
@@ -121,6 +129,37 @@ now `"1.10"`); the data is unchanged.
   wildcard arm to any exhaustive match on it. `MobAdmissionCloseReason` gains
   `Shutdown`, `Destroyed`, `DurabilityFailStop`, `ActorLost` and
   `DispatchFailed`.
+- **Child tool bundle opt-in** (Rust hosts): the new
+  `ChildToolBundleAvailability::ChildOffered` offers a bundle to child mobs
+  without supplying it. A child mob's inline profile mounts it by naming it in
+  `tools.bundles`; a name the host does not offer is refused with the new
+  `MobError::ToolBundleNotOffered`. `ChildToolBundleAvailability` and
+  `ChildMcpServerRegistrationError` are now `#[non_exhaustive]` (add a
+  wildcard arm), and `ToolConfig` and the wire `MobToolConfigInput` gain
+  `bundles` (set it in struct literals, or build `ToolConfig` with
+  `..ToolConfig::default()`).
+
+#### Tool configuration events
+
+- The lifecycle bit of tool configuration changes is named `settled`, not
+  `persisted`: `tool_config_changed` event payloads, stored `tool_config`
+  notices and `mcp` notice blocks that 0.9.4 builds carry `settled`. Rows and
+  events stored by 0.9.3 and earlier keep `persisted` when they are read back,
+  replayed or served in history. The bit says whether the change is a settled
+  lifecycle fact; whether a configuration write happened is still the
+  `persisted` of `mcp/add`, `mcp/remove` and `mcp/reload`, which keep their
+  name.
+- The tool-scope, deferred-catalog and failed-closed events and the MCP
+  restore-refusal delta now report `settled: true` where they reported
+  `persisted: false`: each is a change that has already applied or failed.
+- **Do:** accept either key when you read stored notices. The Python and
+  TypeScript SDKs expose `ToolConfigChangedPayload.settled` (it was
+  `persisted`) and derive it from `status_info`. In Rust, read
+  `ToolConfigChangedPayload::settled()`, `ExternalToolDelta::settled()` and
+  `SystemNoticeBlock::lifecycle_settled()`; `ToolConfigChangedPayload::new`
+  takes no lifecycle argument, `SystemNoticeBlock::Mcp` carries
+  `lifecycle_bit`, and `meerkat-mcp`'s
+  `ExternalToolSurfaceEffect::EmitExternalToolDelta` carries `settled`.
 
 #### Refusals and content filters
 
@@ -187,6 +226,9 @@ budget and report the bound, as `DefaultCompactor` does. A
   their wire bytes.
 - `AuditObservation` is `#[non_exhaustive]`, `AuditObservation::Refused`
   gains `read`, and `AuditPolicyRead` gains `publication_instance`.
+- `OperationRefused` equality includes whether the refused call's tool code
+  ran (`OperationRefused::dispatch`): compare `kind()` and `dispatch()`
+  instead of comparing with `OperationRefused::new(kind)`.
 
 #### Runtime and registration (Rust hosts)
 
@@ -206,6 +248,14 @@ budget and report the bound, as `DefaultCompactor` does. A
 - `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` (wrap
   it in `std::panic::AssertUnwindSafe` to move it into `catch_unwind`), and
   `SqliteMobObserverDrainReport` gains `retained_registrations`.
+- `RuntimeDeliveryOwnerRetirement::join` returns a `#[must_use]`
+  `RuntimeDeliveryOwnerRetired` report instead of `()`: match `Ok(_)` or read
+  the report.
+- GPT Live adapters: `LiveDelegationNarrationKind` gains `FinishedPending`
+  and `GptLiveBrokerObservation` gains `InstructionsContextAppendWithdrawn`
+  (both appended last), and `LiveSidebandProviderCommand` gains
+  `NoteDelegationFinishedContext`, which a provider adapter lowers or
+  refuses. An exhaustive match needs the new arms.
 
 #### Generated machine types
 
@@ -245,13 +295,27 @@ last.
   creates the same schema domain at that moment.
 - **macOS:** starting a SQLite change watch no longer waits for FSEvents
   registration, which held the first mob storage open for over 30 seconds.
+- **Governed tool refusals tell the model whether the tool ran:** the
+  `operation_refused` tool result carries `data`
+  `{"kind": ..., "tool_invoked": false | "unknown"}`. Neither field grants
+  anything; a new call is a new operation. A mob member upcall refusal with
+  no known kind now reads as `operation_authorization_unavailable`, not
+  `operation_refused` with `malformed_facts`.
+- **SQLite session store:** a whole-blob session compacted more often than
+  `history_retained_rewrites` (default 4) is laid out instead of refused.
+- **Public GPT Live:** a delegation result held behind the user's unanswered
+  question first sends a finished notice, so the voice model no longer says
+  the work is still in progress.
+- **`@rkat/sdk`:** a Node process that calls `MeerkatClient.close()` exits as
+  soon as it has nothing else to do, instead of about 5 seconds later.
 
 ### Upgrade checklist
 
 1. Back up the realm state root; there is no downgrade to 0.9.3 after 0.9.4
    writes to it.
 2. Stop every 0.9.3 process that shares a runtime store, then start 0.9.4 on
-   all of them together.
+   all of them together, and upgrade the Python and TypeScript SDKs with
+   `rkat-rpc`.
 3. Fix `SKILL.md` frontmatter the new parser refuses (duplicate keys, null
    values, custom tags, `...` lines).
 4. Handle `MobError::AdmissionClosed` and `MobError::ShutdownInProgress`, and
@@ -261,6 +325,8 @@ last.
 6. Move model changes on a running session to `hot_swap_llm_identity`.
 7. Update custom compactors for the new `prepare_for_summarization`.
 8. Governed hosts: bind host-reported outcomes with `bind_host_outcome`.
+9. Read tool configuration changes by `settled` (accepting `persisted` on
+   rows stored before 0.9.4).
 
 ## Upgrading to 0.8.51
 
@@ -395,11 +461,9 @@ lost.
   per-member outcomes, and `ShutdownOptions::with_deadline` bounds every wait
   by your own deadline (for example below a Kubernetes termination grace
   period).
-- While a Shutdown runs, a command its closed admission refuses (a spawn,
-  work, a flow, wiring) gets `AdmissionClosed`, and while it drains its own
-  work, commands other than a second Shutdown get the retryable
-  `ShutdownInProgress`. Once the actor has exited, commands get
-  `ActorCommandChannelClosed`. Treat all three as "mob shutting down".
+- While a Shutdown runs, commands other than a second Shutdown get
+  `ActorCommandChannelClosed`. Treat it as "mob shutting down". (0.9.4
+  changes these answers; see [Mobs](#mobs) under Upgrading to 0.9.4.)
 - A retirement that started and failed answers `MemberRetirementStuck`.
   **Do:** call `MobHandle::redrive_retirement` or resume the mob.
 - A spawn that completes into a Stopped mob leaves it Stopped and holds the
