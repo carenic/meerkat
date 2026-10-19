@@ -328,6 +328,11 @@ Failed in:
                 "variant AgentEvent::Idle in crates/meerkat-core/src/event.rs:40",
                 ("AgentEvent", "Idle"),
             ),
+            "enum_variant_marked_non_exhaustive": (
+                "variant MemberShutdownOutcome:UnregisterPending in "
+                "crates/meerkat-mob/src/runtime/retirement_settlement.rs:257",
+                ("MemberShutdownOutcome", "UnregisterPending"),
+            ),
             "trait_missing": (
                 "trait meerkat_core::SessionStore, previously in file "
                 "crates/meerkat-core/src/session_store.rs:1315",
