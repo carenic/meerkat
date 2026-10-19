@@ -1414,10 +1414,6 @@ impl PublicLiveBootstrap {
     }
 }
 
-/// Opaque connected sideband handle for one public Live session.
-///
-/// Provider session identity and raw events are intentionally not exposed.
-/// Events are lowered to sanitized observations inside this crate.
 /// Test-only pause points around a held result's finished notice, armed for
 /// the task that appends the result, so a test can end the user's floor at
 /// exactly that point and check that the notice still precedes its result.
@@ -1465,6 +1461,10 @@ mod finished_notice_pause {
     }
 }
 
+/// Opaque connected sideband handle for one public Live session.
+///
+/// Provider session identity and raw events are intentionally not exposed.
+/// Events are lowered to sanitized observations inside this crate.
 pub struct PublicLiveBrokerSession {
     sender: LiveSender,
     receiver: Mutex<LiveReceiver>,
