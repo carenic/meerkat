@@ -500,7 +500,6 @@ struct PlacedActivatedSource {
 async fn placed_activated_source(
     policy: Option<meerkat_core::ForkInstructionPolicy>,
 ) -> PlacedActivatedSource {
-    use meerkat_mob::MobSessionService as _;
     let local_gate = TurnGate::new();
     local_gate.open();
     let fixture = CouncilFixture::new_with(local_script(local_gate), move |state, _root| {
