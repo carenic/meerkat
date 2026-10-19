@@ -348,6 +348,10 @@ STRUCTURAL_EXTRACTORS = {
     # 0.9.0 readiness report for TokenStoreError). Names only the enum.
     "enum_marked_non_exhaustive": _symbols_enum_missing,
     "enum_variant_added": _symbols_enum_variant_added,
+    # "variant {{name}}:{{variant_name}} in <file>:<line>" (v0.50.0 template,
+    # the enum_variant_added shape; first seen on a 0.9.4 branch report for
+    # `LlmDoneOutcome::Success`). The variant must be named, not only the enum.
+    "enum_variant_marked_non_exhaustive": _symbols_enum_variant_added,
     "enum_variant_missing": _symbols_enum_variant_missing,
     "derive_trait_impl_removed": _symbols_derive_trait_impl_removed,
     "inherent_method_missing": _symbols_inherent_method_missing,
