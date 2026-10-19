@@ -1,9 +1,9 @@
-Covers: governed realms (`rkat realm govern`, `grant`, `revoke-grant`,
-`--as-agent`, route keys, limits, listing grants, governed `rkat-rpc`),
-review tiers R1/R2/R3 and `[[governance.review.rules]]`, R3 human consent and
-approvals (codes -32033 to -32035), native authorization and Rust host
-composition, application tool policy, and secret redaction in Debug output.
-Sandboxing, tool policy, credentials, MCP limits, errors: references/security.md
+Covers: governed realms (`rkat realm govern`/`grant`/`revoke-grant`,
+`--as-agent`, route keys, limits, listing grants, governed `rkat-rpc`,
+authorization changes while work runs), review tiers R1/R2/R3 and
+`[[governance.review.rules]]`, R3 consent and approvals (-32033 to -32035),
+native authorization, Rust host composition (stock prompts, host outcomes),
+application tool policy, secret redaction. Other topics: references/security.md
 
 # Security in Meerkat 0.9: governed realms, review and approvals
 
@@ -124,6 +124,41 @@ rkat run --as-agent <AGENT> "..."
   (`ApiError::ResultDisclosureRefused`), JSON-RPC -32025 `SCOPE_DENIED` with
   `data.reason` `result_disclosure_refused`.
 
+### When authorization changes while work runs (0.9.4)
+
+Every owner mutation of the serving process (a grant issued or revoked, a
+policy, identity, destination or route-account change) is published as an
+owner change. Work that reads the authorization while a change is being
+published is refused to rebuild (`ReprepareRequired`): a stale read, not a
+denial. Since 0.9.4:
+
+- A model request, a governed tool dispatch (at its prepared entry, its body
+  entry and the call-level policy gate), the `web_search` helper's model
+  request and a compaction summary wait for a change in progress to complete,
+  then rebuild under the same operation. Each wait state allows at most 2 s
+  (less when the run's budget or the tool's remaining time is shorter) and 3
+  free rebuilds; a reviewed tool call has at most 3 wait states (6 s, 9
+  rebuilds), inside the tool's timeout. Past those bounds the refusal takes its
+  ordinary path: one rebuild, then `operation_refused` feedback to the model
+  (a compaction summary still fails its compaction). A run whose budget runs
+  out while waiting ends with the time-budget terminal. Owner changes while a
+  session runs therefore no longer turn ordinary calls into refusals.
+- A grant resolution that meets an owner change is a stale read everywhere: a
+  preparation rebuilds once; a prompt's controller admission is refused as not
+  ready (`ControllerReadinessUnavailable`, reason `PolicyChanged`), so
+  resubmit it; a review read refuses as stale (`operation_refused`,
+  `ReprepareRequired`) and a fresh attempt reads again; a configured MCP
+  server's per-agent grant check answers `NotCurrent`. A poisoned publication,
+  failed grant custody and a clock failure still answer unavailable.
+- A governed helper's admission fence and a helper child issuance answer
+  `Unavailable` (a later attempt may succeed), not `Denied`, when their check
+  refuses to rebuild. A denial and malformed facts stay `Denied`.
+- Each wait is one `debug` event of target `meerkat::authz::owner_change_wait`
+  with `site` (`model_request`, `compaction_summary`, `tool_dispatch`,
+  `tool_entry`, `tool_policy_entry` or `web_search_delegate`),
+  `operation_id`, `waited_ms` and `settled`. Each refused attempt keeps its
+  own audit record.
+
 ### Serving a governed realm over JSON-RPC
 
 `rkat-rpc --realm <id>` serves a governed realm only as governed JSONL over
@@ -198,14 +233,30 @@ max_output_tokens = 1024
   supply it settles the call as `review_unavailable` (`context_unavailable`)
   before any review; material that changes makes a retained allow stale
   (`review_unsatisfied`, `context_changed`) and a fresh attempt is reviewed
-  again. When only the owner's publication moved during an R2 review or
-  before the tool started (same permission, tier and material), the dispatch
-  itself reviews the call once more as a second attempt for the same call
-  (0.9.4), so a review observer's `context_changed` retirement is not always
-  the call's outcome. Rust owners
-  answer through `WorkAuthorization::review_operation_context`
+  again. In a stock governed realm the mandate text depends on who requested
+  the work (0.9.4): for an outcome bound with `bind_host_outcome` it says the
+  stock ingress itself requested it, that no person did and that it is not
+  the operator's consent, and it attributes the event's content to the ingress
+  instead of asserting it; an operator prompt's and a host-authenticated
+  caller's texts are unchanged. A person sees the mandate as the
+  `stock.review_mandate` consent label, and the requester a consent surface
+  presents is the person the approval is presented to. Rust owners answer
+  through `WorkAuthorization::review_operation_context`
   (`LocalWorkPolicy::review_context`, `AdmittedWorkPolicyOwner::review_mandate`,
   `OperationPolicyOwner::review_action_account`); every default fails closed.
+- Owner changes during an R2 review (0.9.4): when one owner change lands
+  during the review, at its verdict's commit or at the dispatch's entry
+  staging before the tool runs, and the call is still permitted at R2 with the
+  same review material, the dispatch reviews it once more from the start as a
+  second attempt for the same `tool_call_id`; the earlier verdict is never
+  used. At most one re-review per call, only after an allow or a reviewer
+  failure, and only with time left for a whole review deadline. A review
+  observer can therefore see a `context_changed` retirement followed by a
+  second attempt (a second `ReviewAttemptStarted` audit record): do not treat
+  the retirement as the call's outcome. A change still in progress when the
+  verdict is checked is waited out (within the review deadline, 2 s at most).
+  A second change, a denial or escalation, an expired review, a changed tier
+  or material, and a change once the tool runs settle as before.
 
 Feedback is an ordinary tool result: `review_unsatisfied` (data `kind`:
 `denied`, `escalated`, `context_changed`, `human_consent_required`,
@@ -338,7 +389,61 @@ of this.
   Each input is bound with its authenticated caller (`bind_caller_prompt`),
   the host decides each exact caller and session, and a refused caller gets
   `StockGovernanceError::CallerNotAdmitted`. In that posture the operator
-  stays the owner of every session and is no requester.
+  stays the owner of every session and is no requester, and since 0.9.4 the
+  composition's own stock ingress principal (`StockPrincipals::ingress_actor`)
+  is refused as a requester too, with a Denied verdict before the host is
+  asked.
+- Operator inputs (0.9.4): `StockGovernance::bind_prompt` binds only a prompt
+  of the local operator (`Input::Prompt`, from the CLI or a governed JSONL
+  connection; labels `prompt-<event>`, `prompt-events`,
+  `rkat-prompt-<event>`). Any other input, an external event included, is
+  refused with `StockGovernanceError::RequesterUnsupported` before anything
+  is written; 0.9.3 bound any input with the operator as its requester. An
+  administrative outcome the operator's own process reports (for example a
+  connector finalization) binds with `StockGovernance::bind_host_outcome`: an
+  `ExternalEventInput` of origin `InputOrigin::External` and durability
+  `InputDurability::Durable`, whose requester is the stock ingress itself,
+  never the operator, under the operator's grant-lineage mandate at the
+  operator's session (labels `host-outcome-<event>`, `host-outcome-events`,
+  `rkat-host-outcome-<event>`). Each outcome runs its own turn. Both return
+  the input to submit and a `PendingOriginal` to admit once the runtime
+  accepted that input; an uncertain delivery is resubmitted, never bound
+  again. A host-authenticated composition refuses both.
+- Owner-scoped resource domains (0.9.4): `ExecutionRestrictions.resource_domains`
+  is a `DomainRestriction` (`unrestricted`, `exact`, `owned_by`,
+  `unresolved`), read through `bound()` as the `#[non_exhaustive]`
+  `DomainBound` (`Unrestricted`, `Exact`, `OwnedBy`). `owned_by(owners)`
+  matches every domain whose authority is one of the owners, so a parent
+  grant can fix the application while each child names its exact session
+  domain. A reader that cannot interpret a bound kind must treat it as naming
+  nothing. Unrestricted and exact bounds keep their wire bytes; a 0.9.3
+  binary refuses to restore a grant owner whose journal holds an owner-scoped
+  restriction (`RestartRequired`).
+- Session agent mandate (0.9.4): `SessionAgentMandate::new(executor, servers,
+  represented_subject)` has no catalog argument and needs at least one MCP
+  server (`AgentMandateError::NoSelection`); the catalog grant stays in the
+  work's own basis (`AgentGrantRefs::prompt_selection`). A stock selection
+  that grants only the catalog binds no session agent, so configured MCP
+  servers stay unavailable, as before.
+- Observed grant resolution (0.9.4): `LocalGrantAuthority::resolve_lineage_observed`,
+  `resolve_controller_lineage_observed` and `resolve_lineage_ceiling_observed`
+  resolve inside the caller's own observation of the grant publication and
+  return `LineageResolutionRefusal::Changed` (an owner change published
+  during the resolution: classify it as a stale read) or `Refused`. The
+  standalone `resolve_lineage` still reports a concurrent change as
+  `GrantRefusal::Unavailable`.
+- Owner-change waits for custom owners (0.9.4):
+  `WorkAuthorization::owner_change_in_progress` (default `None`) reports a
+  change in progress as a waiting hint, never a permission;
+  `LocalAuthorizationPublication::change_in_progress` answers it for the local
+  owners. `meerkat_core::authorization::OwnerChangeChurn` is the bounded wait
+  (`OWNER_CHANGE_WAIT_BOUND` 2 s, `OWNER_CHANGE_FREE_REBUILDS` 3); a tool that
+  waits inside its body bounds the wait by
+  `ToolDispatchContext::remaining_tool_time`.
+- Audit types (0.9.4): `AuditObservation` is `#[non_exhaustive]`,
+  `AuditObservation::Refused` gains `read: Option<AuditRefusalRead>` and
+  `AuditPolicyRead` gains `publication_instance` (see "Audit and security
+  events" in `references/security.md`).
 - Prepared construction: `AgentFactory::prepare_agent` (or
   `prepare_agent_with_controller`) returns a `PreparedAgent` whose
   `tool_surface()` is the final composed tool surface. No agent exists and
