@@ -3670,8 +3670,10 @@ pub trait SessionAgent: Send {
         Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Unsupported)
     }
 
-    /// Replace the LLM client for subsequent turns after proving that its
-    /// concrete wire can represent the existing canonical transcript.
+    /// Replace the LLM client for subsequent turns with another client for
+    /// the session's current model. A client for another provider or model
+    /// is refused with `AgentError::ClientModelChangeRequiresHotSwap`; a model
+    /// change goes through `hot_swap_llm_identity`.
     fn replace_client(
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,

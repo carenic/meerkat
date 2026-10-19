@@ -9872,6 +9872,7 @@ mod tests {
     }
 
     struct HotSwapLimitRecordingClient {
+        provider: crate::provider::Provider,
         model: String,
         seen_max_tokens: Mutex<Vec<u32>>,
         request_pressure_bytes: Option<u64>,
@@ -9881,6 +9882,7 @@ mod tests {
     impl HotSwapLimitRecordingClient {
         fn new(model: &str) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: None,
@@ -9890,6 +9892,7 @@ mod tests {
 
         fn with_request_pressure(model: &str, encoded_bytes: u64) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: Some(encoded_bytes),
@@ -9899,11 +9902,17 @@ mod tests {
 
         fn with_provider_issued_input_tokens(model: &str, input_tokens: u64) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: Some(1_024),
                 provider_issued_input_tokens: Some(input_tokens),
             }
+        }
+
+        fn on_provider(mut self, provider: crate::provider::Provider) -> Self {
+            self.provider = provider;
+            self
         }
 
         fn seen_max_tokens(&self) -> Vec<u32> {
@@ -10252,7 +10261,7 @@ mod tests {
         }
 
         fn provider(&self) -> crate::provider::Provider {
-            crate::provider::Provider::OpenAI
+            self.provider
         }
 
         fn model(&self) -> &str {
@@ -17224,10 +17233,95 @@ mod tests {
         assert_eq!(backup.seen_max_tokens(), vec![2048]);
     }
 
+    /// A direct client replacement keeps the session's model: a client for
+    /// another model or provider, or a request policy for another model, is
+    /// refused with a typed error that names the hot swap, and the live
+    /// client, request model and active profile stay as they were.
+    #[tokio::test]
+    async fn direct_client_replacement_refuses_a_model_change() {
+        let registry = fallback_activation_test_registry();
+        let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
+        let backup = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(16_384)
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(primary.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        let error = agent
+            .replace_client(backup.clone())
+            .expect_err("a client for another model must not replace the session's client");
+        assert!(
+            matches!(
+                &error,
+                AgentError::ClientModelChangeRequiresHotSwap {
+                    durable_provider: crate::Provider::OpenAI,
+                    durable_model,
+                    requested_provider: crate::Provider::OpenAI,
+                    requested_model,
+                } if durable_model == "primary" && requested_model == "backup"
+            ),
+            "unexpected refusal: {error:?}"
+        );
+        assert!(error.to_string().contains("hot_swap_llm_identity"));
+
+        let other_provider = Arc::new(
+            HotSwapLimitRecordingClient::new("primary").on_provider(crate::Provider::Anthropic),
+        );
+        let provider_error = agent
+            .replace_client(other_provider.clone())
+            .expect_err("a client for another provider must not replace the session's client");
+        assert!(
+            matches!(
+                &provider_error,
+                AgentError::ClientModelChangeRequiresHotSwap {
+                    requested_provider: crate::Provider::Anthropic,
+                    requested_model,
+                    ..
+                } if requested_model == "primary"
+            ),
+            "unexpected refusal: {provider_error:?}"
+        );
+
+        let policy_error = agent
+            .replace_client_with_request_policy(primary.clone(), explicit_hot_swap_policy("backup"))
+            .expect_err("a request policy for another model must not reach the session");
+        assert!(
+            matches!(
+                &policy_error,
+                AgentError::ClientModelChangeRequiresHotSwap { requested_model, .. }
+                    if requested_model == "backup"
+            ),
+            "unexpected refusal: {policy_error:?}"
+        );
+        assert_eq!(agent.config.model, "primary");
+        assert_eq!(
+            agent
+                .active_model_profile
+                .as_ref()
+                .map(crate::ModelProfileWitness::model),
+            Some("primary")
+        );
+
+        agent
+            .run("the session keeps its model".into())
+            .await
+            .expect("the original client should remain live");
+        assert_eq!(primary.seen_max_tokens().len(), 1);
+        assert!(backup.seen_max_tokens().is_empty());
+        assert!(other_provider.seen_max_tokens().is_empty());
+    }
+
     #[tokio::test]
     async fn direct_client_replacement_preserves_arbitrary_position_system_messages() {
         let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
-        let replacement = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let replacement = Arc::new(HotSwapLimitRecordingClient::new("primary"));
         let mut session = explicit_hot_swap_session("primary");
         session.push(Message::User(UserMessage::text("ordinary turn")));
         session.push(Message::System(crate::SystemMessage::new(

@@ -933,14 +933,47 @@ where
         self.mob_authority_handle = Some(handle);
     }
 
-    /// Replace the LLM client for subsequent turns.
+    /// Replace the LLM client for subsequent turns with another client for
+    /// the session's current model, such as one with a fresh transport or
+    /// credentials. The new client takes effect on the next `run()` /
+    /// `run_with_events()` call.
     ///
-    /// Enables hot-swapping the model/provider on a live session without
-    /// rebuilding the agent. The new client takes effect on the next
-    /// `run()` / `run_with_events()` call.
+    /// A client whose provider or model differs from the session's durable
+    /// identity is refused with `AgentError::ClientModelChangeRequiresHotSwap`:
+    /// the durable identity is what the active model profile, and with it the
+    /// context and compaction budgets, describe. Change the model with
+    /// `hot_swap_llm_identity`, which publishes the client, the durable
+    /// identity and the active model profile together. A session without a
+    /// durable identity has no model to keep and admits any client.
     pub fn replace_client(&mut self, client: Arc<C>) -> Result<(), AgentError> {
+        self.refuse_client_model_change(client.provider(), client.model())?;
         self.client = client;
         Ok(())
+    }
+
+    /// Refuse a provider or model other than the session's durable identity.
+    fn refuse_client_model_change(
+        &self,
+        provider: crate::Provider,
+        model: &str,
+    ) -> Result<(), AgentError> {
+        let Some(metadata) = self.session.try_session_metadata().map_err(|error| {
+            AgentError::ConfigError(format!(
+                "failed to read the session's durable LLM identity before replacing its client: {error}"
+            ))
+        })?
+        else {
+            return Ok(());
+        };
+        if metadata.provider == provider && metadata.model == model {
+            return Ok(());
+        }
+        Err(AgentError::ClientModelChangeRequiresHotSwap {
+            durable_provider: metadata.provider,
+            durable_model: metadata.model,
+            requested_provider: provider,
+            requested_model: model.to_string(),
+        })
     }
 
     /// Apply the live LLM request policy paired with an identity hot-swap.
@@ -958,11 +991,16 @@ where
     }
 
     /// Replace the LLM client and its next-turn request policy together.
+    ///
+    /// Like `replace_client`, this keeps the session's model: a client or a
+    /// policy model other than the durable identity is refused with
+    /// `AgentError::ClientModelChangeRequiresHotSwap`, before anything changes.
     pub fn replace_client_with_request_policy(
         &mut self,
         client: Arc<C>,
         policy: crate::SessionLlmRequestPolicy,
     ) -> Result<(), AgentError> {
+        self.refuse_client_model_change(client.provider(), &policy.model)?;
         self.replace_client(client)?;
         self.apply_llm_request_policy(policy);
         Ok(())

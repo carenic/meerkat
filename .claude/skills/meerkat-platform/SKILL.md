@@ -1357,7 +1357,7 @@ A session's model can change between turns; the new identity is used for later t
 - **MCP**: `meerkat_resume` with `model`, `provider` or `provider_params` rebuilds the session's agent.
 - **CLI**: `rkat run --resume <ID> -m <MODEL>` (optionally `-p`, `--params-json`).
 - **Agent tool**: `brain_swap` stages a switch that applies before the next input, only if the run completes.
-- **Rust SDK**: `Agent::replace_client()` for direct library usage; `SessionService::hot_swap_session_llm_identity` is implemented by the ephemeral and persistent services (only the trait default returns `SessionError::Unsupported`).
+- **Rust SDK**: `Agent::hot_swap_llm_identity()` for direct library usage; `SessionService::hot_swap_session_llm_identity` is implemented by the ephemeral and persistent services (only the trait default returns `SessionError::Unsupported`). `Agent::replace_client()` and `SessionService::set_session_client` only swap in another client for the same model; a client for another provider or model is refused with `AgentError::ClientModelChangeRequiresHotSwap`.
 
 ## Core features
 

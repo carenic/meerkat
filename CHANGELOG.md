@@ -54,6 +54,19 @@ them.
   result by the budget and reports the bound, as `DefaultCompactor` does. The
   implementors in this repository (`DefaultCompactor` and the test
   compactors) are updated; no published example implements the trait.
+- `meerkat-core`: `Agent::replace_client` and
+  `Agent::replace_client_with_request_policy`, and through them the ephemeral
+  service's `SessionService::set_session_client`, no longer change the
+  session's model. A client, or a request-policy model, whose provider or
+  model differs from the session's durable identity is refused with
+  `AgentError::ClientModelChangeRequiresHotSwap` before anything changes: such
+  a swap left the durable identity and the active model profile, which size
+  the context and compaction budgets, on the previous model. Change the model
+  with `Agent::hot_swap_llm_identity` or
+  `SessionService::hot_swap_session_llm_identity`, which publish the client,
+  the durable identity and the profile together. A replacement client for the
+  same model, or any client on a session without a durable identity, is
+  accepted as before.
 
 ### Added
 
@@ -69,6 +82,9 @@ them.
   the Python (`CompactionCompleted.summary_source`) and TypeScript
   (`CompactionCompletedEvent.summarySource`) SDKs parse it; a kind they do
   not know parses to `unknown` with the wire object.
+- `meerkat-core`: `AgentError::ClientModelChangeRequiresHotSwap`, a
+  configuration-class error that names the durable and the requested provider
+  and model and points to `hot_swap_llm_identity`.
 
 ### Changed
 
