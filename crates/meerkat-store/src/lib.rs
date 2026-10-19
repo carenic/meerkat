@@ -61,9 +61,9 @@ pub use meerkat_core::session_store::{
     HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, VerifiedHeadCanonicalAuthority,
 };
 pub use meerkat_core::{
-    IncrementalSessionStore, SessionFilter, SessionHead, SessionHeadCas, SessionStore,
-    SessionStoreError, TranscriptStrandId, head_canonical_plain_save_guard, session_head_cas_token,
-    strand_layout_for_history,
+    IncrementalSessionStore, RetainedStrandLayout, SessionFilter, SessionHead, SessionHeadCas,
+    SessionStore, SessionStoreError, TranscriptStrandId, head_canonical_plain_save_guard,
+    session_head_cas_token, strand_layout_for_history, strand_layout_for_retained_history,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

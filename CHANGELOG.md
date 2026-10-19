@@ -139,6 +139,11 @@ them.
   check that `preflight_schema_eligibility` runs and returns the ledger
   version it verified (`None` for a fresh domain), read in the same snapshot
   as the check.
+- `meerkat-core`: `strand_layout_for_retained_history` lays out the retained
+  part of a session's transcript graph, including a graph that retired its
+  oldest occurrences after compaction, and returns `RetainedStrandLayout`:
+  that layout and the retired base a store persists beside its rows.
+  `strand_layout_for_history` still refuses a re-anchored graph.
 - `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`
   converts a standalone WholeBlob runtime database in place to the
   HeadCanonical profile, co-located with the SQLite session store in the same
@@ -256,6 +261,16 @@ them.
 
 ### Fixed
 
+- `meerkat-store`: the SQLite session store lays out a whole-blob session
+  whose transcript graph retired its oldest occurrences, which every session
+  compacted more often than `history_retained_rewrites` (default 4) has. It
+  refused such a session typed before. The realm's one-time migration of a
+  blob row, the standalone WholeBlob conversion's seeding and read-only head
+  synthesis now write or derive the rows the store keeps after retiring the
+  same occurrences incrementally: the retired base as a
+  `session_transcript_retirements` row and rewrite rows for the retained
+  generations only, and the synthesized head is the head the migration
+  writes. The in-memory store still refuses such a session typed.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved

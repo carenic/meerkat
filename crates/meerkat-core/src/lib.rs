@@ -559,11 +559,13 @@ pub use session_recovery::{
 };
 pub use session_store::{
     HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
-    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight, SessionFilter,
-    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, SessionStore,
-    SessionStoreError, StrandLayout, StrandRewriteLayout, TranscriptRowRetention,
-    TranscriptStrandId, VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
+    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight,
+    RetainedStrandLayout, SessionFilter, SessionHead, SessionHeadCas,
+    SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
+    StrandRewriteLayout, TranscriptRowRetention, TranscriptStrandId,
+    VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
     head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
+    strand_layout_for_retained_history,
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{

@@ -20760,6 +20760,13 @@ ORDER BY runtime_id";
         /// keeps its session store in another file). See the fixture README.
         const META_093_GATEWAY_FIXTURE: &str = "tests/fixtures/v0_9_3_meta_gateway_runtime";
 
+        /// The runtime database a published Meta 0.9.3 persistent gateway
+        /// left behind after two of its sessions compacted past the default
+        /// retention, so that their WholeBlob bodies hold re-anchored
+        /// transcript graphs. See the fixture README.
+        const META_093_RE_ANCHORED_GATEWAY_FIXTURE: &str =
+            "tests/fixtures/v0_9_3_meta_gateway_runtime_re_anchored";
+
         /// One WholeBlob runtime of the 0.9.3 gateway database, read raw.
         struct Meta093GatewayRuntime {
             runtime_id: LogicalRuntimeId,
@@ -20768,15 +20775,23 @@ ORDER BY runtime_id";
             body: Vec<u8>,
             message_count: usize,
             rewrite_occurrences: u64,
+            retired_occurrences: usize,
         }
 
         /// Copy the released gateway database into a fresh directory after
         /// binding every byte of it to the fixture manifest, and read its
         /// WholeBlob runtimes without opening it as a store.
         fn meta_093_gateway_fixture_copy() -> (TempDir, PathBuf, Vec<Meta093GatewayRuntime>) {
+            meta_093_fixture_copy(META_093_GATEWAY_FIXTURE)
+        }
+
+        /// [`meta_093_gateway_fixture_copy`] for the released gateway
+        /// database in `fixture`, stored whole or as the byte-exact parts its
+        /// manifest lists.
+        fn meta_093_fixture_copy(fixture: &str) -> (TempDir, PathBuf, Vec<Meta093GatewayRuntime>) {
             use sha2::Digest as _;
 
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(META_093_GATEWAY_FIXTURE);
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
             let manifest: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(fixture.join("fixture-manifest.json")).unwrap(),
             )
@@ -20785,7 +20800,23 @@ ORDER BY runtime_id";
             assert_eq!(manifest["data_classification"], "synthetic_non_production");
             assert_eq!(manifest["producer"]["artifact_origin"], "published_release");
             assert_eq!(manifest["producer"]["version"], "0.9.3");
-            let bytes = std::fs::read(fixture.join("runtime.sqlite")).unwrap();
+            let bytes = match manifest["file"]["stored_as"].as_array() {
+                None => std::fs::read(fixture.join("runtime.sqlite")).unwrap(),
+                Some(parts) => parts.iter().fold(Vec::new(), |mut bytes, part| {
+                    let part_bytes =
+                        std::fs::read(fixture.join(part["path"].as_str().unwrap())).unwrap();
+                    assert_eq!(
+                        (part["bytes"].clone(), part["sha256"].clone()),
+                        (
+                            serde_json::json!(part_bytes.len()),
+                            serde_json::json!(format!("{:x}", sha2::Sha256::digest(&part_bytes)))
+                        ),
+                        "a stored part of the released gateway database changed"
+                    );
+                    bytes.extend_from_slice(&part_bytes);
+                    bytes
+                }),
+            };
             assert_eq!(
                 manifest["file"]["bytes"],
                 bytes.len(),
@@ -20868,8 +20899,16 @@ ORDER BY runtime_id";
                         let rewrite_occurrences = session
                             .transcript_rewrite_prefix_authority()
                             .map_or(0, |prefix| prefix.occurrence_count());
+                        let retired_occurrences = session
+                            .validated_transcript_history_state()
+                            .unwrap()
+                            .map_or(0, |history| history.state().retired_count());
                         assert_eq!(expected["message_count"], session.messages().len());
                         assert_eq!(expected["rewrite_occurrences"], rewrite_occurrences);
+                        assert_eq!(
+                            expected["retired_occurrences"].as_u64().unwrap_or(0),
+                            retired_occurrences as u64
+                        );
                         Meta093GatewayRuntime {
                             runtime_id: LogicalRuntimeId::new(runtime_id),
                             session_id: session.id().clone(),
@@ -20877,6 +20916,7 @@ ORDER BY runtime_id";
                             body,
                             message_count: session.messages().len(),
                             rewrite_occurrences,
+                            retired_occurrences,
                         }
                     },
                 )
@@ -21186,7 +21226,7 @@ ORDER BY runtime_id";
             }
         }
 
-        /// #306 K1: the published Meta 0.9.3 gateway runtime database converts
+        /// The published Meta 0.9.3 gateway runtime database converts
         /// in place once the session store is opened on the same file. Every
         /// session the co-located store loads afterwards is its WholeBlob
         /// body, transcript and rewrite history byte for byte; each runtime's
@@ -21234,7 +21274,7 @@ ORDER BY runtime_id";
             }
         }
 
-        /// #306 K1: realm activation stays as it was on the gateway database.
+        /// Realm activation stays as it was on the gateway database.
         /// `new_head_canonical` refuses it typed on every attempt and seeds
         /// no session; the refusal leaves the file pinned with its first
         /// runtime's activation in progress, and the standalone conversion
@@ -21292,7 +21332,7 @@ ORDER BY runtime_id";
             assert_meta_093_gateway_converted(&path, &runtimes).await;
         }
 
-        /// #306 K1: the conversion needs the co-located session store's
+        /// The conversion needs the co-located session store's
         /// schema. Without it the conversion refuses typed and leaves every
         /// byte of the database as it was; once the session store has been
         /// opened on the file, the same bytes convert.
@@ -21321,7 +21361,7 @@ ORDER BY runtime_id";
             assert_meta_093_gateway_converted(&path, &runtimes).await;
         }
 
-        /// #306 K1 (mid-activation retry): a conversion stopped after its
+        /// Mid-activation retry: a conversion stopped after its
         /// first runtime committed, with the second runtime's conversion
         /// rolled back at its authority write, keeps the first runtime and
         /// none of the second's seeded rows; the next call finishes it, and
@@ -21411,7 +21451,7 @@ ORDER BY runtime_id";
             assert_meta_093_gateway_converted(&stopped, &runtimes).await;
         }
 
-        /// #306 K1: a WholeBlob body that differs from its store-issued digest,
+        /// A WholeBlob body that differs from its store-issued digest,
         /// or is missing, refuses the conversion typed at that runtime. It
         /// keeps no authority and no seeded session there, and the runtimes
         /// before it stay converted.
@@ -21540,7 +21580,7 @@ ORDER BY runtime_id";
             )
         }
 
-        /// #306 K1 (no resurrection): a published 0.8.10 SQLite realm whose
+        /// No resurrection: a published 0.8.10 SQLite realm whose
         /// session was deleted from the session store while its runtime entry
         /// lingered does not get the session back. Composed as a realm
         /// composes its stores today, `new_head_canonical` refuses typed on
@@ -21587,7 +21627,7 @@ ORDER BY runtime_id";
             );
         }
 
-        /// #306 K1: on a published 0.8.10 realm whose session is present, the
+        /// On a published 0.8.10 realm whose session is present, the
         /// standalone conversion takes today's derivation for the runtime: its
         /// result is the realm's own `new_head_canonical` activation, row for
         /// row, and its report names the co-located session store as the
@@ -21640,7 +21680,7 @@ ORDER BY runtime_id";
             );
         }
 
-        /// #306 K1 (content guard): the conversion seeds only into a
+        /// Content guard: the conversion seeds only into a
         /// co-located store that holds no session beyond the ones this
         /// database's completed activations own. A gateway file whose store
         /// holds a foreign session refuses typed at its first runtime, seeds
@@ -21717,7 +21757,7 @@ ORDER BY runtime_id";
             assert_eq!(kept.messages(), foreign.messages());
         }
 
-        /// #306 K1 (seed before deriving): a row the co-located store held
+        /// Seed before deriving: a row the co-located store held
         /// before the conversion refuses the seeds even when it is the
         /// session of the file's own first runtime, whether that runtime's
         /// activation never started or a realm open stopped it in progress.
@@ -21839,6 +21879,276 @@ ORDER BY runtime_id";
                     }
                 }
             }
+        }
+
+        /// A standalone WholeBlob runtime database at `path` holding two
+        /// runtimes: first by runtime id, a session compacted five times and
+        /// retired to the default retention, so that its transcript graph is
+        /// re-anchored, as every long-lived gateway session's is; after it, a
+        /// session without compactions.
+        async fn re_anchored_whole_blob_database(path: &Path) -> (Session, Session) {
+            let (mut re_anchored, mut plain) = (Session::new(), Session::new());
+            if re_anchored.id() > plain.id() {
+                std::mem::swap(&mut re_anchored, &mut plain);
+            }
+            for cycle in 0..5 {
+                for turn in 0..2 {
+                    re_anchored.push(Message::User(UserMessage::text(format!(
+                        "cycle {cycle} turn {turn}"
+                    ))));
+                }
+                let end = re_anchored.messages().len() - 1;
+                re_anchored
+                    .commit_transcript_rewrite(
+                        TranscriptRewriteSelection::MessageRange { start: 0, end },
+                        vec![Message::User(UserMessage::text(format!("summary {cycle}")))],
+                        TranscriptRewriteReason::new("compaction"),
+                        Some("test".to_string()),
+                        None,
+                    )
+                    .unwrap();
+            }
+            re_anchored.push(Message::User(UserMessage::text(
+                "after the fifth compaction",
+            )));
+            assert_eq!(
+                re_anchored
+                    .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                    .unwrap(),
+                1
+            );
+            plain.push(Message::User(UserMessage::text(
+                "a session without compactions",
+            )));
+            let whole_blob = SqliteRuntimeStore::new_whole_blob(path).unwrap();
+            for session in [&re_anchored, &plain] {
+                whole_blob
+                    .commit_session_snapshot(
+                        &LogicalRuntimeId::for_session(session.id()),
+                        SerializedSessionSnapshot {
+                            session_snapshot: serde_json::to_vec(session).unwrap().into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            (re_anchored, plain)
+        }
+
+        /// A WholeBlob body whose transcript graph retired its
+        /// oldest occurrences converts, beside the runtime after it. The
+        /// co-located store keeps the retired base and the retained
+        /// occurrences, the session cold-loads as the body's document, and
+        /// the converted runtime commits a turn and reopens.
+        #[tokio::test]
+        async fn re_anchored_whole_blob_body_converts_and_commits_a_turn() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("a re-anchored WholeBlob body converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (2, 0));
+            let retired_count: i64 =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap()
+                    .query_row(
+                        "SELECT retired_count FROM session_transcript_retirements
+                         WHERE session_id = ?1",
+                        params![re_anchored.id().to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(retired_count, 1);
+            for session in [&re_anchored, &plain] {
+                let loaded = session_store
+                    .load(session.id())
+                    .await
+                    .unwrap()
+                    .expect("converted session");
+                assert_eq!(
+                    serde_json::to_value(&loaded).unwrap(),
+                    serde_json::to_value(session).unwrap(),
+                    "{}: the whole session document",
+                    session.id()
+                );
+            }
+
+            let runtime_id = LogicalRuntimeId::for_session(re_anchored.id());
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            let observed_head = session_store
+                .load_head(re_anchored.id())
+                .await
+                .unwrap()
+                .expect("converted head");
+            let mut resumed = session_store
+                .load(re_anchored.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the conversion",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let appended_head = mutation.successor_head().clone();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on the converted runtime");
+            drop(store);
+            let reopened = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file reopens after the turn");
+            let Some(RuntimeSessionAuthority::HeadCanonical(authority)) = reopened
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .unwrap()
+            else {
+                panic!("no HeadCanonical authority after the turn");
+            };
+            assert_eq!(
+                authority.boundary_head().message_count,
+                appended_head.message_count
+            );
+            assert_eq!(
+                session_store
+                    .load(re_anchored.id())
+                    .await
+                    .unwrap()
+                    .expect("session after the turn")
+                    .messages(),
+                resumed.messages()
+            );
+        }
+
+        /// The published Meta 0.9.3 gateway's re-anchored WholeBlob bodies
+        /// convert in place beside its whole-graph bodies. Every co-located
+        /// session is its body's document; each re-anchored session keeps its
+        /// retired base and rewrite rows for its retained occurrences only;
+        /// and a re-anchored runtime commits a turn and reopens.
+        #[tokio::test]
+        async fn meta_093_gateway_runtime_with_re_anchored_bodies_converts_in_place() {
+            let (_dir, path, runtimes) =
+                meta_093_fixture_copy(META_093_RE_ANCHORED_GATEWAY_FIXTURE);
+            let re_anchored = runtimes
+                .iter()
+                .filter(|runtime| runtime.retired_occurrences > 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                re_anchored
+                    .iter()
+                    .map(|runtime| (runtime.retired_occurrences, runtime.rewrite_occurrences))
+                    .collect::<Vec<_>>(),
+                vec![(2, 6), (2, 6)],
+                "two bodies retired the two oldest of their six rewrite occurrences"
+            );
+            let session_store = meta_093_co_located_session_store(&path);
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the released gateway database with re-anchored bodies converts");
+            assert_meta_093_seeded_report(&report, &runtimes.iter().collect::<Vec<_>>());
+            assert_meta_093_gateway_converted(&path, &runtimes).await;
+
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            for runtime in &re_anchored {
+                let session_id = runtime.session_id.to_string();
+                let retired_count: i64 = conn
+                    .query_row(
+                        "SELECT retired_count FROM session_transcript_retirements
+                         WHERE session_id = ?1",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retired_count, 2, "{}: retirement row", runtime.runtime_id);
+                let rewrite_rows = conn
+                    .prepare(
+                        "SELECT rewrite_idx FROM session_rewrites WHERE session_id = ?1
+                         ORDER BY rewrite_idx",
+                    )
+                    .unwrap()
+                    .query_map(params![session_id], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    rewrite_rows,
+                    vec![2, 3, 4, 5],
+                    "{}: rewrite rows for the retained occurrences only",
+                    runtime.runtime_id
+                );
+            }
+            let retirement_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_transcript_retirements",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                retirement_rows, 2,
+                "only the re-anchored sessions keep a retirement row"
+            );
+            drop(conn);
+
+            let runtime = re_anchored[0];
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted gateway database opens head-canonical");
+            let observed_head = session_store
+                .load_head(&runtime.session_id)
+                .await
+                .unwrap()
+                .expect("converted head");
+            let mut resumed = session_store
+                .load(&runtime.session_id)
+                .await
+                .unwrap()
+                .expect("converted session");
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the conversion",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let appended_head = mutation.successor_head().clone();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime.runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on a converted re-anchored runtime");
+            drop(store);
+            let reopened = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted gateway database reopens after the turn");
+            let Some(RuntimeSessionAuthority::HeadCanonical(authority)) = reopened
+                .load_session_boundary_authority(&runtime.runtime_id)
+                .await
+                .unwrap()
+            else {
+                panic!("no HeadCanonical authority after the turn");
+            };
+            assert_eq!(
+                authority.boundary_head().message_count,
+                appended_head.message_count
+            );
+            assert_eq!(
+                session_store
+                    .load(&runtime.session_id)
+                    .await
+                    .unwrap()
+                    .expect("session after the turn")
+                    .messages(),
+                resumed.messages()
+            );
         }
 
         #[tokio::test]
