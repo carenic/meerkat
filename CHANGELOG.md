@@ -491,7 +491,12 @@ them.
   unrestored, its store kept as found, and the other mobs restore. A lookup
   of its id, and a create of that id, answer its refusal:
   `IncarnationInconsistent` and `IncarnationDestroyed` keep their variants,
-  and any other refusal answers `MobError::Internal` with its message. A
+  and any other refusal answers `MobError::Internal` with its message. Its
+  stored roster still counts for the provenance a session's create
+  records: a create by a session that roster names, or while it cannot be
+  read, is refused with `MobError::ProvenanceUnavailable` naming that mob.
+  A child mob that a member of that mob created still resumes while its
+  owner session is live, although its parent mob does not run. A
   transport or persistence fault, and a store that names no mob, still fail
   the restore, so the next mob verb tries it again. Pre-existing in 0.9.3
   and earlier.
