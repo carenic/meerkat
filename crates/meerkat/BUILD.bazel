@@ -2555,6 +2555,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/agent_builder_policy_canary.rs",
@@ -2722,6 +2723,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/agent_factory_auth_binding.rs",
@@ -2852,6 +2854,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/anthropic_stop_reasons.rs",
@@ -2983,6 +2986,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/anthropic_structured_output_bounds.rs",
@@ -3114,6 +3118,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/atif_reexport.rs",
@@ -3244,6 +3249,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/brain_swap_history_read_classification.rs",
@@ -3374,6 +3380,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/brain_swap_pre_dequeue_loop.rs",
@@ -3505,6 +3512,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/brain_swap_realization_saga.rs",
@@ -3635,6 +3643,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/brain_swap_surface_parity.rs",
@@ -3784,6 +3793,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/callback_resume_ordinary_continuation.rs",
@@ -3914,6 +3924,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/catalog_control_agent_boundary.rs",
@@ -4044,6 +4055,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/cold_restart_resume.rs",
@@ -4175,6 +4187,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/cold_restart_resume_after_compaction.rs",
@@ -4306,6 +4319,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/command_hook_confinement.rs",
@@ -4437,6 +4451,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/consent_notice_delivery.rs",
@@ -4567,6 +4582,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/continuation_delivery.rs",
@@ -4697,6 +4713,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/continuation_submit.rs",
@@ -4827,6 +4844,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/credential_command_routes.rs",
@@ -4958,6 +4976,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/e2e_shell.rs",
@@ -5091,6 +5110,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/embedded_skill_registration.rs",
@@ -5221,6 +5241,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/factory_build_agent.rs",
@@ -5352,6 +5373,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/gemini_stop_reasons.rs",
@@ -5483,6 +5505,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/governed_realm.rs",
@@ -5614,6 +5637,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/governed_realm_account_binding.rs",
@@ -5744,6 +5768,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/host_confinement.rs",
@@ -5875,6 +5900,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/host_launch_sites.rs",
@@ -6071,6 +6097,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/integration.rs",
@@ -6200,6 +6227,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/job_composition.rs",
@@ -6330,6 +6358,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/job_delivery_projector.rs",
@@ -6463,6 +6492,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/job_surface.rs",
@@ -6593,6 +6623,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/live_meerkat_regression.rs",
@@ -6726,6 +6757,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/live_meerkat_user_flows.rs",
@@ -6857,6 +6889,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/live_pipeline_unit.rs",
@@ -6987,6 +7020,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/live_video_uri_surface_smoke.rs",
@@ -7116,6 +7150,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/mcp_confinement_feedback.rs",
@@ -7246,6 +7281,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/mcp_oauth_host_canary.rs",
@@ -7376,6 +7412,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/openai_stop_reasons.rs",
@@ -7507,6 +7544,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/persistence_contract.rs",
@@ -7637,6 +7675,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/predicate_schedule.rs",
@@ -7767,6 +7806,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/realm_config_write_lock.rs",
@@ -7898,6 +7938,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/runtime_delivery_callback_hold.rs",
@@ -8028,6 +8069,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/runtime_delivery_hosting.rs",
@@ -8158,6 +8200,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/runtime_delivery_owner.rs",
@@ -8288,6 +8331,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/runtime_delivery_surface.rs",
@@ -8418,6 +8462,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/schedule_host_typed_mapping.rs",
@@ -8549,6 +8594,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/sdk_agentfactory.rs",
@@ -8682,6 +8728,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/sdk_config_ephemeral.rs",
@@ -8813,6 +8860,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/sdk_structured_output.rs",
@@ -8944,6 +8992,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_admission.rs",
@@ -9074,6 +9123,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_builder.rs",
@@ -9204,6 +9254,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_live_orchestration.rs",
@@ -9335,6 +9386,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_llm_reconfigure.rs",
@@ -9465,6 +9517,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_recovery.rs",
@@ -9595,6 +9648,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_runtime_state.rs",
@@ -9725,6 +9779,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/session_runtime_staged_promotion.rs",
@@ -9855,6 +9910,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/smoke_meerkat_sdk.rs",
@@ -9988,6 +10044,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/standalone_turn_lifecycle.rs",
@@ -10119,6 +10176,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/stock_governed_prompt.rs",
@@ -10250,6 +10308,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/stock_host_supplied_stores.rs",
@@ -10380,6 +10439,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/storage_provider_seam.rs",
@@ -10511,6 +10571,7 @@ rust_test(
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md",
         "embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md",
         "src/surface/request_execution.rs",
+        "tests/fixtures/anthropic_refusal_stop_details.sse",
     ],
     srcs = [
         "tests/tool_process_custody_restart.rs",

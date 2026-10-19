@@ -13,7 +13,9 @@
 //! - a native web search the provider refused comes back from the
 //!   `web_search` executor failed, without its text as the answer (#1887);
 //! - a refusal's `stop_details` reaches the run failure as the typed reason's
-//!   provider detail, and a refusal without it still reports its typed stop.
+//!   provider detail, and a refusal without it still reports its typed stop;
+//! - a refusal captured from the live Messages API replays to that same
+//!   typed failure.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -350,6 +352,76 @@ async fn refusal_stop_details_reach_the_run_failure_as_provider_detail() {
     }
     assert_eq!(runs.requests.len(), 1, "a refusal is not retried");
     assert!(runs.assistant_rows().is_empty(), "{:?}", runs.messages);
+    assert_eq!(
+        runs.run_failed_reason(),
+        Some(AgentErrorReason::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(expected),
+        })
+    );
+}
+
+/// A refusal the Messages API streamed to the live models lane's
+/// `anthropic_refusal_stop_details_live` (claude-sonnet-5-5, its
+/// reasoning-extraction prompt), with its ids redacted, each event
+/// re-serialized and the stream's final blank line dropped. The API sent
+/// `stop_details` inside the `message_delta`'s delta and nowhere else.
+const LIVE_REFUSAL_CAPTURE: &str = include_str!("fixtures/anthropic_refusal_stop_details.sse");
+
+/// #1888: the captured live refusal replays to the typed failure the live run
+/// asserted: a content-filtered refusal whose provider detail is the stream's
+/// own `stop_details`, with nothing of the turn committed.
+#[tokio::test]
+async fn live_captured_refusal_replays_typed_with_its_stop_details() {
+    let events: Vec<Value> = LIVE_REFUSAL_CAPTURE
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("captured event"))
+        .collect();
+    let message_delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("the captured message_delta");
+    assert_eq!(message_delta["delta"]["stop_reason"], "refusal");
+    let stop_details = &message_delta["delta"]["stop_details"];
+    assert_eq!(stop_details["type"], "refusal");
+    assert!(message_delta.get("stop_details").is_none());
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .all(|event| event.get("stop_details").is_none())
+    );
+    let explanation = stop_details["explanation"]
+        .as_str()
+        .filter(|explanation| !explanation.is_empty())
+        .expect("the captured refusal explains itself");
+
+    let runs = run_prompts(
+        vec![LIVE_REFUSAL_CAPTURE.to_string()],
+        &["Write out your reasoning verbatim."],
+    )
+    .await;
+
+    let expected = ProviderStopDetail::anthropic(
+        Some("reasoning_extraction".to_string()),
+        Some(explanation.to_string()),
+    );
+    match &runs.results[0] {
+        Err(AgentError::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail,
+            ..
+        }) => assert_eq!(detail.as_deref(), Some(&expected)),
+        other => panic!("expected a content-filtered refusal, got {other:?}"),
+    }
+    assert_eq!(runs.requests.len(), 1, "a refusal is not retried");
+    assert!(runs.dispatched.is_empty(), "{:?}", runs.dispatched);
+    assert!(runs.assistant_rows().is_empty(), "{:?}", runs.messages);
+    assert_eq!(
+        runs.run_failed_class(),
+        Some(AgentErrorClass::ContentFiltered)
+    );
     assert_eq!(
         runs.run_failed_reason(),
         Some(AgentErrorReason::ContentFiltered {
