@@ -351,9 +351,9 @@ surface, not the old live-adapter/docs-refresh snapshot:
   - Forks of a source with activated host instructions that start the
     child's first turn themselves (`fork_off`, council participants, RPC
     `session/fork_at` / `session/fork_replace`) are refused with
-    `FORK_INSTRUCTION_REFUSED` unless the host sets `reactivate_inherited` or
-    the RPC call passes `inherited_instructions`; upgrade member hosts before
-    their controller.
+    `FORK_INSTRUCTION_REFUSED` unless the host sets, or the RPC call passes
+    as `inherited_instructions`, the `reactivate_inherited` policy; upgrade
+    member hosts before their controller.
   - In-turn steers are written into the running turn's transcript (or one
     follow-up turn), and a 0.9.3 peer that checks signatures drops a 0.9.4
     `reply_to_peer` reply, so upgrade comms peers together.

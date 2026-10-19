@@ -277,8 +277,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   council participants) and the RPC forks `session/fork_at` /
   `session/fork_replace` are refused before commit with
   `FORK_INSTRUCTION_REFUSED` (-32037, HTTP 422, exit 57); set
-  `reactivate_inherited` (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`)
-  or pass `inherited_instructions` to carry the activations. Rust:
+  `reactivate_inherited` (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
+  or pass `inherited_instructions: "reactivate_inherited"` on the RPC fork, to
+  carry the activations. Rust:
   `SessionError::ForkInstructionRefused`, `MobError::ForkInstructionRefused`,
   `AgentError::InstructionActivation` (was `ConfigError`), new
   `inherited_instructions` fields and `reactivated_instruction_count`, council

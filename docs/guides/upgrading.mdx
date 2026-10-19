@@ -280,8 +280,8 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
 - **Do:** a host that wants such forks to carry the activations sets
   `reactivate_inherited` with `MobBuilder::with_fork_instruction_policy` or
   `MobMcpState::with_fork_instruction_policy`; an RPC client passes
-  `inherited_instructions` to the fork call, whose result reports
-  `reactivated_instruction_count`.
+  `"inherited_instructions": "reactivate_inherited"` to the fork call, whose
+  result reports `reactivated_instruction_count`.
 - **Mixed versions:** a 0.9.3 member host does not know the policy. Upgrade
   member hosts before their controller: until then a 0.9.3 member host forks
   participants without the policy, and a participant whose source has
@@ -532,8 +532,8 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
     rows stored before 0.9.4).
 11. Realtime clients: handle the `turn_failed` observation, and add the new
     arms and `signal_turn_failed` in Rust.
-12. Forks: handle `FORK_INSTRUCTION_REFUSED`, and set `reactivate_inherited`
-    or pass `inherited_instructions` where a fork must carry activated host
+12. Forks: handle `FORK_INSTRUCTION_REFUSED`, and set or pass
+    `reactivate_inherited` where a fork must carry activated host
     instructions; upgrade member hosts before their controller.
 13. Comms: upgrade peers together (a 0.9.3 peer drops `reply_to_peer`
     replies), and expect in-turn steers in history.
