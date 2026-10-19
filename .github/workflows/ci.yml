@@ -3074,24 +3074,44 @@ jobs:
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
           STAGGER_JOB_NAME: Stagger the short rows
+          # Seconds to wait before each retry of a GitHub API request that
+          # answered with a server error (5xx). Any other failure, or a
+          # server error after the last retry, still fails a measurement the
+          # run enforces.
+          API_RETRY_DELAYS: 5 10 20
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import datetime
           import json
           import os
+          import re
           import subprocess
           import sys
+          import time
+
+          API_RETRY_DELAYS = [int(delay) for delay in os.environ.get("API_RETRY_DELAYS", "").split()]
+          SERVER_ERROR = re.compile(r"HTTP 5\d\d")
 
 
           def api(path):
-              out = subprocess.run(
-                  ["gh", "api", "--paginate", "--slurp", path],
-                  check=True,
-                  capture_output=True,
-                  text=True,
-              ).stdout
-              return json.loads(out)
+              delays = list(API_RETRY_DELAYS)
+              while True:
+                  result = subprocess.run(
+                      ["gh", "api", "--paginate", "--slurp", path],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if result.returncode == 0:
+                      return json.loads(result.stdout)
+                  if delays and SERVER_ERROR.search(result.stderr):
+                      delay = delays.pop(0)
+                      print(f"GitHub API server error for {path} ({result.stderr.strip()}); retrying in {delay} s")
+                      time.sleep(delay)
+                      continue
+                  raise subprocess.CalledProcessError(
+                      result.returncode, result.args, output=result.stdout, stderr=result.stderr
+                  )
 
 
           def ts(value):
