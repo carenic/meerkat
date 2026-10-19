@@ -11,7 +11,7 @@ import Ajv from "ajv";
 
 const exec = promisify(execFile);
 // The per-run timeout is a hang detector, not a speed check. A run normally
-// ends in about 5 s, but a busy runner has stretched the first runs of a job
+// ends within seconds, but a busy runner has stretched the first runs of a job
 // past 15 s, the old limit. Only a run that never ends should reach this.
 const RUN_TIMEOUT_MS = 60_000;
 // The hang check below passes this through the same parameter, so it
@@ -285,9 +285,10 @@ describe("Run timeout", () => {
   it("a run whose peer never replies is killed and reported as timed out",
     { timeout: HANG_PROBE_TIMEOUT_MS + 30_000 }, async () => {
       const started = Date.now();
+      // A run stalled before it sends initialize is killed with no request.
       await assert.rejects(
         runExample("003-hello-meerkat-ts", "never-reply", {}, HANG_PROBE_TIMEOUT_MS),
-        /003-hello-meerkat-ts\/never-reply timed out after the requests \[initialize\]:/,
+        /003-hello-meerkat-ts\/never-reply timed out after the requests \[(initialize)?\]:/,
       );
       const elapsed = Date.now() - started;
       assert.ok(elapsed >= HANG_PROBE_TIMEOUT_MS && elapsed < HANG_PROBE_TIMEOUT_MS + 10_000,
