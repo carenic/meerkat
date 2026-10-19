@@ -152,8 +152,9 @@ pub struct AuditRefusalRead {
     pub observed_at_ms: u64,
     pub basis: AuditRefusalBasis,
     /// The sequence the refused attempt read: the coherent sequence of an
-    /// owner answer, or the sequence the attempt started from when the
-    /// publication changed under it.
+    /// owner answer; when the publication changed, the sequence read just
+    /// before the attempt (for a refusal at a prepared decision's check, the
+    /// decision's own sequence).
     pub publication_sequence: u64,
     /// The live sequence once the refused attempt ended, when the
     /// publication changed under it. Absent for an owner answer.
@@ -186,9 +187,13 @@ impl AuditRefusalRead {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditRefusalBasis {
-    /// The owners answered at one coherent publication.
+    /// The owners answered at one coherent publication. A refusal from the
+    /// prepared decision's own validity window (its not-before, expiry or
+    /// deadline) is such an answer too, not a policy change.
     OwnerAnswer,
-    /// The publication changed under the attempt, and the change completed.
+    /// The publication changed after the sequence the attempt read (under a
+    /// preparation, or after a prepared decision's own read when its check
+    /// refused to rebuild), and the change completed.
     PublicationChanged,
     /// An owner change was still in progress when the attempt ended.
     ChangeInProgress,

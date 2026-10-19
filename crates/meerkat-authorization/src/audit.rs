@@ -146,8 +146,9 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                     // A changed stamp invalidates policy data, but must not erase a known
                     // infrastructure failure or turn it into another refusal to observe.
                     let mut known_failure = None;
-                    // The sequence this attempt starts from, for the read of
-                    // a refusal if the publication changes under it.
+                    // The sequence read just before this attempt, for the read
+                    // of a refusal if the publication changes under it. The
+                    // attempt's own first read can be one change newer.
                     let started = self.publication.current_read();
                     let observed = self.publication.observe(|| {
                         let result = self.inner.prepare(binding);
@@ -247,6 +248,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                             binding: binding.clone(),
                             target,
                             sink: Arc::clone(&self.sink),
+                            publication: self.publication.clone(),
                             clock: Arc::clone(&self.clock),
                         }))
                     }
@@ -330,19 +332,34 @@ struct AuditedPrepared {
     binding: PreparedAuthorizationBinding,
     target: Arc<AuditTarget>,
     sink: Arc<dyn AuthorizationAuditSink>,
+    publication: LocalAuthorizationPublication,
     clock: Arc<dyn LocalAuthorizationClock>,
 }
 
 impl AuditedPrepared {
-    /// A check-time refusal is the owners' answer for this decision's own
-    /// coherent read. `None` when the clock cannot be read.
-    fn refusal_read(&self) -> Option<AuditRefusalRead> {
+    /// The read of a refusal observed at this decision's check. A refusal to
+    /// rebuild means the publication moved after the decision's own read
+    /// ([`PreparedOperationAuthorization::observe`] refuses another binding
+    /// before it records anything), so it reads as changed against the live
+    /// sequence, as at prepare time. Every other refusal is the owners'
+    /// answer at the decision's own coherent read. `None` when the clock
+    /// cannot be read.
+    fn refusal_read(&self, reason: OperationRefusalKind) -> Option<AuditRefusalRead> {
         let meerkat_core::authorization::PolicyPublicationObservation::LocalPublication {
             instance,
             sequence,
         } = self.policy_observation?;
         let now = self.clock.now().ok()?;
-        Some(AttemptRead::Coherent { instance, sequence }.refusal_read(now.unix_ms))
+        let read = if reason == OperationRefusalKind::ReprepareRequired {
+            AttemptRead::Changed {
+                instance,
+                sequence,
+                live: self.publication.current_read().map(|(_, live)| live),
+            }
+        } else {
+            AttemptRead::Coherent { instance, sequence }
+        };
+        Some(read.refusal_read(now.unix_ms))
     }
 }
 
@@ -395,7 +412,7 @@ impl PreparedOperationAuthorization for AuditedPrepared {
             OperationObservation::Refused(reason) => AuditObservation::Refused {
                 target: Arc::clone(&self.target),
                 reason,
-                read: self.refusal_read(),
+                read: self.refusal_read(reason),
             },
         };
         self.sink.append(observation(binding, event))

@@ -74,7 +74,11 @@ them.
   publication, the publication changed under the attempt and the change
   completed, or a change was still in progress), the sequence the attempt
   read, the live sequence when the publication changed under it, and the
-  publication instance. A `Prepared` record's policy read names its
+  publication instance. A refusal to rebuild that a prepared decision
+  observes at its check reads as a changed publication against the live
+  sequence, since the publication moved after the decision's own read; a
+  denial at the check, one from the decision's own validity window
+  included, is an owner answer. A `Prepared` record's policy read names its
   publication instance too, since sequences of different instances do not
   compare. Rows carry both at stored input state version 7; a row stamped
   before v7 that carries either is refused. Records written earlier read

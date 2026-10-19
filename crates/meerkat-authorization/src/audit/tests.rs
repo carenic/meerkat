@@ -802,6 +802,64 @@ fn a_check_time_refusal_reads_at_the_decision_own_read() {
     ));
 }
 
+/// A refusal to rebuild the prepared decision observes at its check means
+/// the publication moved after the decision's own read (an observation of
+/// another binding is refused before it is recorded), so it reads as
+/// changed against the live sequence, as at prepare time: first with the
+/// change still in progress, then once it completed.
+#[test]
+fn a_check_time_refusal_to_rebuild_reads_as_the_publication_changed() {
+    let publication = LocalAuthorizationPublication::new();
+    let prepared =
+        prepare_scripted_on(publication.clone(), vec![(false, RebuildOutcome::Prepared)]);
+    let decision = prepared.result.as_ref().expect("prepared");
+    let refuse_to_rebuild = || {
+        decision
+            .observe(
+                &prepared.binding,
+                OperationObservation::Refused(OperationRefusalKind::ReprepareRequired),
+            )
+            .expect("observed");
+    };
+    let change = publication.begin_owner_change().expect("owner change");
+    refuse_to_rebuild();
+    drop(change);
+    refuse_to_rebuild();
+    let records = prepared.sink.0.lock().expect("observations").clone();
+    assert_eq!(records.len(), 3, "Prepared, then two check-time refusals");
+    let reads = records[1..]
+        .iter()
+        .map(|record| match &record.observation {
+            AuditObservation::Refused {
+                reason: OperationRefusalKind::ReprepareRequired,
+                read,
+                ..
+            } => read.clone(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        reads
+            == vec![
+                Some(AuditRefusalRead::new(
+                    1,
+                    AuditRefusalBasis::ChangeInProgress,
+                    0,
+                    Some(1),
+                    prepared.instance,
+                )),
+                Some(AuditRefusalRead::new(
+                    1,
+                    AuditRefusalBasis::PublicationChanged,
+                    0,
+                    Some(2),
+                    prepared.instance,
+                )),
+            ],
+        "a change in progress, then a completed change"
+    );
+}
+
 #[test]
 fn the_rebuild_answers_from_current_owners_not_from_the_changed_read() {
     // A revocation published during the first read is honored.
