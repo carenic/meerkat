@@ -64,9 +64,16 @@ g add -A && g commit -qm xtask
 # An unknown revision is an error, never "not live".
 [[ "$(classify deadbeefdeadbeef)" == 2 ]] || fail "an unknown revision did not fail closed"
 
+# The workflow hands the verdict its log through a secret filter, so every
+# verdict case reads its log through that same filter.
+workflow="${ROOT}/.github/workflows/live-gate.yml"
+gate_filter="$(grep -o "grep -v -E '[^']*'" "$workflow" | head -n 1 | sed -e "s/^grep -v -E '//" -e "s/'\$//" || true)"
+[[ -n "$gate_filter" ]] || fail "live-gate.yml no longer filters the gate log with grep -v -E"
+filtered() { grep -v -E "$gate_filter" "$1" > "$work/filtered.log" || true; }
 run_verdict() {
+  filtered "$1"
   set +e
-  python3 "$verdict" "$1" "$2" >/dev/null 2>&1
+  python3 "$verdict" "$work/filtered.log" "$2" >/dev/null 2>&1
   local status=$?
   set -e
   echo "$status"
@@ -92,10 +99,91 @@ grep -q '^RED  //:e2e_smoke_turbo_s_s103 run 1$' <<<"$bare_out" \
 bare 104 "GPT_LIVE_VERDICT scenario=S104 verdict=provider_degraded exchange=e2" > "$work/bare-void.log"
 [[ "$(run_verdict "$work/bare-void.log" 3)" == 3 ]] || fail "a single-run provider-degraded section was not VOID"
 
+# The provider stalled after it started speaking: the recorded S98 section of
+# run 39209102955 is VOID, and each near miss of its signature is RED.
+stall="${ROOT}/scripts/tests/fixtures/live-gate/s98-provider-stall.log"
+[[ "$(run_verdict "$stall" 3)" == 3 ]] || fail "the recorded S98 provider stall was not VOID"
+filtered "$stall"
+stall_out="$(python3 "$verdict" "$work/filtered.log" 3 2>/dev/null || true)"
+grep -q '^VOID //:e2e_smoke_turbo_s_s98 run 1 (provider stalled after it started speaking)$' <<<"$stall_out" \
+  || fail "the recorded S98 provider stall was not attributed to its target and reason"
+{ cat "$stall"; section 101 "S101 deterministic checks failed"; } > "$work/stall-red.log"
+[[ "$(run_verdict "$work/stall-red.log" 3)" == 1 ]] || fail "a real failure next to a provider stall was not RED"
+{ cat "$stall"; section 104 "GPT_LIVE_VERDICT scenario=S104 verdict=provider_degraded exchange=e2"; } > "$work/stall-void.log"
+[[ "$(run_verdict "$work/stall-void.log" 3)" == 3 ]] || fail "a provider stall next to a provider-degraded run was not VOID"
+
+# A near miss is the recorded section with one edit: an awk program over the
+# fixture, read twice so that `answer` holds the line of the last turn_started
+# (the answer that stalled). An edit that changes nothing fails here rather
+# than passing as RED for an unrelated reason.
+near_miss() {
+  local name="$1" why="$2" program="$3" add="${4:-}"
+  awk -v add="$add" 'NR == FNR { if (index($0, "kind: \"turn_started\"")) answer = FNR; next } '"$program" \
+    "$stall" "$stall" > "$work/near-${name}.log"
+  ! cmp -s "$stall" "$work/near-${name}.log" || fail "near miss ${name} left the recorded section unchanged"
+  [[ "$(run_verdict "$work/near-${name}.log" 3)" == 1 ]] || fail "near miss ${name} was not RED: ${why}"
+}
+# Insert `add` after everything the stalled answer logged.
+late='/ \.\.\. FAILED$/ { print add } { print }'
+observed() {
+  printf '2026-10-19T06:21:39.000000Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "%s", payload: "<redacted>" }' "$1"
+}
+held="2026-10-19T06:21:39.000000Z  INFO meerkat_openai::public_live: public Live text-chat context held: the model's response is audible token=7"
+near_miss duck-muted "the product ducked the answer" "$late" "$(observed user_speech_over_assistant)"
+near_miss restored "the answer started ducked, then restored" "$late" "$(observed assistant_playback_restorable)"
+near_miss ducked-before "the answer started into an unrestored duck" '!/kind: "assistant_playback_restorable"/'
+near_miss held "the product held text chat behind an audible answer" "$late" "$held"
+near_miss held-earlier "the product held text chat earlier in the run" 'FNR == 2 { print add } { print }' "$held"
+near_miss released "the product released held text chat" "$late" \
+  "2026-10-19T06:21:39.000000Z  INFO meerkat_openai::public_live: public Live held text-chat context released token=7"
+near_miss no-answer "the provider never started the answer" '!(FNR > answer && /kind: "assistant_transcript_fragment"/)'
+near_miss no-turn "the provider started no turn" '!/kind: "turn_started"/'
+near_miss finished "the provider finished the answer" "$late" "$(observed turn_finished)"
+near_miss finished-unlowered "the provider finished the answer, observation not lowered" "$late" \
+  "2026-10-19T06:21:39.000000Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:2 role=Assistant"
+near_miss no-output-audio "no provider output audio after the answer started" \
+  '!(FNR > answer && /public Live sideband reflected output audio /)'
+near_miss stream-ended "the observation stream ended during the answer" "$late" \
+  "2026-10-19T06:21:39.000000Z  WARN meerkat::experimental_gpt_live: experimental live adapter observation stream ended"
+near_miss closed "the channel closed during the answer" "$late" \
+  '2026-10-19T06:21:39.000000Z  INFO meerkat::live_close: live close drain slice observed step="drain_slice"'
+near_miss audible "the browser decoded audible frames" '{ sub(/ decoded_non_silent_frames=0,/, " decoded_non_silent_frames=7200,"); print }'
+near_miss audible-gated "the gated analyser heard audible frames" '{ sub(/ non_silent_frames=0,/, " non_silent_frames=3,"); print }'
+near_miss no-processor "the browser could not decode the track" '{ sub(/ processor_supported=true,/, " processor_supported=false,"); print }'
+near_miss processor-errors "the track processor failed" '{ sub(/ processor_errors=0,/, " processor_errors=1,"); print }'
+near_miss no-track "the remote track delivered no frame" '{ sub(/ decoded_frames=[0-9]+,/, " decoded_frames=0,"); print }'
+near_miss other-timeout "a timeout other than spoken output" \
+  '{ sub(/timed out waiting for spoken output;/, "timed out waiting for provider events;"); print }'
+
+# The signature reads strings the product, the scenario harness and the
+# browser harness write. Each must still be written where the verdict expects
+# it: a renamed disqualifier (a hold, a duck, a finished turn, a channel end)
+# would silently widen VOID.
+pinned() { grep -qF -- "$2" "${ROOT}/$1" || fail "$1 no longer contains: $2 (update scripts/live-gate-verdict)"; }
+public_live=crates/meerkat-openai/src/public_live.rs
+pinned "$public_live" '"public Live lowered a sideband observation"'
+pinned "$public_live" '"public Live provider turn finished; queued for the transcript projection"'
+pinned "$public_live" '"public Live sideband reflected output audio"'
+pinned "$public_live" "\"public Live text-chat context held: the model's response is audible\""
+pinned "$public_live" '"public Live held text-chat context released"'
+broker=crates/meerkat-openai/src/gpt_live_broker.rs
+pinned "$broker" '.debug_struct("GptLiveBrokerObservation")'
+pinned "$broker" '.field("kind", &kind)'
+for kind in turn_started turn_finished assistant_transcript_fragment user_speech_over_assistant assistant_playback_restorable; do
+  pinned "$broker" "=> \"${kind}\","
+done
+pinned crates/meerkat-live/src/lib.rs 'pub const LIVE_CLOSE_TRACE_TARGET: &str = "meerkat::live_close";'
+pinned crates/meerkat/src/experimental_gpt_live.rs '"experimental live adapter observation stream ended"'
+pinned tests/integration/tests/support/gpt_live_e2e.rs \
+  '"timed out waiting for spoken output; decoded_frames={decoded_frames}, decoded_non_silent_frames={decoded_non_silent_frames}, max_decoded_rms={max_decoded_rms:.6}, processor_supported={processor_supported}, processor_errors={processor_errors}, sampled_frames={sampled_frames}, non_silent_frames={non_silent_frames},'
+# Decoded frames are counted on the raw remote track, ahead of the playback
+# gate: a duck cannot silence them.
+pinned tests/live_smoke/browser/harness/gpt-live-peer-e2e.mjs 'new MediaStreamTrackProcessor({ track: event.track })'
+pinned tests/live_smoke/browser/harness/gpt-live-peer-e2e.mjs 'remoteAudio.decodedNonSilentFrames += audioData.numberOfFrames;'
+
 # The setup-buildbuddy-ci composite action reads BUILDBUDDY_API_KEY from the
 # job environment; a step-level env never reaches it (#1544's first runs
 # failed at "Require BuildBuddy API key" with the secret configured).
-workflow="${ROOT}/.github/workflows/live-gate.yml"
 job_env="$(awk '/^    env:$/{f=1; next} f && /^    [a-z]/{exit} f' "$workflow")"
 grep -q '^      BUILDBUDDY_API_KEY: \${{ secrets.BUILDBUDDY_API_KEY }}$' <<<"$job_env" \
   || fail "live-gate.yml must set BUILDBUDDY_API_KEY in the job env for setup-buildbuddy-ci"

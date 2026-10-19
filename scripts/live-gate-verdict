@@ -6,20 +6,26 @@ usage: scripts/live-gate-verdict <bazel-log> <bazel-exit-code>
 The lane runs every GPT Live scenario exactly once (no Bazel retry), with
 --test_output=errors, so each failed run prints one
 "==== Test output for //:<target>:" section ("... (run N of M):" when a
-target runs more than once). A section carrying
-the scenario's typed provider-degraded verdict (GPT_LIVE_VERDICT ...
-verdict=provider_degraded, emitted by Journal::provider_degraded_verdict when
-the provider's input transcription lagged past the measured threshold) is
-VOID: neither green nor red, it says nothing about the change. Any other
-failed section is RED.
+target runs more than once). A failed section is VOID when it carries one of
+two provider signatures; VOID is neither green nor red, it says nothing
+about the change:
+- provider degraded: the scenario's typed verdict (GPT_LIVE_VERDICT ...
+  verdict=provider_degraded, emitted by Journal::provider_degraded_verdict
+  when the provider's input transcription lagged past the measured
+  threshold);
+- provider stalled after it started speaking (provider_stalled below): the
+  provider began an answer, then sent only silent audio until the scenario
+  timed out waiting for it, and nothing in the run shows the product
+  holding, muting or ending that answer.
+Any other failed section is RED.
 
 Exit codes:
   0  GREEN: Bazel succeeded and no run failed.
-  1  RED: at least one run failed for a reason other than provider
-     degradation, or Bazel failed without any test output (a build failure).
-  3  VOID: every failed run was provider-degraded. There is no green
-     evidence, so the gate does not pass; re-run it in a healthy provider
-     window. A void never turns red into green.
+  1  RED: at least one run failed for a reason other than those two, or
+     Bazel failed without any test output (a build failure).
+  3  VOID: every failed run was void. There is no green evidence, so the
+     gate does not pass; re-run it in a healthy provider window. A void
+     never turns red into green.
 """
 
 import re
@@ -30,6 +36,90 @@ import sys
 SECTION = re.compile(r"^=+ Test output for (//[^\s:]*:[^\s:]+)(?: \(run (\d+) of (\d+)\))?:\s*$")
 SECTION_END = re.compile(r"^={40,}\s*$")
 DEGRADED = re.compile(r"GPT_LIVE_VERDICT .*verdict=provider_degraded|PROVIDER_DEGRADED: ")
+
+# The provider-stall signature (S98 in run 39209102955). The browser's wait
+# for spoken output timed out while the remote track flowed and every frame
+# was silent. The harness counts decoded frames on the raw remote track,
+# ahead of the playback gate (the duck), so with a working track processor
+# zero audible frames means none reached the browser at all.
+SPOKEN_OUTPUT_TIMEOUT = re.compile(
+    r"timed out waiting for spoken output; "
+    r"(?=.*\bdecoded_frames=[1-9])"
+    r"(?=.*\bdecoded_non_silent_frames=0\b)"
+    r"(?=.*\bprocessor_supported=true\b)"
+    r"(?=.*\bprocessor_errors=0\b)"
+    r"(?=.*\bnon_silent_frames=0\b)"
+)
+# A sideband observation the product lowered from the provider's stream.
+OBSERVATION = re.compile(r'GptLiveBrokerObservation \{ kind: "([a-z_]+)"')
+# Logged when the provider finishes a turn, before the turn_finished
+# observation is lowered: it shows even when lowering stalls.
+TURN_FINISHED = re.compile(r"public Live provider turn finished; ")
+# The provider's output audio reached the sideband: its stream was alive and
+# carried audio, not text only.
+REFLECTED_OUTPUT_AUDIO = re.compile(r"public Live sideband reflected output audio ")
+# The product held a typed text-chat row because it measured the model's
+# response as audible, or released one: it saw audible output.
+TEXT_CHAT_HOLD = re.compile(r"public Live (?:text-chat context held|held text-chat context released)")
+# The channel closed or its observation stream ended.
+CHANNEL_END = re.compile(r"\bmeerkat::live_close: |experimental live adapter observation stream ended")
+# The product's playback gate: user speech over the assistant ducks the
+# browser's playback, and a restorable playback lifts the duck.
+DUCK = "user_speech_over_assistant"
+RESTORE = "assistant_playback_restorable"
+
+
+def provider_stalled(lines: list[str]) -> bool:
+    """The provider started its answer, then went silent upstream.
+
+    Every condition must hold; any other spoken-output timeout stays RED:
+    - the scenario timed out waiting for spoken output with the remote track
+      flowing and no audible frame decoded (SPOKEN_OUTPUT_TIMEOUT);
+    - the run holds or releases no text-chat context anywhere;
+    - after the last turn the provider started, it sent assistant transcript
+      (the answer began), finished no turn, and its output audio kept
+      reaching the sideband;
+    - the playback gate was open when that turn started (no duck, or the
+      last duck restored) and never ducked or restored after it;
+    - the channel did not close and its observation stream did not end
+      after that turn started.
+    """
+    if not any(SPOKEN_OUTPUT_TIMEOUT.search(line) for line in lines):
+        return False
+    if any(TEXT_CHAT_HOLD.search(line) for line in lines):
+        return False
+    kinds = [_kind(line) for line in lines]
+    started = [index for index, kind in enumerate(kinds) if kind == "turn_started"]
+    if not started:
+        return False
+    answer = started[-1]
+    gate_before = [kind for kind in kinds[:answer] if kind in (DUCK, RESTORE)]
+    if gate_before and gate_before[-1] == DUCK:
+        return False
+    after_kinds = set(kinds[answer + 1 :])
+    after = lines[answer + 1 :]
+    return (
+        "assistant_transcript_fragment" in after_kinds
+        and "turn_finished" not in after_kinds
+        and DUCK not in after_kinds
+        and RESTORE not in after_kinds
+        and not any(TURN_FINISHED.search(line) for line in after)
+        and any(REFLECTED_OUTPUT_AUDIO.search(line) for line in after)
+        and not any(CHANNEL_END.search(line) for line in after)
+    )
+
+
+def _kind(line: str) -> str | None:
+    match = OBSERVATION.search(line)
+    return match.group(1) if match else None
+
+
+def void_reason(lines: list[str]) -> str | None:
+    if any(DEGRADED.search(line) for line in lines):
+        return "provider degraded"
+    if provider_stalled(lines):
+        return "provider stalled after it started speaking"
+    return None
 
 
 def main() -> int:
@@ -44,21 +134,23 @@ def main() -> int:
             line = line.rstrip("\n")
             start = SECTION.match(line)
             if start:
-                current = {"target": start.group(1), "run": start.group(2) or "1", "degraded": False}
+                current = {"target": start.group(1), "run": start.group(2) or "1", "lines": []}
                 sections.append(current)
                 continue
             if current is not None:
                 if SECTION_END.match(line):
                     current = None
-                elif DEGRADED.search(line):
-                    current["degraded"] = True
+                else:
+                    current["lines"].append(line)
+    for section in sections:
+        section["void"] = void_reason(section["lines"])
 
-    red = [s for s in sections if not s["degraded"]]
-    void = [s for s in sections if s["degraded"]]
+    red = [s for s in sections if s["void"] is None]
+    void = [s for s in sections if s["void"] is not None]
     for s in red:
         print(f"RED  {s['target']} run {s['run']}")
     for s in void:
-        print(f"VOID {s['target']} run {s['run']} (provider degraded)")
+        print(f"VOID {s['target']} run {s['run']} ({s['void']})")
 
     if red:
         print(f"live gate: RED ({len(red)} failed run(s), {len(void)} void)")
@@ -67,7 +159,7 @@ def main() -> int:
         print(f"live gate: RED (Bazel exited {bazel_exit} without test output: build or infrastructure failure)")
         return 1
     if void:
-        print(f"live gate: VOID ({len(void)} provider-degraded run(s), no other failure); re-run in a healthy provider window")
+        print(f"live gate: VOID ({len(void)} void run(s), no other failure); re-run in a healthy provider window")
         return 3
     print("live gate: GREEN")
     return 0
