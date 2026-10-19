@@ -47,9 +47,10 @@ them.
   operator's prompts and an administrative outcome its own process reports
   (for example a connector finalization submitted as an external event of
   `InputOrigin::External` origin) keeps `bind_prompt` for the prompts and
-  binds the outcome with `StockGovernance::bind_host_outcome`; the reserved
-  submission, the exact retained input and the rule that an uncertain
-  delivery is resubmitted, never bound again, are unchanged.
+  binds the outcome, as a durable event, with
+  `StockGovernance::bind_host_outcome`; the reserved submission, the exact
+  retained input and the rule that an uncertain delivery is resubmitted,
+  never bound again, are unchanged.
 - Behaviour-only (not measured by the gate): `meerkat`: a
   host-authenticated stock composition refuses its own stock ingress
   principal (`StockPrincipals::ingress_actor`) as a requester, with a Denied
@@ -68,10 +69,11 @@ them.
   no represented subject, under the labels `host-outcome-<event>`,
   `host-outcome-events` and `rkat-host-outcome-<event>` (evidence namespace
   `host-outcome-authentication`). The event's origin must be
-  `InputOrigin::External`; any other origin, and a host-authenticated
-  composition, are refused before anything is written. A turn's identity
-  includes its requester, so an outcome never shares a turn with a queued
-  operator prompt: each outcome runs its own turn.
+  `InputOrigin::External` and its durability `InputDurability::Durable`;
+  any other origin or durability, and a host-authenticated composition, are
+  refused before anything is written. A turn's identity includes its
+  requester, so an outcome never shares a turn with a queued operator
+  prompt: each outcome runs its own turn.
 
 ### Changed
 

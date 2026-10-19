@@ -1816,8 +1816,8 @@ async fn a_host_outcome_is_the_stock_ingress_own_original() {
 }
 
 /// An external event is no prompt of the operator: `bind_prompt` refuses
-/// it, typed and before any write, and a host's outcome binds only as an
-/// external event of external origin. The refusals come before the
+/// it, typed and before any write, and a host's outcome binds only as a
+/// durable external event of external origin. The refusals come before the
 /// session's destination binding: on a session with no registration they
 /// are the same, never the destination's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1861,6 +1861,22 @@ async fn an_outcome_binds_only_as_the_hosts_external_event() {
             assert!(
                 matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
                 "{label} origin: {:?}",
+                refused.map(drop)
+            );
+        }
+        for (label, durability) in [
+            ("derived", InputDurability::Derived),
+            ("ephemeral", InputDurability::Ephemeral),
+        ] {
+            let mut outcome = host_outcome(external());
+            outcome.header.durability = durability;
+            let refused = realm
+                .stock
+                .bind_host_outcome(&realm.machine, target, outcome, session.controller.clone())
+                .await;
+            assert!(
+                matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
+                "{label} durability: {:?}",
                 refused.map(drop)
             );
         }

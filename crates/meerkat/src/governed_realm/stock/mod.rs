@@ -78,7 +78,7 @@ use meerkat_core::{
     ControllerModelClient, ControllerModelSelection, OperationAuthorizationError,
     OperationRefusalKind, OperationRefused, PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
 };
-use meerkat_runtime::input::{ExternalEventInput, Input, InputOrigin};
+use meerkat_runtime::input::{ExternalEventInput, Input, InputDurability, InputOrigin};
 use meerkat_runtime::meerkat_machine::{
     AuthenticatedOriginal, AuthenticatedOriginalSource, ScopedInvocation, bind_scoped_original,
 };
@@ -178,6 +178,16 @@ impl StockPrincipals {
             ingress_actor: principal(PrincipalKind::RuntimeHost, "rkat-cli".to_string())?,
             executor: principal(PrincipalKind::PersonalAgent, "rkat-agent".to_string())?,
         })
+    }
+
+    /// The composition's ingress namespace: the stock ingress's
+    /// `cli-prompts` domain, in which binding records every original and
+    /// admission resolves it.
+    fn ingress_domain(&self) -> ResourceDomain {
+        ResourceDomain {
+            authority: self.ingress_actor.clone(),
+            namespace: PROMPT_NAMESPACE.into(),
+        }
     }
 }
 
@@ -672,13 +682,6 @@ impl StockGovernance {
         Arc::clone(&self.ledger) as Arc<dyn AuthenticatedOriginalSource>
     }
 
-    fn ingress_domain(&self) -> ResourceDomain {
-        ResourceDomain {
-            authority: self.principals.ingress_actor.clone(),
-            namespace: PROMPT_NAMESPACE.into(),
-        }
-    }
-
     /// The realm machine's composition over the restored grant owner, or why
     /// it is unavailable. Called once, while the realm opens.
     pub(crate) async fn composition(
@@ -726,7 +729,7 @@ impl StockGovernance {
         }
         Ok(meerkat_runtime::meerkat_machine::ScopedGrantComposition {
             grants,
-            ingress_domain: self.ingress_domain(),
+            ingress_domain: self.principals.ingress_domain(),
             originals: self.originals(),
             invocation: ScopedInvocation::from_policy(Arc::clone(&policy)),
             operation_owner: policy,
@@ -805,12 +808,15 @@ impl StockGovernance {
     /// The event carries only the outcome that process retained, nothing
     /// from another source. The stock rules cannot verify that the command
     /// ran: the event's content is attributed to the ingress, never
-    /// asserted. Its origin must be [`InputOrigin::External`]; any other
-    /// origin is refused ([`StockGovernanceError::RequesterUnsupported`]),
-    /// the runtime's own system origin included, and so is a
-    /// host-authenticated composition, which admits its ingress as no
-    /// requester. Every refusal here is local and typed, before anything is
-    /// written.
+    /// asserted. Its origin must be [`InputOrigin::External`] and its
+    /// durability [`InputDurability::Durable`]. Any other origin is refused
+    /// ([`StockGovernanceError::RequesterUnsupported`]), the runtime's own
+    /// system origin included, and so is any other durability: the runtime
+    /// refuses a derived external event only at its accept, after this
+    /// binding's writes, and an ephemeral one may be lost while the outcome
+    /// it reports stands. A host-authenticated composition is refused too:
+    /// it admits its ingress as no requester. Every refusal here is local
+    /// and typed, before anything is written.
     ///
     /// As for a prompt, the returned input is submitted through the ordinary
     /// runtime accept and the returned candidate original then admitted
@@ -821,8 +827,8 @@ impl StockGovernance {
     ///
     /// For example, a host whose setup flow finalizes a reviewed connector
     /// installation ([`finalize::ReviewedConnectorFinalization`]) and then
-    /// tells the session's agent the outcome builds an [`ExternalEventInput`]
-    /// from that retained outcome, of origin
+    /// tells the session's agent the outcome builds a durable
+    /// [`ExternalEventInput`] from that retained outcome, of origin
     /// `InputOrigin::External { source_name: "connector-finalization" }`,
     /// and binds it here, while the operator's own prompts in the same
     /// session keep binding with [`Self::bind_prompt`].
@@ -843,6 +849,14 @@ impl StockGovernance {
         if !matches!(event.header.source, InputOrigin::External { .. }) {
             return Err(StockGovernanceError::RequesterUnsupported(
                 "an administrative outcome binds only as an event of external origin".to_string(),
+            ));
+        }
+        // Exactly a durable event: the runtime refuses a derived external
+        // event only at its accept, after this binding's writes, and an
+        // ephemeral one may be lost while the outcome it reports stands.
+        if !matches!(event.header.durability, InputDurability::Durable) {
+            return Err(StockGovernanceError::RequesterUnsupported(
+                "an administrative outcome binds only as a durable event".to_string(),
             ));
         }
         self.bind_original(
@@ -1146,10 +1160,7 @@ impl StockOriginalClaims {
             .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
         let namespace = QualifiedIngressNamespace {
             realm: realm.clone(),
-            ingress: ResourceDomain {
-                authority: principals.ingress_actor.clone(),
-                namespace: PROMPT_NAMESPACE.into(),
-            },
+            ingress: principals.ingress_domain(),
             occurrence_scope: occurrence.clone(),
         };
         let (requester, authentication) = match requesting {
