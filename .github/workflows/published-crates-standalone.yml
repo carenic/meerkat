@@ -17,11 +17,11 @@ name: Published crates standalone
 # (`make check-published-crates-standalone-guard`).
 #
 # Runs nightly, after nightly.yml's chains have released their hosted slots,
-# and on demand. The release workflow refuses to publish crates unless a run
-# of this workflow succeeded at exactly the release commit
-# (scripts/release-require-standalone-green), so the release operator
-# dispatches it on the release commit once that commit is on main:
-#   gh workflow run published-crates-standalone.yml --ref main
+# and on demand:
+#   gh workflow run published-crates-standalone.yml --ref <branch>
+# scripts/release-require-standalone-green checks that a run passed at a
+# given commit. The release workflow does not require one yet: that gate
+# returns once a nightly run has passed and its duration is measured.
 on:
   schedule:
     - cron: "41 5 * * *"

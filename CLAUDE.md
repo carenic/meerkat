@@ -664,7 +664,9 @@ needs a crate the package cannot depend on (a cyclic or unpublished
 dev-dependency) is gated on its crate's internal `workspace-tests` feature,
 which only the crate's path-only self dev-dependency enables (`cargo package`
 strips it), and the Bazel generator fails a crate that declares the feature
-without that edge.
+without that edge. Publication does not wait for the census yet: the release
+gate on a passing run at the release commit returns once a nightly run has
+passed and its duration is measured.
 
 The release tag path requires successful exact-main CI (schema-4 attestation)
 and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
@@ -715,7 +717,6 @@ release semver gate; PR and manual artifacts are previews.
 | `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after exact-main CI (`require_ci_green`) and the full gate, downloads artifacts (a prebuild's once that run's full binary build gate passed, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
 | `update_homebrew` | After the trailing publisher | Updates the Homebrew tap formula from the complete release's published checksums |
 | `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published (add-only: a baseline already attached stays). It is the baseline the next release's semver gate compares against; no job waits for either |
-| `release_standalone_gate` | Tags or manual `publish_release_packages=true` (not Web-only) | Requires a completed, successful `published-crates-standalone.yml` run on main at exactly the release commit, its gate job green (`scripts/release-require-standalone-green`, which waits for a run still going); dispatch it on main once the release commit is main's head. `publish_registries` needs it |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm; before the SDK packages build, it waits for the release's complete manifest (`scripts/release-await-binary-manifest`), verifies each `rkat-rpc` archive's build attestation and stamps the archive and binary digests into both (`scripts/release-stamp-sdk-binary-digests`), and each publish step refuses a package that does not pin them for its version |
 | `publish_web_sdk` | Tags or manual package/Web recovery | After `require_ci_green`, `release_validate_gate` and `release_semver_gate` (both skipped only on Web-only recovery), the registry credential preflight and the build (or a found prebuild), checks the artifact's stamp against the release commit (and a reused artifact's source run), verifies a prebuild's package attestation and version, then publishes `@rkat/web` → npm |
 

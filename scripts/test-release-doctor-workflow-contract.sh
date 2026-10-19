@@ -42,8 +42,6 @@ WINDOWS_FAIL="FAIL Release workflow should cross-compile Windows binaries on Lin
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
 CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job or semver readiness run restores a cache on any event, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
-STANDALONE_PASS="PASS Rust registry publication waits for the published crates' standalone tests at the release commit"
-STANDALONE_FAIL="FAIL Rust registry publication must need release_standalone_gate, which runs scripts/release-require-standalone-green on the release commit"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or CI installs sccache through sccache-action or without a pinned sha256"
 
 fail() {
@@ -111,13 +109,7 @@ READBACK_STEP = re.compile(r"      - name: Verify all Rust crates are public\n" 
 SLO_STEP = re.compile(r"      - name: Enforce the 30 minute Rust publication SLO\n" + STEP_BODY)
 PYTHON_SDK_STEP = re.compile(r"      - name: Publish Python SDK\n")
 
-if name == "standalone-gate-unneeded":
-    replace_once(
-        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, registry_credentials_preflight, release_standalone_gate]\n",
-        "    needs: [require_ci_green, release_validate_gate, release_semver_gate, registry_credentials_preflight]\n",
-    )
-    replace_once("      needs.release_standalone_gate.result == 'success' &&\n", "")
-elif name == "evidence-step-removed":
+if name == "evidence-step-removed":
     match = EVIDENCE_STEP.search(text)
     if match is None or len(EVIDENCE_STEP.findall(text)) != 1:
         raise SystemExit("fixture expects exactly one exact-tree evidence step")
@@ -1274,7 +1266,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$WINDOWS_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS" "$STANDALONE_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$WINDOWS_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -1337,13 +1329,6 @@ run_doctor "${TEST_ROOT}/doctor-caches.yml" "${TEST_ROOT}/doctor-caches.log"
 if ! grep -Fq "$CACHES_FAIL" "${TEST_ROOT}/doctor-caches.log"; then
   fail "doctor does not report \`${CACHES_FAIL}\` for a workflow whose Windows SDK cache is saved by a dispatch" \
     "$(cat "${TEST_ROOT}/doctor-caches.log")"
-fi
-
-mutate standalone-gate-unneeded "${TEST_ROOT}/doctor-standalone.yml"
-run_doctor "${TEST_ROOT}/doctor-standalone.yml" "${TEST_ROOT}/doctor-standalone.log"
-if ! grep -Fq "$STANDALONE_FAIL" "${TEST_ROOT}/doctor-standalone.log"; then
-  fail "doctor does not report \`${STANDALONE_FAIL}\` for a workflow whose crates publish without the standalone gate" \
-    "$(cat "${TEST_ROOT}/doctor-standalone.log")"
 fi
 
 echo "release doctor workflow contract holds"

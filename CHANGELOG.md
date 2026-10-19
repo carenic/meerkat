@@ -230,11 +230,11 @@ them.
   (that test fails until the fixture matches).
 - A nightly workflow, `published-crates-standalone.yml`, packages every
   release crate, runs each one's tests in its unpacked package, and compares
-  every test target's test names with the workspace's. The release workflow
-  publishes no crate unless a successful run of it exists at the exact
-  release commit (job `release_standalone_gate`,
-  `scripts/release-require-standalone-green`); `release-doctor` checks that
-  wiring.
+  every test target's test names with the workspace's. Publication does not
+  wait for it yet: the release gate on a passing run at the release commit
+  returns once a nightly run has passed and its duration is measured.
+  `scripts/release-require-standalone-green` checks that a run passed at a
+  given commit.
 - `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,
   which nothing called any more (a browser opens through
   `HostLaunchExemption::browser_opener`). Builds drop it and its platform
