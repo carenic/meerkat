@@ -25205,6 +25205,28 @@ fn interrupt_yielding_peer_input(
     (input, input_id)
 }
 
+/// A request-only Steer that takes the exact live-boundary path: an ordinary
+/// continuation carrying a typed notice append. A peer steer joins the running
+/// run through the durable path, one per boundary, so the exact-boundary
+/// tests drive this input instead.
+fn interrupt_yielding_request_only_input(body: &str) -> (Input, InputId) {
+    let mut continuation = crate::input::ContinuationInput::detached_background_op_completed();
+    continuation.header.durability = crate::input::InputDurability::Durable;
+    continuation.turn_append = Some(meerkat_core::lifecycle::ConversationAppend {
+        runtime_source: None,
+        role: meerkat_core::lifecycle::ConversationAppendRole::SystemNotice,
+        content: meerkat_core::lifecycle::CoreRenderable::SystemNotice {
+            kind: meerkat_core::types::SystemNoticeKind::Generic,
+            body: Some(body.to_string()),
+            blocks: Vec::new(),
+        },
+        identity: None,
+    });
+    let input = Input::Continuation(continuation);
+    let input_id = input.id().clone();
+    (input, input_id)
+}
+
 fn directed_interrupt_yielding_peer_input(body: &str) -> (Input, InputId) {
     let input_id = InputId::new();
     let interaction_id = meerkat_core::interaction::InteractionId(input_id.0);
@@ -25345,10 +25367,8 @@ async fn unavailable_exact_boundary_uses_queued_fallback() {
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "unavailable exact boundary remains queued",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("unavailable exact boundary remains queued");
     let (outcome, completion_handle) = rig
         .adapter
         .accept_input_with_completion(&rig.session_id, peer_input)
@@ -25399,10 +25419,8 @@ async fn stale_exact_boundary_uses_queued_fallback() {
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "stale exact boundary remains queued",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("stale exact boundary remains queued");
     let (outcome, completion_handle) = rig
         .adapter
         .accept_input_with_completion(&rig.session_id, peer_input)
@@ -25448,10 +25466,8 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
     let mut accepts = Vec::with_capacity(FAN_IN);
 
     for index in 0..FAN_IN {
-        let (peer_input, input_id) = interrupt_yielding_peer_input(
-            &format!("concurrent peer report {index}"),
-            Some(meerkat_core::types::HandlingMode::Steer),
-        );
+        let (peer_input, input_id) =
+            interrupt_yielding_request_only_input(&format!("concurrent peer report {index}"));
         input_ids.push(input_id);
         let adapter = Arc::clone(&rig.adapter);
         let session_id = rig.session_id.clone();
@@ -25531,10 +25547,8 @@ async fn stalled_boundary_optimization_does_not_block_sixty_nine_durable_admissi
     let accepts = tokio::spawn(async move {
         let mut accepted_ids = Vec::with_capacity(FAN_IN);
         for index in 0..FAN_IN {
-            let (peer_input, input_id) = interrupt_yielding_peer_input(
-                &format!("serial peer report {index}"),
-                Some(meerkat_core::types::HandlingMode::Steer),
-            );
+            let (peer_input, input_id) =
+                interrupt_yielding_request_only_input(&format!("serial peer report {index}"));
             let (outcome, completion_handle) = adapter
                 .accept_input_with_completion(&session_id, peer_input)
                 .await
@@ -25584,8 +25598,10 @@ async fn stalled_boundary_optimization_does_not_block_sixty_nine_durable_admissi
     let stalled_index = prepared_texts
         .last()
         .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("serial peer report "))
+            text.lines().find_map(|line| {
+                line.split_once("serial peer report ")
+                    .map(|(_, index)| index.trim())
+            })
         })
         .and_then(|index| index.parse::<usize>().ok())
         .unwrap_or_else(|| {
@@ -25661,10 +25677,8 @@ async fn run_advancing_during_live_boundary_preparation_preserves_successor_clai
     let rig = InterruptYieldingTestRig::new_with_adapter(adapter, Some(probe.clone()), None).await;
     rig.start_busy_turn().await;
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "run advance must not drop accepted peer input",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("run advance must not drop accepted peer input");
     let accept = {
         let adapter = Arc::clone(&rig.adapter);
         let session_id = rig.session_id.clone();
@@ -25763,10 +25777,8 @@ async fn assert_faulted_boundary_terminalizes_exact_input() {
     let (hint, runless_terminal_tells, _told) = counting_runless_terminal_hint();
     rig.adapter.set_runless_input_terminal_hint(hint);
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "failed exact boundary must not fall back",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("failed exact boundary must not fall back");
     let (outcome, completion_handle) = tokio::time::timeout(
         Duration::from_secs(1),
         rig.adapter
