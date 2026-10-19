@@ -209,7 +209,10 @@ def run(*args):
 # make target -> (CI job, plan flag). test-sdk-web is the Makefile's
 # `npm install`, `npm run build` (build:wasm, then build:ts), `npm test`
 # (build:ts first) and `npm run test:packed` in sdks/web; example-web runs
-# the same commands there.
+# the same commands there: `npm test` on the job's flag, the wasm build and
+# the packed-package smoke on example_web_wasm, the plan's flag for
+# building the wasm in the job (a pull request that changes a crate the web
+# runtime builds on leaves those to the push).
 RATCHETS = {
     "machine-authority-docs-gate": ("governance-gates", "governance_gates"),
     "runtime-authority-bypass": ("governance-gates", "governance_gates"),
@@ -223,7 +226,13 @@ RATCHETS = {
     "test-sdk-web": ("example-web", "example_web"),
     "wasm-check": ("wasm-check", "wasm"),
 }
-WEB_SDK_COMMANDS = ("npm run build:wasm", "npm test", "npm run test:packed")
+WEB_SDK_COMMANDS = {
+    "npm run build:wasm": "example_web_wasm",
+    "npm test": "example_web",
+    "npm run test:packed": "example_web_wasm",
+}
+# Flags beyond the job's that a ratchet's CI steps need.
+STEP_FLAGS = {"test-sdk-web": ("example_web_wasm",)}
 
 def job(name):
     match = re.search(rf"\n  {re.escape(name)}:\n(.*?)(?=\n  [a-z][a-z0-9-]*:\n|\Z)", ci, re.S)
@@ -286,9 +295,15 @@ for target, (job_name, flag) in sorted(RATCHETS.items()):
     assert runs_on_flag(condition(head, 4), flag), f"job {job_name} does not run on {flag} alone"
     selected = [step for step in steps(block) if runs_on_flag(step["if"], flag)]
     if target == "test-sdk-web":
-        ran = {command for step in selected if step["directory"] == "sdks/web" for command in step["commands"]}
-        missing = [command for command in WEB_SDK_COMMANDS if command not in ran]
-        assert not missing, f"job {job_name} no longer runs {missing} in sdks/web on {flag}"
+        missing = [
+            command
+            for command, step_flag in WEB_SDK_COMMANDS.items()
+            if not any(
+                step["directory"] == "sdks/web" and command in step["commands"] and runs_on_flag(step["if"], step_flag)
+                for step in steps(block)
+            )
+        ]
+        assert not missing, f"job {job_name} no longer runs {missing} in sdks/web on its flags"
         continue
     assert any(
         command.startswith("make ") and target in command.split()[1:]
@@ -327,8 +342,9 @@ for path in samples:
             if target not in RATCHETS:
                 raise SystemExit(f"{path}: the hook runs make {target}, which this test maps to no CI step")
             job_name, flag = RATCHETS[target]
-            if plan.get(flag) is not True:
-                raise SystemExit(f"{path} ({event}): the hook runs make {target}, but the plan's {flag} is {plan.get(flag)}")
+            for needed in (flag, *STEP_FLAGS.get(target, ())):
+                if plan.get(needed) is not True:
+                    raise SystemExit(f"{path} ({event}): the hook runs make {target}, but the plan's {needed} is {plan.get(needed)}")
         print(f"covered: {path} ({event}): {' '.join(targets)}")
 PY
 

@@ -46,6 +46,8 @@ for line in sys.stdin:
     if method == "initialize":
         if mode == "exit-before-reply":
             sys.exit(13)
+        if mode == "never-reply":
+            continue
         result = {
             "contract_version": (
                 "99.0.0" if mode == "mismatch" else os.environ["EXAMPLE_TEST_VERSION"]
