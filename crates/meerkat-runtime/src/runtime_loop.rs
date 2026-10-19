@@ -2757,7 +2757,7 @@ enum OwnedTerminalizationState {
 }
 
 impl RuntimeLoopTeardownSlot {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pending() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             state: std::sync::Mutex::new(RuntimeLoopTeardownState::Pending),

@@ -549,6 +549,14 @@ jobs:
       - name: MODULE.bazel.lock recorded inputs
         run: make verify-bazel-module-lock-inputs
 
+      # The BUILD files are generated from Cargo metadata and the Rust
+      # sources' text. The bazel-graph job's query and --nobuild build accept
+      # a stale graph that is still valid (a missing data label, no target
+      # for a new test), and the commit hook that regenerates them is local
+      # and never sees a merge commit. About 5 seconds.
+      - name: Generated Bazel BUILD files are current
+        run: node scripts/generate-bazel-rust-builds.mjs --check
+
       # Release binaries must compile no test-only code: the release builds
       # pass the release define, under which no target they link enables a
       # non-shipping feature; the packaged-binary marker scan is the backstop.
@@ -563,6 +571,15 @@ jobs:
 
       - name: Release crates package their license files
         run: make check-crate-license-files
+
+      # Published crates' tests must pass standalone: no packaged test
+      # reads outside its package or skips itself when a binary is missing,
+      # and every [package] exclude matches ci/standalone-workspace-only.toml.
+      # The census that runs the packages' tests is nightly's.
+      - name: Published crate tests stay standalone (static guard)
+        run: |
+          make published-crates-standalone-selftest
+          make check-published-crates-standalone-guard
 
       - name: CI lane classifier fails closed
         run: make ci-lanes-selftest
@@ -579,6 +596,9 @@ jobs:
 
       - name: Release prebuild lookup selects only usable exact-commit prebuilds
         run: scripts/test-release-find-prebuild.sh
+
+      - name: Release crate publication requires the standalone census at the release commit
+        run: scripts/test-release-require-standalone-green.sh
 
       - name: Release asset provenance accepts an earlier run only through its build gate
         run: scripts/test-verify-release-asset-provenance.sh

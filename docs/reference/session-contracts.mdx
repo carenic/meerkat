@@ -525,6 +525,8 @@ mobs. `set_additional_child_tool_bundles` carries the matching optional tool
 factories, so children can use a configured host service. Each factory uses
 the actual executing caller's resolver; registration conveys no inherited
 parent authority and exposes no tools unless the host selects their bundle.
+A bundle registered `ChildOffered` reaches only a child profile that names it
+in `tools.bundles`, and only while the host offers it (see the mobs guide).
 
 `MobMcpState::set_after_destroy` is the release counterpart for the mobs that
 state destroys. Once a destroy completed natively and the mob left the
@@ -652,6 +654,39 @@ including their ingress payloads, whatever lifecycle state they reached -
 without scheduling or replaying them. A later session activation follows normal
 recovery, which applies this binary's ordinary terminal-payload retirement to
 rows it writes itself.
+
+A SQLite realm activates the HeadCanonical profile when it opens:
+`SqliteRuntimeStore::new_head_canonical` converts each WholeBlob runtime from
+the co-located session store's own row for its session, and refuses typed when
+that store holds no row, because in a realm a missing row can be a deleted
+session that activation must not bring back. A standalone WholeBlob runtime
+database - one a host composed with `SqliteRuntimeStore::new` on a file of its
+own while its session store lived elsewhere, such as a Meta 0.9.3 persistent
+gateway's `runtime.sqlite` - holds no physical session, so it converts once,
+offline, through `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`.
+The host first opens `SqliteSessionStore` on the same file: without the
+co-located session schema the conversion refuses typed and leaves the database
+file unchanged. Before it writes, the conversion checks every runtime it would
+convert, in the order it converts them: a WholeBlob body that is missing,
+differs from its digest, or does not lay out as the session store's rows, or a
+session the guard below refuses, refuses typed before anything is written, so a
+file the conversion has not pinned stays a WholeBlob database. The conversion
+then pins the file and seeds each runtime's session that the co-located store
+holds no row for from its digest-verified WholeBlob body, in the transaction
+that installs the runtime's authority and completes its activation receipt, so
+the co-located transcript, rewrite history and metadata are that body's. A body
+whose transcript graph retired its oldest occurrences seeds the rows the store
+keeps after retiring the same occurrences: the retired base and rewrite rows
+for the retained occurrences only. It seeds only while the co-located store
+holds no session beyond the ones the file's completed activations own: any
+other session refuses that runtime typed without seeding, and runtimes to seed
+convert before runtimes whose session already has a row, so a session the store
+held before the conversion always refuses. The host therefore writes no session
+row into the file before the conversion returns. A conversion stopped part way
+finishes on the next call, and a converted file opens with
+`new_head_canonical`. The caller asserts that the file is standalone: the
+conversion is never used on a realm database, and the guard cannot tell a realm
+whose remaining sessions all completed activation from a standalone file.
 
 ### Durable-tail recovery
 

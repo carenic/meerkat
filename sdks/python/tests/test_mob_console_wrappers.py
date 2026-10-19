@@ -429,7 +429,7 @@ def test_history_validator_accepts_only_schema_nullable_nested_fields() -> None:
                         "phase": "pending",
                         "detail": None,
                     },
-                    "persisted": True,
+                    "settled": False,
                     "applied_at_turn": None,
                     "domain": None,
                     "deferred_catalog_delta": None,
@@ -441,7 +441,7 @@ def test_history_validator_accepts_only_schema_nullable_nested_fields() -> None:
                 "server_id": None,
                 "operation": None,
                 "phase": None,
-                "persisted": False,
+                "settled": False,
             },
             {
                 "type": "background_job",
@@ -502,6 +502,12 @@ def test_history_validator_accepts_only_schema_nullable_nested_fields() -> None:
             "created_at": "2026-07-12T10:00:00Z",
             "kind": "mcp",
             "blocks": [{"type": "mcp", "persisted": None}],
+        },
+        {
+            "role": "system_notice",
+            "created_at": "2026-07-12T10:00:00Z",
+            "kind": "mcp",
+            "blocks": [{"type": "mcp", "settled": None}],
         },
         {
             "role": "tool_results",

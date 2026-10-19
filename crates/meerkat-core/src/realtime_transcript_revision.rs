@@ -1168,6 +1168,9 @@ fn apply_realtime_transcript_event_from_channel_inner(
         RealtimeTranscriptEvent::AssistantTurnInterrupted { response_id } => {
             apply_assistant_turn_interrupted(state, response_id)?
         }
+        RealtimeTranscriptEvent::AssistantTurnFailed { response_id } => {
+            apply_assistant_turn_failed(state, response_id)?
+        }
     };
     Ok(commit)
 }
@@ -2168,6 +2171,42 @@ fn apply_assistant_turn_interrupted(
     finish_realtime_event(state, decision)
 }
 
+/// #1883: a provider response that ended without completing. The document
+/// resolves it as a terminal of kind `Failed`: the whole response is
+/// discarded, display and spoken lanes alike, and no completion is recorded.
+fn apply_assistant_turn_failed(
+    state: &mut SessionRealtimeTranscriptState,
+    response_id: String,
+) -> Result<RealtimeTranscriptApplyCommit, RealtimeTranscriptShellError> {
+    let response_id = normalize_realtime_response_id(response_id);
+    let response_discarded = response_id
+        .as_ref()
+        .is_some_and(|id| state.discarded_assistant_response_ids.contains(id));
+    let decision = resolve_realtime_event(|authority| {
+        authority.resolve_realtime_assistant_turn_completed(
+            response_id.is_some(),
+            response_discarded,
+            RealtimeTranscriptStopReasonKind::Failed,
+        )
+    })?;
+    // A failed response has no stop reason or usage to record, so a decision
+    // that records a completion or readies the response cannot be mirrored.
+    if decision.record_completion || decision.mark_response_ready {
+        return Err(RealtimeTranscriptShellError {
+            op: "realtime_turn_failed_completion",
+        });
+    }
+    if let Some(response_id) = response_id {
+        if decision.discard_response {
+            discard_realtime_assistant_response(state, &response_id);
+        }
+        if decision.remove_completion {
+            state.assistant_completions.remove(&response_id);
+        }
+    }
+    finish_realtime_event(state, decision)
+}
+
 fn finish_realtime_event(
     state: &mut SessionRealtimeTranscriptState,
     decision: RealtimeTranscriptEventDecision,
@@ -2820,6 +2859,32 @@ mod completion_records_staged_text_tests {
                 records,
                 "{stop_reason:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod failed_terminal_decision_tests {
+    use super::{RealtimeTranscriptStopReasonKind, resolve_realtime_event};
+
+    #[test]
+    fn failed_kind_discards_the_whole_response_and_records_no_completion() {
+        for response_discarded in [false, true] {
+            let decision = resolve_realtime_event(|authority| {
+                authority.resolve_realtime_assistant_turn_completed(
+                    true,
+                    response_discarded,
+                    RealtimeTranscriptStopReasonKind::Failed,
+                )
+            })
+            .expect("the document resolves a failed terminal");
+            assert!(decision.discard_response, "{response_discarded}");
+            assert!(!decision.discard_response_by_lane, "{response_discarded}");
+            assert!(!decision.record_completion, "{response_discarded}");
+            assert!(!decision.remove_completion, "{response_discarded}");
+            assert!(!decision.mark_response_ready, "{response_discarded}");
+            assert!(decision.materialize_ready_items, "{response_discarded}");
         }
     }
 }

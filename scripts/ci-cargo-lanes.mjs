@@ -1298,8 +1298,9 @@ function isLaneDefinitionPath(path) {
 
 // Paths whose change can alter the Bazel graph without touching Rust code:
 // generated or hand-written BUILD files, Starlark, module and lock inputs,
-// the BUILD generator, the Bazel toolchain and lane definitions, and every
-// Cargo manifest and the lockfile (crate_universe reads them).
+// the BUILD generator and the modules and lists it reads, the Bazel
+// toolchain and lane definitions, and every Cargo manifest and the lockfile
+// (crate_universe reads them).
 function isBazelGraphPath(path) {
   const base = path.split("/").pop();
   return (
@@ -1315,6 +1316,9 @@ function isBazelGraphPath(path) {
     path === "Cargo.lock" ||
     base === "Cargo.toml" ||
     path === "scripts/generate-bazel-rust-builds.mjs" ||
+    path === "scripts/rust-source-text.mjs" ||
+    path === "scripts/rust-test-selector.mjs" ||
+    path === "scripts/non-shipping-features.json" ||
     path.startsWith("tools/bazel/") ||
     path.startsWith("tools/buildbuddy/")
   );

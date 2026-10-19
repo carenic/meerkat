@@ -595,16 +595,17 @@ pub use meerkat_machine::{
     PreparedArchivedResumeCommitLease, PreparedAttachedSessionActorRecovery,
     PreparedRuntimeExecutorAttachmentRetirement, PreparedSessionMaterialization,
     ReloadRequiredRegistrationDisposition, ReloadRequiredRegistrationSettlement,
-    RunStartHoldReason, RunStartsHold, RunlessInputTerminalHint, RuntimeBindingsError,
-    RuntimeCleanupTaskSpawner, RuntimeDetachedUnregister,
-    RuntimeExecutorAttachmentRetirementCompletion, RuntimeExecutorAttachmentWitness,
-    RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan, RuntimeOwnerIdentity,
-    RuntimeOwnerlessRegistrationAdmission, RuntimeOwnerlessRegistrationLease,
+    ReloadRequiredRegistrationUseSettlement, RunStartHoldReason, RunStartsHold,
+    RunlessInputTerminalHint, RuntimeBindingsError, RuntimeCleanupTaskSpawner,
+    RuntimeDetachedUnregister, RuntimeExecutorAttachmentRetirementCompletion,
+    RuntimeExecutorAttachmentWitness, RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan,
+    RuntimeOwnerIdentity, RuntimeOwnerlessRegistrationAdmission, RuntimeOwnerlessRegistrationLease,
     RuntimeSessionAttachmentState, RuntimeSessionLifecycleObservation,
-    RuntimeSessionQuiescentClose, RuntimeSessionRegistrationOutcome,
+    RuntimeSessionQuiescentClose, RuntimeSessionRegistrationOutcome, RuntimeSessionRegistrationUse,
     RuntimeSessionRegistrationWitness, RuntimeSessionUnregisterAdmission,
-    RuntimeSessionUnregisterObserver, SessionDurabilityReloadRequired, StagedCustodyRelease,
-    StagedMeerkatMachine, StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
+    RuntimeSessionUnregisterObserver, RuntimeSessionUnregisterUseAdmission,
+    SessionDurabilityReloadRequired, StagedCustodyRelease, StagedMeerkatMachine,
+    StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
     classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
     standalone_tool_visibility_owner,
 };
@@ -646,9 +647,9 @@ pub use session_hosting::spawn_blocking_holding_claim;
 pub use session_hosting::{
     ColdDeliveryOwnership, HostingAcquisition, HostingCapability, HostingClaim,
     HostingClaimUnavailable, HostingOwner, HostingOwnerLossProof, HostingPaths, HostingRefused,
-    OwnerLossAttachment, OwnerLossReservation, ServedElsewhere, SessionHostingAuthority,
-    SessionServing, grant_session_hosting, local_session_serving, os_lock_if_trusted,
-    try_cold_delivery_ownership, with_write_hosting,
+    OwnerLossAttachment, OwnerLossReservation, RetainedNotificationRegistration, ServedElsewhere,
+    SessionHostingAuthority, SessionServing, grant_session_hosting, local_session_serving,
+    os_lock_if_trusted, try_cold_delivery_ownership, with_write_hosting,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use session_hosting::{DELIVERY_STORE_SWEEP, DeliveryStoreWatch, watch_delivery_store};
@@ -1112,8 +1113,6 @@ pub use runtime_event::{
 };
 pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
 pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_handle};
-#[cfg(feature = "sqlite-store")]
-pub use store::SqliteRuntimeStore;
 pub use store::{
     CommittedRecoveryBoundary, CommittedWholeBlobMetadata, CommittedWholeBlobProvisionalTail,
     CommittedWholeBlobSnapshot, CommittingWholeBlobSession, ContinuationAdmission,
@@ -1133,6 +1132,11 @@ pub use store::{
     RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, VerifiedCommittedWholeBlobPayload,
     WholeBlobCommittedTranscriptFacts, WholeBlobProvisionalTailAuthority, WholeBlobStoreAuthority,
     reuse_or_load_committed_whole_blob_snapshot,
+};
+#[cfg(feature = "sqlite-store")]
+pub use store::{
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    StandaloneWholeBlobSessionSource,
 };
 pub use traits::{
     DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlPlane,

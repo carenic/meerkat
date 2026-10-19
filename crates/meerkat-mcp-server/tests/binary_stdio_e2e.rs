@@ -13,45 +13,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
-fn mcp_binary_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rkat-mcp") {
-        // Bazel wires a runfiles-relative path; the server below is spawned
-        // with its own working directory, so resolve it first.
-        if let Ok(path) = PathBuf::from(path).canonicalize() {
-            return Some(path);
-        }
-    }
-
-    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        let target_dir = PathBuf::from(target_dir);
-        let candidates = [
-            target_dir.join("debug/rkat-mcp"),
-            target_dir.join("release/rkat-mcp"),
-        ];
-        if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.exists()) {
-            return Some(candidate);
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent()?.parent()?;
-    let debug = workspace_root.join("target/debug/rkat-mcp");
-    if debug.exists() {
-        return Some(debug);
-    }
-    let release = workspace_root.join("target/release/rkat-mcp");
-    if release.exists() {
-        return Some(release);
-    }
-    None
-}
-
-fn skip_if_no_prereqs() -> bool {
-    if mcp_binary_path().is_some() {
-        return false;
-    }
-    eprintln!("Skipping: missing rkat-mcp binary");
-    true
+/// Cargo, nextest, the e2e lane harness and the Bazel graph advertise the
+/// crate's own binary through `CARGO_BIN_EXE_rkat-mcp`, so a missing binary
+/// fails the test instead of skipping it.
+fn mcp_binary_path() -> PathBuf {
+    let advertised = PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_rkat-mcp")
+            .expect("cargo advertises CARGO_BIN_EXE_rkat-mcp to the crate's integration tests"),
+    );
+    // Bazel wires a runfiles-relative path; the server below is spawned
+    // with its own working directory, so resolve it first.
+    advertised.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "CARGO_BIN_EXE_rkat-mcp names a missing binary {}: {error}",
+            advertised.display()
+        )
+    })
 }
 
 struct McpProcess {
@@ -95,7 +72,7 @@ async fn spawn_mcp_stdio(
     cwd: &std::path::Path,
     state_root: &std::path::Path,
 ) -> Result<McpProcess, Box<dyn std::error::Error>> {
-    let binary = mcp_binary_path().ok_or("missing rkat-mcp binary")?;
+    let binary = mcp_binary_path();
     let mut child = Command::new(binary)
         .current_dir(cwd)
         .env("HOME", cwd)
@@ -126,10 +103,6 @@ async fn spawn_mcp_stdio(
 #[tokio::test]
 #[ignore = "lane:e2e-build"]
 async fn stdio_e2e_run_and_resume() -> Result<(), Box<dyn std::error::Error>> {
-    if skip_if_no_prereqs() {
-        return Ok(());
-    }
-
     let temp = TempDir::new()?;
     let project_dir = temp.path().join("project");
     let state_root = temp.path().join("state");

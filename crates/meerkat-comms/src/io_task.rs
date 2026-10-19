@@ -351,6 +351,7 @@ mod tests {
         Arc::new(RwLock::new(store))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_for_trust(
         trusted: &Arc<RwLock<TrustStore>>,
         require_peer_auth: bool,
@@ -361,6 +362,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_for_trust_with_runtime(
         trusted: &Arc<RwLock<TrustStore>>,
         require_peer_auth: bool,
@@ -382,6 +384,7 @@ mod tests {
         (inbox, sender, finalizer)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_finalize_next_runtime(
         inbox: Arc<Inbox>,
         finalizer: meerkat_runtime::TestPeerIngressRuntimeFinalizer,
@@ -520,6 +523,7 @@ mod tests {
         assert_eq!(received.id, envelope_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_verifies_signature() {
         let sender_keypair = make_keypair();
@@ -570,6 +574,7 @@ mod tests {
 
     /// ROW #300 gate: an envelope addressed to a different recipient is rejected
     /// with a typed `Misaddressed` fault, not silently swallowed as `Ok(())`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_misaddressed_returns_typed_fault() {
         let sender_keypair = make_keypair();
@@ -611,6 +616,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_checks_trust() {
         let sender_keypair = make_keypair();
@@ -651,6 +657,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_accepts_invalid_signature_when_auth_disabled() {
         let sender_keypair = make_keypair();
@@ -697,6 +704,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_accepts_untrusted_sender_when_auth_disabled() {
         let sender_keypair = make_keypair();
@@ -742,6 +750,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_sends_ack() {
         let sender_keypair = make_keypair();
@@ -793,6 +802,7 @@ mod tests {
         assert!(ack.verify());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_enqueues_to_inbox() {
         let sender_keypair = make_keypair();
@@ -834,6 +844,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, envelope_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_message() {
         let sender_keypair = make_keypair();
@@ -879,6 +890,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_multimodal_message() {
         let sender_keypair = make_keypair();
@@ -926,6 +938,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_request() {
         let sender_keypair = make_keypair();
@@ -973,6 +986,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn incarnation_fenced_durable_rejection_closes_without_success_ack() {
         let sender_keypair = make_keypair();
@@ -1036,6 +1050,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tcp_handler_threads_observed_source_into_reply_endpoint_classification() {
         let sender_keypair = make_keypair();
@@ -1080,6 +1095,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_no_ack_for_ack() {
         let sender_keypair = make_keypair();
@@ -1112,6 +1128,7 @@ mod tests {
         assert!(result.is_err(), "Should not receive ack for Ack message");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_response_preserves_legacy_queued_no_ack_semantics() {
         let sender_keypair = make_keypair();
@@ -1162,6 +1179,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn supervisor_bridge_request_acknowledges_exact_volatile_handoff() {
         let sender_keypair = make_keypair();
@@ -1230,6 +1248,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_drop_invalid_signature() {
         let sender_keypair = make_keypair();
@@ -1279,6 +1298,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_drop_untrusted_sender() {
         let sender_keypair = make_keypair();
@@ -1322,6 +1342,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_waits_for_final_admission_outcome() {
         // DOGMA-12 defensive scan: if admission rejects the ingress item,
@@ -1367,6 +1388,7 @@ mod tests {
     /// peer added to the router *after* the connection is accepted is
     /// still admitted. This locks in the Wave 3 D Row 20 invariant: one
     /// trust authority, one read path, no snapshot divergence.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_reads_live_trust_after_listener_spawn() {
         let sender_keypair = make_keypair();
@@ -1453,6 +1475,7 @@ mod tests {
     /// §11 demux row: an envelope addressed to member B lands in B's inbox
     /// and the ack is signed by B's keypair — the ADDRESSED identity, not
     /// any other registered identity.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_routes_by_to_and_acks_with_addressed_keypair() {
         let sender_keypair = make_keypair();
@@ -1510,6 +1533,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tcp_demux_threads_observed_source_to_addressed_member_classifier() {
         let sender_keypair = make_keypair();
@@ -1557,6 +1581,7 @@ mod tests {
 
     /// §11 misaddressed row: an envelope addressed to a never-registered key
     /// is rejected with the typed `Misaddressed` fault, no ack sent.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_misaddressed_unregistered_identity_rejected() {
         let sender_keypair = make_keypair();
@@ -1597,6 +1622,7 @@ mod tests {
     /// typed reject as never-registered; removal requires the installed
     /// owner (a wrong owner gets a typed error and the registry is never
     /// mutated).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_registered_then_removed_identity_rejected() {
         let sender_keypair = make_keypair();
@@ -1663,6 +1689,7 @@ mod tests {
     /// `require_peer_auth`), so an unsigned envelope is rejected even when
     /// the registered identity's own inbox context was built from a
     /// `require_peer_auth = false` configuration.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_rejects_unsigned_envelope_despite_no_auth_context() {
         let sender_keypair = make_keypair();
@@ -1708,6 +1735,7 @@ mod tests {
     /// signature verifies — no signed-region or codec drift across the
     /// refactor. The exact-byte signable-region fixtures in types.rs stand
     /// untouched as the primary pin.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_accepts_hand_encoded_envelope_bytes() {
         let sender_keypair = make_keypair();

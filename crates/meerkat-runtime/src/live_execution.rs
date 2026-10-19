@@ -25,8 +25,8 @@ use meerkat_core::{
 };
 #[cfg(feature = "live")]
 use meerkat_live::{
-    LiveSidebandAppendAuthority, LiveSidebandDelegationRef, LiveSidebandNarrationAuthority,
-    LiveSidebandReleaseAuthority, ProviderWebrtcBinding,
+    LiveSidebandAppendAuthority, LiveSidebandDelegationRef, LiveSidebandFinishedNoticeAuthority,
+    LiveSidebandNarrationAuthority, LiveSidebandReleaseAuthority, ProviderWebrtcBinding,
 };
 use sha2::{Digest, Sha256};
 #[cfg(feature = "live")]
@@ -330,6 +330,12 @@ struct LiveDelegationRecoveryOperation {
     /// and derive it from the worker phase and terminal on restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     schedule_state: Option<crate::meerkat_machine::dsl::LiveDelegationScheduleState>,
+    /// The delegation's last authorized narration kind. A `FinishedPending`
+    /// narration is never written (#1820): a runtime from before it cannot
+    /// decode the kind, so the session's lifecycle record would read as
+    /// malformed there and the session would be quarantined. Nothing is lost:
+    /// narration memory only gates narration, which needs the channel's live
+    /// binding, and an image restores no channel binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_narration: Option<crate::meerkat_machine::dsl::LiveDelegationNarrationKind>,
 }
@@ -616,7 +622,11 @@ impl LiveBridgeRecoveryImage {
                 last_narration: state
                     .live_delegation_last_narration_by_operation
                     .get(operation_id)
-                    .copied(),
+                    .copied()
+                    .filter(|kind| {
+                        *kind
+                            != crate::meerkat_machine::dsl::LiveDelegationNarrationKind::FinishedPending
+                    }),
             });
         }
         delegations.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
@@ -3663,15 +3673,14 @@ impl LiveDelegationNarrationAuthority {
         self.kind
     }
 
-    /// Convert into the one-shot provider sideband narration authority. The
-    /// delegation reference must be the exact provider delegation this
-    /// operation was admitted for.
+    /// Check the provider binding and delegation of one provider dispatch
+    /// and spend this authority's single conversion.
     #[cfg(feature = "live")]
-    pub fn into_sideband_narration_authority(
+    fn claim_provider_dispatch(
         &self,
-        binding: ProviderWebrtcBinding,
+        binding: &ProviderWebrtcBinding,
         delegation: &LiveSidebandDelegationRef,
-    ) -> Result<LiveSidebandNarrationAuthority, LiveExecutionAuthorityError> {
+    ) -> Result<String, LiveExecutionAuthorityError> {
         let correlation = self.operation.domain_correlation();
         if self.session_id != *binding.session_id()
             || correlation.channel_id() != binding.channel_id()
@@ -3684,32 +3693,71 @@ impl LiveDelegationNarrationAuthority {
         self.provider_dispatch_consumed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| LiveExecutionAuthorityError::ProviderDispatchAlreadyConverted)?;
-        LiveSidebandNarrationAuthority::__from_generated_narration_authority(
-            binding,
-            format!(
-                "{}:{}",
-                self.operation.operation_id(),
-                match self.kind {
-                    LiveDelegationNarrationKind::Queued => "queued",
-                    LiveDelegationNarrationKind::Claimed => "claimed",
-                    LiveDelegationNarrationKind::Blocked => "blocked",
-                    LiveDelegationNarrationKind::Completed => "completed",
-                    LiveDelegationNarrationKind::SourceBusy => "source-busy",
-                    LiveDelegationNarrationKind::Failed => "failed",
-                }
-            ),
-        )
-        .map(|authority| {
-            // A Failed narration is the delegation's last word: it ends
-            // without a result, so the provider session stops naming it as
-            // still running.
-            if self.kind == LiveDelegationNarrationKind::Failed {
-                authority.__ending_the_delegation()
-            } else {
-                authority
+        Ok(format!(
+            "{}:{}",
+            self.operation.operation_id(),
+            match self.kind {
+                LiveDelegationNarrationKind::Queued => "queued",
+                LiveDelegationNarrationKind::Claimed => "claimed",
+                LiveDelegationNarrationKind::Blocked => "blocked",
+                LiveDelegationNarrationKind::Completed => "completed",
+                LiveDelegationNarrationKind::SourceBusy => "source-busy",
+                LiveDelegationNarrationKind::Failed => "failed",
+                LiveDelegationNarrationKind::FinishedPending => "finished-pending",
             }
-        })
+        ))
+    }
+
+    /// Convert into the one-shot provider sideband finished-notice
+    /// authority: this delegation's work finished while its result has not
+    /// been handed to delivery. Only a `FinishedPending` authority converts;
+    /// the delegation reference must be the exact provider delegation this
+    /// operation was admitted for.
+    #[cfg(feature = "live")]
+    pub fn into_sideband_finished_notice_authority(
+        &self,
+        binding: ProviderWebrtcBinding,
+        delegation: &LiveSidebandDelegationRef,
+    ) -> Result<LiveSidebandFinishedNoticeAuthority, LiveExecutionAuthorityError> {
+        if self.kind != LiveDelegationNarrationKind::FinishedPending {
+            return Err(LiveExecutionAuthorityError::CorrelationMismatch);
+        }
+        let narration_id = self.claim_provider_dispatch(&binding, delegation)?;
+        LiveSidebandFinishedNoticeAuthority::__from_generated_finished_notice_authority(
+            binding,
+            narration_id,
+            delegation.clone(),
+        )
         .ok_or(LiveExecutionAuthorityError::CorrelationMismatch)
+    }
+
+    /// Convert into the one-shot provider sideband narration authority. The
+    /// delegation reference must be the exact provider delegation this
+    /// operation was admitted for. A `FinishedPending` authority is not
+    /// spoken narration and never converts here
+    /// ([`Self::into_sideband_finished_notice_authority`]).
+    #[cfg(feature = "live")]
+    pub fn into_sideband_narration_authority(
+        &self,
+        binding: ProviderWebrtcBinding,
+        delegation: &LiveSidebandDelegationRef,
+    ) -> Result<LiveSidebandNarrationAuthority, LiveExecutionAuthorityError> {
+        if self.kind == LiveDelegationNarrationKind::FinishedPending {
+            return Err(LiveExecutionAuthorityError::CorrelationMismatch);
+        }
+        let narration_id = self.claim_provider_dispatch(&binding, delegation)?;
+        LiveSidebandNarrationAuthority::__from_generated_narration_authority(binding, narration_id)
+            .map(|authority| {
+                // A Failed narration is the delegation's last word: it ends
+                // without a result, so the provider session stops naming it as
+                // still running.
+                if self.kind == LiveDelegationNarrationKind::Failed {
+                    authority.__ending_the_delegation()
+                } else {
+                    authority
+                }
+            })
+            .ok_or(LiveExecutionAuthorityError::CorrelationMismatch)
     }
 }
 
@@ -6272,6 +6320,85 @@ mod tests {
         }
     }
 
+    /// A `FinishedPending` authority is not spoken narration (#1820): it
+    /// converts only into the finished-notice authority, whose command
+    /// lowers to the provider's finished notice for that delegation, and a
+    /// spoken kind never converts into one. A refused conversion spends
+    /// nothing.
+    #[cfg(feature = "live")]
+    #[test]
+    fn only_a_finished_pending_authority_converts_into_a_finished_notice() {
+        use meerkat_live::{LiveSidebandCommand, LiveSidebandProviderCommand};
+        for kind in [
+            LiveDelegationNarrationKind::Queued,
+            LiveDelegationNarrationKind::Claimed,
+            LiveDelegationNarrationKind::Blocked,
+            LiveDelegationNarrationKind::Completed,
+            LiveDelegationNarrationKind::SourceBusy,
+            LiveDelegationNarrationKind::Failed,
+            LiveDelegationNarrationKind::FinishedPending,
+        ] {
+            let session_id = session(1);
+            let operation = exact_operation("channel-a", "provider-turn-secret", 11);
+            let correlation = operation.domain_correlation();
+            let effect = MeerkatMachineEffect::LiveDelegationNarrationAuthorized {
+                channel_id: correlation.channel_id().to_string(),
+                interaction_id: correlation.interaction_id().to_string(),
+                operation_id: DslOperationId::from_domain(operation.operation_id()),
+                provider_turn_correlation: correlation.provider().user_turn_id().to_owned(),
+                kind,
+            };
+            let authority = LiveDelegationNarrationAuthority::from_generated_effect(
+                &session_id,
+                &operation,
+                kind,
+                &effect,
+            )
+            .expect("narration effect")
+            .expect("matching narration effect");
+            let binding = ProviderWebrtcBinding::new(
+                correlation.channel_id().clone(),
+                session_id,
+                meerkat_live::LiveRuntimeBindingGeneration::new(7),
+                meerkat_live::LiveRuntimeBindingFence::new(9),
+            );
+            let delegation = LiveSidebandDelegationRef::__from_provider_observation(
+                "delegation-secret".to_string(),
+                "private-provider-delegation-id".to_string(),
+            )
+            .expect("delegation");
+            if kind == LiveDelegationNarrationKind::FinishedPending {
+                assert!(matches!(
+                    authority.into_sideband_narration_authority(binding.clone(), &delegation),
+                    Err(LiveExecutionAuthorityError::CorrelationMismatch)
+                ));
+                let sideband = authority
+                    .into_sideband_finished_notice_authority(binding, &delegation)
+                    .expect("the refused narration conversion spent nothing");
+                let command = LiveSidebandCommand::note_delegation_finished(sideband)
+                    .expect("finished notice command");
+                assert!(!command.is_spoken(), "a finished notice is never spoken");
+                assert!(matches!(
+                    command.__into_provider_command(),
+                    LiveSidebandProviderCommand::NoteDelegationFinishedContext { delegation, .. }
+                        if delegation.adapter_key() == "delegation-secret"
+                ));
+            } else {
+                assert!(
+                    matches!(
+                        authority
+                            .into_sideband_finished_notice_authority(binding.clone(), &delegation),
+                        Err(LiveExecutionAuthorityError::CorrelationMismatch)
+                    ),
+                    "{kind:?}"
+                );
+                authority
+                    .into_sideband_narration_authority(binding, &delegation)
+                    .expect("a spoken kind still converts into narration");
+            }
+        }
+    }
+
     #[cfg(feature = "live")]
     #[test]
     fn generated_append_conversion_is_exact_and_one_use_across_clones() {
@@ -6536,6 +6663,146 @@ mod tests {
         assert!(!rendered.contains("provider-turn-secret"));
         assert!(!rendered.contains("delegation-secret"));
         assert!(!rendered.contains("executor-input-secret"));
+    }
+
+    /// A slot-blocked delegation as a durable image row: its work completed
+    /// and its result is eligible but not yet released, with `narration` as
+    /// the last narration kind.
+    fn slot_blocked_delegation_image(narration: &str) -> serde_json::Value {
+        serde_json::json!({
+            "operations": [],
+            "delegations": [{
+                "operation_id": "00000000-0000-0000-0000-000000001820",
+                "channel_id": "finished-pending-channel",
+                "channel_revoked": false,
+                "interaction_id": "00000000-0000-0000-0000-000000001821",
+                "provider_turn_ref": "finished-pending-turn",
+                "worker_identity": "finished-pending-worker",
+                "worker_ownership": "OwnedMember",
+                "phase": "Terminal",
+                "reconciliation": "Confirmed",
+                "terminal": "Completed",
+                "cancellation_reason": null,
+                "abandoned": false,
+                "late": false,
+                "result_eligible": true,
+                "schedule_state": "Completed",
+                "last_narration": narration
+            }]
+        })
+    }
+
+    /// The durable image as 0.9.3 decodes it (#1820): the same strict rows,
+    /// and only the narration kinds 0.9.3 knows.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Image093 {
+        operations: Vec<serde_json::Value>,
+        #[serde(default)]
+        delegations: Vec<DelegationRow093>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct DelegationRow093 {
+        operation_id: String,
+        channel_id: String,
+        channel_revoked: bool,
+        interaction_id: String,
+        provider_turn_ref: String,
+        worker_identity: String,
+        worker_ownership: serde_json::Value,
+        phase: serde_json::Value,
+        reconciliation: serde_json::Value,
+        terminal: Option<serde_json::Value>,
+        cancellation_reason: Option<serde_json::Value>,
+        abandoned: bool,
+        late: bool,
+        result_eligible: bool,
+        #[serde(default)]
+        schedule_state: Option<serde_json::Value>,
+        #[serde(default)]
+        last_narration: Option<Narration093>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+    #[allow(dead_code)]
+    enum Narration093 {
+        Queued,
+        Claimed,
+        Blocked,
+        Completed,
+        SourceBusy,
+        Failed,
+    }
+
+    /// #1820: a slot-blocked delegation's FinishedPending narration never
+    /// reaches the durable image. 0.9.3 decodes the image strictly and has no
+    /// such kind, so a rolled-back runtime would read the session's lifecycle
+    /// record as malformed and quarantine the session.
+    #[test]
+    fn a_finished_pending_narration_never_reaches_the_durable_image() {
+        use crate::meerkat_machine::dsl::{
+            LiveDelegationNarrationKind, MeerkatMachineState, OperationId,
+        };
+        let image: LiveBridgeRecoveryImage =
+            serde_json::from_value(slot_blocked_delegation_image("FinishedPending"))
+                .expect("decode a slot-blocked delegation row");
+        let mut state = MeerkatMachineState::default();
+        image.restore_into(&mut state).expect("restore the row");
+        let operation = OperationId("00000000-0000-0000-0000-000000001820".to_string());
+        assert_eq!(
+            state
+                .live_delegation_last_narration_by_operation
+                .get(&operation),
+            Some(&LiveDelegationNarrationKind::FinishedPending),
+            "precondition: the session remembers the finished notice"
+        );
+
+        let captured = LiveBridgeRecoveryImage::capture(&state).expect("capture the image");
+        let persisted = serde_json::to_value(&captured).expect("persist the image");
+        let older: Image093 =
+            serde_json::from_value(persisted).expect("0.9.3 decodes the persisted image");
+        assert_eq!(older.delegations.len(), 1);
+        assert!(older.delegations[0].last_narration.is_none());
+
+        // Restored, the delegation has no narration memory and is otherwise
+        // the same image.
+        let mut restored = MeerkatMachineState::default();
+        captured
+            .restore_into(&mut restored)
+            .expect("restore the persisted image");
+        assert_eq!(
+            restored
+                .live_delegation_last_narration_by_operation
+                .get(&operation),
+            None
+        );
+        assert_eq!(
+            LiveBridgeRecoveryImage::capture(&restored).expect("capture again"),
+            captured
+        );
+    }
+
+    /// A narration kind 0.9.3 knows is persisted as before.
+    #[test]
+    fn a_narration_older_runtimes_know_is_still_persisted() {
+        let image: LiveBridgeRecoveryImage =
+            serde_json::from_value(slot_blocked_delegation_image("Claimed"))
+                .expect("decode a slot-blocked delegation row");
+        let mut state = crate::meerkat_machine::dsl::MeerkatMachineState::default();
+        image.restore_into(&mut state).expect("restore the row");
+        let captured = LiveBridgeRecoveryImage::capture(&state).expect("capture the image");
+        assert_eq!(captured, image);
+        let older: Image093 =
+            serde_json::from_value(serde_json::to_value(&captured).expect("persist the image"))
+                .expect("0.9.3 decodes the persisted image");
+        assert_eq!(
+            older.delegations[0].last_narration,
+            Some(Narration093::Claimed)
+        );
     }
 
     #[test]

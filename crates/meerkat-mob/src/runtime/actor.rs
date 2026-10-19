@@ -27,6 +27,8 @@ mod resume_topology_control;
 mod retirement_io;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(in crate::runtime) use shutdown_teardown::teardown_session;
 pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
@@ -5740,9 +5742,10 @@ struct DeferredResumeProvision {
     agent_identity: AgentIdentity,
     profile: crate::profile::Profile,
     external_tools: Option<Arc<dyn AgentToolDispatcher>>,
-    /// Tool names of the bundles the profile resolved when `external_tools`
-    /// was composed, for the declared tool restriction.
-    bundle_tools: std::collections::BTreeMap<String, meerkat_core::ToolNameSet>,
+    /// The deny vocabularies of the bundles the profile resolved when
+    /// `external_tools` was composed, for the declared tool restriction.
+    bundle_tools:
+        std::collections::BTreeMap<meerkat_core::ToolVocabularySource, meerkat_core::ToolNameSet>,
     compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     context: Option<serde_json::Value>,
     labels: Option<std::collections::BTreeMap<String, String>>,
@@ -6188,7 +6191,10 @@ fn observe_spawn_exec_facts(
     });
     SpawnExecObservations {
         workgraph_required: explicit_workgraph,
-        rust_bundles_present: !profile.tools.rust_bundles.is_empty(),
+        // An opted-in bundle is a Rust bundle too: a placed member cannot
+        // carry either.
+        rust_bundles_present: !profile.tools.rust_bundles.is_empty()
+            || !profile.tools.bundles.is_empty(),
         per_spawn_external_tools_present,
         host_surface_mcp_allowlist_present: !profile.tools.mcp.is_empty(),
         inherited_tool_filter_present,
@@ -6198,6 +6204,26 @@ fn observe_spawn_exec_facts(
         memory_required: profile.tools.memory,
         mcp_required: !profile.tools.mcp_servers.is_empty(),
         resume_session_id,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spawn_observation_tests {
+    use super::*;
+
+    /// A bundle a profile opts into is a Rust bundle too: a placed member
+    /// cannot carry it, so the spawn observes it like a strictly named one.
+    #[test]
+    fn an_opted_in_bundle_is_observed_as_a_rust_bundle() {
+        let mut profile: crate::profile::Profile =
+            serde_json::from_value(serde_json::json!({ "model": "claude-sonnet-4-6" })).unwrap();
+        let observe = |profile: &crate::profile::Profile| {
+            observe_spawn_exec_facts(profile, false, false, None, false, None).rust_bundles_present
+        };
+        assert!(!observe(&profile));
+        profile.tools.bundles = vec!["announcements".to_string()];
+        assert!(observe(&profile));
     }
 }
 
@@ -14204,6 +14230,7 @@ impl MobActor {
             roster: self.roster.clone(),
             definition: self.definition.clone(),
             events: self.events.clone(),
+            identity_member: self.identity_member.clone(),
             run_store: self.run_store.clone(),
             runtime_metadata: self.runtime_metadata.clone(),
             flow_streams: self.flow_streams.clone(),
@@ -14231,6 +14258,8 @@ impl MobActor {
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
             incarnation: self.incarnation,
+            registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
+            realm_profile_store: self.realm_profile_store.clone(),
         }
     }
 
@@ -16350,16 +16379,19 @@ impl MobActor {
         }
     }
 
+    #[cfg(feature = "runtime-adapter")]
     pub(super) fn record_shutdown_unregister_pending(
         &mut self,
         member: Option<&AgentIdentity>,
         stage: &'static str,
+        settlement: super::MemberUnregisterSettlement,
     ) {
         if let Some(member) = member {
             self.record_shutdown_outcome(
                 member.clone(),
                 super::MemberShutdownOutcome::UnregisterPending {
                     stage: stage.to_string(),
+                    settlement,
                 },
             );
         }
@@ -18347,8 +18379,9 @@ impl MobActor {
         Ok(())
     }
 
-    /// Hold every roster member's run starts for a Stop (#1500), the holds
-    /// running concurrently. Each hold waits on its own member's runtime (its
+    /// Hold every roster member's run starts for a Stop (#1500), each through
+    /// [`Self::stage_and_hold_member_run_starts`], the holds running
+    /// concurrently. Each hold waits on its own member's runtime (its
     /// session's mutation gate, which a running turn's commit holds, or its
     /// host for a placed member), so one busy member does not delay the
     /// others, and the inline Stop lasts about one hold rather than all of
@@ -18394,12 +18427,7 @@ impl MobActor {
                 let provisioner = Arc::clone(&provisioner);
                 async move {
                     let result = converge_autonomous_stop_member_result(
-                        provisioner
-                            .stop_member_runtime(
-                                &incarnation.member_ref,
-                                incarnation.expected_member.as_ref(),
-                                false,
-                            )
+                        Self::stage_and_hold_member_run_starts(provisioner.as_ref(), &incarnation)
                             .await,
                     );
                     (position, identity, result)
@@ -18427,6 +18455,34 @@ impl MobActor {
             Some((_, error)) => Err(error),
             None => Ok(outcomes),
         }
+    }
+
+    /// Hold one member's run starts for a Stop (#1500): stage `MobStop` for
+    /// its next runtime registration, then hold the current one. The stage
+    /// comes first and outlives the registration it was taken for, so a
+    /// registration that replaces the held one while the mob is Stopped (a
+    /// reload) is held too; Resume releases both. A Shutdown never stages:
+    /// it discards its members. A placed member's runtime registers on its
+    /// host, not here, so only the hold reaches it.
+    async fn stage_and_hold_member_run_starts(
+        provisioner: &dyn MobProvisioner,
+        incarnation: &AutonomousStopInterruptIncarnation,
+    ) -> Result<super::stop_report::MemberStopOutcome, MobError> {
+        if incarnation.expected_member.is_none() {
+            provisioner
+                .stage_member_registration_run_start_hold_only(
+                    &incarnation.member_ref,
+                    meerkat_runtime::RunStartHoldReason::MobStop,
+                )
+                .await?;
+        }
+        provisioner
+            .stop_member_runtime(
+                &incarnation.member_ref,
+                incarnation.expected_member.as_ref(),
+                false,
+            )
+            .await
     }
 
     async fn prepare_all_autonomous_member_stops(
@@ -20199,12 +20255,15 @@ impl MobActor {
     }
 
     /// Realize MobMachine's `HoldMemberRunStarts` on a member provisioned by
-    /// a spawn that completed into a Stopped mob (#1500).
+    /// a spawn that completed into a Stopped mob (#1500): it stages and holds
+    /// like every member the Stop held.
     async fn hold_spawned_member_run_starts(&self, member_ref: &MemberRef) {
-        if let Err(error) = self
-            .provisioner
-            .stop_member_runtime(member_ref, None, false)
-            .await
+        let incarnation = AutonomousStopInterruptIncarnation {
+            member_ref: member_ref.clone(),
+            expected_member: None,
+        };
+        if let Err(error) =
+            Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
         {
             tracing::warn!(
                 error = %error,
@@ -20216,6 +20275,7 @@ impl MobActor {
     /// Hold every member of a Stopped mob again (#1500): after a resume that
     /// released the holds and then failed, so queued input still waits for a
     /// resume that succeeds, and after a spawn completed into the Stopped mob.
+    /// Each member stages and holds as the Stop did.
     async fn hold_member_run_starts_while_stopped(&mut self) {
         if self.state() != MobState::Stopped {
             return;
@@ -20229,15 +20289,11 @@ impl MobActor {
                 continue;
             }
             let held = match self.autonomous_stop_interrupt_incarnation(entry) {
-                Ok(incarnation) => self
-                    .provisioner
-                    .stop_member_runtime(
-                        &incarnation.member_ref,
-                        incarnation.expected_member.as_ref(),
-                        false,
-                    )
-                    .await
-                    .map(|_| ()),
+                Ok(incarnation) => {
+                    Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation)
+                        .await
+                        .map(|_| ())
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = held {
@@ -47124,6 +47180,29 @@ impl MobActor {
         self.edge_locks.prune(ctx.agent_identity.as_str()).await;
     }
 
+    /// Drop the `MobStop` a Stop staged for a member whose session is
+    /// disposed for good, by a retire or a destroy (#1500), so a later
+    /// registration of the same session is not held for it. The runtime's
+    /// unregister keeps staged reasons on purpose: a reload unregisters and
+    /// registers the same session again while the mob is Stopped. A failure
+    /// is logged only: the member is gone either way.
+    async fn unstage_departed_member_mob_stop(&self, entry: &RosterEntry) {
+        if let Err(error) = self
+            .provisioner
+            .unstage_member_registration_run_start_hold(
+                &entry.member_ref,
+                meerkat_runtime::RunStartHoldReason::MobStop,
+            )
+            .await
+        {
+            tracing::warn!(
+                agent_identity = %entry.agent_identity,
+                error = %error,
+                "dropping the staged MobStop of a departed member failed"
+            );
+        }
+    }
+
     /// Remove only the exact retired incarnation from the roster.
     ///
     /// `drop_flow_lane` is false exactly on the respawn path: the
@@ -48458,6 +48537,7 @@ impl MobActor {
                 });
             }
         }
+        self.unstage_departed_member_mob_stop(&entry).await;
         if let Err(error) = boxed_arm_future(|| {
             self.release_forked_participant_attachments_for_member(&entry.agent_identity)
         })

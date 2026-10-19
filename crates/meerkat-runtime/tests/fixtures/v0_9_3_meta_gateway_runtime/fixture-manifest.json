@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "fixture_id": "meta-0.9.3-gateway-runtime-synthetic",
+  "data_classification": "synthetic_non_production",
+  "producer": {
+    "artifact_origin": "published_release",
+    "product": "meerkat-meta rpc_gateway",
+    "version": "0.9.3",
+    "binary_version_output": "rpc_gateway 0.9.3 (meerkat-meta SDK stdin-RPC gateway)",
+    "binary_sha256": "757519ed1210d16d865e2e37de3fba098a1cca6ccba6a7e1dc646963fb04a335",
+    "release_asset": "meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz",
+    "release_asset_sha256": "b416df1ba5648ca3ed849dec2692f664c37b0e7277232a6d2421ac53961a18b0",
+    "source_release": "https://github.com/lukacf/meerkat-meta/releases/tag/v0.9.3"
+  },
+  "capture": {
+    "composition": "rpc_gateway --persistent over a persistent_state directory without a roster provider; runtime.sqlite is that gateway's standalone WholeBlob SqliteRuntimeStore",
+    "boots": 3,
+    "clean_shutdown": true,
+    "model": "loopback chat-completions model with synthetic replies; it reports a large input cost once for the first session, which therefore compacts exactly once"
+  },
+  "file": {
+    "path": "runtime.sqlite",
+    "bytes": 380928,
+    "sha256": "7622592e567a69a54978f015ad48386ca090340f523aebb71b446e26f5148f18"
+  },
+  "expected": {
+    "ledgers": [
+      {
+        "domain": "runtime-store",
+        "version": 3
+      }
+    ],
+    "runtimes": [
+      {
+        "runtime_id": "rt:session:01a15366-1877-7873-9ca2-9638981a1e79",
+        "session_id": "01a15366-1877-7873-9ca2-9638981a1e79",
+        "store_revision": 9,
+        "body_bytes": 20554,
+        "body_sha256": "618378c315e68015d12d3e0d4c73f7ae3fffc0df81fcee7e6e36585868988301",
+        "message_count": 10,
+        "rewrite_occurrences": 1
+      },
+      {
+        "runtime_id": "rt:session:01a15366-18f7-7a13-8b89-36d95d9eaacb",
+        "session_id": "01a15366-18f7-7a13-8b89-36d95d9eaacb",
+        "store_revision": 5,
+        "body_bytes": 7274,
+        "body_sha256": "92997412c0a022b90b4063a633a5ee4eb68d2da30febf8ca6a018a613ddad212",
+        "message_count": 7,
+        "rewrite_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a15366-8f7e-71f0-937c-c99dfa32bf8e",
+        "session_id": "01a15366-8f7e-71f0-937c-c99dfa32bf8e",
+        "store_revision": 4,
+        "body_bytes": 7251,
+        "body_sha256": "563391203019e0f860c2c1960ca50170c9672c01f44dc8a224f40dc05cc4646c",
+        "message_count": 7,
+        "rewrite_occurrences": 0
+      }
+    ]
+  }
+}

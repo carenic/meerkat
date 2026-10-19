@@ -36,6 +36,26 @@ impl MeerkatMachine {
         Ok((stage, lease))
     }
 
+    /// Whether a delegation result's delivery authorization on this channel
+    /// would wait on the bootstrap barrier now
+    /// ([`Self::wait_live_context_ready_for_results`]): the channel's summary
+    /// is being prepared and the provider has not acknowledged it. One read
+    /// of the generated state that never waits; an unreadable state reads as
+    /// not holding.
+    pub async fn live_context_holds_results(
+        &self,
+        session_id: &SessionId,
+        channel_id: &LiveChannelId,
+    ) -> bool {
+        let Ok(state) = self.session_dsl_state(session_id).await else {
+            return false;
+        };
+        matches!(
+            LiveContextPreparationStatus::from_state(&state, channel_id.as_str()),
+            Ok(LiveContextPreparationStatus::Preparing(_))
+        )
+    }
+
     /// Join the generated bootstrap barrier before publishing a delegation
     /// result: the summary's provider acknowledgement. Strict channels have no
     /// bootstrap barrier.

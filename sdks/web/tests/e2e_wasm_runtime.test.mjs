@@ -271,7 +271,7 @@ test("isKnownEvent recognizes the full current canonical event surface", () => {
         operation: "reload",
         target: "external",
         status: "applied",
-        persisted: true,
+        settled: true,
         applied_at_turn: 4,
       },
     }),

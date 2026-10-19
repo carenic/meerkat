@@ -1,4 +1,5 @@
-#![cfg(not(target_arch = "wasm32"))]
+// Most of these factories keep sessions in meerkat-store's in-memory store.
+#![cfg(all(not(target_arch = "wasm32"), feature = "memory-store"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! A stock host's resolved OS process confinement installed on its factory:

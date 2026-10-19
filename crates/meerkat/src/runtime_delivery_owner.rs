@@ -34,7 +34,7 @@
 //! the pass collects the inbox, until its enumeration ends.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::future::{BoxFuture, FutureExt as _, Shared};
@@ -42,8 +42,8 @@ use meerkat_core::SessionId;
 use meerkat_jobs::DetachedJobStore;
 use meerkat_runtime::{
     ColdDeliveryOwnership, HostingCapability, HostingClaim, HostingRefused, LogicalRuntimeId,
-    RuntimeDeliveryInbox, RuntimeDeliveryKind, RuntimeDeliveryOwnerAlreadyArmed,
-    RuntimeDeliveryOwnership,
+    RetainedNotificationRegistration, RuntimeDeliveryInbox, RuntimeDeliveryKind,
+    RuntimeDeliveryOwnerAlreadyArmed, RuntimeDeliveryOwnership,
 };
 use tokio::sync::watch;
 
@@ -380,7 +380,8 @@ impl RuntimeDeliveryOwner {
         // Order matters (#1813): the watch starts BEFORE the reconcile pass
         // reads the delivery generation, so a commit landing in between is
         // seen by the pass or ticks the watch (at worst at the next sweep).
-        let store_watch = StoreWake::start(&capability, self.store_sweep);
+        let retained = Arc::new(OnceLock::new());
+        let store_watch = StoreWake::start(&capability, self.store_sweep, &retained);
         let cold = meerkat_runtime::try_cold_delivery_ownership(&capability);
         let (stop, stop_rx) = watch::channel(false);
         let projects_owed = host.projects_owed_continuations();
@@ -407,7 +408,7 @@ impl RuntimeDeliveryOwner {
             owed_round: None,
         }));
         Ok(RuntimeDeliveryOwnerHandle {
-            task: Some(OwnerTask::new(task)),
+            task: Some(OwnerTask::new(task, retained)),
             passes: passes_rx,
             stop,
         })
@@ -427,11 +428,16 @@ pub struct RuntimeDeliveryOwnerHandle {
 /// retirement through one shared join of the task.
 struct OwnerTask {
     abort: tokio::task::AbortHandle,
-    joined: Shared<BoxFuture<'static, ()>>,
+    joined: Shared<BoxFuture<'static, RuntimeDeliveryOwnerRetired>>,
 }
 
 impl OwnerTask {
-    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+    /// `retained` is where the task's store watch records what its stop
+    /// left with the process.
+    fn new(
+        task: tokio::task::JoinHandle<()>,
+        retained: Arc<OnceLock<RetainedNotificationRegistration>>,
+    ) -> Self {
         let abort = task.abort_handle();
         let joined = async move {
             if let Err(error) = task.await
@@ -439,6 +445,21 @@ impl OwnerTask {
             {
                 tracing::warn!(%error, "runtime delivery owner task panicked");
             }
+            // However the task ended, its end dropped the store watch, and
+            // with it recorded what the watch's stop left with the process.
+            let retired = RuntimeDeliveryOwnerRetired {
+                notification_registration_retained: retained.get().cloned(),
+            };
+            // The one trace of the report: this future runs once per task,
+            // however many retirements join it.
+            if let Some(registration) = &retired.notification_registration_retained {
+                tracing::info!(
+                    directory = %registration.directory.display(),
+                    "runtime delivery owner retired; its store watch's file notification \
+                     registration stays with the process until the platform call returns"
+                );
+            }
+            retired
         }
         .boxed()
         .shared();
@@ -450,7 +471,7 @@ impl OwnerTask {
 /// [`RuntimeDeliveryOwnerHandle::retire`].
 #[must_use = "a retirement is confirmed only once joined"]
 pub struct RuntimeDeliveryOwnerRetirement {
-    joined: Option<Shared<BoxFuture<'static, ()>>>,
+    joined: Option<Shared<BoxFuture<'static, RuntimeDeliveryOwnerRetired>>>,
 }
 
 impl std::fmt::Debug for RuntimeDeliveryOwnerRetirement {
@@ -462,18 +483,37 @@ impl std::fmt::Debug for RuntimeDeliveryOwnerRetirement {
 
 impl RuntimeDeliveryOwnerRetirement {
     /// Join the owner's task within `bound`. A joined owner has released the
-    /// inbox, its store watch and any cold-delivery claim.
+    /// inbox, its store watch and any cold-delivery claim; the report says
+    /// what the store watch's stop left with the process.
     pub async fn join(
         self,
         bound: Duration,
-    ) -> Result<(), RuntimeDeliveryOwnerRetirementIncomplete> {
+    ) -> Result<RuntimeDeliveryOwnerRetired, RuntimeDeliveryOwnerRetirementIncomplete> {
         let Some(joined) = self.joined else {
-            return Ok(());
+            return Ok(RuntimeDeliveryOwnerRetired::default());
         };
         tokio::time::timeout(bound, joined)
             .await
             .map_err(|_| RuntimeDeliveryOwnerRetirementIncomplete { bound })
     }
+}
+
+/// What a joined owner left with the process
+/// ([`RuntimeDeliveryOwnerRetirement::join`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[must_use = "the report says what the retirement left with the process"]
+pub struct RuntimeDeliveryOwnerRetired {
+    /// The file notification registration of the owner's store watch, when
+    /// the operating system still held it as the owner stopped the watch:
+    /// at retirement, or earlier if the watch's thread ended and the owner
+    /// went on without cross-process wake.
+    /// Nothing can interrupt that platform call (macOS FSEvents can hold it
+    /// for tens of seconds), so the stop cancels the registration without
+    /// waiting for it: its thread stays with the process until the call
+    /// returns, and never reads or writes the store. `None` when the
+    /// registration had ended, or the store is not watched.
+    pub notification_registration_retained: Option<RetainedNotificationRegistration>,
 }
 
 /// The delivery owner's task did not stop within its retirement bound. Its
@@ -555,21 +595,55 @@ enum StoreWake {
     NotShared,
     #[cfg(not(target_arch = "wasm32"))]
     Watching {
-        _watch: meerkat_runtime::DeliveryStoreWatch,
+        _watch: OwnedStoreWatch,
         ticks: watch::Receiver<u64>,
     },
     Unavailable(String),
 }
 
+/// The owner's store watch, stopped wherever the owner lets it go: when
+/// its task ends (returned, panicked or aborted), or when the loop replaces
+/// a watch whose thread ended. A file notification registration the stop
+/// leaves with the process is recorded for the owner's retirement.
+#[cfg(not(target_arch = "wasm32"))]
+struct OwnedStoreWatch {
+    watch: Option<meerkat_runtime::DeliveryStoreWatch>,
+    retained: Arc<OnceLock<RetainedNotificationRegistration>>,
+}
+
+// Runs in the owner task's teardown, also while a panic unwinds, so it must
+// never block or panic: the stop only requests the watch's stop and reads its
+// registration slot, and dropping the watch does not join its threads.
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for OwnedStoreWatch {
+    fn drop(&mut self) {
+        if let Some(retained) = self
+            .watch
+            .take()
+            .and_then(meerkat_runtime::DeliveryStoreWatch::stop)
+        {
+            // An owner starts one store watch, so this is the only record.
+            let _ = self.retained.set(retained);
+        }
+    }
+}
+
 impl StoreWake {
-    fn start(capability: &HostingCapability, sweep: Duration) -> Self {
+    fn start(
+        capability: &HostingCapability,
+        sweep: Duration,
+        retained: &Arc<OnceLock<RetainedNotificationRegistration>>,
+    ) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         {
             match meerkat_runtime::watch_delivery_store(capability, sweep) {
                 Ok(None) => Self::NotShared,
                 Ok(Some(watch)) => Self::Watching {
                     ticks: watch.subscribe_ticks(),
-                    _watch: watch,
+                    _watch: OwnedStoreWatch {
+                        watch: Some(watch),
+                        retained: Arc::clone(retained),
+                    },
                 },
                 Err(reason) => {
                     tracing::warn!(
@@ -582,7 +656,7 @@ impl StoreWake {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = sweep;
+            let _ = (sweep, retained);
             if capability.is_cross_process() {
                 Self::Unavailable("a browser build has no SQLite store watch".to_string())
             } else {

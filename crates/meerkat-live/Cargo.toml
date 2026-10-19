@@ -39,6 +39,8 @@ test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# Parses this crate's own manifest in the e26 dependency-direction tests.
+toml = { workspace = true }
 tokio-tungstenite = "0.29"
 futures = { workspace = true }
 meerkat-machine-schema = { workspace = true }

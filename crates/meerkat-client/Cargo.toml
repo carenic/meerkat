@@ -11,6 +11,17 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_client_provider_matrix.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_client_proxy.rs",
+    # keyless guard over tests/live_client_provider_matrix.rs: includes that file's source, which the package leaves out
+    "tests/provider_matrix_catalog.rs",
+]
 
 [dependencies]
 meerkat-core = { workspace = true }

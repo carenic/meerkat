@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Require that the published crates' tests passed standalone at exactly the
+# release commit before any crate is published.
+#
+# Usage: release-require-standalone-green <release-commit-sha>
+#
+# Succeeds once a run of .github/workflows/published-crates-standalone.yml in
+# this repository (GITHUB_REPOSITORY), on main, whose head is exactly
+# <release-commit-sha>, completed with conclusion success and a successful
+# "Published crates standalone gate" job. A matching run that has not
+# completed is waited for, polling every MEERKAT_STANDALONE_POLL_SECONDS
+# (default 60), until MEERKAT_STANDALONE_WAIT_SECONDS (default 14400) have
+# passed since it started. No such run, a failed one, or an API failure
+# fails, naming the dispatch that produces the evidence:
+#   gh workflow run published-crates-standalone.yml --ref main
+# (run on main once the release commit is main's head).
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+WORKFLOW_PATH=".github/workflows/published-crates-standalone.yml"
+GATE_JOB="Published crates standalone gate"
+
+usage() {
+  sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
+  exit 2
+}
+
+[[ "$#" -eq 1 ]] || usage
+release_sha="$1"
+[[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "release-require-standalone-green: expected a full commit sha, got ${release_sha}" >&2
+  exit 2
+}
+repository="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the repository}"
+poll_seconds="${MEERKAT_STANDALONE_POLL_SECONDS:-60}"
+wait_seconds="${MEERKAT_STANDALONE_WAIT_SECONDS:-14400}"
+[[ "${poll_seconds}" =~ ^[0-9]+$ && "${wait_seconds}" =~ ^[0-9]+$ ]] || {
+  echo "release-require-standalone-green: poll and wait seconds must be integers" >&2
+  exit 2
+}
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+# id<TAB>status<TAB>conclusion ("none" before it concludes: read splits on
+# tabs and would drop an empty field)<TAB>started-epoch for every run of the
+# workflow at the release commit on main, newest first.
+candidate_runs() {
+  local listing
+  listing="$(gh api \
+    "repos/${repository}/actions/workflows/published-crates-standalone.yml/runs?branch=main&head_sha=${release_sha}&per_page=100" \
+    --jq '.workflow_runs[] | [.id, .status, (.conclusion // "none"), .path, .event, .head_branch, .head_sha, .repository.full_name, (.run_started_at // .created_at)] | @tsv')" ||
+    { log "cannot list the published-crates-standalone.yml runs of ${release_sha}"; return 1; }
+  local id status conclusion path event branch sha repo started
+  while IFS=$'\t' read -r id status conclusion path event branch sha repo started; do
+    [[ -n "${id}" ]] || continue
+    # The query parameters filter server-side; check every field again.
+    if [[ "${path}" != "${WORKFLOW_PATH}" || "${branch}" != "main" || "${sha}" != "${release_sha}" ||
+          "${repo}" != "${repository}" ]]; then
+      continue
+    fi
+    if [[ "${event}" != "workflow_dispatch" && "${event}" != "schedule" ]]; then
+      log "run ${id}: event ${event} is neither a dispatch nor the schedule"
+      continue
+    fi
+    printf '%s\t%s\t%s\t%s\n' "${id}" "${status}" "${conclusion}" "$(date -u -d "${started}" +%s)"
+  done <<<"${listing}" | sort -t $'\t' -k1,1nr
+}
+
+# The gate job's conclusion, or "absent" when the run has no such job.
+gate_conclusion() {
+  local run_id="$1" state
+  state="$(gh api --paginate "repos/${repository}/actions/runs/${run_id}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${GATE_JOB}\") | (.conclusion // \"pending\")")" ||
+    { log "cannot list the jobs of run ${run_id}"; exit 1; }
+  printf '%s\n' "${state:-absent}"
+}
+
+while true; do
+  runs="$(candidate_runs)"
+  pending=0
+  while IFS=$'\t' read -r run_id status conclusion started; do
+    [[ -n "${run_id}" ]] || continue
+    if [[ "${status}" != "completed" ]]; then
+      if (($(date -u +%s) - started < wait_seconds)); then
+        log "run ${run_id} for ${release_sha} is ${status}; waiting for it"
+        pending=1
+      else
+        log "run ${run_id} for ${release_sha} is still ${status} ${wait_seconds}s after it started; not waiting longer"
+      fi
+      continue
+    fi
+    if [[ "${conclusion}" != "success" ]]; then
+      log "run ${run_id} for ${release_sha} concluded ${conclusion}"
+      continue
+    fi
+    gate="$(gate_conclusion "${run_id}")"
+    if [[ "${gate}" == "success" ]]; then
+      echo "Published crates standalone: run ${run_id} passed at ${release_sha}."
+      exit 0
+    fi
+    log "run ${run_id} for ${release_sha}: ${GATE_JOB} is ${gate}"
+  done <<<"${runs}"
+  if [[ "${pending}" -eq 0 ]]; then
+    log "No successful published-crates-standalone.yml run at ${release_sha} on main."
+    log "Dispatch one on the release commit (main's head) and rerun this job:"
+    log "  gh workflow run published-crates-standalone.yml --ref main"
+    exit 1
+  fi
+  sleep "${poll_seconds}"
+done

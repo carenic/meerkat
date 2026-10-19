@@ -49,7 +49,7 @@ fn has_action(
     operation: ToolConfigChangeOperation,
     phase: McpLifecyclePhase,
 ) -> bool {
-    let expected_persisted = !matches!(
+    let expected_settled = !matches!(
         phase,
         McpLifecyclePhase::Pending | McpLifecyclePhase::Draining
     );
@@ -57,7 +57,7 @@ fn has_action(
         action.target == target
             && action.operation == operation
             && action.phase == phase
-            && action.persisted == expected_persisted
+            && action.settled() == expected_settled
             && action.applied_at_turn.is_none()
     })
 }

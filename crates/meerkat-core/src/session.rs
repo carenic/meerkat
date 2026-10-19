@@ -3625,6 +3625,61 @@ pub struct SessionBuildState {
     pub mcp_attachment_intent_revision: u64,
 }
 
+impl SessionBuildState {
+    /// The build state a durable transcript fork commits for its child.
+    ///
+    /// A fork child continues its source's conversation under the source's
+    /// session configuration, so every field the source's own recovery feeds
+    /// into its next build is carried. Three kinds of field are not:
+    ///
+    /// - `mob_tool_authority_context`: mob operator authority belongs to the
+    ///   source's member identity, not to a branch of its transcript.
+    /// - `shell_env`: a secret-bearing launch environment. A resumed mob
+    ///   member never replays it either.
+    /// - `mcp_attachment_intents` and `mcp_attachment_intent_revision`: the
+    ///   source's own accepted attachment requests, which a restarted host
+    ///   re-stages for that session only. The child starts with none, and its
+    ///   revision counter starts at zero.
+    ///
+    /// Every field is named below, so a new field does not compile until it
+    /// is classified here.
+    #[must_use]
+    pub fn fork_child_projection(self) -> Self {
+        let Self {
+            output_schema,
+            hooks_override,
+            budget_limits,
+            recoverable_tool_defs,
+            silent_comms_intents,
+            max_inline_peer_notifications,
+            app_context,
+            additional_instructions,
+            shell_env: _,
+            shell_timeout_secs,
+            mob_tool_authority_context: _,
+            call_timeout_override,
+            mcp_attachment_intents: _,
+            mcp_attachment_intent_revision: _,
+        } = self;
+        Self {
+            output_schema,
+            hooks_override,
+            budget_limits,
+            recoverable_tool_defs,
+            silent_comms_intents,
+            max_inline_peer_notifications,
+            app_context,
+            additional_instructions,
+            shell_env: None,
+            shell_timeout_secs,
+            mob_tool_authority_context: None,
+            call_timeout_override,
+            mcp_attachment_intents: Vec::new(),
+            mcp_attachment_intent_revision: 0,
+        }
+    }
+}
+
 /// Deferred create-time prompt staged for the next turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -12085,7 +12140,7 @@ mod tests {
                 server_id: Some("server".to_string()),
                 operation: None,
                 phase: None,
-                persisted: true,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(true),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),
@@ -12110,7 +12165,7 @@ mod tests {
                 server_id: Some("server".to_string()),
                 operation: None,
                 phase: None,
-                persisted: true,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(true),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),
@@ -15376,6 +15431,137 @@ mod tests {
         assert_eq!(full_fork.messages().len(), 3);
     }
 
+    /// A fork child's build state carries every field its source's own
+    /// recovery feeds into the next build, value for value, and none of the
+    /// source's mob operator authority, launch environment or MCP attachment
+    /// requests.
+    #[test]
+    fn fork_child_projection_carries_session_configuration_and_drops_source_records() {
+        let source = SessionBuildState {
+            output_schema: Some(
+                crate::OutputSchema::from_json_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}}
+                }))
+                .expect("output schema"),
+            ),
+            hooks_override: crate::HookRunOverrides {
+                entries: vec![crate::HookEntryConfig::default()],
+                disable: vec![crate::HookId::new("disabled-hook")],
+            },
+            budget_limits: Some(crate::BudgetLimits {
+                max_tokens: Some(55),
+                max_duration: Some(std::time::Duration::from_secs(9)),
+                max_turn_duration: Some(std::time::Duration::from_secs(3)),
+                max_tool_calls: Some(2),
+            }),
+            recoverable_tool_defs: vec![ToolDef {
+                audience: Default::default(),
+                name: "inline_tool".into(),
+                description: "recoverable inline tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                provenance: None,
+            }],
+            silent_comms_intents: vec!["peer-b".to_string()],
+            max_inline_peer_notifications: Some(4),
+            app_context: Some(serde_json::json!({"surface": "rpc"})),
+            additional_instructions: Some(vec!["be precise".to_string()]),
+            shell_env: Some(HashMap::from([(
+                "MEERKAT_MODE".to_string(),
+                "test".to_string(),
+            )])),
+            shell_timeout_secs: std::num::NonZeroU64::new(7),
+            mob_tool_authority_context: Some(
+                crate::service::MobToolAuthorityContext::generated_for_test(
+                    crate::service::OpaquePrincipalToken::new("source-member"),
+                    false,
+                    false,
+                    false,
+                    std::collections::BTreeSet::from(["mob-a".to_string()]),
+                    std::collections::BTreeMap::new(),
+                    None,
+                    None,
+                ),
+            ),
+            call_timeout_override: crate::CallTimeoutOverride::Value(
+                std::time::Duration::from_secs(42),
+            ),
+            mcp_attachment_intents: vec![crate::McpSessionAttachmentIntent {
+                descriptor: crate::McpAttachmentDescriptorIdentity {
+                    server_name: "docs".to_string(),
+                    target: crate::McpAttachmentTarget::Http {
+                        location: "https://mcp.example.test/docs".to_string(),
+                        withheld: false,
+                        binding: None,
+                    },
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                    connector_account: None,
+                },
+                disposition: crate::McpAttachmentIntentDisposition::Requested,
+                revision: 3,
+            }],
+            mcp_attachment_intent_revision: 3,
+        };
+        // An unset field serializes to nothing, so one key per field shows
+        // that every field of the source is set.
+        let source_document = serde_json::to_value(&source).expect("source build state");
+        let source_document = source_document.as_object().expect("an object");
+        assert_eq!(
+            source_document.len(),
+            14,
+            "every field of the source is set: {source_document:?}"
+        );
+
+        let child = source.fork_child_projection();
+        assert!(
+            child.mob_tool_authority_context.is_none(),
+            "a fork child holds no mob operator authority"
+        );
+        assert!(
+            child.shell_env.is_none(),
+            "a fork child inherits no launch environment"
+        );
+        assert!(
+            child.mcp_attachment_intents.is_empty(),
+            "a fork child inherits no MCP attachment requests"
+        );
+        assert_eq!(
+            child.mcp_attachment_intent_revision, 0,
+            "a fork child's attachment revisions start over"
+        );
+
+        const NOT_INHERITED: [&str; 4] = [
+            "shell_env",
+            "mob_tool_authority_context",
+            "mcp_attachment_intents",
+            "mcp_attachment_intent_revision",
+        ];
+        let child_document = serde_json::to_value(&child).expect("child build state");
+        let child_document = child_document.as_object().expect("an object");
+        for (field, value) in source_document {
+            if NOT_INHERITED.contains(&field.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                child_document.get(field),
+                Some(value),
+                "a fork child carries {field}"
+            );
+        }
+        assert_eq!(
+            child_document.len(),
+            source_document.len() - NOT_INHERITED.len(),
+            "a fork child carries nothing else: {child_document:?}"
+        );
+
+        // The fork commit writes the child's state through the canonical
+        // persist gate.
+        Session::new()
+            .set_build_state(child)
+            .expect("the persist gate admits a fork child's build state");
+    }
+
     #[test]
     fn test_session_forks_drop_generated_authority_metadata() {
         let mut session = Session::new();
@@ -16853,6 +17039,108 @@ mod tests {
         // Usage was recorded once for the turn.
         assert_eq!(session.usage.input_tokens, 11);
         assert_eq!(session.usage.output_tokens, 22);
+    }
+
+    /// The text of every assistant block the session committed, in order.
+    fn committed_assistant_texts(session: &Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.blocks.iter())
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_realtime_turn_discards_every_lane_and_records_no_completion() {
+        // #1883: a failed response commits nothing it staged, display or
+        // spoken; it leaves the in-flight set, so a later barge-in cannot
+        // target it; a completion that follows cannot resurrect it; and the
+        // next response commits normally.
+        let mut session = Session::new();
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_display".to_string(),
+                item_id: "item_failed_display".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "partial display text".to_string(),
+            });
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_spoken".to_string(),
+                item_id: "item_failed_spoken".to_string(),
+                previous_item_id: Some("item_failed_display".to_string()),
+                content_index: 0,
+                delta: "partial speech".to_string(),
+            },
+        );
+        assert_eq!(
+            session.in_flight_realtime_assistant_response_ids(),
+            vec!["resp_failed".to_string()]
+        );
+
+        let failed = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".to_string(),
+            },
+        );
+        assert!(
+            failed.materialized_messages.is_empty(),
+            "a failed response commits nothing: {failed:?}"
+        );
+        assert!(
+            session
+                .in_flight_realtime_assistant_response_ids()
+                .is_empty(),
+            "a failed response is no longer in flight"
+        );
+        let late = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_failed".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert!(
+            late.materialized_messages.is_empty(),
+            "a completion after the failure cannot resurrect it: {late:?}"
+        );
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_next".to_string(),
+                delta_id: "delta_next".to_string(),
+                item_id: "item_next".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "next answer".to_string(),
+            },
+        );
+        let next = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_next".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert_eq!(next.materialized_messages.len(), 1, "{next:?}");
+        assert_eq!(
+            committed_assistant_texts(&session),
+            vec!["next answer".to_string()],
+            "only the next response is committed"
+        );
     }
 
     #[test]

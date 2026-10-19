@@ -8,6 +8,7 @@ use super::*;
 use crate::connection::CustodyNotHeld;
 use std::collections::HashMap;
 
+#[cfg(feature = "workspace-tests")]
 fn surface_router() -> McpRouter {
     McpRouter::new_with_surface_handle_and_stdio_profile(
         Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
@@ -211,6 +212,7 @@ fn a_close_reports_no_process_only_when_it_held_none() {
 
 /// C1: a close task that ends without reporting is still recorded, as
 /// `TaskFailed`, against the server it was closing.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_close_task_that_panics_is_reported_against_its_server() {
     let mut router = surface_router();
@@ -383,6 +385,7 @@ mod stdio {
     /// C1: shutdown reports an established stdio server's close with its
     /// receipt, and a server that exits on EOF settles (C4). (Fails at base:
     /// the receipt was only traced, and shutdown reported nothing.)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn shutdown_reports_an_established_servers_settled_close() {
         let mut router = surface_router();
@@ -402,6 +405,7 @@ mod stdio {
     /// C1: shutdown reports the close of a connect attempt it aborted
     /// mid-handshake, through the router's custody of the attempt's process.
     /// (Fails at base: that receipt was traced and dropped.)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn shutdown_reports_a_still_connecting_servers_close() {
         let mut pending = PidReport::new("report-still-connecting");
@@ -428,6 +432,7 @@ mod stdio {
     /// group is killed and reaped, but its stdout witness is still open when
     /// the backstop expires. The report keeps the typed receipt and does not
     /// settle. The test kills the escaped process at its end.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_escaped_stdout_holder_leaves_the_close_unsettled() {
         let mut escaped = PidReport::new("report-escaped-holder");
@@ -451,6 +456,7 @@ mod stdio {
 
     /// C1: a removal close that ended unsettled before shutdown is kept, once
     /// reaped, and still reported by the shutdown.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_unsettled_removal_close_is_kept_for_the_report() {
         let mut escaped = PidReport::new("report-removed-holder");
@@ -491,6 +497,7 @@ mod stdio {
     /// keeps the receipt for the router; one that ended unsettled is kept,
     /// once the attempt's result is processed, and reported by the shutdown.
     /// (Fails at base: the attempt traced its receipt and dropped it.)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_failed_attempts_unsettled_close_is_kept_for_the_report() {
         let mut escaped = PidReport::new("report-failed-attempt-holder");
@@ -540,6 +547,7 @@ mod stdio {
     /// unsettled is still the router's to report at shutdown, although the
     /// attempt never had a pending entry. The test kills the escaped process
     /// once the close has ended.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_failed_installations_unsettled_close_is_kept_for_the_report() {
         let mut escaped = PidReport::new("report-failed-install-holder");
@@ -763,6 +771,7 @@ mod stdio {
     /// staging from then on; the shutdown later joins the same close and
     /// reports the same receipt. (Fails at base: the adapter started a close
     /// only after it took the router's write lock.)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn begin_close_closes_a_server_while_a_dispatch_holds_the_router() {
         let mut router = surface_router();
@@ -824,6 +833,7 @@ mod stdio {
     /// C8: a ticket's deadline counts from when each close actually began. A
     /// removal's close that began before the ticket keeps its own deadline,
     /// earlier than one counted from the ticket, and reports within it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_ticket_deadline_counts_from_each_closes_own_start() {
         let mut router = surface_router();
@@ -919,6 +929,7 @@ mod stdio {
     /// router lock a dispatch held), gets its attempt's custodies created
     /// closed under the index's freeze, so nothing spawns, and the shutdown
     /// reports nothing unsettled.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_add_admitted_before_the_close_spawns_nothing_after_it() {
         let mut started = PidReport::new("admitted-before-close");

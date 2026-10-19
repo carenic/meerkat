@@ -654,6 +654,14 @@ pub struct MobToolConfigInput {
     pub deny: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<String>,
+    /// Host tool bundles this profile opts into. Only an inline profile of a
+    /// child mob (one a member creates with `mob_create`) may name them, and
+    /// only bundles the host offers to child mobs; any other name, an empty
+    /// name or a repeated one is refused as an argument error. The opt-in is
+    /// kept with the definition. Each build mounts the opted bundles the host
+    /// still offers and withholds the rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
 }
 
 /// Profile binding input: either an inline profile or a realm profile reference.

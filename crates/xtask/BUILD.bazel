@@ -433,7 +433,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
         "//crates/meerkat-cli:cargo_manifest",
         "//crates/meerkat-cli:package_runfiles",
         "//crates/meerkat-contracts:cargo_manifest",

@@ -152,6 +152,7 @@ impl AgentSessionStore for NoopStore {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 async fn gated_agent(
     client: Arc<RecordingClient>,
     entered: Arc<Notify>,
@@ -220,6 +221,7 @@ async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     panic!("{what} did not happen");
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_boundary_appends_join_the_running_turn_and_every_later_request() {
     let client = Arc::new(RecordingClient::new());
@@ -364,6 +366,7 @@ async fn durable_boundary_appends_join_the_running_turn_and_every_later_request(
     assert!(before.is_some() && after.is_some() && before != after);
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn request_only_boundary_context_stays_request_local() {
     let client = Arc::new(RecordingClient::new());
@@ -431,6 +434,7 @@ async fn request_only_boundary_context_stays_request_local() {
 /// Run one gated turn and deliver `delivery` at its post-tool boundary.
 /// Returns the agent after the run, the Session before the run, the delivery
 /// witness and every event the run published.
+#[cfg(feature = "workspace-tests")]
 async fn run_with_durable_delivery_at_post_tool_boundary(
     delivery: meerkat_core::lifecycle::TurnBoundaryDelivery,
 ) -> (
@@ -504,6 +508,7 @@ fn uncommitted_compaction_rollback(
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn compaction_rollback_discards_only_the_durable_appends_applied_after_its_capture() {
     let (mut agent, pre_run_session, witness, _events) =
@@ -584,6 +589,7 @@ async fn compaction_rollback_discards_only_the_durable_appends_applied_after_its
     );
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_comms_notice_publishes_peer_content_ingested_in_turn() {
     let comms_notice = meerkat_core::lifecycle::ConversationAppend {
@@ -672,6 +678,7 @@ fn projection_contract_notice() -> meerkat_core::lifecycle::ConversationAppend {
     )
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_notice_event_rows_equal_applied_transcript_rows() {
     let input_id = meerkat_core::lifecycle::InputId::new();
@@ -794,6 +801,7 @@ async fn durable_notice_event_rows_equal_applied_transcript_rows() {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn durable_persisted_background_job_keeps_exact_notice_origin_through_refresh() {
     let input_id = meerkat_core::lifecycle::InputId::new();

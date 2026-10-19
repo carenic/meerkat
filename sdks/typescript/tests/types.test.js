@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import packageJson from "../package.json" with { type: "json" };
 import {
@@ -473,10 +474,22 @@ describe("Typed Events", () => {
             operation: "add",
             target: "filesystem",
             status: "staged",
+            settled: "false",
+          },
+        },
+        reason: "non-boolean settled must not become false",
+      },
+      {
+        raw: {
+          type: "tool_config_changed",
+          payload: {
+            operation: "add",
+            target: "filesystem",
+            status: "staged",
             persisted: "false",
           },
         },
-        reason: "non-boolean persisted must not become false",
+        reason: "non-boolean persisted from rkat-rpc 0.9.3 must not become false",
       },
       {
         raw: {
@@ -485,7 +498,7 @@ describe("Typed Events", () => {
             operation: "bogus",
             target: 0,
             status: 0,
-            persisted: "false",
+            settled: "false",
           },
         },
         reason: "malformed operation/status semantics must not become an empty typed payload",
@@ -1276,7 +1289,7 @@ describe("Typed Events", () => {
         detail: "required execution confinement is unsupported by this backend",
         ...(refusal !== undefined ? { confinement_refusal: refusal } : {}) };
       const raw = { type: "tool_config_changed", payload: {
-        operation: "reload", target: "local-server", status_info: status, persisted: true,
+        operation: "reload", target: "local-server", status_info: status, settled: true,
       } };
       const event = parseEvent(raw);
       assert.equal(event.type, "tool_config_changed");
@@ -1287,7 +1300,7 @@ describe("Typed Events", () => {
         assert.equal(event.payload.status_info.confinement_refusal, refusal);
       }
       for (const block of [
-        { type: "mcp", server_id: "local-server", phase: "failed", persisted: true,
+        { type: "mcp", server_id: "local-server", phase: "failed", settled: true,
           ...(refusal !== undefined ? { confinement_refusal: refusal } : {}) },
         { type: "tool_config", payload: raw.payload },
       ]) {
@@ -1301,7 +1314,7 @@ describe("Typed Events", () => {
 
   it("preserves malformed setup refusal events and rejects malformed typed transcript fields", () => {
     for (const refusal of ["future_reason", "", 7, false, {}, []]) {
-      const payload = { operation: "add", target: "local-server", persisted: true,
+      const payload = { operation: "add", target: "local-server", settled: true,
         status_info: { kind: "external_tool_delta", phase: "failed", confinement_refusal: refusal } };
       const raw = { type: "tool_config_changed", payload };
       const events = [raw, { type: "text_delta", delta: "permitted sibling" }].map(parseEvent);
@@ -1337,7 +1350,7 @@ describe("Typed Events", () => {
     });
     assert.equal(mcp.role, "system_notice");
     for (const refusal of ["backend_unavailable", null, undefined]) {
-      const payload = { operation: "add", target: "local-server", persisted: true,
+      const payload = { operation: "add", target: "local-server", settled: true,
         status_info: { kind: "external_tool_delta", phase: "failed",
           ...(refusal === undefined ? {} : { confinement_refusal: refusal }) } };
       const parsed = MeerkatClient.parseSessionMessage({
@@ -1360,7 +1373,7 @@ describe("Typed Events", () => {
           visible_changed: false,
           revision: 9,
         },
-        persisted: false,
+        settled: true,
         applied_at_turn: 7,
       },
     });
@@ -1374,7 +1387,7 @@ describe("Typed Events", () => {
         visible_changed: false,
         revision: 9,
       });
-      assert.equal(event.payload.persisted, false);
+      assert.equal(event.payload.settled, true);
       assert.equal(event.payload.applied_at_turn, 7);
     }
   });
@@ -1568,7 +1581,7 @@ describe("Typed Events", () => {
         operation: "add",
         target: "filesystem",
         status: "staged",
-        persisted: true,
+        settled: true,
         applied_at_turn: "oops",
       },
     });
@@ -1578,20 +1591,96 @@ describe("Typed Events", () => {
     }
   });
 
-  it("should preserve non-boolean persisted in tool_config_changed", () => {
-    const raw = {
-      type: "tool_config_changed",
-      payload: {
-        operation: "add",
-        target: "filesystem",
-        status: "staged",
-        persisted: "false",
-      },
+  it("should preserve non-boolean settled in tool_config_changed", () => {
+    for (const field of ["settled", "persisted"]) {
+      const raw = {
+        type: "tool_config_changed",
+        payload: {
+          operation: "add",
+          target: "filesystem",
+          status: "staged",
+          [field]: "false",
+        },
+      };
+      const event = parseEvent(raw);
+      assert.equal(event.type, "malformed_event", field);
+      assert.equal(event.rawType, "tool_config_changed");
+      assert.deepEqual(event.raw, raw);
+    }
+  });
+
+  it("derives settled from status_info, as rkat-rpc does, over the stored bit", () => {
+    // Payloads stored by rkat-rpc 0.9.3 and earlier are served back with their
+    // `persisted`, which was false for changes that had already applied; only a
+    // status this SDK does not know falls back to the stored bit.
+    const boundary = { kind: "boundary_applied", base_changed: true, visible_changed: true, revision: 2 };
+    const catalog = {
+      kind: "deferred_catalog_delta", added_hidden_count: 1, removed_hidden_count: 0, pending_source_count: 0,
     };
-    const event = parseEvent(raw);
-    assert.equal(event.type, "malformed_event");
-    assert.equal(event.rawType, "tool_config_changed");
-    assert.deepEqual(event.raw, raw);
+    const failedClosed = { kind: "warning_failed_closed", error: "scope refused" };
+    const delta = (phase) => ({ kind: "external_tool_delta", phase });
+    for (const [statusInfo, fields, settled] of [
+      [boundary, { persisted: false }, true],
+      [catalog, { persisted: false }, true],
+      [failedClosed, { persisted: false }, true],
+      [boundary, { settled: true }, true],
+      [delta("pending"), { persisted: true }, false],
+      [delta("draining"), { settled: true }, false],
+      [delta("applied"), { persisted: false }, true],
+      [delta("forced"), { settled: false }, true],
+      [delta("failed"), { persisted: false }, true],
+      [delta("pending"), { settled: false, persisted: true }, false],
+      [{ kind: "a_later_kind" }, { settled: true }, true],
+      [{ kind: "a_later_kind" }, { persisted: false }, false],
+      [{ kind: "a_later_kind" }, { settled: false, persisted: true }, false],
+      [delta("a_later_phase"), { persisted: true }, true],
+    ]) {
+      const label = JSON.stringify([statusInfo, fields]);
+      const event = parseEvent({ type: "tool_config_changed", payload: {
+        operation: "add", target: "filesystem", status_info: statusInfo, ...fields,
+      } });
+      assert.equal(event.type, "tool_config_changed", label);
+      assert.equal(event.payload.settled, settled, label);
+      assert.equal(Object.hasOwn(event.payload, "persisted"), false, label);
+    }
+    const raw = { type: "tool_config_changed", payload: {
+      operation: "add", target: "filesystem", status_info: boundary,
+    } };
+    const missing = parseEvent(raw);
+    assert.equal(missing.type, "malformed_event");
+    assert.deepEqual(missing.raw, raw);
+  });
+
+  it("reads settled or persisted in stored tool-config notices", () => {
+    const applied = { kind: "external_tool_delta", phase: "applied" };
+    const history = (block) => ({
+      session_id: "s1", message_count: 1, offset: 0, has_more: false,
+      messages: [{ role: "system_notice", kind: "mcp", body: "Tools changed.",
+        blocks: [block], created_at: "2026-05-26T10:00:00Z" }],
+    });
+    for (const fields of [{ settled: true }, { persisted: false }]) {
+      const payload = { operation: "add", target: "local-server", status_info: applied, ...fields };
+      for (const block of [
+        { type: "tool_config", payload },
+        { type: "mcp", server_id: "local-server", ...fields },
+      ]) {
+        const raw = history(block);
+        const parsed = MeerkatClient.parseSessionHistory(raw);
+        assert.deepEqual(
+          MeerkatClient.serializeTranscriptRewriteMessage(parsed.messages[0]),
+          raw.messages[0],
+        );
+      }
+    }
+    for (const block of [
+      { type: "tool_config", payload: { operation: "add", target: "local-server", status_info: applied } },
+      { type: "mcp", settled: "false" },
+      { type: "mcp", persisted: "false" },
+    ]) {
+      assert.throws(() => MeerkatClient.parseSessionHistory(history(block)),
+        error => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+        JSON.stringify(block));
+    }
   });
 
   it("should not default malformed tool_config_changed operation/status semantics", () => {
@@ -1601,7 +1690,7 @@ describe("Typed Events", () => {
         operation: "bogus",
         target: 0,
         status: 0,
-        persisted: "false",
+        settled: "false",
       },
     };
     const event = parseEvent(raw);
@@ -5964,9 +6053,25 @@ describe("Capability status parse boundary (row 161)", () => {
 });
 
 describe("Transport corrupted-frame fault (row 246)", () => {
+  /** A stand-in child process that exits when it is signalled, as a real one does. */
+  function exitingChild(onKill = () => {}) {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: { write: () => {}, end: () => {}, destroy: () => {} },
+      exitCode: null,
+      signalCode: null,
+      kill(signal = "SIGTERM") {
+        onKill(signal);
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+        return true;
+      },
+    });
+    return child;
+  }
+
   it("surfaces a typed PROTOCOL_ERROR to pending callers instead of silently dropping a corrupted frame", async () => {
     const client = new MeerkatClient();
-    client.process = { stdin: { write: () => {}, destroy: () => {} }, kill: () => {} };
+    client.process = exitingChild();
 
     // Register a pending request through the real request bookkeeping.
     const pending = client.registerRequest(client.requestId + 1);
@@ -5983,12 +6088,9 @@ describe("Transport corrupted-frame fault (row 246)", () => {
   it("marks the client unusable after transport corruption: later calls reject with the recorded fault, process is torn down", async () => {
     let killed = false;
     const client = new MeerkatClient();
-    client.process = {
-      stdin: { write: () => {}, destroy: () => {} },
-      kill: () => {
-        killed = true;
-      },
-    };
+    client.process = exitingChild(() => {
+      killed = true;
+    });
 
     client.handleLine("this is not json{");
 

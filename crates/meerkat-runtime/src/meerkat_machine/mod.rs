@@ -957,9 +957,21 @@ enum PersistentAuthAuthorityKey {
     Process(usize),
 }
 
+/// One store key's provider-auth authority bundle. Creating the bundle
+/// rehydrates the store's OAuth flows (a store read, and a write back when
+/// flows were persisted), so it runs under this slot's own lock: callers for
+/// one key wait for that key's bundle, callers for other keys never do.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct PersistentAuthAuthoritySlot {
+    bundle: StdMutex<Option<Arc<PersistentAuthAuthorityBundle>>>,
+}
+
+/// Every store key's slot. The map's lock covers only the slot lookup, and
+/// nothing takes it while holding a slot's lock.
 #[cfg(not(target_arch = "wasm32"))]
 static PERSISTENT_AUTH_AUTHORITIES: OnceLock<
-    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthorityBundle>>>,
+    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthoritySlot>>>,
 > = OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1016,19 +1028,43 @@ impl ProviderAuthRuntimeAuthority {
 fn persistent_auth_authorities(
     store: &Arc<dyn RuntimeStore>,
 ) -> Arc<PersistentAuthAuthorityBundle> {
-    let key = runtime_store_identity(store);
+    persistent_auth_authorities_for_key(runtime_store_identity(store), store)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authority_slot(
+    key: PersistentAuthAuthorityKey,
+) -> Arc<PersistentAuthAuthoritySlot> {
     let authorities = PERSISTENT_AUTH_AUTHORITIES.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut authorities = authorities
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = authorities.get(&key) {
+    Arc::clone(authorities.entry(key).or_default())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authorities_for_key(
+    key: PersistentAuthAuthorityKey,
+    store: &Arc<dyn RuntimeStore>,
+) -> Arc<PersistentAuthAuthorityBundle> {
+    let durable = matches!(key, PersistentAuthAuthorityKey::Durable(_));
+    let slot = persistent_auth_authority_slot(key);
+    let mut bundle = slot
+        .bundle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = bundle.as_ref() {
         let stored_store_alive = existing
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upgrade()
             .is_some();
-        if matches!(key, PersistentAuthAuthorityKey::Durable(_)) || stored_store_alive {
+        // A process key whose store is gone gets a fresh bundle. That case is
+        // defensive: the bundle's weak reference keeps the store's allocation,
+        // so no other store takes its address while the entry exists. Only a
+        // test reaches it, with a key of its own.
+        if durable || stored_store_alive {
             existing.oauth_flows.bind_persistent_store(store);
             *existing
                 .store
@@ -1045,22 +1081,27 @@ fn persistent_auth_authorities(
             store,
         ),
     );
-    let bundle = Arc::new(PersistentAuthAuthorityBundle {
+    let created = Arc::new(PersistentAuthAuthorityBundle {
         store: StdMutex::new(Arc::downgrade(store)),
         auth_lease,
         oauth_flows,
     });
-    authorities.insert(key, Arc::clone(&bundle));
-    bundle
+    *bundle = Some(Arc::clone(&created));
+    created
 }
 
+/// Forget the authority bundle cached for `store`'s key, as a process
+/// restart would: the next machine over a store with that key rehydrates
+/// from the store. Only that key is forgotten, so tests running beside the
+/// caller keep theirs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn clear_persistent_auth_authorities_for_test() {
+pub(crate) fn forget_persistent_auth_authorities_for_test(store: &Arc<dyn RuntimeStore>) {
+    let key = runtime_store_identity(store);
     if let Some(authorities) = PERSISTENT_AUTH_AUTHORITIES.get() {
         authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .remove(&key);
     }
 }
 
@@ -1245,7 +1286,8 @@ enum CommittedEffectDispatchFailure {
 
 type UnregisterTeardownResult = Result<(), RuntimeDriverError>;
 type RuntimeStopCleanupResult = Result<(), RuntimeDriverError>;
-type ReloadRequiredDiscardResult = Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError>;
+type ReloadRequiredDiscardResult =
+    Result<ReloadRequiredRegistrationUseSettlement, RuntimeDriverError>;
 
 /// Joinable result channel for the one owned unregister saga of an epoch.
 #[derive(Clone)]
@@ -1342,6 +1384,20 @@ pub enum RuntimeSessionUnregisterAdmission {
     /// The exact coordinator remains process-owned; poll this observer on a
     /// later caller retry.
     Pending(RuntimeSessionUnregisterObserver),
+}
+
+/// Answer of
+/// [`MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RuntimeSessionUnregisterUseAdmission {
+    /// The registration's use was the expected one when the unregister was
+    /// started or joined, or the registration is no longer current: the
+    /// exact admission's answer.
+    Admitted(RuntimeSessionUnregisterAdmission),
+    /// The registration is current but was handed to another user after the
+    /// expected use was read. Nothing was started or joined.
+    Changed,
 }
 
 /// Typed answer of the same-registration quiescent close admission
@@ -1512,6 +1568,12 @@ impl UnregisterTeardownMechanicalObservations {
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
     runtime_id: LogicalRuntimeId,
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]):
+    /// stamped from the machine-wide sequence when the entry is built, and
+    /// stamped again by every adoption that hands the registration to a new
+    /// user. Adoptions stamp it under the session map lock, which every
+    /// reader of it holds too.
+    registration_use: std::sync::atomic::AtomicU64,
     /// The agent this registration's session acts as, bound by the trusted
     /// governed host. Every registration owns a fresh, unbound slot.
     agent_binding: agent_mandate::SessionAgentBinding,
@@ -2200,6 +2262,21 @@ impl RuntimeSessionRegistrationWitness {
         &self.epoch_id
     }
 
+    /// Whether this exact registration has ended for good: its runtime entry
+    /// is gone and nothing holds the entry's private incarnation identity,
+    /// so no machine can have it current, now or later. Read-only and
+    /// one-directional: `false` does not mean the registration is current
+    /// (an ended entry's identity can still be held while a task finishes
+    /// with it). Grants nothing and starts nothing.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        // A live entry holds its mutation gate strongly for its whole
+        // lifetime, and a rebuilt entry gets a gate of its own, so no strong
+        // reference left means this incarnation's entry exists nowhere. A
+        // dropped allocation can never gain a strong reference again.
+        self.registration_gate.strong_count() == 0
+    }
+
     fn belongs_to(&self, machine: &MeerkatMachine) -> bool {
         std::ptr::eq(self.machine.as_ptr(), Arc::as_ptr(&machine.shared))
     }
@@ -2235,6 +2312,20 @@ impl PartialEq for RuntimeSessionRegistrationWitness {
 }
 
 impl Eq for RuntimeSessionRegistrationWitness {}
+
+/// Which use of one exact runtime-session registration a caller saw.
+///
+/// A registration can be handed to a new user without being replaced: a
+/// later `register_session` reuses it as it is, and an executor attachment
+/// or an actor materialization adopts it in place, so its
+/// [`RuntimeSessionRegistrationWitness`] stays the same. Every such adoption
+/// stamps the registration with a fresh value of one machine-wide sequence.
+/// A use read earlier therefore differs from the current one once anyone
+/// has taken the registration since, and a successor registration never
+/// carries its predecessor's use. Opaque: compare it for equality only. Read
+/// it with [`MeerkatMachine::session_registration_use`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSessionRegistrationUse(u64);
 
 /// Result of exact cleanup for one durability-degraded runtime registration.
 ///
@@ -2290,6 +2381,47 @@ impl ReloadRequiredRegistrationSettlement {
             Self::NotCurrent => ReloadRequiredRegistrationDisposition::NotCurrent,
             Self::NotDegraded => ReloadRequiredRegistrationDisposition::NotDegraded,
             Self::Discarded { .. } => ReloadRequiredRegistrationDisposition::Discarded,
+        }
+    }
+}
+
+/// Answer of
+/// [`MeerkatMachine::reload_required_registration_settlement_if_current`]:
+/// the registration reload's terminal result, with the use the published
+/// successor starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReloadRequiredRegistrationUseSettlement {
+    /// The witness no longer names this machine's exact current registration.
+    NotCurrent,
+    /// The exact registration remains durability-ready and was left untouched.
+    NotDegraded,
+    /// The exact ReloadRequired process shell was replaced by `successor`,
+    /// the registration this reload published, whose use starts at
+    /// `successor_use`.
+    Discarded {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after the expected use
+    /// was read: nothing was discarded and no running discard was joined.
+    Changed,
+}
+
+impl ReloadRequiredRegistrationUseSettlement {
+    /// The settlement of a reload that was not gated on a use.
+    fn into_ungated_settlement(
+        self,
+    ) -> Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError> {
+        match self {
+            Self::NotCurrent => Ok(ReloadRequiredRegistrationSettlement::NotCurrent),
+            Self::NotDegraded => Ok(ReloadRequiredRegistrationSettlement::NotDegraded),
+            Self::Discarded { successor, .. } => {
+                Ok(ReloadRequiredRegistrationSettlement::Discarded { successor })
+            }
+            Self::Changed => Err(RuntimeDriverError::Internal(
+                "a use-gated reload result reached a caller that gave no expected use".to_string(),
+            )),
         }
     }
 }
@@ -6075,6 +6207,45 @@ impl RuntimeSessionEntry {
         )
     }
 
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]).
+    /// The caller holds the session map lock.
+    fn registration_use(&self) -> RuntimeSessionRegistrationUse {
+        RuntimeSessionRegistrationUse(
+            self.registration_use
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Hand this registration to a new user: stamp it with `stamp`, a fresh
+    /// value of the machine-wide sequence. The caller holds the session map
+    /// lock.
+    fn stamp_adoption(&self, stamp: u64) {
+        self.registration_use
+            .store(stamp, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether no runtime loop can hold this registration's mutation fence:
+    /// no attachment is pending or committed and no runtime-loop teardown
+    /// slot exists (no loop was ever attached, or its teardown completed).
+    fn no_runtime_loop_holds_mutation_fence(&self) -> bool {
+        matches!(self.attachment_slot, RuntimeLoopAttachmentSlot::Empty)
+            && self.runtime_loop_teardown.is_none()
+    }
+
+    /// Whether this registration's runtime-loop teardown is still the one a
+    /// reload-required discard was admitted with: the exact teardown handoff
+    /// slot, or, for a registration no runtime loop held, still none.
+    fn runtime_loop_teardown_is_as_admitted(
+        &self,
+        admitted: Option<&Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>>,
+    ) -> bool {
+        match (self.runtime_loop_teardown.as_ref(), admitted) {
+            (Some(current), Some(admitted)) => Arc::ptr_eq(current, admitted),
+            (None, None) => self.no_runtime_loop_holds_mutation_fence(),
+            _ => false,
+        }
+    }
+
     fn live_attachment_id(&self) -> Option<RuntimeLoopAttachmentId> {
         match &self.attachment_slot {
             RuntimeLoopAttachmentSlot::Pending(attachment)
@@ -7218,6 +7389,59 @@ impl MeerkatMachine {
         (entered_rx, release_tx)
     }
 
+    /// Pause one ReloadRequired discard worker of `session_id` after it
+    /// released the registration transaction and claimed any teardown
+    /// handoff, before it takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_reload_required_discard_before_mutation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "ReloadRequired before-mutation-gate test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Install a fresh runtime-loop teardown slot on the current registration
+    /// of `session_id`, as a runtime loop attached to it would, when it has
+    /// none. A real loop can reach a durability-degraded registration this
+    /// way: an executor registration checks durability when it claims the
+    /// session, releases the registration transaction while it still holds
+    /// the mutation gate, and attaches its loop without checking again, so a
+    /// session that degrades in between gets a loop after a discard was
+    /// admitted. Tests use this to place that attach inside a discard's
+    /// window deterministically. `false` when the session is not registered
+    /// or already has one.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn install_runtime_loop_teardown_slot_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(session_id) {
+            Some(entry) if entry.runtime_loop_teardown.is_none() => {
+                entry.runtime_loop_teardown =
+                    Some(crate::runtime_loop::RuntimeLoopTeardownSlot::pending());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Force one persistent session's shared durability gate into
     /// ReloadRequired without fabricating a store outcome. Test-only callers
     /// use this to exercise cancellation around the real disposal coordinator.
@@ -7268,6 +7492,31 @@ impl MeerkatMachine {
             .persist_ops_lifecycle(&runtime_id, &snapshot)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn run_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_reload_required_discard_before_mutation_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -9778,6 +10027,9 @@ impl Drop for RunStartHoldInFlightForTest<'_> {
 #[doc(hidden)]
 pub struct MeerkatMachineShared {
     native_work_authorization_host: crate::input_authority::NativeWorkAuthorizationSlot,
+    /// Source of [`RuntimeSessionRegistrationUse`] stamps: one machine-wide
+    /// sequence, so no two stamps this machine hands out are equal.
+    registration_use_sequence: std::sync::atomic::AtomicU64,
     /// The issuing consent owner's owner-loss settlement, installed by the
     /// composition before any session is registered. Empty: nothing is
     /// settled and nothing is recorded as settled.
@@ -10072,7 +10324,7 @@ pub struct MeerkatMachineShared {
     test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
     /// Fail the next record of a deferred close-time playback settlement
     /// after its machine transition, as a failed recovery-state persist does.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
     test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
@@ -10187,6 +10439,17 @@ pub struct MeerkatMachineShared {
     /// from the already-current successor.
     #[cfg(any(test, feature = "test-support"))]
     test_reload_required_discard_after_successor_publication: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot deterministic gate in a ReloadRequired discard worker, after
+    /// the registration transaction was released and any teardown handoff
+    /// claimed, before the worker takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    test_reload_required_discard_before_mutation_gate: StdMutex<
         Option<(
             SessionId,
             crate::tokio::sync::oneshot::Sender<()>,
@@ -11854,6 +12117,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -11948,7 +12212,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
@@ -11979,6 +12243,8 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12090,6 +12356,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -12184,7 +12451,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
@@ -12215,6 +12482,8 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12983,6 +13252,9 @@ mod input_transition_wait_tests;
 #[cfg(all(test, feature = "live"))]
 mod live_custody_read_tests;
 
+#[cfg(test)]
+mod registration_use_tests;
+
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;
 
@@ -13003,6 +13275,14 @@ impl Drop for MeerkatMachineShared {
 }
 
 impl MeerkatMachineShared {
+    /// A fresh [`RuntimeSessionRegistrationUse`] stamp value: the next value
+    /// of the machine-wide sequence.
+    fn next_registration_use(&self) -> u64 {
+        self.registration_use_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
     fn require_governed_execution_custody(&self) -> Result<(), RuntimeDriverError> {
         if self.store.is_none()
             || self

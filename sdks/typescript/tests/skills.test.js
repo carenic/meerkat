@@ -578,10 +578,13 @@ describe("Skills v2.1", () => {
 
     const sub = await client.subscribeSessionEvents("s1");
     const iterator = sub[Symbol.asyncIterator]();
+    let timer;
     const first = await Promise.race([
       iterator.next(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("stream did not terminate")), 200)),
-    ]);
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("stream did not terminate")), 200);
+      }),
+    ]).finally(() => clearTimeout(timer));
     assert.equal(first.done, true);
     assert.deepEqual(sub.terminalOutcome, {
       stream_id: "stream-end-1",

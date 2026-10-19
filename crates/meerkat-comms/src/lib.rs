@@ -2,6 +2,15 @@
 // meerkat-comms
 //! Inter-agent communication for Meerkat instances.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 // On wasm32, use tokio_with_wasm as a drop-in replacement for tokio.
 #[cfg(target_arch = "wasm32")]
 pub mod tokio {

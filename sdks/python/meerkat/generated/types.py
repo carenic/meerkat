@@ -3621,6 +3621,7 @@ class MobSupervisorSpecInput:
 class MobToolConfigInput:
     """Request payload for MobToolConfigInput."""
     builtins: Optional[bool] = None
+    bundles: Optional[list[str]] = None
     comms: Optional[bool] = None
     deny: Optional[list[str]] = None
     image_generation: Optional[bool] = None
@@ -5015,14 +5016,20 @@ class ToolConfigChangedPayload:
     """Payload for tool configuration change notifications.
 
 The typed `status_info` is the sole owner of the change status; display
-text is derived at read time via [`ToolConfigChangedPayload::status_text`]."""
+text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+The lifecycle fact is derived from it too ([`Self::settled`],
+[`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+with that value as `settled`; a decoded payload keeps the bit it was stored
+with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+which carry `persisted`, serialize back unchanged."""
     operation: ToolConfigChangeOperation
-    persisted: bool
     status_info: ToolConfigChangeStatus
     target: str
     applied_at_turn: Optional[int] = None
     deferred_catalog_delta: Optional[DeferredCatalogDelta] = None
     domain: Optional[ToolConfigChangeDomain] = None
+    persisted: Optional[bool] = None
+    settled: Optional[bool] = None
 
 
 @dataclass
@@ -5686,7 +5693,11 @@ class RealtimeTranscriptEventAssistantTurnInterrupted(TypedDict, total=False):
     response_id: Required[str]
     type: Required[Literal['assistant_turn_interrupted']]
 
-RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted
+class RealtimeTranscriptEventAssistantTurnFailed(TypedDict, total=False):
+    response_id: Required[str]
+    type: Required[Literal['assistant_turn_failed']]
+
+RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted | RealtimeTranscriptEventAssistantTurnFailed
 
 # Provider-neutral role for a realtime transcript item.
 RealtimeTranscriptRole = Literal['user', 'assistant']
@@ -5895,6 +5906,28 @@ class WireLiveAdapterErrorCodeUnknown(TypedDict, total=False):
 
 WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown
 
+# Wire mirror of [`LiveResponseFailureStatus`].
+#
+# The known statuses serialize as plain strings (`"failed"`,
+# `"incomplete"`, `"in_progress"`), so clients route on `failure.status`.
+class WireLiveResponseFailureStatusUnknownPayload(TypedDict, total=False):
+    debug: Required[str]
+
+class WireLiveResponseFailureStatusUnknown(TypedDict, total=False):
+    unknown: Required[WireLiveResponseFailureStatusUnknownPayload]
+
+WireLiveResponseFailureStatus = Literal['failed'] | Literal['incomplete'] | Literal['in_progress'] | WireLiveResponseFailureStatusUnknown
+
+# Wire mirror of [`LiveResponseFailure`]: how a live response ended without
+# completing. Route on `status`; `reason`, `code` and `message` repeat what
+# the provider said and are diagnostics only.
+class WireLiveResponseFailure(TypedDict, total=False):
+    code: NotRequired[Optional[str]]
+    message: NotRequired[Optional[str]]
+    reason: NotRequired[Optional[str]]
+    status: Required[WireLiveResponseFailureStatus]
+
+
 # Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].
 #
 # FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
@@ -6022,7 +6055,13 @@ class WireLiveAdapterObservationUnknown(TypedDict, total=False):
     debug: Required[str]
     observation: Required[Literal['unknown']]
 
-WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown
+class WireLiveAdapterObservationTurnFailed(TypedDict, total=False):
+    failure: Required[WireLiveResponseFailure]
+    observation: Required[Literal['turn_failed']]
+    response_id: NotRequired[Optional[str]]
+    usage: NotRequired[Optional[dict[str, Any]]]
+
+WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown | WireLiveAdapterObservationTurnFailed
 
 @dataclass
 class RuntimeAcceptResult:
@@ -7914,6 +7953,7 @@ class SystemNoticeBlockMcp(TypedDict, total=False):
     persisted: NotRequired[bool]
     phase: NotRequired[Optional[ExternalToolDeltaPhase]]
     server_id: NotRequired[Optional[str]]
+    settled: NotRequired[bool]
     type: Required[Literal['mcp']]
 
 class SystemNoticeBlockBackgroundJob(TypedDict, total=False):

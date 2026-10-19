@@ -949,7 +949,7 @@ fn runtime_effect_from_core(
             operation: surface_delta_operation_from_core(operation),
             phase: surface_delta_phase_from_core(phase),
             cause,
-            persisted: matches!(
+            settled: matches!(
                 phase,
                 ExternalToolSurfaceDeltaPhase::Applied
                     | ExternalToolSurfaceDeltaPhase::Failed
@@ -5441,10 +5441,12 @@ pub(crate) mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_surface_handle() -> Arc<dyn ExternalToolSurfaceHandle> {
         Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral())
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_handle_owner_router() -> McpRouter {
         McpRouter::new_with_surface_handle_and_stdio_profile(
             generated_surface_handle(),
@@ -5452,6 +5454,7 @@ pub(crate) mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_handle_owner_router_with_timeout(removal_timeout: Duration) -> McpRouter {
         let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
             generated_surface_handle(),
@@ -5755,6 +5758,7 @@ pub(crate) mod tests {
             .expect("add success");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn setup_refusal_projection_requires_accepted_completion_and_exact_error_type() {
         use meerkat_core::confinement::ConfinementRefusal;
@@ -5857,6 +5861,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn core_handle_owner_add_apply_success_makes_surface_active_visible() {
         let mut router = generated_handle_owner_router();
@@ -5874,6 +5879,7 @@ pub(crate) mod tests {
         assert_eq!(entry.pending_op, ExternalToolSurfacePendingOp::None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn core_handle_owner_reload_rejects_before_active_and_accepts_after_active() {
         let mut router = generated_handle_owner_router();
@@ -5914,6 +5920,7 @@ pub(crate) mod tests {
         )));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn core_handle_owner_remove_finalize_and_call_guards_are_owner_owned() {
         let mut router = generated_handle_owner_router();
@@ -6001,6 +6008,7 @@ pub(crate) mod tests {
         inner: Arc<dyn ExternalToolSurfaceHandle>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectFinalizeSurfaceHandle {
         fn new() -> Self {
             Self {
@@ -6148,6 +6156,7 @@ pub(crate) mod tests {
         inner: Arc<dyn ExternalToolSurfaceHandle>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectCallFinishedSurfaceHandle {
         fn new() -> Self {
             Self {
@@ -6288,6 +6297,7 @@ pub(crate) mod tests {
     /// `ServerUnavailable` fault) instead of warn-and-returning the tool result
     /// with router/machine inflight-call state diverged. Mirrors the
     /// fail-closed `CallStarted` rejection path.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn call_finished_rejection_fails_closed_not_returning_result() {
         let server_path = mcp_test_server::fixture_binary();
@@ -6316,6 +6326,7 @@ pub(crate) mod tests {
     /// Gate for dogma row #112: a surface-owner rejection of a finalize-removal
     /// is authoritative divergence. The router must fail closed (return a typed
     /// error) instead of warn-and-continuing with router/machine state diverged.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn finalize_removal_rejection_fails_closed_not_silently_continue() {
         let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
@@ -6418,6 +6429,7 @@ pub(crate) mod tests {
     /// last-wins (silently route to an arbitrary owner). The published
     /// projection must exclude the collided name entirely while leaving each
     /// server's non-colliding tools routable.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn duplicate_tool_name_across_servers_is_excluded_from_projection() {
         let mut router = generated_handle_owner_router();
@@ -6524,6 +6536,7 @@ pub(crate) mod tests {
             .collect();
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn explicit_tool_names_keep_raw_route_and_source_provenance() {
         let mut router = generated_handle_owner_router();
@@ -6573,6 +6586,7 @@ pub(crate) mod tests {
         assert!(!router.projection.tool_routes.contains_key("no_phantom"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn exposed_collisions_exclude_all_routes_within_and_across_servers() {
         let mut router = generated_handle_owner_router();
@@ -6633,6 +6647,7 @@ pub(crate) mod tests {
         assert!(router.tool_name_collisions().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn divergent_raw_definitions_cannot_be_repaired_by_an_alias() {
         let mut router = generated_handle_owner_router();
@@ -6651,6 +6666,7 @@ pub(crate) mod tests {
         assert!(router.projection.tool_routes.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn exposure_does_not_repair_mismatched_provenance() {
         for (kind, source) in [
@@ -6673,6 +6689,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn invalid_tool_names_refuse_before_staging_or_connection() {
         use meerkat_core::tool_catalog::{TOOL_CATALOG_LOAD_NAME, TOOL_CATALOG_SEARCH_NAME};
@@ -6721,6 +6738,7 @@ pub(crate) mod tests {
 
     /// Same-name-same-server re-entry with identical definitions is NOT a
     /// collision; the tool stays routable and the projection complete.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn same_server_identical_duplicate_definitions_collapse_once() {
         let mut router = generated_handle_owner_router();
@@ -6760,6 +6778,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn same_server_divergent_duplicate_definitions_are_excluded_from_projection() {
         let mut router = generated_handle_owner_router();
@@ -6826,6 +6845,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn same_server_duplicate_description_mismatch_is_divergent() {
         let mut router = generated_handle_owner_router();
@@ -6867,6 +6887,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn core_handle_owner_uses_owner_pending_operation_over_completion_hint() {
         let router = generated_handle_owner_router();
@@ -6912,6 +6933,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn staged_add_remove_reload_transitions() {
         let server_path = mcp_test_server::fixture_binary();
@@ -6949,6 +6971,7 @@ pub(crate) mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn remove_is_immediately_hidden_on_boundary_apply() {
         let server_path = mcp_test_server::fixture_binary();
@@ -6973,6 +6996,7 @@ pub(crate) mod tests {
     /// `shutdown` joins: the removed server and its process group have exited
     /// when shutdown returns. (Fails-old: the close was a detached task, and
     /// rmcp waited up to 3 s after EOF before killing only the direct child.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn removed_stdio_server_has_exited_when_shutdown_returns() {
@@ -7006,6 +7030,7 @@ pub(crate) mod tests {
     /// their graces run concurrently rather than in turn. Both ignore stdin
     /// EOF and exit on the SIGTERM at their 2 s EOF deadline. (Fails-old:
     /// shutdown awaited each close in turn, at least 4 s here.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_closes_pending_and_established_stdio_servers_concurrently() {
@@ -7062,6 +7087,7 @@ pub(crate) mod tests {
     /// EOF deadline and runs its handler. (Fails-old: aborting the attempt
     /// dropped its close, so the group was SIGKILLed at once and the pending
     /// cleanup reported nothing.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_joins_a_close_a_failed_connect_attempt_started() {
@@ -7116,6 +7142,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn removing_state_rejects_new_calls_and_drains_inflight() {
         let server_path = mcp_test_server::fixture_binary();
@@ -7162,6 +7189,7 @@ pub(crate) mod tests {
         assert!(result.delta.degraded_removals.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn removal_timeout_forces_close_and_reports_degraded_signal() {
         let server_path = mcp_test_server::fixture_binary();
@@ -7191,6 +7219,7 @@ pub(crate) mod tests {
         }));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn awaiting_authorization_is_host_status_not_an_agent_notice_payload() {
         use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
@@ -7234,6 +7263,7 @@ pub(crate) mod tests {
     /// A router whose first Add of an OAuth-protected server failed with
     /// `AuthorizationRequired` and was accepted: the retained retry record
     /// exists. The resolver holds no credential until the test "logs in".
+    #[cfg(feature = "workspace-tests")]
     pub(crate) async fn router_awaiting_authorization() -> (
         McpRouter,
         McpServerIdentity,
@@ -7261,6 +7291,7 @@ pub(crate) mod tests {
 
     /// A router with "guarded" connected under a stored credential for an
     /// explicit account, so the bearer refuses locally once it is gone.
+    #[cfg(feature = "workspace-tests")]
     async fn router_connected_under_credential() -> (
         McpRouter,
         McpServerIdentity,
@@ -7289,6 +7320,7 @@ pub(crate) mod tests {
         (router, target, resolver, server)
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn sign_out_unpublishes_the_connected_server_and_sign_in_adds_it_back() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7359,6 +7391,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn sign_out_matches_the_realm_scoped_target_the_host_reports() {
         use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
@@ -7415,6 +7448,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_release_of_another_credential_leaves_the_server_published() {
         let (mut router, target, _resolver, _server) = router_connected_under_credential().await;
@@ -7449,6 +7483,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_newer_staged_intent_wins_over_a_release() {
         let (mut router, target, _resolver, _server) = router_connected_under_credential().await;
@@ -7461,6 +7496,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_call_without_a_usable_credential_unpublishes_at_the_next_boundary() {
         let (mut router, target, resolver, server) = router_connected_under_credential().await;
@@ -7489,6 +7525,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_sign_in_before_the_release_boundary_restores_the_server_without_another_sign_in() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7519,6 +7556,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_refused_restage_is_reported_and_the_sign_in_is_kept() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7567,6 +7605,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_sign_out_after_a_retained_sign_in_supersedes_it() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7590,6 +7629,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_explicit_remove_during_a_release_withdraws_the_sign_in_record() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7609,6 +7649,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_sign_in_before_a_queued_call_refusal_keeps_the_server_published() {
         let (mut router, target, resolver, _server) = router_connected_under_credential().await;
@@ -7649,6 +7690,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_after_login_reconnects_the_failed_first_add_once_at_the_boundary() {
         let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
@@ -7683,6 +7725,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_touches_only_the_exact_retained_target() {
         let (mut router, target, _resolver, _server) = router_awaiting_authorization().await;
@@ -7721,6 +7764,7 @@ pub(crate) mod tests {
         fresh.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_remove_staged_ahead_of_the_old_failure_wins() {
         use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
@@ -7760,6 +7804,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_accepted_host_remove_withdraws_the_retry() {
         let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
@@ -7801,6 +7846,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_mirror_fault_is_typed_and_the_boundary_runs_the_retained_config() {
         let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
@@ -7829,6 +7875,7 @@ pub(crate) mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_owner_staging_rejection_keeps_the_record_for_a_later_retry() {
         let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
@@ -7862,6 +7909,7 @@ pub(crate) mod tests {
 
     /// A stale result for an older attempt (owner-rejected) neither erases
     /// nor replaces the newer retry record.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stale_results_cannot_clear_or_replace_a_newer_retry_record() {
         use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
@@ -7946,6 +7994,7 @@ pub(crate) mod tests {
     /// own close. The surface owner refuses a second boundary while an
     /// attempt is pending, so, as in the stale-results test above, the stale
     /// result is replayed for an obligation that already completed.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(unix)]
     #[tokio::test]
     async fn a_superseded_success_cancels_as_not_installed() {
@@ -8070,6 +8119,7 @@ pub(crate) mod tests {
         assert_ne!(finishes[1].1.key.attempt, attempt);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn apply_staged_add_is_non_blocking() {
         let server_path = mcp_test_server::fixture_binary();
@@ -8137,6 +8187,7 @@ pub(crate) mod tests {
     /// operations, under their exposed names too: the others are neither
     /// published nor callable, through the router or directly on its
     /// connection. The ceiling does not certify the allowed ones read-only.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn access_ceiling_admits_only_its_allowed_operations() {
         let server_path = mcp_test_server::fixture_binary();
@@ -8194,6 +8245,7 @@ pub(crate) mod tests {
     /// binding broader than the ceiling is valid configuration, an operation
     /// the binding lists but the ceiling refuses is refused locally before
     /// any connector preparation, and an operation both admit is prepared.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn access_ceiling_and_connector_binding_intersect_at_call_time() {
         struct CountingProvider(std::sync::Mutex<Vec<String>>);
@@ -8279,6 +8331,7 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn add_remove_add_discards_stale_generation() {
         let server_path = mcp_test_server::fixture_binary();
@@ -8324,7 +8377,7 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[path = "call_context_tests.rs"]
 mod call_context_tests;
 
@@ -8332,6 +8385,6 @@ mod call_context_tests;
 #[path = "shutdown_report_tests.rs"]
 mod shutdown_report_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[path = "apps_tests.rs"]
 mod apps_tests;

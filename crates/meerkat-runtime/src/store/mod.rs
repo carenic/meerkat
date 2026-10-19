@@ -9986,7 +9986,10 @@ pub trait RuntimeStore: Send + Sync {
 
 pub use memory::InMemoryRuntimeStore;
 #[cfg(feature = "sqlite-store")]
-pub use sqlite::SqliteRuntimeStore;
+pub use sqlite::{
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    StandaloneWholeBlobSessionSource,
+};
 
 #[cfg(test)]
 mod runtime_store_write_fence_tests {

@@ -2715,6 +2715,7 @@ export interface MobSupervisorSpecInput {
 
 export interface MobToolConfigInput {
   builtins?: boolean;
+  bundles?: string[];
   comms?: boolean;
   deny?: string[];
   image_generation?: boolean;
@@ -3542,7 +3543,8 @@ export interface ToolConfigChangedPayload {
   deferred_catalog_delta?: DeferredCatalogDelta | null;
   domain?: ToolConfigChangeDomain | null;
   operation: ToolConfigChangeOperation;
-  persisted: boolean;
+  persisted?: boolean;
+  settled?: boolean;
   status_info: ToolConfigChangeStatus;
   target: string;
 }
@@ -5870,7 +5872,12 @@ export interface RealtimeTranscriptEventAssistantTurnInterrupted {
   type: "assistant_turn_interrupted";
 }
 
-export type RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted;
+export interface RealtimeTranscriptEventAssistantTurnFailed {
+  response_id: string;
+  type: "assistant_turn_failed";
+}
+
+export type RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted | RealtimeTranscriptEventAssistantTurnFailed;
 
 export type RealtimeTranscriptRole = "user" | "assistant";
 
@@ -6098,6 +6105,23 @@ export interface WireLiveAdapterErrorCodeUnknown {
 
 export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown;
 
+export interface WireLiveResponseFailureStatusUnknownPayload {
+  debug: string;
+}
+
+export interface WireLiveResponseFailureStatusUnknown {
+  unknown: WireLiveResponseFailureStatusUnknownPayload;
+}
+
+export type WireLiveResponseFailureStatus = "failed" | "incomplete" | "in_progress" | WireLiveResponseFailureStatusUnknown;
+
+export interface WireLiveResponseFailure {
+  code?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  status: WireLiveResponseFailureStatus;
+}
+
 export interface WireLiveAdapterObservationReady {
   observation: "ready";
 }
@@ -6216,7 +6240,14 @@ export interface WireLiveAdapterObservationUnknown {
   observation: "unknown";
 }
 
-export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown;
+export interface WireLiveAdapterObservationTurnFailed {
+  failure: WireLiveResponseFailure;
+  observation: "turn_failed";
+  response_id?: string | null;
+  usage?: Record<string, unknown> | null;
+}
+
+export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown | WireLiveAdapterObservationTurnFailed;
 
 export interface RuntimeAcceptResult {
   existing_id?: string | null;
@@ -6913,6 +6944,7 @@ export interface SystemNoticeBlockMcp {
   persisted?: boolean;
   phase?: ExternalToolDeltaPhase | null;
   server_id?: string | null;
+  settled?: boolean;
   type: "mcp";
 }
 

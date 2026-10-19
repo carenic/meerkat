@@ -67,7 +67,8 @@ jobs:
           echo "::add-mask::${provider_overrides}"
           unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
           # One attempt per scenario (no Bazel retry); the typed verdict
-          # separates real failures from provider-degraded void runs.
+          # separates real failures from void runs (provider degraded, or
+          # provider stalled after it started speaking).
           set +e
           MEERKAT_BUILDBUDDY_SECRET_ENV_OVERRIDES="${provider_overrides}" \
             scripts/buildbuddy-dev e2e-smoke-turbo-s 2>&1 | tee turbo-s.log

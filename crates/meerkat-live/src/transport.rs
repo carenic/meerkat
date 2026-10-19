@@ -1934,6 +1934,16 @@ mod tests {
             Ok(())
         }
 
+        async fn signal_turn_failed(
+            &self,
+            _session_id: &SessionId,
+            _response_id: Option<&str>,
+            _failure: &meerkat_core::live_adapter::LiveResponseFailure,
+            _accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+        ) -> Result<(), LiveProjectionError> {
+            Ok(())
+        }
+
         async fn signal_terminal_error(
             &self,
             session_id: &SessionId,

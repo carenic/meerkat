@@ -11,6 +11,25 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # needs the unpublished mcp-test-server crate
+    "tests/external_tool_integration.rs",
+    # needs the unpublished mcp-test-server and meerkat-runtime, which depends on this crate
+    "tests/form_elicitation.rs",
+    # support modules of tests/form_elicitation.rs
+    "tests/form_elicitation",
+    # needs the unpublished mcp-test-server crate
+    "tests/lifecycle_contract.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/m6_composition.rs",
+    # support modules of tests/m6_composition.rs
+    "tests/m6_composition_support",
+    # needs the unpublished mcp-test-server and meerkat-runtime, which depends on this crate
+    "tests/m6_staged_boundary.rs",
+]
 
 [dependencies]
 meerkat-capabilities = { workspace = true }
@@ -41,6 +60,12 @@ sse-stream = "0.2.4"  # SseStream::from_bytes_stream first ships in 0.2.4
 
 [features]
 test-support = []
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [[test]]
 name = "lifecycle_contract"
@@ -56,6 +81,9 @@ required-features = ["test-support"]
 nix = { workspace = true }
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-mcp = { path = ".", features = ["workspace-tests"] }
 tempfile = { workspace = true }
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "registry"] }

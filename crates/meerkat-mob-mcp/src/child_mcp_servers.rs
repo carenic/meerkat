@@ -9,9 +9,14 @@ use crate::ChildToolBundleAvailability;
 
 /// A conflicting destination may not silently replace an existing descriptor.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChildMcpServerRegistrationError {
     #[error("conflicting child MCP server registration: {name}")]
     ConflictingServer { name: String },
+    /// MCP descriptors have no profile opt-in, so a server cannot be offered
+    /// the way a tool bundle can ([`ChildToolBundleAvailability::ChildOffered`]).
+    #[error("child MCP server {name} cannot be registered as offered: MCP servers have no opt-in")]
+    OfferNotSupported { name: String },
 }
 
 /// Host-attested public MCP descriptors. Registration attests that the entire
@@ -51,6 +56,11 @@ impl ChildMcpServers {
         config: McpServerConfig,
         availability: ChildToolBundleAvailability,
     ) -> Result<Self, ChildMcpServerRegistrationError> {
+        if availability == ChildToolBundleAvailability::ChildOffered {
+            return Err(ChildMcpServerRegistrationError::OfferNotSupported {
+                name: config.name.clone(),
+            });
+        }
         if self
             .servers
             .get(&config.name)

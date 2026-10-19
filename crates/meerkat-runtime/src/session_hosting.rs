@@ -70,6 +70,21 @@ pub const DELIVERY_STORE_SWEEP: std::time::Duration = meerkat_sqlite::watch::SQL
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sqlite-store")))]
 pub const DELIVERY_STORE_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A store watch's file notification registration that the operating system
+/// still held when the watch stopped (`DeliveryStoreWatch::stop`). Nothing
+/// can interrupt that platform call (macOS FSEvents can hold it for tens of
+/// seconds), so the stop cancels the registration instead: its thread stays
+/// with the process until the call returns, then discards the result
+/// (`meerkat_sqlite::watch::retained_registrations` lists it until then). It
+/// never reads or writes the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetainedNotificationRegistration {
+    /// The directory it registers: the store database's resolved parent
+    /// directory, as the process listing names it.
+    pub directory: std::path::PathBuf,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{DeliveryStoreWatch, watch_delivery_store};
 
@@ -135,10 +150,11 @@ mod native {
     /// A running wake watch over a shared store's database. Its tick
     /// receiver moves once per coalesced file notification and once per
     /// sweep interval without one. Dropping the watch stops it (the watch
-    /// thread exits at its next wait).
+    /// thread exits at its next wait); [`Self::stop`] also says what the
+    /// stop left with the process.
     pub struct DeliveryStoreWatch {
         #[cfg(feature = "sqlite-store")]
-        _watch: meerkat_sqlite::watch::SqliteChangeWatch,
+        watch: meerkat_sqlite::watch::SqliteChangeWatch,
         ticks: crate::tokio::sync::watch::Receiver<u64>,
     }
 
@@ -155,12 +171,34 @@ mod native {
             self.ticks.clone()
         }
 
+        /// Stop the watch as dropping it does, without waiting: its thread
+        /// exits at its next wait. A file notification registration the
+        /// operating system still holds is cancelled and returned: its
+        /// thread stays with the process until the platform call returns.
+        pub fn stop(self) -> Option<super::RetainedNotificationRegistration> {
+            #[cfg(feature = "sqlite-store")]
+            {
+                // The request comes first: a registration still pending after
+                // it discards its result when the platform call returns.
+                self.watch.request_stop();
+                self.watch.pending_registration().map(|pending| {
+                    super::RetainedNotificationRegistration {
+                        directory: pending.directory,
+                    }
+                })
+            }
+            #[cfg(not(feature = "sqlite-store"))]
+            {
+                None
+            }
+        }
+
         /// Where the watch's file notification registration stands.
         #[cfg(all(test, feature = "sqlite-store"))]
         pub(crate) fn notification_registration(
             &self,
         ) -> meerkat_sqlite::watch::SqliteWatchRegistration {
-            self._watch.registration()
+            self.watch.registration()
         }
     }
 
@@ -215,10 +253,7 @@ mod native {
                 meerkat_sqlite::watch::SqliteWatchControl::Handled
             },
         )?;
-        Ok(Some(DeliveryStoreWatch {
-            _watch: watch,
-            ticks,
-        }))
+        Ok(Some(DeliveryStoreWatch { watch, ticks }))
     }
 }
 
@@ -276,6 +311,156 @@ mod tests {
             .await
             .expect("the write is observed through its notification, before any sweep")
             .expect("watch open");
+    }
+
+    /// The bound on a start, a tick or a stop that must not wait for a held
+    /// notification registration. The hold itself lasts until the test
+    /// releases it.
+    #[cfg(feature = "sqlite-store")]
+    const HELD_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+    /// A short sweep, so a watch whose registration is held ticks well
+    /// within the bound.
+    #[cfg(feature = "sqlite-store")]
+    const HELD_SWEEP: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// A shared store in `root` whose file notification registrations are
+    /// held, as a stalled macOS FSEvents registration holds them, until the
+    /// returned hold is released or dropped.
+    #[cfg(feature = "sqlite-store")]
+    fn held_store(
+        root: &std::path::Path,
+    ) -> (
+        meerkat_sqlite::watch::test_support::HeldRegistrations,
+        HostingCapability,
+    ) {
+        let held = meerkat_sqlite::watch::test_support::hold_registrations_in(root)
+            .expect("hold the store's registrations");
+        let database = root.join("runtime.sqlite3");
+        std::fs::write(&database, b"").expect("seed file");
+        let capability = HostingCapability::OsLock(std::sync::Arc::new(paths(root, database)));
+        (held, capability)
+    }
+
+    /// A held notification registration holds neither the start of the
+    /// delivery store watch nor its sweep: the start returns while the
+    /// registration is held, and the sweep ticks.
+    #[cfg(feature = "sqlite-store")]
+    #[tokio::test]
+    async fn a_held_registration_holds_neither_the_delivery_store_watch_start_nor_its_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (held, capability) = held_store(dir.path());
+        // A start that waited for the registration would block its thread
+        // until the hold ends, which the unwind of a failed assertion does.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            let _ = started_tx.send(watch_delivery_store(&capability, HELD_SWEEP));
+        });
+        assert!(
+            held.wait_entered(1, HELD_BOUND),
+            "the registration reached its platform call"
+        );
+        let watch = started_rx
+            .recv_timeout(HELD_BOUND)
+            .expect("the start does not wait for the held registration")
+            .expect("watch starts")
+            .expect("an OsLock store is watched");
+        let mut ticks = watch.subscribe_ticks();
+        tokio::time::timeout(HELD_BOUND, ticks.changed())
+            .await
+            .expect("the sweep ticks while the registration is held")
+            .expect("watch open");
+        held.release();
+        starter.join().expect("the starter returns");
+    }
+
+    #[cfg(feature = "sqlite-store")]
+    fn retained_in(directory: &std::path::Path) -> usize {
+        meerkat_sqlite::watch::retained_registrations()
+            .iter()
+            .filter(|retained| retained.directory == directory)
+            .count()
+    }
+
+    /// Stopping the delivery store watch while its registration is held
+    /// reports that registration, typed, by the directory the process
+    /// listing names. The stop does not wait for it: the process keeps its
+    /// thread until the platform call returns, then joins it.
+    #[cfg(feature = "sqlite-store")]
+    #[test]
+    fn stopping_the_delivery_store_watch_reports_its_held_registration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = dir
+            .path()
+            .canonicalize()
+            .expect("canonical store directory");
+        let (held, capability) = held_store(dir.path());
+        let watch = watch_delivery_store(&capability, HELD_SWEEP)
+            .expect("watch starts")
+            .expect("an OsLock store is watched");
+        assert!(
+            held.wait_entered(1, HELD_BOUND),
+            "the registration reached its platform call"
+        );
+        assert_eq!(
+            watch.notification_registration(),
+            meerkat_sqlite::watch::SqliteWatchRegistration::Pending
+        );
+
+        let retained = watch.stop().expect("the held registration is reported");
+        assert_eq!(retained.directory, directory);
+        assert_eq!(
+            retained_in(&directory),
+            1,
+            "the process keeps the registration's thread"
+        );
+        assert_eq!(held.live_sources(), 1);
+
+        held.release();
+        let deadline = std::time::Instant::now() + HELD_BOUND;
+        while retained_in(&directory) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            retained_in(&directory),
+            0,
+            "the process joins the thread once the platform call returns"
+        );
+        assert_eq!(
+            (held.live_sources(), held.dropped_sources()),
+            (0, 1),
+            "the cancelled registration discarded its source"
+        );
+    }
+
+    /// A watch whose registration completed reports nothing when it stops,
+    /// and leaves nothing with the process.
+    #[cfg(feature = "sqlite-store")]
+    #[test]
+    fn stopping_a_registered_delivery_store_watch_reports_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = dir
+            .path()
+            .canonicalize()
+            .expect("canonical store directory");
+        let (held, capability) = held_store(dir.path());
+        // Released before the start: the registration completes at once.
+        held.release();
+        let watch = watch_delivery_store(&capability, HELD_SWEEP)
+            .expect("watch starts")
+            .expect("an OsLock store is watched");
+        let deadline = std::time::Instant::now() + HELD_BOUND;
+        while watch.notification_registration()
+            == meerkat_sqlite::watch::SqliteWatchRegistration::Pending
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            watch.notification_registration(),
+            meerkat_sqlite::watch::SqliteWatchRegistration::Registered
+        );
+        assert_eq!(watch.stop(), None);
+        assert_eq!(retained_in(&directory), 0);
     }
 
     #[cfg(feature = "sqlite-store")]

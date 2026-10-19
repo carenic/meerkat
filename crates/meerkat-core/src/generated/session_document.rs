@@ -63,6 +63,7 @@ pub enum RealtimeTranscriptStopReasonKind {
     ToolUse,
     #[default]
     Other,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -6439,7 +6440,8 @@ fn realtime_should_mark_ready_after_write(
 }
 
 fn realtime_stop_reason_discards(stop_reason: RealtimeTranscriptStopReasonKind) -> bool {
-    stop_reason == RealtimeTranscriptStopReasonKind::Cancelled
+    (stop_reason == RealtimeTranscriptStopReasonKind::Cancelled)
+        || (stop_reason == RealtimeTranscriptStopReasonKind::Failed)
 }
 
 fn realtime_stop_reason_removes_completion(stop_reason: RealtimeTranscriptStopReasonKind) -> bool {

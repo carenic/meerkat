@@ -13071,6 +13071,386 @@ mod tests {
         );
     }
 
+    /// A `session/fork_at` child runs its first turn: the fork commits the
+    /// child with a build state derived from its source, which the child's
+    /// cold resume requires.
+    #[tokio::test]
+    async fn session_fork_at_child_runs_its_first_turn() {
+        let (router, _notif_rx) = test_router().await;
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "Hello" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 2,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(fork_resp.error.is_none(), "the fork commits: {fork_resp:?}");
+        let forked_id = result_value(&fork_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &forked_id,
+                    "prompt": "Follow up on the branch",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(turn_resp.error.is_none(), "the child runs: {turn_resp:?}");
+
+        let history_resp = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &forked_id }),
+            ))
+            .await
+            .unwrap();
+        let history = result_value(&history_resp);
+        let messages = history["messages"].as_array().unwrap();
+        assert!(
+            messages.len() > 2,
+            "the child's turn extends the forked prefix: {history}"
+        );
+        assert!(
+            messages.iter().any(|message| message["role"] == "user"
+                && message["content"] == "Follow up on the branch"),
+            "the child's transcript holds its own turn: {history}"
+        );
+    }
+
+    /// A `session/fork_replace` child runs its first turn, as a `fork_at`
+    /// child does.
+    #[tokio::test]
+    async fn session_fork_replace_child_runs_its_first_turn() {
+        let (router, _notif_rx) = test_router().await;
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "Hello" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let history_resp = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let message_index = result_value(&history_resp)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|message| message["role"] == "user" && message["content"] == "Hello")
+            .expect("the source transcript holds the first user message");
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_replace",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": message_index,
+                    "replacement": {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": "Edited hello"
+                        }
+                    },
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(fork_resp.error.is_none(), "the fork commits: {fork_resp:?}");
+        let forked_id = result_value(&fork_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &forked_id,
+                    "prompt": "Follow up on the edited branch",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(turn_resp.error.is_none(), "the child runs: {turn_resp:?}");
+    }
+
+    /// A router over a runtime store the test can also reach.
+    async fn test_router_with_runtime_store() -> (
+        MethodRouter,
+        mpsc::Receiver<RpcNotification>,
+        Arc<dyn meerkat_runtime::RuntimeStore>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let config = anthropic_test_config();
+        let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
+            config.clone(),
+            meerkat_models::canonical(),
+        ));
+        let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let persistence =
+            meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), memory_blob_store())
+                .expect("construct runtime authority");
+        let runtime =
+            SessionRuntime::new(factory, config, 10, persistence, NotificationSink::noop())
+                .expect("compose the RPC session runtime");
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
+        runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
+            Arc::clone(&config_store),
+            temp.path().join("config_state.json"),
+        )));
+        let runtime = Arc::new(runtime);
+        let (notif_tx, notif_rx) = mpsc::channel(100);
+        let router = MethodRouter::new(runtime, config_store, NotificationSink::new(notif_tx))
+            .expect("construct runtime authority");
+        (router, notif_rx, runtime_store)
+    }
+
+    /// A session with metadata but no build state (a child forked by an
+    /// earlier release has that shape) cannot be forked: both fork methods
+    /// answer invalid params with the refusal's kind and source.
+    #[tokio::test]
+    async fn session_forks_of_a_source_without_build_state_answer_invalid_params() {
+        let (router, _notif_rx, runtime_store) = test_router_with_runtime_store().await;
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "Hello" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let history_resp = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let hello_index = result_value(&history_resp)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|message| message["role"] == "user" && message["content"] == "Hello")
+            .expect("the source transcript holds the first user message");
+
+        // Commit the source's body again without its build state.
+        let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::for_session(
+            &SessionId::parse(&session_id).expect("session id"),
+        );
+        let committed = runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .expect("load the committed source")
+            .expect("the source is committed");
+        assert!(
+            committed
+                .session()
+                .try_session_metadata()
+                .expect("decode source metadata")
+                .is_some(),
+            "the source has canonical metadata"
+        );
+        let mut document = serde_json::to_value(committed.session()).expect("source document");
+        assert!(
+            document["metadata"]
+                .as_object_mut()
+                .expect("metadata map")
+                .remove(meerkat_core::SESSION_BUILD_STATE_KEY)
+                .is_some(),
+            "the source had a build state"
+        );
+        runtime_store
+            .commit_session_snapshot(
+                &runtime_id,
+                meerkat_runtime::store::SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&document)
+                        .expect("encode source document")
+                        .into(),
+                },
+            )
+            .await
+            .expect("commit the source without its build state");
+
+        let fork_at = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": hello_index + 1,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        let fork_replace = router
+            .dispatch(make_request(
+                "session/fork_replace",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": hello_index,
+                    "replacement": {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": "Edited hello"
+                        }
+                    },
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        for (method, response) in [
+            ("session/fork_at", &fork_at),
+            ("session/fork_replace", &fork_replace),
+        ] {
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("{method} is refused: {response:?}"));
+            assert_eq!(error.code, error::INVALID_PARAMS, "{method}: {error:?}");
+            let data = error.data.as_ref().expect("the refusal carries its data");
+            assert_eq!(
+                data["kind"], "fork_source_build_state_missing",
+                "{method}: {error:?}"
+            );
+            assert_eq!(
+                data["source_session_id"],
+                session_id.as_str(),
+                "{method}: {error:?}"
+            );
+        }
+    }
+
+    /// A fork child of a source created with additional instructions runs
+    /// its first turn on the transcript's own System message: the request
+    /// carries that System message and no second one authored from the
+    /// instructions its build state carries.
+    #[tokio::test]
+    async fn session_fork_child_first_turn_keeps_the_prefix_system_message() {
+        const INSTRUCTION: &str = "Answer in one short sentence.";
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
+        let (router, _notif_rx) =
+            test_router_with_llm(Arc::new(RecordingMockLlmClient::new(Arc::clone(&requests))))
+                .await;
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "additional_instructions": [INSTRUCTION],
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(create_resp.error.is_none(), "{create_resp:?}");
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_system = {
+            let recorded = requests.lock().expect("recorded requests lock poisoned");
+            let source_request = recorded.last().expect("the source's turn was sent");
+            system_prompt_from_request(source_request)
+                .expect("the source's turn carries its System message")
+                .to_string()
+        };
+        assert!(
+            source_system.contains(INSTRUCTION),
+            "the source's System message carries the instruction: {source_system}"
+        );
+        let history_resp = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let source_len = result_value(&history_resp)["message_count"]
+            .as_u64()
+            .expect("message count");
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": source_len,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(fork_resp.error.is_none(), "the fork commits: {fork_resp:?}");
+        let forked_id = result_value(&fork_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &forked_id,
+                    "prompt": "Follow up on the branch",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(turn_resp.error.is_none(), "the child runs: {turn_resp:?}");
+
+        let recorded = requests.lock().expect("recorded requests lock poisoned");
+        let child_request = recorded.last().expect("the child's turn was sent");
+        let system_messages: Vec<&str> = child_request
+            .iter()
+            .filter_map(|message| match message {
+                Message::System(system) => Some(system.content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system_messages,
+            vec![source_system.as_str()],
+            "the child's turn sends the prefix's System message and no second one"
+        );
+    }
+
     #[tokio::test]
     async fn archived_session_rejects_later_turn_after_system_append() {
         let recorded_requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
@@ -15180,6 +15560,231 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             "origin must name this session, channel and canonical row: {origin:?}"
         );
         assert_eq!(origin.provider_item_ids(), ["item_spoken".to_string()]);
+    }
+
+    /// #1883: through the production RPC sink, a failed response commits
+    /// nothing it staged (spoken transcript or buffered display text),
+    /// leaves the in-flight set a barge-in targets, and records its
+    /// accounting: measured usage on the session, or the routed unmeasured
+    /// fact. The next response on the same channel commits normally.
+    #[tokio::test]
+    async fn live_host_failed_response_commits_nothing_through_the_rpc_sink() {
+        use meerkat_live::LiveProjectionSink as _;
+
+        let (router, _notif_rx) = test_router().await;
+        let create = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({"prompt": "live fixture session"}),
+            ))
+            .await
+            .expect("session/create response");
+        assert!(create.error.is_none(), "session/create failed: {create:?}");
+        let session_id = SessionId::parse(
+            result_value(&create)["session_id"]
+                .as_str()
+                .expect("session_id"),
+        )
+        .expect("canonical session id");
+
+        let sink = Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        );
+        let host = meerkat_live::LiveAdapterHost::new(
+            Arc::clone(&sink) as Arc<dyn meerkat_live::LiveProjectionSink>
+        );
+        let channel_id = meerkat_live::LiveChannelId::random_uuid();
+        let identity = meerkat_core::SessionLlmIdentity {
+            model: "gpt-realtime-2".to_string(),
+            provider: meerkat_core::Provider::OpenAI,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        };
+        let authority = router
+            .runtime_adapter
+            .resolve_live_open_admission(&session_id, &channel_id, &identity)
+            .await
+            .expect("machine admits fixture channel");
+        host.open_channel_with_authority(
+            authority
+                .channel_open_authority()
+                .expect("generated host open handoff"),
+        )
+        .await
+        .expect("open live channel");
+        let mut events = router
+            .runtime
+            .subscribe_session_events(&session_id)
+            .await
+            .expect("subscribe to session events");
+
+        let spoken = |response_id: &str, item_id: &str, delta: &str| {
+            meerkat_core::live_adapter::LiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id: Some(item_id.to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some(response_id.to_string()),
+                delta_id: Some(format!("{item_id}-delta")),
+                delta: delta.to_string(),
+            }
+        };
+        let failure = meerkat_core::live_adapter::LiveResponseFailure {
+            status: meerkat_core::live_adapter::LiveResponseFailureStatus::Incomplete,
+            reason: Some("provider_reason".to_string()),
+            code: None,
+            message: None,
+        };
+        host.apply_observation(
+            &channel_id,
+            &spoken("resp_failed", "item_failed", "partial speech"),
+        )
+        .await
+        .expect("spoken delta applies");
+        sink.append_assistant_text_final(
+            &session_id,
+            "partial display text",
+            meerkat_live::LiveTranscriptIdentity::default(),
+            meerkat_core::types::StopReason::EndTurn,
+            meerkat_core::types::Usage::default(),
+            Some("resp_failed"),
+        )
+        .await
+        .expect("display final buffers");
+        assert_eq!(
+            router
+                .runtime
+                .in_flight_realtime_assistant_response_ids(&session_id)
+                .await
+                .expect("in-flight ids read"),
+            vec!["resp_failed".to_string()]
+        );
+        let usage_before = router
+            .runtime
+            .read_session(&session_id)
+            .await
+            .expect("session reads")
+            .billing
+            .usage;
+
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".to_string()),
+                failure: failure.clone(),
+                accounting: meerkat_core::live_adapter::LiveResponseAccounting::Measured {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                        meerkat_core::types::Usage {
+                            input_tokens: 17,
+                            output_tokens: 23,
+                            ..meerkat_core::types::Usage::default()
+                        },
+                    ),
+                },
+            },
+        )
+        .await
+        .expect("a failed response projects through the RPC sink");
+        assert!(
+            router
+                .runtime
+                .in_flight_realtime_assistant_response_ids(&session_id)
+                .await
+                .expect("in-flight ids read")
+                .is_empty(),
+            "a failed response leaves the in-flight set a barge-in targets"
+        );
+        let usage_after = router
+            .runtime
+            .read_session(&session_id)
+            .await
+            .expect("session reads")
+            .billing
+            .usage;
+        assert_eq!(usage_after.input_tokens, usage_before.input_tokens + 17);
+        assert_eq!(usage_after.output_tokens, usage_before.output_tokens + 23);
+
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_unmeasured".to_string()),
+                failure,
+                accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                    unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                    ),
+                },
+            },
+        )
+        .await
+        .expect("an unmeasured failed response projects through the RPC sink");
+        let unmeasured = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let envelope = futures::StreamExt::next(&mut events)
+                    .await
+                    .expect("session event stream stays open");
+                match envelope.payload {
+                    meerkat_core::AgentEvent::TurnUsageAccountingUnmeasured {
+                        unmeasured, ..
+                    } => break unmeasured,
+                    meerkat_core::AgentEvent::TurnCompleted { .. } => {
+                        panic!("a failed response publishes no turn terminal")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the unmeasured fact is published");
+        assert_eq!(unmeasured.model, "gpt-realtime-2");
+
+        host.apply_observation(
+            &channel_id,
+            &spoken("resp_next", "item_next", "next answer"),
+        )
+        .await
+        .expect("the next response stages");
+        host.apply_observation(
+            &channel_id,
+            &meerkat_core::live_adapter::LiveAdapterObservation::TurnCompleted {
+                response_id: Some("resp_next".to_string()),
+                stop_reason: meerkat_core::types::StopReason::EndTurn,
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Other,
+                    "rpc-turn-failed-test",
+                    meerkat_core::types::Usage::default(),
+                ),
+            },
+        )
+        .await
+        .expect("the next response completes");
+
+        let history = router
+            .runtime
+            .read_session_history_rich(
+                &session_id,
+                meerkat_core::service::SessionHistoryQuery {
+                    offset: 0,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("history reads")
+            .expect("session exists");
+        let rendered = serde_json::to_string(&history.messages).expect("history serializes");
+        assert!(
+            !rendered.contains("partial speech") && !rendered.contains("partial display text"),
+            "nothing of the failed response is committed: {rendered}"
+        );
+        assert!(
+            rendered.contains("next answer"),
+            "the next response commits normally: {rendered}"
+        );
     }
 
     /// Create a real, materialized session through `session/create` (its

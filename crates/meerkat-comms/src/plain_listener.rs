@@ -145,7 +145,7 @@ pub async fn handle_plain_connection<S>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

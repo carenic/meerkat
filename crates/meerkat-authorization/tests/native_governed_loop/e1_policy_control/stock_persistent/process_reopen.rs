@@ -636,7 +636,10 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
     assert!(refused.is_error);
     assert_eq!(
         serde_json::from_str::<Value>(&refused.text_content()).unwrap(),
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     let allowed = tool_feedback(saved.messages(), COLD_PERMITTED_CALL).unwrap();
     assert!(!allowed.is_error);

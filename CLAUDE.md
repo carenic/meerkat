@@ -412,10 +412,19 @@ and its CI must be green before a release tag (`require_ci_green`):
   is planned as the whole workspace (without looking for evidence): the
   explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
-  parity, lock consistency, `make ci-lanes-selftest`,
-  `make path-classifier-selftest`, and the ripgrep tombstone scans
+  parity, lock consistency, generated BUILD freshness
+  (`node scripts/generate-bazel-rust-builds.mjs --check`),
+  `make ci-lanes-selftest`,
+  `make path-classifier-selftest`, the ripgrep tombstone scans
   (`legacy-surface-gate`, `session-control-gate`, `deprecated-backend-gate`;
-  ripgrep is installed first, and each scan refuses to run without it).
+  ripgrep is installed first, and each scan refuses to run without it), and
+  the published crates' static standalone guard
+  (`make published-crates-standalone-selftest
+  check-published-crates-standalone-guard`: no packaged test reads outside
+  its package or skips itself when a binary is missing, every workspace-only
+  test file is left out in both the crate's `[package] exclude` and
+  `ci/standalone-workspace-only.toml`, and a crate whose tests need features
+  or a stack prints the exact `cargo test` command in its README).
 - `ratchets`: generated-contract freshness when contract paths changed;
   `machine-check-drift`/`protocol-check-drift` when machine authority changed;
   `verify-machine-poster-coverage` when machine authority or a poster input
@@ -646,6 +655,23 @@ existing `lint` (clippy `--all-targets`), `lint-feature-matrix`,
 `e2e-system`, `test-sdk-web`, `wasm-contract`, `check-rust-release-packaging`,
 and cargo-deny sweep.
 
+**Published crates standalone** (`.github/workflows/published-crates-standalone.yml`,
+daily after nightly's chains and on dispatch) runs
+`make published-crates-standalone-census` in shards: every release crate is
+packaged and unpacked into a synthetic workspace, and per crate, without
+sibling feature unification, its tests run there with plain `cargo test` and
+the feature set its `[package.metadata.meerkat.standalone-tests]` publishes,
+the naive `cargo test --no-run` compiles with default features, and the test
+names per target must equal the workspace's minus the files and tests
+`ci/standalone-workspace-only.toml` declares workspace-only. A unit test that
+needs a crate the package cannot depend on (a cyclic or unpublished
+dev-dependency) is gated on its crate's internal `workspace-tests` feature,
+which only the crate's path-only self dev-dependency enables (`cargo package`
+strips it), and the Bazel generator fails a crate that declares the feature
+without that edge. Publication does not wait for the census yet: the release
+gate on a passing run at the release commit returns once a nightly run has
+passed and its duration is measured.
+
 The release tag path requires successful exact-main CI (schema-4 attestation)
 and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
 BuildBuddy graph (`release_validate_buildbuddy_full`) as its validation gate;
@@ -744,7 +770,7 @@ Installed via `make install-hooks`. Two stages:
 
 **On commit** (`pre-commit`):
 - `repo-cargo fmt --all`
-- `node scripts/generate-bazel-rust-builds.mjs` (regenerates Bazel rust build metadata)
+- `node scripts/precommit-build-hook.mjs` (runs `scripts/generate-bazel-rust-builds.mjs` to regenerate Bazel rust build metadata when the staged changes, deletions included, touch Cargo metadata, a Rust source under `crates/` or `tests/`, or a generator input; about 5 s. It refuses the commit while a Rust file under `crates/` or `tests/` is not in the index, since the generator would read it from disk)
 - `scripts/sync-meerkat-dogma-skill-docs.sh` (syncs dogma docs into the skill)
 
 **On push** (`pre-push`), sized to finish in a few minutes warm (the CI it
@@ -770,7 +796,7 @@ features, which only nightly's workspace unit lane runs:
 - `changed-path-ratchets`: `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy). CI: the `ratchets` job (generated contracts; drift on a machine-authority change), the `governance-gates` job (the typed governance gates on a machine-authority or dogma change), `example-web` and `wasm-check`, selected by the same paths; `scripts/test-pre-push-ratchets.sh` pins it (each ratchet's CI step and trigger included) and runs in `make ci-lanes-selftest`
 - `machine-codegen-drift` / `machine-codegen-verify`: `scripts/pre-push-machines.sh --codegen-only|--verify-only` (machine and protocol codegen under the clean-tree contract; the canonical TLC lane). CI: the `ratchets` job's `machine-check-drift`/`protocol-check-drift` and the `tlc-audits` shards on a machine-authority change; the `machine-verify --all` sweep nightly and on the release gate
 - `cargo-test`: `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend). CI: the pull request's unit lanes for the changed packages, the push's `main-unit` and `closure-tests` rows, nightly's workspace unit lane
-- `release-test-code-guards-contract`, `release-doctor-workflow-contract`, `release-find-prebuild-contract`, `macos-x86-release-binary-check-contract`, `release-asset-provenance-contract`: CI's `Format + governance` job runs these on every pull request
+- `release-test-code-guards-contract`, `release-doctor-workflow-contract`, `release-find-prebuild-contract`, `release-standalone-gate-contract`, `macos-x86-release-binary-check-contract`, `release-asset-provenance-contract`: CI's `Format + governance` job runs these on every pull request
 
 The manual deterministic gate's source-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
@@ -981,6 +1007,7 @@ despite the error is skipped as published.
 - **Use the final qualification sequence above** - run change-specific required checks, then normal commit hooks and one normal push for the overlapping inventory; retain standalone and explicit checks for coverage the push does not supply
 - **`ContractVersion::CURRENT` must equal `workspace.package.version`** — they are lock-stepped
 - **Never change `Cargo.lock` without refreshing `MODULE.bazel.lock`** - the lock is a crate_universe extension input; `make buildbuddy-lock-update` regenerates it, and `make verify-bazel-locks` proves it
+- **Never add or change a fenced `rkat` example in `docs/` without refreshing its fixture** - the published `rkat` package parses every one against the CLI from `crates/meerkat-cli/tests/fixtures/doc_examples.txt`; `UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture` regenerates it, and that test fails until it matches
 - **Never hand-maintain a second list of workspace crates** - `scripts/release-rust-crates.sh` is the one hand-ordered enumeration; the patch config derives from it and `make check-rust-release-config` fails when the documented order, count, or patch map disagrees
 - **Never write a bare crate count in this file that nothing derives** - `make check-rust-release-config` rejects any `N crates` / `N path deps` claim it cannot bind to a computed quantity. Register the new claim in `documented_count_claim_errors` (`scripts/check_rust_release_packaging.py`) alongside the artifact that owns the number, or write it as an approximation with a leading `~`. Release crate count and internal path-dep count are different facts with different owners; they are not interchangeable even when they happen to be equal
 - **Never size a thread stack in a host binary or bypass the budget with `#[tokio::main]`** - every host runs through `meerkat_runtime::host_stack::run_host` on the one documented 8 MiB default budget (`HOST_WORKER_STACK_BUDGET`); a deep frame is fixed with `meerkat_runtime::stack_relief`, not a bigger stack. The debug canary `rpc_dispatch_path_fits_debug_worker_stack_budget` (4 MiB) and nightly `make stack-budget-release` (1 MiB release) pin the numbers

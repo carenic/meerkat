@@ -488,6 +488,37 @@ impl SessionError {
         )
     }
 
+    /// Structured-data `kind` of [`Self::fork_source_build_state_missing`].
+    pub const FORK_SOURCE_BUILD_STATE_MISSING_KIND: &'static str =
+        "fork_source_build_state_missing";
+
+    /// A durable fork refused before anything was committed: its source has
+    /// canonical session metadata but no build state, so a child forked from
+    /// it could not run a turn. A session forked by an earlier release that
+    /// never ran a turn of its own is such a source; fork the session it was
+    /// forked from instead. Surfaces answer the invalid-params class.
+    pub fn fork_source_build_state_missing(source_session_id: &SessionId) -> Self {
+        Self::FailedWithData {
+            message: format!(
+                "session {source_session_id} has no build state, so a fork of it could not run a turn"
+            ),
+            data: serde_json::json!({
+                "kind": Self::FORK_SOURCE_BUILD_STATE_MISSING_KIND,
+                "source_session_id": source_session_id.to_string(),
+            }),
+        }
+    }
+
+    /// Whether this error is a [`Self::fork_source_build_state_missing`].
+    pub fn is_fork_source_build_state_missing(&self) -> bool {
+        matches!(
+            self.primary_error(),
+            Self::FailedWithData { data, .. }
+                if data.get("kind").and_then(serde_json::Value::as_str)
+                    == Some(Self::FORK_SOURCE_BUILD_STATE_MISSING_KIND)
+        )
+    }
+
     /// Structured-data `kind` of a [`Self::ServedElsewhere`] refusal on the
     /// wire, where it travels under the session-busy code.
     pub const SERVED_ELSEWHERE_KIND: &'static str = "session_served_elsewhere";

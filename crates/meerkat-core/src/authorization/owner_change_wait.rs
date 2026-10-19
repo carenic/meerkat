@@ -14,7 +14,7 @@ use crate::time_compat::{DeadlineInstant, Duration};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 
-use super::WorkAuthorization;
+use super::{WaitReport, WorkAuthorization};
 
 /// The longest one operation waits, in total wall-clock time from its first
 /// wait and including the rebuilds in between, for owner changes in progress.
@@ -31,12 +31,14 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 const MAX_BACKOFF: Duration = Duration::from_millis(64);
 
 /// One operation's waiting state across its rebuilds: a single wall-clock
-/// deadline, set at its first wait and never re-armed, and the free rebuilds
-/// it has spent.
+/// deadline, set at its first wait and never re-armed, the free rebuilds it
+/// has spent, and where its waits are reported to the host's operation
+/// refusal observer, when one is installed.
 #[derive(Debug, Default)]
 pub struct OwnerChangeChurn {
     deadline: Option<DeadlineInstant>,
     free_rebuilds: u8,
+    report: Option<WaitReport>,
 }
 
 /// How waiting for one refused operation's owner change ended.
@@ -96,6 +98,16 @@ impl OwnerChangeChurn {
         Self::default()
     }
 
+    /// A waiting state whose waits are reported through `report`, the host's
+    /// operation refusal observer for this operation, when one is installed.
+    #[must_use]
+    pub(crate) fn reporting(report: Option<WaitReport>) -> Self {
+        Self {
+            report,
+            ..Self::default()
+        }
+    }
+
     /// After a `ReprepareRequired` refusal of an operation of `work`: when
     /// `work` reports an owner change in progress on its own publication,
     /// wait for that change, and for any later one, to complete. The first
@@ -108,28 +120,40 @@ impl OwnerChangeChurn {
     /// poisoned during the wait also ends it as settled; see
     /// [`OwnerChangeWait::Settled`].
     ///
+    /// Each wait is traced at `site` for `operation` ([`OwnerChangeWait::trace`])
+    /// and reported to the operation refusal observer of the host that
+    /// composed the agent, when one is installed.
+    ///
     /// `None` when no change is in progress: the refusal takes its ordinary
     /// path, exactly as without this wait.
     pub async fn wait_for_settled_change(
         &mut self,
         work: &dyn WorkAuthorization,
         budget_remaining: Option<Duration>,
+        site: &'static str,
+        operation: Option<&crate::OperationId>,
     ) -> Option<OwnerChangeWait> {
         work.owner_change_in_progress()?;
-        if self.free_rebuilds >= OWNER_CHANGE_FREE_REBUILDS {
-            return Some(OwnerChangeWait::NotSettled {
+        let wait = if self.free_rebuilds >= OWNER_CHANGE_FREE_REBUILDS {
+            OwnerChangeWait::NotSettled {
                 waited: Duration::ZERO,
+            }
+        } else {
+            let deadline = *self.deadline.get_or_insert_with(|| {
+                let bound = budget_remaining.map_or(OWNER_CHANGE_WAIT_BOUND, |remaining| {
+                    remaining.min(OWNER_CHANGE_WAIT_BOUND)
+                });
+                DeadlineInstant::now() + bound
             });
-        }
-        let deadline = *self.deadline.get_or_insert_with(|| {
-            let bound = budget_remaining.map_or(OWNER_CHANGE_WAIT_BOUND, |remaining| {
-                remaining.min(OWNER_CHANGE_WAIT_BOUND)
-            });
-            DeadlineInstant::now() + bound
-        });
-        let wait = await_owner_change(work, deadline).await;
-        if wait.settled() {
-            self.free_rebuilds += 1;
+            let wait = await_owner_change(work, deadline).await;
+            if wait.settled() {
+                self.free_rebuilds += 1;
+            }
+            wait
+        };
+        wait.trace(site, operation);
+        if let Some(report) = self.report.as_ref() {
+            report.report(wait, operation);
         }
         Some(wait)
     }

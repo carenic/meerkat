@@ -948,16 +948,16 @@ async fn current_decision(
         if let OperationAuthorizationError::Refused(refusal) = &error
             && refusal.kind() == crate::authorization::OperationRefusalKind::ReprepareRequired
             && let Some(wait) = churn
-                .wait_for_settled_change(work.authorization().as_ref(), Some(retained.remaining()))
+                .wait_for_settled_change(
+                    work.authorization().as_ref(),
+                    Some(retained.remaining()),
+                    "review_currentness",
+                    Some(&prepared.binding().facts().operation_id),
+                )
                 .await
+            && wait.settled()
         {
-            wait.trace(
-                "review_currentness",
-                Some(&prepared.binding().facts().operation_id),
-            );
-            if wait.settled() {
-                continue;
-            }
+            continue;
         }
         return CurrentDecision::Failed(error);
     }

@@ -894,7 +894,7 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RealtimeTranscriptStopReasonKind",
-                &["Cancelled", "ToolUse", "Other"],
+                &["Cancelled", "ToolUse", "Other", "Failed"],
             ),
             NamedTypeBinding::string_enum(
                 "RealtimeTranscriptMaterializeDecision",
@@ -1444,6 +1444,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "Completed",
                     "SourceBusy",
                     "Failed",
+                    "FinishedPending",
                 ],
             ),
             NamedTypeBinding::string_enum(

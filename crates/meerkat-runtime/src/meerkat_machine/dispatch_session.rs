@@ -2282,27 +2282,41 @@ impl MeerkatMachine {
             }
             None
         } else {
-            let mut state = materialization_claim_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current == Some(requested_claim_id)
-                && state.phase == crate::RuntimeActorMaterializationClaimPhase::Prepared
+            // The claim is granted and the registration's use stamped under
+            // one session map lock: a use-gated discard or unregister decides
+            // under that lock too, so it sees both or neither.
+            let sessions = self.sessions.read().await;
+            let granted = {
+                let mut state = materialization_claim_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.current == Some(requested_claim_id)
+                    && state.phase == crate::RuntimeActorMaterializationClaimPhase::Prepared
+                {
+                    requested_claim_id
+                } else if state.current.is_some()
+                    || state.phase != crate::RuntimeActorMaterializationClaimPhase::Vacant
+                {
+                    // Another owner holds this pre-existing registration's claim.
+                    // The refusal happens before this call reserved a claim,
+                    // inserted a registration, or installed handles, so it is the
+                    // typed pre-effect "registration owned" verdict (#1251), not
+                    // an opaque stale-authority failure.
+                    return Err(RuntimeDriverError::MaterializationRegistrationOwned { session_id });
+                } else {
+                    state.current = Some(requested_claim_id);
+                    state.phase = crate::RuntimeActorMaterializationClaimPhase::Prepared;
+                    requested_claim_id
+                }
+            };
+            if let Some(entry) = sessions.get(&session_id)
+                && Arc::ptr_eq(&entry.materialization_claim_state, &materialization_claim_state)
             {
-                Some(requested_claim_id)
-            } else if state.current.is_some()
-                || state.phase != crate::RuntimeActorMaterializationClaimPhase::Vacant
-            {
-                // Another owner holds this pre-existing registration's claim.
-                // The refusal happens before this call reserved a claim,
-                // inserted a registration, or installed handles, so it is the
-                // typed pre-effect "registration owned" verdict (#1251), not
-                // an opaque stale-authority failure.
-                return Err(RuntimeDriverError::MaterializationRegistrationOwned { session_id });
-            } else {
-                state.current = Some(requested_claim_id);
-                state.phase = crate::RuntimeActorMaterializationClaimPhase::Prepared;
-                Some(requested_claim_id)
+                // An actor-materialization claim granted to this call hands
+                // the registration to this caller.
+                entry.stamp_adoption(self.next_registration_use());
             }
+            Some(granted)
         };
         let legacy_actor_materialization_generation = {
             let state = materialization_claim_state

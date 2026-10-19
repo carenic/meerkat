@@ -327,6 +327,11 @@ pub struct FinishResult {
 /// and every API surface accept it now; a decision that carries it anyway is
 /// parsed as `Disabled` and judged by the member's build like any other
 /// request.
+///
+/// The `tools.bundles` opt-in is left out of this schema too, for the same
+/// reason: a decision that carries it anyway is parsed, counted as a
+/// `rust_bundle` class in the policy evidence and judged by the member's
+/// build.
 #[cfg(feature = "schema")]
 pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schemars::schema_for!(LayerDecision))?;
@@ -345,6 +350,13 @@ pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
                         .wire_type(),
                 )
         });
+    }
+    // Nor the tool bundle opt-in, which the released schema does not carry.
+    if let Some(properties) = schema
+        .pointer_mut("/$defs/ToolConfig/properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.remove("bundles");
     }
     Ok(schema)
 }
@@ -3187,7 +3199,12 @@ fn collect_profile_tool_classes(
     for name in &profile.tools.mcp {
         out.insert(AdaptiveToolIdentity::mcp_server(name)?.into_canonical());
     }
-    for name in &profile.tools.rust_bundles {
+    for name in profile
+        .tools
+        .rust_bundles
+        .iter()
+        .chain(&profile.tools.bundles)
+    {
         out.insert(AdaptiveToolIdentity::rust_bundle(name)?.into_canonical());
     }
     Ok(())
@@ -3693,6 +3710,31 @@ mod tests {
             "result": { "result": { "ok": true } }
         });
         assert!(validator.is_valid(&finish));
+    }
+
+    #[cfg(feature = "schema")]
+    #[test]
+    fn layer_decision_schema_leaves_the_tool_bundle_opt_in_out() {
+        let properties = |schema: &serde_json::Value| {
+            schema
+                .pointer("/$defs/ToolConfig/properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("ToolConfig properties")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let pinned = properties(&layer_decision_schema().expect("canonical schema serializes"));
+        assert!(
+            pinned.iter().any(|name| name == "rust_bundles"),
+            "{pinned:?}"
+        );
+        assert!(!pinned.iter().any(|name| name == "bundles"), "{pinned:?}");
+        // The derived schema carries the field; the pin is what removes it.
+        let derived = properties(
+            &serde_json::to_value(schemars::schema_for!(LayerDecision)).expect("derived schema"),
+        );
+        assert!(derived.iter().any(|name| name == "bundles"), "{derived:?}");
     }
 
     #[cfg(feature = "schema")]
@@ -5980,6 +6022,26 @@ mod tests {
         assert_eq!(
             runtime_limits.allowed_skill_identities,
             BTreeSet::from(["lint-review".to_string()])
+        );
+    }
+
+    /// A bundle a profile opts into is a Rust bundle the layer uses, like a
+    /// strictly named one: the adaptive policy sees it.
+    #[test]
+    fn adaptive_layer_evidence_counts_opted_in_bundles() {
+        let mut context = compile_context();
+        let verifier = context
+            .profile_templates
+            .get_mut(&ProfileName::from("verifier"))
+            .expect("verifier profile");
+        verifier.tools.bundles = vec!["announcements".to_string()];
+
+        let compiled = compile_layer(&layer_plan(), &context, &compile_policy()).unwrap();
+        assert!(
+            compiled
+                .policy_evidence
+                .used_tool_classes
+                .contains("rust_bundle:announcements")
         );
     }
 

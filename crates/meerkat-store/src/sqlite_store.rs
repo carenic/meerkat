@@ -8,11 +8,12 @@ use meerkat_core::session_store::{
     HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
     PreparedHeadCanonicalMutation, PreparedHeadCanonicalParentSplice,
     PreparedHeadCanonicalParentTransition, PreparedHeadCanonicalRewriteMutation,
-    SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness, SessionHead, SessionHeadCas,
-    SessionMessageRowPrefixAccumulator, SessionRowLineageAnchor, StrandLayout, StrandRewriteLayout,
-    StrandSegment, StrandSplice, TranscriptStrandId, VerifiedHeadCanonicalTranscriptHistory,
-    head_canonical_plain_save_guard_with_prefix_witness, reconstruct_rewrite_record,
-    session_head_cas_token, strand_layout_for_history, validate_save_head_transition,
+    RetainedStrandLayout, SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness, SessionHead,
+    SessionHeadCas, SessionMessageRowPrefixAccumulator, SessionRowLineageAnchor, StrandLayout,
+    StrandRewriteLayout, StrandSegment, StrandSplice, TranscriptStrandId,
+    VerifiedHeadCanonicalTranscriptHistory, head_canonical_plain_save_guard_with_prefix_witness,
+    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
+    strand_layout_for_retained_history, validate_save_head_transition,
 };
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::transcript_messages_digest;
@@ -1041,6 +1042,8 @@ fn migrate_released_head_envelopes(tx: &Transaction<'_>) -> Result<(), rusqlite:
         ] {
             tx.execute(sql, params![head.id.to_string()])?;
         }
+        // Released envelopes predate transcript retention (0.8.51), so this
+        // stays the whole-graph layout and refuses a re-anchored graph.
         let (layout, current_head) = layout_for_blob_session(&session)
             .map_err(|error| invalid_released_head_envelope(&session_id, error))?;
         persist_blob_strand_layout_in_txn(tx, &head.id, &layout)
@@ -5010,6 +5013,8 @@ fn backfill_rewrite_graph_edges_from_validated_session_in_txn(
                 "rewrite-edge migration requires validated compact transcript history: {error}"
             ),
         })?;
+    // Released 0.8.10 graphs predate transcript retention (0.8.51), so this
+    // backfill keeps the whole-graph layout and refuses a re-anchored graph.
     let layout = strand_layout_for_history(session, history.as_ref())?;
     let rows = indexed_rewrite_rows_range_in_txn(tx, id, 0, expected_rewrite_count)?;
     if rows.len() != edges.len() || rows.len() != layout.rewrites.len() {
@@ -5283,9 +5288,37 @@ fn validate_blob_rewrite_layout(
     Ok(edge)
 }
 
+/// The whole-graph blob layout the released schema migrations replay.
+///
+/// No release before 0.8.51 retired transcript occurrences, so a released
+/// envelope never holds a re-anchored graph, and one here refuses typed.
 fn layout_for_blob_session(
     session: &Session,
 ) -> Result<(StrandLayout, SessionHead), SessionStoreError> {
+    let (retained, head) = retained_layout_for_blob_session(session)?;
+    if retained.retired_count() != 0 {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: session.id().clone(),
+            reason: format!(
+                "a released envelope predates transcript retention, but this graph retired its first {} rewrite occurrence(s)",
+                retained.retired_count()
+            ),
+        });
+    }
+    Ok((retained.layout, head))
+}
+
+/// The blob layout of a session's retained transcript graph, and the head it
+/// lays out to.
+///
+/// A re-anchored graph lays out only its retained occurrences: the anchor
+/// strand holds the re-anchored anchor, retained rewrite `i` is generation
+/// `retired_count + i + 1`, and the row lineage and rewrite prefix continue
+/// from the retired base. The head is the one the same session's incremental
+/// head-canonical rows prove.
+fn retained_layout_for_blob_session(
+    session: &Session,
+) -> Result<(RetainedStrandLayout, SessionHead), SessionStoreError> {
     let id = session.id();
     let history = session
         .validated_transcript_history_state()
@@ -5293,7 +5326,12 @@ fn layout_for_blob_session(
             id: id.clone(),
             reason: format!("stored transcript history state is malformed: {err}"),
         })?;
-    let layout = strand_layout_for_history(session, history.as_ref())?;
+    let retained = strand_layout_for_retained_history(session, history.as_ref())?;
+    let layout = &retained.layout;
+    let retired_count = retained.retired_count();
+    let laid_out_count = retired_count
+        .checked_add(layout.rewrites.len())
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
     if layout.anchor_strand != TranscriptStrandId::root()
         || layout.head_len
             != u64::try_from(session.messages().len())
@@ -5301,19 +5339,40 @@ fn layout_for_blob_session(
         || history
             .as_ref()
             .map_or(0, |proved| proved.state().commit_count())
-            != layout.rewrites.len()
+            != laid_out_count
     {
         return Err(SessionStoreError::Corrupted(id.clone()));
     }
-    let mut row_lineage =
-        SessionMessageRowPrefixAccumulator::from_serialized_rows(&layout.serialized_anchor)?;
+    // The retained edges continue the re-anchored anchor's own row-lineage
+    // token (a splice lineage, not a flat hash of its rows) and the rewrite
+    // prefix the retired occurrences sealed.
+    let (mut row_lineage, mut rewrite_prefix) = match retained.retired_base.as_ref() {
+        Some(base) => (
+            base.anchor().row_prefix().clone(),
+            base.retired().rewrite_prefix().clone(),
+        ),
+        None => (
+            SessionMessageRowPrefixAccumulator::from_serialized_rows(&layout.serialized_anchor)?,
+            TranscriptRewritePrefixAccumulator::empty(),
+        ),
+    };
     let mut current_strand = layout.anchor_strand.clone();
     let mut current_count = u64::try_from(layout.serialized_anchor.len())
         .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
-    let mut rewrite_prefix = TranscriptRewritePrefixAccumulator::empty();
+    if row_lineage.row_count() != current_count {
+        return Err(SessionStoreError::Corrupted(id.clone()));
+    }
     for (index, rewrite) in layout.rewrites.iter().enumerate() {
-        let edge =
-            validate_blob_rewrite_layout(id, index, &current_strand, current_count, rewrite)?;
+        let generation_index = retired_count
+            .checked_add(index)
+            .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?;
+        let edge = validate_blob_rewrite_layout(
+            id,
+            generation_index,
+            &current_strand,
+            current_count,
+            rewrite,
+        )?;
         match &rewrite.parent_transition {
             PreparedHeadCanonicalParentTransition::ExactAppend => {}
             PreparedHeadCanonicalParentTransition::ExactSplice(parent_splice) => {
@@ -5369,8 +5428,7 @@ fn layout_for_blob_session(
         .transcript_rewrite_prefix_authority()
         .unwrap_or_else(TranscriptRewritePrefixAccumulator::empty);
     if proved_rewrite_prefix.occurrence_count()
-        != u64::try_from(layout.rewrites.len())
-            .map_err(|_| SessionStoreError::Corrupted(id.clone()))?
+        != u64::try_from(laid_out_count).map_err(|_| SessionStoreError::Corrupted(id.clone()))?
         || proved_rewrite_prefix != rewrite_prefix
     {
         return Err(SessionStoreError::Corrupted(id.clone()));
@@ -5381,13 +5439,52 @@ fn layout_for_blob_session(
         proved_rewrite_prefix,
         row_lineage,
     )?;
-    Ok((layout, head))
+    Ok((retained, head))
 }
 
 fn persist_blob_strand_layout_in_txn(
     tx: &Transaction<'_>,
     id: &SessionId,
     layout: &StrandLayout,
+) -> Result<(), SessionStoreError> {
+    persist_blob_strand_rows_in_txn(tx, id, layout, 0)
+}
+
+/// Persist a retained blob layout and, for a re-anchored graph, the retired
+/// base its cold replay starts from: the rows an incremental head-canonical
+/// store keeps once it has retired the same occurrences.
+fn persist_retained_blob_layout_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    retained: &RetainedStrandLayout,
+) -> Result<(), SessionStoreError> {
+    let first_generation = u64::try_from(retained.retired_count())
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    persist_blob_strand_rows_in_txn(tx, id, &retained.layout, first_generation)?;
+    let Some(base) = retained.retired_base.as_ref() else {
+        return Ok(());
+    };
+    let retired_count =
+        i64::try_from(first_generation).map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+    let base_json = serde_json::to_vec(base).map_err(SessionStoreError::from)?;
+    tx.execute(
+        "INSERT INTO session_transcript_retirements
+             (session_id, retired_count, base_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id.to_string(), retired_count, base_json, now_millis()],
+    )
+    .map_err(StoreError::from)
+    .map_err(into_session_store_error)?;
+    Ok(())
+}
+
+/// Persist `layout`'s strands, links and rewrite rows, the rewrite rows
+/// numbered from generation index `first_generation`.
+fn persist_blob_strand_rows_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    layout: &StrandLayout,
+    first_generation: u64,
 ) -> Result<(), SessionStoreError> {
     reconcile_serialized_strand_rows_in_txn(
         tx,
@@ -5459,7 +5556,10 @@ fn persist_blob_strand_layout_in_txn(
         insert_rewrite_row_in_txn(
             tx,
             id,
-            u64::try_from(index).map_err(|_| SessionStoreError::Corrupted(id.clone()))?,
+            u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(first_generation))
+                .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))?,
             &RewriteRow {
                 commit: rewrite.commit.clone(),
                 parent_strand: rewrite.parent_strand.clone(),
@@ -5601,8 +5701,20 @@ fn migrate_legacy_blob_in_txn(
     else {
         return Ok(None);
     };
-    let (layout, head) = layout_for_blob_session(&session)?;
-    persist_blob_strand_layout_in_txn(tx, id, &layout)?;
+    lay_out_blob_session_in_txn(tx, id, &session).map(Some)
+}
+
+/// Lay out one whole-blob session document as this store's physical session:
+/// its strands, settled rows and canonical head, inside the caller's
+/// transaction. A re-anchored transcript graph lays out its retained
+/// occurrences beside the retired base it persists.
+fn lay_out_blob_session_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    session: &Session,
+) -> Result<(SessionHead, String), SessionStoreError> {
+    let (retained, head) = retained_layout_for_blob_session(session)?;
+    persist_retained_blob_layout_in_txn(tx, id, &retained)?;
     // Blob activation is the explicit one-time full-history path. Settle its
     // current store-issued anchor before publishing the canonical head so all
     // subsequent ordinary resumes start from direct rows regardless of how
@@ -5620,7 +5732,7 @@ fn migrate_legacy_blob_in_txn(
         return Err(SessionStoreError::Corrupted(id.clone()));
     }
     let token = write_head_row_only_in_txn(tx, &head)?;
-    Ok(Some((head, token)))
+    Ok((head, token))
 }
 
 /// Head row if present; otherwise migrate a legacy blob in this transaction
@@ -6840,6 +6952,82 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
     )?;
     let upgraded_token = write_head_row_only_in_txn(tx, &upgraded)?;
     Ok(Some((upgraded, upgraded_token)))
+}
+
+/// One-time seeding seam for a standalone WholeBlob runtime database.
+///
+/// A runtime database that never shared its file with a session store holds
+/// WholeBlob bodies and no physical session. The runtime's explicit
+/// standalone conversion calls this, for a session this store holds no row
+/// for, inside the transaction that installs the session's HeadCanonical
+/// authority and completes its activation receipt, after it verified
+/// `session` as the exact store-issued WholeBlob body. The body is laid out
+/// as this store's physical session through the same one-time full-history
+/// layout as a released blob, and the head comes back exactly as
+/// [`ensure_head_canonical_for_runtime_in_txn`] returns it. The runtime
+/// seeds only while this store holds no session beyond the ones its completed
+/// activations own, which it reads with [`held_session_ids_in_txn`] in the
+/// same transaction. The seam refuses
+/// ([`SessionStoreError::Internal`]: the caller seeds only a session this
+/// store holds no row for) when this store already holds a head or blob row
+/// for the session, and it neither opens nor commits a transaction.
+#[doc(hidden)]
+pub fn seed_head_canonical_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    session: &Session,
+) -> Result<(SessionHead, String), SessionStoreError> {
+    let id = session.id();
+    if head_row_in_txn(tx, id)?.is_some()
+        || load_session_snapshot_in_txn(tx, id)
+            .map_err(into_session_store_error)?
+            .is_some()
+    {
+        return Err(SessionStoreError::Internal(format!(
+            "seeding session {id} requires a co-tenant session store that holds no row for it"
+        )));
+    }
+    lay_out_blob_session_in_txn(tx, id, session)?;
+    ensure_head_canonical_for_runtime_in_txn(tx, id)?
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))
+}
+
+/// Lay out `session` as [`seed_head_canonical_for_runtime_in_txn`] would,
+/// and write nothing.
+///
+/// The runtime's standalone WholeBlob conversion checks every body it would
+/// seed with this before it pins its file, so a body this store cannot lay
+/// out refuses while the file is still the WholeBlob database it was.
+#[doc(hidden)]
+pub fn check_runtime_seed_layout(session: &Session) -> Result<(), SessionStoreError> {
+    retained_layout_for_blob_session(session).map(|_| ())
+}
+
+/// Every session this store holds, as a head row or a legacy blob row, read
+/// inside the caller's transaction, which it neither opens nor commits.
+///
+/// The runtime's standalone WholeBlob conversion reads it in the transaction
+/// that would seed a session through
+/// [`seed_head_canonical_for_runtime_in_txn`], and seeds only while every
+/// session named here belongs to one of its completed activations.
+#[doc(hidden)]
+pub fn held_session_ids_in_txn(
+    tx: &Transaction<'_>,
+) -> Result<BTreeSet<SessionId>, SessionStoreError> {
+    let mut statement = tx
+        .prepare("SELECT session_id FROM session_heads UNION SELECT session_id FROM sessions")
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?;
+    let raw_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?;
+    raw_ids
+        .into_iter()
+        .map(|raw| parse_session_id(raw).map_err(into_session_store_error))
+        .collect()
 }
 
 /// Cross one persisted SQLite HeadCanonical representation and return the
@@ -9635,7 +9823,7 @@ impl IncrementalSessionStore for SqliteSessionStore {
             else {
                 return Ok(None);
             };
-            let (_layout, head) = layout_for_blob_session(&session)?;
+            let (_retained, head) = retained_layout_for_blob_session(&session)?;
             Ok(Some(head))
         })
         .await
@@ -9703,8 +9891,8 @@ impl IncrementalSessionStore for SqliteSessionStore {
             else {
                 return Err(SessionStoreError::NotFound(id));
             };
-            let (layout, _head) = layout_for_blob_session(&session)?;
-            let rows = blob_strand_messages(&session, &layout, &strand)?;
+            let (retained, _head) = retained_layout_for_blob_session(&session)?;
+            let rows = blob_strand_messages(&session, &retained.layout, &strand)?;
             let start = usize::try_from(range.start)
                 .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
             let end =
@@ -9765,7 +9953,8 @@ impl IncrementalSessionStore for SqliteSessionStore {
                     id: id.clone(),
                     reason: format!("stored transcript history state is malformed: {error}"),
                 })?;
-            let (layout, _head) = layout_for_blob_session(&session)?;
+            let (retained, _head) = retained_layout_for_blob_session(&session)?;
+            let layout = retained.layout;
             let Some(history) = history else {
                 if layout.rewrites.is_empty() {
                     return Ok(Vec::new());
@@ -9837,8 +10026,9 @@ impl IncrementalSessionStore for SqliteSessionStore {
             else {
                 return Ok(Vec::new());
             };
-            let (layout, _head) = layout_for_blob_session(&session)?;
-            Ok(layout
+            let (retained, _head) = retained_layout_for_blob_session(&session)?;
+            Ok(retained
+                .layout
                 .rewrites
                 .into_iter()
                 .map(|rewrite| rewrite.commit)
@@ -9885,6 +10075,622 @@ mod tests {
         let path = dir.path().join("sessions.sqlite3");
         let store = SqliteSessionStore::open(&path).unwrap();
         (dir, store)
+    }
+
+    /// The standalone conversion's seeding seam lays out a session this store
+    /// holds no row for, with the head realm activation derives from it, and
+    /// refuses typed when the store already holds a head row or a released
+    /// blob row for that session.
+    #[tokio::test]
+    async fn runtime_seed_lays_out_an_absent_session_and_refuses_an_existing_row() {
+        let (_dir, store) = temp_store();
+        let mut session = Session::new();
+        session.push(user("seeded from a runtime body"));
+        let seed = session.clone();
+        let (seeded, seeded_token) = store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .expect("seed a session the store holds no row for");
+        let id = session.id().clone();
+        let (ensured, ensured_token) = store
+            .in_write_txn(move |tx| {
+                ensure_head_canonical_for_runtime_in_txn(tx, &id)?
+                    .ok_or(SessionStoreError::NotFound(id))
+            })
+            .await
+            .expect("the seeded head is the canonical runtime head");
+        assert_eq!(seeded_token, ensured_token);
+        assert_eq!(seeded.message_count, ensured.message_count);
+        let loaded = store
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the seeded session loads");
+        assert_eq!(loaded.messages(), session.messages());
+
+        let again = session.clone();
+        let refusal = store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &again))
+            .await;
+        assert!(
+            matches!(
+                &refusal,
+                Err(SessionStoreError::Internal(detail)) if detail.contains("holds no row")
+            ),
+            "seeding over a head row: {refusal:?}"
+        );
+
+        let (_blob_dir, blob_store) = temp_store();
+        let mut released = Session::new();
+        released.push(user("held as a released blob row"));
+        Connection::open(blob_store.path())
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    released.id().to_string(),
+                    system_time_millis(released.created_at()),
+                    system_time_millis(released.updated_at()),
+                    1_i64,
+                    0_i64,
+                    "{}",
+                    serde_json::to_vec(&released).unwrap(),
+                ],
+            )
+            .unwrap();
+        let blob = released.clone();
+        let refusal = blob_store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &blob))
+            .await;
+        assert!(
+            matches!(
+                &refusal,
+                Err(SessionStoreError::Internal(detail)) if detail.contains("holds no row")
+            ),
+            "seeding over a released blob row: {refusal:?}"
+        );
+    }
+
+    /// The standalone conversion's guard reads every session the store
+    /// holds, each once: a seeded head row, a released blob row, and a blob
+    /// row kept beside the head it migrated into.
+    #[tokio::test]
+    async fn held_session_ids_name_head_and_blob_sessions_once() {
+        let (_dir, store) = temp_store();
+        assert!(
+            store
+                .in_write_txn(held_session_ids_in_txn)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut seeded = Session::new();
+        seeded.push(user("seeded from a runtime body"));
+        let seed = seeded.clone();
+        store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let mut released_ids = Vec::new();
+        for text in [
+            "held as a released blob row",
+            "migrated from a released blob row",
+        ] {
+            let mut released = Session::new();
+            released.push(user(text));
+            conn.execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    released.id().to_string(),
+                    system_time_millis(released.created_at()),
+                    system_time_millis(released.updated_at()),
+                    1_i64,
+                    0_i64,
+                    "{}",
+                    serde_json::to_vec(&released).unwrap(),
+                ],
+            )
+            .unwrap();
+            released_ids.push(released.id().clone());
+        }
+        drop(conn);
+        let migrated = released_ids[1].clone();
+        let migrated_head = store
+            .in_write_txn(move |tx| ensure_head_canonical_for_runtime_in_txn(tx, &migrated))
+            .await
+            .unwrap();
+        assert!(migrated_head.is_some(), "the blob row migrates into a head");
+        let blob_rows_kept: i64 = Connection::open(store.path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            blob_rows_kept, 2,
+            "the migrated blob row stays beside its head"
+        );
+
+        let held = store.in_write_txn(held_session_ids_in_txn).await.unwrap();
+        assert_eq!(
+            held,
+            BTreeSet::from([
+                seeded.id().clone(),
+                released_ids[0].clone(),
+                released_ids[1].clone(),
+            ])
+        );
+    }
+
+    /// The retirement row a store keeps for `id`: its retired count and the
+    /// persisted base bytes (its write time left out).
+    fn retirement_row(path: &Path, id: &SessionId) -> Option<(i64, Vec<u8>)> {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT retired_count, base_json FROM session_transcript_retirements
+                 WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, JsonColumnBytes>(1)?.into_bytes(),
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The rewrite generation indices a store keeps rows for.
+    fn rewrite_row_indices(path: &Path, id: &SessionId) -> Vec<i64> {
+        let conn = Connection::open(path).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT rewrite_idx FROM session_rewrites WHERE session_id = ?1
+                 ORDER BY rewrite_idx",
+            )
+            .unwrap();
+        statement
+            .query_map(params![id.to_string()], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// `session` as the legacy blob row a WholeBlob store keeps.
+    fn insert_whole_blob_row(path: &Path, session: &Session) {
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session.id().to_string(),
+                    system_time_millis(session.created_at()),
+                    system_time_millis(session.updated_at()),
+                    i64::try_from(session.messages().len()).unwrap(),
+                    0_i64,
+                    "{}",
+                    serde_json::to_vec(session).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The head fields the transcript and its rewrite graph determine, which a
+    /// converted head and an incrementally written head share.
+    fn transcript_head_fields(head: &SessionHead) -> serde_json::Value {
+        let value = serde_json::to_value(head).unwrap();
+        serde_json::json!({
+            "strand": value["strand"],
+            "head_revision": value["head_revision"],
+            "message_count": value["message_count"],
+            "message_row_prefix": value["message_row_prefix"],
+            "rewrite_count": value["rewrite_count"],
+            "rewrite_prefix": value["rewrite_prefix"],
+            "graph_prefix": value["graph_prefix"],
+        })
+    }
+
+    /// Differential oracle: a session whose transcript graph
+    /// retired its oldest occurrences converts, from its whole-blob document,
+    /// into the rows an incremental head-canonical store keeps for the same
+    /// compaction sequence: the retired base as the retirement row, rewrite
+    /// rows only for the retained generations, and the same cold load,
+    /// commits, records and refusal below the retention cut. The read-only
+    /// head a legacy blob row synthesizes is the head its migration writes,
+    /// and the converted rows keep retiring on the next compaction.
+    #[tokio::test]
+    async fn re_anchored_blob_converts_to_the_incremental_retirement_rows() {
+        let (_incremental_dir, incremental_store) = temp_store();
+        let retention = meerkat_core::TranscriptHistoryRetention::default();
+        let session = rewrite_cycles_with_live_tail(&incremental_store, 7, Some(retention)).await;
+        let id = session.id().clone();
+        let history = session
+            .validated_transcript_history_state()
+            .unwrap()
+            .expect("compacted history");
+        assert_eq!(
+            (
+                history.state().commit_count(),
+                history.state().retired_count()
+            ),
+            (7, 3)
+        );
+        let expected_retirement = Some((
+            3,
+            serde_json::to_vec(&history.state().retired_base().expect("retired base")).unwrap(),
+        ));
+        assert_eq!(
+            retirement_row(incremental_store.path(), &id),
+            expected_retirement
+        );
+        assert_eq!(
+            rewrite_row_indices(incremental_store.path(), &id),
+            vec![3, 4, 5, 6]
+        );
+        let incremental_view = incremental(&incremental_store);
+        let incremental_commits = incremental_view.load_rewrite_commits(&id).await.unwrap();
+        assert_eq!(incremental_commits.len(), 4);
+        let incremental_records =
+            serde_json::to_value(incremental_view.load_rewrites(&id).await.unwrap()).unwrap();
+        let incremental_head = incremental_view
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("head");
+        let incremental_load = incremental_store
+            .load(&id)
+            .await
+            .unwrap()
+            .expect("incremental session");
+
+        // The realm route: a legacy blob row, read through head synthesis
+        // first, then migrated by the first head-canonical write.
+        let (_blob_dir, blob_store) = temp_store();
+        insert_whole_blob_row(blob_store.path(), &session);
+        let blob_view = incremental(&blob_store);
+        let synthesized = blob_view
+            .load_head(&id)
+            .await
+            .unwrap()
+            .expect("synthesized head");
+        assert_eq!(
+            blob_view.load_rewrite_commits(&id).await.unwrap(),
+            incremental_commits,
+            "synthesized commits"
+        );
+        assert_eq!(
+            serde_json::to_value(blob_view.load_rewrites(&id).await.unwrap()).unwrap(),
+            incremental_records,
+            "synthesized records"
+        );
+        assert_eq!(
+            blob_view
+                .load_messages(&id, &synthesized.strand, 0..synthesized.message_count)
+                .await
+                .unwrap(),
+            session.messages(),
+            "synthesized rows"
+        );
+        let migrate_id = id.clone();
+        let (migrated, migrated_token) = blob_store
+            .in_write_txn(move |tx| {
+                migrate_legacy_blob_in_txn(tx, &migrate_id)?
+                    .ok_or(SessionStoreError::NotFound(migrate_id))
+            })
+            .await
+            .expect("the realm migration lays out a re-anchored graph");
+        assert_eq!(
+            serde_json::to_value(&synthesized).unwrap(),
+            serde_json::to_value(&migrated).unwrap(),
+            "the synthesized head is the head the migration writes"
+        );
+        assert_eq!(
+            session_head_cas_token(&synthesized).unwrap(),
+            migrated_token
+        );
+
+        // The standalone conversion's route: the seeding seam.
+        let (_seed_dir, seed_store) = temp_store();
+        let seed = session.clone();
+        let (seeded_head, _seeded_token) = seed_store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .expect("the seed lays out a re-anchored graph");
+        // Two head fields record the store's own logs rather than the session:
+        // the row-lineage anchor (where cold row replay starts) and the
+        // realtime component event prefix (the incremental store logged a
+        // rebase per compaction, a conversion activates the component with
+        // one snapshot event, as the whole-graph blob migration does).
+        let without_store_logs = |head: &SessionHead| {
+            let mut head = head.clone();
+            head.row_lineage_anchor = None;
+            head.realtime_event_prefix = None;
+            serde_json::to_value(&head).unwrap()
+        };
+        assert_eq!(
+            without_store_logs(&seeded_head),
+            without_store_logs(&incremental_head),
+            "the seeded head is the incremental head apart from the store logs"
+        );
+
+        for (route, store, head) in [
+            ("realm migration", &blob_store, &migrated),
+            ("seed", &seed_store, &seeded_head),
+        ] {
+            assert_eq!(
+                retirement_row(store.path(), &id),
+                expected_retirement,
+                "{route}: retirement row"
+            );
+            assert_eq!(
+                rewrite_row_indices(store.path(), &id),
+                vec![3, 4, 5, 6],
+                "{route}: retained rewrite rows"
+            );
+            assert_eq!(
+                transcript_head_fields(head),
+                transcript_head_fields(&incremental_head),
+                "{route}: head"
+            );
+            let view = incremental(store);
+            assert_eq!(
+                view.load_rewrite_commits(&id).await.unwrap(),
+                incremental_commits,
+                "{route}: commits"
+            );
+            assert_eq!(
+                serde_json::to_value(view.load_rewrites(&id).await.unwrap()).unwrap(),
+                incremental_records,
+                "{route}: records"
+            );
+            let loaded = store.load(&id).await.unwrap().expect("converted session");
+            assert_eq!(
+                serde_json::to_value(loaded.messages()).unwrap(),
+                serde_json::to_value(incremental_load.messages()).unwrap(),
+                "{route}: per-message JSON"
+            );
+            let loaded_history = loaded
+                .validated_transcript_history_state()
+                .unwrap()
+                .expect("converted history");
+            let incremental_history = incremental_load
+                .validated_transcript_history_state()
+                .unwrap()
+                .expect("incremental history");
+            assert_eq!(
+                loaded_history.state().commits().collect::<Vec<_>>(),
+                incremental_history.state().commits().collect::<Vec<_>>(),
+                "{route}: commit list"
+            );
+            assert_eq!(loaded_history.state().retired_count(), 3, "{route}");
+            assert_eq!(
+                loaded_history.state().oldest_retained_revision(),
+                incremental_history.state().oldest_retained_revision(),
+                "{route}: oldest retained revision"
+            );
+            assert_eq!(
+                loaded_history.state().rewrite_prefix(),
+                incremental_history.state().rewrite_prefix(),
+                "{route}: rewrite prefix"
+            );
+            assert_eq!(
+                loaded_history.state().graph_prefix(),
+                incremental_history.state().graph_prefix(),
+                "{route}: rolling graph identity"
+            );
+            let retired_revision = incremental_history
+                .state()
+                .commit(0)
+                .expect("first commit")
+                .revision
+                .clone();
+            for (store_name, read) in [
+                (
+                    route,
+                    loaded.retained_transcript_revision_rows(&retired_revision),
+                ),
+                (
+                    "incremental",
+                    incremental_load.retained_transcript_revision_rows(&retired_revision),
+                ),
+            ] {
+                assert!(
+                    matches!(&read, Err(error) if error.to_string().contains(incremental_history.state().oldest_retained_revision())),
+                    "{store_name}: a retired revision refuses typed: {read:?}"
+                );
+            }
+            let cut_id = id.clone();
+            let below_cut = store
+                .in_write_txn(move |tx| refuse_rows_below_retention_cut_in_txn(tx, &cut_id, 2))
+                .await;
+            assert!(
+                matches!(
+                    &below_cut,
+                    Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
+                        if reason.contains("predates the stored transcript retention cut at 3")
+                ),
+                "{route}: rows below the cut refuse typed: {below_cut:?}"
+            );
+        }
+
+        // Both stores keep retiring through the ordinary incremental path:
+        // two more compactions, each retiring one more occurrence. Each store
+        // follows its own live session (the one that drove it, and the one
+        // cold-loaded from the conversion), fed the same messages. Each
+        // store's rows stay exactly its live graph's, and each retirement row
+        // chains from the previous one. Across the stores the transcript, the
+        // retention and the commits match; only the commit times differ,
+        // since each live session commits its own rewrite.
+        let stores = [&incremental_store, &seed_store];
+        let mut live = [
+            session.clone(),
+            seed_store.load(&id).await.unwrap().expect("seeded session"),
+        ];
+        let mut heads = [incremental_head.clone(), seeded_head.clone()];
+        let mut previous_rows = [
+            retirement_row(incremental_store.path(), &id).expect("incremental row"),
+            retirement_row(seed_store.path(), &id).expect("seeded row"),
+        ];
+        for cycle in 0..2_usize {
+            for turn in 0..2 {
+                let message = user(&format!("continuation {cycle} turn {turn}"));
+                for index in 0..2 {
+                    live[index].push(message.clone());
+                    let mutation = PreparedHeadCanonicalMutation::prepare(
+                        &live[index],
+                        Some(heads[index].clone()),
+                    )
+                    .expect("prepare ordinary turn");
+                    incremental(stores[index])
+                        .apply_prepared_head_canonical_mutation(&mutation)
+                        .await
+                        .expect("persist ordinary turn");
+                    mutation
+                        .acknowledge_session(&mut live[index], mutation.successor_head_token())
+                        .expect("acknowledge ordinary turn");
+                    heads[index] = mutation.successor_head().clone();
+                }
+            }
+            let summary = user(&format!("continuation summary {cycle}"));
+            let tail = user(&format!("continuation {cycle} live tail"));
+            for index in 0..2 {
+                let end = live[index].messages().len() - 1;
+                live[index]
+                    .commit_transcript_rewrite(
+                        TranscriptRewriteSelection::MessageRange { start: 0, end },
+                        vec![summary.clone()],
+                        TranscriptRewriteReason::new("compaction"),
+                        Some("unit-test".to_string()),
+                        None,
+                    )
+                    .expect("commit rewrite");
+                assert_eq!(live[index].retire_transcript_history(retention).unwrap(), 1);
+                live[index].push(tail.clone());
+                let rewrite = PreparedHeadCanonicalRewriteMutation::prepare(
+                    &live[index],
+                    heads[index].clone(),
+                )
+                .expect("prepare rewrite");
+                incremental(stores[index])
+                    .apply_prepared_head_canonical_rewrite_mutation(&rewrite)
+                    .await
+                    .expect("persist rewrite");
+                rewrite
+                    .acknowledge_physical_projection(
+                        &mut live[index],
+                        rewrite.successor_head_token(),
+                    )
+                    .expect("acknowledge rewrite");
+                heads[index] = rewrite.successor_head().clone();
+            }
+
+            let first_retained = 4 + cycle;
+            for index in 0..2 {
+                let route = ["incremental", "converted"][index];
+                let live_history = live[index]
+                    .validated_transcript_history_state()
+                    .unwrap()
+                    .expect("live history");
+                let row = retirement_row(stores[index].path(), &id).expect("retirement row");
+                assert_eq!(
+                    row,
+                    (
+                        i64::try_from(first_retained).unwrap(),
+                        serde_json::to_vec(&live_history.state().retired_base().unwrap()).unwrap(),
+                    ),
+                    "{route} cycle {cycle}: the retirement row is the live graph's base"
+                );
+                let base: RetiredTranscriptGraphBase = serde_json::from_slice(&row.1).unwrap();
+                let previous: RetiredTranscriptGraphBase =
+                    serde_json::from_slice(&previous_rows[index].1).unwrap();
+                assert_eq!(
+                    base.retired_count(),
+                    previous.retired_count() + 1,
+                    "{route} cycle {cycle}: one more occurrence retired"
+                );
+                assert_eq!(
+                    &base.retired().commits()[..previous.retired_count()],
+                    previous.retired().commits(),
+                    "{route} cycle {cycle}: the new base chains from the previous one"
+                );
+                assert_eq!(
+                    rewrite_row_indices(stores[index].path(), &id),
+                    (i64::try_from(first_retained).unwrap()
+                        ..i64::try_from(first_retained + 4).unwrap())
+                        .collect::<Vec<_>>(),
+                    "{route} cycle {cycle}: retained rewrite rows"
+                );
+                let loaded = stores[index]
+                    .load(&id)
+                    .await
+                    .unwrap()
+                    .expect("continued session");
+                assert_eq!(
+                    serde_json::to_value(loaded.messages()).unwrap(),
+                    serde_json::to_value(live[index].messages()).unwrap(),
+                    "{route} cycle {cycle}: cold load"
+                );
+                let loaded_history = loaded
+                    .validated_transcript_history_state()
+                    .unwrap()
+                    .expect("continued history");
+                assert_eq!(
+                    loaded_history.state().commits().collect::<Vec<_>>(),
+                    live_history.state().commits().collect::<Vec<_>>(),
+                    "{route} cycle {cycle}: commits"
+                );
+                assert_eq!(
+                    loaded_history.state().rewrite_prefix(),
+                    live_history.state().rewrite_prefix(),
+                    "{route} cycle {cycle}: rewrite prefix"
+                );
+                assert_eq!(
+                    loaded_history.state().graph_prefix(),
+                    live_history.state().graph_prefix(),
+                    "{route} cycle {cycle}: rolling graph identity"
+                );
+                previous_rows[index] = row;
+            }
+            let commits_apart_from_their_time = |session: &Session| {
+                session
+                    .validated_transcript_history_state()
+                    .unwrap()
+                    .expect("live history")
+                    .state()
+                    .commits()
+                    .map(|commit| {
+                        let mut commit = serde_json::to_value(commit).unwrap();
+                        commit.as_object_mut().unwrap().remove("committed_at");
+                        commit
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                serde_json::to_value(live[0].messages()).unwrap(),
+                serde_json::to_value(live[1].messages()).unwrap(),
+                "cycle {cycle}: the same transcript in both stores"
+            );
+            assert_eq!(
+                commits_apart_from_their_time(&live[0]),
+                commits_apart_from_their_time(&live[1]),
+                "cycle {cycle}: the same commits in both stores"
+            );
+            assert_eq!(
+                (heads[0].message_count, &heads[0].message_row_prefix),
+                (heads[1].message_count, &heads[1].message_row_prefix),
+                "cycle {cycle}: the same row lineage in both stores"
+            );
+        }
     }
 
     /// The durable-writer invariant for the session store, asserted through
@@ -9994,39 +10800,18 @@ mod tests {
         );
     }
 
+    /// The released 0.8.10 corpus database: this crate's byte copy of
+    /// meerkat-runtime's corpus (see the fixture README), embedded so archived,
+    /// sandboxed and published-package test runs need no source-tree path.
+    const RELEASED_0810_CORPUS_DB: &[u8] =
+        include_bytes!("../tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3");
+
     #[tokio::test]
     async fn exact_released_0810_corpus_imports_and_fully_loads_current_session() {
-        // The workspace root: `MEERKAT_WORKSPACE_ROOT` (set by the
-        // `repo-cargo` wrapper), the working directory when it holds the
-        // fixture (Bazel runs the test from its runfiles root), or two levels
-        // above this crate's manifest. A plain `cargo test` runs from
-        // `crates/meerkat-store`, whose own `Cargo.toml` must not make it the
-        // root. The fixture literal stays joined onto a `workspace_root`, the
-        // form CI's non-Rust readers guard recognizes as a read.
-        let fixture_under = |workspace_root: &Path| {
-            workspace_root.join(
-                "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
-            )
-        };
-        let workspace_root = std::env::var_os("MEERKAT_WORKSPACE_ROOT")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .filter(|root| fixture_under(root).is_file())
-            })
-            .or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .ancestors()
-                    .nth(2)
-                    .filter(|root| fixture_under(root).is_file())
-                    .map(Path::to_path_buf)
-            })
-            .expect("a workspace root holding the released 0.8.10 corpus fixture");
-        let source = fixture_under(&workspace_root);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sessions.sqlite3");
-        std::fs::copy(&source, &path).expect("copy exact released 0.8.10 corpus database");
+        std::fs::write(&path, RELEASED_0810_CORPUS_DB)
+            .expect("write exact released 0.8.10 corpus database");
 
         let raw = open_connection(&path).unwrap();
         let raw_id = raw

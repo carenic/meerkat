@@ -1102,6 +1102,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio_util::codec::FramedRead;
 
+    #[cfg(feature = "workspace-tests")]
     struct MemberFixture {
         keypair: Keypair,
         trusted: Arc<parking_lot::RwLock<TrustStore>>,
@@ -1110,6 +1111,7 @@ mod tests {
         runtime_finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn member_trusting(sender_pubkey: &PubKey, require_peer_auth: bool) -> MemberFixture {
         let keypair = Keypair::generate();
         let mut store = TrustStore::new();
@@ -1142,6 +1144,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_finalize_next_runtime(
         member: &MemberFixture,
     ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
@@ -1174,6 +1177,7 @@ mod tests {
         (registry, owner)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn register_member(
         registry: &HostAcceptorIdentityRegistry,
         owner: &Arc<dyn Any + Send + Sync>,
@@ -1679,6 +1683,7 @@ mod tests {
     /// Two identities on one acceptor: an envelope to A is durably admitted by
     /// A's real runtime before the byte-compatible signed ACK comes from A's
     /// keypair. The same holds independently for B.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn acceptor_demuxes_by_to_and_acks_per_member() {
         let sender_keypair = Keypair::generate();
@@ -1732,6 +1737,7 @@ mod tests {
 
     /// An envelope addressed to an unregistered identity is refused with no
     /// ack — the sender observes `PeerOffline`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn acceptor_send_to_unregistered_identity_reports_peer_offline() {
         let sender_keypair = Keypair::generate();
@@ -1756,6 +1762,7 @@ mod tests {
     }
 
     /// Register → remove → send is rejected exactly like never-registered.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn acceptor_rejects_registered_then_removed_identity() {
         let sender_keypair = Keypair::generate();
@@ -1803,6 +1810,7 @@ mod tests {
     /// consult, so even an identity whose own inbox context was built from a
     /// `require_peer_auth = false` configuration still rejects unsigned
     /// envelopes at the acceptor's hardwired signature gate.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn acceptor_rejects_unsigned_envelope_and_has_no_auth_knob() {
         let sender_keypair = Keypair::generate();
@@ -1842,6 +1850,7 @@ mod tests {
     /// length prefix + ciborium CBOR) drive the demux path end to end; the
     /// signature verifies, delivery happens, and the ack decodes with the
     /// addressed member as signer.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn acceptor_accepts_hand_encoded_envelope_bytes() {
         let sender_keypair = Keypair::generate();
@@ -2103,6 +2112,7 @@ mod tests {
     /// registered identity's trust view is untouched and the registry is
     /// never mutated. Type-level backstop: `HostPairingConfig` holds no
     /// router/trust-store/persistence handles at all.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn host_pairing_returns_descriptor_and_installs_no_trust() {
         let descriptor =

@@ -974,6 +974,10 @@ function normalizeMobWireMembersBatchEdge(
   return { a, b };
 }
 
+// How long a child that exited by itself gets for its stdout and stderr to
+// close before its exit is settled anyway.
+const CHILD_EXIT_PIPE_GRACE_MS = 1_000;
+
 export class MeerkatClient {
   private process: ChildProcess | null = null;
   // Permanent transport-failed state: once the JSONL framing is untrustworthy
@@ -981,6 +985,10 @@ export class MeerkatClient {
   // typed fault instead of writing into the condemned stream. Cleared only by
   // a fresh connect() (new process, new stream).
   private transportFault: MeerkatError | null = null;
+  // Stops failTransport() started without waiting for them. close() waits for
+  // every one still running, so it returns once each child it let go of has
+  // exited.
+  private readonly stoppingChildren = new Set<Promise<void>>();
   private processStderr = "";
   private requestId = 0;
   private _capabilities: Capability[] = [];
@@ -1177,24 +1185,38 @@ export class MeerkatClient {
         this.closeQueues();
       }
     });
-    child.once("close", (code, signal) => {
-      const expectedClose = this.process !== child;
-      if (this.process === child) {
-        this.process = null;
-        this.rl?.close();
-        this.rl = null;
-      }
-      if (!expectedClose) {
-        const suffix = this.processStderr.trim() ? `: ${this.processStderr.trim()}` : "";
-        this.rejectPendingRequests(
-          new MeerkatError(
-            "PROCESS_EXITED",
-            `${this.rkatPath} exited before replying (code ${code ?? "null"}, signal ${signal ?? "null"})${suffix}`,
-          ),
-        );
-        this.closeQueues();
-      }
+    // An unexpected exit settles on "close", once the child's stdout and
+    // stderr have ended, so the error carries all of stderr. A descendant
+    // that inherited those pipes can keep them open after the child has
+    // exited, so the exit settles anyway after a short grace, and the pipes
+    // are destroyed so they cannot keep the caller's process alive. Whichever
+    // comes first settles it.
+    let exitGrace: ReturnType<typeof setTimeout> | undefined;
+    const settleExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(exitGrace);
+      if (this.process !== child) return;
+      this.process = null;
+      this.rl?.close();
+      this.rl = null;
+      const suffix = this.processStderr.trim() ? `: ${this.processStderr.trim()}` : "";
+      this.rejectPendingRequests(
+        new MeerkatError(
+          "PROCESS_EXITED",
+          `${this.rkatPath} exited before replying (code ${code ?? "null"}, signal ${signal ?? "null"})${suffix}`,
+        ),
+      );
+      this.closeQueues();
+    };
+    child.once("exit", (code, signal) => {
+      // close() and failTransport() drop the child before it exits.
+      if (this.process !== child) return;
+      exitGrace = setTimeout(() => {
+        settleExit(code, signal);
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }, CHILD_EXIT_PIPE_GRACE_MS);
     });
+    child.once("close", settleExit);
 
     this.rl = createInterface({ input: this.process.stdout! });
     this.rl.on("line", (line: string) => this.handleLine(line, child));
@@ -1262,20 +1284,46 @@ export class MeerkatClient {
     // new work while the original child is still being reaped.
     this.rejectPendingRequests(new MeerkatError("CLIENT_CLOSED", "Client closed"));
     this.closeQueues();
-    if (process) {
-      process.stdin?.end();
-      const closed = once(process, "close").catch(() => []);
-      process.kill();
-      const timeout = delay(5000).then(() => "timeout");
-      const outcome = await Promise.race([closed, timeout]);
-      if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
-        process.kill("SIGKILL");
-        await closed.catch(() => {});
-      }
-      process.stdin?.destroy();
-      process.stdout?.destroy();
-      process.stderr?.destroy();
+    // A child a protocol error already let go of may still be stopping (one
+    // that ignores SIGTERM is killed only after 5 s): wait for it as well.
+    await Promise.all([
+      process ? MeerkatClient.stopChild(process) : undefined,
+      ...this.stoppingChildren,
+    ]);
+  }
+
+  /**
+   * Stop a child this client has let go of: end its stdin, signal it, and
+   * wait for it to exit, killing it with SIGKILL after 5 s; then destroy its
+   * stdio, so nothing the child started can keep the caller's process alive
+   * through those pipes. Never rejects: a kill that fails settles the wait.
+   */
+  private static async stopChild(process: ChildProcess): Promise<void> {
+    process.stdin?.end();
+    // Settle on the child's exit, not its "close": a descendant that
+    // inherited the child's stdio can hold those pipes open long after the
+    // child is gone. A child that has already exited settles at once.
+    const exited =
+      process.exitCode != null || process.signalCode != null
+        ? Promise.resolve()
+        : once(process, "exit").then(
+            () => undefined,
+            () => undefined,
+          );
+    process.kill();
+    // Cancel the 5 s cap once the child has exited: a pending timer keeps
+    // the caller's Node process alive until it fires.
+    const cap = new AbortController();
+    const timeout = delay(5000, "timeout" as const, { signal: cap.signal });
+    const outcome = await Promise.race([exited, timeout]);
+    cap.abort();
+    if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
+      process.kill("SIGKILL");
+      await exited;
     }
+    process.stdin?.destroy();
+    process.stdout?.destroy();
+    process.stderr?.destroy();
   }
 
   private rejectPendingRequests(reason: unknown): void {
@@ -1311,7 +1359,12 @@ export class MeerkatClient {
     this.process = null;
     if (process) {
       process.stdin?.destroy();
-      process.kill();
+      // Stopped as close() stops it, without waiting for it here: a child
+      // that ignores SIGTERM is killed after 5 s, and its pipes are let go.
+      // A later close() waits for this stop. stopChild() never rejects.
+      const stopping = MeerkatClient.stopChild(process);
+      this.stoppingChildren.add(stopping);
+      void stopping.then(() => this.stoppingChildren.delete(stopping));
     }
   }
 
@@ -5319,7 +5372,12 @@ export class MeerkatClient {
       ["add", "remove", "reload"],
       context,
     );
-    MeerkatClient.requireBooleanField(payload, "persisted", context);
+    // rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+    MeerkatClient.requireBooleanField(
+      payload,
+      Object.prototype.hasOwnProperty.call(payload, "settled") ? "settled" : "persisted",
+      context,
+    );
     MeerkatClient.requirePresentStringField(payload, "target", context);
     MeerkatClient.validateToolConfigStatus(payload.status_info, `${context}: status_info`);
     if (Object.prototype.hasOwnProperty.call(payload, "applied_at_turn")) {
@@ -5452,7 +5510,10 @@ export class MeerkatClient {
       if (Object.prototype.hasOwnProperty.call(raw, "pending_sources")) {
         MeerkatClient.requireStringArray(raw.pending_sources, `${context}: pending_sources`);
       }
-      MeerkatClient.validateOptionalBooleanField(raw, "persisted", context);
+      // rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+      for (const field of ["settled", "persisted"] as const) {
+        MeerkatClient.validateOptionalBooleanField(raw, field, context);
+      }
       if (Object.prototype.hasOwnProperty.call(raw, "phase")) {
         MeerkatClient.requireClosedStringField(
           raw,

@@ -235,6 +235,9 @@ describe("MeerkatClient callback connection lifetime", () => {
       (error) => { outcome = error; },
     );
     const replacementId = client.requestId;
+    // A child exits before its stdio closes; close() settles on the exit.
+    original.exitCode = 0;
+    original.emit("exit", 0, null);
     original.emit("close", 0, null);
     await closing;
     await originalClosed;

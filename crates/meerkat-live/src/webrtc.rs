@@ -91,6 +91,24 @@ struct OutgoingAudioPacket {
     data: Vec<u8>,
 }
 
+/// Discard the output audio queued for the peer when an applied observation
+/// ends the response it belongs to, and return the new generation. An
+/// interruption or a truncation ends the audio the user talked over. A
+/// response that ended without completing (#1883) commits nothing, so the
+/// user must not hear the rest of it either.
+fn discard_queued_output_audio_after(
+    outcome: &ObservationOutcome,
+    control: &OutgoingAudioControl,
+) -> Option<u64> {
+    matches!(
+        outcome,
+        ObservationOutcome::InterruptSignalled
+            | ObservationOutcome::TranscriptTruncated
+            | ObservationOutcome::TurnFailureProjected
+    )
+    .then(|| control.discard_queued())
+}
+
 #[derive(Default)]
 struct OutgoingAudioControl {
     generation: AtomicU64,
@@ -2374,6 +2392,16 @@ async fn pump_observations_to_data_channel(
             }
         }
 
+        if let Some(generation) =
+            discard_queued_output_audio_after(&outcome, &outgoing_audio_control)
+        {
+            tracing::debug!(
+                channel = %channel_id,
+                generation,
+                "discarding queued WebRTC output audio: its response was interrupted, truncated or failed"
+            );
+        }
+
         match outcome {
             ObservationOutcome::UserContentCommitted { observation } => {
                 if let Err(err) = forward_observation_json(&data_channel, &observation).await {
@@ -2395,14 +2423,6 @@ async fn pump_observations_to_data_channel(
                     ?code,
                     %message,
                     "live command rejected; WebRTC peer remains open"
-                );
-            }
-            ObservationOutcome::InterruptSignalled | ObservationOutcome::TranscriptTruncated => {
-                let generation = outgoing_audio_control.discard_queued();
-                tracing::debug!(
-                    channel = %channel_id,
-                    generation,
-                    "discarding queued WebRTC output audio after live interruption"
                 );
             }
             _ => {}
@@ -3220,6 +3240,16 @@ mod tests {
             Ok(())
         }
 
+        async fn signal_turn_failed(
+            &self,
+            _session_id: &SessionId,
+            _response_id: Option<&str>,
+            _failure: &meerkat_core::live_adapter::LiveResponseFailure,
+            _accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+        ) -> Result<(), LiveProjectionError> {
+            Ok(())
+        }
+
         async fn signal_terminal_error(
             &self,
             _session_id: &SessionId,
@@ -3355,6 +3385,46 @@ mod tests {
         let next_generation = control.discard_queued();
         assert!(next_generation > generation);
         assert_eq!(control.queued_packets(), 0);
+    }
+
+    #[test]
+    fn a_failed_response_discards_the_output_audio_queued_for_the_peer() {
+        // #1883: a response that ended without completing commits nothing,
+        // so the audio it queued for the peer is discarded as an interrupted
+        // response's is. The user never hears audio of a response that
+        // commits nothing.
+        for outcome in [
+            ObservationOutcome::InterruptSignalled,
+            ObservationOutcome::TranscriptTruncated,
+            ObservationOutcome::TurnFailureProjected,
+        ] {
+            let control = OutgoingAudioControl::default();
+            control.note_queued();
+            let generation = control.generation();
+            assert_eq!(
+                discard_queued_output_audio_after(&outcome, &control),
+                Some(generation + 1),
+                "{outcome:?}"
+            );
+            assert_eq!(control.generation(), generation + 1, "{outcome:?}");
+            assert_eq!(control.queued_packets(), 0, "{outcome:?}");
+        }
+        // Control: an outcome that ends no response keeps the queued audio.
+        for outcome in [
+            ObservationOutcome::Noop,
+            ObservationOutcome::TranscriptAppended,
+        ] {
+            let control = OutgoingAudioControl::default();
+            control.note_queued();
+            let generation = control.generation();
+            assert_eq!(
+                discard_queued_output_audio_after(&outcome, &control),
+                None,
+                "{outcome:?}"
+            );
+            assert_eq!(control.generation(), generation, "{outcome:?}");
+            assert_eq!(control.queued_packets(), 1, "{outcome:?}");
+        }
     }
 
     #[test]

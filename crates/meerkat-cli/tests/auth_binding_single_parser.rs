@@ -26,22 +26,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    loop {
-        let toml = p.join("Cargo.toml");
-        if toml.exists() {
-            let text = fs::read_to_string(&toml).unwrap_or_default();
-            if text.contains("[workspace]") {
-                return p;
-            }
-        }
-        if !p.pop() {
-            panic!("could not locate workspace root");
-        }
-    }
-}
-
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -58,11 +42,12 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn exactly_one_parse_auth_binding_user_input_in_cli_src() {
-    let root = workspace_root();
-    let cli_src = root.join("crates/meerkat-cli/src");
+    // The crate's own sources, so the scan also runs from the published
+    // package.
+    let cli_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     assert!(
         cli_src.is_dir(),
-        "expected crates/meerkat-cli/src to exist at {}",
+        "expected src to exist at {}",
         cli_src.display()
     );
 

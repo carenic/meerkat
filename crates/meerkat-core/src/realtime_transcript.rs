@@ -333,6 +333,11 @@ pub enum RealtimeTranscriptEvent {
     },
     /// Provider turn was interrupted before terminal materialization.
     AssistantTurnInterrupted { response_id: String },
+    /// #1883: the provider ended the response without completing it. The
+    /// session discards everything the response staged, on every lane, and
+    /// records no completion. Persisted under realtime sidecar event schema
+    /// 4, which older readers refuse.
+    AssistantTurnFailed { response_id: String },
 }
 
 impl RealtimeTranscriptEvent {

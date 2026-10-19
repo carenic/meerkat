@@ -1472,6 +1472,39 @@ impl MobIdentityStore for InMemoryMobIdentityStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MobIdentityMemberStore for InMemoryMobIdentityStore {
+    async fn read_member_binding_journal(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<super::MemberBindingJournalRead, MobStoreError> {
+        if self.event_tx.is_none() {
+            return Err(MobStoreError::IdentityMemberAtomicPersistenceUnavailable);
+        }
+        // One aggregate guard covers the journal and the intent rows; each
+        // row is classified as `observe_identity_intent` classifies it.
+        let aggregate = self.aggregate.read().await;
+        let mut intent_rows = BTreeMap::new();
+        for ((intent_mob_id, identity), record) in &aggregate.identity.intents {
+            if intent_mob_id != mob_id {
+                continue;
+            }
+            let observation = if record.mob_id != *mob_id || record.intent.identity() != identity {
+                malformed_identity_record(
+                    record,
+                    "identity intent record does not match its physical mob/identity key",
+                )?
+            } else {
+                classify_identity_record(record, IdentityIntentRecord::validate)?
+            };
+            if let Some(management) = super::intent_row_management(&observation) {
+                intent_rows.insert(identity.clone(), management);
+            }
+        }
+        Ok(super::MemberBindingJournalRead {
+            events: aggregate.events.clone(),
+            intent_rows,
+        })
+    }
+
     async fn observe_identity_member_target(
         &self,
         mob_id: &MobId,

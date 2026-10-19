@@ -1629,12 +1629,18 @@ class ToolConfigChangedPayload(TypedDict, total=False):
 
     The typed `status_info` is the sole owner of the change status; display
     text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+    The lifecycle fact is derived from it too ([`Self::settled`],
+    [`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+    with that value as `settled`; a decoded payload keeps the bit it was stored
+    with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+    which carry `persisted`, serialize back unchanged.
     """
     applied_at_turn: NotRequired[Optional[int]]
     deferred_catalog_delta: NotRequired[Optional[DeferredCatalogDelta]]
     domain: NotRequired[Optional[ToolConfigChangeDomain]]
     operation: Required[ToolConfigChangeOperation]
-    persisted: Required[bool]
+    persisted: NotRequired[bool]
+    settled: NotRequired[bool]
     status_info: Required[ToolConfigChangeStatus]
     target: Required[str]
 

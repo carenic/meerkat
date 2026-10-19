@@ -100,6 +100,7 @@ struct Fixture {
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
+#[cfg(feature = "workspace-tests")]
 impl Fixture {
     async fn start() -> Self {
         let server = Server {
@@ -431,6 +432,7 @@ fn an_incomplete_route_is_refused() {
 /// only under actual bound work for its own session, with a plan its own
 /// instance resolved on the live connection, once per plan. Every refusal
 /// is before anything reaches the server.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_checked_route_enters_once_under_its_own_sessions_bound_work() {
     let fixture = Fixture::start().await;
@@ -636,6 +638,7 @@ async fn a_checked_route_enters_once_under_its_own_sessions_bound_work() {
 /// Closing the route refuses work that has not reached its transport
 /// handoff, even after its own entry checks passed, and never cancels an
 /// effect that already entered.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn closing_a_route_refuses_unentered_work_and_keeps_entered_custody() {
     let fixture = Fixture::start().await;
@@ -715,6 +718,7 @@ async fn closing_a_route_refuses_unentered_work_and_keeps_entered_custody() {
 /// turn: its fresh resolution is a new occurrence, entering once under its
 /// own prepared authorization. Of two dispatches of one plan, both held
 /// after the route's entry checks, exactly one enters at the handoff.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn after_the_hosts_own_consume_each_plan_enters_once() {
     let fixture = Fixture::start().await;

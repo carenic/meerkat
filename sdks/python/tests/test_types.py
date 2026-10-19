@@ -3050,7 +3050,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         field = {"confinement_refusal": refusal} if present else {}
         status = {"kind": "external_tool_delta", "phase": "failed",
             "detail": "required execution confinement is unsupported by this backend", **field}
-        payload = {"operation": "reload", "target": "local-server", "persisted": True,
+        payload = {"operation": "reload", "target": "local-server", "settled": True,
             "status_info": status}
         event = parse_event({"type": "tool_config_changed", "payload": payload})
         assert isinstance(event, ToolConfigChanged)
@@ -3058,7 +3058,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         assert event.payload.status_info.phase == "failed"
         assert event.payload.status_info.confinement_refusal == (refusal if present else None)
         for block in [
-            {"type": "mcp", "server_id": "local-server", "phase": "failed", "persisted": True, **field},
+            {"type": "mcp", "server_id": "local-server", "phase": "failed", "settled": True, **field},
             {"type": "tool_config", "payload": payload},
         ]:
             message = {"role": "system_notice", "kind": "mcp", "body": "Continue with available tools.",
@@ -3069,7 +3069,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
 
 @pytest.mark.parametrize("refusal", ["future_reason", "", 7, False, {}, []])
 def test_malformed_mcp_refusal_preserves_raw_event_without_hiding_sibling(refusal):
-    payload = {"operation": "add", "target": "local-server", "persisted": True,
+    payload = {"operation": "add", "target": "local-server", "settled": True,
         "status_info": {"kind": "external_tool_delta", "phase": "failed", "confinement_refusal": refusal}}
     raw = {"type": "tool_config_changed", "payload": payload}
     events = [parse_event(value) for value in [raw, {"type": "text_delta", "delta": "permitted sibling"}]]
@@ -3111,7 +3111,7 @@ def test_parse_tool_config_changed():
                 "visible_changed": False,
                 "revision": 9,
             },
-            "persisted": False,
+            "settled": True,
             "applied_at_turn": 7,
         },
     }
@@ -3123,7 +3123,7 @@ def test_parse_tool_config_changed():
     assert event.payload.status_info.base_changed is True
     assert event.payload.status_info.visible_changed is False
     assert event.payload.status_info.revision == 9
-    assert event.payload.persisted is False
+    assert event.payload.settled is True
     assert event.payload.applied_at_turn == 7
 
 
@@ -3145,7 +3145,7 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": True,
+            "settled": True,
             "applied_at_turn": "oops",
         },
     }
@@ -3154,20 +3154,108 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
     assert event.payload.applied_at_turn is None
 
 
-def test_parse_tool_config_changed_with_non_boolean_persisted():
+@pytest.mark.parametrize("field", ["settled", "persisted"])
+def test_parse_tool_config_changed_with_non_boolean_settled(field):
     raw = {
         "type": "tool_config_changed",
         "payload": {
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": "false",
+            field: "false",
         },
     }
     event = parse_event(raw)
     assert isinstance(event, UnknownEvent)
     assert event.type == "malformed_event"
     assert event.data == raw
+
+
+def test_parse_tool_config_changed_derives_settled_from_status_info():
+    """rkat-rpc derives the lifecycle fact from ``status_info``. Payloads
+    stored by 0.9.3 and earlier are served back with their ``persisted``,
+    which was ``False`` for changes that had already applied; only a status
+    this SDK does not know falls back to the stored bit."""
+    boundary = {
+        "kind": "boundary_applied",
+        "base_changed": True,
+        "visible_changed": True,
+        "revision": 2,
+    }
+    catalog = {
+        "kind": "deferred_catalog_delta",
+        "added_hidden_count": 1,
+        "removed_hidden_count": 0,
+        "pending_source_count": 0,
+    }
+    failed_closed = {"kind": "warning_failed_closed", "error": "scope refused"}
+
+    def delta(phase):
+        return {"kind": "external_tool_delta", "phase": phase}
+
+    for status_info, fields, settled in [
+        (boundary, {"persisted": False}, True),
+        (catalog, {"persisted": False}, True),
+        (failed_closed, {"persisted": False}, True),
+        (boundary, {"settled": True}, True),
+        (delta("pending"), {"persisted": True}, False),
+        (delta("draining"), {"settled": True}, False),
+        (delta("applied"), {"persisted": False}, True),
+        (delta("forced"), {"settled": False}, True),
+        (delta("failed"), {"persisted": False}, True),
+        (delta("pending"), {"settled": False, "persisted": True}, False),
+        ({"kind": "a_later_kind"}, {"settled": True}, True),
+        ({"kind": "a_later_kind"}, {"persisted": False}, False),
+        ({"kind": "a_later_kind"}, {"settled": False, "persisted": True}, False),
+        (delta("a_later_phase"), {"persisted": True}, True),
+    ]:
+        raw = {
+            "type": "tool_config_changed",
+            "payload": {
+                "operation": "add",
+                "target": "filesystem",
+                "status_info": status_info,
+                **fields,
+            },
+        }
+        event = parse_event(raw)
+        assert isinstance(event, ToolConfigChanged), (status_info, fields)
+        assert event.payload.settled is settled, (status_info, fields)
+    raw = {
+        "type": "tool_config_changed",
+        "payload": {"operation": "add", "target": "filesystem", "status_info": boundary},
+    }
+    event = parse_event(raw)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"
+    assert event.data == raw
+
+
+def test_tool_config_transcript_blocks_read_settled_or_persisted():
+    """Stored notices from rkat-rpc 0.9.3 and earlier carry ``persisted``."""
+    status_info = {"kind": "external_tool_delta", "phase": "applied"}
+    for fields in [{"settled": True}, {"persisted": False}]:
+        payload = {"operation": "add", "target": "local-server", "status_info": status_info, **fields}
+        for block in [
+            {"type": "tool_config", "payload": payload},
+            {"type": "mcp", "server_id": "local-server", **fields},
+        ]:
+            message = {"role": "system_notice", "kind": "mcp", "body": "Tools changed.",
+                "blocks": [block], "created_at": "2026-05-26T10:00:00Z"}
+            parsed = MeerkatClient._parse_session_message(message)
+            assert MeerkatClient._serialize_transcript_rewrite_message(parsed) == message
+    for block in [
+        {"type": "tool_config", "payload": {"operation": "add", "target": "local-server",
+            "status_info": status_info}},
+        {"type": "mcp", "settled": "false"},
+        {"type": "mcp", "persisted": "false"},
+    ]:
+        with pytest.raises(MeerkatError) as error:
+            MeerkatClient._parse_session_message({
+                "role": "system_notice", "kind": "mcp", "blocks": [block],
+                "created_at": "2026-05-26T10:00:00Z",
+            })
+        assert error.value.code == "INVALID_RESPONSE", block
 
 
 def test_parse_background_job_completed_uses_typed_terminal_status():
@@ -3441,10 +3529,22 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "add",
                     "target": "filesystem",
                     "status": "staged",
+                    "settled": "false",
+                },
+            },
+            "non-boolean settled must not become false",
+        ),
+        (
+            {
+                "type": "tool_config_changed",
+                "payload": {
+                    "operation": "add",
+                    "target": "filesystem",
+                    "status": "staged",
                     "persisted": "false",
                 },
             },
-            "non-boolean persisted must not become false",
+            "non-boolean persisted from rkat-rpc 0.9.3 must not become false",
         ),
         (
             {
@@ -3453,7 +3553,7 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "bogus",
                     "target": 0,
                     "status": 0,
-                    "persisted": "false",
+                    "settled": "false",
                 },
             },
             "malformed operation/status semantics must not become an empty typed payload",
@@ -6839,6 +6939,7 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
         WireLiveAdapterObservationError,
         WireLiveAdapterObservationReady,
         WireLiveAdapterObservationStatusChanged,
+        WireLiveAdapterObservationTurnFailed,
         WireLiveAdapterObservationTurnInterrupted,
         WireLiveAdapterObservationUserContentCommitted,
     )
@@ -6852,6 +6953,30 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     assert WireLiveAdapterObservationStatusChanged in union_members
     assert WireLiveAdapterObservationTurnInterrupted in union_members
     assert WireLiveAdapterObservationUserContentCommitted in union_members
+    # #1883: a response that ended without completing is its own variant.
+    assert WireLiveAdapterObservationTurnFailed in union_members
+    failed_hints = get_type_hints(WireLiveAdapterObservationTurnFailed)
+    assert get_args(failed_hints["observation"]) == ("turn_failed",)
+    # #1883: the failure is typed by name, so a client routes on
+    # `failure.status`; an unrecognized status arrives as `unknown.debug`.
+    from meerkat import WireLiveResponseFailure, WireLiveResponseFailureStatus
+
+    assert failed_hints["failure"] is WireLiveResponseFailure
+    failure_hints = get_type_hints(WireLiveResponseFailure)
+    assert failure_hints["status"] == WireLiveResponseFailureStatus
+    status_members = get_args(WireLiveResponseFailureStatus)
+    known_statuses = {
+        value
+        for member in status_members
+        if get_origin(member) is Literal
+        for value in get_args(member)
+    }
+    assert known_statuses == {"failed", "incomplete", "in_progress"}
+    (unknown_status,) = [
+        member for member in status_members if get_origin(member) is not Literal
+    ]
+    unknown_payload = get_type_hints(unknown_status)["unknown"]
+    assert get_type_hints(unknown_payload)["debug"] is str
     # Sanity: each variant is tagged on `observation` with the snake_case
     # discriminator value.
     audio_hints = get_type_hints(WireLiveAdapterObservationAssistantAudioChunk)

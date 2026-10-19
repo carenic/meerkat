@@ -5,6 +5,15 @@
 //! own the canonical config-store, config-runtime, path-layout, and maintenance
 //! fence primitives, so this crate is not a blanket no-I/O layer.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 // All WASM Tokio users share these host adapters. Time and cooperative yields
 // own cancellable JavaScript resources here; spawning retains the upstream
 // scheduler but boxes every future it hands it (`wasm_task`). Native code
@@ -193,12 +202,13 @@ pub use authorization::{
     AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
-    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
-    OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
-    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
-    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
-    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
-    WorkAuthorizationContext,
+    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalDisposition,
+    OperationRefusalKind, OperationRefusalObservation, OperationRefusalObserver,
+    OperationRefusalOutcome, OperationRefusalSurface, OperationRefused, OperationReviewTier,
+    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, RefusalDispatch,
+    SourceAuthorizationFacts, SourceAuthorizationTarget, SourceAuthorizationUse,
+    ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,
@@ -279,9 +289,9 @@ pub use event::{
     ExternalToolDeltaPhase, InteractionFailureReason, LiveChannelCloseReason, ScopedAgentEvent,
     SkillResolutionFailureReason, StreamScopeFrame, StreamTruncationReason, StructuredOutputOrigin,
     ToolCallArguments, ToolCallArgumentsError, ToolConfigChangeOperation, ToolConfigChangeStatus,
-    ToolConfigChangedPayload, TurnErrorMetadata, VerboseEventConfig, agent_event_type,
-    compare_event_envelopes, format_verbose_event, format_verbose_event_with_config,
-    turn_usage_summary, usage_summary,
+    ToolConfigChangedPayload, ToolConfigLifecycleBit, TurnErrorMetadata, VerboseEventConfig,
+    agent_event_type, compare_event_envelopes, format_verbose_event,
+    format_verbose_event_with_config, turn_usage_summary, usage_summary,
 };
 pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{
@@ -467,8 +477,9 @@ pub use realtime_transcript::{
 };
 pub use realtime_transcript_sidecar::{
     REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1, REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V2,
-    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3, RealtimeTranscriptSidecarError,
-    RealtimeTranscriptSidecarRecord, RealtimeTranscriptSnapshotReasonV1,
+    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3, REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4,
+    RealtimeTranscriptSidecarError, RealtimeTranscriptSidecarRecord,
+    RealtimeTranscriptSnapshotReasonV1,
 };
 pub use retry::{
     DEFAULT_STREAM_INACTIVITY_TIMEOUT, LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan,
@@ -562,11 +573,13 @@ pub use session_recovery::{
 };
 pub use session_store::{
     HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
-    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight, SessionFilter,
-    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, SessionStore,
-    SessionStoreError, StrandLayout, StrandRewriteLayout, TranscriptRowRetention,
-    TranscriptStrandId, VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
+    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight,
+    RetainedStrandLayout, SessionFilter, SessionHead, SessionHeadCas,
+    SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
+    StrandRewriteLayout, TranscriptRowRetention, TranscriptStrandId,
+    VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
     head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
+    strand_layout_for_retained_history,
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{

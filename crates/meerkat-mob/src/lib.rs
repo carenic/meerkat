@@ -306,24 +306,25 @@ pub use runtime::{
     MemberLiveStatusDomain, MemberPreviewUnavailable, MemberReloadDisposition, MemberReloadOutcome,
     MemberRespawnReceipt, MemberRunState, MemberSessionActivity, MemberShutdownOutcome,
     MemberStatusSessionView, MemberStatusViewSource, MemberTargetAbsence, MemberTurnEventSender,
-    MemberTurnHandle, MemberTurnOptions, MobActorTaskWait, MobActorTaskWatch, MobBuilder,
-    MobDestroyError, MobDestroyReport, MobEventRouterConfig, MobEventRouterHandle,
-    MobEventsSubscription, MobEventsSubscriptionConfig, MobHandle, MobMachineStateChanges,
-    MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberPeerEndpoint, MobMemberSnapshot,
-    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSessionService,
-    MobShutdownReport, MobSpawnManyFailure, MobState, MobUnreachablePeer,
-    MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt, PeerTarget,
-    PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality,
-    ResumedMemberView, RetirementSettlement, RetirementSettlementWatch, RetirementStage,
-    SessionResumeAuthority, SessionResumeLifecycle, SessionResumeMaterialization,
+    MemberTurnHandle, MemberTurnOptions, MemberUnregisterSettlement, MemberUnregisterState,
+    MobActorTaskWait, MobActorTaskWatch, MobBuilder, MobDestroyError, MobDestroyReport,
+    MobEventRouterConfig, MobEventRouterHandle, MobEventsSubscription, MobEventsSubscriptionConfig,
+    MobHandle, MobMachineStateChanges, MobMemberEndpointOwner, MobMemberEndpointStatus,
+    MobMemberPeerEndpoint, MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot,
+    MobRespawnError, MobSessionService, MobShutdownReport, MobSpawnManyFailure, MobState,
+    MobUnreachablePeer, MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt,
+    PeerTarget, PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad,
+    ResumeVerdictTerminality, ResumedMemberView, RetirementSettlement, RetirementSettlementWatch,
+    RetirementStage, SessionResumeAuthority, SessionResumeLifecycle, SessionResumeMaterialization,
     SessionResumePreparationReceipt, SessionResumeRejection, SessionResumeVerdict, ShutdownOptions,
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
     SpawnMemberSpec, SpawnPolicy, SpawnResult, SpawnSource, SpawnSpec, SpawnSystemPromptOverride,
-    SpawnToolAdmission, SupervisorRotationReport, WorkBoundedTurnResult, WorkDeliveryReceipt,
-    WorkTurnHandle, materialize_nonpersistent_session_resume_verdict, mob_error_wire_code,
-    observe_live_durable_source_via_projection_visibility, observe_member_status_view_via_read,
-    profile_to_wire, render_bounded_delegation_task, stored_realm_profile_to_wire,
+    SpawnToolAdmission, SupervisorRotationReport, WithheldToolBundle, WorkBoundedTurnResult,
+    WorkDeliveryReceipt, WorkTurnHandle, materialize_nonpersistent_session_resume_verdict,
+    mob_error_wire_code, observe_live_durable_source_via_projection_visibility,
+    observe_member_status_view_via_read, profile_to_wire, render_bounded_delegation_task,
+    stored_realm_profile_to_wire,
 };
 pub use runtime::{CloseIfIdleOutcome, MobAdmissionCloseReason, MobBusy};
 #[cfg(feature = "openai-live")]
@@ -341,8 +342,10 @@ pub use runtime::{
     DeliveryUnknownCause,
 };
 pub use runtime::{
-    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope,
-    ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState, WorkAdmissionStage,
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberBinding, MemberBindingHistory,
+    MemberBindingHistoryReadError, MemberBindingState, MemberDeliveryScope,
+    MemberIdentityManagement, ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
+    WorkAdmissionStage,
 };
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{

@@ -2748,6 +2748,17 @@ pub struct HookRunOverrides {
     pub disable: Vec<HookId>,
 }
 
+/// The workspace's [`HookRunOverrides`] fixture document: it disables
+/// `global_observer` and adds a foreground pre-tool guardrail and a background
+/// post-tool HTTP observer. Its one copy is this crate's
+/// `tests/fixtures/hooks/run_override.json`, which the published package
+/// carries, so the surface crates' tests that read it also run from their
+/// packages.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const HOOK_RUN_OVERRIDES_FIXTURE_JSON: &str =
+    include_str!("../tests/fixtures/hooks/run_override.json");
+
 /// One hook registration entry.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(default)]

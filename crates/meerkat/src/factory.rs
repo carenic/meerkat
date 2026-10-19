@@ -2910,6 +2910,11 @@ pub struct AgentFactory {
     /// options. Its absence never skips a tier: native authorization resolves
     /// the tier, and required R2 review without it is local unavailable.
     operation_review: Option<Arc<meerkat_core::approval::review::BoundOperationReview>>,
+    /// The host's operation refusal observer for every agent this factory
+    /// builds. Host-only, like `operation_review`: absent from
+    /// `AgentBuildConfig`, session build options and every wire type.
+    operation_refusal_observer:
+        Option<Arc<dyn meerkat_core::authorization::OperationRefusalObserver>>,
 }
 
 impl std::fmt::Debug for AgentFactory {
@@ -2949,6 +2954,10 @@ impl std::fmt::Debug for AgentFactory {
         #[cfg(feature = "comms")]
         d.field("comms_runtime", &self.comms_runtime.is_some());
         d.field("operation_review", &self.operation_review.is_some());
+        d.field(
+            "operation_refusal_observer",
+            &self.operation_refusal_observer.is_some(),
+        );
         d.finish()
     }
 }
@@ -4132,6 +4141,7 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             connector_oauth_authority: None,
             operation_review: None,
+            operation_refusal_observer: None,
         }
     }
 
@@ -4146,6 +4156,21 @@ impl AgentFactory {
         review: Arc<meerkat_core::approval::review::BoundOperationReview>,
     ) -> Self {
         self.operation_review = Some(review);
+        self
+    }
+
+    /// Install the host's operation refusal observer for every agent this
+    /// factory builds (see
+    /// `meerkat_core::AgentBuilder::with_operation_refusal_observer`). It
+    /// receives each refusal disposition an agent decides for a governed
+    /// operation, with the typed refusal; nothing of it reaches the event
+    /// stream, a wire type or the model.
+    #[must_use]
+    pub fn with_operation_refusal_observer(
+        mut self,
+        observer: Arc<dyn meerkat_core::authorization::OperationRefusalObserver>,
+    ) -> Self {
+        self.operation_refusal_observer = Some(observer);
         self
     }
 
@@ -4326,6 +4351,7 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             connector_oauth_authority: None,
             operation_review: None,
+            operation_refusal_observer: None,
         }
     }
 
@@ -9050,6 +9076,9 @@ impl AgentFactory {
         if let Some(review) = self.operation_review.as_ref() {
             builder = builder.with_operation_review(Arc::clone(review));
         }
+        if let Some(observer) = self.operation_refusal_observer.as_ref() {
+            builder = builder.with_operation_refusal_observer(Arc::clone(observer));
+        }
         if let Some(system_prompt) = system_prompt {
             builder = builder.system_prompt(system_prompt);
         }
@@ -9305,6 +9334,27 @@ impl AgentFactory {
                     tracing::info!(
                         declared_by = %restriction.declared_by,
                         "deny name {tool} deferred to runtime (server {servers} declares no tool list)"
+                    );
+                }
+            }
+            let withheld = restriction
+                .vocabulary
+                .keys()
+                .filter_map(|source| match source {
+                    meerkat_core::ToolVocabularySource::WithheldBundle(bundle) => {
+                        Some(bundle.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !withheld.is_empty() {
+                // An opted-in bundle the host no longer offers names tools
+                // this build cannot know: the gate enforces these by name.
+                let bundles = withheld.join(", ");
+                for tool in unknown.drain(..) {
+                    tracing::info!(
+                        declared_by = %restriction.declared_by,
+                        "deny name {tool} deferred to runtime (tool bundle {bundles} is withheld)"
                     );
                 }
             }
@@ -22982,6 +23032,7 @@ mod prepared_agent_tests {
     }
 
     /// A configured fixture MCP server the construction connects.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     fn mcp_fixture_build(snapshots: &Arc<AtomicUsize>) -> AgentBuildConfig {
         let mut build = governed("host", snapshots);
@@ -23000,6 +23051,7 @@ mod prepared_agent_tests {
     /// The trusted host's custody adopts each construction's exact MCP
     /// adapter before any server is staged, and observes that adapter's
     /// shutdown when the construction is abandoned.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn the_mcp_adapter_custody_adopts_the_adapter_before_anything_is_staged() {
@@ -23068,6 +23120,7 @@ mod prepared_agent_tests {
     /// A closed custody fails the build at adoption, before any server is
     /// staged: no server process ever exists for the construction, and the
     /// empty adapter is shut down.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn a_closed_mcp_adapter_custody_fails_the_build_before_any_server_exists() {
@@ -23181,6 +23234,7 @@ mod prepared_agent_tests {
     /// r1 15: each configured stdio server of a construction gets a guard
     /// request whose construction id is the adopted adapter's, for the
     /// construction's session and mob member.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn configured_servers_begin_guards_for_the_adopted_construction() {
@@ -23224,6 +23278,7 @@ mod prepared_agent_tests {
 
     /// r1 16: a rebuild keeps the session and changes the construction; a
     /// reset changes both and keeps the mob member.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn a_rebuild_and_a_reset_change_the_construction() {
@@ -23280,6 +23335,7 @@ mod prepared_agent_tests {
 
     /// r1 17: aborting a prepared agent finishes every guard; dropping it
     /// finishes them in the background, and the installation reports them.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn an_aborted_or_dropped_prepared_agent_finishes_its_guards() {

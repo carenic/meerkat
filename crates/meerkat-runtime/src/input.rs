@@ -2552,12 +2552,12 @@ mod tests {
         input
     }
 
-    fn mcp_block(persisted: bool) -> meerkat_core::types::SystemNoticeBlock {
+    fn mcp_block(settled: bool) -> meerkat_core::types::SystemNoticeBlock {
         meerkat_core::types::SystemNoticeBlock::Mcp {
             server_id: Some("server".to_string()),
             operation: None,
             phase: None,
-            persisted,
+            lifecycle_bit: meerkat_core::event::ToolConfigLifecycleBit::Settled(settled),
             detail: None,
             confinement_refusal: None,
             pending_sources: Vec::new(),

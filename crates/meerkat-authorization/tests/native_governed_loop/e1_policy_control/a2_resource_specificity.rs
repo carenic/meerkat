@@ -450,7 +450,10 @@ fn assert_feedback(body: &Value, order: Order) {
     let diagnostic: Value = serde_json::from_str(&wire_text(&refused["content"])).unwrap();
     assert_eq!(
         diagnostic,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     for (id, expected) in [(READ_T, READ_RESULT), (DELETE_T2, DELETE_RESULT)] {
         let result = results

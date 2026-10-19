@@ -326,10 +326,10 @@ fn run_override_schema_roundtrip_contract() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn run_override_fixture_contract() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/hooks/run_override.json");
-    let payload = std::fs::read_to_string(fixture)?;
-    let overrides: HookRunOverrides = serde_json::from_str(&payload)?;
+    // The fixture's one copy, which `HOOK_RUN_OVERRIDES_FIXTURE_JSON` also
+    // embeds for the surface crates' tests.
+    let payload = include_str!("fixtures/hooks/run_override.json");
+    let overrides: HookRunOverrides = serde_json::from_str(payload)?;
 
     assert_eq!(overrides.disable, vec![HookId::new("global_observer")]);
     assert_eq!(overrides.entries.len(), 2);

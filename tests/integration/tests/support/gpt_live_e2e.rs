@@ -694,6 +694,25 @@ impl BrowserPeer {
         Ok(serde_json::from_value(snapshot["audio"].clone())?)
     }
 
+    /// One snapshot read for the assistant-quiet wait: the events so far and
+    /// the decoded playback audio ([`PlaybackAudio`]).
+    pub async fn quiet_probe(
+        &mut self,
+    ) -> Result<(Vec<Value>, PlaybackAudio), Box<dyn std::error::Error>> {
+        let snapshot = self.snapshot().await?;
+        self.last_raw_messages = snapshot["event_transport"]["rawMessages"]
+            .as_u64()
+            .unwrap_or(0);
+        self.last_parse_failures = snapshot["event_transport"]["parseFailures"]
+            .as_u64()
+            .unwrap_or(0);
+        let audio = PlaybackAudio::from_snapshot(&snapshot["audio"])?;
+        Ok((
+            snapshot["events"].as_array().cloned().unwrap_or_default(),
+            audio,
+        ))
+    }
+
     /// Payload-free summary of `events` under this peer's protocol.
     pub fn event_summary(&self, events: &[Value]) -> String {
         browser_event_summary(events, self.protocol)
@@ -1182,6 +1201,595 @@ impl AudioEvidence {
                     .non_silent_frames
                     .saturating_sub(baseline.non_silent_frames)
                     >= 2)
+    }
+}
+
+/// Decoded remote (assistant) audio as the assistant-quiet wait reads it
+/// from a peer snapshot. The browser counts non-silent frames it decoded
+/// from the raw remote track ahead of its playback gate, and remote RTP
+/// arrives at playback pace, so the counter follows what the user hears.
+/// Event arrival does not: a long readout's transcript and audio events end
+/// seconds before its playback does (#1719).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackAudio {
+    /// Non-silent decoded frames so far.
+    Measured(u64),
+    /// The browser decodes nothing: it has no `MediaStreamTrackProcessor`,
+    /// or the track reader stopped on an error. The counter then stays put,
+    /// which must never read as silence.
+    Unmeasured,
+}
+
+impl PlaybackAudio {
+    /// Read a peer snapshot's `audio` object. A missing or mistyped field is
+    /// an error, never a default.
+    pub fn from_snapshot(audio: &Value) -> Result<Self, String> {
+        let field = |name: &str| {
+            audio
+                .get(name)
+                .ok_or_else(|| format!("browser snapshot audio has no {name}"))
+        };
+        let supported = field("processor_supported")?
+            .as_bool()
+            .ok_or("browser snapshot audio processor_supported is not a boolean")?;
+        let errors = field("processor_errors")?
+            .as_u64()
+            .ok_or("browser snapshot audio processor_errors is not a count")?;
+        let frames = field("decoded_non_silent_frames")?
+            .as_u64()
+            .ok_or("browser snapshot audio decoded_non_silent_frames is not a count")?;
+        Ok(if supported && errors == 0 {
+            Self::Measured(frames)
+        } else {
+            Self::Unmeasured
+        })
+    }
+}
+
+/// What a scenario's assistant-quiet wait does without measured playback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackAudioPolicy {
+    /// The wait fails ([`QuietPoll::Unmeasured`]): S99, whose exchanges
+    /// already require decoded speech.
+    Required,
+    /// The wait runs on its other clauses and reports that playback was not
+    /// measured: S97 and S98, which accept analyser-only speech.
+    BestEffort,
+}
+
+/// The clause that last restarted the assistant-quiet window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuietRestart {
+    /// A newly arrived assistant transcript or audio event.
+    OutputEvent,
+    /// More non-silent decoded playback audio.
+    PlaybackAudio,
+    /// A new owned context append on the thinking or instructions lane.
+    ContextAppend,
+}
+
+/// How an assistant-quiet wait ended. The append counts are waiting
+/// periods, not appends: every owned append seen before assistant output
+/// follows joins one period (the bound runs from the newest of them), and
+/// the journal counts append attempts per fragment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuietReport {
+    /// Waiting periods that assistant output ended within the bound.
+    pub appends_answered: u32,
+    /// Waiting periods the bound ended with no assistant output.
+    pub appends_unanswered: u32,
+    /// Playback was not measured, so the audio clause did not run
+    /// ([`PlaybackAudioPolicy::BestEffort`] only).
+    pub audio_unmeasured: bool,
+}
+
+impl QuietReport {
+    /// The record of one wait that took `waited`: which clauses ended it,
+    /// for the `GPT_LIVE_QUIET` line and S99's `quiet_wait` metric.
+    pub fn describe(&self, waited: Duration) -> String {
+        format!(
+            "appends_answered={} appends_unanswered={} audio={} waited_ms={}",
+            self.appends_answered,
+            self.appends_unanswered,
+            if self.audio_unmeasured {
+                "unmeasured"
+            } else {
+                "measured"
+            },
+            waited.as_millis()
+        )
+    }
+}
+
+/// One poll of an assistant-quiet wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuietPoll {
+    Waiting,
+    Quiet(QuietReport),
+    /// Playback is not measured and the policy requires it.
+    Unmeasured,
+    /// The wait ran past [`AssistantQuiet::CEILING`]; the clause that last
+    /// restarted it, if any did.
+    CeilingExceeded(Option<QuietRestart>),
+}
+
+/// What the assistant-quiet wait reads at each poll.
+#[derive(Clone, Copy, Debug)]
+pub struct QuietObservation<'a> {
+    /// Every peer event so far.
+    pub events: &'a [Value],
+    pub audio: PlaybackAudio,
+    /// Owned thinking and instructions append attempts so far, when the
+    /// scenario keeps an evidence journal.
+    pub owned_appends: Option<usize>,
+}
+
+/// The rule a spoken fixture waits for, so it never talks over the
+/// assistant: [`Self::QUIET_FOR`] with no new assistant output event, no
+/// new non-silent decoded playback audio and no new owned context append,
+/// and every append seen during the wait followed by assistant output or
+/// left unanswered for [`Self::APPEND_RESPONSE_BOUND`]. A result's cue goes
+/// out about 1.6 s after a readout ends and its response starts later
+/// still; the bound keeps the window open across that gap.
+#[derive(Clone, Debug)]
+pub struct AssistantQuiet {
+    policy: PlaybackAudioPolicy,
+    started: Instant,
+    quiet_since: Instant,
+    seen_events: usize,
+    seen_decoded: Option<u64>,
+    seen_appends: Option<usize>,
+    awaiting_response_since: Option<Instant>,
+    last_restart: Option<QuietRestart>,
+    report: QuietReport,
+}
+
+impl AssistantQuiet {
+    pub const QUIET_FOR: Duration = Duration::from_secs(3);
+    pub const APPEND_RESPONSE_BOUND: Duration = Duration::from_secs(8);
+    /// Longer than any readout the scenarios ask for (S99's spelled-out
+    /// working directory runs about 28 s), so a clause that never stops
+    /// restarting the window fails here instead of at the scenario deadline.
+    pub const CEILING: Duration = Duration::from_secs(180);
+
+    /// Start a wait at `first`: what it already holds restarts nothing.
+    pub fn new(now: Instant, first: &QuietObservation<'_>, policy: PlaybackAudioPolicy) -> Self {
+        Self {
+            policy,
+            started: now,
+            quiet_since: now,
+            seen_events: first.events.len(),
+            seen_decoded: match first.audio {
+                PlaybackAudio::Measured(frames) => Some(frames),
+                PlaybackAudio::Unmeasured => None,
+            },
+            seen_appends: first.owned_appends,
+            awaiting_response_since: None,
+            last_restart: None,
+            report: QuietReport::default(),
+        }
+    }
+
+    pub fn observe(&mut self, now: Instant, seen: &QuietObservation<'_>) -> QuietPoll {
+        // Output first: it answers appends seen at earlier polls. An append
+        // first seen at this poll is answered by output at a later poll, so
+        // output that predates it in this poll never counts as its answer.
+        let mut output = false;
+        match seen.audio {
+            PlaybackAudio::Unmeasured => match self.policy {
+                PlaybackAudioPolicy::Required => return QuietPoll::Unmeasured,
+                PlaybackAudioPolicy::BestEffort => {
+                    self.report.audio_unmeasured = true;
+                    self.seen_decoded = None;
+                }
+            },
+            PlaybackAudio::Measured(frames) => {
+                if self
+                    .seen_decoded
+                    .is_some_and(|seen_frames| frames > seen_frames)
+                {
+                    self.restart(now, QuietRestart::PlaybackAudio);
+                    output = true;
+                }
+                self.seen_decoded = Some(frames);
+            }
+        }
+        let fresh = seen.events.get(self.seen_events..).unwrap_or_default();
+        if fresh.iter().any(is_assistant_output_event) {
+            self.restart(now, QuietRestart::OutputEvent);
+            output = true;
+        }
+        self.seen_events = seen.events.len();
+        if output && self.awaiting_response_since.take().is_some() {
+            self.report.appends_answered += 1;
+        }
+        if let Some(appends) = seen.owned_appends {
+            if self
+                .seen_appends
+                .is_some_and(|seen_appends| appends > seen_appends)
+            {
+                self.restart(now, QuietRestart::ContextAppend);
+                // The bound runs from the newest append: a cue sent after
+                // quiet context gets its own window to be answered in.
+                self.awaiting_response_since = Some(now);
+            }
+            self.seen_appends = Some(appends);
+        }
+        if self.awaiting_response_since.is_some_and(|since| {
+            now.saturating_duration_since(since) >= Self::APPEND_RESPONSE_BOUND
+        }) {
+            self.awaiting_response_since = None;
+            self.report.appends_unanswered += 1;
+        }
+        if self.awaiting_response_since.is_none()
+            && now.saturating_duration_since(self.quiet_since) >= Self::QUIET_FOR
+        {
+            return QuietPoll::Quiet(self.report);
+        }
+        if now.saturating_duration_since(self.started) >= Self::CEILING {
+            return QuietPoll::CeilingExceeded(self.last_restart);
+        }
+        QuietPoll::Waiting
+    }
+
+    fn restart(&mut self, now: Instant, clause: QuietRestart) {
+        self.quiet_since = now;
+        self.last_restart = Some(clause);
+    }
+}
+
+/// An assistant output event as the peer records it.
+pub fn is_assistant_output_event(event: &Value) -> bool {
+    event["type"] == "session.output_transcript.delta"
+        || event["type"] == "session.output_audio.delta"
+}
+
+/// Whether the assistant was audible as a spoken question began: decoded
+/// playback grew between the snapshot taken before the fixture played and
+/// the one at the question's first input transcript delta.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuestionOnset {
+    Silent,
+    OverPlayback,
+    Unmeasured,
+}
+
+impl QuestionOnset {
+    pub fn classify(before_play: PlaybackAudio, at_first_input: PlaybackAudio) -> Self {
+        match (before_play, at_first_input) {
+            (PlaybackAudio::Measured(before), PlaybackAudio::Measured(at)) if at > before => {
+                Self::OverPlayback
+            }
+            (PlaybackAudio::Measured(_), PlaybackAudio::Measured(_)) => Self::Silent,
+            _ => Self::Unmeasured,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Silent => "false",
+            Self::OverPlayback => "true",
+            Self::Unmeasured => "unmeasured",
+        }
+    }
+}
+
+#[cfg(test)]
+mod assistant_quiet_tests {
+    use super::{
+        AssistantQuiet, PlaybackAudio, PlaybackAudioPolicy, QuestionOnset, QuietObservation,
+        QuietPoll, QuietReport, QuietRestart,
+    };
+    use serde_json::{Value, json};
+    use tokio::time::{Duration, Instant};
+
+    const POLL: Duration = Duration::from_millis(100);
+
+    /// A scripted poll timeline: what the peer and journal report at each
+    /// 100 ms poll, and when the wait first answers anything but Waiting.
+    struct Script {
+        start: Instant,
+        events: Vec<Value>,
+        decoded: u64,
+        appends: usize,
+        audio_measured: bool,
+    }
+
+    impl Script {
+        fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                events: Vec::new(),
+                decoded: 1_000,
+                appends: 4,
+                audio_measured: true,
+            }
+        }
+
+        fn audio(&self) -> PlaybackAudio {
+            if self.audio_measured {
+                PlaybackAudio::Measured(self.decoded)
+            } else {
+                PlaybackAudio::Unmeasured
+            }
+        }
+
+        /// Poll every 100 ms from t=0 until `until`, applying `step` before
+        /// each poll; returns the first non-Waiting answer and its time.
+        fn run(
+            mut self,
+            policy: PlaybackAudioPolicy,
+            until: Duration,
+            mut step: impl FnMut(Duration, &mut Script),
+        ) -> Option<(Duration, QuietPoll)> {
+            let first = QuietObservation {
+                events: &self.events,
+                audio: self.audio(),
+                owned_appends: Some(self.appends),
+            };
+            let mut quiet = AssistantQuiet::new(self.start, &first, policy);
+            let mut at = Duration::ZERO;
+            while at <= until {
+                step(at, &mut self);
+                let seen = QuietObservation {
+                    events: &self.events,
+                    audio: self.audio(),
+                    owned_appends: Some(self.appends),
+                };
+                let poll = quiet.observe(self.start + at, &seen);
+                if poll != QuietPoll::Waiting {
+                    return Some((at, poll));
+                }
+                at += POLL;
+            }
+            None
+        }
+    }
+
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// R3 (control): nothing moves after the wait starts, so it ends after
+    /// exactly the quiet window, as today's rule does.
+    #[test]
+    fn quiet_after_three_silent_seconds_when_nothing_moves() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |_, _| {});
+        assert_eq!(
+            outcome,
+            Some((ms(3_000), QuietPoll::Quiet(QuietReport::default())))
+        );
+    }
+
+    /// R1: the readout's events have all arrived, but its audio keeps
+    /// playing for 8 s. The question must wait for playback to end, not for
+    /// events to stop arriving (S99 run 39205621248 spoke over it).
+    #[test]
+    fn playback_that_outlasts_the_events_keeps_the_window_open() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at <= ms(8_000) {
+                script.decoded += 960;
+            }
+        });
+        assert_eq!(
+            outcome,
+            Some((ms(11_000), QuietPoll::Quiet(QuietReport::default())))
+        );
+    }
+
+    /// R1 (events): an assistant transcript event still restarts the window.
+    #[test]
+    fn an_output_event_restarts_the_window() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at == ms(2_000) {
+                script
+                    .events
+                    .push(json!({"type": "session.output_transcript.delta", "delta": "x"}));
+            }
+        });
+        assert_eq!(
+            outcome,
+            Some((ms(5_000), QuietPoll::Quiet(QuietReport::default())))
+        );
+    }
+
+    /// R2: the readout ends at t0, its deferred result cue goes out 1.6 s
+    /// later, and the cue's response plays from t0+3.2 s to t0+6 s. Quiet
+    /// comes 3 s after that response, not 3 s after the readout.
+    #[test]
+    fn a_cue_after_the_readout_and_its_response_keep_the_window_open() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at == ms(1_600) {
+                script.appends += 1;
+            }
+            if at >= ms(3_200) && at <= ms(6_000) {
+                script.decoded += 960;
+            }
+        });
+        assert_eq!(
+            outcome,
+            Some((
+                ms(9_000),
+                QuietPoll::Quiet(QuietReport {
+                    appends_answered: 1,
+                    ..QuietReport::default()
+                })
+            ))
+        );
+    }
+
+    /// R5 (L2): the cue's response starts 3.9 s after the cue, past the
+    /// quiet window. The append keeps the window open until the response
+    /// begins, and quiet comes 3 s after the response ends.
+    #[test]
+    fn a_response_later_than_the_quiet_window_still_holds_the_wait() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at == ms(1_600) {
+                script.appends += 1;
+            }
+            if at >= ms(5_500) && at <= ms(7_000) {
+                script.decoded += 960;
+            }
+        });
+        assert_eq!(
+            outcome,
+            Some((
+                ms(10_000),
+                QuietPoll::Quiet(QuietReport {
+                    appends_answered: 1,
+                    ..QuietReport::default()
+                })
+            ))
+        );
+    }
+
+    /// R5 (L2 bound): quiet context the model does not answer holds the wait
+    /// for the bound only, and the report says it went unanswered.
+    #[test]
+    fn an_unanswered_append_is_waited_out_for_the_bound_only() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at == ms(1_000) {
+                script.appends += 1;
+            }
+        });
+        assert_eq!(
+            outcome,
+            Some((
+                ms(9_000),
+                QuietPoll::Quiet(QuietReport {
+                    appends_unanswered: 1,
+                    ..QuietReport::default()
+                })
+            ))
+        );
+    }
+
+    /// L1: without measured playback, S99's wait fails typed instead of
+    /// reading a still counter as silence.
+    #[test]
+    fn unmeasured_playback_fails_a_wait_that_requires_it() {
+        let mut script = Script::new();
+        script.audio_measured = false;
+        let outcome = script.run(PlaybackAudioPolicy::Required, ms(20_000), |_, _| {});
+        assert_eq!(outcome, Some((ms(0), QuietPoll::Unmeasured)));
+    }
+
+    /// L1: playback is judged on every poll, not once at the start. Frames
+    /// grow, then the browser reports a processor error: from that poll the
+    /// audio clause is unmeasured, so a wait that requires it fails with the
+    /// typed error instead of going quiet 3 s after the last growth.
+    #[test]
+    fn a_processor_error_mid_wait_fails_a_wait_that_requires_it() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at <= ms(1_000) {
+                script.decoded += 960;
+            }
+            let snapshot = json!({
+                "processor_supported": true,
+                "processor_errors": u64::from(at >= ms(1_500)),
+                "decoded_non_silent_frames": script.decoded,
+            });
+            script.audio_measured = PlaybackAudio::from_snapshot(&snapshot)
+                == Ok(PlaybackAudio::Measured(script.decoded));
+        });
+        assert_eq!(outcome, Some((ms(1_500), QuietPoll::Unmeasured)));
+    }
+
+    /// L1: S97 and S98 run on the other clauses and the report says so.
+    #[test]
+    fn unmeasured_playback_is_reported_by_a_best_effort_wait() {
+        let mut script = Script::new();
+        script.audio_measured = false;
+        let outcome = script.run(PlaybackAudioPolicy::BestEffort, ms(20_000), |_, _| {});
+        assert_eq!(
+            outcome,
+            Some((
+                ms(3_000),
+                QuietPoll::Quiet(QuietReport {
+                    audio_unmeasured: true,
+                    ..QuietReport::default()
+                })
+            ))
+        );
+    }
+
+    /// L3: a clause that never stops (a remote noise floor above the
+    /// non-silent threshold) fails at the ceiling and is named.
+    #[test]
+    fn a_clause_that_never_stops_fails_at_the_ceiling_and_is_named() {
+        let outcome = Script::new().run(
+            PlaybackAudioPolicy::Required,
+            AssistantQuiet::CEILING + ms(1_000),
+            |_, script| script.decoded += 960,
+        );
+        assert_eq!(
+            outcome,
+            Some((
+                AssistantQuiet::CEILING,
+                QuietPoll::CeilingExceeded(Some(QuietRestart::PlaybackAudio))
+            ))
+        );
+    }
+
+    #[test]
+    fn snapshot_audio_is_measured_only_while_the_processor_decodes() {
+        let audio = |supported: bool, errors: u64| {
+            json!({
+                "processor_supported": supported,
+                "processor_errors": errors,
+                "decoded_non_silent_frames": 4_800,
+            })
+        };
+        assert_eq!(
+            PlaybackAudio::from_snapshot(&audio(true, 0)),
+            Ok(PlaybackAudio::Measured(4_800))
+        );
+        assert_eq!(
+            PlaybackAudio::from_snapshot(&audio(false, 0)),
+            Ok(PlaybackAudio::Unmeasured)
+        );
+        assert_eq!(
+            PlaybackAudio::from_snapshot(&audio(true, 1)),
+            Ok(PlaybackAudio::Unmeasured)
+        );
+        assert!(PlaybackAudio::from_snapshot(&json!({"processor_supported": true})).is_err());
+    }
+
+    /// R4: the onset compares the snapshot before the fixture played with
+    /// the one at the question's first input delta.
+    #[test]
+    fn a_question_that_starts_over_playback_is_classified() {
+        assert_eq!(
+            QuestionOnset::classify(PlaybackAudio::Measured(100), PlaybackAudio::Measured(900)),
+            QuestionOnset::OverPlayback
+        );
+        assert_eq!(
+            QuestionOnset::classify(PlaybackAudio::Measured(900), PlaybackAudio::Measured(900)),
+            QuestionOnset::Silent
+        );
+        assert_eq!(
+            QuestionOnset::classify(PlaybackAudio::Unmeasured, PlaybackAudio::Measured(900)),
+            QuestionOnset::Unmeasured
+        );
+    }
+
+    /// The per-wait record (`GPT_LIVE_QUIET`, S99's `quiet_wait`) names how
+    /// the wait ended, so a soak can count cues left unanswered.
+    #[test]
+    fn a_quiet_report_describes_how_its_wait_ended() {
+        let report = QuietReport {
+            appends_answered: 1,
+            appends_unanswered: 2,
+            audio_unmeasured: true,
+        };
+        assert_eq!(
+            report.describe(ms(9_250)),
+            "appends_answered=1 appends_unanswered=2 audio=unmeasured waited_ms=9250"
+        );
+        assert_eq!(
+            QuietReport::default().describe(ms(3_000)),
+            "appends_answered=0 appends_unanswered=0 audio=measured waited_ms=3000"
+        );
     }
 }
 

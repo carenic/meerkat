@@ -2,6 +2,15 @@
 //!
 //! Connect to MCP servers and route tool calls.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 mod adapter;
 pub mod apps;
 mod attempt;
@@ -90,7 +99,7 @@ inventory::submit! {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod client_service_tests;
 #[cfg(test)]
 mod connect_attempt_tests;

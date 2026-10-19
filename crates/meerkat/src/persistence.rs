@@ -1922,6 +1922,7 @@ mod tests {
     /// prompt and persisted it before the provider call failed, so it is the
     /// only shape that reaches the runtime bridge's row-preparation callback.
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "workspace-tests")]
     fn stage_published_pre_ledger_realm(
         state_root: &Path,
         realm_id: &str,
@@ -1965,6 +1966,7 @@ mod tests {
     /// returned on the first failure, schedule-store was never attempted even
     /// though it would have migrated cleanly. Two of three recoverable
     /// domains landed zero.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn unbridgeable_domain_does_not_condemn_its_co_tenants()
@@ -2059,6 +2061,7 @@ mod tests {
     /// The one real dependency edge is still honoured: the runtime bridge
     /// imports session snapshots, so a failed session-store must skip it
     /// rather than run it against a source that was never established.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn runtime_bridge_is_skipped_when_its_session_prerequisite_fails()
@@ -2116,6 +2119,7 @@ mod tests {
     /// is the one an operator actually owns: it carries the durable rows a
     /// real run left behind, and it is the only one that reaches the runtime
     /// bridge's row-preparation callback.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn published_pre_ledger_realm_bridges_through_the_facade()
@@ -2315,6 +2319,7 @@ mod tests {
     /// failing closed on an undecodable durable row exactly as before. This
     /// test contracts the operator-visible half: the domain lands, the record
     /// is named, and its bytes are untouched.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn an_undecodable_terminal_row_costs_its_record_and_not_the_domain()
@@ -2407,6 +2412,7 @@ mod tests {
     /// would leave the operator-facing promise - that the bridge inspects
     /// records and prints the ones it cannot carry - backed by nothing, which
     /// is the exact shape of unverified promise this P0 exists to remove.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn an_uncarriable_record_is_named_and_the_realm_still_opens()
@@ -2547,6 +2553,7 @@ mod tests {
     /// succeeding on the realm a published binary wrote - including the
     /// `attempted-turn` captures, whose durable rows are the ones the bridge
     /// used to refuse.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn bridged_pre_ledger_realm_opens_through_the_ordinary_path()

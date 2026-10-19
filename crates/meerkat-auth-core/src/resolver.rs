@@ -2444,6 +2444,7 @@ mod tests {
         ProviderAuthPersistence::new(store, Arc::new(crate::InMemoryCoordinator::new()))
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn generated_auth_lease_handle_for_test(
         handle: Arc<meerkat_runtime::RuntimeAuthLeaseHandle>,
@@ -2473,6 +2474,7 @@ mod tests {
             .expect("generated AuthMachine transition marks fixture tokens")
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_tokens_lifecycle_published_for_test(
         tokens: &PersistedTokens,
@@ -2519,6 +2521,7 @@ mod tests {
             .expect("generated fixture marker carries publication time")
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     fn mark_tokens_lifecycle_published_after_time_for_test(
         tokens: &PersistedTokens,
@@ -2716,12 +2719,14 @@ mod tests {
         default_test_lease_key().to_token_key()
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     struct StaticAuthLeaseHandle {
         handle: Arc<meerkat_runtime::RuntimeAuthLeaseHandle>,
         publication_transition: Option<AuthLeaseTransition>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     impl StaticAuthLeaseHandle {
         fn valid() -> Arc<Self> {
@@ -2796,12 +2801,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     struct MutableAuthLeaseHandle {
         handle: Arc<meerkat_runtime::RuntimeAuthLeaseHandle>,
         publication_transition: Option<AuthLeaseTransition>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     impl MutableAuthLeaseHandle {
         fn unknown() -> Arc<Self> {
@@ -3076,6 +3083,7 @@ mod tests {
     /// credential-use verdict, and agrees with the open in every lease phase:
     /// a valid lease with a stored secret is ready; a lease needing a refresh
     /// or a re-login is not, because the simple-secret open rejects both.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_readiness_with_persistence_agrees_with_the_open() {
@@ -3174,6 +3182,7 @@ mod tests {
         assert!(matches!(err, ProviderAuthError::SourceResolutionFailed(_)));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn command_credential_freshness_verdict_comes_from_auth_machine_lease() {
@@ -3342,6 +3351,7 @@ mod tests {
         let _ = std::fs::remove_file(&run_log);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_source_reads_binding_scoped_token_store() {
@@ -3363,6 +3373,7 @@ mod tests {
         assert_eq!(secret, "sk-managed");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_source_restores_marked_token_lifecycle_after_restart() {
@@ -3430,6 +3441,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_non_oauth_source_rejects_empty_auth_lifecycle() {
@@ -3454,6 +3466,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_non_oauth_source_rejects_released_auth_lifecycle() {
@@ -3515,6 +3528,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_source_rejects_unmarked_token_even_with_valid_lifecycle() {
@@ -3540,6 +3554,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_source_rejects_marker_from_stale_lifecycle_generation() {
@@ -3570,6 +3585,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_source_rejects_expiring_authmachine_freshness() {
@@ -3597,6 +3613,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_empty_lifecycle_rejects_marker_with_mismatched_expiry() {
@@ -3632,6 +3649,7 @@ mod tests {
         assert_eq!(auth_lease.snapshot(&default_test_lease_key()).phase, None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_empty_lifecycle_rejects_marker_missing_explicit_expiry() {
@@ -3662,6 +3680,7 @@ mod tests {
         assert_eq!(auth_lease.snapshot(&default_test_lease_key()).phase, None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_empty_lifecycle_restores_valid_lifecycle_marker() {
@@ -3695,6 +3714,7 @@ mod tests {
         assert_eq!(snapshot.credential_published_at_millis, published_at);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_only_lifecycle_rejects_valid_marked_token() {
@@ -3731,6 +3751,7 @@ mod tests {
         assert_eq!(snapshot.phase, Some(AuthLeasePhase::ReauthRequired));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_released_lifecycle_rejects_valid_marked_token() {
@@ -3777,6 +3798,7 @@ mod tests {
         assert_eq!(auth_lease.snapshot(&lease_key).phase, None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_source_accepts_marker_when_generation_and_publication_match() {
@@ -3805,6 +3827,7 @@ mod tests {
         assert_eq!(secret, "post-consume-access");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_source_rejects_newer_token_marker_over_existing_lease() {
@@ -3850,6 +3873,7 @@ mod tests {
         assert_eq!(auth_lease.snapshot(&lease_key), previous_snapshot);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn oauth_lifecycle_marker_relation_compares_publication_time_for_equal_expiry() {
@@ -3901,6 +3925,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn oauth_lifecycle_marker_relation_prefers_publication_time_over_expiry() {
@@ -3950,6 +3975,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn oauth_lifecycle_marker_relation_rejects_equal_publication_time_expiry_drift() {
@@ -4023,6 +4049,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn oauth_lifecycle_marker_relation_rejects_same_time_same_expiry_older_generation() {
@@ -4051,6 +4078,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn oauth_lifecycle_marker_relation_rejects_equal_expiry_without_publication_match() {
@@ -4077,6 +4105,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_refresh_rejects_newer_token_marker_over_existing_lease() {
@@ -4132,6 +4161,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_refresh_commit_uses_authmachine_refresh_lifecycle() {
@@ -4185,6 +4215,7 @@ mod tests {
         assert!(after_refresh.credential_present);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn account_alias_oauth_rebase_preserves_exact_credential_identity() {
@@ -4323,6 +4354,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(not(target_arch = "wasm32"), feature = "file-lock"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forced_rotating_refreshes_rebase_token_and_lifecycle_baseline_under_file_lock() {
@@ -4521,6 +4553,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn adopted_refresh_failure_does_not_poison_inflight_owner_lifecycle() {
@@ -4573,6 +4606,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn managed_store_oauth_owned_refresh_failure_publishes_authmachine_failure() {
@@ -4624,6 +4658,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_transient_refresh_failure_keeps_retryable_marker() {
@@ -4680,6 +4715,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn cancelled_oauth_refresh_failure_publishes_owner_lifecycle_failure() {
@@ -4768,6 +4804,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn dropped_oauth_refresh_before_coordinator_claim_marks_transient_failure() {
@@ -4851,6 +4888,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn oauth_refresh_inner_coordinator_rejection_marks_transient_failure() {
@@ -4904,6 +4942,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_resolution_holds_lifecycle_guard_until_commit_boundary() {
@@ -4959,6 +4998,7 @@ mod tests {
             .expect("second resolver should succeed");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_refresh_commit_rejects_stale_loaded_tokens() {
@@ -5005,6 +5045,7 @@ mod tests {
         assert_eq!(stored, newer_tokens);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_refresh_commit_accepts_already_committed_shared_refresh() {
@@ -5064,6 +5105,7 @@ mod tests {
         assert_eq!(store.load(&key).await.unwrap(), Some(first));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_oauth_refresh_rejects_newer_token_marker_over_refreshing_lease() {
@@ -5120,6 +5162,7 @@ mod tests {
         assert_eq!(store.load(&key).await.unwrap().unwrap(), shared_tokens);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn managed_store_source_rejects_wrong_token_mode() {
@@ -5186,6 +5229,7 @@ mod tests {
     }
 
     // C-e: real generated owner controls, not a mutable snapshot fake.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     async fn ce_status_fixture() -> (
         Arc<dyn TokenStore>,
@@ -5211,6 +5255,7 @@ mod tests {
         (store, auth, marked)
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     async fn ce_status_preserves_phase(phase: AuthLeasePhase) {
         let (store, auth, original) = ce_status_fixture().await;
@@ -5267,18 +5312,21 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn ce_status_preserves_matching_refreshing() {
         ce_status_preserves_phase(AuthLeasePhase::Refreshing).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn ce_status_preserves_matching_reauth_required() {
         ce_status_preserves_phase(AuthLeasePhase::ReauthRequired).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn ce_status_absent_newer_and_unmarked_controls() {
@@ -5382,6 +5430,7 @@ mod tests {
         /// A managed OpenAI OAuth binding in `realm`, published under its
         /// lifecycle exclusion. A test that releases the lease takes a realm
         /// of its own (see `simple_secret_binding_in`).
+        #[cfg(feature = "workspace-tests")]
         async fn fixture(
             realm: &str,
             present: bool,
@@ -5433,6 +5482,7 @@ mod tests {
         /// A managed OpenAI OAuth binding in its own realm, published on a
         /// fresh owner: the lifecycle owner registry is process wide, and
         /// these tests hold or retain its exclusion.
+        #[cfg(feature = "workspace-tests")]
         #[cfg(feature = "keyring")]
         async fn keychain_fixture(
             realm: &str,
@@ -5476,6 +5526,7 @@ mod tests {
         /// T1: at the public status entry, with the ACTUAL lifecycle guard held
         /// and an interactive keychain call in flight, status answers at once
         /// that the owner is busy, and reads nothing.
+        #[cfg(feature = "workspace-tests")]
         #[cfg(feature = "keyring")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn status_with_the_owner_busy_answers_at_once_without_reading() {
@@ -5519,6 +5570,7 @@ mod tests {
         /// Public unattended cold control: concurrent cold resolutions of one
         /// credential make exactly one keychain call, and every other caller
         /// answers a typed pending at once.
+        #[cfg(feature = "workspace-tests")]
         #[cfg(feature = "keyring")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn concurrent_cold_resolutions_of_one_credential_make_one_keychain_call() {
@@ -5571,6 +5623,7 @@ mod tests {
         /// credential's resolution over the process capacity answers a typed
         /// unavailability with no call, and a recorded denial answers typed
         /// denied with no call until an explicit credential change re-arms it.
+        #[cfg(feature = "workspace-tests")]
         #[cfg(feature = "keyring")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn cold_resolutions_over_capacity_or_after_a_denial_make_no_keychain_call() {
@@ -5662,6 +5715,7 @@ mod tests {
             assert_eq!(keychain.calls(), 4);
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn fresh_resolution_still_restores_an_absent_owner() {
             let (env, binding, store, owner, marked) = fixture("rm-fresh-restore", false).await;
@@ -5677,6 +5731,7 @@ mod tests {
             drop(loaded);
             assert_eq!(store.load(&key).await.unwrap(), Some(marked));
         }
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn existing_maintenance_cannot_restore_absent_owner() {
             let (env, binding, store, owner, marked) = fixture("rm-existing-absent", false).await;
@@ -5696,6 +5751,7 @@ mod tests {
         /// resolving the shared binding holds its lifecycle exclusion while
         /// this test releases its own lease. `release_lease` try-locks, so
         /// the release must not share that exclusion.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_held_shared_binding_does_not_block_a_fixture_release() {
             let (_env, binding, _store, owner, _) = fixture("rm-held-shared", true).await;
@@ -5708,6 +5764,7 @@ mod tests {
             assert!(!owner.snapshot(&lease).credential_present);
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn existing_maintenance_rechecks_release_before_locked_rebase() {
             for changed_row in [false, true] {
@@ -5832,6 +5889,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn absent_or_released_maintenance_preload_never_reads_the_store() {
             for released in [false, true] {
@@ -5866,6 +5924,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         async fn assert_locked_newer_publication(replace_owner: bool) {
             // The shared binding: the newer publication below is marked for it,
             // and this helper only awaits the exclusion, never try-locks it.
@@ -5958,11 +6017,13 @@ mod tests {
             assert_eq!(store.load(&key).await.unwrap(), Some(durable));
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn existing_maintenance_adopts_newer_locked_row_from_same_owner() {
             assert_locked_newer_publication(false).await;
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn existing_maintenance_rejects_newer_locked_row_after_owner_replacement() {
             assert_locked_newer_publication(true).await;

@@ -177,6 +177,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn realtime_session_factory_defaults_to_missing_feature() {
         use crate::provider_runtime::binding::StaticLease;

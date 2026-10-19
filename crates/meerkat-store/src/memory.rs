@@ -1285,6 +1285,73 @@ mod tests {
         );
     }
 
+    /// The memory store lays out only whole transcript graphs.
+    /// A blob session whose graph retired its oldest occurrences refuses
+    /// typed at its first head-canonical write and at a read-only head
+    /// synthesis, and never yields a head that counts only the retained
+    /// occurrences.
+    #[tokio::test]
+    async fn re_anchored_blob_session_refuses_typed() {
+        let mut session = Session::new();
+        for cycle in 0..5 {
+            for turn in 0..2 {
+                session.push(Message::User(UserMessage::text(format!(
+                    "cycle {cycle} turn {turn}"
+                ))));
+            }
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text(format!("summary {cycle}")))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .expect("compaction");
+        }
+        assert_eq!(
+            session
+                .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                .expect("retire"),
+            1
+        );
+        let id = session.id().clone();
+
+        let mut state = MemoryStoreState::default();
+        state.sessions.insert(id.clone(), session.clone());
+        let migrated = state.ensure_head_canonical_for_write(&id);
+        assert!(
+            matches!(
+                &migrated,
+                Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
+                    if reason.contains("needs the whole graph")
+            ),
+            "{migrated:?}"
+        );
+        assert!(!state.heads.contains_key(&id));
+
+        let store = Arc::new(MemoryStore::new());
+        store
+            .state
+            .write()
+            .await
+            .sessions
+            .insert(id.clone(), session);
+        let inc = Arc::clone(&store)
+            .as_incremental()
+            .expect("memory store must expose the incremental capability");
+        let synthesized = inc.load_head(&id).await;
+        assert!(
+            matches!(
+                &synthesized,
+                Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
+                    if reason.contains("needs the whole graph")
+            ),
+            "{synthesized:?}"
+        );
+    }
+
     #[tokio::test]
     async fn verify_current_head_keeps_the_materialize_head_row_checks() {
         let store = Arc::new(MemoryStore::new());

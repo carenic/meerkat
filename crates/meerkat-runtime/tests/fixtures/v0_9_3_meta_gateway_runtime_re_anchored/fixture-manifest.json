@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "fixture_id": "meta-0.9.3-gateway-runtime-re-anchored-synthetic",
+  "data_classification": "synthetic_non_production",
+  "producer": {
+    "artifact_origin": "published_release",
+    "product": "meerkat-meta rpc_gateway",
+    "version": "0.9.3",
+    "binary_sha256": "757519ed1210d16d865e2e37de3fba098a1cca6ccba6a7e1dc646963fb04a335",
+    "release_asset": "meta-rpc-gateway-0.9.3-x86_64-unknown-linux-gnu.tar.gz",
+    "release_asset_sha256": "b416df1ba5648ca3ed849dec2692f664c37b0e7277232a6d2421ac53961a18b0",
+    "source_release": "https://github.com/lukacf/meerkat-meta/releases/tag/v0.9.3"
+  },
+  "capture": {
+    "composition": "rpc_gateway --persistent over a persistent_state directory with a roster of member agents; runtime.sqlite is that gateway's standalone WholeBlob SqliteRuntimeStore",
+    "boots": 3,
+    "clean_shutdown": true,
+    "model": "loopback chat-completions model with synthetic replies; a user message can make it report an input cost above the auto-compaction threshold once, which compacts that session",
+    "compaction": "the 0.9.3 defaults: history_retained_rewrites 4, min_turns_between_compactions 3",
+    "re_anchored": "two sessions compacted six times each, so the gateway retired the two oldest rewrite occurrences of each; one of the two sessions was deleted under 0.9.3 and its member continued on a new session, so its runtime remains bound to nothing"
+  },
+  "file": {
+    "path": "runtime.sqlite",
+    "bytes": 1146880,
+    "sha256": "f46d9c81406e2e3a93c6c16879614e1c4f751ccb2ef24de32ed5c767ff5bc39e",
+    "stored_as": [
+      {
+        "path": "runtime.sqlite.part1",
+        "bytes": 573440,
+        "sha256": "78efebbe9c5136aa8864440622158bd1fc1b3deb884858ee7238341c8c1d8ae4"
+      },
+      {
+        "path": "runtime.sqlite.part2",
+        "bytes": 573440,
+        "sha256": "4f3fc95e2b5fa51677a4f4bbb6bd0f3e527743bd85187418a1c9d3ec8e92f995"
+      }
+    ]
+  },
+  "expected": {
+    "ledgers": [
+      {
+        "domain": "runtime-store",
+        "version": 3
+      }
+    ],
+    "runtimes": [
+      {
+        "runtime_id": "rt:session:01a1546e-8170-79b3-a26f-8de4f7f21f19",
+        "session_id": "01a1546e-8170-79b3-a26f-8de4f7f21f19",
+        "store_revision": 9,
+        "body_bytes": 26642,
+        "body_sha256": "d550d7e393b5410bde96fd0d046ff5186487e6e31ada2e78a41dc35e00d72505",
+        "message_count": 4,
+        "rewrite_occurrences": 2,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8171-7ea3-86c2-02042751d84f",
+        "session_id": "01a1546e-8171-7ea3-86c2-02042751d84f",
+        "store_revision": 5,
+        "body_bytes": 7277,
+        "body_sha256": "10155175f6eb2d571767109cbf58abe61390101a139cfd112278ee0e8d620d5a",
+        "message_count": 7,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8173-7280-9b5b-4c81dac3344d",
+        "session_id": "01a1546e-8173-7280-9b5b-4c81dac3344d",
+        "store_revision": 5,
+        "body_bytes": 18887,
+        "body_sha256": "13662553d870afb2cccc558147e848fc68e3edbf419809944cd9e98c86bb790c",
+        "message_count": 4,
+        "rewrite_occurrences": 1,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8174-7fc2-8736-bc0247309cc2",
+        "session_id": "01a1546e-8174-7fc2-8736-bc0247309cc2",
+        "store_revision": 5,
+        "body_bytes": 18887,
+        "body_sha256": "74609164f1d3e3b2a55fb6fcab6abd96fd2624ab50b495a3ef426494675bf45f",
+        "message_count": 4,
+        "rewrite_occurrences": 1,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-821a-7d13-88b0-480fd863c394",
+        "session_id": "01a1546e-821a-7d13-88b0-480fd863c394",
+        "store_revision": 3,
+        "body_bytes": 6135,
+        "body_sha256": "7170cf6ebde94673f35ac5675c259d66832a2f79f28587518b0d4ab040e77982",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-821b-73d1-82ce-6f7d8eefd9b5",
+        "session_id": "01a1546e-821b-73d1-82ce-6f7d8eefd9b5",
+        "store_revision": 2,
+        "body_bytes": 6102,
+        "body_sha256": "bbb5162140b56eeb72fe6930c248ce4a6c2fbe8173022651721a6fccfb3236f2",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8228-78c3-ad21-6e411b0cdc78",
+        "session_id": "01a1546e-8228-78c3-ad21-6e411b0cdc78",
+        "store_revision": 2,
+        "body_bytes": 6100,
+        "body_sha256": "6ba4288f8b9e6ec86258ec2412a25e8cb49c1bdabaa49485121b6ad13e67514f",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8232-7013-9427-496f15666bf6",
+        "session_id": "01a1546e-8232-7013-9427-496f15666bf6",
+        "store_revision": 6,
+        "body_bytes": 18883,
+        "body_sha256": "ecbbc43e50827f019dc1a313a178618c9b5c43c0443bccf517d7af50f26c9b66",
+        "message_count": 4,
+        "rewrite_occurrences": 1,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-82ae-75b1-ba4d-0c46f401678b",
+        "session_id": "01a1546e-82ae-75b1-ba4d-0c46f401678b",
+        "store_revision": 3,
+        "body_bytes": 6135,
+        "body_sha256": "12132b4faa69add64622509e3bb7f013295996e1d3abcded6d70a96a515fe7c4",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-82cd-7721-87b1-060d8cfa43aa",
+        "session_id": "01a1546e-82cd-7721-87b1-060d8cfa43aa",
+        "store_revision": 4,
+        "body_bytes": 6711,
+        "body_sha256": "2a7554985f3dc6650c9d3a8255b77835bffcfe12bb848e90159372d1424ad722",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-82cf-7092-b4ce-87cd3eb04b41",
+        "session_id": "01a1546e-82cf-7092-b4ce-87cd3eb04b41",
+        "store_revision": 5,
+        "body_bytes": 6715,
+        "body_sha256": "3975538352eb372b94aa2e8d63e9cfba671afeea7d8f3d72cb1446b17a520b54",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-82d1-77b2-bc92-65105db0980e",
+        "session_id": "01a1546e-82d1-77b2-bc92-65105db0980e",
+        "store_revision": 4,
+        "body_bytes": 6704,
+        "body_sha256": "d417ea261864d066867de57d78376d72ae89c9532ef88ea0e462cffc454867aa",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8333-73c2-82e3-59d51261a4eb",
+        "session_id": "01a1546e-8333-73c2-82e3-59d51261a4eb",
+        "store_revision": 4,
+        "body_bytes": 6713,
+        "body_sha256": "80960e31db94787b166f473c23e11c59f681672d1c77c5e52de3253979c95e36",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8371-74d1-896c-966fb45300d9",
+        "session_id": "01a1546e-8371-74d1-896c-966fb45300d9",
+        "store_revision": 3,
+        "body_bytes": 6135,
+        "body_sha256": "775c4e60e0166d646f375015c58d475b24c42d24674714c4232918b90fa4c6fd",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-837c-7d83-8d3b-7b122f899d7a",
+        "session_id": "01a1546e-837c-7d83-8d3b-7b122f899d7a",
+        "store_revision": 3,
+        "body_bytes": 6136,
+        "body_sha256": "0bbf0d7e7ffa1654ee489418c3bcc00a3b62d805e4f42ed61dafc62d9983367a",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-837d-72a2-a164-bfd6824978a7",
+        "session_id": "01a1546e-837d-72a2-a164-bfd6824978a7",
+        "store_revision": 29,
+        "body_bytes": 48682,
+        "body_sha256": "fc790696d2dbd70132b7934da361ac2e8187f201c2d1825e2cc382361b6a9ad6",
+        "message_count": 10,
+        "rewrite_occurrences": 6,
+        "retired_occurrences": 2
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-839b-75e0-bf3a-2f11627c6f19",
+        "session_id": "01a1546e-839b-75e0-bf3a-2f11627c6f19",
+        "store_revision": 27,
+        "body_bytes": 48135,
+        "body_sha256": "16fdaf395cae6c533a34c021eb94de93a728d3f3cbbc6562f843d6200d7f0e23",
+        "message_count": 8,
+        "rewrite_occurrences": 6,
+        "retired_occurrences": 2
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8405-7e10-acdf-a4b6712df257",
+        "session_id": "01a1546e-8405-7e10-acdf-a4b6712df257",
+        "store_revision": 3,
+        "body_bytes": 6136,
+        "body_sha256": "da13ed88b5833f2a29587a518a69b65af337b55d69522dd9904f8d4880da0786",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-8eee-7962-a81d-0a73cd7b5591",
+        "session_id": "01a1546e-8eee-7962-a81d-0a73cd7b5591",
+        "store_revision": 5,
+        "body_bytes": 6708,
+        "body_sha256": "d00a4ec57c3b1308abc89c64cbde5ecfefc34853652daa74f23b7975c665399f",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-9023-7492-9c84-34a8aa47cb94",
+        "session_id": "01a1546e-9023-7492-9c84-34a8aa47cb94",
+        "store_revision": 5,
+        "body_bytes": 6709,
+        "body_sha256": "2ec08e65a4d6ded2ddb521f80ada5935d45f1ce0ac3f4f0731acc352180ea4ef",
+        "message_count": 5,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-aedb-75e1-9c89-cad299db61ae",
+        "session_id": "01a1546e-aedb-75e1-9c89-cad299db61ae",
+        "store_revision": 2,
+        "body_bytes": 6102,
+        "body_sha256": "46708b6cf20529fa52c7c3b647ef20d0cecbcd1a22304ed928b413eafacf3135",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-b020-7df1-ba55-4aec07989a87",
+        "session_id": "01a1546e-b020-7df1-ba55-4aec07989a87",
+        "store_revision": 3,
+        "body_bytes": 6136,
+        "body_sha256": "84e3810be070625253fde0171f414e06315c00bf59b8b535b3e848b07e7217a3",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      },
+      {
+        "runtime_id": "rt:session:01a1546e-c3c2-7551-b735-8d48b2999b64",
+        "session_id": "01a1546e-c3c2-7551-b735-8d48b2999b64",
+        "store_revision": 2,
+        "body_bytes": 6109,
+        "body_sha256": "3c7be9f4096b57cde8ca242bfea7dd11ce88a69710ddad6eee7cd001142fb19b",
+        "message_count": 3,
+        "rewrite_occurrences": 0,
+        "retired_occurrences": 0
+      }
+    ]
+  }
+}

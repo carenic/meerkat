@@ -672,6 +672,9 @@ pub(crate) struct CompactionInvocation<'a> {
     /// registry-owned limits; `None` when that model declares no context
     /// window.
     pub(crate) summarization_budget: Option<crate::compact::SummarizationSourceBudget>,
+    /// Where the summary request's owner-change waits are reported, for a
+    /// host that installed an operation refusal observer.
+    pub(crate) wait_report: Option<crate::authorization::WaitReport>,
 }
 
 /// Exact canonical unmeasured transcript subset incorporated by this attempt.
@@ -785,6 +788,7 @@ where
         request_pressure,
         parent_revision,
         summarization_budget,
+        wait_report,
     } = invocation;
     let CompactionWindow {
         messages,
@@ -872,7 +876,7 @@ where
         // because an owner change is still in progress on the work's own
         // publication waits for it (bounded) and asks again under the same
         // operation; any other refusal fails this compaction as before.
-        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
+        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::reporting(wait_report);
         let llm_result = loop {
             let result = client
                 .stream_response_authorized(
@@ -893,13 +897,13 @@ where
                     .wait_for_settled_change(
                         request.work_authorization().authorization().as_ref(),
                         budget.and_then(crate::budget::Budget::remaining_duration),
+                        "compaction_summary",
+                        Some(request.operation_id()),
                     )
                     .await
+                && wait.settled()
             {
-                wait.trace("compaction_summary", Some(request.operation_id()));
-                if wait.settled() {
-                    continue;
-                }
+                continue;
             }
             break result;
         };
@@ -1512,6 +1516,7 @@ mod tests {
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
+                wait_report: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -1806,6 +1811,7 @@ mod tests {
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
+                wait_report: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),

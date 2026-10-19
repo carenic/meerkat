@@ -8292,6 +8292,7 @@ impl MobBuilder {
                 roster: roster_state.clone(),
                 definition: definition.clone(),
                 events: storage.events.clone(),
+                identity_member: storage.identity_member.clone(),
                 run_store: storage.runs.clone(),
                 runtime_metadata: storage.runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -8317,6 +8318,8 @@ impl MobBuilder {
                 ownership: super::admission_close::MobOwnership::new(),
                 admission_closed_rx: tokio::sync::watch::channel(None).1,
                 incarnation: wiring.incarnation,
+                registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
+                realm_profile_store: storage.realm_profiles.clone(),
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
             if let Some(hook) = before_activation {
@@ -8343,6 +8346,22 @@ impl MobBuilder {
                         )
                         .await?;
                 }
+            }
+            // A `MobStop` staged for a restored member comes from a Stop of an
+            // earlier incarnation in this process (#1500): a Stop that
+            // fail-stopped for cold recovery releases nothing. Reconcile it to
+            // the restored posture before any member runtime can register:
+            // drop it here, and a posture that holds member run starts stages
+            // it again below, once the recovered phase is known. Left staged,
+            // a running mob's members would register held, with no Resume to
+            // release them.
+            for entry in roster.list() {
+                runtime_provisioner
+                    .unstage_member_registration_run_start_hold(
+                        &entry.member_ref,
+                        meerkat_runtime::RunStartHoldReason::MobStop,
+                    )
+                    .await?;
             }
             let mut per_spawn_external_tools_seed = super::fork_build::RetainedOverlays::default();
             let mut recovered_direct_member_adoption_pending = false;
@@ -8485,8 +8504,10 @@ impl MobBuilder {
             );
             // A restored mob whose member run starts are held (a Stopped
             // mob) holds its local members' runtimes from their registration
-            // on: the in-memory holds of the previous process are gone.
-            // Resume releases them, before or after they register.
+            // on: the in-memory holds of the previous process are gone, and a
+            // `MobStop` an earlier incarnation in this process staged was
+            // dropped above. Resume releases them, before or after they
+            // register.
             if wiring.dsl_authority.state().member_run_starts_held {
                 for entry in roster.list() {
                     runtime_provisioner
@@ -10519,6 +10540,7 @@ impl MobBuilder {
                 roster: roster.clone(),
                 definition: definition.clone(),
                 events: events.clone(),
+                identity_member: identity_member.clone(),
                 run_store: run_store.clone(),
                 runtime_metadata: runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -10539,6 +10561,8 @@ impl MobBuilder {
                 ownership: Arc::clone(&ownership),
                 admission_closed_rx,
                 incarnation,
+                registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
+                realm_profile_store: realm_profile_store.clone(),
             };
             if let Some(hook) = before_activation {
                 hook(handle.read_handle()).await?;
