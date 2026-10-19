@@ -43,6 +43,12 @@ mod owner_change_wait;
 pub use owner_change_wait::{
     OWNER_CHANGE_FREE_REBUILDS, OWNER_CHANGE_WAIT_BOUND, OwnerChangeChurn, OwnerChangeWait,
 };
+mod refusal_observer;
+pub use refusal_observer::{
+    OperationRefusalDisposition, OperationRefusalObservation, OperationRefusalObserver,
+    OperationRefusalOutcome, OperationRefusalSurface,
+};
+pub(crate) use refusal_observer::{RefusalObserverBinding, WaitReport};
 
 /// Why an input or session operation cannot obtain current runtime authority.
 /// No variant is a permission verdict or a terminal result for existing work.

@@ -1255,7 +1255,8 @@ where
         let context = self
             .tool_dispatch_context
             .clone()
-            .with_operation_review(self.operation_review.clone());
+            .with_operation_review(self.operation_review.clone())
+            .with_refusal_observer(self.refusal_observer_binding());
         let outcome = self
             .dispatch_host_tool_call(call, timeout_policy, context)
             .await?;
@@ -3272,6 +3273,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             last_pending_catalog_sources: Default::default(),
             tool_dispatch_context: Default::default(),
             operation_review: self.operation_review.clone(),
+            refusal_observer: self.refusal_observer.clone(),
             run_consent_attempts: Default::default(),
             live_bridge_dispatch_admission: Some(dispatch_admission),
             live_bridge_tool_defs: Some(frozen_tool_defs),
@@ -5706,6 +5708,76 @@ mod skill_activation_effect_tests {
         let (result, dirty) = other.settle_tool_application(outcome).into_parts();
         assert!(!dirty && matches!(result, Err(AgentError::ConfigError(_))));
         assert!(other.session.messages().is_empty());
+    }
+
+    /// The operation refusal observer of the host that composed the agent
+    /// sees a host's external tool call refused under governed work, as that
+    /// call's result, from the same fenced dispatch the loop's calls take,
+    /// with the dispatch fact the model payload carries.
+    #[tokio::test]
+    async fn an_external_tool_call_refusal_reaches_the_host_observer() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<crate::authorization::OperationRefusalObservation>>);
+        impl crate::authorization::OperationRefusalObserver for Recording {
+            fn observe(&self, observation: &crate::authorization::OperationRefusalObservation) {
+                self.0.lock().unwrap().push(observation.clone());
+            }
+        }
+        let observer = Arc::new(Recording::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut agent = with_test_turn_state_handle(
+            AgentBuilder::new().with_operation_refusal_observer(Arc::clone(&observer) as _),
+        )
+        .build_standalone(
+            Arc::new(StaticLlmClient),
+            Arc::new(AppTestTools {
+                entered: entered.clone(),
+                effects: Vec::new(),
+                settlement_failures: Vec::new(),
+            }),
+            Arc::new(NoopStore),
+        )
+        .await;
+        agent.tool_dispatch_context = crate::ToolDispatchContext::default()
+            .with_work_authorization(Some(attachment_context()));
+        let outcome = agent
+            .dispatch_external_tool_call(crate::ToolCall::new(
+                "external-call".into(),
+                "show".into(),
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("a refusal is the call's result");
+        assert!(outcome.result.is_error);
+        assert!(!entered.load(Ordering::SeqCst), "no tool code ran");
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).expect("typed payload");
+        assert_eq!(
+            payload["data"],
+            serde_json::json!({"kind": "denied", "tool_invoked": false})
+        );
+        let observed = observer.0.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        let observation = &observed[0];
+        assert_eq!(observation.session_id(), agent.session.id());
+        assert_eq!(
+            observation.surface(),
+            &crate::authorization::OperationRefusalSurface::ToolCall {
+                tool_use_id: "external-call".into()
+            }
+        );
+        assert_eq!(
+            observation.outcome(),
+            crate::authorization::OperationRefusalOutcome::Refused {
+                kind: crate::OperationRefusalKind::Denied,
+                dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+            }
+        );
+        assert_eq!(
+            observation.disposition(),
+            crate::authorization::OperationRefusalDisposition::ToolResult
+        );
+        assert!(observation.operation_id().is_some());
     }
 
     struct AttachmentOnlyAuthorization;

@@ -28,6 +28,25 @@ enum Churn {
     HeldOverToolCall { hold: Duration },
 }
 
+/// The host's operation refusal observer: keeps what it is given.
+#[derive(Default)]
+struct RefusalLog(Mutex<Vec<meerkat_core::OperationRefusalObservation>>);
+
+impl meerkat_core::OperationRefusalObserver for RefusalLog {
+    fn observe(&self, observation: &meerkat_core::OperationRefusalObservation) {
+        self.0
+            .lock()
+            .expect("refusal log")
+            .push(observation.clone());
+    }
+}
+
+impl RefusalLog {
+    fn observed(&self) -> Vec<meerkat_core::OperationRefusalObservation> {
+        self.0.lock().expect("refusal log").clone()
+    }
+}
+
 /// One request the transport received.
 struct Request {
     operation: OperationId,
@@ -225,6 +244,7 @@ async fn start_native_run(
     provider: Arc<ChurnProvider>,
     publication: LocalAuthorizationPublication,
     tools: Arc<RecordingTools>,
+    observer: Option<Arc<RefusalLog>>,
 ) -> NativeRun {
     let grants = Arc::new(
         LocalGrantAuthority::new(
@@ -270,7 +290,11 @@ async fn start_native_run(
             })
             .expect("exclusive actual native host setup"),
     );
-    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
+    let mut factory = AgentFactory::minimal();
+    if let Some(observer) = observer {
+        factory = factory.with_operation_refusal_observer(observer);
+    }
+    let mut builder = FactoryAgentBuilder::new(factory, Config::default());
     builder.default_llm_client = Some(provider);
     builder.default_tool_dispatcher = Some(tools);
     builder.default_session_store = Some(Arc::new(RecordingStore::default()));
@@ -444,12 +468,15 @@ async fn a_held_owner_change_is_waited_out_by_the_native_model_request() {
         },
         publication.clone(),
     ));
+    let observer = Arc::new(RefusalLog::default());
     let run = start_native_run(
         Arc::clone(&provider),
         publication,
         Arc::new(RecordingTools::default()),
+        Some(Arc::clone(&observer)),
     )
     .await;
+    let session_id = run.session_id.clone();
     let (audit, outcome) = answered_run(&provider, run).await;
 
     let requests = provider.requests();
@@ -459,6 +486,20 @@ async fn a_held_owner_change_is_waited_out_by_the_native_model_request() {
         requests.iter().all(|(id, _)| *id == operation),
         "the rebuild keeps its operation"
     );
+    // The observer the host installed on its agent factory saw the wait,
+    // under the audited operation, and nothing else.
+    let observed = observer.observed();
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    assert_eq!(observed[0].session_id(), &session_id);
+    assert_eq!(observed[0].operation_id(), Some(&operation));
+    assert_eq!(
+        observed[0].surface(),
+        &meerkat_core::OperationRefusalSurface::ModelRequest
+    );
+    assert!(matches!(
+        observed[0].disposition(),
+        meerkat_core::OperationRefusalDisposition::WaitedForOwnerChange { settled: true, .. }
+    ));
     let held = provider
         .first_held
         .lock()
@@ -548,6 +589,7 @@ async fn a_publication_storm_bounds_native_model_attempts_and_their_audit() {
         Arc::clone(&provider),
         publication,
         Arc::new(RecordingTools::default()),
+        None,
     )
     .await;
     let (audit, outcome) = answered_run(&provider, run).await;
@@ -620,7 +662,14 @@ async fn a_held_owner_change_is_waited_out_by_the_native_tool_dispatch() {
         publication.clone(),
     ));
     let tools = Arc::new(RecordingTools::default());
-    let run = start_native_run(Arc::clone(&provider), publication, Arc::clone(&tools)).await;
+    let observer = Arc::new(RefusalLog::default());
+    let run = start_native_run(
+        Arc::clone(&provider),
+        publication,
+        Arc::clone(&tools),
+        Some(Arc::clone(&observer)),
+    )
+    .await;
     let (audit, outcome) = answered_run(&provider, run).await;
 
     assert_eq!(
@@ -666,6 +715,23 @@ async fn a_held_owner_change_is_waited_out_by_the_native_tool_dispatch() {
             _ => None,
         })
         .expect("the audit names the tool operation");
+    // The factory's observer saw the tool entry's waits, on the call, under
+    // its audited operation, and no tool result: the call ran.
+    let observed = observer.observed();
+    assert!(!observed.is_empty(), "the dispatch's wait was observed");
+    for observation in &observed {
+        assert_eq!(
+            observation.surface(),
+            &meerkat_core::OperationRefusalSurface::ToolCall {
+                tool_use_id: TOOL_CALL.into()
+            }
+        );
+        assert_eq!(observation.operation_id(), Some(&tool_operation));
+        assert!(matches!(
+            observation.disposition(),
+            meerkat_core::OperationRefusalDisposition::WaitedForOwnerChange { .. }
+        ));
+    }
     let records: Vec<&AuditObservation> = audit
         .iter()
         .filter(|(id, _)| *id == tool_operation)

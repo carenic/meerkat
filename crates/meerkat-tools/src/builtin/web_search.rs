@@ -156,8 +156,11 @@ impl WebSearchTool {
         // A delegate request refused because an owner change is still in
         // progress on the work's own publication waits for it (bounded, and
         // never past the call's tool time, read at the wait) and asks again
-        // under the same operation.
-        let mut owner_change_churn = meerkat_core::authorization::OwnerChangeChurn::new();
+        // under the same operation. The call's context reports the waits as
+        // this call's to the host's operation refusal observer.
+        let mut owner_change_churn = context
+            .map(meerkat_core::ToolDispatchContext::owner_change_churn)
+            .unwrap_or_default();
         let result = loop {
             let result = self
                 .executor
@@ -172,18 +175,15 @@ impl WebSearchTool {
                     .wait_for_settled_change(
                         work.authorization().as_ref(),
                         context.remaining_tool_time(),
+                        "web_search_delegate",
+                        authorization
+                            .as_ref()
+                            .map(meerkat_core::LlmRequestAuthorization::operation_id),
                     )
                     .await
+                && wait.settled()
             {
-                wait.trace(
-                    "web_search_delegate",
-                    authorization
-                        .as_ref()
-                        .map(meerkat_core::LlmRequestAuthorization::operation_id),
-                );
-                if wait.settled() {
-                    continue;
-                }
+                continue;
             }
             break result;
         }

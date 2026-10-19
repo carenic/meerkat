@@ -273,6 +273,54 @@ is not evidence that the tool executed. See the
 [review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
 for the boundary and remaining acceptance scope.
 
+## Observe refusal dispositions
+
+A refused or unavailable governed operation reaches the model only as
+uniform feedback that carries no private fact. The host that composed the
+agent can see which typed refusal Core met and what Core did with it by
+installing an `OperationRefusalObserver` on its factory (or with
+`AgentBuilder::with_operation_refusal_observer`):
+
+```rust
+use std::sync::Arc;
+use meerkat_core::{OperationRefusalObservation, OperationRefusalObserver};
+use tokio::sync::mpsc;
+
+struct RefusalLog(mpsc::UnboundedSender<OperationRefusalObservation>);
+
+impl OperationRefusalObserver for RefusalLog {
+    fn observe(&self, observation: &OperationRefusalObservation) {
+        // Hand the observation off: never block the deciding task.
+        let _ = self.0.send(observation.clone());
+    }
+}
+
+let (refusals, refusal_rx) = mpsc::unbounded_channel();
+let factory = factory.with_operation_refusal_observer(Arc::new(RefusalLog(refusals)));
+```
+
+Each `OperationRefusalObservation` names the session, the run and the refused
+operation (the id its authorization audit records), the surface (the model
+request, a tool call by its tool-use id, or a compaction summary), the outcome
+(the closed refusal kind with its `RefusalDispatch`, read from the same refusal
+the model payload renders, or owners that could not decide) and the
+disposition: a bounded wait for an owner change (how long, and whether the
+change settled), the one rebuild, the controller feedback request, the tool
+result, a skipped compaction or the failed run. Observations are diagnostics
+at decision time, not durable records: they are not exactly-once across a
+crash, and an operation reported as waiting or rebuilding can still fail
+later. None of it enters the event stream, a wire type or any model context.
+
+The observer covers the agent's own governed operations: its model requests,
+its tool calls (a decided consent's retained attempt included, once the
+attempt has resolved its candidate), the owner-change waits of a tool's
+delegate operations that wait with the call's
+`ToolDispatchContext::owner_change_churn`, and its compaction summaries.
+Refusals decided elsewhere are not observed: the exact-control refusals of MCP
+attachments, tool applications and context controls, a consent attempt refused
+before it resolved its candidate, and review outcomes, which are not operation
+refusals.
+
 ## Authorize the builtin web_search and its helper
 
 <Note>

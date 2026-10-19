@@ -1015,6 +1015,109 @@ where
         true
     }
 
+    /// Where one operation's owner-change waits on `surface` are reported,
+    /// when an operation refusal observer is installed.
+    pub(crate) fn refusal_wait_report(
+        &self,
+        run_id: Option<RunId>,
+        surface: crate::authorization::OperationRefusalSurface,
+    ) -> Option<crate::authorization::WaitReport> {
+        self.refusal_observer_binding()
+            .map(|binding| binding.wait_report(run_id, surface))
+    }
+
+    /// [`Self::recover_local_model_operation`], also reporting the refusal's
+    /// disposition to the operation refusal observer of the host that
+    /// composed the agent: the controller feedback request when it recovers,
+    /// the failed run otherwise. An error that is neither an operation
+    /// refusal nor owners that could not decide reports nothing.
+    fn recover_or_report_model_refusal(
+        &mut self,
+        error: &AgentError,
+        run_id: &RunId,
+        messages: &mut Arc<Vec<Message>>,
+        provider_params: &mut Option<ProviderParamsOverride>,
+        authorization: &mut Option<crate::LlmRequestAuthorization>,
+        controller_feedback: &mut bool,
+    ) -> bool {
+        let refused_operation = authorization
+            .as_ref()
+            .map(|authorization| authorization.operation_id().clone());
+        let recovered = self.recover_local_model_operation(
+            error,
+            run_id,
+            messages,
+            provider_params,
+            authorization,
+            controller_feedback,
+        );
+        self.observe_model_refusal(
+            error,
+            run_id,
+            refused_operation,
+            if recovered {
+                crate::authorization::OperationRefusalDisposition::ControllerFeedback
+            } else {
+                crate::authorization::OperationRefusalDisposition::RunFailed
+            },
+        );
+        recovered
+    }
+
+    /// Report one refused or unavailable model request of `run_id` to the
+    /// host's operation refusal observer, when one is installed.
+    fn observe_model_refusal(
+        &self,
+        error: &AgentError,
+        run_id: &RunId,
+        operation_id: Option<crate::OperationId>,
+        disposition: crate::authorization::OperationRefusalDisposition,
+    ) {
+        self.observe_agent_refusal(
+            error,
+            Some(run_id.clone()),
+            operation_id,
+            crate::authorization::OperationRefusalSurface::ModelRequest,
+            disposition,
+        );
+    }
+
+    /// Report one refused or unavailable compaction summary request to the
+    /// host's operation refusal observer, when one is installed.
+    fn observe_compaction_refusal(
+        &self,
+        error: &AgentError,
+        operation_id: crate::OperationId,
+        disposition: crate::authorization::OperationRefusalDisposition,
+    ) {
+        self.observe_agent_refusal(
+            error,
+            self.tool_dispatch_context.run_id().cloned(),
+            Some(operation_id),
+            crate::authorization::OperationRefusalSurface::Compaction,
+            disposition,
+        );
+    }
+
+    /// Report `error` on `surface` when it is an operation refusal or owners
+    /// that could not decide, and an operation refusal observer is installed.
+    fn observe_agent_refusal(
+        &self,
+        error: &AgentError,
+        run_id: Option<RunId>,
+        operation_id: Option<crate::OperationId>,
+        surface: crate::authorization::OperationRefusalSurface,
+        disposition: crate::authorization::OperationRefusalDisposition,
+    ) {
+        let (Some(binding), Some(outcome)) = (
+            self.refusal_observer_binding(),
+            crate::authorization::OperationRefusalOutcome::of_agent_error(error),
+        ) else {
+            return;
+        };
+        binding.observe(run_id, operation_id, surface, outcome, disposition);
+    }
+
     /// Lower the active turn's reasoning preference onto one attempt's
     /// request copy (`profile` is the model this attempt actually selected)
     /// and describe what the attempt sent. `None` when the turn carries no
@@ -2445,7 +2548,11 @@ where
         let mut authorization_reprepared = false;
         // One bounded wait state per model call: its wall-clock deadline and
         // free rebuilds span every rebuild and the controller-feedback attempt.
-        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
+        let mut owner_change_churn =
+            crate::authorization::OwnerChangeChurn::reporting(self.refusal_wait_report(
+                Some(run_id.clone()),
+                crate::authorization::OperationRefusalSurface::ModelRequest,
+            ));
 
         let recovery_context = LlmRecoveryContext {
             run_id,
@@ -2522,7 +2629,7 @@ where
                 ) {
                     Ok(attempt) => attempt,
                     Err(error) => {
-                        if self.recover_local_model_operation(
+                        if self.recover_or_report_model_refusal(
                             &error,
                             run_id,
                             &mut current_messages,
@@ -2567,7 +2674,7 @@ where
                 let request_pressure = match request_pressure_result {
                     Ok(pressure) => pressure,
                     Err(error) => {
-                        if self.recover_local_model_operation(
+                        if self.recover_or_report_model_refusal(
                             &error,
                             run_id,
                             &mut current_messages,
@@ -2864,15 +2971,13 @@ where
                             .wait_for_settled_change(
                                 work.authorization().as_ref(),
                                 self.budget.remaining_duration(),
+                                "model_request",
+                                authorization
+                                    .as_ref()
+                                    .map(crate::LlmRequestAuthorization::operation_id),
                             )
                             .await
                     {
-                        wait.trace(
-                            "model_request",
-                            authorization
-                                .as_ref()
-                                .map(crate::LlmRequestAuthorization::operation_id),
-                        );
                         if let Some(exceeded) = self.budget.observe().exceeded() {
                             return Err(exceeded.to_agent_error());
                         }
@@ -2884,9 +2989,17 @@ where
                         // The final check observed a relevant owner change.
                         // Rebuild once from that owner; never retag old facts.
                         authorization_reprepared = true;
+                        self.observe_model_refusal(
+                            &error,
+                            run_id,
+                            authorization
+                                .as_ref()
+                                .map(|authorization| authorization.operation_id().clone()),
+                            crate::authorization::OperationRefusalDisposition::Rebuilt,
+                        );
                         continue;
                     }
-                    if self.recover_local_model_operation(
+                    if self.recover_or_report_model_refusal(
                         &error,
                         run_id,
                         &mut current_messages,
@@ -3610,13 +3723,16 @@ where
                                 })
                                 .map_err(|error| format!("live transcript is not digestible: {error}"))
                         });
+                        // The summary request's own operation, so a refusal
+                        // the host observes names what the audit records.
+                        let summary_operation = crate::OperationId::new();
                         let outcome = match compaction_source {
                             Ok((parent_revision, observation_source)) => {
                                 let invocation = crate::agent::compact::CompactionInvocation {
                                     authorization: self.model_request_authorization(
                                         self.tool_dispatch_context.run_id().cloned(),
                                         crate::authorization::ModelAuthorizationUse::Compaction,
-                                        crate::OperationId::new(),
+                                        summary_operation.clone(),
                                     ),
                                     budget: Some(&self.budget),
                                     model_messages: &model_messages,
@@ -3628,6 +3744,10 @@ where
                                     },
                                     request_pressure: provider_request_pressure,
                                     parent_revision,
+                                    wait_report: self.refusal_wait_report(
+                                        self.tool_dispatch_context.run_id().cloned(),
+                                        crate::authorization::OperationRefusalSurface::Compaction,
+                                    ),
                                 };
                                 // The compactor's warnings (a bounded source,
                                 // a rewrite keeping no complete turn) name the
@@ -3713,6 +3833,19 @@ where
                             }
                         };
 
+                        if let Err(crate::agent::compact::CompactionError::LlmFailed(error)) =
+                            &outcome
+                        {
+                            self.observe_compaction_refusal(
+                                error,
+                                summary_operation,
+                                if agent_error_is_policy_stop(error) {
+                                    crate::authorization::OperationRefusalDisposition::RunFailed
+                                } else {
+                                    crate::authorization::OperationRefusalDisposition::CompactionSkipped
+                                },
+                            );
+                        }
                         if matches!(
                             &outcome,
                             Err(crate::agent::compact::CompactionError::LlmFailed(error))
@@ -5876,7 +6009,8 @@ where
             Arc::clone(&self.tools),
             self.tool_dispatch_context
                 .clone()
-                .with_operation_review(Some(Arc::clone(review))),
+                .with_operation_review(Some(Arc::clone(review)))
+                .with_refusal_observer(self.refusal_observer_binding()),
             decided.approval_id.clone(),
         )
         .await;
@@ -6617,7 +6751,7 @@ where
                     continue;
                 }
                 Err(error) => {
-                    if self.recover_local_model_operation(
+                    if self.recover_or_report_model_refusal(
                         &error,
                         ctx.run_id,
                         &mut request_messages,
@@ -6642,7 +6776,7 @@ where
                     route_stabilization_attempt += 1;
                 }
                 Err(error) => {
-                    if self.recover_local_model_operation(
+                    if self.recover_or_report_model_refusal(
                         &error,
                         ctx.run_id,
                         &mut request_messages,
@@ -7711,7 +7845,8 @@ where
             Arc::clone(&self.tools),
             self.tool_dispatch_context
                 .clone()
-                .with_operation_review(self.operation_review.clone()),
+                .with_operation_review(self.operation_review.clone())
+                .with_refusal_observer(self.refusal_observer_binding()),
             self.tools_config.default_timeout,
             self.tools_config.tool_timeouts.clone(),
             self.tools_config.max_concurrent.max(1),
@@ -32181,6 +32316,7 @@ mod tests {
             notices: usize,
             events: mpsc::Receiver<crate::AgentEvent>,
             elapsed: std::time::Duration,
+            session_id: crate::types::SessionId,
         }
 
         /// Run one prompt with `client` as both the session's model and the
@@ -32190,7 +32326,23 @@ mod tests {
             client: &Arc<ChurnClient>,
             limits: Option<crate::budget::BudgetLimits>,
         ) -> ChurnRun {
-            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+            run_churn_observed(policy, client, limits, None).await
+        }
+
+        /// [`run_churn`] with `observer` installed as the host's operation
+        /// refusal observer.
+        async fn run_churn_observed(
+            policy: &Arc<ChurnPolicy>,
+            client: &Arc<ChurnClient>,
+            limits: Option<crate::budget::BudgetLimits>,
+            observer: Option<Arc<RecordingObserver>>,
+        ) -> ChurnRun {
+            let mut builder =
+                with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"));
+            if let Some(observer) = observer {
+                builder = builder.with_operation_refusal_observer(observer);
+            }
+            let mut agent = builder
                 .build_standalone(
                     Arc::clone(client),
                     Arc::new(IndeterminateDispatcher),
@@ -32241,7 +32393,30 @@ mod tests {
                 notices,
                 events,
                 elapsed,
+                session_id: agent.session().id().clone(),
             }
+        }
+
+        /// The host's operation refusal observer: it keeps what it is given.
+        #[derive(Default)]
+        struct RecordingObserver(Mutex<Vec<crate::authorization::OperationRefusalObservation>>);
+
+        impl crate::authorization::OperationRefusalObserver for RecordingObserver {
+            fn observe(&self, observation: &crate::authorization::OperationRefusalObservation) {
+                self.0.lock().unwrap().push(observation.clone());
+            }
+        }
+
+        impl RecordingObserver {
+            fn observed(&self) -> Vec<crate::authorization::OperationRefusalObservation> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        /// A `ReprepareRequired` refusal, which makes no claim about tool
+        /// code: the outcome of every model request refusal below.
+        fn reprepare_outcome() -> crate::authorization::OperationRefusalOutcome {
+            OperationRefused::new(OperationRefusalKind::ReprepareRequired).into()
         }
 
         fn refused_kind(
@@ -32489,8 +32664,10 @@ mod tests {
                 ChurnStep::Allow,
             ]);
             let client = ChurnClient::new(std::time::Duration::ZERO);
+            let observer = Arc::new(RecordingObserver::default());
             let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
                 .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .with_operation_refusal_observer(Arc::clone(&observer) as _)
                 .build_standalone(
                     Arc::clone(&client),
                     Arc::new(IndeterminateDispatcher),
@@ -32545,6 +32722,285 @@ mod tests {
             );
             let transcript = serde_json::to_string(agent.session().messages()).unwrap();
             assert!(!transcript.contains("operation_refused"));
+            // The host sees the summary's wait, on the compaction surface,
+            // for the summary request's own operation.
+            let observed = observer.observed();
+            assert_eq!(observed.len(), 1, "{observed:?}");
+            assert_eq!(
+                observed[0].surface(),
+                &crate::authorization::OperationRefusalSurface::Compaction
+            );
+            assert_eq!(observed[0].operation_id(), Some(&summaries[0]));
+            assert!(matches!(
+                observed[0].disposition(),
+                crate::authorization::OperationRefusalDisposition::WaitedForOwnerChange {
+                    settled: true,
+                    ..
+                }
+            ));
+        }
+
+        /// The host's operation refusal observer sees the model request's
+        /// wait for an owner change, with the refused operation, its run and
+        /// session, and how long it waited; the rebuild that follows was
+        /// authorized, so nothing else is observed.
+        #[tokio::test(start_paused = true)]
+        async fn the_host_observes_the_model_request_waiting_out_an_owner_change() {
+            let policy = ChurnPolicy::new([
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let observer = Arc::new(RecordingObserver::default());
+            let mut run =
+                run_churn_observed(&policy, &client, None, Some(Arc::clone(&observer))).await;
+
+            run.result.as_ref().expect("the rebuild is authorized");
+            let observed = observer.observed();
+            assert_eq!(observed.len(), 1, "{observed:?}");
+            let observation = &observed[0];
+            assert_eq!(observation.session_id(), &run.session_id);
+            assert!(observation.run_id().is_some());
+            assert_eq!(observation.operation_id(), Some(&client.operations()[0]));
+            assert_eq!(
+                observation.surface(),
+                &crate::authorization::OperationRefusalSurface::ModelRequest
+            );
+            assert_eq!(observation.outcome(), reprepare_outcome());
+            let crate::authorization::OperationRefusalDisposition::WaitedForOwnerChange {
+                waited_ms,
+                settled,
+            } = observation.disposition()
+            else {
+                panic!("a wait: {observation:?}");
+            };
+            assert!(settled);
+            assert!(waited_ms >= 30, "{waited_ms}");
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// Without a change in progress the refusal rebuilds once and then
+        /// goes to the controller: the host sees both decisions, for the
+        /// refused operation, and nothing for the feedback request that was
+        /// authorized.
+        #[tokio::test(start_paused = true)]
+        async fn the_host_observes_the_rebuild_and_the_controller_feedback() {
+            let policy = ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let observer = Arc::new(RecordingObserver::default());
+            let run = run_churn_observed(&policy, &client, None, Some(Arc::clone(&observer))).await;
+
+            run.result
+                .as_ref()
+                .expect("the feedback request is authorized");
+            let refused = client.operations()[0].clone();
+            let observed: Vec<_> = observer
+                .observed()
+                .iter()
+                .map(|observation| {
+                    (
+                        observation.operation_id().cloned(),
+                        observation.surface().clone(),
+                        observation.outcome(),
+                        observation.disposition(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                observed,
+                [
+                    crate::authorization::OperationRefusalDisposition::Rebuilt,
+                    crate::authorization::OperationRefusalDisposition::ControllerFeedback,
+                ]
+                .map(|disposition| {
+                    (
+                        Some(refused.clone()),
+                        crate::authorization::OperationRefusalSurface::ModelRequest,
+                        reprepare_outcome(),
+                        disposition,
+                    )
+                })
+            );
+        }
+
+        /// A flip storm, observed: three waits that settled, the waits that
+        /// no longer may, the call's own rebuild, the controller feedback
+        /// request and, when that one is refused too, the failed run, on the
+        /// feedback request's own operation.
+        #[tokio::test(start_paused = true)]
+        async fn the_host_observes_every_disposition_of_a_flip_storm() {
+            use crate::authorization::OperationRefusalDisposition as Disposition;
+            let policy = ChurnPolicy::new([ChurnStep::Begin {
+                settle: Some(std::time::Duration::from_millis(1)),
+            }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let observer = Arc::new(RecordingObserver::default());
+            let run = run_churn_observed(&policy, &client, None, Some(Arc::clone(&observer))).await;
+
+            assert_eq!(
+                refused_kind(&run.result),
+                Some(OperationRefusalKind::ReprepareRequired)
+            );
+            let operations = client.operations();
+            let (original, feedback) = (operations[0].clone(), operations[5].clone());
+            let observed: Vec<_> = observer
+                .observed()
+                .iter()
+                .map(|observation| {
+                    let disposition = match observation.disposition() {
+                        Disposition::WaitedForOwnerChange { settled, .. } => {
+                            if settled {
+                                "waited"
+                            } else {
+                                "not settled"
+                            }
+                        }
+                        Disposition::Rebuilt => "rebuilt",
+                        Disposition::ControllerFeedback => "controller feedback",
+                        Disposition::RunFailed => "run failed",
+                        other => panic!("{other:?}"),
+                    };
+                    assert_eq!(observation.outcome(), reprepare_outcome());
+                    (observation.operation_id().cloned(), disposition)
+                })
+                .collect();
+            let on = |operation: &crate::OperationId, disposition| {
+                (Some(operation.clone()), disposition)
+            };
+            assert_eq!(
+                observed,
+                [
+                    on(&original, "waited"),
+                    on(&original, "waited"),
+                    on(&original, "waited"),
+                    on(&original, "not settled"),
+                    on(&original, "rebuilt"),
+                    on(&original, "not settled"),
+                    on(&original, "controller feedback"),
+                    on(&feedback, "not settled"),
+                    on(&feedback, "run failed"),
+                ]
+            );
+        }
+
+        /// Observations are the host's only: a run with an observer emits
+        /// exactly the events and keeps exactly the transcript of the same
+        /// run without one, and each agent reports its own session to an
+        /// observer two agents share.
+        #[tokio::test(start_paused = true)]
+        async fn an_observation_reaches_only_the_host_that_installed_the_observer() {
+            fn shape(mut run: ChurnRun) -> (Vec<String>, usize) {
+                let mut kinds = Vec::new();
+                while let Ok(event) = run.events.try_recv() {
+                    let debug = format!("{event:?}");
+                    kinds.push(
+                        debug
+                            .split(|c: char| !c.is_alphanumeric())
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
+                (kinds, run.notices)
+            }
+            let script =
+                || ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let unobserved = run_churn(&script(), &client, None).await;
+            let observer = Arc::new(RecordingObserver::default());
+            let first = run_churn_observed(
+                &script(),
+                &ChurnClient::new(std::time::Duration::ZERO),
+                None,
+                Some(Arc::clone(&observer)),
+            )
+            .await;
+            let second = run_churn_observed(
+                &script(),
+                &ChurnClient::new(std::time::Duration::ZERO),
+                None,
+                Some(Arc::clone(&observer)),
+            )
+            .await;
+
+            let sessions: Vec<_> = observer
+                .observed()
+                .iter()
+                .map(|observation| observation.session_id().clone())
+                .collect();
+            assert_eq!(
+                sessions,
+                [
+                    first.session_id.clone(),
+                    first.session_id.clone(),
+                    second.session_id.clone(),
+                    second.session_id.clone(),
+                ]
+            );
+            assert_ne!(first.session_id, second.session_id);
+            let expected = shape(unobserved);
+            assert_eq!(shape(first), expected, "the observer adds no event");
+            assert_eq!(shape(second), expected);
+        }
+
+        /// A compaction summary the owners refuse is skipped with the history
+        /// kept, and the host observes it on the compaction surface with the
+        /// summary request's own operation.
+        #[tokio::test]
+        async fn the_host_observes_a_refused_compaction_summary_as_skipped() {
+            let client = Arc::new(FixtureClient {
+                requests: Mutex::new(Vec::new()),
+                tool_first: false,
+                authorizations: Mutex::new(Vec::new()),
+                hosted_default: false,
+            });
+            let policy = Arc::new(FixturePolicy {
+                hosted_denials: AtomicUsize::new(0),
+                compaction_denials: AtomicUsize::new(0),
+            });
+            let observer = Arc::new(RecordingObserver::default());
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .compactor(Arc::new(TrackingCompactor::new(Some(1))))
+                .with_operation_refusal_observer(Arc::clone(&observer) as _)
+                .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+                .await;
+            let context = work(policy.clone(), client.clone());
+            for prompt in ["first retained input", "second input"] {
+                let (tx, _rx) = mpsc::channel(128);
+                agent
+                    .run_with_events_and_work_authorization(
+                        prompt.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(context.clone()),
+                    )
+                    .await
+                    .expect("a refused optional compaction does not stop the run");
+            }
+            assert_eq!(policy.compaction_denials.load(Ordering::Relaxed), 1);
+            let observed = observer.observed();
+            assert_eq!(observed.len(), 1, "{observed:?}");
+            let observation = &observed[0];
+            assert_eq!(observation.session_id(), agent.session().id());
+            assert_eq!(
+                observation.surface(),
+                &crate::authorization::OperationRefusalSurface::Compaction
+            );
+            assert_eq!(
+                observation.outcome(),
+                crate::authorization::OperationRefusalOutcome::from(OperationRefused::new(
+                    OperationRefusalKind::Denied
+                ))
+            );
+            assert_eq!(
+                observation.disposition(),
+                crate::authorization::OperationRefusalDisposition::CompactionSkipped
+            );
+            assert!(observation.operation_id().is_some());
         }
 
         /// A PreLlm gate fixture. It denies every ordinary request and,

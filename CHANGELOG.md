@@ -205,7 +205,12 @@ them.
   reports such a change as a waiting hint, never a permission;
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners, and the native run and audit wrappers forward it.
-  `OwnerChangeWait::trace` records one wait as the debug event below.
+  `OwnerChangeChurn::wait_for_settled_change` takes the wait's trace site and
+  operation: it records each wait as the debug event below
+  (`OwnerChangeWait::trace`) and reports it to the host's operation refusal
+  observer (see below). `ToolDispatchContext::owner_change_churn` gives a
+  delegate operation of a tool call, such as the `web_search` helper's model
+  request, the waiting state that reports as that call's.
 - `ToolDispatchContext::remaining_tool_time`: the tool time a fenced
   dispatch has left, measured from its start against its plan's effective
   timeout, for a tool that waits inside its body. The `web_search` helper's
@@ -235,6 +240,22 @@ them.
   returns included, is `Unknown`, which makes no claim. A dispatcher layer
   that runs tool code of its own before delegating to a certifying
   component forwards `OperationRefused::new(refusal.kind())`.
+- `meerkat_core::authorization::OperationRefusalObserver`, installed with
+  `AgentBuilder::with_operation_refusal_observer` or the facade's
+  `AgentFactory::with_operation_refusal_observer`: the Rust host that
+  composed an agent receives each refusal disposition the agent decides for
+  a governed operation, as an `OperationRefusalObservation` with the session,
+  the run and the refused operation, the surface (the model request, a tool
+  call by its tool-use id, or a compaction summary), the outcome (the closed
+  refusal kind with its `RefusalDispatch`, read from the same value the
+  model payload renders, or owners that could not decide) and what was done
+  with it: waited for an owner change (how long, and whether it settled),
+  rebuilt, sent to the controller, returned as the tool result, skipped the
+  compaction or failed the run. It is a diagnostic at decision time, not
+  exactly-once across a crash, called synchronously and never blocking, and
+  host-only: no observation enters the event stream, a wire type or any
+  model context. `OperationRefusalSurface`, `OperationRefusalOutcome` and
+  `OperationRefusalDisposition` are non-exhaustive.
 
 ### Changed
 

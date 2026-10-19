@@ -2910,6 +2910,11 @@ pub struct AgentFactory {
     /// options. Its absence never skips a tier: native authorization resolves
     /// the tier, and required R2 review without it is local unavailable.
     operation_review: Option<Arc<meerkat_core::approval::review::BoundOperationReview>>,
+    /// The host's operation refusal observer for every agent this factory
+    /// builds. Host-only, like `operation_review`: absent from
+    /// `AgentBuildConfig`, session build options and every wire type.
+    operation_refusal_observer:
+        Option<Arc<dyn meerkat_core::authorization::OperationRefusalObserver>>,
 }
 
 impl std::fmt::Debug for AgentFactory {
@@ -2949,6 +2954,10 @@ impl std::fmt::Debug for AgentFactory {
         #[cfg(feature = "comms")]
         d.field("comms_runtime", &self.comms_runtime.is_some());
         d.field("operation_review", &self.operation_review.is_some());
+        d.field(
+            "operation_refusal_observer",
+            &self.operation_refusal_observer.is_some(),
+        );
         d.finish()
     }
 }
@@ -4132,6 +4141,7 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             connector_oauth_authority: None,
             operation_review: None,
+            operation_refusal_observer: None,
         }
     }
 
@@ -4146,6 +4156,21 @@ impl AgentFactory {
         review: Arc<meerkat_core::approval::review::BoundOperationReview>,
     ) -> Self {
         self.operation_review = Some(review);
+        self
+    }
+
+    /// Install the host's operation refusal observer for every agent this
+    /// factory builds (see
+    /// `meerkat_core::AgentBuilder::with_operation_refusal_observer`). It
+    /// receives each refusal disposition an agent decides for a governed
+    /// operation, with the typed refusal; nothing of it reaches the event
+    /// stream, a wire type or the model.
+    #[must_use]
+    pub fn with_operation_refusal_observer(
+        mut self,
+        observer: Arc<dyn meerkat_core::authorization::OperationRefusalObserver>,
+    ) -> Self {
+        self.operation_refusal_observer = Some(observer);
         self
     }
 
@@ -4326,6 +4351,7 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             connector_oauth_authority: None,
             operation_review: None,
+            operation_refusal_observer: None,
         }
     }
 
@@ -9049,6 +9075,9 @@ impl AgentFactory {
         }
         if let Some(review) = self.operation_review.as_ref() {
             builder = builder.with_operation_review(Arc::clone(review));
+        }
+        if let Some(observer) = self.operation_refusal_observer.as_ref() {
+            builder = builder.with_operation_refusal_observer(Arc::clone(observer));
         }
         if let Some(system_prompt) = system_prompt {
             builder = builder.system_prompt(system_prompt);
