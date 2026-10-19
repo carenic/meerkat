@@ -422,8 +422,9 @@ affected.
 
 ## Prompt caching
 
-Prompt caching knobs, per-provider defaults, the known 0.9.0 gap and all
-`provider_params` keys: references/providers_and_auth_models.md (Provider parameters).
+Prompt caching knobs, per-provider defaults, the backends that receive them and
+all `provider_params` keys: references/providers_and_auth_models.md (Provider
+parameters).
 Anthropic bills cache writes at a premium (1.25x input for the default
 five-minute cache; hits about 0.1x), reported as `cache_creation_tokens` and
 `cache_read_tokens`.
