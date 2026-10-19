@@ -232,18 +232,6 @@ them.
   of `Unknown`. A Rust decoder of this type built before it rejects the new
   kind; the Python, TypeScript and Web SDKs keep error details as untyped
   data.
-
-### Security
-
-- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
-  (deprecated) and the archived unsafe-libyaml it brought in
-  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
-  including from the `@rkat/web` wasm module, and `deny.toml` no longer
-  ignores that advisory. serde-saphyr is pinned exactly; its parser
-  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
-  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
-  that could).
-
 - `meerkat-llm-core`: `LlmDoneOutcome::Success` gains the field
   `stop_detail: Option<Box<ProviderStopDetail>>` (the provider's own account
   of a refusal or filter) and is `#[non_exhaustive]`: build it with
@@ -263,6 +251,17 @@ them.
   unknown reason and keep it raw. Downgrade: the session event store decodes
   every line strictly, so a 0.9.3 binary cannot read a session event log that
   holds such a `run_failed` line.
+
+### Security
+
+- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
+  (deprecated) and the archived unsafe-libyaml it brought in
+  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
+  including from the `@rkat/web` wasm module, and `deny.toml` no longer
+  ignores that advisory. serde-saphyr is pinned exactly; its parser
+  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
+  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
+  that could).
 
 ### Added
 
@@ -346,7 +345,6 @@ them.
   continuation row the runtime is not ready to admit; the drain reports it as
   `BlockedDeliveryReason::NotReady` (above). Nothing is stored; the cause is
   read again on every retry.
-
 - `meerkat-core`: `ProviderStopDetail`, the provider's own account of why it
   refused or filtered a response, held as provider-tagged data (`anthropic`:
   the refusal's `stop_details` category and explanation; `open_ai`: the filter
@@ -654,7 +652,6 @@ them.
   retryable until the owner settles the original, instead of being refused
   for good. A cancelled original is still refused, and the controller-grant
   mutation check no longer counts such a contributor as unreferenced.
-
 - The `web_search` tool's native search call now reads its stop reason
   (#1887). A search the provider refused or filtered, one whose context window
   filled and a cancelled one come back `failed`, naming the stop reason, with
