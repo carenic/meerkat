@@ -111,6 +111,16 @@ impl MobActor {
                                 deadline,
                             )
                             .await;
+                            // Shutdown is done with the member for good
+                            // (#1500): a `MobStop` an earlier Stop staged must
+                            // not hold a later registration of the session.
+                            // Dropped after the teardown, so a successor the
+                            // teardown's own discard publishes registers as
+                            // held as before.
+                            adapter.unstage_registration_run_start_hold(
+                                &session_id,
+                                meerkat_runtime::RunStartHoldReason::MobStop,
+                            );
                             (session_id, outcome)
                         }
                     },

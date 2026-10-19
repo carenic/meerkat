@@ -55,9 +55,25 @@ them.
   registration has provably ended.
 - `meerkat-runtime`: `RuntimeSessionRegistrationWitness::has_ended`, whether
   an exact registration has ended for good (no runtime holds its entry).
+- `meerkat-runtime`: `MeerkatMachine::stage_registration_run_start_hold_only`
+  and `MeerkatMachine::unstage_registration_run_start_hold`. The first stages
+  a run-start hold that the session's next registration applies, without
+  trying to hold the registration that is current; the second removes a
+  staged reason and leaves a hold the current registration applies in place.
+  A runtime unregister keeps staged reasons, so a registration that replaces
+  the session's (a reload) applies them.
 
 ### Changed
 
+- `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
+  holds the member, so a member reloaded while the mob is Stopped stays held
+  until Resume; a member spawned into a Stopped mob, or held again after a
+  failed Resume, stages it too. A restore drops a `MobStop` that an earlier
+  incarnation in the same process staged before any member registers, so a
+  mob reopened with released run starts (after a Stop that fail-stopped)
+  does not come up held; a restored Stopped mob stages it again. Retire,
+  Shutdown and destroy drop it for the members they dispose of, so a later
+  registration of the same session is not held for them.
 - `meerkat-mob`: a runtime refusal of a member's unregister until its
   registration's durability is repaired
   (`RuntimeDriverError::RecoveryRepairBlocked`) is reported

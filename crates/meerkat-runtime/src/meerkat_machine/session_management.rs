@@ -12355,11 +12355,12 @@ Ok::<(), RuntimeDriverError>(())
 
     /// Release `reason`'s hold on `session_id` (#1500), whether it was taken
     /// by [`Self::hold_run_starts`] or staged for registration with
-    /// [`Self::stage_registration_run_start_hold`]. Runs start again once no
-    /// reason holds the runtime: a runtime loop that parked on the hold is
-    /// woken when input is queued. Releasing a reason that does not hold is a
-    /// no-op, and so is releasing on a session not registered yet: its
-    /// registration then applies no hold for `reason`.
+    /// [`Self::stage_registration_run_start_hold`] or
+    /// [`Self::stage_registration_run_start_hold_only`]. Runs start again
+    /// once no reason holds the runtime: a runtime loop that parked on the
+    /// hold is woken when input is queued. Releasing a reason that does not
+    /// hold is a no-op, and so is releasing on a session not registered yet:
+    /// its registration then applies no hold for `reason`.
     pub async fn release_run_starts(
         &self,
         session_id: &SessionId,
@@ -12414,24 +12415,57 @@ Ok::<(), RuntimeDriverError>(())
     /// already registered, the hold is applied now as well. The reason stays
     /// staged until [`Self::release_run_starts`] releases it, so a later
     /// re-registration re-applies it.
+    ///
+    /// The order is fixed: the reason is staged first and the hold is tried
+    /// after. A hold that is refused (the current registration is not
+    /// durability-ready, say) fails this call but leaves the reason staged,
+    /// so the registration that replaces the refused one applies it.
     pub async fn stage_registration_run_start_hold(
         &self,
         session_id: &SessionId,
         reason: super::RunStartHoldReason,
     ) -> Result<(), RuntimeDriverError> {
-        self.registration_run_start_holds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(session_id.clone())
-            .or_default()
-            .insert(reason.dsl());
+        self.stage_registration_run_start_hold_only(session_id, reason);
         if self.session_mutation_gate(session_id).await.is_some() {
             self.hold_run_starts(session_id, reason).await?;
         }
         Ok(())
     }
 
-    fn unstage_registration_run_start_hold(
+    /// Stage a run-start hold that `session_id`'s next registration applies
+    /// (#1500), and nothing more: unlike
+    /// [`Self::stage_registration_run_start_hold`], no hold is tried on a
+    /// registration that is already current, so this never waits on the
+    /// session and never fails. A caller that also holds the current
+    /// registration does so with [`Self::hold_run_starts`].
+    ///
+    /// The reason stays staged until [`Self::release_run_starts`] releases it
+    /// or [`Self::unstage_registration_run_start_hold`] removes it. Unregister
+    /// does not remove it: a registration that replaces this one for the same
+    /// session (a reload, say) applies it.
+    pub fn stage_registration_run_start_hold_only(
+        &self,
+        session_id: &SessionId,
+        reason: super::RunStartHoldReason,
+    ) {
+        self.registration_run_start_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session_id.clone())
+            .or_default()
+            .insert(reason.dsl());
+    }
+
+    /// Remove `reason` from the run-start holds staged for `session_id`'s
+    /// registration (#1500), and nothing more: unlike
+    /// [`Self::release_run_starts`], a hold that the current registration
+    /// already applies stays in place. Its next registration no longer
+    /// applies `reason`. Removing a reason that is not staged is a no-op.
+    ///
+    /// For an owner whose claim on the session is over for good (its member
+    /// was retired or torn down), so that a later registration of the same
+    /// session id is not held for it.
+    pub fn unstage_registration_run_start_hold(
         &self,
         session_id: &SessionId,
         reason: super::RunStartHoldReason,

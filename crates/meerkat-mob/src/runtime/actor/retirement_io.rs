@@ -1989,6 +1989,9 @@ impl MobActor {
         mut continuation: RetirementContinuation,
         disposal: mob_dsl::MemberSessionDisposal,
     ) {
+        // The member's session is disposed for good (#1500).
+        self.unstage_departed_member_mob_stop(&continuation.entry)
+            .await;
         continuation.archive_disposal = Some(disposal);
         if continuation.terminal_published {
             let identity = mob_dsl::AgentIdentity::from_domain(&continuation.entry.agent_identity);

@@ -8099,6 +8099,22 @@ impl MobBuilder {
                         .await?;
                 }
             }
+            // A `MobStop` staged for a restored member comes from a Stop of an
+            // earlier incarnation in this process (#1500): a Stop that
+            // fail-stopped for cold recovery releases nothing. Reconcile it to
+            // the restored posture before any member runtime can register:
+            // drop it here, and a posture that holds member run starts stages
+            // it again below, once the recovered phase is known. Left staged,
+            // a running mob's members would register held, with no Resume to
+            // release them.
+            for entry in roster.list() {
+                runtime_provisioner
+                    .unstage_member_registration_run_start_hold(
+                        &entry.member_ref,
+                        meerkat_runtime::RunStartHoldReason::MobStop,
+                    )
+                    .await?;
+            }
             let mut per_spawn_external_tools_seed = super::fork_build::RetainedOverlays::default();
             let mut recovered_direct_member_adoption_pending = false;
             let mut deferred_orchestrator_resume_notifications = Vec::new();
@@ -8240,8 +8256,10 @@ impl MobBuilder {
             );
             // A restored mob whose member run starts are held (a Stopped
             // mob) holds its local members' runtimes from their registration
-            // on: the in-memory holds of the previous process are gone.
-            // Resume releases them, before or after they register.
+            // on: the in-memory holds of the previous process are gone, and a
+            // `MobStop` an earlier incarnation in this process staged was
+            // dropped above. Resume releases them, before or after they
+            // register.
             if wiring.dsl_authority.state().member_run_starts_held {
                 for entry in roster.list() {
                     runtime_provisioner

@@ -1715,6 +1715,35 @@ pub trait MobProvisioner: Send + Sync {
     ) -> Result<(), MobError> {
         Ok(())
     }
+    /// Stage a run-start hold that the member's next runtime registration
+    /// applies (#1500), without holding the registration that is current: a
+    /// mob Stop stages `MobStop` this way and then holds the member with
+    /// [`Self::stop_member_runtime`], so a registration that replaces the
+    /// held one while the mob is Stopped (a reload) is held too. The reason
+    /// stays staged until [`Self::release_member_run_starts`] releases it or
+    /// [`Self::unstage_member_registration_run_start_hold`] removes it. Only
+    /// a runtime this process hosts is staged; the default stages nothing.
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
+    /// Remove a run-start hold staged for the member's runtime registration
+    /// (#1500), and nothing more: a hold the current registration already
+    /// applies stays in place. For a member that is gone for good (retired,
+    /// torn down by Shutdown, disposed by destroy), so that a later
+    /// registration of the same session is not held for it, and for a
+    /// restore that drops a `MobStop` an earlier incarnation staged before
+    /// any member registers. The default removes nothing.
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
     async fn hard_cancel_member(
         &self,
         member_ref: &MemberRef,
@@ -14200,6 +14229,30 @@ impl MobProvisioner for SessionBackend {
             })
     }
 
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "stage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.stage_registration_run_start_hold_only(&session_id, reason);
+        }
+        Ok(())
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "unstage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.unstage_registration_run_start_hold(&session_id, reason);
+        }
+        Ok(())
+    }
+
     async fn hard_cancel_member(
         &self,
         member_ref: &MemberRef,
@@ -18002,6 +18055,38 @@ impl MobProvisioner for MultiBackendProvisioner {
             _ => {
                 self.session
                     .stage_member_registration_run_start_hold(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .stage_member_registration_run_start_hold_only(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .unstage_member_registration_run_start_hold(member_ref, reason)
                     .await
             }
         }
