@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# check-release-binary-sqlite-profile: refuse an rkat release binary whose
+# bundled SQLite runs with a process-wide lock.
+#
+# Every repository build sets LIBSQLITE3_FLAGS to
+# meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS (.cargo/config.toml for Cargo,
+# MODULE.bazel for Bazel), which builds SQLite without its three
+# process-wide locks: allocator statistics, one page cache shared by every
+# connection, and page-cache overflow statistics. A toolchain or lane that
+# drops the setting still builds working binaries, so the release runs
+# `rkat storage doctor --json` on the rkat it builds and requires the
+# report's `sqlite_lock_profile` to have every lock off, and the
+# allocator-statistics switch rkat calls first in `main` to find statistics
+# already off (the build's flag, not the runtime fallback). The four release
+# binaries of a target come from one build configuration.
+#
+# Releases before 0.9.4 predate the profile and its report: with VERSION
+# naming one (asset recovery of an older tag runs the workflow's copy of this
+# script), the check passes without running the binary. With VERSION unset or
+# unparsable, the check runs.
+#
+# --if-runnable-target <triple>: check only when this host runs <triple>
+# natively; otherwise say so and pass. For a job that packages binaries for
+# several targets on one runner; the target it can run carries the same
+# build configuration.
+#
+# Usage: [VERSION=X.Y.Z] check-release-binary-sqlite-profile [--if-runnable-target <triple>] <rkat>
+# Exit 0 = the required profile (or not checked, as above), 1 = a lock is on
+# or the report has no profile, 2 = usage error or the binary did not run.
+
+set -euo pipefail
+
+PROFILE_SINCE="0.9.4"
+
+usage() {
+  echo "usage: [VERSION=X.Y.Z] check-release-binary-sqlite-profile [--if-runnable-target <triple>] <rkat>" >&2
+  exit 2
+}
+
+runnable_target=""
+if [[ "${1-}" == "--if-runnable-target" ]]; then
+  [[ "$#" -eq 3 ]] || usage
+  runnable_target="$2"
+  shift 2
+fi
+[[ "$#" -eq 1 ]] || usage
+name="$(basename "$1")"
+if [[ ! -f "$1" ]]; then
+  echo "${name}: no such binary" >&2
+  exit 2
+fi
+binary="$(cd "$(dirname "$1")" && pwd)/${name}"
+
+# Succeeds when VERSION names a release before PROFILE_SINCE (a prerelease
+# counts as its release).
+predates_profile() {
+  local version="${VERSION-}"
+  local pattern='^v?(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})(-[0-9A-Za-z.-]+)?$'
+  [[ "${version}" =~ ${pattern} ]] || return 1
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+  local since_major since_minor since_patch
+  IFS=. read -r since_major since_minor since_patch <<<"${PROFILE_SINCE}"
+  ((major < since_major ||
+    (major == since_major && (minor < since_minor ||
+      (minor == since_minor && patch < since_patch)))))
+}
+
+# The target triple this host runs natively; empty when unknown.
+host_target() {
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) echo x86_64-unknown-linux-gnu ;;
+    Linux-aarch64 | Linux-arm64) echo aarch64-unknown-linux-gnu ;;
+    Darwin-arm64) echo aarch64-apple-darwin ;;
+    Darwin-x86_64) echo x86_64-apple-darwin ;;
+    *) echo "" ;;
+  esac
+}
+
+if predates_profile; then
+  echo "${name}: release ${VERSION} predates the SQLite lock profile report (${PROFILE_SINCE}); not checked"
+  exit 0
+fi
+if [[ -n "${runnable_target}" && "${runnable_target}" != "$(host_target)" ]]; then
+  echo "${name}: built for ${runnable_target}, which this $(uname -s) $(uname -m) runner does not run; not checked here"
+  exit 0
+fi
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-sqlite-profile.XXXXXX")"
+trap 'rm -rf "${scratch}"' EXIT
+mkdir -p "${scratch}/home" "${scratch}/project"
+
+# A sweep of one empty state root, from an empty home: the report is the
+# binary's own profile, whatever the runner holds.
+set +e
+(
+  cd "${scratch}/project" &&
+    HOME="${scratch}/home" XDG_CONFIG_HOME="${scratch}/home/.config" \
+      XDG_DATA_HOME="${scratch}/home/.local/share" \
+      "${binary}" --context-root "${scratch}/project" --state-root "${scratch}/realms" \
+      storage doctor --json >"${scratch}/report.json" 2>"${scratch}/stderr"
+)
+status=$?
+set -e
+if [[ "${status}" -ne 0 ]]; then
+  echo "${name}: \`storage doctor --json\` exited ${status}" >&2
+  cat "${scratch}/stderr" >&2
+  exit 2
+fi
+
+python3 - "${name}" "${scratch}/report.json" <<'PY'
+import json
+import sys
+
+name, path = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as handle:
+        report = json.load(handle)
+except ValueError as err:
+    print(f"{name}: `storage doctor --json` printed no JSON report: {err}", file=sys.stderr)
+    sys.exit(1)
+profile = report.get("sqlite_lock_profile") if isinstance(report, dict) else None
+if not isinstance(profile, dict):
+    print(f"{name}: the doctor report has no sqlite_lock_profile", file=sys.stderr)
+    sys.exit(1)
+locks = ("memory_statistics", "shared_page_cache", "page_cache_overflow_statistics")
+on = [lock for lock in locks if profile.get(lock) is not False]
+switch = profile.get("memory_statistics_switch")
+if on or switch != "already_off":
+    print(
+        f"{name}: SQLite runs with process-wide locks {on or 'none'} and the allocator "
+        f"statistics switch found {switch!r} (expected none and 'already_off'): the build "
+        "did not set LIBSQLITE3_FLAGS to meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"{name}: SQLite runs without process-wide locks (allocator statistics already off)")
+PY

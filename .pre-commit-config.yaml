@@ -316,6 +316,14 @@ repos:
         always_run: true
         stages: [manual]
 
+      - id: release-sqlite-profile-check-contract
+        name: release SQLite lock profile check refuses each defect
+        entry: scripts/test-check-release-binary-sqlite-profile.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+
       - id: release-asset-provenance-contract
         name: release asset provenance accepts an earlier run only through its build gate
         entry: scripts/test-verify-release-asset-provenance.sh

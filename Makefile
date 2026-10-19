@@ -853,6 +853,7 @@ release-doctor:
 	@scripts/test-verify-release-asset-provenance.sh
 	@$(PYTHON) scripts/test_release_stamp_sdk_binary_digests.py
 	@scripts/test-check-macos-x86-release-binary.sh
+	@scripts/test-check-release-binary-sqlite-profile.sh
 	@scripts/test-gcp-buildbuddy-workflow-gate.sh
 	@scripts/release-doctor
 
