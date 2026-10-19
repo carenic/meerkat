@@ -109,7 +109,9 @@ pub enum OperationEntryBoundary {
     /// ([`crate::ToolDispatchContext::observe_tool_entry`]).
     ToolDispatch,
     /// The call-level execution policy gate's staging of a tool call
-    /// ([`crate::ExecutionPolicyGatedDispatcher`]).
+    /// ([`crate::ExecutionPolicyGatedDispatcher`]), after the gate's own
+    /// awaits. A staging that waits out an owner change in progress records
+    /// its entry again, for the decision prepared after the change.
     ToolExecutionPolicy,
     /// The owning tool leaf's single consuming entry, immediately before
     /// its effect or transport handoff

@@ -71,14 +71,15 @@ them.
 - The same bounded wait covers the other operations that rebuild after a
   `ReprepareRequired` refusal. A compaction summary no longer fails its
   compaction with a refusal. A governed tool dispatch waits at its prepared
-  entry and again at its body entry, each with its own deadline and free
-  rebuilds, inside the tool's timeout; the review check point runs on the
-  decision prepared after the wait, so a reviewed tool whose decision changed
-  meanwhile is reviewed once more (see below) and no review is reused. The
-  `web_search` tool's helper model request asks again under the same
-  delegate operation. The debug event names the site (`model_request`,
-  `compaction_summary`, `tool_dispatch`, `tool_entry`,
-  `web_search_delegate`).
+  entry and again at its body entry, and when the call-level execution
+  policy gate stages the call again after its own awaits (dispatch admission,
+  consequence policy), inside the tool's timeout; the review check point
+  runs on the decision prepared after the wait, so a reviewed tool whose
+  decision changed meanwhile is reviewed once more (see below) and no review
+  is reused. The `web_search` tool's helper model request asks again under
+  the same delegate operation. The debug event names the site
+  (`model_request`, `compaction_summary`, `tool_dispatch`, `tool_entry`,
+  `tool_policy_entry`, `web_search_delegate`).
 - A governed helper admission fence and a helper child issuance answer
   `Unavailable` instead of `Denied` when their check refuses to rebuild
   (`ReprepareRequired`), on the prepared path and on the dispatch path alike:
@@ -106,8 +107,9 @@ them.
   `ReviewAttemptStarted` after the successor's `Prepared` record, and a
   change at the entry staging also leaves that staging's `Entry` record
   twice. Per tool call the waits stay bounded: at most 3 wait states (the
-  dispatch's preparation and each review attempt), 9 free rebuilds and 6 s
-  of waiting, inside the tool's timeout.
+  dispatch's preparation, and each review attempt's, which every staging of
+  that attempt shares), 9 free rebuilds and 6 s of waiting, inside the
+  tool's timeout.
 
 ## [0.9.3] - 2026-10-18
 
