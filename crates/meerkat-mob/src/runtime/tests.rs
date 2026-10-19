@@ -2208,6 +2208,9 @@ struct MockSessionService {
     /// One permit per interrupt that entered its gate.
     interrupt_gate_entered: tokio::sync::Notify,
     runtime_boundary_acknowledgements: RwLock<Vec<RuntimeBoundaryAcknowledgement>>,
+    /// Cleared by [`Self::keep_no_durable_sessions`]: the service then reports
+    /// that it keeps no durable sessions, as an ephemeral service does.
+    keeps_durable_sessions: AtomicBool,
 }
 
 impl MockSessionService {
@@ -2363,7 +2366,13 @@ impl MockSessionService {
             interrupt_gates: RwLock::new(HashMap::new()),
             interrupt_gate_entered: tokio::sync::Notify::new(),
             runtime_boundary_acknowledgements: RwLock::new(Vec::new()),
+            keeps_durable_sessions: AtomicBool::new(true),
         }
+    }
+
+    /// Report, from now on, that this service keeps no durable sessions.
+    fn keep_no_durable_sessions(&self) {
+        self.keeps_durable_sessions.store(false, Ordering::SeqCst);
     }
 
     async fn fail_subscribe_for_session(&self, session_id: SessionId) {
@@ -5299,7 +5308,7 @@ impl MobSessionService for MockSessionService {
     }
 
     fn supports_persistent_sessions(&self) -> bool {
-        true
+        self.keeps_durable_sessions.load(Ordering::SeqCst)
     }
 
     fn supports_runtime_turn_apply(&self) -> bool {

@@ -9698,7 +9698,9 @@ impl MobBuilder {
                 direct_member_incarnation: None,
                 ops_registry: None,
                 generated_self_owned_operation_owner: None,
-                runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                // A host refusal of the recreated member's registration comes
+                // back typed, as on the durable arm above.
+                runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::ColdRestore,
                 held_bound: None,
             };
             let admitted_bridge_session_id =
@@ -9721,7 +9723,33 @@ impl MobBuilder {
                     &admitted_bridge_session_id,
                     "resume_fresh_member_session_provision_owner",
                 )?);
-            let receipt = provisioner.provision_member(provision_request).await?;
+            let receipt = match provisioner.provision_member(provision_request).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    // A host refusal of this member's registration breaks only
+                    // this member, as on the durable arm: the seed records the
+                    // refusal's code, and the transaction's own rollback
+                    // already removed the registration the host was asked
+                    // about. Any other failure still fails the resume.
+                    let registration_refusal = match &error {
+                        MobError::MemberRegistrationRefused { call, .. } => *call,
+                        _ => return Err(error),
+                    };
+                    tool_handle.restore_diagnostics.write().await.insert(
+                        entry.agent_identity.clone(),
+                        super::handle::RestoreFailureDiagnostic {
+                            bridge_session_id: Some(bridge_session_id.clone()),
+                            reason: format!(
+                                "failed to recreate the session of member '{}': {error}",
+                                entry.agent_identity
+                            ),
+                            hold: None,
+                            registration_refusal: Some(registration_refusal),
+                        },
+                    );
+                    continue;
+                }
+            };
             let created_bridge_session_id = receipt
                 .member_ref
                 .bridge_session_id()
