@@ -1681,13 +1681,14 @@ for (const path of [
       `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 60 (a cold feature row takes up to 45 minutes, and a longer cap only delays a hung row)`,
     );
   }
-  // The integration suites and the example web suites compile cold on the
-  // first push or dispatch of a tree that changes meerkat-core: a pull
-  // request keeps its caps, a push or dispatch gets caps sized from the cold
-  // runs (the comments beside each job).
+  // The integration suites, the example web suites and the confinement lane
+  // compile cold on the first push or dispatch of a tree that changes
+  // meerkat-core: a pull request keeps its caps, a push or dispatch gets
+  // caps sized from the cold runs (the comments beside each job).
   for (const [job, pullRequest, push] of [
     ["integration", 30, 50],
     ["example-web", 25, 35],
+    ["mcp-confinement-positive", 40, 50],
   ]) {
     const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: /.test(line));
     assert.equal(

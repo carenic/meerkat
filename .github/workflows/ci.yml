@@ -124,6 +124,10 @@ name: CI
 # dispatch on main saves into the scope the next push to main restores
 # from, and that run writes the exact-tree attestation a release tag
 # trusts (scripts/check_release_workflow_contract.py, release-caches).
+# The sccache bucket is not such a cache: a dispatch on a release branch
+# writes it (.github/actions/setup-sccache-ci), and an object there serves
+# only a compile with the same inputs. The registry cache keeps the rule
+# on every dispatch; a save would spare a registry download at most.
 #
 # Everything else (integration-fast and e2e-fast over the whole workspace,
 # the dense Mob topology stress, the bounded TLC machine-verify sweep, the
@@ -1257,9 +1261,13 @@ jobs:
     # feature: 863 s on run 38859112297) unless it touches the lane's own
     # inputs or changes its definition (GUARD_LANE_INPUTS,
     # GUARD_LANE_DEFINITIONS in scripts/ci-cargo-lanes.mjs).
+    # The push's build is cold after a change below the facade: 32.5 minutes
+    # on main push 39213218053 and 27.5 on dispatch 39211283488, against the
+    # 40 a pull request keeps. A push or dispatch gets 50, about 54% above
+    # the slower run.
     if: ${{ needs.changes.outputs.mcp_confinement_positive == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 40 || 50 }}
     env:
       RUSTC_WRAPPER: sccache
       CARGO_TERM_COLOR: never

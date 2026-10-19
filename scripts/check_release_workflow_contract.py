@@ -2060,13 +2060,15 @@ TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml"
 RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
-# schedule runs, and a dispatch on a release branch (rel/** or release/**,
-# whose code only a writer can push, as for a push to release/**), set the
-# sccache client to write them (a client-side setting: a later step can
-# still read the job's GCS credentials file, SCCACHE_GCS_KEY_PATH, whose
-# identity can write). It installs a release checked against a pinned
-# sha256 itself, not through sccache-action, which would export the job's
-# Actions cache token to the run steps after it.
+# schedule runs, and a dispatch on a release branch (rel/** or release/**),
+# set the sccache client to write them (a client-side setting: a later step
+# can still read the job's GCS credentials file, SCCACHE_GCS_KEY_PATH, whose
+# identity can write). The branch prefix is no authorization control: any
+# writer can create such a branch and dispatch it, as any writer can push to
+# release/**, so the write boundary stays repository write access. It
+# installs a release checked against a pinned sha256 itself, not through
+# sccache-action, which would export the job's Actions cache token to the
+# run steps after it.
 SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
 # The (event, ref) runs whose client writes, and those whose client only
 # reads: a dispatch on any other ref (main, a near-miss branch name, a tag)

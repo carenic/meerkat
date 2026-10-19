@@ -395,6 +395,10 @@ graph.
   read the credentials file `SCCACHE_GCS_KEY_PATH` names. Only a separate
   read-only identity for those runs, an IAM change outside this
   repository, closes that.
+- The release-branch prefix that lets a dispatch write the bucket is no
+  authorization control either: any writer can create a `rel/**` branch and
+  dispatch it, as any writer can push to `release/**`. The write boundary is
+  repository write access.
 - The bearer token in that credentials file (`gha-creds-*.json`) is the
   job's Actions runtime token: the runner sets
   `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same token. No step exports the
