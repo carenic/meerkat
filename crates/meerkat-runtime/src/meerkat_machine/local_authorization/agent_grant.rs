@@ -70,7 +70,7 @@ impl AgentConfiguredMcpProvider {
 impl super::ConfiguredMcpAttachmentProvider for AgentConfiguredMcpProvider {
     fn configured(
         &self,
-        _session_id: &meerkat_core::SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: SessionAgentBinding,
     ) -> Option<Arc<dyn ConfiguredMcpAttachmentAuthority>> {
         Some(self.grant.for_agent(

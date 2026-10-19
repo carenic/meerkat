@@ -74,7 +74,11 @@ pub trait StockConsentSurface: Send + Sync {
     /// Presentation facts for the approval of one exact candidate: who
     /// requested it, its risk and the surface metadata shown with it. The
     /// route adds the accepted assurance and the operation's account and
-    /// mandate to the metadata.
+    /// mandate to the metadata. The requester a surface presents is the
+    /// person the approval is presented to on its behalf, such as the
+    /// operator of a pipe; the work's own requester (the operator, a
+    /// caller, or the stock ingress for an outcome it reports) is stated in
+    /// the mandate ([`STOCK_REVIEW_MANDATE_LABEL`]).
     ///
     /// # Errors
     /// [`ConsentRouteUnavailable`] when the surface cannot present the
