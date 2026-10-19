@@ -115,8 +115,10 @@ cross-compile the four surface binaries and package their ZIP archives. It
 adds an 8 GiB swap file when total swap is below 8 GiB; it does not set
 `CARGO_BUILD_JOBS=2` or inject the per-package optimization pins shown below.
 The subsequent `verify_windows_binaries` job runs on `windows-2025-vs2026`,
-extracts the archives, executes each binary's `--version`, and checks
-`rkat --help`; it does not compile them natively. These workflow settings are
+extracts the archives, executes each binary's `--version`, checks
+`rkat --help`, and checks the SQLite lock profile `rkat storage doctor --json`
+reports (see [SQLite Lock Profile](#sqlite-lock-profile)); it does not compile
+them natively. These workflow settings are
 not new wall-time or memory measurements. Continuous integration
 (`.github/workflows/ci.yml`) uses BuildBuddy for its broad lane and hosted
 Linux for the required dense Mob topology stress; release binaries are
@@ -297,6 +299,65 @@ serving runtime and the machine cleanup runtime) always run two workers each.
 A Rust host that builds its own Tokio runtime can apply the same setting:
 `meerkat_runtime::host_stack::worker_threads_from_env()` returns the validated
 count, or `None` for the default.
+
+## SQLite Lock Profile
+
+Meerkat's stores run on the SQLite that `libsqlite3-sys` bundles. Three
+defaults of that build put one process-wide mutex in front of every
+connection in the process, so sessions that share a host process queue on
+each other:
+
+| Lock | Taken on | On by default because |
+|------|----------|-----------------------|
+| Allocator statistics (`SQLITE_MUTEX_STATIC_MEM`) | every SQLite allocation and free; opening a connection and parsing its schema makes thousands | SQLite's `SQLITE_DEFAULT_MEMSTATUS=1` |
+| Shared page cache (`SQLITE_MUTEX_STATIC_LRU`) | every page fetch, unpin and release | `libsqlite3-sys` builds with `SQLITE_ENABLE_MEMORY_MANAGEMENT` |
+| Page-cache overflow statistics (`SQLITE_MUTEX_STATIC_PMEM`) | every page buffer allocated or freed on the heap | SQLite's default |
+
+On a shared 192-core host (`meerkat-sqlite`'s `process_wide_locks_bench`
+test measures this), sixteen threads that each opened their own database
+opened fewer connections per second together with the defaults (about 700)
+than one thread alone (about 3,000), and 10,000 to 24,000 with allocator
+statistics off. Sixteen threads writing to their own databases ran about six
+times faster with one page cache per connection. The overflow statistics lock
+is taken least often: turning it off as well made no difference beyond the
+host's run-to-run variation.
+
+One build setting turns all three off
+(`meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS`):
+
+```bash
+LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"
+```
+
+Nothing Meerkat calls reads what these provide (SQLite's memory and
+page-cache statistics, its heap limits, `sqlite3_release_memory`). The
+repository sets the value for every build it makes, Cargo through
+`.cargo/config.toml` and Bazel through `MODULE.bazel`, so the release binaries
+carry it. The release workflow runs `rkat storage doctor --json` on each
+`rkat` it builds where the runner can execute it, and fails when a lock is on:
+every target of the GitHub-hosted lane, the x86_64 Linux target of the
+BuildBuddy lane (its other targets build from the same Bazel annotation),
+Intel macOS under Rosetta, and Windows on the Windows verification runner.
+
+A build outside the repository does not read those files: set the variable
+yourself for `cargo install rkat` and for an application that embeds Meerkat.
+Without it, every host binary still turns allocator statistics off as the
+first statement of `main`, but the shared page cache and the overflow
+statistics stay on.
+
+`rkat storage doctor` reports the profile its binary runs with (the
+`sqlite_lock_profile` object of `--json`, and a line of the text report) and
+warns with the finding `sqlite-lock-profile` when a lock is on. A process
+that opens its first store connection with a lock on also logs a warning that
+names the variable.
+
+A Rust application that embeds Meerkat sets the variable for its own build,
+and calls `meerkat_sqlite::disable_memory_statistics_at_process_start()` as
+the first statement of its `main`. The function is `unsafe`: SQLite accepts
+the switch only before anything uses it, and no other thread may use SQLite
+while it runs. `meerkat_sqlite::check_lock_profile()` and
+`meerkat_sqlite::SqliteLockProfile::effective()` tell the application which
+locks it runs with.
 
 ## Containerizing The Binaries
 

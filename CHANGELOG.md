@@ -1073,6 +1073,35 @@ them.
 - `meerkat-runtime`: `PreparedSessionMaterialization::inserted_registration()`
   tells whether the materialization's own prepare inserted the session's
   registration or found one already current.
+- `meerkat-sqlite`: the `lock_profile` module, the one declaration of the
+  bundled SQLite's lock profile. `REQUIRED_LIBSQLITE3_FLAGS` is the build
+  setting that turns SQLite's three process-wide locks off (see Changed);
+  `SqliteLockProfile::compiled()` and `effective()` read which locks the
+  process runs with, and `check_lock_profile()` refuses with
+  `SqliteLockProfileMismatch`, naming the setting, when one is on.
+  `disable_memory_statistics_at_process_start()`, an `unsafe fn` for the
+  first statement of `main`, turns allocator statistics off in a build
+  without the setting and records its `MemoryStatisticsOutcome` (`Applied`,
+  `AlreadyOff`, or `TooLate` when SQLite was already in use;
+  `memory_statistics_outcome()` reads it). The first connection
+  `meerkat-sqlite` opens in a process logs a warning naming the setting when
+  a lock is on.
+- `rkat storage doctor` reports the SQLite lock profile of its binary:
+  `StorageDiagnosis::sqlite_lock_profile` (`SqliteLockProfileReport` in
+  `meerkat-core`, with the allocator-statistics switch's
+  `SqliteMemoryStatisticsSwitch`), the `sqlite_lock_profile` object of
+  `--json`, a line of the text report, and the warning finding
+  `sqlite-lock-profile` when a lock is on. The disk diagnosis
+  (`DiskStorageMigrator`) fills it; other diagnosers leave it out.
+- `meerkat-sqlite`: `KeptConnectionPresence`, the presence lock
+  (`<file>.mpresence`, `presence_lock_path`) a connection kept open between
+  operations holds shared for its whole life.
+- `meerkat-runtime`: `RuntimeStore::delivery_generation_reader`, a defaulted
+  method returning an optional `DeliveryGenerationReader` for a delivery
+  owner's store ticks (the default, `None`, reads through
+  `load_delivery_generation`), `RuntimeDeliveryInbox::delivery_generation_reader`,
+  and `KEPT_DELIVERY_READER_IDLE`. A store decorator forwards the method to
+  the store it wraps or keeps the default.
 
 ### Changed
 
@@ -1270,6 +1299,52 @@ them.
   replaces the registration from durable truth. A mob member's tracked turn
   stays pending on either failure, as on `AuthorityUnavailable`, and a
   scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+- The bundled SQLite is built without its three process-wide locks:
+  allocator statistics, one page cache shared by every connection, and
+  page-cache overflow statistics. Each put a mutex in front of every
+  connection in the process, so concurrent sessions in one host queued on
+  each other: sixteen threads that each opened their own database opened
+  fewer connections per second together than one thread alone. The
+  repository builds set `LIBSQLITE3_FLAGS` to
+  `meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS`
+  (`-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT
+  -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS`): Cargo through
+  `.cargo/config.toml` (forced over a value in the environment) and Bazel
+  through `MODULE.bazel`. Nothing Meerkat calls reads what the locks provided
+  (SQLite's memory statistics, heap limits and `sqlite3_release_memory`). A
+  build outside the repository (`cargo install rkat`, an application that
+  embeds Meerkat) sets the variable itself; see "SQLite Lock Profile" in the
+  deploying guide. Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`,
+  `rkat-mcp`, `rkat-mob-mcp`) turns allocator statistics off as the first
+  statement of `main`, which removes that lock even without the variable.
+- `meerkat-sqlite`: `ExclusiveFence` now holds the presence lock as well and
+  creates `<file>.mpresence` next to each database it fences. `try_acquire`
+  takes both locks or neither, and `acquire` takes the fence lock, then waits
+  for the presence lock within the same deadline, so maintenance waits for
+  kept connections to close.
+- `meerkat-store`: the storage doctor's artifact sweep (`rkat storage
+  doctor`) lists `*.mpresence` presence lock files as
+  `maintenance-fence-lock` findings, as it lists the `*.mfence` fence lock
+  files.
+- A runtime delivery owner on a store other processes share reads the
+  store's delivery generation through one kept connection instead of a
+  verified open on every store tick (up to one tick per 10 ms on a busy
+  store). In the ignored `bench_fresh_and_kept_generation_reads` test, in a
+  release build on a shared 192-core host, a kept read took about 19
+  microseconds and a fresh one about 500. The connection holds the
+  database's presence lock and still takes the shared fence guard for each
+  read; under the guard it checks that the path still names the file it
+  opened and that the schema and the delivery domain's ledger row are
+  unchanged, and opens again, verified, when they are not. The maintenance
+  fence takes the presence lock after its fence lock, and the reader closes
+  before its owner calls into the host, at its next read, which the fence
+  refuses, or after `KEPT_DELIVERY_READER_IDLE` (1 second) without a read,
+  so maintenance gets the database well inside `rkat storage migrate`'s
+  default 10-second fence wait. Windows keeps the fresh-open read path
+  because no CI lane runs the kept reader on Windows.
+  Maintenance from an older binary takes only the fence lock and does not
+  wait for a kept connection: run maintenance with the same release as the
+  hosts.
 
 ### Fixed
 

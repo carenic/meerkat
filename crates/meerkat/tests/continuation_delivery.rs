@@ -2896,6 +2896,456 @@ mod hosting {
             0
         );
     }
+
+    /// The store's kept delivery-generation reader under a delivery
+    /// owner. Unix only: the store keeps the reader on unix.
+    #[cfg(unix)]
+    mod kept_reader {
+        use super::*;
+
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        use meerkat_runtime::store::sqlite::delivery_generation_test_hooks as hooks;
+
+        /// A store watched for other processes' commits, with its database
+        /// path (the key of the delivery-generation test hooks).
+        fn watched_store() -> (Fixture, std::path::PathBuf, HostingCapability) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let paths = HostingPaths {
+                hosting_lock_dir: dir.path().join("hosting"),
+                cold_delivery_lock: dir.path().join("delivery").join("cold-delivery.lock"),
+                database: None,
+            };
+            let store = Arc::new(
+                SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+                    .expect("open store")
+                    .with_hosting_paths(paths),
+            );
+            let path = store.path().to_path_buf();
+            let capability = RuntimeStore::hosting_capability(store.as_ref());
+            assert!(capability.is_cross_process());
+            (Fixture::on(store, Some(dir)), path, capability)
+        }
+
+        /// Counts the kept reads of the database at `path`: reads on a kept
+        /// connection, not its verified opens.
+        fn count_kept_reads(path: &std::path::Path) -> Arc<AtomicU64> {
+            let reads = Arc::new(AtomicU64::new(0));
+            hooks::before_kept_read_guard(path, {
+                let reads = Arc::clone(&reads);
+                move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            reads
+        }
+
+        /// Whether maintenance gets the database at `path` now: no kept
+        /// connection holds its presence lock. The fence is released at once.
+        fn maintenance_gets_the_database(path: &std::path::Path) -> bool {
+            meerkat_sqlite::ExclusiveFence::try_acquire(path)
+                .expect("io")
+                .is_some()
+        }
+
+        /// A quiet watched store ticks its owner every sweep, and
+        /// every tick reads the delivery generation. Through the store's kept
+        /// reader the owner opens the database once and reads on the kept
+        /// connection at its ticks; through the fresh-open path (the one
+        /// every tick took before) it opens it on every tick.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_quiet_store_ticks_on_one_kept_open_instead_of_one_open_per_tick() {
+            const SWEEP: Duration = Duration::from_millis(5);
+
+            let (fresh, fresh_path, capability) = watched_store();
+            hooks::force_fresh_reads(&fresh_path);
+            let handle = fresh
+                .owner()
+                .with_store_sweep(SWEEP)
+                .arm(ClaimHost::new(&capability))
+                .expect("arm the fresh owner");
+            let started = std::time::Instant::now();
+            while hooks::verified_opens(&fresh_path) < 100 {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "100 store ticks never came"
+                );
+                tokio::time::sleep(SWEEP).await;
+            }
+            let hundred_ticks = started.elapsed();
+            drop(handle);
+
+            let (kept, kept_path, capability) = watched_store();
+            let kept_reads = count_kept_reads(&kept_path);
+            let handle = kept
+                .owner()
+                .with_store_sweep(SWEEP)
+                .arm(ClaimHost::new(&capability))
+                .expect("arm the kept owner");
+            tokio::time::sleep(hundred_ticks).await;
+            assert_eq!(
+                hooks::verified_opens(&kept_path),
+                1,
+                "as many ticks as the fresh owner took for 100 opens cost one open"
+            );
+            let reads = kept_reads.load(Ordering::SeqCst);
+            assert!(
+                reads >= 50,
+                "the kept owner reads at its ticks: {reads} kept reads in the time the fresh \
+                 owner opened 100 times"
+            );
+            drop(handle);
+        }
+
+        /// The kept reader's connection closes once the store has been
+        /// quiet for `KEPT_DELIVERY_READER_IDLE`, and with it the presence
+        /// lock the maintenance fence waits for (paused time).
+        #[tokio::test(start_paused = true)]
+        async fn a_quiet_kept_reader_closes_at_its_idle_bound() {
+            let (fixture, path, capability) = watched_store();
+            // No sweep inside the test: the arming pass is the only read.
+            let handle = fixture
+                .owner()
+                .with_store_sweep(Duration::from_secs(3600))
+                .arm(ClaimHost::new(&capability))
+                .expect("arm");
+            let mut passes = handle.subscribe_passes();
+            first_pass(&mut passes).await;
+            assert!(
+                !maintenance_gets_the_database(&path),
+                "the arming read keeps its connection, so maintenance waits"
+            );
+
+            tokio::time::advance(
+                meerkat_runtime::KEPT_DELIVERY_READER_IDLE
+                    .saturating_sub(Duration::from_millis(50)),
+            )
+            .await;
+            tokio::task::yield_now().await;
+            assert!(
+                !maintenance_gets_the_database(&path),
+                "kept until the idle bound"
+            );
+
+            tokio::time::advance(Duration::from_millis(100)).await;
+            let mut released = false;
+            for _ in 0..1000 {
+                tokio::task::yield_now().await;
+                released = maintenance_gets_the_database(&path);
+                if released {
+                    break;
+                }
+            }
+            assert!(
+                released,
+                "the quiet reader closed at its idle bound, and maintenance gets the database"
+            );
+            drop(handle);
+        }
+
+        /// Holds the host calls made through it, once armed, until the test
+        /// opens it, and says when it holds one.
+        struct HostGate {
+            armed: AtomicBool,
+            held: watch::Sender<bool>,
+            open: watch::Sender<bool>,
+        }
+
+        impl HostGate {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    armed: AtomicBool::new(false),
+                    held: watch::Sender::new(false),
+                    open: watch::Sender::new(false),
+                })
+            }
+
+            /// Hold the calls from now on.
+            fn arm(&self) {
+                self.armed.store(true, Ordering::SeqCst);
+            }
+
+            /// A host call through the gate: held while it is armed and
+            /// closed.
+            async fn pass(&self) {
+                if !self.armed.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.held.send_replace(true);
+                // The gate owns the sender, so this wait ends when it opens.
+                let mut open = self.open.subscribe();
+                let _ = open.wait_for(|open| *open).await;
+            }
+
+            /// Wait until the gate holds a call.
+            async fn wait_held(&self, what: &str) {
+                let mut held = self.held.subscribe();
+                tokio::time::timeout(EVENT_GUARD, held.wait_for(|held| *held))
+                    .await
+                    .unwrap_or_else(|_| panic!("never held: {what}"))
+                    .expect("the gate owns the sender");
+            }
+
+            fn open(&self) {
+                self.open.send_replace(true);
+            }
+        }
+
+        /// Admits through [`ObservingSink`] once its gate lets the admission
+        /// on.
+        struct GatedSink {
+            inner: Arc<ObservingSink>,
+            gate: Arc<HostGate>,
+        }
+
+        #[async_trait::async_trait]
+        impl ContinuationDeliverySink for GatedSink {
+            async fn admit(
+                &self,
+                session: &SessionId,
+                input: meerkat_runtime::Input,
+            ) -> Result<InputId, String> {
+                self.gate.pass().await;
+                self.inner.admit(session, input).await
+            }
+
+            async fn admitted_input(
+                &self,
+                session: &SessionId,
+                admission_key: &str,
+            ) -> Result<Option<StoredInputState>, String> {
+                self.inner.admitted_input(session, admission_key).await
+            }
+        }
+
+        /// Routes and claims as [`ClaimHost`] does, and puts a gate in front
+        /// of each host call that can wait: an admission, a page of owed
+        /// continuations and an address resolution.
+        struct GatedHost {
+            claims: Arc<ClaimHost>,
+            sink: Arc<GatedSink>,
+            owed: Arc<HostGate>,
+            resolution: Arc<HostGate>,
+            /// Changes of the owing source; `None`: the host owes nothing.
+            owed_changes: Option<watch::Receiver<u64>>,
+        }
+
+        impl GatedHost {
+            fn new(
+                capability: &HostingCapability,
+                owed_changes: Option<watch::Receiver<u64>>,
+            ) -> Arc<Self> {
+                let claims = ClaimHost::new(capability);
+                Arc::new(Self {
+                    sink: Arc::new(GatedSink {
+                        inner: claims.sink.clone(),
+                        gate: HostGate::new(),
+                    }),
+                    claims,
+                    owed: HostGate::new(),
+                    resolution: HostGate::new(),
+                    owed_changes,
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RuntimeDeliveryHost for GatedHost {
+            async fn delivery_route(
+                &self,
+                session_id: &SessionId,
+            ) -> Option<meerkat::DeliveryRoute> {
+                self.claims.delivery_route(session_id).await
+            }
+
+            async fn claim_cold_delivery(
+                &self,
+                session_id: &SessionId,
+            ) -> Option<Result<HostingClaim, HostingRefused>> {
+                self.claims.claim_cold_delivery(session_id).await
+            }
+
+            async fn continuation_sink(
+                &self,
+                _session_id: &SessionId,
+            ) -> Option<Arc<dyn ContinuationDeliverySink>> {
+                Some(self.sink.clone())
+            }
+
+            async fn resolve_address(&self, address: &LogicalRuntimeId) -> AddressResolution {
+                self.resolution.pass().await;
+                self.claims.resolve_address(address).await
+            }
+
+            fn projects_owed_continuations(&self) -> bool {
+                self.owed_changes.is_some()
+            }
+
+            fn subscribe_owed_continuation_changes(&self) -> Option<watch::Receiver<u64>> {
+                self.owed_changes.clone()
+            }
+
+            async fn project_owed_continuations(
+                &self,
+                _after: Option<&meerkat::OwedContinuationCursor>,
+                _limit: usize,
+            ) -> meerkat::OwedContinuationProjection {
+                self.owed.pass().await;
+                meerkat::OwedContinuationProjection::default()
+            }
+        }
+
+        /// Delivering calls into the host, which can wait, so an owner
+        /// closes its kept reader's connection before it delivers, and
+        /// maintenance never waits on a delivery. The arming pass reads the
+        /// delivery generation through the kept reader, then delivers a
+        /// continuation whose admission the test holds: while it is held,
+        /// the fence gets the database.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_delivering_owner_holds_no_kept_connection_while_the_host_admits() {
+            let (fixture, path, capability) = watched_store();
+            let session = SessionId::new();
+            let owner = ContinuationOwner::Session {
+                session_id: session.clone(),
+            };
+            fixture
+                .continuations
+                .submit(&owner, delivery("task-1", host_producer()), 1)
+                .await
+                .expect("commit");
+
+            let host = GatedHost::new(&capability, None);
+            host.sink.gate.arm();
+            let handle = fixture
+                .owner()
+                .with_store_sweep(Duration::from_secs(3600))
+                .arm(host.clone())
+                .expect("arm");
+            let mut passes = handle.subscribe_passes();
+
+            host.sink
+                .gate
+                .wait_held("the arming pass reaches the admission")
+                .await;
+            assert!(
+                maintenance_gets_the_database(&path),
+                "a delivering owner keeps no connection, so maintenance gets the database"
+            );
+
+            host.sink.gate.open();
+            wait_for_status(&fixture, &owner, "task-1", &mut passes, |status| {
+                matches!(status, ContinuationStatus::Applied { .. })
+            })
+            .await;
+            drop(handle);
+        }
+
+        /// Projecting a page of owed continuations calls into the
+        /// host, which can wait, so an owner closes its kept reader's
+        /// connection before it projects. The store sweep reads on the kept
+        /// connection until a change of the owing source starts a round,
+        /// whose page the test holds: while it is held, the fence gets the
+        /// database.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_owner_projecting_owed_continuations_holds_no_kept_connection() {
+            let (fixture, path, capability) = watched_store();
+            let (owed_source, owed_changes) = watch::channel(0_u64);
+            let host = GatedHost::new(&capability, Some(owed_changes));
+            let kept_reads = count_kept_reads(&path);
+            let handle = fixture
+                .owner()
+                .with_store_sweep(TEST_SWEEP)
+                .arm(host.clone())
+                .expect("arm");
+            let mut passes = handle.subscribe_passes();
+            let armed = first_pass(&mut passes).await;
+            let started = std::time::Instant::now();
+            while kept_reads.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    started.elapsed() < EVENT_GUARD,
+                    "the sweep never read on the kept connection"
+                );
+                tokio::time::sleep(TEST_SWEEP).await;
+            }
+
+            host.owed.arm();
+            owed_source.send_modify(|revision| *revision += 1);
+            host.owed
+                .wait_held("a source change starts a round of owed continuations")
+                .await;
+            assert!(
+                maintenance_gets_the_database(&path),
+                "an owner projecting owed continuations keeps no connection, so maintenance \
+                 gets the database"
+            );
+
+            host.owed.open();
+            wait_for_pass(&mut passes, "the pass of the held round", |pass| {
+                pass.generation > armed.generation
+            })
+            .await;
+            drop(handle);
+        }
+
+        /// Resolving a continuation address calls into the host, which
+        /// can wait (it can revive a member), so an owner closes its kept
+        /// reader's connection before it resolves the address of a member
+        /// continuation waiting on another host. The test holds the
+        /// resolution a store tick makes: while it is held, the fence gets
+        /// the database. Then the member repoints to a session served here,
+        /// and the row applies through it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_owner_resolving_a_waiting_address_holds_no_kept_connection() {
+            let (fixture, path, capability) = watched_store();
+            let host = GatedHost::new(&capability, None);
+            let (address, a, b, _elsewhere, _a_claim) =
+                repointed_member(&fixture, &capability, &host.claims).await;
+            let handle = fixture
+                .owner()
+                .with_store_sweep(TEST_SWEEP)
+                .arm(host.clone())
+                .expect("arm");
+            let mut passes = handle.subscribe_passes();
+            let pass = first_pass(&mut passes).await;
+            assert_eq!(
+                pass.awaiting_other_hosts, 1,
+                "A is hosted elsewhere: {pass:?}"
+            );
+
+            host.resolution.arm();
+            host.resolution
+                .wait_held("a store tick resolves the waiting address again")
+                .await;
+            assert!(
+                maintenance_gets_the_database(&path),
+                "an owner resolving an address keeps no connection, so maintenance gets the \
+                 database"
+            );
+
+            // B is served here and the member repoints to it while the
+            // resolution is held, so the held call resolves B.
+            let _b_claim = host.claims.authority.grant(&b).expect("B is served here");
+            host.claims
+                .resolve(&address, AddressResolution::Session(b.clone()));
+            host.resolution.open();
+            wait_for_pass(&mut passes, "the row applied through B", |pass| {
+                pass.applied > 0 || pass.awaiting_other_hosts == 0
+            })
+            .await;
+            assert_eq!(
+                host.claims
+                    .sink
+                    .inner
+                    .admissions()
+                    .iter()
+                    .map(|(session, ..)| session.clone())
+                    .collect::<Vec<_>>(),
+                vec![b.clone()],
+                "admitted once, into B, never into A ({a})"
+            );
+            drop(handle);
+        }
+    }
 }
 
 /// Invariant behind continuation routing (#1813): the applier routes and

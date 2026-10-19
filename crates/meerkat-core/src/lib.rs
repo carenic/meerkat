@@ -584,8 +584,9 @@ pub use session_store::{
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{
-    DatabaseInventory, DiagnoseScope, FindingSeverity, StorageDiagnosis, StorageDiagnosticsError,
-    StorageFinding, StorageInventoryEntry, StorageMigrator,
+    DatabaseInventory, DiagnoseScope, FindingSeverity, SqliteLockProfileReport,
+    SqliteMemoryStatisticsSwitch, StorageDiagnosis, StorageDiagnosticsError, StorageFinding,
+    StorageInventoryEntry, StorageMigrator,
 };
 pub use storage_durability::{DurabilityClass, DurabilityDeclaration, DurabilityResolution};
 pub use storage_layout::{

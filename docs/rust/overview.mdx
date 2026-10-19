@@ -116,6 +116,17 @@ adapter types remain owned by `meerkat-live`.
 | `test-realtime-fixtures` | Test-only deterministic realtime fixtures | No |
 </Accordion>
 
+<Note>
+Meerkat's stores run on the SQLite that `libsqlite3-sys` bundles, whose
+defaults put every connection in the process behind three process-wide locks.
+Build your application with
+`LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"`
+(for example in the `[env]` table of your workspace's `.cargo/config.toml`),
+and call `meerkat_sqlite::disable_memory_statistics_at_process_start()` from
+the `meerkat-sqlite` crate as the first statement of `main`. See
+[SQLite Lock Profile](/guides/deploying#sqlite-lock-profile).
+</Note>
+
 ---
 
 ## Quick start

@@ -4279,6 +4279,10 @@ fn init_tracing(cli: &Cli) {
 }
 
 fn main() -> anyhow::Result<ExitCode> {
+    // SAFETY: the first statement of main: no other thread exists yet and
+    // nothing has used SQLite, as the switch requires.
+    #[allow(unsafe_code)]
+    let _ = unsafe { meerkat_sqlite::disable_memory_statistics_at_process_start() };
     // One documented worker-stack budget for every host binary; the main
     // future runs on a budgeted thread too, not the platform main thread
     // (1 MiB on Windows).
@@ -9623,6 +9627,12 @@ fn print_storage_diagnosis_text(
     if let Some(realm) = &scope.realm {
         println!("Realm filter: {realm}");
     }
+    if let Some(profile) = &diagnosis.sqlite_lock_profile {
+        println!(
+            "SQLite lock profile of this binary: {}",
+            describe_sqlite_lock_profile(profile)
+        );
+    }
     println!();
 
     for (severity, header) in [
@@ -9686,6 +9696,27 @@ fn print_storage_diagnosis_text(
         diagnosis.count(FindingSeverity::Warning),
         diagnosis.count(FindingSeverity::Info)
     );
+}
+
+/// One line for the doctor's text report: each process-wide lock on or off,
+/// and what the allocator-statistics switch at the start of `main` found.
+fn describe_sqlite_lock_profile(profile: &meerkat_core::SqliteLockProfileReport) -> String {
+    use meerkat_core::SqliteMemoryStatisticsSwitch;
+
+    let state = |on: bool| if on { "on" } else { "off" };
+    let switch = match profile.memory_statistics_switch {
+        Some(SqliteMemoryStatisticsSwitch::Applied) => "applied",
+        Some(SqliteMemoryStatisticsSwitch::AlreadyOff) => "already off",
+        Some(SqliteMemoryStatisticsSwitch::TooLate) => "too late",
+        None => "not called",
+    };
+    format!(
+        "memory statistics {}, shared page cache {}, page-cache overflow statistics {} \
+         (allocator statistics switch at start: {switch})",
+        state(profile.memory_statistics),
+        state(profile.shared_page_cache),
+        state(profile.page_cache_overflow_statistics),
+    )
 }
 
 async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> anyhow::Result<()> {

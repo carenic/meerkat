@@ -58,6 +58,7 @@ experimental-gpt-live-gate0-harness = [
 ]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+meerkat-sqlite = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

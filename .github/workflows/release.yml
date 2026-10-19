@@ -1139,6 +1139,7 @@ jobs:
             .github/actions/setup-rust-ci/action.yml
             scripts/ci-pin-rust-toolchain-env
             scripts/check-release-binary-markers
+            scripts/check-release-binary-sqlite-profile
           sparse-checkout-cone-mode: false
 
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
@@ -1270,6 +1271,12 @@ jobs:
             # reads the release version from VERSION: tokio's test-util
             # marker passes only in a release before 0.9.2.
             .release-tooling/scripts/check-release-binary-markers "$src"
+            # The bundled SQLite carries the lock profile the repository's
+            # builds declare (LIBSQLITE3_FLAGS); a lane or toolchain that
+            # dropped it fails here. Each runner is native to its target.
+            if [[ "${bin}" == rkat ]]; then
+              .release-tooling/scripts/check-release-binary-sqlite-profile "$src"
+            fi
 
             tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
             echo "packaged=${bin} -> dist/${artifact_name}"
@@ -1502,6 +1509,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "rkat --help exited $LASTEXITCODE" }
           Write-Host "all four Windows binaries run on windows-2025-vs2026"
 
+          # The SQLite lock profile the repository's builds declare
+          # (scripts/check-release-binary-sqlite-profile checks the other
+          # targets): every process-wide lock off, and the allocator
+          # statistics switch rkat calls first finding them already off.
+          # Releases before 0.9.4 predate the report.
+          $release = [version](($version -replace '^v', '') -replace '-.*$', '')
+          if ($release -lt [version]'0.9.4') {
+            Write-Host "rkat.exe: release $version predates the SQLite lock profile report; not checked"
+          } else {
+            $scratch = Join-Path $env:RUNNER_TEMP 'sqlite-lock-profile'
+            New-Item -ItemType Directory -Force -Path (Join-Path $scratch 'project') | Out-Null
+            $report = & (Join-Path extracted 'rkat.exe') --context-root (Join-Path $scratch 'project') --state-root (Join-Path $scratch 'realms') storage doctor --json | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "rkat storage doctor --json exited $LASTEXITCODE`n$report" }
+            $lockProfile = ($report | ConvertFrom-Json).sqlite_lock_profile
+            if ($null -eq $lockProfile -or
+                $lockProfile.memory_statistics -ne $false -or
+                $lockProfile.shared_page_cache -ne $false -or
+                $lockProfile.page_cache_overflow_statistics -ne $false -or
+                $lockProfile.memory_statistics_switch -ne 'already_off') {
+              throw "rkat.exe runs SQLite with a process-wide lock (the build did not set LIBSQLITE3_FLAGS): $($lockProfile | ConvertTo-Json -Compress)"
+            }
+            Write-Host "rkat.exe: SQLite runs without process-wide locks (allocator statistics already off)"
+          }
+
   # Intel macOS is a trailing platform: its archives may reach the release
   # after the critical Linux and macOS arm64 ones (publish_github_release
   # adds them, add-only). It is cross-compiled on an Apple silicon runner
@@ -1566,6 +1597,7 @@ jobs:
             scripts/ci-pin-rust-toolchain-env
             scripts/check-release-binary-markers
             scripts/check-macos-x86-release-binary
+            scripts/check-release-binary-sqlite-profile
           sparse-checkout-cone-mode: false
 
       - uses: ./.release-tooling/.github/actions/setup-rust-ci
@@ -1612,6 +1644,11 @@ jobs:
           .release-tooling/scripts/check-macos-x86-release-binary "$src" "$VERSION"
           # No release binary may carry compiled-in test code.
           .release-tooling/scripts/check-release-binary-markers "$src"
+          # The SQLite lock profile the repository's builds declare, under
+          # Rosetta (the macOS x86 check above installed it when missing).
+          if [[ "${bin}" == rkat ]]; then
+            .release-tooling/scripts/check-release-binary-sqlite-profile "$src"
+          fi
           tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
           echo "packaged=${bin} -> dist/${artifact_name}"
 
@@ -1736,6 +1773,7 @@ jobs:
           sparse-checkout: |
             .github/actions/setup-buildbuddy-ci/action.yml
             scripts/check-release-binary-markers
+            scripts/check-release-binary-sqlite-profile
             scripts/ci-pin-rust-toolchain-env
             scripts/install-buildbuddy-cli
           sparse-checkout-cone-mode: false
@@ -1848,6 +1886,14 @@ jobs:
             # marker passes only in a release before 0.9.2, whose Bazel
             # release builds compiled it (an asset recovery of such a tag).
             .release-tooling/scripts/check-release-binary-markers "${stage_dir}/${payload_name}"
+            # The SQLite lock profile the repository's builds declare. One
+            # runner packages every target, so only the target it runs is
+            # executed; the others build from the same MODULE.bazel
+            # annotation, which has no per-platform value.
+            if [[ "${bin}" == rkat ]]; then
+              .release-tooling/scripts/check-release-binary-sqlite-profile \
+                --if-runnable-target "${TARGET}" "${stage_dir}/${payload_name}"
+            fi
             archive_path="${PWD}/dist/${artifact_name}"
 
             if [[ "$ARCHIVE_EXT" == "zip" ]]; then

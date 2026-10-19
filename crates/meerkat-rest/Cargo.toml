@@ -59,6 +59,7 @@ meerkat-providers = { workspace = true, features = ["anthropic", "openai", "gemi
 meerkat-store = { workspace = true }
 meerkat-tools = { workspace = true }
 meerkat-runtime = { workspace = true, features = ["sqlite-store"] }
+meerkat-sqlite = { workspace = true }
 meerkat-mob = { workspace = true, optional = true }
 meerkat-mob-mcp = { workspace = true, optional = true }
 meerkat-comms = { workspace = true, optional = true }

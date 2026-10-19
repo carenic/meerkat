@@ -11,6 +11,17 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# These tests check the repository's build configuration (`.cargo/config.toml`
+# and `MODULE.bazel` set the bundled SQLite's flags) and the host binaries'
+# sources, so they run in the repository only and stay out of the published
+# package, whose other tests build standalone.
+exclude = [
+    "tests/lock_profile.rs",
+    "tests/lock_profile_sources.rs",
+    "tests/process_wide_mutexes.rs",
+    "tests/statistics_switch_first.rs",
+    "tests/statistics_switch_late.rs",
+]
 
 [features]
 # Test hooks for dependent crates' own tests (never a production feature):
@@ -30,6 +41,7 @@ notify = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

@@ -765,7 +765,12 @@ binary refuses typed (`SchemaFromTheFuture`) — a rollback candidate fails
 certification cleanly instead of crash-looping. Each database also has a
 sibling `<file>.mfence` lock file: store operations hold a shared
 per-operation guard, and offline maintenance (`rkat storage migrate`) takes
-the exclusive side after in-flight operations drain. Backup artifacts
+the exclusive side after in-flight operations drain. A connection kept open
+between operations (a runtime delivery owner's generation reader) also holds
+`<file>.mpresence` shared, and maintenance takes that lock exclusively after
+the fence lock, so it waits for the connection to close. Maintenance creates
+the presence file next to every database it fences, and `rkat storage doctor`
+inventories it with the fence lock file. Backup artifacts
 written by maintenance use the registered `*.pre-<version>-<timestamp>`
 naming that `rkat storage doctor` inventories and `rkat storage prune`
 owns.

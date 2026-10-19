@@ -157,6 +157,74 @@ pub struct StorageDiagnosis {
     /// Per-realm inventory across all swept roots.
     #[serde(default)]
     pub inventory: Vec<StorageInventoryEntry>,
+    /// The SQLite lock profile of the process that produced the diagnosis,
+    /// from diagnosers whose stores run on SQLite in that process (the disk
+    /// diagnosis); `None` from others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite_lock_profile: Option<SqliteLockProfileReport>,
+}
+
+/// Which of SQLite's process-wide locks every connection in the diagnosing
+/// process queues on (`true` means the lock is in use), and what that
+/// process's allocator-statistics switch found. Meerkat requires all three
+/// off; the `LIBSQLITE3_FLAGS` build setting that `meerkat-sqlite` declares
+/// turns them off.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteLockProfileReport {
+    /// Allocator statistics (`SQLITE_MUTEX_STATIC_MEM` on every allocation).
+    pub memory_statistics: bool,
+    /// One page cache shared by every connection (`SQLITE_MUTEX_STATIC_LRU`
+    /// on every page operation).
+    pub shared_page_cache: bool,
+    /// Page-cache overflow statistics (`SQLITE_MUTEX_STATIC_PMEM` on every
+    /// heap page buffer).
+    pub page_cache_overflow_statistics: bool,
+    /// What the process's allocator-statistics switch at the start of
+    /// `main` found; `None` when the process never called it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_statistics_switch: Option<SqliteMemoryStatisticsSwitch>,
+}
+
+impl SqliteLockProfileReport {
+    /// A report of the three locks, without a switch outcome.
+    pub fn new(
+        memory_statistics: bool,
+        shared_page_cache: bool,
+        page_cache_overflow_statistics: bool,
+    ) -> Self {
+        Self {
+            memory_statistics,
+            shared_page_cache,
+            page_cache_overflow_statistics,
+            memory_statistics_switch: None,
+        }
+    }
+
+    /// Attach what the allocator-statistics switch found.
+    #[must_use]
+    pub fn with_memory_statistics_switch(mut self, switch: SqliteMemoryStatisticsSwitch) -> Self {
+        self.memory_statistics_switch = Some(switch);
+        self
+    }
+}
+
+/// What a process's allocator-statistics switch found: SQLite accepted it
+/// (allocator statistics were on, or already off) or refused it because
+/// SQLite was already in use.
+///
+/// Exhaustive on purpose, like the `meerkat_sqlite::MemoryStatisticsOutcome`
+/// it reports: these three are every outcome the switch has, and the storage
+/// doctor maps that enum onto this one with an exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqliteMemoryStatisticsSwitch {
+    /// Allocator statistics were on; the switch turned them off.
+    Applied,
+    /// The build has allocator statistics off; nothing changed.
+    AlreadyOff,
+    /// SQLite was already in use and refused the switch.
+    TooLate,
 }
 
 impl StorageDiagnosis {
@@ -313,6 +381,44 @@ mod tests {
         assert_eq!(diagnosis.count(FindingSeverity::Error), 1);
         assert_eq!(diagnosis.count(FindingSeverity::Warning), 1);
         assert_eq!(diagnosis.count(FindingSeverity::Info), 0);
+    }
+
+    #[test]
+    fn sqlite_lock_profile_json_shape_is_stable() {
+        let mut diagnosis = StorageDiagnosis::default();
+        let json = serde_json::to_value(&diagnosis).expect("serialize");
+        assert!(json.get("sqlite_lock_profile").is_none(), "{json}");
+
+        diagnosis.sqlite_lock_profile = Some(
+            SqliteLockProfileReport::new(false, true, false)
+                .with_memory_statistics_switch(SqliteMemoryStatisticsSwitch::AlreadyOff),
+        );
+        let json = serde_json::to_value(&diagnosis).expect("serialize");
+        assert_eq!(
+            json["sqlite_lock_profile"],
+            serde_json::json!({
+                "memory_statistics": false,
+                "shared_page_cache": true,
+                "page_cache_overflow_statistics": false,
+                "memory_statistics_switch": "already_off",
+            })
+        );
+        let parsed: StorageDiagnosis = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.sqlite_lock_profile, diagnosis.sqlite_lock_profile);
+
+        let never_switched = serde_json::to_value(SqliteLockProfileReport::new(true, false, false))
+            .expect("serialize");
+        assert!(
+            never_switched.get("memory_statistics_switch").is_none(),
+            "{never_switched}"
+        );
+        for (switch, wire) in [
+            (SqliteMemoryStatisticsSwitch::Applied, "applied"),
+            (SqliteMemoryStatisticsSwitch::AlreadyOff, "already_off"),
+            (SqliteMemoryStatisticsSwitch::TooLate, "too_late"),
+        ] {
+            assert_eq!(serde_json::to_value(switch).expect("serialize"), wire);
+        }
     }
 
     #[test]

@@ -226,6 +226,10 @@ impl From<RealmBackendArg> for RealmBackend {
 const LEGACY_WORKER_STACK_ENV: &str = "RKAT_RPC_WORKER_STACK_BYTES";
 
 fn main() -> ExitCode {
+    // SAFETY: the first statement of main: no other thread exists yet and
+    // nothing has used SQLite, as the switch requires.
+    #[allow(unsafe_code)]
+    let _ = unsafe { meerkat_sqlite::disable_memory_statistics_at_process_start() };
     // One documented worker-stack budget for every host binary; the main
     // future runs on a budgeted thread too, not the platform main thread.
     let budget = match meerkat_runtime::host_stack::HostStackBudget::from_env(&[

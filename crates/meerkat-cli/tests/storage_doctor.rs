@@ -193,6 +193,66 @@ fn healthy_sqlite_realm_is_clean_and_exits_zero() {
     );
 }
 
+/// `rkat` switches SQLite's allocator statistics off as the first statement
+/// of `main`, and the doctor reports the lock profile the binary runs with.
+/// Holds for any build: with the declared build flags nothing is on and the
+/// switch finds statistics already off; without them the switch applies and
+/// the warning names the two locks only the flags remove.
+#[test]
+fn doctor_reports_the_binarys_sqlite_lock_profile() {
+    let temp = TempDir::new().unwrap();
+    let state_root = temp.path().join("realms");
+    let output = run_doctor(
+        &temp,
+        &[
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "storage",
+            "doctor",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "doctor over an absent root must exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_json(&output);
+    let profile = &report["sqlite_lock_profile"];
+    assert_eq!(profile["memory_statistics"], false, "{profile}");
+    assert!(
+        matches!(
+            profile["memory_statistics_switch"].as_str(),
+            Some("already_off" | "applied")
+        ),
+        "the switch ran before anything used SQLite: {profile}"
+    );
+    let lock_in_use =
+        profile["shared_page_cache"] == true || profile["page_cache_overflow_statistics"] == true;
+    assert_eq!(
+        findings_with_code(&report, "sqlite-lock-profile").len(),
+        usize::from(lock_in_use),
+        "{report}"
+    );
+
+    let text = run_doctor(
+        &temp,
+        &[
+            "--state-root",
+            state_root.to_str().unwrap(),
+            "storage",
+            "doctor",
+        ],
+    );
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("SQLite lock profile of this binary: memory statistics off"),
+        "profile line missing:\n{stdout}"
+    );
+}
+
 #[test]
 fn unledgered_realm_reports_structural_inventory_without_mutating() {
     let temp = TempDir::new().unwrap();

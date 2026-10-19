@@ -40,6 +40,19 @@
         ]
       },
       {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "every_host_binary_depends_on_meerkat_sqlite_unconditionally",
+          "every_host_binary_switches_allocator_statistics_off_first",
+          "every_workspace_binary_is_a_host_or_exempt_with_a_reason"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
+        ]
+      },
+      {
         "package": "meerkat-tools",
         "target": "test:rct_manual_schema_literals",
         "scope": "target",
@@ -130,6 +143,17 @@
       }
     ],
     ".cargo/config.toml": [
+      {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "cargo_and_bazel_set_the_declared_sqlite_flags"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
+        ]
+      },
       {
         "package": "xtask",
         "target": "test:buildbuddy_static_lanes",
@@ -537,6 +561,17 @@
       }
     ],
     "MODULE.bazel": [
+      {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "cargo_and_bazel_set_the_declared_sqlite_flags"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
+        ]
+      },
       {
         "package": "xtask",
         "target": "test:buildbuddy_static_lanes",

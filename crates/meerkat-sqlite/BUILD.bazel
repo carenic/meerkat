@@ -159,9 +159,444 @@ rust_test(
     ),
 )
 
+rust_test(
+    name = "kept_connection_archive_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "kept_connection_archive",
+    crate_root = "tests/kept_connection_archive.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/kept_connection_archive.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "kept_connection_archive",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "kept_connection_presence_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "kept_connection_presence",
+    crate_root = "tests/kept_connection_presence.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/kept_connection_presence.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "kept_connection_presence",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "lock_profile_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "lock_profile",
+    crate_root = "tests/lock_profile.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/lock_profile.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "lock_profile",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "lock_profile_sources_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "lock_profile_sources",
+    crate_root = "tests/lock_profile_sources.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/lock_profile_sources.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "lock_profile_sources",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [
+        ":package_runfiles",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//crates/meerkat-cli:cargo_manifest",
+        "//crates/meerkat-cli:package_runfiles",
+        "//crates/meerkat-mcp-server:cargo_manifest",
+        "//crates/meerkat-mcp-server:package_runfiles",
+        "//crates/meerkat-mob-mcp:cargo_manifest",
+        "//crates/meerkat-mob-mcp:package_runfiles",
+        "//crates/meerkat-rest:cargo_manifest",
+        "//crates/meerkat-rest:package_runfiles",
+        "//crates/meerkat-rpc:cargo_manifest",
+        "//crates/meerkat-rpc:package_runfiles",
+        "//:workspace_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+        "WORKSPACE_ROOT": ".",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "process_wide_locks_bench_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "process_wide_locks_bench",
+    crate_root = "tests/process_wide_locks_bench.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/process_wide_locks_bench.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "process_wide_locks_bench",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [
+        ":package_runfiles",
+        "//:repo_governance_files",
+    ],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "process_wide_mutexes_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "process_wide_mutexes",
+    crate_root = "tests/process_wide_mutexes.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/process_wide_mutexes.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "process_wide_mutexes",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "statistics_switch_first_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "statistics_switch_first",
+    crate_root = "tests/statistics_switch_first.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/statistics_switch_first.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "statistics_switch_first",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "statistics_switch_late_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "statistics_switch_late",
+    crate_root = "tests/statistics_switch_late.rs",
+    crate_features = [
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/statistics_switch_late.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "statistics_switch_late",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-sqlite",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-sqlite",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 test_suite(
     name = "fast_tests",
     tests = [
+        ":kept_connection_archive_test",
+        ":kept_connection_presence_test",
+        ":lock_profile_sources_test",
+        ":lock_profile_test",
         ":meerkat_sqlite_unit_test",
+        ":process_wide_locks_bench_test",
+        ":process_wide_mutexes_test",
+        ":statistics_switch_first_test",
+        ":statistics_switch_late_test",
     ],
 )
