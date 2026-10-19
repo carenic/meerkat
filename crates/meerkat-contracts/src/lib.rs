@@ -548,6 +548,7 @@ pub use wire::{
     WireMemberProgressSnapshot,
     WireMemberRef,
     WireMemberRefError,
+    WireMemberRegistrationHookCall,
     WireMemberRunState,
     WireMemberToolAccessConstraint,
     WireMemberToolAccessDeclaration,

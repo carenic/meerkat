@@ -2955,6 +2955,7 @@ class MobMemberStatusResult:
     placement: Optional[WireHostRef] = None
     preview_unavailable: Optional[WireMemberPreviewUnavailable] = None
     progress: Optional[WireMemberProgressSnapshot] = None
+    registration_refusal: Optional[WireMemberRegistrationHookCall] = None
     resolved_capabilities: Optional[WireResolvedModelCapabilities] = None
 
 
@@ -6863,6 +6864,10 @@ WireNonPortableResourceKind = Literal['rust_bundles', 'per_spawn_external_tools'
 # Why a member status read carries no observation of the member's session
 # view.
 WireMemberPreviewUnavailable = Literal['observation_deadline', 'read_failed', 'session_absent', 'not_observed_while_retiring']
+
+# The member registration hook call that refused a restored member's
+# registration.
+WireMemberRegistrationHookCall = Literal['select_destination', 'select_agent_mandate', 'prepare_member_surface', 'verify_member_surface']
 
 # Lifecycle status of a flow run on the wire. Mirrors
 # `meerkat_mob::MobRunStatus` so consumers branch on a closed type rather than

@@ -1093,6 +1093,10 @@ pub struct MobMemberSnapshot {
     pub lifecycle_capabilities: Option<meerkat_contracts::wire::WireMemberLifecycleCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_portable_disabled: Option<Vec<meerkat_contracts::wire::WireNonPortableResourceKind>>,
+    /// The host hook call that refused this restored member's registration:
+    /// the member is Broken until an explicit repair. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 /// Whether the member currently owns an open execution run.
@@ -1304,7 +1308,29 @@ impl MobMemberSnapshot {
             lifecycle_capabilities: self.lifecycle_capabilities,
             non_portable_disabled: self.non_portable_disabled.clone(),
             preview_unavailable: self.preview_unavailable.map(wire_preview_unavailable),
+            registration_refusal: self.registration_refusal.map(wire_registration_hook_call),
         })
+    }
+}
+
+/// Project the refusing [`crate::MemberRegistrationHookCall`] into its closed
+/// wire twin.
+fn wire_registration_hook_call(
+    call: crate::MemberRegistrationHookCall,
+) -> meerkat_contracts::WireMemberRegistrationHookCall {
+    match call {
+        crate::MemberRegistrationHookCall::SelectDestination => {
+            meerkat_contracts::WireMemberRegistrationHookCall::SelectDestination
+        }
+        crate::MemberRegistrationHookCall::SelectAgentMandate => {
+            meerkat_contracts::WireMemberRegistrationHookCall::SelectAgentMandate
+        }
+        crate::MemberRegistrationHookCall::PrepareMemberSurface => {
+            meerkat_contracts::WireMemberRegistrationHookCall::PrepareMemberSurface
+        }
+        crate::MemberRegistrationHookCall::VerifyMemberSurface => {
+            meerkat_contracts::WireMemberRegistrationHookCall::VerifyMemberSurface
+        }
     }
 }
 
@@ -2364,6 +2390,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::PlacedInteractionIdAlreadyUsed { .. }
         | MobError::InvalidPlacedInteractionId { .. }
         | MobError::DeliveryInteractionConflict { .. }
+        // Only a restored member's revival answers a host refusal with this
+        // variant; spawn-many provisions with no revival intent, so a host
+        // refusal there keeps the host's own error.
+        | MobError::MemberRegistrationRefused { .. }
         | MobError::PlacedCompletionDeliveryRejected
         | MobError::PlacedCompletionHostNoEffect
         | MobError::PlacedCompletionHostCancelled
@@ -8580,6 +8610,7 @@ impl MobHandle {
                 roster_entry.and_then(|entry| entry.kickoff.as_ref()),
             ),
             progress: None,
+            registration_refusal: machine_state.member_registration_refusal_for_identity(identity),
         });
         let snapshot = material.to_snapshot();
         let current_bridge_session_id = snapshot.current_bridge_session_id().cloned();
@@ -9896,6 +9927,8 @@ impl MobHandle {
                 peer_connectivity: None,
                 kickoff,
                 progress: None,
+                registration_refusal: machine_state
+                    .member_registration_refusal_for_identity(&dsl_identity),
             })
             .to_snapshot()
             .with_preview_unavailable(preview_unavailable),
@@ -18513,6 +18546,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         }
         .with_current_bridge_session_id(Some(sid.clone()));
         let snapshot_value =
@@ -18554,6 +18588,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         };
 
         let snapshot_value =
@@ -18597,6 +18632,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         };
         assert_eq!(
             snapshot.agent_identity(),
@@ -18622,6 +18658,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         }
         .to_snapshot();
 

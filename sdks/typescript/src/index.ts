@@ -589,6 +589,7 @@ export type {
   WireMemberLaunchMode,
   WireMemberPreviewUnavailable,
   WireMemberRef,
+  WireMemberRegistrationHookCall,
   WireMobBackendKind,
   WireMobMemberStatus,
   WireMobProfile,

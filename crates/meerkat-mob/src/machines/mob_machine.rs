@@ -2399,6 +2399,17 @@ impl MobMachineState {
             .collect()
     }
 
+    /// The host hook call that refused this member's restored registration,
+    /// when its recorded restore failure is that typed refusal.
+    pub(crate) fn member_registration_refusal_for_identity(
+        &self,
+        agent_identity: &AgentIdentity,
+    ) -> Option<crate::MemberRegistrationHookCall> {
+        self.member_restore_failure_codes
+            .get(agent_identity)
+            .and_then(|code| crate::MemberRegistrationHookCall::from_code(code))
+    }
+
     /// Project lifecycle truth for an identity from the machine's membership
     /// maps.
     pub fn member_lifecycle_for_identity(

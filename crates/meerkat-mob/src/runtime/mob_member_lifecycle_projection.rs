@@ -30,6 +30,7 @@ pub(super) struct CanonicalMemberSnapshotMaterial {
     pub(super) peer_connectivity: Option<meerkat_contracts::WirePeerConnectivity>,
     pub(super) kickoff: Option<MobMemberKickoffSnapshot>,
     pub(super) progress: Option<MemberProgressSnapshot>,
+    pub(super) registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 impl CanonicalMemberSnapshotMaterial {
@@ -65,6 +66,7 @@ impl CanonicalMemberSnapshotMaterial {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: self.registration_refusal,
         }
         .with_current_bridge_session_id(self.current_bridge_session_id.clone())
     }
@@ -83,6 +85,9 @@ pub(super) struct MobMemberLifecycleInput {
     pub(super) peer_connectivity: Option<meerkat_contracts::WirePeerConnectivity>,
     pub(super) kickoff: Option<MobMemberKickoffSnapshot>,
     pub(super) progress: Option<MemberProgressSnapshot>,
+    /// The hook call that refused a restored member's registration, read
+    /// from MobMachine's restore-failure code.
+    pub(super) registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 pub(super) struct MobMemberLifecycleProjection;
@@ -153,6 +158,7 @@ impl MobMemberLifecycleProjection {
             peer_connectivity: input.peer_connectivity,
             kickoff: input.kickoff,
             progress: input.progress,
+            registration_refusal: input.registration_refusal,
         }
     }
 }
@@ -180,6 +186,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         });
         assert_eq!(material.status, CanonicalMemberStatus::Broken);
         assert!(material.is_terminal);
@@ -242,6 +249,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         });
         assert_eq!(material.status, CanonicalMemberStatus::Completed);
         assert!(material.is_terminal);
@@ -265,6 +273,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         });
         assert_eq!(material.status, CanonicalMemberStatus::Active);
         assert!(!material.is_terminal);
@@ -288,6 +297,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         });
         assert_eq!(material.status, CanonicalMemberStatus::Retiring);
         assert!(!material.is_terminal);

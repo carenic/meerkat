@@ -10912,6 +10912,52 @@ impl MobActor {
         Ok(())
     }
 
+    /// The signal that records a failed revival of `agent_identity`. A host
+    /// refusal of the member's registration keeps its typed code: the member
+    /// stays Broken with it until an explicit repair.
+    pub(super) fn member_revival_failure_signal(
+        agent_identity: mob_dsl::AgentIdentity,
+        reason: String,
+        error: &MobError,
+    ) -> mob_dsl::MobMachineSignal {
+        match error {
+            MobError::MemberRegistrationRefused { call, .. } => {
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
+                    agent_identity,
+                    refusal_code: call.as_code().to_string(),
+                    reason,
+                }
+            }
+            _ => mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
+                agent_identity,
+                reason,
+            },
+        }
+    }
+
+    /// The typed host refusal `agent_identity` is Broken with, read from
+    /// MobMachine's recorded restore-failure code, so asking again answers
+    /// the same refusal without asking the host.
+    pub(super) fn recorded_registration_refusal(
+        &self,
+        agent_identity: &AgentIdentity,
+        session_id: Option<meerkat_core::types::SessionId>,
+        reason: String,
+    ) -> Option<MobError> {
+        let call = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                &crate::ids::AgentIdentity::from(agent_identity.as_str()),
+            ))?;
+        Some(MobError::MemberRegistrationRefused {
+            member_id: agent_identity.clone(),
+            session_id,
+            call,
+            reason,
+        })
+    }
+
     async fn ensure_member_not_broken(
         &self,
         agent_identity: &AgentIdentity,
@@ -10933,6 +10979,13 @@ impl MobActor {
                     hold: None,
                 },
             );
+            if let Some(refusal) = self.recorded_registration_refusal(
+                agent_identity,
+                diag.bridge_session_id.clone(),
+                diag.reason.clone(),
+            ) {
+                return Err(refusal);
+            }
             return Err(MobError::MemberRestoreFailed {
                 member_id: agent_identity.clone(),
                 session_id: diag.bridge_session_id,
@@ -12814,6 +12867,10 @@ impl MobActor {
             .dsl_authority
             .state()
             .member_lifecycle_for_identity(&dsl_identity);
+        let registration_refusal = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&dsl_identity);
         let kickoff = kickoff_snapshot_from_machine_state(
             agent_identity.as_str(),
             self.dsl_authority.state(),
@@ -12955,6 +13012,7 @@ impl MobActor {
                 peer_connectivity: None,
                 kickoff,
                 progress,
+                registration_refusal,
             },
         ))
     }

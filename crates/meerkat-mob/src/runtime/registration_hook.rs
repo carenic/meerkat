@@ -6,7 +6,7 @@
 //! registration, so a host can neither skip the install nor bind another
 //! runtime owner's session. The host never receives the machine.
 
-use crate::MobError;
+use crate::{MemberRegistrationHookCall, MobError};
 use meerkat_authorization_contracts::constraints::AudienceRef;
 use meerkat_authorization_contracts::evidence::EvidenceId;
 use meerkat_authorization_contracts::work_association::NativeWorkTarget;
@@ -15,6 +15,30 @@ use meerkat_core::{MobMemberBinding, RealmId};
 use meerkat_runtime::meerkat_machine::SessionAgentMandate;
 use meerkat_runtime::{LogicalRuntimeId, MeerkatMachine, RuntimeSessionRegistrationWitness};
 use std::sync::Arc;
+
+/// The hook call that refused one member's registration, recorded by that
+/// call itself when the host returns an error. A host may return any
+/// [`MobError`], so a refusal is never read back from an error's type or
+/// text. The first refusal is kept.
+#[derive(Clone, Default)]
+pub(super) struct HostRefusalSlot(Arc<std::sync::Mutex<Option<MemberRegistrationHookCall>>>);
+
+impl HostRefusalSlot {
+    fn record(&self, call: MemberRegistrationHookCall) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(call);
+    }
+
+    /// The call that refused, if a host refused.
+    pub(super) fn refused(&self) -> Option<MemberRegistrationHookCall> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// The destination a host selects for one member: everything of the
 /// member's scoped target except its runtime, which only the member's exact
@@ -145,6 +169,16 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// bound to. Called while the member's prepared registration transaction
     /// owns cleanup, before actor creation; a refusal rolls that transaction
     /// back exactly. The provisioner installs the returned target.
+    ///
+    /// For a restored member whose registration this transaction did not
+    /// insert, a refusal removes that registration exactly through the
+    /// canonical unregister: the session's durable history records it, every
+    /// input the session still holds is abandoned as Stopped, and their
+    /// completions resolve as runtime-terminated. Any other failure keeps the
+    /// restored registration for an explicit repair to reuse. A spawn that
+    /// adopts a session registered before it (a resumed or pre-registered
+    /// session) keeps that registration on a refusal; only the transaction
+    /// is rolled back.
     async fn select_destination(
         &self,
         identity: &MemberRuntimeBuildIdentity,
@@ -166,8 +200,10 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// member's destination is installed and before its agent or any of its
     /// tools is built; the provisioner binds the returned mandate on the
     /// member's exact registration. A refusal rolls the registration back
-    /// exactly. The default selects none: the registration stays unbound, so
-    /// its configured servers are refused as unavailable.
+    /// exactly. A restored member's refusal removes its registration the same
+    /// way (see [`Self::select_destination`]). The default selects none: the
+    /// registration stays unbound, so its configured servers are refused as
+    /// unavailable.
     async fn select_agent_mandate(
         &self,
         _identity: &MemberRuntimeBuildIdentity,
@@ -195,7 +231,9 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// provenance is attribution only: the host compares this surface with
     /// its own committed activation, which owns the association between an
     /// installed artifact and its tools. A refusal discards the member
-    /// exactly; effects its construction already started are not undone.
+    /// exactly; effects its construction already started are not undone. A
+    /// restored member's refusal removes its registration the same way (see
+    /// [`Self::select_destination`]).
     async fn verify_member_surface(
         &self,
         identity: &MemberRuntimeBuildIdentity,
@@ -210,8 +248,10 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// returns the resolved `Provider` binding with the exact surface it
     /// compiled against; the construction binds it, with its own member and
     /// registry, when it is finished. A refusal abandons the construction and
-    /// discards the member exactly. A host that selects nothing cannot
-    /// complete a member it registers: the default refuses.
+    /// discards the member exactly. A restored member's refusal removes its
+    /// registration the same way (see [`Self::select_destination`]). A host
+    /// that selects nothing cannot complete a member it registers: the
+    /// default refuses.
     async fn prepare_member_surface(
         &self,
         _identity: &MemberRuntimeBuildIdentity,
@@ -254,6 +294,7 @@ struct MemberSurfaceGate {
     hook: Arc<dyn MemberRuntimeRegistrationHook>,
     identity: MemberRuntimeBuildIdentity,
     selected: Option<MemberSurfaceSelectionSlot>,
+    refusals: Option<HostRefusalSlot>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -267,7 +308,12 @@ impl meerkat_core::ToolSurfaceGate for MemberSurfaceGate {
             .hook
             .prepare_member_surface(&self.identity, surface)
             .await
-            .map_err(|error| meerkat_core::ToolSurfaceRefusal::new(error.to_string()))?;
+            .map_err(|error| {
+                if let Some(refusals) = &self.refusals {
+                    refusals.record(MemberRegistrationHookCall::PrepareMemberSurface);
+                }
+                meerkat_core::ToolSurfaceRefusal::new(error.to_string())
+            })?;
         if let Some(selected) = &self.selected {
             selected.record(&selection);
         }
@@ -285,6 +331,7 @@ pub(super) async fn install_member_surface_gate(
     registration: &RuntimeSessionRegistrationWitness,
     identity: &MemberRuntimeBuildIdentity,
     selected: Option<MemberSurfaceSelectionSlot>,
+    refusals: Option<HostRefusalSlot>,
 ) -> Result<(), MobError> {
     if machine
         .session_tool_surface_gate(registration.session_id())
@@ -300,6 +347,7 @@ pub(super) async fn install_member_surface_gate(
                 hook,
                 identity: identity.clone(),
                 selected,
+                refusals,
             }),
         )
         .await
@@ -317,8 +365,13 @@ pub(super) async fn install_selected_agent_mandate(
     hook: &dyn MemberRuntimeRegistrationHook,
     registration: &RuntimeSessionRegistrationWitness,
     identity: &MemberRuntimeBuildIdentity,
+    refusals: &HostRefusalSlot,
 ) -> Result<(), MobError> {
-    let Some(mandate) = hook.select_agent_mandate(identity).await? else {
+    let Some(mandate) = hook
+        .select_agent_mandate(identity)
+        .await
+        .inspect_err(|_| refusals.record(MemberRegistrationHookCall::SelectAgentMandate))?
+    else {
         return Ok(());
     };
     machine
@@ -343,12 +396,14 @@ pub(super) async fn install_selected_destination(
     hook: &dyn MemberRuntimeRegistrationHook,
     registration: &RuntimeSessionRegistrationWitness,
     req: &meerkat_core::service::CreateSessionRequest,
+    refusals: &HostRefusalSlot,
 ) -> Result<MemberRuntimeBuildIdentity, MobError> {
     require_deferred_first_turn(req)?;
     let identity = MemberRuntimeBuildIdentity::from_request(req, registration)?;
     let target = hook
         .select_destination(&identity)
-        .await?
+        .await
+        .inspect_err(|_| refusals.record(MemberRegistrationHookCall::SelectDestination))?
         .target_for(registration, &identity)?;
     machine
         .bind_scoped_context(registration, &target)
@@ -382,6 +437,7 @@ pub(super) async fn verify_member_surface(
     session_service: &dyn super::MobSessionService,
     session_id: &meerkat_core::types::SessionId,
     identity: &MemberRuntimeBuildIdentity,
+    refusals: Option<&HostRefusalSlot>,
 ) -> Result<(), MobError> {
     let surface = session_service
         .live_visible_tool_defs(session_id)
@@ -392,7 +448,13 @@ pub(super) async fn verify_member_surface(
                 "the member's session service cannot report its actual tool surface".into(),
             )
         })?;
-    hook.verify_member_surface(identity, &surface).await
+    hook.verify_member_surface(identity, &surface)
+        .await
+        .inspect_err(|_| {
+            if let Some(refusals) = refusals {
+                refusals.record(MemberRegistrationHookCall::VerifyMemberSurface);
+            }
+        })
 }
 
 /// The destination the host still expects for an attached member, as the

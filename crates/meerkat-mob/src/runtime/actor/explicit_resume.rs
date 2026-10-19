@@ -507,10 +507,11 @@ impl MobActor {
                         work.rebuild.bridge_session_id
                     );
                     if let Err(error) = self.apply_dsl_signal(
-                        mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
-                            agent_identity: identity.clone(),
-                            reason: reason.clone(),
-                        },
+                        Self::member_revival_failure_signal(
+                            identity.clone(),
+                            reason.clone(),
+                            &error,
+                        ),
                         "resolve_failed_explicit_resume_member",
                     ) {
                         self.retain_explicit_resume_error(error);

@@ -10054,6 +10054,18 @@ ResolveMemberRevivalFailedRunning(agent_identity, reason) ==
     /\ UnchangedFrame_9b9015523df19a1e
 
 
+ResolveMemberRevivalHostRefusedRunning(agent_identity, refusal_code, reason) ==
+    /\ phase = "Running"
+    /\ ((agent_identity \in member_revival_pending) = TRUE)
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ member_restore_failures' = MapSet(member_restore_failures, agent_identity, reason)
+    /\ member_restore_failure_codes' = MapSet(member_restore_failure_codes, agent_identity, refusal_code)
+    /\ member_revival_pending' = (member_revival_pending \ {agent_identity})
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UnchangedFrame_9b9015523df19a1e
+
+
 AdmitDestroyCleanup ==
     /\ phase = "Running"
     /\ mob_machine_adaptive_lifecycle_drained(adaptive_active_run, adaptive_active_layer, adaptive_active_members, adaptive_layer_phase, adaptive_layer_disposition)
@@ -19516,6 +19528,7 @@ Next ==
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E generation \in GenerationValues : \E bridge_session_id \in SessionIdValues : ResolveRecreatedMemberSessionSucceededRunningLocal(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id)
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : ResolveMemberRevivalSucceededRunningPlaced(agent_identity)
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E reason \in StringValues : ResolveMemberRevivalFailedRunning(agent_identity, reason)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E refusal_code \in StringValues : \E reason \in StringValues : ResolveMemberRevivalHostRefusedRunning(agent_identity, refusal_code, reason)
     \/ AdmitDestroyCleanup
     \/ AdmitDestroyStorageFinalizing
     \/ MarkCompleted

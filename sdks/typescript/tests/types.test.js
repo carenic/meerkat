@@ -4935,6 +4935,67 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
       }
     });
 
+    for (const hookCall of [
+      "select_destination",
+      "select_agent_mandate",
+      "prepare_member_surface",
+      "verify_member_surface",
+    ]) {
+      it(`surfaces the registration_refusal hook call '${hookCall}'`, async () => {
+        const client = memberStatusClient(
+          validResponse({ status: "broken", registration_refusal: hookCall }),
+        );
+        const result = await client.mobMemberStatus("mob-1", "worker-1");
+        assert.equal(result.registrationRefusal, hookCall);
+        assert.equal(result.status, "broken");
+      });
+    }
+
+    it("omits registrationRefusal when the wire omits or nulls it", async () => {
+      for (const response of [validResponse(), validResponse({ registration_refusal: null })]) {
+        const result = await memberStatusClient(response).mobMemberStatus("mob-1", "worker-1");
+        assert.equal(Object.prototype.hasOwnProperty.call(result, "registrationRefusal"), false);
+      }
+    });
+
+    it("rejects a registration_refusal outside the closed vocabulary", async () => {
+      for (const refusal of ["SelectDestination", { kind: "select_destination" }]) {
+        const client = memberStatusClient(
+          validResponse({ status: "broken", registration_refusal: refusal }),
+        );
+        await assert.rejects(
+          () => client.mobMemberStatus("mob-1", "worker-1"),
+          (error) =>
+            error instanceof MeerkatError &&
+            error.code === "INVALID_RESPONSE" &&
+            /registration_refusal/.test(String(error.message)),
+        );
+      }
+    });
+
+    it("carries registration_refusal on wait_kickoff and wait_ready members", async () => {
+      const client = new MeerkatClient();
+      client.request = async () => ({
+        members: [
+          {
+            agent_identity: "lead",
+            status: "broken",
+            tokens_used: 0,
+            is_final: false,
+            registration_refusal: "select_destination",
+          },
+          { agent_identity: "writer", status: "active", tokens_used: 7, is_final: false },
+        ],
+      });
+      for (const members of [
+        await client.waitMobKickoff("mob-1"),
+        await client.waitMobReady("mob-1"),
+      ]) {
+        assert.equal(members[0].registrationRefusal, "select_destination");
+        assert.equal(Object.prototype.hasOwnProperty.call(members[1], "registrationRefusal"), false);
+      }
+    });
+
     it("rejects an absent status instead of fabricating 'unknown'", async () => {
       const response = validResponse();
       delete response.status;

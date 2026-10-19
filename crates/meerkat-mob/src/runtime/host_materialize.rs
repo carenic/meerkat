@@ -2130,6 +2130,7 @@ impl HostMemberMaterializer {
                         )
                     }),
                 None,
+                None,
             )
             .await
             .map_err(|error| classify_materialize_create_error(error, spec))?;
@@ -2743,6 +2744,7 @@ impl HostMemberMaterializer {
                             Arc::clone(hook),
                         )
                     }),
+                None,
                 None,
             )
             .await

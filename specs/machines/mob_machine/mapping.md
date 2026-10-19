@@ -2214,6 +2214,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveMemberRevivalFailedRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AdmitDestroyCleanup`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

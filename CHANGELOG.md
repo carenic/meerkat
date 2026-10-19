@@ -55,6 +55,30 @@ them.
   whichever registration of that session asks. Read the id with
   `registration.session_id()`; a closure provider is
   `Fn(&RuntimeSessionRegistrationWitness, SessionAgentBinding) -> Option<..>`.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a host refusal
+  of a restored member's registration (`select_destination`,
+  `select_agent_mandate`, `prepare_member_surface` or
+  `verify_member_surface`) now removes that registration exactly, as a new
+  member's refusal does. The removal is the canonical unregister: it is
+  recorded in the session's durable history, and it terminates every input
+  the session still holds (abandoned as `Stopped`, their completions
+  resolved as runtime-terminated). The owner context the restore bound to
+  the member is released with it. The member stays Broken with the typed
+  refusal (`MobError::MemberRegistrationRefused`, shown in
+  `MobMemberSnapshot::registration_refusal`) until an explicit repair, and
+  `ensure_member_live` returns that refusal without asking the host again.
+  A failure that is not the host's refusal keeps the restored registration
+  for the repair to reuse, and a spawn that adopts a session registered
+  before it keeps that registration on a refusal.
+- `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
+  member_id, session_id, call, reason }`: a restored member's host refused
+  its registration at `call` (see above). Its RPC error data has the kind
+  `mob_member_registration_refused` with the refusing `hook_call`. Code that
+  matches `MobError` exhaustively adds an arm.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
+  the wire unless a restored member's host refused its registration. Code
+  that builds the result with a struct literal sets it.
 
 ### Added
 
@@ -92,6 +116,13 @@ them.
   registration instead of to an identity it derives from the member's
   session id or labels; a later registration of the same session is a
   different registration.
+- `meerkat-mob`: `MemberRegistrationHookCall`, the registration hook call
+  that refused a restored member's registration, and
+  `MobMemberSnapshot::registration_refusal`, which carries it for a Broken
+  member. `meerkat-contracts` mirrors it as `WireMemberRegistrationHookCall`.
+- `meerkat-runtime`: `PreparedSessionMaterialization::inserted_registration()`
+  tells whether the materialization's own prepare inserted the session's
+  registration or found one already current.
 
 ### Changed
 

@@ -574,6 +574,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResolveMemberRevivalSucceeded`(agent_identity: AgentIdentity)
 - `ResolveRecreatedMemberSessionSucceeded`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, bridge_session_id: SessionId)
 - `ResolveMemberRevivalFailed`(agent_identity: AgentIdentity, reason: String)
+- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
 - `AdmitDestroyCleanup`
 - `AdmitDestroyStorageFinalizing`
 - `MarkCompleted`
@@ -7921,6 +7922,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `ResolveMemberRevivalFailedRunning`
 - From: `Running`
 - On: `ResolveMemberRevivalFailed`(agent_identity, reason)
+- Guards:
+  - `revival_pending`
+- To: `Running`
+
+### `ResolveMemberRevivalHostRefusedRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
 - Guards:
   - `revival_pending`
 - To: `Running`

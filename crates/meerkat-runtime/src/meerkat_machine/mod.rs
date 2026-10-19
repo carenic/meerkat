@@ -1899,6 +1899,7 @@ pub struct PreparedSessionMaterialization {
     bindings: meerkat_core::SessionRuntimeBindings,
     claim_id: uuid::Uuid,
     claim_state: Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
+    inserted_registration: bool,
     cleanup_spawner: MachineCleanupTaskSpawner,
     archived_resume_authorization_issued: bool,
     armed: bool,
@@ -4591,6 +4592,7 @@ impl PreparedSessionMaterialization {
         machine: Arc<MeerkatMachine>,
         bindings: meerkat_core::SessionRuntimeBindings,
         claim_id: uuid::Uuid,
+        inserted_registration: bool,
         cleanup_spawner: MachineCleanupTaskSpawner,
     ) -> Result<Self, RuntimeDriverError> {
         let authority = bindings
@@ -4610,6 +4612,7 @@ impl PreparedSessionMaterialization {
             bindings,
             claim_id,
             claim_state,
+            inserted_registration,
             cleanup_spawner,
             archived_resume_authorization_issued: false,
             armed: true,
@@ -4618,6 +4621,15 @@ impl PreparedSessionMaterialization {
 
     pub fn bindings(&self) -> &meerkat_core::SessionRuntimeBindings {
         &self.bindings
+    }
+
+    /// Whether this materialization's own prepare inserted the session's
+    /// registration. `false` when it found a registration already current,
+    /// such as one a restore prepared before this revival: rolling this
+    /// materialization back leaves that registration in place. Fixed at the
+    /// prepare; an executor attaching later does not change it.
+    pub fn inserted_registration(&self) -> bool {
+        self.inserted_registration
     }
 
     pub fn bindings_clone(&self) -> meerkat_core::SessionRuntimeBindings {

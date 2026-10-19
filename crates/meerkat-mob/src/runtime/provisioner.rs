@@ -5715,6 +5715,12 @@ impl SessionBackend {
         }
     }
 
+    /// Whether this backend still holds an operation binding for `session_id`.
+    #[cfg(test)]
+    pub(super) fn has_session_ops_binding_for_test(&self, session_id: &SessionId) -> bool {
+        self.ops_adapter.has_session_binding_for_test(session_id)
+    }
+
     pub fn with_member_runtime_registration_hook(
         mut self,
         hook: Arc<dyn super::MemberRuntimeRegistrationHook>,
@@ -7583,6 +7589,7 @@ async fn create_attached_session_actor_recovery_owned(
                             session_service.as_ref(),
                             &session_id,
                             identity,
+                            None,
                         )
                         .await
                     }
@@ -7637,6 +7644,84 @@ async fn create_attached_session_actor_recovery_owned(
             "owned actor-only recovery for '{wait_session_id}' ended without a result: {error}"
         ))
     })?
+}
+
+/// What a restored member's revival needs to settle a host refusal of the
+/// member's registration (see [`settle_restored_member_refusal`]).
+#[cfg(feature = "runtime-adapter")]
+pub(super) struct RestoredMemberRefusalCleanup {
+    pub(super) member_id: AgentIdentity,
+    pub(super) ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
+    /// The member's operation binding observed when this revival began,
+    /// before it bound anything itself: the owner context the restore bound
+    /// to the restored registration.
+    pub(super) superseded_ops_binding: Option<super::ops_adapter::SessionOpsBindingWitness>,
+}
+
+/// The registration a host was asked about, with whether this transaction's
+/// own prepare inserted it.
+#[cfg(feature = "runtime-adapter")]
+struct AskedRegistration {
+    machine: Arc<MeerkatMachine>,
+    registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+    inserted_by_this_transaction: bool,
+}
+
+/// Settle a host refusal of a restored member's registration once the
+/// transaction's own exact abort has returned, so no runtime turn boundary is
+/// held. A registration this revival inserted was rolled back by that abort.
+/// One it did not insert (the restore prepared it) was outside the abort's
+/// authority: remove exactly that registration through the canonical
+/// unregister, by the witness the host was asked about, and release the owner
+/// context the restore bound to it. `Ok(false)` means a successor already
+/// replaced the registration: the successor, and the operation binding it
+/// owns, are left alone. The answer is the typed refusal. A failed abort,
+/// removal or release is reported as cleanup uncertainty, never as a clean
+/// refusal.
+#[cfg(feature = "runtime-adapter")]
+async fn settle_restored_member_refusal(
+    restored: RestoredMemberRefusalCleanup,
+    call: crate::MemberRegistrationHookCall,
+    asked: AskedRegistration,
+    refusal: MobError,
+    abort: Result<(), MobError>,
+) -> (MobError, Result<(), MobError>) {
+    if let Err(error) = abort {
+        return (refusal, Err(error));
+    }
+    let session_id = asked.registration.session_id().clone();
+    let refused = MobError::MemberRegistrationRefused {
+        member_id: restored.member_id,
+        session_id: Some(session_id.clone()),
+        call,
+        reason: refusal.to_string(),
+    };
+    if asked.inserted_by_this_transaction {
+        return (refused, Ok(()));
+    }
+    let removed = match asked
+        .machine
+        .unregister_session_registration_until_terminal_if_current(&asked.registration)
+        .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            return (
+                refused,
+                Err(MobError::Internal(format!(
+                    "removing the refused restored registration of session '{session_id}' failed: {error}"
+                ))),
+            );
+        }
+    };
+    if !removed {
+        return (refused, Ok(()));
+    }
+    let released = restored
+        .ops_adapter
+        .release_session_binding_for_explicit_resume(&session_id, restored.superseded_ops_binding)
+        .map(|_| ());
+    (refused, released)
 }
 
 /// Cancellation-safe owner of the service actor and exact prepared machine
@@ -7852,6 +7937,7 @@ impl PreparedServiceActorTransaction {
         route: super::session_service::SessionActorMaterializationRoute,
         registration_composition: super::registration_hook::MemberRegistrationComposition,
         held_bound: Option<super::held_spawn::HeldProvisionBound>,
+        restored: Option<RestoredMemberRefusalCleanup>,
     ) -> Result<(meerkat_core::RunResult, Self), MobError> {
         let cleanup_spawner = self.cleanup_spawner.clone();
         let session_id = self.session_id.clone();
@@ -7860,9 +7946,13 @@ impl PreparedServiceActorTransaction {
         cleanup_spawner.spawn_detached(async move {
             let mut transaction = self;
             let revivable = route.is_revivable();
+            let refusals = super::registration_hook::HostRefusalSlot::default();
+            let mut asked = None;
             let create_result = {
                 let transaction = &mut transaction;
                 let result_tx = &result_tx;
+                let refusals = &refusals;
+                let asked = &mut asked;
                 async move {
                     let held_stop = || {
                         held_bound
@@ -7882,8 +7972,9 @@ impl PreparedServiceActorTransaction {
                                 let _ = release_rx.await;
                             }
                         }
-                        let registration = transaction
-                            .prepared()?
+                        let prepared = transaction.prepared()?;
+                        let inserted_by_this_transaction = prepared.inserted_registration();
+                        let registration = prepared
                             .registration_witness()
                             .await
                             .ok_or_else(|| {
@@ -7892,6 +7983,11 @@ impl PreparedServiceActorTransaction {
                                         .into(),
                                 )
                             })?;
+                        *asked = Some(AskedRegistration {
+                            machine: Arc::clone(&machine),
+                            registration: registration.clone(),
+                            inserted_by_this_transaction,
+                        });
                         // The witness waits for the session's mutation gate. A
                         // held setup whose bound ended meanwhile stops before
                         // the host's destination callback starts.
@@ -7903,6 +7999,7 @@ impl PreparedServiceActorTransaction {
                             hook.as_ref(),
                             &registration,
                             &req,
+                            refusals,
                         )
                         .await?;
                         if let Some(stop) = held_stop() {
@@ -7915,6 +8012,7 @@ impl PreparedServiceActorTransaction {
                             hook.as_ref(),
                             &registration,
                             &identity,
+                            refusals,
                         )
                         .await?;
                         if let Some(stop) = held_stop() {
@@ -7926,6 +8024,7 @@ impl PreparedServiceActorTransaction {
                             &registration,
                             &identity,
                             Some(transaction.surface_selection.clone()),
+                            Some(refusals.clone()),
                         )
                         .await?;
                         surface_check = Some((hook, identity));
@@ -7961,6 +8060,7 @@ impl PreparedServiceActorTransaction {
                             transaction.session_service.as_ref(),
                             &created.session_id,
                             &identity,
+                            Some(refusals),
                         )
                         .await?;
                     }
@@ -8012,6 +8112,24 @@ impl PreparedServiceActorTransaction {
                     } else {
                         cleanup
                     };
+                    // A restored member's host refusal is settled here, after
+                    // the transaction's own abort: see
+                    // `settle_restored_member_refusal`. Every other failure,
+                    // and every failure of a new member, keeps today's answer.
+                    let (materialization_error, cleanup) =
+                        match (restored, refusals.refused(), asked) {
+                            (Some(restored), Some(call), Some(asked)) => {
+                                settle_restored_member_refusal(
+                                    restored,
+                                    call,
+                                    asked,
+                                    materialization_error,
+                                    cleanup,
+                                )
+                                .await
+                            }
+                            _ => (materialization_error, cleanup),
+                        };
                     let error = match (materialization_error, cleanup) {
                         // Preserve the service's typed build failure once
                         // exact volatile cleanup is proven. Callers can then
@@ -12630,6 +12748,21 @@ impl SessionBackend {
         } else {
             None
         };
+        // Only a restored member's revival settles a host refusal of its
+        // registration itself; spawns keep the transaction's own rollback.
+        let mut restored_refusal_cleanup = missing_live_revival.then(|| {
+            let member = req
+                .create_session
+                .build
+                .as_ref()
+                .and_then(|build| build.mob_member_binding.as_ref())
+                .map_or(req.peer_name.as_str(), |binding| binding.member.as_str());
+            RestoredMemberRefusalCleanup {
+                member_id: AgentIdentity::from(member),
+                ops_adapter: Arc::clone(&backend.ops_adapter),
+                superseded_ops_binding: superseded_ops_binding.clone(),
+            }
+        });
         let mut prepared_ops_binding: Option<(SessionId, Arc<dyn OpsLifecycleRegistry>)> = None;
         if backend.member_runtime_registration_hook.is_some() && backend.runtime_adapter.is_none() {
             return Err(MobError::Internal(
@@ -12773,6 +12906,7 @@ impl SessionBackend {
                         Arc::clone(hook),
                         &registration,
                         &identity,
+                        None,
                         None,
                     )
                     .await?;
@@ -13042,6 +13176,7 @@ impl SessionBackend {
                     actor_materialization_route,
                     backend.registration_composition(),
                     held_bound.clone(),
+                    restored_refusal_cleanup.take(),
                 )
             })
             .await

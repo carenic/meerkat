@@ -2801,6 +2801,27 @@ pub struct MobMemberStatusResult {
     /// released SDKs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_unavailable: Option<WireMemberPreviewUnavailable>,
+    /// Present when the member's host refused its restored registration: the
+    /// hook call that refused it. The member stays Broken until an explicit
+    /// repair. Absent-omitted for byte-compat with released SDKs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_refusal: Option<WireMemberRegistrationHookCall>,
+}
+
+/// The member registration hook call that refused a restored member's
+/// registration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireMemberRegistrationHookCall {
+    /// The host refused to select the member's destination.
+    SelectDestination,
+    /// The host refused to select the agent the member's registration acts as.
+    SelectAgentMandate,
+    /// The host refused the member's prepared tool surface.
+    PrepareMemberSurface,
+    /// The host refused the member's built tool surface.
+    VerifyMemberSurface,
 }
 
 /// Why a member status read carries no observation of the member's session
@@ -2913,6 +2934,7 @@ mod member_status_capability_tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         };
 
         let json = serde_json::to_string(&result)?;
@@ -4655,6 +4677,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         }
     }
 
