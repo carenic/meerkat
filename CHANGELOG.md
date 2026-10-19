@@ -342,7 +342,9 @@ them.
   answer, so the turn answering it did not see it. The transport now holds
   the boundary across the rows it already has, for at most 64 rows or about
   a second at a time, so a queued turn waits at most that long for them. A
-  WebSocket or WebRTC live channel still takes the boundary once per row
+  WebSocket or WebRTC live channel still takes the boundary once per row, and
+  its transport forwards nothing behind a row that waits, so its voice goes
+  silent while a member turn runs and arrives in a burst when the turn ends
   (see `docs/guides/realtime.mdx`). (#1821)
 
 ## [0.9.3] - 2026-10-18
