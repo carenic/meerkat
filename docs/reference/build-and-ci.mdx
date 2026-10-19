@@ -368,6 +368,12 @@ and the confinement lane, and it fails when the classifier produced no lanes.
 `make ci-lanes-selftest` (`scripts/ci-cargo-lanes-selftest.mjs`) pins these
 properties with fixtures for a core touch, docs-only, `Cargo.lock`-only,
 machine-authority-only, an unmapped `.rs`, and a missing base.
+`scripts/ci-gate-consistency-selftest.mjs`, in the same target, runs the
+gate's own shell on the planner's plans for both events, a release
+projection and a dispatch, with every job's `if:` evaluated: the gate must
+pass when every lane the plan selected ran and passed, and fail when a lane
+that ran fails or is skipped instead (its allowlist names, with the reason,
+the lanes a dispatch's gate does not require).
 
 PR CI runs the directly changed packages, not their dependents: measured on
 a 4-vCPU runner, compiling the reverse-dependency closure of `meerkat-core`

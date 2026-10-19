@@ -607,6 +607,11 @@ and its CI must be green before a release tag (`require_ci_green`):
   and records the run and attempt in the attestation (`plan.mode:
   release-projection`, `reused_test_evidence`). It runs under
   `!cancelled()` so superseded runs surface as cancelled.
+  `scripts/ci-gate-consistency-selftest.mjs` (in `make ci-lanes-selftest`)
+  runs its shell on the planner's plans with each job's `if:` evaluated:
+  the gate must pass a run in which every selected lane passed and fail one
+  in which a lane that ran failed or did not run (an allowlist names the
+  dispatch's archived main-unit lanes).
 
 The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
 the feature-matrix test runs, audit, the SDK suites, and the whole
