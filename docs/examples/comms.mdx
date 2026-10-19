@@ -81,7 +81,9 @@ SDKs rather than the signed peer channel.
 ## Reply from inside an agent turn
 
 The agent-facing tools are separate from the host APIs below. When a peer
-message caused the current turn, use the pre-addressed `reply_to_peer` tool:
+message was delivered in the current turn (it started the turn or, since
+0.9.4, was written into it while it ran), use the pre-addressed
+`reply_to_peer` tool:
 
 ```json
 {
@@ -93,21 +95,31 @@ message caused the current turn, use the pre-addressed `reply_to_peer` tool:
 }
 ```
 
-There is no `peer_id` input. The runtime mints a reply capability for the
-incoming delivery and revalidates trust when the reply is sent. If several
-peer messages were admitted in the same turn, the first call returns
-`ambiguous_reply` with delivery IDs; retry with one of them:
+There is no `peer_id` input. The runtime mints a reply capability for each
+incoming delivery and revalidates trust when the reply is sent. Since 0.9.4
+each peer message notice shows a `Delivery ID` line. If several peer messages
+were delivered in the turn, pass that ID as `reply_to`; a call without it
+returns `ambiguous_reply`, which lists the valid IDs with their senders:
 
 ```json
 {
   "name": "reply_to_peer",
   "arguments": {
-    "reply_to": "delivery-id-from-ambiguous-reply",
+    "reply_to": "delivery-id-from-the-notice",
     "body": "This result is for your review request.",
     "handling_mode": "queue"
   }
 }
 ```
+
+The reply names the delivery it answers, and the receiver's notice shows it as
+an `In reply to` line. If the ID matches messages from two different senders,
+the call returns `ambiguous_reply` naming both and sends nothing; answer one of
+them with `send_message`. In a mixed deployment, a 0.9.3 receiver that checks
+signatures refuses a `reply_to_peer` reply from 0.9.4 (the sender gets no
+acknowledgement and an ambiguous delivery outcome); `send_message` still
+reaches it. The [Comms reference](/reference/comms-reference) has the full
+rules.
 
 For unsolicited outreach, discover a canonical identity with `peers`, then
 use `send_message`. Use `send_response` only when answering a typed

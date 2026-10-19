@@ -74,24 +74,38 @@ The table below is the current **session transport** mapping (`SessionError::cod
 |----------------|------|----------|-----|-----|
 | `NotFound` | `SESSION_NOT_FOUND` | -32001 | tool error | exit 10 |
 | `Busy` | `SESSION_BUSY` | -32002 | tool error | exit 11 |
+| `ServedElsewhere` | `SESSION_SERVED_ELSEWHERE` | -32002 | tool error | exit 11 |
+| `RuntimeUnavailable` | `SESSION_RUNTIME_UNAVAILABLE` | -32032 | tool error | exit 52 |
+| `HostingUnavailable` | `SESSION_HOSTING_UNAVAILABLE` | -32032 | tool error | exit 52 |
 | `PersistenceDisabled` | `SESSION_PERSISTENCE_DISABLED` | -32603 | tool error | exit 1 |
 | `CompactionDisabled` | `SESSION_COMPACTION_DISABLED` | -32603 | tool error | exit 1 |
 | `NotRunning` | `SESSION_NOT_RUNNING` | -32603 | tool error | exit 1 |
 | `DurableTailHeldForRecovery` | `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` | -32003 | tool error | exit 12 |
 | `DurableTailRecoveryRefused` | `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` | -32003 | tool error | exit 12 |
 | `DurableEvidenceQuarantined` | `SESSION_DURABLE_EVIDENCE_QUARANTINED` | -32003 | tool error | exit 12 |
+| `WholeBlobAuditedEndpointDivergence` | `SESSION_WHOLEBLOB_AUDITED_ENDPOINT_DIVERGENCE` | -32003 | tool error | exit 12 |
 | `Store` | `SESSION_STORE_ERROR` | -32603 | tool error | exit 1 |
 | `Unsupported` | `SESSION_UNSUPPORTED` | -32603 | tool error | exit 1 |
+| `ExternalWriteFenceConflict` | `SESSION_EXTERNAL_WRITE_FENCE_CONFLICT` | -32603 | tool error | exit 1 |
+| `ExternalWriteFenceBackoff` | `SESSION_EXTERNAL_WRITE_FENCE_BACKOFF` | -32603 | tool error | exit 1 |
+| `CapabilityUnavailable` | `CAPABILITY_UNAVAILABLE` | -32603 | tool error | exit 1 |
+| `ForkInstructionRefused` (since 0.9.4) | `FORK_INSTRUCTION_REFUSED` | -32037 | tool error | exit 57 |
 | `Agent` | `AGENT_ERROR` | by cause (see below) | tool error | by cause (see below) |
-| `FailedWithData` | `SESSION_ERROR` | -32603 | tool error | exit 1 |
+| `FailedWithData` | `SESSION_ERROR` | -32603 (see below) | tool error | exit 1 (see below) |
 
 `Agent` errors map per typed cause to the canonical contracts codes: provider
 failures -32010 (exit 20), budget exhaustion -32011 (exit 21), hook denial
--32012 (exit 22), cancellation -32005 (exit 14), config errors -32602 (exit 2),
+-32012 (exit 22), cancellation -32005 (exit 14), config errors and (since
+0.9.4) `AgentError::InstructionActivation` -32602 (exit 2),
 `AgentError::SessionNotFound` -32001 (exit 10),
 `AgentError::SkillResolutionFailed` -32022 (exit 42), and remaining causes
 -32603 (exit 1). The CLI exit status is always the `cli_exit_code()` of the
 same `ErrorCode`.
+
+`FailedWithData` has two typed exceptions: a runtime teardown in progress
+answers `SESSION_BUSY` (-32002, exit 11), and, since 0.9.4, a fork whose source
+has session metadata but no build state answers `INVALID_PARAMS` (-32602,
+exit 2) with the data kind `fork_source_build_state_missing`.
 
 Temporary councils are agent-internal mob orchestration, not a public wire
 family. Where the host can deliver a later completion to the convener (a mob
@@ -121,10 +135,10 @@ parsing messages.
 
 ### Transport error mapping summary
 
-- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved. A failed runtime-routed turn (`turn/start`, `mob/turn_start`) maps the typed cause of its terminal to the same codes (`llm_failure` and `retry_exhausted` -32010, `budget_exhausted` and `time_budget_exceeded` -32011, `hook_denied` -32012, other causes -32603), with the typed turn error in `data.error`. A runtime that refuses to admit a turn or event keeps the refusal's typed code: an invalid input -32602, a native refusal or unavailable readiness -32030/-32031, no runtime under the session's id in the runtime driver -32001, another owner or a teardown in progress -32002, unavailable runtime authority -32032, and a lifecycle state that admits no input (a retired runtime, or the destroyed runtime of a session that is gone) -32600. Every method keeps an error's typed `data`.
+- **JSON-RPC**: `NotFound`, `Busy` and `ServedElsewhere` keep dedicated codes (-32001/-32002), an unavailable session runtime or hosting uses -32032, durable resume holds use `SessionNotRunning` (-32003), a fork refused by the host's fork instruction policy uses `FORK_INSTRUCTION_REFUSED` (-32037, since 0.9.4), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved, apart from the two `FailedWithData` exceptions above. A failed runtime-routed turn (`turn/start`, `mob/turn_start`) maps the typed cause of its terminal to the same codes (`llm_failure` and `retry_exhausted` -32010, `budget_exhausted` and `time_budget_exceeded` -32011, `hook_denied` -32012, other causes -32603), with the typed turn error in `data.error`. A runtime that refuses to admit a turn or event keeps the refusal's typed code: an invalid input -32602, a native refusal or unavailable readiness -32030/-32031, no runtime under the session's id in the runtime driver -32001, another owner or a teardown in progress -32002, unavailable runtime authority -32032, and a lifecycle state that admits no input (a retired runtime, or the destroyed runtime of a session that is gone) -32600. Every method keeps an error's typed `data`.
 - **REST**: Endpoint-typed `ApiError` mapping (`NotFound` -> 404; `Busy` -> 400 on create/turn, 409 on interrupt conflicts; archived/unavailable history -> 400; agent/internal -> 500). Where canonical wire errors are emitted, `ErrorCode::http_status()` decides the status. Error body includes `{ "code": "...", "message": "..." }`.
 - **MCP Server**: Tool calls return `is_error: true` with the error message and code in the content.
-- **CLI**: General commands use 0 for success, 1 for error, and 2 for graceful budget exhaustion. Multi-host mob commands additionally preserve the typed operator failures: 45 scope denied, 46 host unavailable, 47 stale cursor, and 48 stale fence. Error details are printed to stderr.
+- **CLI**: A command that fails with a typed error exits with the `cli_exit_code()` of its `ErrorCode` (the table above shows the session ones); [CLI exit codes](/cli/configuration#exit-codes) lists every code, including the mob operator failures (45-49 and 56). Error details are printed to stderr.
 
 ## Mob control scopes
 
