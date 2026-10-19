@@ -96,7 +96,7 @@ be a second work-execution authority.
    Unsupported initial profiles refuse before effects; this does not remove
    the wider ADR obligations or its declared future-profile boundaries.
 5. Review source and evidence adversarially; resolve every material finding.
-   Ask all four bus reviewers to accept exact implementation commits and tests.
+   Ask all four project reviewers to accept exact implementation commits and tests.
    Create independently green PRs to main, declare source breaks and migration,
    run local WASM and semantic/model gates, and verify actual PR CI state.
 
@@ -168,5 +168,5 @@ source review nor early refresh closes this item.
 - Race/fault tests and TLC evidence from the same catalog used by production.
 - Latency, throughput, restart and pressure measurements on both host classes.
 - Feature-off, wasm32, schema/codegen, source-break and store-conformance checks.
-- All four final bus verdicts bound to exact implementation revisions.
+- All four final project-reviewer verdicts bound to exact implementation revisions.
 - PR URLs and verified green CI for the final reviewed heads.

@@ -223,7 +223,7 @@ and frozen r6 profiles, identified by
 their manifest. The complete
 r5-to-r6 patch, archived in
 verified base64 transport, was supplied to all
-four bus reviewers with the final hashes. No earlier verdict is silently
+four project reviewers with the final hashes. No earlier verdict is silently
 carried forward to different bytes.
 
 The final delta resolves downstream-app N5 and D1 from its r4 review
@@ -270,7 +270,7 @@ governed end-to-end vertical slice with actual sink and fault assertions.
 
 ## Follow-on owner composition protocol
 
-All four requested bus reviewers subsequently accepted the revision 7
+All four requested project reviewers subsequently accepted the revision 7
 [owner composition protocol](adr-001-implementation/owner-composition-proposal.md)
 and its [keyed-request amendment](adr-001-implementation/owner-composition-keyed-request-amendment.md).
 The [review record](adr-001-implementation/owner-composition-review.md) pins those

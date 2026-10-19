@@ -446,7 +446,7 @@ Reserve a quiet benchmark window after compilation.
    who has no delegation from the credential's owner. Verify receiving-service
    enforcement for the knowledge service and connector-local enforcement for opaque APIs.
 3. Run focused adversarial races/fault cases and cost measurements, obtain the
-   four independent bus implementation reviews, and create the PR with green CI.
+   four independent project implementation reviews, and create the PR with green CI.
    Review changes from accepted checkpoints; preserve shared build reservations.
 
 Preserve but remove from the default path the unfinished witness/time/recovery

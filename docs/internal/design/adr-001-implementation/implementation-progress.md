@@ -98,7 +98,7 @@ with the earlier ordinal failure, this is a completed red correction batch.
 Its complete 91,366-byte raw log has SHA-256
 `69fdf9c7498f27eeac3b08781ad7da9f1b9ac8e16d4c2ae18d8d877ba1236d8b`
 and is retained as `integration-25dd-completed-20261008.log` in the root's
-October 7 bus artifact prefix. The original header remains 25dd plus staged
+October 7 review artifact prefix. The original header remains 25dd plus staged
 `fd98ec80d5ac`; later source fixes do not change this executed identity.
 
 The earlier test-only `23c6b93f430ae9ef5906be0a894a896acb3bf370` correction was
@@ -186,7 +186,7 @@ skipped in 5.130s, command exit 2; the failure is the already reviewed
 fails, exit 101: `cold_restart_resume_after_compaction.rs:350:41` introduces a
 panic forbidden by the target's lint policy. The existing run ends at
 02:48:46 UTC after 24m40s total wall time. Its complete 224,019-byte raw log is
-retained as `integration-5aaf-completed-20261008.log` in the existing bus
+retained as `integration-5aaf-completed-20261008.log` in the existing review
 artifact prefix, SHA-256
 `1dac9104c3698351b2570037a3ee128ac8cbb68f769ac35411d39a9eda24e2c6`.
 This is a completed red correction batch, not a clean-head qualification.
@@ -242,7 +242,7 @@ BackendUnavailable; two report assertion failures without the actual refusal
 cause. These results establish attempted selection, not eligible-host positive
 acceptance or the underlying host cause. The detailed source rulings are
 `integration-5aaf-ordinal-linux-review-r1.md` and
-`cold-restart-5aaf-delta-review-r1.md` in the existing bus artifact prefix.
+`cold-restart-5aaf-delta-review-r1.md` in the existing review artifact prefix.
 
 The fixture-status defect is source-clear in
 `bbf71ecb2c8eb4dc552ca8280b9c0b9d50eaa3e2`, retained by `4d561ef06`:
@@ -281,7 +281,7 @@ tests need to retain the pre-retry committed target and assert typed executor
 stop plus actual fatalization. `head-canonical-9fcf-review-r1.md` records those
 bounded oracles; reported 440 passes and Clippy remain unverified raw claims.
 Neither lever establishes overhead acceptance or the remaining caller coverage.
-All named review artifacts are retained in the root's October 7 bus prefix.
+All named review artifacts are retained in the root's October 7 review artifact prefix.
 
 The unbuilt R2 staged-witness candidate
 `93afe928db74f23e0c78415c583121edf6ff9d75` has two further source findings.
@@ -301,7 +301,7 @@ existing helper. The original-map legacy split and present-empty staged-map
 handling are sound. Stage's canonical update frame and focused pre/post
 assertions suffice for noninterference without a stored prior-state mirror.
 `r2-staged-witness-93afe-ruling-r1.md` retains the ruling and links all three
-independent source reviews in the same bus prefix. Existing authors retain
+independent source reviews in the same review artifact prefix. Existing authors retain
 correction and execution; no generated drift, TLC or test pass is claimed for
 this WIP.
 
@@ -2212,7 +2212,7 @@ or authorization overhead. PR1730 subsequently merged as `8ca50a1a4` at 04:02:54
 UTC. Its parents are `589d98736a98ab6932127a915b46e8b584124877` and published
 `dab5f9865`; GitHub independently confirms the identical tree above. This
 establishes merge provenance, not a new merged-main CI run. GCP reports the
-codegen-guard push finished successfully at 04:08:38 UTC and benchmark builds
+code generation guard push finished successfully at 04:08:38 UTC and benchmark builds
 resumed while other pushes remained held. The later completed measurement and
 its acceptance limits are recorded below.
 
@@ -2748,7 +2748,7 @@ This does not establish a Linux compilation or a qualified following-boundary ba
 Independent r759 source reviews at that exact combined head found two bounded
 gaps. Mandatory PostTool hook infrastructure failure returns before the completed
 tool batch commits, losing already-entered sibling results, effects and async
-obligations. The GCP lead assigned the existing `turbo-live` owner one fix and a
+obligations. The GCP lead assigned the existing live-path owner one fix and a
 critical regression test first. Deliberate permission/confinement refusals retain
 their accepted local behavior; background and committed-observation Guardrails
 remain explicitly unsupported. Separately, the reviewer context read checks
@@ -2826,7 +2826,7 @@ was performed.
 | MCP account selection | Production through `7d5a33e83` retains scoped source clearance. Test/docs successor `b8cb065191ad2fc1182b42f1bfdf5c643c275bb9` is independently source-clear: the actual materialized router must remain unchanged after each Known/Discover/Unverified refusal, and the plain-config control must stage successfully. Legacy Known disconnect-first wording now applies to a new login, not ordinary stored-credential use. Production still refuses account fields before session lookup/staging, propagates pending-flow retirement errors before fresh admission and restricts mode construction to configuration. Failed-retirement fault coverage remains open; the new fixture does not perform login, apply the staged server or prove disk-write behavior. Installation-scoped storage remains an incremental checkpoint: actual realm identity, native binding-use admission, attributable administration/audit and portable-profile coverage are still required. Host RPC/REST configuration remains ambient administration, not authenticated local-actor evidence. The injected client-failure test does not prove zero network attempts or unchanged refresh lifecycle. Reported tests and Clippy remain owner evidence; no raw correction-run log was independently read, and combined CI/full acceptance remain separate. |
 | Performance | The earlier independently checked depth-1 COW1 diagnostic records trusted/governed means of 2.9062/5.9554ms and 104.92% ratio-of-means overhead. Its governed mean is about 68.3% below opt3 in the same comparison. Macro-side COW and schema-driven renderer parity are source-clear through `2192f4693`, with the separately attributed functional/drift evidence above. The existing owner is proceeding to profiling and attribution. This one-cell comparison does not replace the unchanged six-cell <=10% acceptance study, which remains MISS. Profile window filtering and earlier sample counts are independently verified; retained recording clock/event/binary linkage remains unqualified. No accepted performance result qualifies the integrated candidate; added native authorization p99 below 1 ms and representative turn overhead at most 10 percent remain required. Optional model-review latency is measured separately from the local default. |
 
-The generated native-auth compatibility delta
+The generated native authorization compatibility delta
 `27adbf0c39509ce82f40f651fb4c35c2d9fab20e`, tree
 `51bb523840e938967c4c44ff1b4ab20b73d456d4`, exposes the existing
 `outcome_uncertain` terminal kind in schemas and SDK unions. Review
@@ -3156,7 +3156,7 @@ successor remain open.
 | Area | Verified evidence and remaining limit |
 |---|---|
 | Native human consent | Exact `885554aed055c42e332850c9b5a518036ee82e94` passed 218 focused tests with 2,748 skipped, including seven consent cases. These are library and fenced-dispatch controls, not a full Agent flow or separate-process consent recovery. The raw log is (operator-retained path); compilation took 3m16s and test bodies 1.045s. |
-| Human-consent successor | Source review at `5568d2bc01968e12595601917a435fa9fd980c45` is not clear. Existing `consent-impl` has a reviewed repair plan for typed store commitment/reconciliation, callback-free entry reservations, current approver eligibility and machine-owned consent association/use. Compile companion `5d257c610` is source-clear; that does not qualify the pending repairs. Original-run closure/carry, real authenticated host admission, qualified presentation, delivery/wake and restored live-consent custody remain incomplete. |
+| Human-consent successor | Source review at `5568d2bc01968e12595601917a435fa9fd980c45` is not clear. The existing consent implementation owner has a reviewed repair plan for typed store commitment/reconciliation, callback-free entry reservations, current approver eligibility and machine-owned consent association/use. Compile companion `5d257c610` is source-clear; that does not qualify the pending repairs. Original-run closure/carry, real authenticated host admission, qualified presentation, delivery/wake and restored live-consent custody remain incomplete. |
 | Reviewer context and failure feedback | Native original-input context (`15dee74b` patch), supported typed text-appends (`c35c4945`) and successful reviewer HTTP followed by protected observation failure (`ac4ab4ef`) are independently source-reviewed and delivered. Original-input reads retain their actual work owner and independently checked source permission; unsupported media/reference context remains unavailable. Protected observation failure remains infrastructure failure, with no target effect or automatic retry and with permitted sibling continuation. The new fixtures are unexecuted. |
 | Recovery | Same-process evidence retains its stated scope. The separately recorded `adc79830f` subprocess fixture proves completed-turn reconstruction followed by fresh governed work under newly installed current grants. It does not prove interrupted continuation, restored live consent or automatic recovery across all surfaces. |
 | SDK and Console | Feedback `151d9d62`, optional reference `074bf586`, reference display `774c72a4`, typed gating-result patches and public TypeScript subscription fixtures (`75e087fc`) are source-delivered. MCP setup-reason propagation is source-clear in native Python/TypeScript (`a6faf991`) and stock/shared Console projection (`769d4938`). Point-aware PostTool Console feedback (`9bb2fb59`) is source-reviewed against the accepted chain. Only a canonical per-call result establishes withholding; a bare Observe-hook refusal does not. The sole assembler must regenerate native schema/types; integrated execution and publication remain pending. An approval reference or displayed refusal does not establish action execution. |
@@ -3232,10 +3232,10 @@ The remaining batch includes persistent controller and credential continuity;
 owner-bound context source/audience admission across live, detached, ephemeral
 and staged surfaces; typed local recipient outcomes and multi-subscription
 delivery; and the assigned owners' native consent/reviewer, original-work carry
-and surface-coverage changes. The coordinator assigned `consent-impl` the native
+and surface-coverage changes. The coordinator assigned the consent implementation owner the native
 review/consent source against `50ede58a1`; root retains design review and integration.
 Root integrates the public typed delivery errors
-and per-recipient behavior. The `mob-flakes` continuation batch owns the shared
+and per-recipient behavior. The mob flake-repair continuation batch owns the shared
 durable refused-delivery primitive and version gate; this branch stacks on that
 exact source rather than duplicating it. Issues #1497, #1646, #1741 and #1807
 remain in the cross-owner integration scope. Source preparation is not acceptance.
@@ -4148,7 +4148,7 @@ gate PID3381990 was suspended TN at 0.0 percent CPU. CPU idle ranged from
 was 729,390 MiB and swap was zero (`native761-fixed-mean32-r1-monitor.log`, SHA256
 `2f1e3e7e132efd43541f04168bba8e7832d11fd993935cd6e36f31d560f8c1f9`).
 These samples establish observed resource quiet under the prior reservation.
-A fresh typing-lag HOLD acknowledgment was absent; no new all-owner clearance
+A fresh HOLD acknowledgment from the typing-latency owner was absent; no new all-owner clearance
 is claimed. Root owns measurement and the GCP resource owner owns host quiet
 qualification. The less-than-20-minute total attempt bound includes setup,
 warmup, measured work, oracles, cleanup and output. Functional PASS, sampled
@@ -4191,7 +4191,7 @@ CPU idle and zero iowait/steal/swap.
 Its raw log is `quiet-a08-fixed-mean32-r1-monitor.log`, SHA256
 `7957dbadc462f3d2881182ca169eb9a42618601226e82b48bd48ba3f5287fda7`.
 The autonomous host and the adapter consumer supplied current nonconflict replies, while fresh
-lead/typing-lag acknowledgment was absent. No full-host acknowledgment is
+acknowledgment from the lead and the typing-latency owner was absent. No full-host acknowledgment is
 claimed. Performance remains an unmet architecture gate, and further runtime
 expansion remains held behind it.
 
@@ -4233,7 +4233,7 @@ heavy process. Minimum available memory was 729,546 MiB. The retained Cargo
 process was a zero-CPU zombie and its parent remained suspended. Raw
 `quiet-f9f0-fixed-mean32-r1-monitor.log` has SHA256
 `4399342d870895bdb808459cf7aceb4ccd0b0c8461e2d89d9c116b0293304aa0`.
-Fresh lead/typing-lag acknowledgment remained absent; this is sampled resource
+Fresh acknowledgment from the lead and the typing-latency owner remained absent; this is sampled resource
 qualification, not all-owner clearance. Source and measurement remain separate
 from published native00b0 CI; the combined successor must pass its own normal gates.
 
@@ -4437,7 +4437,7 @@ compile, 0.16s body). Final schema freshness and normal commit hooks passed.
 Native command-hook confinement, protected hook
 refusal audit and other hook-point locality remain incomplete.
 
-The bus monitor is active. Publication clearance and a quiet performance window
+The review channel monitor is active. Publication clearance and a quiet performance window
 are specific scheduling dependencies, not a halt on independent work. Root owns
 the serial Rust lane while agents prepare and review child-process cleanup,
 physical SQLite custody, documentation and existing E2E registration. SQLite
@@ -4748,7 +4748,7 @@ The detailed receipt and future resource conditions are in
 
 | Candidate | Exact source | Evidence and limits |
 | --- | --- | --- |
-| [Meerkat ADR PR 1352](https://github.com/lukacf/meerkat/pull/1352) | `97d3078e2e5cff9f0a49e3f46c67d2da7a9a0fe9` | Four requested bus reviewers accepted the frozen r6 design. Scoped PR source reviews and two pilot host record corrections are retained. Hosted CI gate passed at this head. The PR remains a draft; it changes documentation and archived-review hygiene, not runtime enforcement. |
+| [Meerkat ADR PR 1352](https://github.com/lukacf/meerkat/pull/1352) | `97d3078e2e5cff9f0a49e3f46c67d2da7a9a0fe9` | Four requested project reviewers accepted the frozen r6 design. Scoped PR source reviews and two pilot host record corrections are retained. Hosted CI gate passed at this head. The PR remains a draft; it changes documentation and archived-review hygiene, not runtime enforcement. |
 | The independent consumer prerequisites change | Published `e55531eb0e41f0c04ab356f9100aa7869197cc36`; local rebased source `3985dbe37f8ee842848c776860d5e6ecf94cc885` | Independent ABAC fixes, verified caller context and retained-work repair passed 2,031 local tests and strict lint at the recorded integration checkpoint. The narrow synthetic-fixture repair passed local full-history scanning, two negative controls and the real authenticated MCP regression. Normal publication hooks and all eight applicable hosted jobs passed in run 36809459432, including all-feature tests and full-history scanning. The workflow skipped E2E; no E2E result is implied. No governed endpoint is enabled. |
 
 The ADR publication explicitly disclosed the failing unchanged broad local
@@ -4800,7 +4800,7 @@ SHA-256 is `1a81c6c7636b0ef235d5ccbc123b570c60c74ed1f557016bd9c77e2ee110d179`.
 Canonical controlled TLC acceptance remains pending.
 
 The [owner composition review record](owner-composition-review.md) records all
-four bus acceptances of the implementation protocol and its keyed-request
+four project-reviewer acceptances of the implementation protocol and its keyed-request
 amendment. These are protocol verdicts. They do not close the implementation
 requirements in the table or the complete requirement inventory.
 
@@ -4860,8 +4860,8 @@ failed lane.
 - Canonical state projection is committed at d93f251ba4d81453ccec5ff5481417232754a2c1. All 106 unique focused tests, strict lint, 19 unchanged non-opted owner expansions and metadata/hooks passed. The ten directly affected fixture tests reran after a test-only lint repair. Production framing stayed byte-identical to the reviewed candidate. Full snapshot identity changes when opting in, and old snapshots refuse explicitly. This is a projection prerequisite, not grant validity.
 - The combined witness/authentication integration is clean at 0a29f1dbd after normal cherry-pick hooks and canonical lock refresh. All 124 combined-feature tests passed, including three compile-fail docs. Final strict all-target lint, combined-feature WASM compilation and metadata checks all passed. The immutable combined archive manifest is bd48ecab04394efa60eb53151f6e06c31f9655542036eba9ccf9644e6c909cb8. Existing cryptographic and SQLite production source hashes are retained; no operational service/currentness is implemented by composing the features.
 - The accepted frozen r7 protocol documents are committed locally at 61ac05c2d, followed by the bounded native-tracer companion 75bd40ef3 and explicit post-fence time clarification e23829ed2 and its corrected revision 90477194b. Docs checks and normal commit hooks passed. These commits remain unpublished; PR #1352 still exposes 97d3078e with its earlier green CI.
-- The lead conditionally accepts witness time at a fresh post-fence logical decision point with a historical durable reply. GL4 remains open until authoritative final release checks, fresh retry observations, uncertainty refusal, cleanup and exact pause/race fixtures pass. All four bus reviewers received the written clarification. The inspected GCP deployment lacks the proposed authenticated clock source; no daemon or host-clock change has been made.
-- The numeric publication lane remains held for the lead's mob-flakes repair SHA. The separate main integration repairs do not authorize retry. No hook bypass, merged PR, production deployment or full ADR completion is claimed.
+- The lead conditionally accepts witness time at a fresh post-fence logical decision point with a historical durable reply. GL4 remains open until authoritative final release checks, fresh retry observations, uncertainty refusal, cleanup and exact pause/race fixtures pass. All four project reviewers received the written clarification. The inspected GCP deployment lacks the proposed authenticated clock source; no daemon or host-clock change has been made.
+- The numeric publication lane remains held for the lead's mob flake-repair batch SHA. The separate main integration repairs do not authorize retry. No hook bypass, merged PR, production deployment or full ADR completion is claimed.
 
 ## 2026-10-01 adversarial continuation
 
@@ -4882,7 +4882,7 @@ Generated preparation owns the next focused Mac lease. Root then reuses the now-
 
 The GCP lead reserved **09:00-09:45 UTC** for the unchanged retention benchmark controller and binaries. GCP agents must stop heavy work by 08:58 and launch no compiler/TLC/hook-running push during the reservation. Host idle and compiler-free preconditions remain unchanged; violation yields NOT_MEASURED rather than another blind probe. CoreNext's 88 comparison jobs have finished, with classification/raw evidence still pending.
 
-GF-4 revision9 (`7d11682b067c38e54db57c78a1f1de4b59644849b5710510271ca62935dd779f`) has lead and the adapter consumer textual acceptance. It closes complete owner-derived frontier, surviving continuation/readmission claims, linear recovery chains and exact committed observation recovery. Source must distinguish a surviving committed outcome with pending evidence from Unknown. Attempt source review may proceed. Native admission edits wait for the lead's explicit handoff at turbo-live 2b's merge commit; unrelated main changes do not trigger repeated rebases.
+GF-4 revision9 (`7d11682b067c38e54db57c78a1f1de4b59644849b5710510271ca62935dd779f`) has lead and the adapter consumer textual acceptance. It closes complete owner-derived frontier, surviving continuation/readmission claims, linear recovery chains and exact committed observation recovery. Source must distinguish a surviving committed outcome with pending evidence from Unknown. Attempt source review may proceed. Native admission edits wait for the lead's explicit handoff at the second live-path branch's merge commit; unrelated main changes do not trigger repeated rebases.
 
 Witness bootstrap outer revision5 (`c01fae20ea2f12349342d1d21aa6b08d3b3c90a509bb1a77d974457876f292e0`) is accepted for source. The neutral certificate-evidence framing is frozen before implementation. This does not qualify an inner proof, clock, key producer, current witness or runtime entry.
 

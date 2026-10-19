@@ -2,7 +2,7 @@
 
 ## Proposal and evidence boundary
 
-Revision r7 for root and bus closure, 2026-10-01. This supersedes r6 SHA256
+Revision r7 for root and project-reviewer closure, 2026-10-01. This supersedes r6 SHA256
 `0837cf6157cc2fd9debfd8fe128fdfb1f5186e76d91ad36d6127b0a7dce3cd57`,
 preserved at `/tmp/adr-001-turbos-e2e-r7/r6.md`.
 No tests, builds, new live model requests, or production changes were made for

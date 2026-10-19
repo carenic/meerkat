@@ -60,12 +60,12 @@ reserve broader suites for coherent integration checkpoints.
 | Candidate | Exact SHA-256 | Result |
 | --- | --- | --- |
 | r1 | `bbf338e21790cf4f300aabfe44954662ad32706ecb5f77fe43397d11ecd44527` | Internal adversarial findings repaired in r2. |
-| r2 | `589ede7935310f466492da380b2f666ba42ee4071fa5b9551999835047b26c9d` | Three internal reviewers GREEN. Four bus reviewers returned the findings below. |
+| r2 | `589ede7935310f466492da380b2f666ba42ee4071fa5b9551999835047b26c9d` | Three internal reviewers GREEN. Four project reviewers returned the findings below. |
 | r3 | `c765254055ed49bc83c0a4db6b9faf245d3b74fd89e684a72457fe5f55403b18` | Three internal reviewers GREEN. The operator deployment and the downstream app closed their findings; GCP closed F2-F8 but required the premature scheduler choice to become pending and the planned filtering/lease clauses to appear in the text. |
-| r4 | `ff5fc7bc7f87ee3ee715b72dde5efee0fbb5b1e43c4e9d8f3a2c5cc70f7fe31c` | Independent information/runtime delta reviews GREEN. All four bus reviewers accepted the common contract and closed their findings. The irreducible-request question was pending at that checkpoint and was resolved by Luka in r5. |
+| r4 | `ff5fc7bc7f87ee3ee715b72dde5efee0fbb5b1e43c4e9d8f3a2c5cc70f7fe31c` | Independent information/runtime delta reviews GREEN. All four project reviewers accepted the common contract and closed their findings. The irreducible-request question was pending at that checkpoint and was resolved by Luka in r5. |
 | r5 | `c923089fe65c2eb1af90f04151b2aa83c47a08e036bcf9a2190a52625efa30e8` | Applies Luka's direct clarification: refused actions return normal model feedback. Review found an undefined last-controller-route case, resolved in r6; no terminal request or parked-run mechanism was selected. |
-| r6 | `5190b3dc8c4393ae38a83e94df7ef5f0836643ea7786e487cf75354705d737d6` | All four bus reviewers accepted the exact design. The later direct semantic-provenance correction supersedes its conflicting requirements. |
-| r7 | `c1a69f24c0cc7102953199db9f34b87cdc2af20b8179c125529ae4dc78075fdf` | Three bus reviewers accepted; GCP required closed egress inventory and open-subscription invalidation. Both are incorporated in r8. |
+| r6 | `5190b3dc8c4393ae38a83e94df7ef5f0836643ea7786e487cf75354705d737d6` | All four project reviewers accepted the exact design. The later direct semantic-provenance correction supersedes its conflicting requirements. |
+| r7 | `c1a69f24c0cc7102953199db9f34b87cdc2af20b8179c125529ae4dc78075fdf` | Three project reviewers accepted; GCP required closed egress inventory and open-subscription invalidation. Both are incorporated in r8. |
 | r8 | `5ba0c71ab4de8950bf2e596b4f3d6f87babbc31d2522b79a5da7a6810dd0bd8b` | Two internal reviewers GREEN. GCP, the downstream app, the operator deployment and Toolkit ACCEPT the exact bounded design delta; implementation and performance remain open. |
 
 Frozen candidates, exact patches, manifests and copied reviews live under
@@ -80,8 +80,8 @@ unchanged when a successor candidate is prepared.
 R8 manifest: `ff0da549f49a4d43c1394bb78102f43a05acbf80c3e60e72c3ce00af0a20df6a`.
 R7-to-r8 patch: `bc2ebf0e982e4ad0beaf6ee58fc5ab16a93281dbcb08f8c180b61e59c8f8d89a`.
 Root read both full initial r8 reports and both bounded final-condition reports.
-The four bus envelopes and available full reports are copied under r8
-`bus-reviews/manifest.json`, SHA-256
+The four review messages and available full reports are copied under the r8
+review evidence manifest, SHA-256
 `f3481b0e694c6efb9ff1863a62f38e3bd05602922b724b0d36ab2ec1357598b2`.
 Root read each envelope and both full external reports. These acceptances do not
 close the Toolkit coverage obligations or establish source acceptance.
@@ -92,7 +92,7 @@ The following sections record what reviewers required at each earlier checkpoint
 They are historical reasoning, not current authorization to rebuild the removed
 semantic-provenance machinery.
 
-## Four bus reviewers on r2
+## Four project reviewers on r2
 
 | Reviewer | Verdict and concrete conditions | r3 disposition |
 | --- | --- | --- |
@@ -101,8 +101,8 @@ semantic-provenance machinery.
 | The operator deployment | Accept with one blocking audit condition: MobKit's lossy event-log ingress must not be the sole authoritative audit. Also preserve work associations across in-memory loss/reseed and define retained channel audiences/monitoring copies. | r3 requires native audit at the next existing commit, explicit exporter loss, retained associations or fresh authorized admission, and declared future-reader/retention policy. |
 | Meerkat Toolkit | Bounded design acceptance; clarify that ordinary trusted connectors may attest a local retained-copy contract but cannot invent vendor-issued ACL leases. | The exact source-issuer clarification landed in r4 and Toolkit closed the finding. Full native-path integration remains required for production use. |
 
-Exact bus envelopes are retained in the r2 `bus-reviews` evidence directory as
-four archived review messages.
+The four archived review messages are retained in the r2 review evidence
+directory.
 Their copied full-review manifest is
 `96a17fd26e8245106f29042607ff189e393c08f7704918888a8deb2b49e7da5f`.
 
@@ -152,13 +152,13 @@ Its information/runtime review manifest is
 `25251445930a713935c69183519634352c1f66c72f465879dacdcb37bdf98e78`.
 Root read both complete reports and verified exact candidate/patch hashes.
 
-All four bus reviewers then accepted the common r4 contract. GCP closed C1-C3;
+All four project reviewers then accepted the common r4 contract. GCP closed C1-C3;
 the downstream app kept S1-S5 closed; the operator deployment closed the in-memory durability note and kept
 B1/N1/N2 closed; Toolkit closed the retained-copy source-contract ambiguity.
-The exact copied bus envelopes and available full reports are bound by the r4
-`bus-reviews/manifest.json` SHA-256
+The exact copied review messages and available full reports are bound by the r4
+review evidence manifest SHA-256
 `9b4790345d7f91c766147b2359c5d0c1e15c6c5b5f444e88fcfa9e570e98adc2`.
-The preceding r3 bus-review manifest is
+The preceding r3 review evidence manifest is
 `c9934633747c16c97ae4d824b85790de46039b95fa43bbad38818a9c2d4ed9c5`.
 Root read the complete reports and verified their exact hashes before copying.
 These are design acceptances, not implementation or performance acceptance.
@@ -188,7 +188,7 @@ The r5 candidate manifest is
 `26c64a9d6ef58c838e5dfb248d906a81907ecfcedf1d13713054c73f5e8536a5`;
 its r4-to-r5 patch is
 `48783c6736035db11e21359e0a4ee41cac632b8d20834a5b93a65754f0059da8`.
-The four bus reviewers received that exact candidate and patch. Acceptance of
+The four project reviewers received that exact candidate and patch. Acceptance of
 the user's direction is distinct from closure of the exact r5 wording.
 
 ### Source integration

@@ -355,7 +355,7 @@ Opening an explanation or explicitly previewing a policy may query the existing 
 
 Perform bounded policy validation during authoring. Cache only presentation data with its scope/revision and explicit staleness; a display cache is never an execution permit. The server's local preparation and final check retain the accepted cost requirements, including evaluation, recording, and allocation. The ADR's below-1-ms p99 per-operation and at-most-10-percent representative-turn targets still require matched measurement; this design supplies no performance acceptance. Gate-agent calls are separately selected application cost.
 
-Keep draft typing isolated from timeline and permission-detail updates. Existing typing-lag work may touch the same conversation components; integrate source changes before regenerating bundles and validate responsiveness with a busy stream. A helpful permissions panel must not slow the primary conversation.
+Keep draft typing isolated from timeline and permission-detail updates. Existing typing-latency work may touch the same conversation components; integrate source changes before regenerating bundles and validate responsiveness with a busy stream. A helpful permissions panel must not slow the primary conversation.
 
 ## Minimal first implementation and full end state
 

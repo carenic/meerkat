@@ -88,7 +88,7 @@ claiming a self-contained checks-and-audit slice.
 
 The final review packet is
 `b17de27b1043db434d4ef9c1b6df40fd07291637a9e9b94f8ab032a00246ceaa`.
-Root reports GCP, the downstream app and the operator deployment acceptance on the bus at 16:14 UTC.
+Root reports GCP, the downstream app and the operator deployment acceptance through the review message channel at 16:14 UTC.
 Toolkit verified the final two-paragraph delta, with closure relayed by GCP;
 all four reviewers have closed the UX r5 and E2E r7 designs. Design acceptance
 does not establish implementation coverage. The separate provider diagnostics
@@ -157,7 +157,7 @@ slice; a different agent is implementing it. The
 independent-agent review: five stories, 32 named checkpoints, a complete
 feature/surface matrix, explicit missing integrations and bounded live-call costs.
 It is a design, not newly executed E2E coverage. Both proposals have been sent to
-the GCP lead, the downstream app, the operator deployment and Toolkit for focused bus review.
+the GCP lead, the downstream app, the operator deployment and Toolkit for focused project review.
 
 Console rendering and existing MobKit access administration do not install the
 new native authority producers. The full editor follows real authenticated
@@ -179,7 +179,7 @@ a release-ready PR.
 3. Native admission, controller/account/grant custody, audit and archive guard
    (Mac).
 4. Persistent and detached native coverage, including durable owner recovery and
-   complete unloaded-work custody (VM `turbo-live`, after 3).
+   complete unloaded-work custody (the live-test VM, after 3).
 5. Full sources, communications, delegation and surface wiring, including Calendar
    association validation and exact non-prompt replay (Mac and Toolkit VM lane).
 6. Consent with authenticated late delivery and a fresh explicit attempt (Mac,
@@ -275,7 +275,7 @@ GCP reservation run2 actually ran09:10:05-09:25:26UTC after late compilers drain
 
 Knowledge-service PR4 at64e5a8d02eda56df6b34c9c448704e87eaabda23 has successful hosted CI36838043537. All configured required jobs passed; E2E was skipped by configuration. Prior failed secret-scan evidence remains retained. No merge or deployment occurred.
 
-The native declaration handoff remains pending: turbo-live-b merged at8302972d (PR1387); root waits for the lead's explicit handoff-open message with the2b merge SHA before changing the reserved admission/live declarations. Source-only lower association contracts, witness physical journal, grant/control integration and measured-time producer continue in parallel.
+The native declaration handoff remains pending: the second live-path branch merged at8302972d (PR1387); root waits for the lead's explicit handoff-open message with the2b merge SHA before changing the reserved admission/live declarations. Source-only lower association contracts, witness physical journal, grant/control integration and measured-time producer continue in parallel.
 
 
 ## INTEGRATION-02 accepted checkpoint, 2026-10-01 09:52 UTC

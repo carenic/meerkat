@@ -53,7 +53,7 @@ surfaces a turn failure on the post-commit path. The sibling
 uses `tokio::time::timeout(...)` and surfaces a clear `Elapsed(())` panic
 when the same route hangs; this test uses an unwrapped `app.oneshot(...)`
 and deadlocks the whole workspace `cargo nextest run --workspace` for
-57+ minutes (team-lead's observation).
+57+ minutes (the coordinator's observation).
 
 Wrap the oneshot in a 10s timeout to match the sibling's pattern. This
 surfaces the bug as a visible failure rather than a silent hang. The
