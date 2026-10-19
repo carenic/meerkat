@@ -2895,6 +2895,118 @@ mod hosting {
             0
         );
     }
+
+    /// A store watched for other processes' commits, with its database path
+    /// (the key of the delivery-generation test hooks).
+    fn watched_store() -> (Fixture, std::path::PathBuf, HostingCapability) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = HostingPaths {
+            hosting_lock_dir: dir.path().join("hosting"),
+            cold_delivery_lock: dir.path().join("delivery").join("cold-delivery.lock"),
+            database: None,
+        };
+        let store = Arc::new(
+            SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+                .expect("open store")
+                .with_hosting_paths(paths),
+        );
+        let path = store.path().to_path_buf();
+        let capability = RuntimeStore::hosting_capability(store.as_ref());
+        assert!(capability.is_cross_process());
+        (Fixture::on(store, Some(dir)), path, capability)
+    }
+
+    /// #549b: a quiet watched store ticks its owner every sweep, and every
+    /// tick reads the delivery generation. Through the store's kept reader
+    /// the owner opens the database once; through the fresh-open path (the
+    /// one every tick took before) it opens it on every tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_quiet_store_ticks_on_one_kept_open_instead_of_one_open_per_tick() {
+        use meerkat_runtime::store::sqlite::delivery_generation_test_hooks as hooks;
+        const SWEEP: Duration = Duration::from_millis(5);
+
+        let (fresh, fresh_path, capability) = watched_store();
+        hooks::force_fresh_reads(&fresh_path);
+        let handle = fresh
+            .owner()
+            .with_store_sweep(SWEEP)
+            .arm(ClaimHost::new(&capability))
+            .expect("arm the fresh owner");
+        let started = std::time::Instant::now();
+        while hooks::verified_opens(&fresh_path) < 100 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "100 store ticks never came"
+            );
+            tokio::time::sleep(SWEEP).await;
+        }
+        let hundred_ticks = started.elapsed();
+        drop(handle);
+
+        let (kept, kept_path, capability) = watched_store();
+        let handle = kept
+            .owner()
+            .with_store_sweep(SWEEP)
+            .arm(ClaimHost::new(&capability))
+            .expect("arm the kept owner");
+        tokio::time::sleep(hundred_ticks).await;
+        assert_eq!(
+            hooks::verified_opens(&kept_path),
+            1,
+            "as many ticks as the fresh owner took for 100 opens cost one open"
+        );
+        drop(handle);
+    }
+
+    /// #549b: the kept reader's connection closes once the store has been
+    /// quiet for `KEPT_DELIVERY_READER_IDLE`, and with it the presence lock
+    /// the maintenance fence waits for (paused time).
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_kept_reader_closes_at_its_idle_bound() {
+        let (fixture, path, capability) = watched_store();
+        // No sweep inside the test: the arming pass is the only read.
+        let handle = fixture
+            .owner()
+            .with_store_sweep(Duration::from_secs(3600))
+            .arm(ClaimHost::new(&capability))
+            .expect("arm");
+        let mut passes = handle.subscribe_passes();
+        first_pass(&mut passes).await;
+        assert!(
+            meerkat_sqlite::ExclusiveFence::try_acquire(&path)
+                .expect("io")
+                .is_none(),
+            "the arming read keeps its connection, so maintenance waits"
+        );
+
+        tokio::time::advance(
+            meerkat_runtime::KEPT_DELIVERY_READER_IDLE.saturating_sub(Duration::from_millis(50)),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(
+            meerkat_sqlite::ExclusiveFence::try_acquire(&path)
+                .expect("io")
+                .is_none(),
+            "kept until the idle bound"
+        );
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let mut released = None;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+            released = meerkat_sqlite::ExclusiveFence::try_acquire(&path).expect("io");
+            if released.is_some() {
+                break;
+            }
+        }
+        assert!(
+            released.is_some(),
+            "the quiet reader closed at its idle bound, and maintenance gets the database"
+        );
+        drop(released);
+        drop(handle);
+    }
 }
 
 /// Invariant behind continuation routing (#1813): the applier routes and

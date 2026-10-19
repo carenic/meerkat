@@ -4796,6 +4796,349 @@ END";
         )
     }
 
+    /// The store's durable delivery generation read through a verified open
+    /// of its own (the fresh-open read path).
+    fn read_delivery_generation_fresh(path: &Path) -> Result<u64, RuntimeStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if !runtime_database_absent(path) {
+            delivery_generation_test_hooks::count_verified_open(path);
+        }
+        // A file that never used durable delivery reads zero.
+        let Some(conn) = open_runtime_delivery_read_connection(path)? else {
+            return Ok(0);
+        };
+        // A delivery file below version 3 (the counter's migration) not yet
+        // migrated by a write has no counter yet; its first delivery write
+        // migrates it. Decided on the version the open verified.
+        delivery_generation_at(&conn, Some(conn.version))
+    }
+
+    /// The generation row, on a connection whose delivery domain is at
+    /// `version` (`None`: no delivery domain): zero below version 3, the
+    /// counter's migration.
+    fn delivery_generation_at(
+        conn: &Connection,
+        version: Option<i64>,
+    ) -> Result<u64, RuntimeStoreError> {
+        if version.is_none_or(|version| version < 3) {
+            return Ok(0);
+        }
+        let generation: i64 = conn
+            .prepare_cached(
+                "SELECT generation FROM runtime_delivery_generation WHERE singleton = 1",
+            )
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        u64::try_from(generation).map_err(|_| {
+            RuntimeStoreError::ReadFailed(format!(
+                "runtime delivery generation {generation} is negative"
+            ))
+        })
+    }
+
+    /// Where a delivery owner reads its store's delivery generation from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeliveryGenerationReadPath {
+        /// One verified open, kept between reads under the presence lock.
+        Kept,
+        /// A verified open per read (`load_delivery_generation`).
+        Fresh,
+    }
+
+    /// The platform facts the read path is decided on.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReaderPlatform {
+        Unix,
+        Windows,
+        /// Neither: no file identity (device and inode) to compare.
+        Other,
+    }
+
+    impl ReaderPlatform {
+        fn current() -> Self {
+            if cfg!(windows) {
+                Self::Windows
+            } else if cfg!(unix) {
+                Self::Unix
+            } else {
+                Self::Other
+            }
+        }
+    }
+
+    /// Windows keeps the fresh-open read path: no CI lane runs the kept reader
+    /// on Windows, so it would ship untested there. A platform without a file
+    /// identity keeps it too: a kept reader could not tell a file replaced at
+    /// its path from the one it opened.
+    fn delivery_generation_read_path(platform: ReaderPlatform) -> DeliveryGenerationReadPath {
+        match platform {
+            ReaderPlatform::Unix => DeliveryGenerationReadPath::Kept,
+            ReaderPlatform::Windows | ReaderPlatform::Other => DeliveryGenerationReadPath::Fresh,
+        }
+    }
+
+    /// A delivery owner's kept reader of the durable delivery generation
+    /// (#549b): one verified open, then one guarded snapshot read per tick.
+    ///
+    /// The connection stays open between reads under the database's presence
+    /// lock ([`meerkat_sqlite::KeptConnectionPresence`]), so maintenance waits
+    /// for it to close. Each read takes the shared fence guard first. Under
+    /// it, the read checks that the path still names the file the open
+    /// verified, then reads the schema cookie, the delivery domain's ledger
+    /// row and the generation in one snapshot. A refused guard closes the
+    /// connection and returns the refusal; a moved, replaced or missing file,
+    /// a changed schema or a changed ledger row closes it and opens again,
+    /// verified, in the same read.
+    struct KeptDeliveryGenerationReader {
+        path: PathBuf,
+        kept: Option<KeptDeliveryConnection>,
+    }
+
+    /// A kept delivery read connection. Fields drop in declaration order: the
+    /// connection closes, and finishes any checkpoint its close runs, before
+    /// the presence lock goes.
+    struct KeptDeliveryConnection {
+        conn: Connection,
+        _presence: meerkat_sqlite::KeptConnectionPresence,
+        /// The file the open verified.
+        identity: meerkat_sqlite::DatabaseFileIdentity,
+        /// `PRAGMA schema_version` when the open verified the domain.
+        schema_cookie: i64,
+        /// The delivery domain version the open verified (`None`: no
+        /// delivery domain yet).
+        version: Option<i64>,
+    }
+
+    impl KeptDeliveryGenerationReader {
+        fn new(path: PathBuf) -> Self {
+            Self { path, kept: None }
+        }
+
+        fn read_generation(&mut self) -> Result<u64, RuntimeStoreError> {
+            if let Some(kept) = self.kept.as_ref() {
+                #[cfg(any(test, feature = "test-support"))]
+                delivery_generation_test_hooks::before_kept_read(&self.path);
+                match kept.read(&self.path) {
+                    Ok(Some(generation)) => return Ok(generation),
+                    // No longer the database the open verified: open again.
+                    Ok(None) => self.kept = None,
+                    Err(error) => {
+                        self.kept = None;
+                        return Err(error);
+                    }
+                }
+            }
+            self.open_and_read()
+        }
+
+        /// A verified open, kept when the presence lock can be held; without
+        /// it the read takes the fresh-open path and keeps nothing.
+        fn open_and_read(&mut self) -> Result<u64, RuntimeStoreError> {
+            if runtime_database_absent(&self.path) {
+                meerkat_sqlite::OperationGuard::admit_missing_database(&self.path)
+                    .map_err(map_shared_sqlite_error)?;
+                return Ok(0);
+            }
+            let Some(presence) = meerkat_sqlite::KeptConnectionPresence::acquire(&self.path) else {
+                return read_delivery_generation_fresh(&self.path);
+            };
+            let guard = meerkat_sqlite::OperationGuard::for_database(&self.path)
+                .map_err(map_shared_sqlite_error)?;
+            let conn = match meerkat_sqlite::open_with(
+                &self.path,
+                meerkat_sqlite::ConnectionProfile::Primary { create: false },
+                meerkat_sqlite::OpenOptions {
+                    schema_preflight: &[&RUNTIME_DELIVERY_DOMAIN],
+                    ..meerkat_sqlite::OpenOptions::default()
+                },
+            ) {
+                Ok(conn) => conn,
+                // Removed between the check and the open: still unprovisioned.
+                Err(_) if runtime_database_absent(&self.path) => return Ok(0),
+                Err(error) => return Err(map_shared_sqlite_error(error)),
+            };
+            #[cfg(any(test, feature = "test-support"))]
+            delivery_generation_test_hooks::count_verified_open(&self.path);
+            let identity = meerkat_sqlite::validate_database_file(&self.path)
+                .map_err(map_shared_sqlite_error)?;
+            // The cookie, the version the preflight verifies and the
+            // generation, in one snapshot: a schema or ledger change another
+            // process commits meanwhile is seen whole or not at all.
+            let snapshot = conn
+                .unchecked_transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let schema_cookie = schema_cookie(&snapshot)?;
+            let version =
+                meerkat_sqlite::preflight_domain_version(&snapshot, &RUNTIME_DELIVERY_DOMAIN)
+                    .map_err(map_shared_sqlite_error)?;
+            let generation = delivery_generation_at(&snapshot, version)?;
+            snapshot
+                .rollback()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            drop(guard);
+            // Kept only for a file with an identity to compare against later
+            // (the path still names a file: Kept runs where one is reported).
+            if let Some(identity) = identity {
+                self.kept = Some(KeptDeliveryConnection {
+                    conn,
+                    _presence: presence,
+                    identity,
+                    schema_cookie,
+                    version,
+                });
+            }
+            Ok(generation)
+        }
+    }
+
+    impl KeptDeliveryConnection {
+        /// One guarded read. `Ok(None)`: the connection no longer reads the
+        /// database at `path` as its open verified it.
+        fn read(&self, path: &Path) -> Result<Option<u64>, RuntimeStoreError> {
+            let _guard = meerkat_sqlite::OperationGuard::for_database(path)
+                .map_err(map_shared_sqlite_error)?;
+            // Under the guard no maintenance moves the file, so the identity
+            // compared here is the one this read reads.
+            if meerkat_sqlite::validate_database_file(path).map_err(map_shared_sqlite_error)?
+                != Some(self.identity)
+            {
+                return Ok(None);
+            }
+            let snapshot = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            // An unchanged cookie means no DDL since the open verified the
+            // schema; the ledger row is data, so it is read again.
+            if schema_cookie(&snapshot)? != self.schema_cookie
+                || meerkat_sqlite::domain_version(&snapshot, RUNTIME_DELIVERY_DOMAIN.name)
+                    .map_err(map_shared_sqlite_error)?
+                    != self.version
+            {
+                return Ok(None);
+            }
+            let generation = delivery_generation_at(&snapshot, self.version)?;
+            snapshot
+                .rollback()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            Ok(Some(generation))
+        }
+    }
+
+    fn schema_cookie(conn: &Connection) -> Result<i64, RuntimeStoreError> {
+        conn.prepare_cached("PRAGMA schema_version")
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl crate::store::DeliveryGenerationReader for KeptDeliveryGenerationReader {
+        async fn read(&mut self) -> Result<u64, RuntimeStoreError> {
+            self.read_generation()
+        }
+
+        fn keeps_connection(&self) -> bool {
+            self.kept.is_some()
+        }
+
+        fn release(&mut self) {
+            self.kept = None;
+        }
+    }
+
+    /// Test hooks of the delivery-generation reads (#549b), keyed by database
+    /// path, so tests on their own databases do not meet.
+    #[cfg(any(test, feature = "test-support"))]
+    pub mod delivery_generation_test_hooks {
+        use std::collections::{HashMap, HashSet};
+        use std::path::{Path, PathBuf};
+        use std::sync::{Mutex, OnceLock, PoisonError};
+
+        type Hook = Box<dyn FnMut() + Send>;
+
+        #[derive(Default)]
+        struct Hooks {
+            fresh: HashSet<PathBuf>,
+            verified_opens: HashMap<PathBuf, u64>,
+            before_kept_read: HashMap<PathBuf, Hook>,
+        }
+
+        fn hooks() -> std::sync::MutexGuard<'static, Hooks> {
+            static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
+            HOOKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Readers made for the store at `path` from now on read through the
+        /// fresh-open path (the platform switch, forced in tests).
+        pub fn force_fresh_reads(path: &Path) {
+            hooks().fresh.insert(path.to_path_buf());
+        }
+
+        /// Verified opens of an existing database at `path` by
+        /// delivery-generation reads, kept or fresh (other delivery reads are
+        /// not counted).
+        pub fn verified_opens(path: &Path) -> u64 {
+            hooks().verified_opens.get(path).copied().unwrap_or(0)
+        }
+
+        /// Run `hook` at each kept read of `path`, just before its guard.
+        pub fn before_kept_read_guard(path: &Path, hook: impl FnMut() + Send + 'static) {
+            hooks()
+                .before_kept_read
+                .insert(path.to_path_buf(), Box::new(hook));
+        }
+
+        pub(super) fn forces_fresh(path: &Path) -> bool {
+            hooks().fresh.contains(path)
+        }
+
+        pub(super) fn count_verified_open(path: &Path) {
+            *hooks()
+                .verified_opens
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+        }
+
+        pub(super) fn before_kept_read(path: &Path) {
+            // Taken out while it runs, so the hook may use the store itself.
+            let hook = hooks().before_kept_read.remove(path);
+            if let Some(mut hook) = hook {
+                hook();
+                hooks()
+                    .before_kept_read
+                    .entry(path.to_path_buf())
+                    .or_insert(hook);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod delivery_generation_read_path_tests {
+        use super::{DeliveryGenerationReadPath, ReaderPlatform, delivery_generation_read_path};
+
+        /// Windows keeps the fresh-open read path: no CI lane runs the kept
+        /// reader there. A platform without a file identity keeps it too.
+        #[test]
+        fn only_unix_keeps_a_delivery_generation_reader() {
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Windows),
+                DeliveryGenerationReadPath::Fresh
+            );
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Other),
+                DeliveryGenerationReadPath::Fresh
+            );
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Unix),
+                DeliveryGenerationReadPath::Kept
+            );
+        }
+    }
+
     /// Delivery-write connection: provisions the delivery domain on first
     /// use. This is the ONLY place the `runtime-delivery` ledger row is
     /// stamped — actually using durable delivery marks the file, opening a
@@ -14458,28 +14801,22 @@ ORDER BY runtime_id";
         }
 
         async fn load_delivery_generation(&self) -> Result<u64, RuntimeStoreError> {
-            // A file that never used durable delivery reads zero.
-            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
-                return Ok(0);
-            };
-            // A delivery file below version 3 (the counter's migration) not
-            // yet migrated by a write has no counter yet; its first delivery
-            // write migrates it. Decided on the version the open verified.
-            if conn.version < 3 {
-                return Ok(0);
+            read_delivery_generation_fresh(&self.path)
+        }
+
+        fn delivery_generation_reader(
+            &self,
+        ) -> Option<Box<dyn crate::store::DeliveryGenerationReader>> {
+            #[cfg(any(test, feature = "test-support"))]
+            if delivery_generation_test_hooks::forces_fresh(&self.path) {
+                return None;
             }
-            let generation: i64 = conn
-                .query_row(
-                    "SELECT generation FROM runtime_delivery_generation WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-            u64::try_from(generation).map_err(|_| {
-                RuntimeStoreError::ReadFailed(format!(
-                    "runtime delivery generation {generation} is negative"
-                ))
-            })
+            match delivery_generation_read_path(ReaderPlatform::current()) {
+                DeliveryGenerationReadPath::Kept => Some(Box::new(
+                    KeptDeliveryGenerationReader::new(self.path.clone()),
+                )),
+                DeliveryGenerationReadPath::Fresh => None,
+            }
         }
 
         async fn list_runtime_delivery_authorities(
@@ -26120,6 +26457,8 @@ ORDER BY runtime_id";
     }
 }
 
+#[cfg(all(feature = "sqlite-store", any(test, feature = "test-support")))]
+pub use inner::delivery_generation_test_hooks;
 #[cfg(feature = "sqlite-store")]
 pub use inner::{
     RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, prepare_pre_0_8_10_runtime_input_states,

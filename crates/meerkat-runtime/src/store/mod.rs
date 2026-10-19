@@ -8566,6 +8566,43 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
     ) -> Result<Option<CommittedRecoveryBoundary>, RuntimeStoreError>;
 }
 
+/// How long a delivery owner keeps its generation reader's connection open
+/// after the reader's last read (#549b).
+///
+/// - It bounds how long a quiet reader delays maintenance. The maintenance
+///   fence waits for kept connections to close, and a reader that has read
+///   nothing for this long closes, so a fence deadline longer than this plus
+///   one read always gets the database (`rkat storage migrate` waits 10 s by
+///   default).
+/// - It bounds what a quiet store holds open. An armed delivery owner keeps
+///   at most one reader, so each runtime delivery inbox holds at most one
+///   connection (descriptors for the database, its WAL and shared memory, and
+///   the connection's page cache), and none once its store has been quiet
+///   this long.
+/// - The store watch sweeps a shared store every 5 s when no notification
+///   arrives, so a quiet store pays one verified open per sweep instead of one
+///   per read.
+pub const KEPT_DELIVERY_READER_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A delivery owner's reader of its store's durable delivery generation
+/// ([`RuntimeStore::delivery_generation_reader`]).
+///
+/// A reader may keep a connection open between reads; its owner releases it
+/// once the store has been quiet for [`KEPT_DELIVERY_READER_IDLE`].
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait DeliveryGenerationReader: Send {
+    /// The store's durable delivery generation, as
+    /// [`RuntimeStore::load_delivery_generation`] reads it.
+    async fn read(&mut self) -> Result<u64, RuntimeStoreError>;
+
+    /// Whether the reader keeps a connection open now.
+    fn keeps_connection(&self) -> bool;
+
+    /// Close what the reader keeps between reads; the next read opens again.
+    fn release(&mut self);
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait RuntimeStore: Send + Sync {
@@ -9091,6 +9128,16 @@ pub trait RuntimeStore: Send + Sync {
     /// zero. Stores without cross-process hosting need not count.
     async fn load_delivery_generation(&self) -> Result<u64, RuntimeStoreError> {
         Ok(0)
+    }
+
+    /// A reader of [`Self::load_delivery_generation`] for one delivery
+    /// owner's store ticks (#549b), or `None`, the default, to read through
+    /// [`Self::load_delivery_generation`] on every tick.
+    ///
+    /// A store decorator forwards this to the store it wraps, or keeps the
+    /// default and reads through its own `load_delivery_generation`.
+    fn delivery_generation_reader(&self) -> Option<Box<dyn DeliveryGenerationReader>> {
+        None
     }
 
     /// List durable inbox rows in generated sequence order.

@@ -210,6 +210,12 @@ them.
   presence lock as well: `try_acquire` takes both locks or neither, and
   `acquire` takes the fence lock, then waits for the presence lock within the
   same deadline, so maintenance waits for kept connections to close.
+- `meerkat-runtime`: `RuntimeStore::delivery_generation_reader`, a defaulted
+  method returning an optional `DeliveryGenerationReader` for a delivery
+  owner's store ticks (the default, `None`, reads through
+  `load_delivery_generation`), `RuntimeDeliveryInbox::delivery_generation_reader`,
+  and `KEPT_DELIVERY_READER_IDLE`. A store decorator forwards the method to
+  the store it wraps or keeps the default.
 
 ### Changed
 
@@ -271,6 +277,24 @@ them.
   deploying guide. Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`,
   `rkat-mcp`, `rkat-mob-mcp`) turns allocator statistics off as the first
   statement of `main`, which removes that lock even without the variable.
+- A runtime delivery owner on a store other processes share reads the
+  store's delivery generation through one kept connection instead of a
+  verified open on every store tick (up to one tick per 10 ms on a busy
+  store). In the ignored `bench_fresh_and_kept_generation_reads` test, in a
+  release build on a shared 192-core host, a kept read took about 19
+  microseconds and a fresh one about 500. The connection holds the
+  database's presence lock and still takes the shared fence guard for each
+  read; under the guard it checks that the path still names the file it
+  opened and that the schema and the delivery domain's ledger row are
+  unchanged, and opens again, verified, when they are not. The maintenance
+  fence takes the presence lock after its fence lock, so the reader closes
+  at its next read, which the fence refuses, or after
+  `KEPT_DELIVERY_READER_IDLE` (1 second) without one, well inside `rkat
+  storage migrate`'s default 10-second fence wait. Windows keeps the
+  fresh-open read path because no CI lane runs the kept reader on Windows.
+  Maintenance from an older binary takes only the fence lock and does not
+  wait for a kept connection: run maintenance with the same release as the
+  hosts.
 
 ### Fixed
 
