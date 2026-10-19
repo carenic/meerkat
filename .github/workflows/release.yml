@@ -857,23 +857,6 @@ jobs:
           }}
         uses: ./.github/actions/setup-rust-ci
 
-      - name: Cache cargo
-        if: >-
-          ${{
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.semver_evidence_job_id == '' &&
-            github.event.inputs.release_tag == ''
-          }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: release-semver-breaks
-          # Release caches never come from a dispatch: a dispatch runs on main
-          # and would save into the default branch's scope, which every later
-          # tag run restores from. ~/.cargo/bin is never cached, so no restored
-          # binary can shadow cargo, git or the platform tools on PATH.
-          save-if: ${{ github.event_name != 'workflow_dispatch' }}
-          cache-bin: "false"
-
       - name: Install cargo-semver-checks
         if: >-
           ${{

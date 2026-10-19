@@ -313,4 +313,34 @@ set -e
 [[ "${status}" -eq 2 ]] || fail "malformed commit: expected status 2, got ${status}"
 echo "ok: malformed-commit"
 
+# 12. The lookup's PREBUILD_GATE_JOB and every CRITICAL_JOBS pattern name a
+#     job of release.yml: a renamed gate would leave every run's gate absent,
+#     so no prebuild would ever be accepted, and a renamed critical job would
+#     silently stop the lookup from giving up on a prebuild whose gate can no
+#     longer pass.
+job_names="$(sed -n 's/^    name: //p' "${REPO_ROOT}/.github/workflows/release.yml" | sed 's/^"\(.*\)"$/\1/')"
+gate_job="$(sed -n 's/^PREBUILD_GATE_JOB="\(.*\)"$/\1/p' "${LOOKUP}")"
+[[ -n "${gate_job}" ]] || fail "critical-job-names: no PREBUILD_GATE_JOB in ${LOOKUP}"
+grep -Fxq -- "${gate_job}" <<<"${job_names}" || fail "critical-job-names: PREBUILD_GATE_JOB '${gate_job}' names no job of release.yml"
+patterns="$(sed -n '/^CRITICAL_JOBS=(/,/^)/s/^  "\(.*\)"$/\1/p' "${LOOKUP}")"
+[[ -n "${patterns}" ]] || fail "critical-job-names: no CRITICAL_JOBS patterns in ${LOOKUP}"
+# Every entry is read: one written with other quoting or indentation would
+# otherwise skip the check below. Bash itself counts the array.
+# shellcheck disable=SC2016 # expanded by the inner shell
+critical_count="$(bash -c 'eval "$(sed -n "/^CRITICAL_JOBS=(/,/^)/p" "$1")" && echo "${#CRITICAL_JOBS[@]}"' _ "${LOOKUP}")"
+pattern_count="$(grep -c '' <<<"${patterns}")"
+[[ "${pattern_count}" == "${critical_count}" ]] || fail "critical-job-names: read ${pattern_count} of the ${critical_count:-?} CRITICAL_JOBS entries"
+while IFS= read -r pattern; do
+  matched=false
+  while IFS= read -r job_name; do
+    # shellcheck disable=SC2053 # the pattern is a glob
+    if [[ "${job_name}" == ${pattern} ]]; then
+      matched=true
+      break
+    fi
+  done <<<"${job_names}"
+  [[ "${matched}" == true ]] || fail "critical-job-names: CRITICAL_JOBS pattern '${pattern}' names no job of release.yml"
+done <<<"${patterns}"
+echo "ok: critical-job-names"
+
 echo "release-find-prebuild contract holds"

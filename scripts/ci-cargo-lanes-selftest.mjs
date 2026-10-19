@@ -31,6 +31,7 @@ import {
   WAVE_FIRST_SECONDS,
   WAVE_LANES,
   lockScope,
+  nextestDefaultSelection,
   parseCargoLock,
   readRowDurations,
   compiledInDocKeys,
@@ -284,7 +285,14 @@ function assertEventSplit(plan, label) {
   );
 }
 
-const HOOK_STACK = 32 * 1024 * 1024;
+const HOOK_STACK = 8 * 1024 * 1024;
+// The rows' stack is the one the hook exports for its lanes.
+{
+  const hook = readFileSync(resolve(root, "scripts/pre-push-unit.sh"), "utf8");
+  const exported = [...hook.matchAll(/^export RUST_MIN_STACK="\$\{RUST_MIN_STACK:-(\d+)\}"$/gm)];
+  assert.equal(exported.length, 1, "scripts/pre-push-unit.sh exports one default RUST_MIN_STACK");
+  assert.equal(Number(exported[0][1]), HOOK_STACK, "the hook's lanes run on the closure rows' stack");
+}
 const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
 
 // The closure-tests rows: the deterministic workspace lanes' coverage
@@ -415,10 +423,11 @@ function assertArchivedLanes(plan, label) {
   assert.deepEqual(plan.unit_deferred, []);
   assert.equal(plan.wasm, true, "core is in the wasm runtime closure: the push runs the wasm lanes");
   assert.equal(plan.machine_authority, false);
-  // A pull request runs the wasm lanes only for their own inputs.
+  // Core is a crate the wasm build compiles, so a pull request runs
+  // wasm-check too; the example web suites only for their own inputs.
   const pr = planFor(["crates/meerkat-core/src/lib.rs"], ["--event", "pull_request"]);
-  assert.equal(pr.wasm, false, "a pull request does not run wasm-check for a closure that reaches the runtime");
-  assert.equal(pr.example_web, false, "nor the example web suites");
+  assert.equal(pr.wasm, true, "a pull request runs wasm-check for a crate the web runtime compiles");
+  assert.equal(pr.example_web, false, "but not the example web suites");
   assert.deepEqual(pr.unit_shards.map((shard) => shard.packages), [["meerkat-core"]], "core runs its unit tests in the pull request");
   assertLanes(pr, "core touch (pull request)");
 }
@@ -624,6 +633,36 @@ function assertArchivedLanes(plan, label) {
   assert.equal(unknown.diff, "no diff base supplied");
   assert.deepEqual(unknown.guard_definitions_changed, Object.keys(GUARD_LANE_INPUTS), "no diff: every definition may have changed");
   for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(unknown[lane], true, `no diff: ${lane} runs`);
+}
+
+// The default nextest profile's selection in every TOML spelling: a change to
+// it changes the extract the planner compares, and a change elsewhere (another
+// profile, an override's threads, a comment) does not.
+{
+  const filter = "default-filter = 'not test(/confinement/)'";
+  for (const [before, after] of [
+    ["[ profile.default ]\nretries = 1\n", `[ profile.default ]\nretries = 1\n${filter}\n`],
+    ['["profile"."default"]\nretries = 1\n', `["profile"."default"]\nretries = 1\n${filter}\n`],
+    ["profile.default.retries = 1\n", `profile.default.retries = 1\nprofile.default.${filter}\n`],
+    ["[profile]\ndefault.retries = 1\n", `[profile]\ndefault.retries = 1\ndefault.${filter}\n`],
+    ["[profile]\n", `[profile]\ndefault = { ${filter} }\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\n", `[[profile.default.overrides]]\nfilter = 'test(a)'\n  ${filter}\n`],
+    // A value that spans lines: a dotted key's multi-line string or array.
+    ["profile.default.default-filter = '''\nnot test(/a/)\n'''\n", "profile.default.default-filter = '''\nnot test(/b/)\n'''\n"],
+    ['[profile]\ndefault.default-filter = """\nnot test(/a/)\n"""\n', '[profile]\ndefault.default-filter = """\nnot test(/b/)\n"""\n'],
+    ["profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(b)' },\n]\n", "profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(c)' },\n]\n"],
+  ]) {
+    assert.notEqual(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection sees ${JSON.stringify(after)}`);
+  }
+  for (const [before, after] of [
+    ["profile.ci-unit.retries = 1\n", `profile.ci-unit.${filter}\n`],
+    ["profile.ci-unit.default-filter = '''\nnot test(/a/)\n'''\n", "profile.ci-unit.default-filter = '''\nnot test(/b/)\n'''\n"],
+    ["[profile]\nci-unit.retries = 1\n", `[profile]\nci-unit.${filter}\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 2\n", "[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 4\n"],
+    ["[ profile.default ]\n# one\nretries = 1\n", "[ profile.default ]\n# two\nretries = 1\n"],
+  ]) {
+    assert.equal(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection ignores ${JSON.stringify(after)}`);
+  }
 }
 
 // No chain exception: meerkat-rpc's default-feature unit row (its MCP restart
@@ -854,8 +893,8 @@ for (const path of [
   assert.ok(!shardOf("surface-build-fixtures").packages.includes("meerkat-integration-tests"));
   assert.deepEqual(pr.deferred_to_push.integration_suites.sort(), ["gpt-live-replay", "machine-codegen", "rpc-configured-turn-limit"]);
   assert.deepEqual(pr.deferred_to_push.unit_feature_suites.sort(), ["meerkat[experimental-gpt-live]", "meerkat[openai-live]"]);
-  assert.equal(pr.wasm, false, "a workspace pull request runs the wasm lanes only for their own inputs");
-  assert.equal(pr.example_web, false);
+  assert.equal(pr.wasm, true, "a workspace pull request runs wasm-check: the web runtime is one of its packages");
+  assert.equal(pr.example_web, false, "and the example web suites only for their own inputs");
   const github = run(["--format", "github", "--event", "pull_request", "--", "Cargo.toml"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
@@ -933,6 +972,21 @@ for (const path of [
     const web = planFor([path], ["--event", "pull_request"]);
     assert.equal(web.example_web, true, `${path} runs the example web suites in the pull request`);
     if (!path.startsWith("sdks/")) assert.equal(web.wasm, true, `${path} runs wasm-check in the pull request`);
+  }
+  // wasm-check runs for every crate the wasm build compiles (the web
+  // runtime's dependency closure in the cargo graph), the provider crates
+  // included (#1108), and for no crate outside it.
+  for (const [path, wasm] of [
+    ["crates/meerkat-openai/src/lib.rs", true],
+    ["crates/meerkat-anthropic/src/lib.rs", true],
+    ["crates/meerkat-models/src/lib.rs", true],
+    ["crates/meerkat-rest/src/lib.rs", false],
+    ["crates/meerkat-rpc/src/lib.rs", false],
+    ["crates/meerkat-cli/src/main.rs", false],
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request"]);
+    assert.equal(plan.wasm, wasm, `a pull request that changes ${path} ${wasm ? "runs" : "leaves"} wasm-check`);
+    assert.equal(plan.example_web, false, `${path}: the example web suites keep to their own inputs`);
   }
   assert.notEqual(run(["--event", "merge_group", "--", "Cargo.toml"]).status, 0, "an unknown event fails");
 }
@@ -2432,7 +2486,7 @@ for (const path of [
   const mapping = "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: ${{ matrix.rust_min_stack }}\n";
   const remapped = mutated(mapping, "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: 1048576\n");
   assert.ok(remapped.some((error) => error.includes("step env MIN_STACK")), "an altered MIN_STACK mapping is refused");
-  const stackExport = '          # The hook ran every lane on a 32 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
+  const stackExport = '          # The hook runs every lane on an 8 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
   const reexported = mutated(stackExport, stackExport.replace('RUST_MIN_STACK="${MIN_STACK}"', "RUST_MIN_STACK=1048576"));
   assert.ok(reexported.some((error) => error.includes("job closure-tests: the step runs")), "an altered RUST_MIN_STACK export is refused");
   const unexported = mutated(stackExport, "");

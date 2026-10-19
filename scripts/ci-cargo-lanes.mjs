@@ -47,7 +47,9 @@
 // pull-request Clippy lints lib and bin targets only; their tests run on
 // main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
 // the change invalidates meerkat-mob's build (always in workspace mode), and
-// the wasm lanes that only the reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// the browser example and WASM timer lanes that only the reverse-dependency
+// closure selected (wasm-check runs for every crate the wasm build compiles).
+// On 4-vCPU hosted runners each of those needs 9-30 minutes
 // (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
@@ -287,8 +289,10 @@ export const UNIT_SOLO_PACKAGES = ["xtask"];
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Hook-parity rows (see the header). Every row runs on the hook's test-thread
-// stack: scripts/pre-push-unit.sh exports 32 MiB for all of its lanes.
-export const HOOK_TEST_STACK = 32 * 1024 * 1024;
+// stack: scripts/pre-push-unit.sh exports 8 MiB for all of its lanes, the
+// workspace floor of .cargo/config.toml and the hosts' worker stack budget,
+// which every closure-row test fits in a debug build (#301).
+export const HOOK_TEST_STACK = 8 * 1024 * 1024;
 export const CLOSURE_TESTS_PER_ROW = 12;
 // Nested-Cargo canaries: the tests .config/nextest.toml puts in this test
 // group each build a fixture crate with a nested `cargo` and run one at a time
@@ -322,9 +326,10 @@ const LIB_TARGET_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]
 // instead of silently dropping the suite.
 //
 // 22 of the facade's GPT Live tests overflow the 8 MiB test-thread stack that
-// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33);
-// they pass at the 32 MiB the pre-push hook and the BuildBuddy unit lane use.
-// Their rows carry that stack until the frames fit 8 MiB.
+// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33)
+// and pass at 32 MiB. Their rows, like the --all-features test lane
+// (scripts/run-build-backend-lane test-all), carry that stack until the
+// frames fit 8 MiB.
 //
 // A suite with `pullRequest: false` runs on the push only: the facade's two
 // GPT Live suites compile its lib test under the realtime features, 1089 s
@@ -689,20 +694,28 @@ export function confinementMakeDefinition(text) {
 }
 
 // What decides the default nextest profile's selection: its
-// [profile.default] table and every default override that sets a (platform)
-// default-filter, without comment and blank lines.
+// [profile.default] table, every default override that sets a (platform)
+// default-filter, and the whole [profile] table or top-level section once
+// one of its keys reaches the default profile (so a dotted key's multi-line
+// string or array keeps its continuation lines), whatever the spelling
+// (whitespace or quotes in headers and keys, indented keys), without comment
+// and blank lines.
 export function nextestDefaultSelection(text) {
-  return text
-    .split(/^(?=\[)/m)
-    .filter((section) => {
-      const header = section.split("\n", 1)[0].replace(/#.*/, "").trim();
-      return (
-        header === "[profile.default]" ||
-        (header === "[[profile.default.overrides]]" && /^default-filter\s*=/m.test(section))
-      );
+  const bare = (part) => part.replace(/#.*/, "").replace(/["'\s]/g, "");
+  const key = (line) => bare(line.split("=")[0]);
+  const sections = [{ header: "", lines: [] }];
+  for (const line of text.split("\n")) {
+    if (/^\s*\[\[?[\w.\s"'-]+\]\]?\s*(#.*)?$/.test(line)) sections.push({ header: bare(line), lines: [line] });
+    else sections.at(-1).lines.push(line);
+  }
+  const reachesDefault = { "[profile]": /^default(\.|$)/, "": /^profile(\.default(\.|$)|$)/ };
+  return sections
+    .flatMap(({ header, lines }) => {
+      if (header === "[profile.default]") return lines;
+      if (header === "[[profile.default.overrides]]") return lines.some((line) => key(line) === "default-filter") ? lines : [];
+      if (Object.hasOwn(reachesDefault, header)) return lines.some((line) => reachesDefault[header].test(key(line))) ? lines : [];
+      return [];
     })
-    .join("")
-    .split("\n")
     .filter((line) => !/^\s*(#.*)?$/.test(line))
     .join("\n");
 }
@@ -2198,7 +2211,8 @@ function plan(args) {
     result.reason = workspaceReason;
     result.packages = allNames;
     result.closure = allNames;
-    // A pull request runs the wasm lanes for their own inputs only.
+    // A push runs every wasm lane; a pull request runs wasm-check (below),
+    // and the example lanes for their own inputs only.
     if (!deferToPush) result.wasm = true;
   } else if (seeds.size > 0) {
     result.rust_changed = true;
@@ -2235,6 +2249,14 @@ function plan(args) {
   if (!deferToPush && result.closure.includes("meerkat-web-runtime")) {
     result.wasm = true;
     result.example_web = true;
+  }
+  // wasm-check compiles the web runtime and every workspace crate it links
+  // (its dependency closure, which the wasm32 target does not narrow), so a
+  // pull request that changes one of them runs it too (#1108): a provider
+  // crate that stops compiling for wasm32 fails before the merge.
+  const wasmBuild = closures.get("meerkat-web-runtime");
+  if (result.packages.some((name) => name === "meerkat-web-runtime" || wasmBuild?.has(name))) {
+    result.wasm = true;
   }
 
   if (result.rust_changed) {
