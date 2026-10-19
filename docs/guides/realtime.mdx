@@ -662,7 +662,8 @@ first; the model's next output, the utterance's own delegation, or 1.6 s of
 the user's silence releases it. Each delegation carries a trusted in-progress
 instruction until its result arrives, so a result held back that way is
 finished work the model has not been told about. Meerkat therefore sends a
-notice bound to the delegation as soon as it holds a result: the work has
+notice bound to the delegation as soon as it holds a result, always before
+the result itself can be released: the work has
 finished and its result has not arrived, so the model may say it has just
 finished but must not state, guess or imply the outcome before the result
 reaches it. The notice carries no result content, and the result itself is

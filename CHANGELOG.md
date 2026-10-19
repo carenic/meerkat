@@ -91,7 +91,8 @@ them.
   model's only fact about the delegation was then its in-progress
   instruction, so "is it done yet?" got "Not yet" while the finished result
   waited behind that very question. A held result now sends a notice at
-  once, on the instructions lane and bound to its delegation: the work has
+  once, always ahead of the result itself, on the instructions lane and
+  bound to its delegation: the work has
   finished, its result has not reached the model yet, and the model may say
   it has just finished but must not state, guess or imply the outcome until
   the result arrives. The notice carries no result content and promises no
