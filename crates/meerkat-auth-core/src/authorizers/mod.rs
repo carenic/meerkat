@@ -1062,9 +1062,16 @@ mod tests {
         // Released / absent binding -> LeaseAbsent -> Ok(false). `release_lease`
         // removes the binding entirely, so its snapshot phase is `None`; either
         // way the machine classifies it LeaseAbsent and the observer refreshes.
+        // The binding is this block's own: `release_lease` try-locks the
+        // process-wide lifecycle exclusion, which the other tests' observers
+        // hold for `lease_key()` while they run.
         {
             let handle = Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new());
-            let key = lease_key();
+            let key = LeaseKey::new(
+                RealmId::parse("dev").unwrap(),
+                BindingId::parse("cloud-released").unwrap(),
+                None,
+            );
             handle.acquire_lease(&key, epoch_secs(far_future)).unwrap();
             handle.release_lease(&key).unwrap();
             assert!(
