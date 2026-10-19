@@ -173,6 +173,29 @@ Changed in 0.9.4 (event wire and SDK types):
   `CompactionCompleted.estimated_history_tokens_after`, TypeScript
   `CompactionCompletedEvent.estimatedHistoryTokensAfter`); absent for older
   completions or when the history could not be measured.
+- `tool_config_changed`: the payload's lifecycle bit is `settled` (a settled
+  lifecycle fact, not pending or draining), not `persisted`; it never meant a
+  configuration write (that is the `persisted` of `mcp/add`, `mcp/remove` and
+  `mcp/reload`, unchanged). Python and TypeScript
+  `ToolConfigChangedPayload.persisted` is now `settled`, derived from
+  `status_info` as rkat-rpc derives it. Events and stored notices from 0.9.3
+  and earlier keep `persisted` when read back, so raw readers accept either
+  key. Tool-scope, deferred-catalog and failed-closed notices now report
+  settled where they reported `persisted: false`. The `tool_config_changed`
+  entry of `known_payloads` in `artifacts/schemas/events.json` is generated
+  from the typed payload; the hand-written one required a `status` field the
+  event never carried, so real events failed validation against it.
+- Version skew: a 0.9.3 Python or TypeScript SDK requires `persisted` and fails
+  on every `tool_config_changed` event from a 0.9.4 `rkat-rpc`. The binary an
+  SDK downloads always matches it, so this happens only when it runs one you
+  supply (`MEERKAT_BIN_PATH`, an explicit path, or `rkat-rpc` on `PATH`);
+  upgrade the SDK with the binary. 0.9.3 also cannot read back a transcript
+  that 0.9.4 wrote with a `tool_config` notice.
+- TypeScript `MeerkatClient.close()` resolves as soon as the `rkat-rpc` child
+  exits (it ends stdin, signals the child, waits up to 5 seconds, then sends
+  SIGKILL); before 0.9.4 its timer kept Node alive for about 5 seconds, and a
+  grandchild holding the pipes could make it wait the full 5 seconds or, after
+  the SIGKILL, forever.
 
 Added since 0.8.40:
 
@@ -341,6 +364,26 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   `cancel_tracked_input_for_member_incarnation` wait for an in-between input's
   next committed lifecycle step instead of re-reading it every 25 ms; the
   5-second bound is only a hang guard.
+- `RuntimeDeliveryOwnerRetirement::join` returns `RuntimeDeliveryOwnerRetired`
+  (`#[must_use]`) instead of `()`: `notification_registration_retained` names
+  the directory (`meerkat_runtime::RetainedNotificationRegistration`) whose
+  store watch registration the process still holds (macOS FSEvents can hold it
+  for tens of seconds). Match `Ok(_)` or read the report.
+  `DeliveryStoreWatch::stop` returns the same registration;
+  `SqliteChangeWatch::pending_registration` and
+  `meerkat_sqlite::watch::retained_registrations` describe them, and a mob
+  observer drain counts them (`retained_registrations`).
+- `SqliteRuntimeStore::convert_standalone_whole_blob_in_place` converts a
+  standalone WholeBlob runtime database (a file a host composed with
+  `SqliteRuntimeStore::new`, such as a 0.9.3 Meta gateway's `runtime.sqlite`)
+  in place to the HeadCanonical profile, seeding each session from its
+  digest-verified body; open `SqliteSessionStore` on the file first, write no
+  session row before it returns, and never use it on a realm database. Report:
+  `StandaloneWholeBlobConversionReport`.
+- `meerkat_core::strand_layout_for_retained_history` lays out the retained part
+  of a transcript graph, including one that retired its oldest occurrences,
+  and returns `RetainedStrandLayout`; `strand_layout_for_history` still refuses
+  a re-anchored graph.
 
 ## Removed or renamed
 
