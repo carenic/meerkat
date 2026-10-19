@@ -61,6 +61,7 @@ rust_library(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -113,6 +114,7 @@ rust_library(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -186,6 +188,7 @@ rust_library(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -240,6 +243,7 @@ rust_library(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -300,6 +304,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -316,9 +321,11 @@ rust_test(
     size = "large",
     data = [
         "//:test_fixtures",
+        "//crates/meerkat-core:package_runfiles",
         "//crates/meerkat-machine-kernels:package_runfiles",
         "//crates/meerkat-machine-schema:package_runfiles",
         "//crates/meerkat-mob:package_runfiles",
+        "//crates/meerkat:package_runfiles",
         "//tests/fixtures/machine-dsl-tests:package_runfiles",
         "//tests/fixtures/mcp-test-server:package_runfiles",
         "//tests/fixtures/surface-build-fixtures:package_runfiles",
@@ -381,6 +388,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -458,6 +466,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -532,6 +541,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -608,6 +618,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -684,6 +695,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -760,6 +772,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -842,6 +855,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -916,6 +930,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -990,6 +1005,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1064,6 +1080,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1138,6 +1155,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1212,6 +1230,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1286,6 +1305,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1360,6 +1380,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1378,9 +1399,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:workspace_cargo_manifests",
-        "//:workspace_metadata",
-        "//crates/meerkat-runtime:cargo_manifest",
     ],
     env = {
         "RUST_MIN_STACK": "8388608",
@@ -1439,6 +1457,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1515,6 +1534,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1589,6 +1609,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1663,6 +1684,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1737,6 +1759,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1813,6 +1836,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1887,6 +1911,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1961,6 +1986,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2037,6 +2063,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2117,6 +2144,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2197,6 +2225,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2271,6 +2300,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2347,6 +2377,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2421,6 +2452,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2495,6 +2527,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2571,6 +2604,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2645,6 +2679,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2662,6 +2697,83 @@ rust_test(
     ],
     size = "medium",
     data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = [
+        "//crates/meerkat-machine-derive:meerkat_machine_derive",
+        "//crates/meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-runtime",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-auth-core:meerkat_auth_core",
+        "//crates/meerkat-authorization-contracts:meerkat_authorization_contracts",
+        "//crates/meerkat-authorization:meerkat_authorization",
+        "//crates/meerkat-comms:meerkat_comms",
+        "//crates/meerkat-contracts:meerkat_contracts",
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-live:meerkat_live",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
+        "//crates/meerkat-machine-kernels:meerkat_machine_kernels",
+        "//crates/meerkat-machine-schema:meerkat_machine_schema",
+        "//crates/meerkat-runtime:meerkat_runtime_test_support",
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+        "//crates/meerkat-store:meerkat_store",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-runtime",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "supervisor_bridge_command_manifest_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-runtime",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "supervisor_bridge_command_manifest",
+    crate_root = "tests/supervisor_bridge_command_manifest.rs",
+    crate_features = [
+        "live",
+        "local-authorization",
+        "sqlite-store",
+        "test-support",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "src/comms_drain.rs",
+        "src/handles/peer_comms.rs",
+        "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
+        "tests/fixtures/v0_8_10_recovery_migration_session.json",
+    ],
+    srcs = [
+        "tests/supervisor_bridge_command_manifest.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "supervisor_bridge_command_manifest",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-runtime",
+        "MEERKAT_GENERATED_AUTHORITY_BRIDGE_SYMBOL_SUFFIX": "bazel_private_generated_authority_bridge",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [
+        ":package_runfiles",
+    ],
     env = {
         "RUST_MIN_STACK": "8388608",
         "RUST_TEST_THREADS": "1",
@@ -2719,6 +2831,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2796,6 +2909,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2873,6 +2987,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -2949,6 +3064,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -3025,6 +3141,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -3043,7 +3160,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
     ],
     env = {
         "RUST_MIN_STACK": "8388608",
@@ -3102,6 +3218,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -3176,6 +3293,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -3261,6 +3379,7 @@ test_suite(
         ":runtime_terminal_publication_contract_test",
         ":session_hosting_claims_test",
         ":stop_run_public_api_test",
+        ":supervisor_bridge_command_manifest_test",
         ":trust_reconcile_add_failure_test",
         ":trust_reconcile_concurrency_test",
         ":turn_content_shape_contract_test",

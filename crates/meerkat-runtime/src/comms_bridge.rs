@@ -190,6 +190,12 @@ fn peer_input_from_ingress_fact(
         // typed transcript notice.
         sender_taint: interaction.sender_taint,
         objective_id: interaction.objective_id,
+        // The delivery a peer message says it answers rides to the notice
+        // the same way: a label, never routing.
+        in_reply_to: match &interaction.content {
+            InteractionContent::Message { in_reply_to, .. } => *in_reply_to,
+            _ => None,
+        },
     }))
 }
 
@@ -432,6 +438,7 @@ mod tests {
             content: InteractionContent::Message {
                 body: "hello".into(),
                 blocks: None,
+                in_reply_to: None,
             },
             id: make_interaction_id(),
             rendered_text: String::new(),
@@ -458,6 +465,35 @@ mod tests {
         }
     }
 
+    /// A peer message's signed `in_reply_to` rides to `PeerInput.in_reply_to`
+    /// unchanged; a message without one carries none.
+    #[test]
+    fn message_in_reply_to_threads_to_peer_input() {
+        let answered = meerkat_core::InteractionId(uuid::Uuid::from_u128(0xA5));
+        for in_reply_to in [Some(answered), None] {
+            let interaction = InboxInteraction {
+                objective_id: None,
+                sender_taint: None,
+                from_route: None,
+                from: "peer-1".into(),
+                content: InteractionContent::Message {
+                    body: "hello".into(),
+                    blocks: None,
+                    in_reply_to,
+                },
+                id: make_interaction_id(),
+                rendered_text: String::new(),
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                render_metadata: None,
+            };
+            let input = peer_input_for_test(&interaction, &LogicalRuntimeId::new("test"));
+            let Input::Peer(p) = &input else {
+                panic!("Expected PeerInput");
+            };
+            assert_eq!(p.in_reply_to, in_reply_to);
+        }
+    }
+
     /// Ask 5 gate: the classified interaction's sender-declared content taint
     /// threads through to `PeerInput.sender_taint` as content-adjacent
     /// metadata, and `None` (no declaration) survives as `None` — never
@@ -479,6 +515,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "hello".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id: make_interaction_id(),
                 rendered_text: String::new(),
@@ -618,6 +655,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "{\"ok\":true}".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id,
                 rendered_text: String::new(),
@@ -664,6 +702,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "hello".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id,
                 rendered_text: "stale rendered text".into(),
@@ -768,6 +807,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "hello".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id,
                 rendered_text: "stale rendered text".into(),
@@ -833,6 +873,7 @@ mod tests {
             content: InteractionContent::Message {
                 body: "see image".into(),
                 blocks: Some(blocks.clone()),
+                in_reply_to: None,
             },
             id: make_interaction_id(),
             rendered_text: "stale rendered text".into(),
@@ -937,6 +978,7 @@ mod tests {
             content: InteractionContent::Message {
                 body: "please inspect this image".into(),
                 blocks: Some(blocks.clone()),
+                in_reply_to: None,
             },
             id: make_interaction_id(),
             rendered_text: "stale rendered text".into(),
@@ -984,6 +1026,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "see image".into(),
                     blocks: Some(blocks.clone()),
+                    in_reply_to: None,
                 },
                 id,
                 rendered_text: "stale rendered text".into(),
@@ -1028,6 +1071,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "urgent".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id,
                 rendered_text: "stale rendered text".into(),
@@ -1430,6 +1474,7 @@ mod tests {
             content: InteractionContent::Message {
                 body: "hi".into(),
                 blocks: None,
+                in_reply_to: None,
             },
             id: make_interaction_id(),
             rendered_text: String::new(),
@@ -1468,6 +1513,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "m".into(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 id: make_interaction_id(),
                 rendered_text: String::new(),

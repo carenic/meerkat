@@ -1055,6 +1055,7 @@ export interface ExportAtifParams {
 }
 
 export interface ForkSessionAtParams {
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   message_index: number;
   running_behavior?: "reject";
   session_id: string;
@@ -1062,6 +1063,7 @@ export interface ForkSessionAtParams {
 }
 
 export interface ForkSessionReplaceParams {
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   message_index: number;
   replacement: WireTranscriptReplacement;
   running_behavior?: "reject";
@@ -1330,6 +1332,7 @@ export interface ScheduleToolsResult {
 export interface SessionForkResult {
   cache_inheritance: Record<string, unknown>;
   message_count: number;
+  reactivated_instruction_count?: number;
   session_id: string;
   session_ref?: string | null;
   source_session_id: string;
@@ -2250,6 +2253,7 @@ export interface MobMemberStatusResult {
   placement?: WireHostRef | null;
   preview_unavailable?: WireMemberPreviewUnavailable | null;
   progress?: WireMemberProgressSnapshot | null;
+  registration_refusal?: WireMemberRegistrationHookCall | null;
   resolved_capabilities?: WireResolvedModelCapabilities | null;
   status: WireMobMemberStatus;
   tokens_used: number;
@@ -2715,6 +2719,7 @@ export interface MobSupervisorSpecInput {
 
 export interface MobToolConfigInput {
   builtins?: boolean;
+  bundles?: string[];
   comms?: boolean;
   deny?: string[];
   image_generation?: boolean;
@@ -3487,6 +3492,35 @@ export interface MemberBuildRejectionSelfHostedServerMissing {
 
 export type MemberBuildRejection = MemberBuildRejectionUnknownProviderForModel | MemberBuildRejectionBindingUnresolvable | MemberBuildRejectionProviderAuth | MemberBuildRejectionSelfHostedServerMissing;
 
+export interface ForkInstructionRefusalCausePolicyRefuses {
+  kind: "policy_refuses";
+}
+
+export interface ForkInstructionRefusalCauseNotEffectiveInSource {
+  kind: "not_effective_in_source";
+}
+
+export interface ForkInstructionRefusalCauseLineageBodyBudgetExceeded {
+  kind: "lineage_body_budget_exceeded";
+  max_bytes: number;
+}
+
+export interface ForkInstructionRefusalCauseActivation {
+  code: "invalid_request" | "digest_mismatch" | "effective_activation_conflict" | "activation_identity_conflict" | "immutable_revision_conflict" | "recorded_but_not_effective" | "inherited_activation_requires_explicit_activation" | "malformed_activation_history";
+  kind: "activation";
+}
+
+export interface ForkInstructionRefusalCauseMemberHostUnsupported {
+  kind: "member_host_unsupported";
+}
+
+export type ForkInstructionRefusalCause = ForkInstructionRefusalCausePolicyRefuses | ForkInstructionRefusalCauseNotEffectiveInSource | ForkInstructionRefusalCauseLineageBodyBudgetExceeded | ForkInstructionRefusalCauseActivation | ForkInstructionRefusalCauseMemberHostUnsupported;
+
+export interface ForkInstructionRefusal {
+  cause: ForkInstructionRefusalCause;
+  keys: unknown[][];
+}
+
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
 
 export type ToolConfigChangeOperation = "add" | "remove" | "reload";
@@ -3542,7 +3576,8 @@ export interface ToolConfigChangedPayload {
   deferred_catalog_delta?: DeferredCatalogDelta | null;
   domain?: ToolConfigChangeDomain | null;
   operation: ToolConfigChangeOperation;
-  persisted: boolean;
+  persisted?: boolean;
+  settled?: boolean;
   status_info: ToolConfigChangeStatus;
   target: string;
 }
@@ -3834,6 +3869,8 @@ export type WireReachability = "reachable" | "stale" | "unreachable" | "unknown"
 export type WireNonPortableResourceKind = "rust_bundles" | "per_spawn_external_tools" | "mob_default_external_tools" | "default_llm_client_override" | "host_surface_mcp_allowlist" | "workgraph_tools";
 
 export type WireMemberPreviewUnavailable = "observation_deadline" | "read_failed" | "session_absent" | "not_observed_while_retiring";
+
+export type WireMemberRegistrationHookCall = "select_destination" | "select_agent_mandate" | "prepare_member_surface" | "verify_member_surface";
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
 
@@ -4838,6 +4875,7 @@ export interface BridgeCommandCreateForkedParticipant {
   binding_generation: number;
   command: "create_forked_participant";
   epoch: number;
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   prefix_message_count?: number | null;
   protocol_version: BridgeProtocolVersion;
   request_id: string;
@@ -5066,7 +5104,15 @@ export interface BridgeRejectionCauseSessionOwnershipConflict {
   session_ownership_conflict: BridgeRejectionCauseSessionOwnershipConflictPayload;
 }
 
-export type BridgeRejectionCause = "forked_participant_not_found" | "forked_participant_tampered" | "forked_participant_expired" | "forked_participant_revoked" | "forked_participant_exhausted" | "forked_participant_busy" | "forked_participant_source_mismatch" | "forked_participant_route_mismatch" | "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "forked_participant_protocol_unsupported" | "forked_participant_cleanup_debt" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "bind_admission_outcome_unknown" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict;
+export interface BridgeRejectionCauseForkInstructionRefusedPayload {
+  refusal: ForkInstructionRefusal;
+}
+
+export interface BridgeRejectionCauseForkInstructionRefused {
+  fork_instruction_refused: BridgeRejectionCauseForkInstructionRefusedPayload;
+}
+
+export type BridgeRejectionCause = "forked_participant_not_found" | "forked_participant_tampered" | "forked_participant_expired" | "forked_participant_revoked" | "forked_participant_exhausted" | "forked_participant_busy" | "forked_participant_source_mismatch" | "forked_participant_route_mismatch" | "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "forked_participant_protocol_unsupported" | "forked_participant_cleanup_debt" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "bind_admission_outcome_unknown" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict | BridgeRejectionCauseForkInstructionRefused;
 
 export interface BridgeReplyBindMember {
   address: string;
@@ -5355,7 +5401,7 @@ export interface CommsSendParamsPeerResponse {
   blocks?: ContentBlock[] | null;
   content_taint?: SendTaintOverride | null;
   handling_mode?: HandlingMode | null;
-  in_reply_to: string;
+  in_reply_to: InteractionId;
   kind: "peer_response";
   result?: CommsPeerResponseResult | null;
   session_id: string;
@@ -5870,7 +5916,12 @@ export interface RealtimeTranscriptEventAssistantTurnInterrupted {
   type: "assistant_turn_interrupted";
 }
 
-export type RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted;
+export interface RealtimeTranscriptEventAssistantTurnFailed {
+  response_id: string;
+  type: "assistant_turn_failed";
+}
+
+export type RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted | RealtimeTranscriptEventAssistantTurnFailed;
 
 export type RealtimeTranscriptRole = "user" | "assistant";
 
@@ -6098,6 +6149,23 @@ export interface WireLiveAdapterErrorCodeUnknown {
 
 export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown;
 
+export interface WireLiveResponseFailureStatusUnknownPayload {
+  debug: string;
+}
+
+export interface WireLiveResponseFailureStatusUnknown {
+  unknown: WireLiveResponseFailureStatusUnknownPayload;
+}
+
+export type WireLiveResponseFailureStatus = "failed" | "incomplete" | "in_progress" | WireLiveResponseFailureStatusUnknown;
+
+export interface WireLiveResponseFailure {
+  code?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  status: WireLiveResponseFailureStatus;
+}
+
 export interface WireLiveAdapterObservationReady {
   observation: "ready";
 }
@@ -6216,7 +6284,14 @@ export interface WireLiveAdapterObservationUnknown {
   observation: "unknown";
 }
 
-export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown;
+export interface WireLiveAdapterObservationTurnFailed {
+  failure: WireLiveResponseFailure;
+  observation: "turn_failed";
+  response_id?: string | null;
+  usage?: Record<string, unknown> | null;
+}
+
+export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown | WireLiveAdapterObservationTurnFailed;
 
 export interface RuntimeAcceptResult {
   existing_id?: string | null;
@@ -6796,6 +6871,8 @@ export type BackgroundJobTerminalStatus = "completed" | "failed" | "aborted" | "
 
 export type CommsNoticeKind = string;
 
+export type InteractionId = string;
+
 export type InterruptedInputKind = "prompt" | "peer" | "flow_step" | "external_event" | "continuation" | "operation" | "unknown";
 
 export interface InterruptedToolRunDispositionInputsSettled {
@@ -6878,7 +6955,9 @@ export type ToolProcessSpawner = ToolProcessSpawnerShellCall | ToolProcessSpawne
 
 export interface SystemNoticeBlockComms {
   content?: ContentBlock[];
+  delivery_id?: InteractionId | null;
   direction: SystemNoticeDirection;
+  in_reply_to?: InteractionId | null;
   intent?: string | null;
   kind: CommsNoticeKind;
   payload?: unknown;
@@ -6913,6 +6992,7 @@ export interface SystemNoticeBlockMcp {
   persisted?: boolean;
   phase?: ExternalToolDeltaPhase | null;
   server_id?: string | null;
+  settled?: boolean;
   type: "mcp";
 }
 
@@ -7211,7 +7291,7 @@ export interface WireSessionMessageSystemNotice {
 export interface WireSessionMessageUser {
   content: WireContentInput;
   created_at: string;
-  interaction_id?: string | null;
+  interaction_id?: InteractionId | null;
   role: "user";
   run_id?: RunId | null;
   transcript_role?: TranscriptUserRole;
@@ -7221,7 +7301,7 @@ export interface WireSessionMessageBlockAssistant {
   assistant_message_id?: string | null;
   blocks: WireAssistantBlock[];
   created_at: string;
-  interaction_id?: string | null;
+  interaction_id?: InteractionId | null;
   realtime_origin?: RealtimeMessageOrigin | null;
   role: "block_assistant";
   run_id?: RunId | null;

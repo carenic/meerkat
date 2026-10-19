@@ -2,8 +2,10 @@ Covers: Meerkat 0.9 sessions on every surface (CLI, JSON-RPC, REST, Python,
 TypeScript): create, continue, `rkat run --resume`, list, read, history and
 summaries, archive; per-turn `turn/start` fields and refused build settings;
 turn queueing and the 3-attempt retry cap; interrupt versus `turn/stop_run`;
-forks, transcript edits and retention; system prompts; events, cursor replay,
-ATIF export; durable resume holds, repair-wholeblob, tool-process recovery.
+forks, transcript edits and retention; system prompts; events (0.9.4
+content-filtered `run_failed` reason, compaction summary source), cursor
+replay, ATIF export; durable resume holds, repair-wholeblob, tool-process
+recovery.
 
 # Sessions on Every Surface (Meerkat 0.9)
 
@@ -41,6 +43,11 @@ API changes, error codes, SDKs, prebuilt binaries and Rust embedding:
   turn completes. `SESSION_BUSY` (-32002) means the session cannot take the
   request now: it is still being materialized, served by another process, or
   tearing down.
+- `INPUT_NOT_READY` (-32031) means the runtime did not admit the input now;
+  `error.data.reason.kind` says why. Since 0.9.4 the kind
+  `original_admission_pending` means the input names an original whose
+  source owner has not settled its admission yet: retry later (0.9.3 and
+  earlier refused it as malformed or denied).
 - A turn that keeps failing is attempted back to back at most 3 times in
   total within one wake (about three times the model spend), then its input
   ends abandoned:
@@ -180,6 +187,20 @@ settings before the turn, so REST can change build settings that RPC refuses.
   a tool call from its result is refused (0.8.22). The fork result carries
   `cache_inheritance`, and forks start with zero usage (0.8.43). An optional
   `tool_access_policy` constrains the fork's calls.
+- Fork children run turns since 0.9.4: every durable fork (`fork_at`,
+  `fork_replace`, and mob member, turn-boundary and planned-identity forks)
+  commits a child build state derived from the source's. The child keeps the
+  source's model, provider, output schema, hook overrides, budget limits,
+  callback tool definitions (answer them for the child's session id), comms
+  settings, application context, additional instructions and shell and tool
+  call timeouts; it does not get the source's `shell_env`, MCP attachments
+  (attach servers to the child), mob operator authority, comms name, peer
+  metadata or `keep_alive`. A source with session metadata but no build state
+  is refused before anything is committed: `INVALID_PARAMS` with data
+  `{"kind": "fork_source_build_state_missing", "source_session_id": ...}`. A child
+  forked by 0.9.3 or earlier that never ran a turn still fails `turn/start`
+  with `INTERNAL_ERROR` "turn abandoned: persisted session <id> is missing
+  session build state": fork its source again.
 - Same-session edits keep the session id and are append-audited:
   `session/rewrite_transcript`, `session/transcript_revisions` (list with the
   current head), `session/transcript_revision` (read one; `"revision":
@@ -242,6 +263,18 @@ settings before the turn, so REST can change build settings that RPC refuses.
   carry `runtime_origin {session_id, run_id, input_id, append_ordinal}` in
   history, revision exports and live boundary events (0.8.44); rewrites strip
   it and content digests exclude it.
+- Since 0.9.4 a `run_failed` event of error class `content_filtered` (the
+  provider refused or filtered the response) carries `error_report.reason`
+  `{"reason_type": "content_filtered", "stop": "refusal" | "content_filter",
+  "detail": {...}}` (`detail` only when the provider gave its own account)
+  instead of `null`. `compaction_completed` carries `summary_source` (who
+  wrote the summary: `provider_call` with how much history it saw,
+  `host_curator` or `mechanical_fallback`) and
+  `estimated_history_tokens_after` (compare with `compaction_started`'s
+  `estimated_history_tokens`). Shapes and SDK names:
+  `references/sessions_runtime_surfaces_api_changes.md`. A 0.9.3 binary
+  cannot read a session event log that holds a content-filtered `run_failed`
+  line.
 - ATIF export: `rkat session export-atif <id>` writes
   `<state-root>/<realm>/trajectories/<session_id>.json` unless `--output` is
   given; `rkat run --export-atif` (also with `--resume`) writes one to the

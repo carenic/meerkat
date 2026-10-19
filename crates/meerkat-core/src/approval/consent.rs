@@ -3916,6 +3916,158 @@ mod tests {
         assert_eq!(w.spend(&fresh), Ok(()));
     }
 
+    /// One builtin tool whose review the dispatcher consumes at its entry;
+    /// it counts the bodies it runs.
+    #[derive(Default)]
+    struct ConsumingTool(AtomicUsize);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::AgentToolDispatcher for ConsumingTool {
+        fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
+            [Arc::new(
+                crate::types::ToolDef::new("read_file", "", serde_json::json!({"type": "object"}))
+                    .with_provenance(crate::types::ToolProvenance::new(
+                        crate::types::ToolSourceKind::Builtin,
+                        "fixture",
+                    )),
+            )]
+            .into()
+        }
+
+        fn review_entry_support(&self, _tool_name: &str) -> ReviewEntrySupport {
+            ReviewEntrySupport::ConsumesAtEntry
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::types::ToolResult::new(call.id.to_string(), "ran".to_string(), false).into())
+        }
+    }
+
+    /// The host's operation refusal observer: it keeps what it is given.
+    #[derive(Default)]
+    struct RefusalLog(parking_lot::Mutex<Vec<crate::authorization::OperationRefusalObservation>>);
+
+    impl crate::authorization::OperationRefusalObserver for RefusalLog {
+        fn observe(&self, observation: &crate::authorization::OperationRefusalObservation) {
+            self.0.lock().push(observation.clone());
+        }
+    }
+
+    /// A retained consent attempt refused after its candidate resolved, here
+    /// because the owner withdrew the permission after the approval, reaches
+    /// the host's operation refusal observer once: as the retained call's
+    /// result, under the retained operation, with the dispatch fact its model
+    /// payload carries. The attempt met the refusal at its staging, before the
+    /// retained call's dispatcher ran, so the model reads it certified not
+    /// dispatched (`tool_invoked: false`). The first attempt's consent request
+    /// is not a refusal and is not observed.
+    #[tokio::test]
+    async fn a_refused_consent_attempt_reaches_the_host_observer_as_its_call() {
+        let w = world();
+        let log = Arc::new(RefusalLog::default());
+        let session = SessionId::new();
+        let context = crate::ToolDispatchContext::default()
+            .with_work_authorization(Some(w.work.clone()))
+            .with_operation_review(Some(Arc::clone(&w.review)))
+            .with_refusal_observer(Some(crate::authorization::RefusalObserverBinding::new(
+                Arc::clone(&log) as Arc<dyn crate::authorization::OperationRefusalObserver>,
+                session.clone(),
+            )));
+        let dispatcher = Arc::new(ConsumingTool::default());
+        let args = serde_json::value::RawValue::from_string("{}".into()).expect("args");
+        let call = ToolCallView {
+            id: "call-1",
+            name: "read_file",
+            args: &args,
+        };
+        let resolution = crate::ToolExecutionResolutionContext::new(
+            crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                crate::ToolDeadlineOwner::CoreToolDispatch,
+                Duration::from_secs(60),
+            )])
+            .expect("deadline chain"),
+        );
+        let plan =
+            crate::resolve_tool_execution_plan_fenced(&dispatcher, call, &context, &resolution)
+                .expect("plan");
+        let first =
+            crate::dispatch_tool_execution_plan_fenced(&dispatcher, call, &context, &plan).await;
+        let (id, kind) = w
+            .route
+            .notices
+            .lock()
+            .last()
+            .cloned()
+            .expect("requested notice");
+        assert_eq!(kind, ConsentNoticeKind::Requested);
+        assert_eq!(
+            first.err(),
+            Some(crate::ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+                approval_id: Some(id.clone()),
+            })
+        );
+        assert!(
+            log.0.lock().is_empty(),
+            "a consent request is not a refusal"
+        );
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        w.owner.denied.store(true, Ordering::Release);
+
+        let result = crate::dispatch_retained_consent_attempt(&dispatcher, &context, &id).await;
+        let refusal = result
+            .as_ref()
+            .err()
+            .and_then(|error| match error {
+                crate::ToolError::AuthorizationRefused { refusal } => Some(*refusal),
+                _ => None,
+            })
+            .expect("the withdrawn permission refuses the attempt");
+        assert_eq!(refusal.kind(), OperationRefusalKind::Denied);
+        assert_eq!(
+            refusal.dispatch(),
+            crate::authorization::RefusalDispatch::NotDispatched
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .err()
+                .map(|error| error.to_error_payload()["data"].clone()),
+            Some(serde_json::json!({"kind": "denied", "tool_invoked": false})),
+            "the model reads the certified refusal"
+        );
+        assert_eq!(dispatcher.0.load(Ordering::SeqCst), 0, "no body ran");
+        let observed = log.0.lock().clone();
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        let observation = &observed[0];
+        assert_eq!(observation.session_id(), &session);
+        assert_eq!(
+            observation.surface(),
+            &crate::authorization::OperationRefusalSurface::ToolCall {
+                tool_use_id: "call-1".into()
+            }
+        );
+        assert_eq!(
+            observation.outcome(),
+            crate::authorization::OperationRefusalOutcome::Refused {
+                kind: OperationRefusalKind::Denied,
+                dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+            }
+        );
+        assert_eq!(
+            observation.disposition(),
+            crate::authorization::OperationRefusalDisposition::ToolResult
+        );
+        assert!(observation.operation_id().is_some());
+    }
+
     #[tokio::test]
     async fn a_declined_consent_never_enters() {
         let w = world();

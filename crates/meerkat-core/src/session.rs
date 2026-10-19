@@ -142,6 +142,7 @@ pub use import_0810::{
     released_0810_transcript_serialized_rows_digest,
 };
 pub use instruction_activation::{
+    ActivationWindow, ForkInstructionPolicy, ForkInstructionRefusal, ForkInstructionRefusalCause,
     INSTRUCTION_ACTIVATION_RENDER_VERSION_V1, InstructionActivationAdmissionErrorCode,
     InstructionActivationDisposition, InstructionActivationError, InstructionActivationErrorCode,
     InstructionActivationExpectation, InstructionActivationKeyState, InstructionActivationMutation,
@@ -656,15 +657,23 @@ fn digest_timestamp_sentinel() -> crate::types::MessageTimestamp {
 ///   producer spelling, so metadata buffering cannot change a revision;
 /// - per-construction bookkeeping is erased: [`TranscriptMessageIdentity`]
 ///   (run/interaction ids are runtime-binding atoms — a re-created authority
-///   re-stamps them) and `created_at` timestamps. A resume that re-projects
-///   the same conversation through a new runtime authority must digest to the
-///   same revision as the persisted row, or the append-only save guard
-///   strands the session on restart (fails closed with
+///   re-stamps them), `created_at` timestamps, and the correlation ids of
+///   notices (runtime origin, a peer message's delivery id and the delivery
+///   it answers). A resume that
+///   re-projects the same conversation through a new runtime authority must
+///   digest to the same revision as the persisted row, or the append-only save
+///   guard strands the session on restart (fails closed with
 ///   `TranscriptContinuityViolation`).
 ///
-/// Typed semantic facts stay in the digest — `transcript_role`,
-/// `render_metadata`, notice kinds and blocks — because changing them changes
-/// the transcript's meaning.
+/// Typed semantic facts stay in the digest (`transcript_role`,
+/// `render_metadata`, notice kinds and blocks) because changing them changes
+/// the transcript's meaning. Inside a block, only correlation handles are
+/// erased: a comms notice's delivery id names the delivery a reply capability
+/// answers, and its `in_reply_to` names the delivery the sender says it
+/// answers. Routing authority lives in the reply capability, not in the
+/// transcript. Erasing them keeps the revision stable across versions: a row
+/// with the fields digests like the same row without them, as a reader that
+/// does not know the fields decodes it.
 pub(crate) fn canonicalize_messages_for_digest(messages: &[Message]) -> Vec<Message> {
     let mut canonical = canonicalize_message_images_for_digest(messages);
     for message in &mut canonical {
@@ -708,6 +717,23 @@ fn erase_message_construction_bookkeeping(message: &mut Message) {
         Message::SystemNotice(notice) => {
             notice.created_at = digest_timestamp_sentinel();
             notice.runtime_origin = None;
+            // A peer message's delivery id and the delivery it answers are
+            // correlation, like the runtime origin: erasing them keeps the
+            // revision of a row that carries them equal to the revision a
+            // reader computes after dropping the fields (0.9.3 drops unknown
+            // notice-block keys on decode), so such a reader still loads the
+            // session.
+            for block in &mut notice.blocks {
+                if let crate::types::SystemNoticeBlock::Comms {
+                    delivery_id,
+                    in_reply_to,
+                    ..
+                } = block
+                {
+                    *delivery_id = None;
+                    *in_reply_to = None;
+                }
+            }
         }
         Message::User(user) => {
             user.identity = crate::types::TranscriptMessageIdentity::default();
@@ -3625,6 +3651,61 @@ pub struct SessionBuildState {
     pub mcp_attachment_intent_revision: u64,
 }
 
+impl SessionBuildState {
+    /// The build state a durable transcript fork commits for its child.
+    ///
+    /// A fork child continues its source's conversation under the source's
+    /// session configuration, so every field the source's own recovery feeds
+    /// into its next build is carried. Three kinds of field are not:
+    ///
+    /// - `mob_tool_authority_context`: mob operator authority belongs to the
+    ///   source's member identity, not to a branch of its transcript.
+    /// - `shell_env`: a secret-bearing launch environment. A resumed mob
+    ///   member never replays it either.
+    /// - `mcp_attachment_intents` and `mcp_attachment_intent_revision`: the
+    ///   source's own accepted attachment requests, which a restarted host
+    ///   re-stages for that session only. The child starts with none, and its
+    ///   revision counter starts at zero.
+    ///
+    /// Every field is named below, so a new field does not compile until it
+    /// is classified here.
+    #[must_use]
+    pub fn fork_child_projection(self) -> Self {
+        let Self {
+            output_schema,
+            hooks_override,
+            budget_limits,
+            recoverable_tool_defs,
+            silent_comms_intents,
+            max_inline_peer_notifications,
+            app_context,
+            additional_instructions,
+            shell_env: _,
+            shell_timeout_secs,
+            mob_tool_authority_context: _,
+            call_timeout_override,
+            mcp_attachment_intents: _,
+            mcp_attachment_intent_revision: _,
+        } = self;
+        Self {
+            output_schema,
+            hooks_override,
+            budget_limits,
+            recoverable_tool_defs,
+            silent_comms_intents,
+            max_inline_peer_notifications,
+            app_context,
+            additional_instructions,
+            shell_env: None,
+            shell_timeout_secs,
+            mob_tool_authority_context: None,
+            call_timeout_override,
+            mcp_attachment_intents: Vec::new(),
+            mcp_attachment_intent_revision: 0,
+        }
+    }
+}
+
 /// Deferred create-time prompt staged for the next turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -4710,6 +4791,8 @@ impl Session {
             summary_tokens,
             messages_before,
             messages_after: self.messages.len(),
+            summary_source: None,
+            estimated_history_tokens_after: None,
         };
         self.add_compaction_projection_intent(intent.clone())
             .map_err(|error| error.to_string())?;
@@ -10301,6 +10384,76 @@ mod tests {
         );
     }
 
+    /// Known answer for the revision of a transcript that holds an incoming
+    /// peer message notice. The literal is the revision of the transcript
+    /// without correlation ids, computed before the fields existed (the
+    /// canonical form a 0.9.3 reader computes), and the same transcript with
+    /// a delivery id, an `in_reply_to` or both digests to it, so a reader
+    /// that drops the fields computes the revision this version stores.
+    #[test]
+    fn peer_message_notice_revision_matches_the_known_answer_with_or_without_correlation_ids() {
+        const REVISION_WITHOUT_DELIVERY_ID: &str =
+            "sha256:30ab944fbe82dea6d5b0656daeb606271418d5ae97de750fef40f8f0f3ddfb94";
+        let transcript =
+            |delivery_id: Option<crate::interaction::InteractionId>,
+             in_reply_to: Option<crate::interaction::InteractionId>| {
+                vec![
+                    Message::User(crate::types::UserMessage::text("hello".to_string())),
+                    Message::SystemNotice(crate::types::SystemNoticeMessage::with_block(
+                        crate::types::SystemNoticeKind::Comms,
+                        Some("Peer message".to_string()),
+                        crate::types::SystemNoticeBlock::Comms {
+                            kind: crate::types::CommsNoticeKind::Message,
+                            direction: crate::types::SystemNoticeDirection::Incoming,
+                            peer: Some(crate::types::SystemNoticePeer {
+                                id: crate::comms::PeerId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+                                display_name: Some("sender".to_string()),
+                            }),
+                            sender_taint: None,
+                            request_id: None,
+                            intent: None,
+                            status: None,
+                            summary: Some("Peer message".to_string()),
+                            payload: None,
+                            content: vec![crate::types::ContentBlock::Text {
+                                text: "please look at this".to_string(),
+                            }],
+                            delivery_id,
+                            in_reply_to,
+                        },
+                    )),
+                ]
+            };
+        let delivery_id = Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(77)));
+        let in_reply_to = Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(78)));
+        for (label, messages) in [
+            ("without correlation ids", transcript(None, None)),
+            ("with a delivery id", transcript(delivery_id, None)),
+            ("with an in_reply_to", transcript(None, in_reply_to)),
+            ("with both", transcript(delivery_id, in_reply_to)),
+        ] {
+            assert_eq!(
+                transcript_messages_digest(&messages).unwrap(),
+                REVISION_WITHOUT_DELIVERY_ID,
+                "transcript digest {label}"
+            );
+            let mut session = Session::new();
+            for message in messages.iter().cloned() {
+                session.push(message);
+            }
+            assert_eq!(
+                session.transcript_revision().unwrap(),
+                REVISION_WITHOUT_DELIVERY_ID,
+                "head revision {label}"
+            );
+            assert_eq!(
+                canonical_transcript_prefix_identity(&messages).unwrap().0,
+                REVISION_WITHOUT_DELIVERY_ID,
+                "canonical prefix identity {label}"
+            );
+        }
+    }
+
     #[test]
     fn generic_rewrite_cannot_copy_runtime_notice_origin() {
         let mut session = Session::new();
@@ -12083,7 +12236,7 @@ mod tests {
                 server_id: Some("server".to_string()),
                 operation: None,
                 phase: None,
-                persisted: true,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(true),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),
@@ -12108,7 +12261,7 @@ mod tests {
                 server_id: Some("server".to_string()),
                 operation: None,
                 phase: None,
-                persisted: true,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(true),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),
@@ -15374,6 +15527,137 @@ mod tests {
         assert_eq!(full_fork.messages().len(), 3);
     }
 
+    /// A fork child's build state carries every field its source's own
+    /// recovery feeds into the next build, value for value, and none of the
+    /// source's mob operator authority, launch environment or MCP attachment
+    /// requests.
+    #[test]
+    fn fork_child_projection_carries_session_configuration_and_drops_source_records() {
+        let source = SessionBuildState {
+            output_schema: Some(
+                crate::OutputSchema::from_json_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}}
+                }))
+                .expect("output schema"),
+            ),
+            hooks_override: crate::HookRunOverrides {
+                entries: vec![crate::HookEntryConfig::default()],
+                disable: vec![crate::HookId::new("disabled-hook")],
+            },
+            budget_limits: Some(crate::BudgetLimits {
+                max_tokens: Some(55),
+                max_duration: Some(std::time::Duration::from_secs(9)),
+                max_turn_duration: Some(std::time::Duration::from_secs(3)),
+                max_tool_calls: Some(2),
+            }),
+            recoverable_tool_defs: vec![ToolDef {
+                audience: Default::default(),
+                name: "inline_tool".into(),
+                description: "recoverable inline tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                provenance: None,
+            }],
+            silent_comms_intents: vec!["peer-b".to_string()],
+            max_inline_peer_notifications: Some(4),
+            app_context: Some(serde_json::json!({"surface": "rpc"})),
+            additional_instructions: Some(vec!["be precise".to_string()]),
+            shell_env: Some(HashMap::from([(
+                "MEERKAT_MODE".to_string(),
+                "test".to_string(),
+            )])),
+            shell_timeout_secs: std::num::NonZeroU64::new(7),
+            mob_tool_authority_context: Some(
+                crate::service::MobToolAuthorityContext::generated_for_test(
+                    crate::service::OpaquePrincipalToken::new("source-member"),
+                    false,
+                    false,
+                    false,
+                    std::collections::BTreeSet::from(["mob-a".to_string()]),
+                    std::collections::BTreeMap::new(),
+                    None,
+                    None,
+                ),
+            ),
+            call_timeout_override: crate::CallTimeoutOverride::Value(
+                std::time::Duration::from_secs(42),
+            ),
+            mcp_attachment_intents: vec![crate::McpSessionAttachmentIntent {
+                descriptor: crate::McpAttachmentDescriptorIdentity {
+                    server_name: "docs".to_string(),
+                    target: crate::McpAttachmentTarget::Http {
+                        location: "https://mcp.example.test/docs".to_string(),
+                        withheld: false,
+                        binding: None,
+                    },
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                    connector_account: None,
+                },
+                disposition: crate::McpAttachmentIntentDisposition::Requested,
+                revision: 3,
+            }],
+            mcp_attachment_intent_revision: 3,
+        };
+        // An unset field serializes to nothing, so one key per field shows
+        // that every field of the source is set.
+        let source_document = serde_json::to_value(&source).expect("source build state");
+        let source_document = source_document.as_object().expect("an object");
+        assert_eq!(
+            source_document.len(),
+            14,
+            "every field of the source is set: {source_document:?}"
+        );
+
+        let child = source.fork_child_projection();
+        assert!(
+            child.mob_tool_authority_context.is_none(),
+            "a fork child holds no mob operator authority"
+        );
+        assert!(
+            child.shell_env.is_none(),
+            "a fork child inherits no launch environment"
+        );
+        assert!(
+            child.mcp_attachment_intents.is_empty(),
+            "a fork child inherits no MCP attachment requests"
+        );
+        assert_eq!(
+            child.mcp_attachment_intent_revision, 0,
+            "a fork child's attachment revisions start over"
+        );
+
+        const NOT_INHERITED: [&str; 4] = [
+            "shell_env",
+            "mob_tool_authority_context",
+            "mcp_attachment_intents",
+            "mcp_attachment_intent_revision",
+        ];
+        let child_document = serde_json::to_value(&child).expect("child build state");
+        let child_document = child_document.as_object().expect("an object");
+        for (field, value) in source_document {
+            if NOT_INHERITED.contains(&field.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                child_document.get(field),
+                Some(value),
+                "a fork child carries {field}"
+            );
+        }
+        assert_eq!(
+            child_document.len(),
+            source_document.len() - NOT_INHERITED.len(),
+            "a fork child carries nothing else: {child_document:?}"
+        );
+
+        // The fork commit writes the child's state through the canonical
+        // persist gate.
+        Session::new()
+            .set_build_state(child)
+            .expect("the persist gate admits a fork child's build state");
+    }
+
     #[test]
     fn test_session_forks_drop_generated_authority_metadata() {
         let mut session = Session::new();
@@ -16851,6 +17135,108 @@ mod tests {
         // Usage was recorded once for the turn.
         assert_eq!(session.usage.input_tokens, 11);
         assert_eq!(session.usage.output_tokens, 22);
+    }
+
+    /// The text of every assistant block the session committed, in order.
+    fn committed_assistant_texts(session: &Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.blocks.iter())
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_realtime_turn_discards_every_lane_and_records_no_completion() {
+        // #1883: a failed response commits nothing it staged, display or
+        // spoken; it leaves the in-flight set, so a later barge-in cannot
+        // target it; a completion that follows cannot resurrect it; and the
+        // next response commits normally.
+        let mut session = Session::new();
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_display".to_string(),
+                item_id: "item_failed_display".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "partial display text".to_string(),
+            });
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_spoken".to_string(),
+                item_id: "item_failed_spoken".to_string(),
+                previous_item_id: Some("item_failed_display".to_string()),
+                content_index: 0,
+                delta: "partial speech".to_string(),
+            },
+        );
+        assert_eq!(
+            session.in_flight_realtime_assistant_response_ids(),
+            vec!["resp_failed".to_string()]
+        );
+
+        let failed = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".to_string(),
+            },
+        );
+        assert!(
+            failed.materialized_messages.is_empty(),
+            "a failed response commits nothing: {failed:?}"
+        );
+        assert!(
+            session
+                .in_flight_realtime_assistant_response_ids()
+                .is_empty(),
+            "a failed response is no longer in flight"
+        );
+        let late = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_failed".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert!(
+            late.materialized_messages.is_empty(),
+            "a completion after the failure cannot resurrect it: {late:?}"
+        );
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_next".to_string(),
+                delta_id: "delta_next".to_string(),
+                item_id: "item_next".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "next answer".to_string(),
+            },
+        );
+        let next = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_next".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert_eq!(next.materialized_messages.len(), 1, "{next:?}");
+        assert_eq!(
+            committed_assistant_texts(&session),
+            vec!["next answer".to_string()],
+            "only the next response is committed"
+        );
     }
 
     #[test]

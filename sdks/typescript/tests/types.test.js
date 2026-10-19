@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import packageJson from "../package.json" with { type: "json" };
 import {
@@ -473,10 +474,22 @@ describe("Typed Events", () => {
             operation: "add",
             target: "filesystem",
             status: "staged",
+            settled: "false",
+          },
+        },
+        reason: "non-boolean settled must not become false",
+      },
+      {
+        raw: {
+          type: "tool_config_changed",
+          payload: {
+            operation: "add",
+            target: "filesystem",
+            status: "staged",
             persisted: "false",
           },
         },
-        reason: "non-boolean persisted must not become false",
+        reason: "non-boolean persisted from rkat-rpc 0.9.3 must not become false",
       },
       {
         raw: {
@@ -485,7 +498,7 @@ describe("Typed Events", () => {
             operation: "bogus",
             target: 0,
             status: 0,
-            persisted: "false",
+            settled: "false",
           },
         },
         reason: "malformed operation/status semantics must not become an empty typed payload",
@@ -590,6 +603,42 @@ describe("Typed Events", () => {
         },
       }).type, "malformed_event");
     }
+  });
+
+  it("keeps a content-filtered reason's typed stop and provider detail (#1888)", () => {
+    const detail = {
+      provider: "gemini",
+      stage: "prompt",
+      reason: "BLOCKLIST",
+      blocked_categories: ["HARM_CATEGORY_HARASSMENT"],
+    };
+    const runFailed = (reason) =>
+      parseEvent({
+        type: "run_failed",
+        session_id: "session-1",
+        error_report: { class: "content_filtered", message: "Content filtered on turn 1", reason },
+      });
+
+    const event = runFailed({ reason_type: "content_filtered", stop: "content_filter", detail });
+    assert.equal(event.type, "run_failed");
+    assert.equal(event.errorReport.reason.reasonType, "content_filtered");
+    assert.equal(event.errorReport.reason.stop, "content_filter");
+    assert.deepEqual(event.errorReport.reason.detail, detail);
+
+    for (const malformed of [undefined, "not an object", { stage: "prompt" }]) {
+      const reason = { reason_type: "content_filtered", stop: "refusal" };
+      if (malformed !== undefined) {
+        reason.detail = malformed;
+      }
+      const parsed = runFailed(reason);
+      assert.equal(parsed.errorReport.reason.reasonType, "content_filtered");
+      assert.equal(parsed.errorReport.reason.stop, "refusal");
+      assert.equal(parsed.errorReport.reason.detail, undefined);
+    }
+
+    const unknownStop = runFailed({ reason_type: "content_filtered", stop: "a_future_stop" });
+    assert.equal(unknownStop.errorReport.reason.reasonType, "unknown");
+    assert.equal(unknownStop.errorReport.reason.rawReasonType, "content_filtered");
   });
 
   it("preserves hook-denied error_report on run_failed", () => {
@@ -1240,7 +1289,7 @@ describe("Typed Events", () => {
         detail: "required execution confinement is unsupported by this backend",
         ...(refusal !== undefined ? { confinement_refusal: refusal } : {}) };
       const raw = { type: "tool_config_changed", payload: {
-        operation: "reload", target: "local-server", status_info: status, persisted: true,
+        operation: "reload", target: "local-server", status_info: status, settled: true,
       } };
       const event = parseEvent(raw);
       assert.equal(event.type, "tool_config_changed");
@@ -1251,7 +1300,7 @@ describe("Typed Events", () => {
         assert.equal(event.payload.status_info.confinement_refusal, refusal);
       }
       for (const block of [
-        { type: "mcp", server_id: "local-server", phase: "failed", persisted: true,
+        { type: "mcp", server_id: "local-server", phase: "failed", settled: true,
           ...(refusal !== undefined ? { confinement_refusal: refusal } : {}) },
         { type: "tool_config", payload: raw.payload },
       ]) {
@@ -1265,7 +1314,7 @@ describe("Typed Events", () => {
 
   it("preserves malformed setup refusal events and rejects malformed typed transcript fields", () => {
     for (const refusal of ["future_reason", "", 7, false, {}, []]) {
-      const payload = { operation: "add", target: "local-server", persisted: true,
+      const payload = { operation: "add", target: "local-server", settled: true,
         status_info: { kind: "external_tool_delta", phase: "failed", confinement_refusal: refusal } };
       const raw = { type: "tool_config_changed", payload };
       const events = [raw, { type: "text_delta", delta: "permitted sibling" }].map(parseEvent);
@@ -1301,7 +1350,7 @@ describe("Typed Events", () => {
     });
     assert.equal(mcp.role, "system_notice");
     for (const refusal of ["backend_unavailable", null, undefined]) {
-      const payload = { operation: "add", target: "local-server", persisted: true,
+      const payload = { operation: "add", target: "local-server", settled: true,
         status_info: { kind: "external_tool_delta", phase: "failed",
           ...(refusal === undefined ? {} : { confinement_refusal: refusal }) } };
       const parsed = MeerkatClient.parseSessionMessage({
@@ -1324,7 +1373,7 @@ describe("Typed Events", () => {
           visible_changed: false,
           revision: 9,
         },
-        persisted: false,
+        settled: true,
         applied_at_turn: 7,
       },
     });
@@ -1338,7 +1387,7 @@ describe("Typed Events", () => {
         visible_changed: false,
         revision: 9,
       });
-      assert.equal(event.payload.persisted, false);
+      assert.equal(event.payload.settled, true);
       assert.equal(event.payload.applied_at_turn, 7);
     }
   });
@@ -1532,7 +1581,7 @@ describe("Typed Events", () => {
         operation: "add",
         target: "filesystem",
         status: "staged",
-        persisted: true,
+        settled: true,
         applied_at_turn: "oops",
       },
     });
@@ -1542,20 +1591,96 @@ describe("Typed Events", () => {
     }
   });
 
-  it("should preserve non-boolean persisted in tool_config_changed", () => {
-    const raw = {
-      type: "tool_config_changed",
-      payload: {
-        operation: "add",
-        target: "filesystem",
-        status: "staged",
-        persisted: "false",
-      },
+  it("should preserve non-boolean settled in tool_config_changed", () => {
+    for (const field of ["settled", "persisted"]) {
+      const raw = {
+        type: "tool_config_changed",
+        payload: {
+          operation: "add",
+          target: "filesystem",
+          status: "staged",
+          [field]: "false",
+        },
+      };
+      const event = parseEvent(raw);
+      assert.equal(event.type, "malformed_event", field);
+      assert.equal(event.rawType, "tool_config_changed");
+      assert.deepEqual(event.raw, raw);
+    }
+  });
+
+  it("derives settled from status_info, as rkat-rpc does, over the stored bit", () => {
+    // Payloads stored by rkat-rpc 0.9.3 and earlier are served back with their
+    // `persisted`, which was false for changes that had already applied; only a
+    // status this SDK does not know falls back to the stored bit.
+    const boundary = { kind: "boundary_applied", base_changed: true, visible_changed: true, revision: 2 };
+    const catalog = {
+      kind: "deferred_catalog_delta", added_hidden_count: 1, removed_hidden_count: 0, pending_source_count: 0,
     };
-    const event = parseEvent(raw);
-    assert.equal(event.type, "malformed_event");
-    assert.equal(event.rawType, "tool_config_changed");
-    assert.deepEqual(event.raw, raw);
+    const failedClosed = { kind: "warning_failed_closed", error: "scope refused" };
+    const delta = (phase) => ({ kind: "external_tool_delta", phase });
+    for (const [statusInfo, fields, settled] of [
+      [boundary, { persisted: false }, true],
+      [catalog, { persisted: false }, true],
+      [failedClosed, { persisted: false }, true],
+      [boundary, { settled: true }, true],
+      [delta("pending"), { persisted: true }, false],
+      [delta("draining"), { settled: true }, false],
+      [delta("applied"), { persisted: false }, true],
+      [delta("forced"), { settled: false }, true],
+      [delta("failed"), { persisted: false }, true],
+      [delta("pending"), { settled: false, persisted: true }, false],
+      [{ kind: "a_later_kind" }, { settled: true }, true],
+      [{ kind: "a_later_kind" }, { persisted: false }, false],
+      [{ kind: "a_later_kind" }, { settled: false, persisted: true }, false],
+      [delta("a_later_phase"), { persisted: true }, true],
+    ]) {
+      const label = JSON.stringify([statusInfo, fields]);
+      const event = parseEvent({ type: "tool_config_changed", payload: {
+        operation: "add", target: "filesystem", status_info: statusInfo, ...fields,
+      } });
+      assert.equal(event.type, "tool_config_changed", label);
+      assert.equal(event.payload.settled, settled, label);
+      assert.equal(Object.hasOwn(event.payload, "persisted"), false, label);
+    }
+    const raw = { type: "tool_config_changed", payload: {
+      operation: "add", target: "filesystem", status_info: boundary,
+    } };
+    const missing = parseEvent(raw);
+    assert.equal(missing.type, "malformed_event");
+    assert.deepEqual(missing.raw, raw);
+  });
+
+  it("reads settled or persisted in stored tool-config notices", () => {
+    const applied = { kind: "external_tool_delta", phase: "applied" };
+    const history = (block) => ({
+      session_id: "s1", message_count: 1, offset: 0, has_more: false,
+      messages: [{ role: "system_notice", kind: "mcp", body: "Tools changed.",
+        blocks: [block], created_at: "2026-05-26T10:00:00Z" }],
+    });
+    for (const fields of [{ settled: true }, { persisted: false }]) {
+      const payload = { operation: "add", target: "local-server", status_info: applied, ...fields };
+      for (const block of [
+        { type: "tool_config", payload },
+        { type: "mcp", server_id: "local-server", ...fields },
+      ]) {
+        const raw = history(block);
+        const parsed = MeerkatClient.parseSessionHistory(raw);
+        assert.deepEqual(
+          MeerkatClient.serializeTranscriptRewriteMessage(parsed.messages[0]),
+          raw.messages[0],
+        );
+      }
+    }
+    for (const block of [
+      { type: "tool_config", payload: { operation: "add", target: "local-server", status_info: applied } },
+      { type: "mcp", settled: "false" },
+      { type: "mcp", persisted: "false" },
+    ]) {
+      assert.throws(() => MeerkatClient.parseSessionHistory(history(block)),
+        error => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+        JSON.stringify(block));
+    }
   });
 
   it("should not default malformed tool_config_changed operation/status semantics", () => {
@@ -1565,7 +1690,7 @@ describe("Typed Events", () => {
         operation: "bogus",
         target: 0,
         status: 0,
-        persisted: "false",
+        settled: "false",
       },
     };
     const event = parseEvent(raw);
@@ -4935,6 +5060,67 @@ describe("Mob surface fail-closed status parsing (DOGMA Rule 6)", () => {
       }
     });
 
+    for (const hookCall of [
+      "select_destination",
+      "select_agent_mandate",
+      "prepare_member_surface",
+      "verify_member_surface",
+    ]) {
+      it(`surfaces the registration_refusal hook call '${hookCall}'`, async () => {
+        const client = memberStatusClient(
+          validResponse({ status: "broken", registration_refusal: hookCall }),
+        );
+        const result = await client.mobMemberStatus("mob-1", "worker-1");
+        assert.equal(result.registrationRefusal, hookCall);
+        assert.equal(result.status, "broken");
+      });
+    }
+
+    it("omits registrationRefusal when the wire omits or nulls it", async () => {
+      for (const response of [validResponse(), validResponse({ registration_refusal: null })]) {
+        const result = await memberStatusClient(response).mobMemberStatus("mob-1", "worker-1");
+        assert.equal(Object.prototype.hasOwnProperty.call(result, "registrationRefusal"), false);
+      }
+    });
+
+    it("rejects a registration_refusal outside the closed vocabulary", async () => {
+      for (const refusal of ["SelectDestination", { kind: "select_destination" }]) {
+        const client = memberStatusClient(
+          validResponse({ status: "broken", registration_refusal: refusal }),
+        );
+        await assert.rejects(
+          () => client.mobMemberStatus("mob-1", "worker-1"),
+          (error) =>
+            error instanceof MeerkatError &&
+            error.code === "INVALID_RESPONSE" &&
+            /registration_refusal/.test(String(error.message)),
+        );
+      }
+    });
+
+    it("carries registration_refusal on wait_kickoff and wait_ready members", async () => {
+      const client = new MeerkatClient();
+      client.request = async () => ({
+        members: [
+          {
+            agent_identity: "lead",
+            status: "broken",
+            tokens_used: 0,
+            is_final: false,
+            registration_refusal: "select_destination",
+          },
+          { agent_identity: "writer", status: "active", tokens_used: 7, is_final: false },
+        ],
+      });
+      for (const members of [
+        await client.waitMobKickoff("mob-1"),
+        await client.waitMobReady("mob-1"),
+      ]) {
+        assert.equal(members[0].registrationRefusal, "select_destination");
+        assert.equal(Object.prototype.hasOwnProperty.call(members[1], "registrationRefusal"), false);
+      }
+    });
+
     it("rejects an absent status instead of fabricating 'unknown'", async () => {
       const response = validResponse();
       delete response.status;
@@ -5928,9 +6114,25 @@ describe("Capability status parse boundary (row 161)", () => {
 });
 
 describe("Transport corrupted-frame fault (row 246)", () => {
+  /** A stand-in child process that exits when it is signalled, as a real one does. */
+  function exitingChild(onKill = () => {}) {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: { write: () => {}, end: () => {}, destroy: () => {} },
+      exitCode: null,
+      signalCode: null,
+      kill(signal = "SIGTERM") {
+        onKill(signal);
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+        return true;
+      },
+    });
+    return child;
+  }
+
   it("surfaces a typed PROTOCOL_ERROR to pending callers instead of silently dropping a corrupted frame", async () => {
     const client = new MeerkatClient();
-    client.process = { stdin: { write: () => {}, destroy: () => {} }, kill: () => {} };
+    client.process = exitingChild();
 
     // Register a pending request through the real request bookkeeping.
     const pending = client.registerRequest(client.requestId + 1);
@@ -5947,12 +6149,9 @@ describe("Transport corrupted-frame fault (row 246)", () => {
   it("marks the client unusable after transport corruption: later calls reject with the recorded fault, process is torn down", async () => {
     let killed = false;
     const client = new MeerkatClient();
-    client.process = {
-      stdin: { write: () => {}, destroy: () => {} },
-      kill: () => {
-        killed = true;
-      },
-    };
+    client.process = exitingChild(() => {
+      killed = true;
+    });
 
     client.handleLine("this is not json{");
 
@@ -6480,4 +6679,94 @@ it("hook failed displays every remaining known reason exactly", () => {
     assert.deepEqual(event.reason, reason);
     assert.equal(event.error, display);
   }
+});
+
+describe("Compaction summary source", () => {
+  const base = {
+    type: "compaction_completed",
+    summary_tokens: 7,
+    messages_before: 40,
+    messages_after: 3,
+  };
+
+  it("parses the typed summary source and keeps legacy events without one", () => {
+    const legacy = parseEvent(base);
+    assert.equal(legacy.type, "compaction_completed");
+    assert.equal("summarySource" in legacy, false);
+
+    const trimmed = parseEvent({
+      ...base,
+      summary_source: {
+        kind: "provider_call",
+        source_bound: { kind: "trimmed", through: "tool_results" },
+      },
+    });
+    assert.deepEqual(trimmed.summarySource, {
+      kind: "provider_call",
+      sourceBound: { kind: "trimmed", through: "tool_results" },
+    });
+
+    const requestsOnly = parseEvent({
+      ...base,
+      summary_source: {
+        kind: "provider_call",
+        source_bound: { kind: "requests_only", kept: 3, of: 40 },
+      },
+    });
+    assert.deepEqual(requestsOnly.summarySource.sourceBound, {
+      kind: "requests_only",
+      kept: 3,
+      of: 40,
+    });
+
+    const curator = parseEvent({ ...base, summary_source: { kind: "host_curator" } });
+    assert.deepEqual(curator.summarySource, { kind: "host_curator" });
+  });
+
+  it("keeps kinds this SDK does not know as unknown with the wire object", () => {
+    const futureSource = { kind: "future_author", detail: 1 };
+    assert.deepEqual(parseEvent({ ...base, summary_source: futureSource }).summarySource, {
+      kind: "unknown",
+      rawKind: "future_author",
+      raw: futureSource,
+    });
+
+    const futureBound = { kind: "sampled", ratio: 2 };
+    assert.deepEqual(
+      parseEvent({
+        ...base,
+        summary_source: { kind: "provider_call", source_bound: futureBound },
+      }).summarySource.sourceBound,
+      { kind: "unknown", rawKind: "sampled", raw: futureBound },
+    );
+
+    const futureStage = { kind: "trimmed", through: "attachments" };
+    assert.deepEqual(
+      parseEvent({
+        ...base,
+        summary_source: { kind: "provider_call", source_bound: futureStage },
+      }).summarySource.sourceBound,
+      { kind: "unknown", rawKind: "trimmed", raw: futureStage },
+    );
+
+    const malformed = parseEvent({ ...base, summary_source: "provider_call" });
+    assert.equal(malformed.type, "malformed_event");
+  });
+
+  it("reads the history the rewrite left and keeps events without it", () => {
+    const legacy = parseEvent(base);
+    assert.equal("estimatedHistoryTokensAfter" in legacy, false);
+    const explicitNull = parseEvent({ ...base, estimated_history_tokens_after: null });
+    assert.equal("estimatedHistoryTokensAfter" in explicitNull, false);
+
+    const reported = parseEvent({ ...base, estimated_history_tokens_after: 9800 });
+    assert.equal(reported.estimatedHistoryTokensAfter, 9800);
+
+    for (const malformed of ["9800", -1, true, 1.5]) {
+      assert.equal(
+        parseEvent({ ...base, estimated_history_tokens_after: malformed }).type,
+        "malformed_event",
+      );
+    }
+  });
 });

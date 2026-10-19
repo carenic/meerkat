@@ -104,6 +104,13 @@ done
   exit 2
 }
 
+# Archives already present when packaging starts were left by an earlier run.
+for existing in "$CARGO_TARGET_DIR/package/"*.crate; do
+  if [[ -e "$existing" ]]; then
+    printf '%s\n' "$existing" >> "$STATE_DIR/preexisting-archives"
+  fi
+done
+
 mkdir -p "$STATE_DIR/calls" "$STATE_DIR/call-tmp" "$CARGO_TARGET_DIR/package"
 call_tmp="$(mktemp "$STATE_DIR/call-tmp/$crate.XXXXXX")"
 printf '%s|%s\n' "$CARGO_TARGET_DIR" "$RUST_LANE_ID" > "$call_tmp"
@@ -160,7 +167,11 @@ fi
 if [[ "${OMIT_LICENSE_CRATE:-}" != "$crate" ]]; then
   printf 'Apache-2.0\n' > "$archive_root/LICENSE-APACHE"
 fi
-tar -czf "$CARGO_TARGET_DIR/package/$crate-0.0.0.crate" -C "$call_tmp.archive" "$crate-0.0.0"
+# SKIP_ARCHIVE_CRATE packages that crate without an archive at the workspace
+# version, as cargo does for a crate that sets its own version.
+if [[ "${SKIP_ARCHIVE_CRATE:-}" != "$crate" ]]; then
+  tar -czf "$CARGO_TARGET_DIR/package/$crate-0.0.0.crate" -C "$call_tmp.archive" "$crate-0.0.0"
+fi
 rm -rf "$call_tmp.archive"
 if [[ "${FAIL_CRATE:-}" == "$crate" ]]; then
   echo "error: intentional package failure for $crate" >&2
@@ -348,5 +359,37 @@ if grep -Fq 'beta-0.0.0.crate:' "$caret_log"; then
 fi
 [[ ! -f "$caret_state/facade-target" ]] ||
   fail "the facade smoke ran after an inexact packaged requirement"
+
+# A persistent CARGO_TARGET_DIR keeps the archives of earlier runs, here one
+# at this version and one at a pre-release of it. A rerun checks only what it
+# packaged itself: a crate whose rerun wrote no archive fails as missing,
+# instead of passing on the earlier run's archive.
+stale_target="$TEST_ROOT/stale-archive-target"
+earlier_state="$TEST_ROOT/stale-archive-earlier"
+status="$(run_checker "$CHECKER" "$earlier_state" "$TEST_ROOT/stale-archive-earlier.log" \
+  CARGO_TARGET_DIR="$stale_target")"
+if [[ "$status" -ne 0 ]]; then
+  fail "the earlier packaging run failed" "$(cat "$TEST_ROOT/stale-archive-earlier.log")"
+fi
+earlier_archive="$stale_target/gamma/package/gamma-0.0.0.crate"
+[[ -f "$earlier_archive" ]] ||
+  fail "the earlier packaging run left no archive in the persistent target" "$earlier_archive"
+cp "$earlier_archive" "$stale_target/gamma/package/gamma-0.0.0-rc.1.crate"
+
+stale_state="$TEST_ROOT/stale-archive"
+stale_log="$TEST_ROOT/stale-archive.log"
+status="$(run_checker "$CHECKER" "$stale_state" "$stale_log" \
+  CARGO_TARGET_DIR="$stale_target" SKIP_ARCHIVE_CRATE=gamma)"
+if [[ "$status" -eq 0 ]]; then
+  fail "a package archive left by an earlier run was checked as this run's" "$(cat "$stale_log")"
+fi
+grep -Fq "missing verified package archive: $earlier_archive" "$stale_log" ||
+  fail "the crate without an archive from this run was not named" "$(cat "$stale_log")"
+if [[ -f "$stale_state/preexisting-archives" ]]; then
+  fail "package jobs started beside archives from an earlier run" \
+    "$(cat "$stale_state/preexisting-archives")"
+fi
+[[ ! -f "$stale_state/facade-target" ]] ||
+  fail "the facade smoke ran without this run's archives"
 
 echo "release packaging isolation contract holds"

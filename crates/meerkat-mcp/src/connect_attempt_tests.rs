@@ -649,6 +649,7 @@ async fn a_deletion_answered_without_a_success_status_is_unconfirmed() {
 }
 
 /// A router whose remote servers the close index tests close.
+#[cfg(feature = "workspace-tests")]
 fn close_index_router() -> crate::McpRouter {
     crate::McpRouter::new_with_surface_handle_and_stdio_profile(
         Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
@@ -661,6 +662,7 @@ fn close_index_router() -> crate::McpRouter {
 /// the server) and reports `NoProcess` only once it has; the router's
 /// shutdown then joins the same close. (Fails at r3: the ticket covered only
 /// stdio custodies, so it read settled before this close had ended.)
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_close_ticket_waits_for_a_remote_close_and_reports_it() {
     let (url, server) = spawn(Some(Pause::Delete)).await;
@@ -741,6 +743,7 @@ async fn attempt_failed(adapter: &crate::McpRouterAdapter, server: &str) {
 /// but applied after it (it waited for the router lock a dispatch held) is
 /// refused before any request. (Fails at r3: only stdio custodies were
 /// fenced, and the attempt connected after the close.)
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_remote_add_applied_after_the_close_began_sends_nothing() {
     let (url, server) = spawn(None).await;
@@ -775,6 +778,7 @@ async fn a_remote_add_applied_after_the_close_began_sends_nothing() {
 /// closes the client it connected, and that close is still the router's to
 /// report: the shutdown waits for it (here its session deletion, held by the
 /// server) and reports it, rather than reading settled before it ended.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_failed_remote_attempts_close_is_in_the_shutdown_report() {
     let mut fixture = Server::new(Some(Pause::Delete));

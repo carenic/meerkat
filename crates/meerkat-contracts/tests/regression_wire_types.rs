@@ -558,6 +558,12 @@ fn agent_event_all_variants_roundtrip() {
             summary_tokens: 2048,
             messages_before: 42,
             messages_after: 8,
+            summary_source: Some(meerkat_core::CompactionSummarySource::ProviderCall {
+                source_bound: meerkat_core::SummarizationSourceBound::Trimmed {
+                    through: meerkat_core::SummarizationTrimStage::ToolResults,
+                },
+            }),
+            estimated_history_tokens_after: Some(30_000),
         },
         AgentEvent::CompactionFailed {
             reason: meerkat_core::CompactionFailureReason::LlmFailed {
@@ -621,7 +627,6 @@ fn agent_event_all_variants_roundtrip() {
                     meerkat_core::ExternalToolDeltaPhase::Applied,
                     None,
                 ),
-                true,
             )
             .with_applied_at_turn(Some(5)),
         },
@@ -838,6 +843,8 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
             summary_tokens: 1,
             messages_before: 3,
             messages_after: 1,
+            summary_source: Some(meerkat_core::CompactionSummarySource::HostCurator),
+            estimated_history_tokens_after: None,
         },
         AgentEvent::CompactionFailed {
             reason: meerkat_core::CompactionFailureReason::LlmFailed {
@@ -912,7 +919,6 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
                     meerkat_core::ExternalToolDeltaPhase::Applied,
                     None,
                 ),
-                true,
             )
             .with_applied_at_turn(Some(1)),
         },

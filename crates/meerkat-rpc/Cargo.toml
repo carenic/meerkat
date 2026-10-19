@@ -11,6 +11,19 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # workspace dependency-graph guard over the repository's manifests
+    "tests/live_dependency_guards.rs",
+    # includes the repository's tests/fixtures/live_smoke/support.rs (live lane)
+    "tests/live_rpc_regression.rs",
+    # includes the repository's tests/fixtures/live_smoke/support.rs (live lane)
+    "tests/live_smoke_rpc.rs",
+    # needs the unpublished mcp-test-server crate
+    "tests/mob_registration_redrive_ordering.rs",
+]
 
 [[bin]]
 name = "rkat-rpc"
@@ -79,8 +92,17 @@ experimental-gpt-live = [
     "meerkat/experimental-gpt-live",
     "meerkat-mob-mcp/experimental-gpt-live",
 ]
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-rpc = { path = ".", features = ["workspace-tests"] }
 meerkat-authorization = { workspace = true }
 meerkat-auth-core = { workspace = true }
 meerkat-authorization-contracts = { workspace = true }

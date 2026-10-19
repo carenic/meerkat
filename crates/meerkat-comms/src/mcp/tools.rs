@@ -22,9 +22,9 @@ use meerkat_contracts::{
 use meerkat_core::BlobId;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
-    COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY, CommsCommand, InputStreamMode, PeerCapabilitySet,
-    PeerDirectoryEntry, PeerDirectorySource, PeerId, PeerName, PeerReplyCapability,
-    PeerReplyDispatchContext, PeerRoute, PeerSendability, SendError, SendReceipt,
+    CommsCommand, InputStreamMode, PeerCapabilitySet, PeerDirectoryEntry, PeerDirectorySource,
+    PeerId, PeerName, PeerReplyCapability, PeerReplyDispatchContext, PeerRoute, PeerSendability,
+    SendError, SendReceipt,
 };
 use meerkat_core::error::ToolError;
 use meerkat_core::interaction::{InteractionId, ResponseStatus};
@@ -92,7 +92,7 @@ pub struct SendMessageInput {
     pub handling_mode: HandlingMode,
 }
 
-/// Reply to the peer message that triggered the current turn.
+/// Reply to a peer message delivered in the current turn.
 ///
 /// Pre-addressed: the runtime minted a typed reply capability for this turn's
 /// incoming peer message(s), so no `peer_id` is supplied — only content.
@@ -301,7 +301,7 @@ pub fn tools_list() -> Vec<Value> {
         }),
         json!({
             "name": "reply_to_peer",
-            "description": format!("{}{}", "Reply to the peer message that triggered the current turn. The reply is pre-addressed: the runtime already knows which peer sent the triggering message, so you do not supply a peer_id.\n\nWhen to use: Use reply_to_peer to answer a peer message you received this turn. Use send_message with an explicit peer_id for unsolicited outreach, and use send_response only for typed request/response contracts (send_request traffic).\n\nreply_to (optional): Only needed when more than one peer message arrived in this turn. On an ambiguous call the error lists the available delivery ids; retry with reply_to set to one of them.\n\nhandling_mode:\n- \"queue\": The reply is delivered at the peer's next turn boundary. Use for ordinary collaboration.\n- \"steer\": The peer processes your reply immediately, interrupting its current work. Use only for urgent or time-sensitive collaboration.", "\n\nExamples:\n1. Reply to the turn's peer message:\n   {\"body\": \"Done - the database migration completed successfully.\", \"handling_mode\": \"queue\"}\n2. Disambiguate between multiple deliveries in one turn:\n   {\"reply_to\": \"<delivery-id-from-ambiguous_reply-error>\", \"body\": \"Acknowledged.\", \"handling_mode\": \"queue\"}\n\nFailure handling:\n- no_reply_capability: This turn was not triggered by a peer message; there is nothing to reply to. Use peers + send_message instead.\n- ambiguous_reply: Multiple peer messages arrived this turn. Retry with reply_to set to one of the listed delivery ids.\n- unknown_reply_to: The reply_to value does not match any of this turn's deliveries. Use one of the listed delivery ids.\n- peer_not_found_or_not_trusted / peer_unreachable: Same as send_message - the sending peer is no longer trusted or reachable."),
+            "description": format!("{}{}", "Reply to a peer message delivered in the current turn: the one that started it, or one that joined it while it ran. The reply is pre-addressed: the runtime already knows which peer sent each delivered message, so you do not supply a peer_id.\n\nWhen to use: Use reply_to_peer to answer a peer message you received this turn. Use send_message with an explicit peer_id for unsolicited outreach, and use send_response only for typed request/response contracts (send_request traffic).\n\nreply_to (optional): Only needed when more than one peer message arrived in this turn. Each peer message notice shows its Delivery ID. On an ambiguous call the error lists the available delivery ids with their senders; retry with reply_to set to one of them.\n\nhandling_mode:\n- \"queue\": The reply is delivered at the peer's next turn boundary. Use for ordinary collaboration.\n- \"steer\": The peer processes your reply immediately, interrupting its current work. Use only for urgent or time-sensitive collaboration.", "\n\nExamples:\n1. Reply to the turn's peer message:\n   {\"body\": \"Done - the database migration completed successfully.\", \"handling_mode\": \"queue\"}\n2. Disambiguate between multiple deliveries in one turn:\n   {\"reply_to\": \"<delivery-id-from-ambiguous_reply-error>\", \"body\": \"Acknowledged.\", \"handling_mode\": \"queue\"}\n\nFailure handling:\n- no_reply_capability: No peer message was delivered in this turn; there is nothing to reply to. Use peers + send_message instead.\n- ambiguous_reply: Multiple peer messages arrived this turn, or the reply_to id belongs to messages from more than one peer. Nothing was sent. Retry with reply_to set to one of the listed delivery ids, or use send_message to answer a specific peer.\n- unknown_reply_to: The reply_to value does not match any of this turn's deliveries. Use one of the listed delivery ids.\n- peer_not_found_or_not_trusted / peer_unreachable: Same as send_message - the sending peer is no longer trusted or reachable."),
             "inputSchema": schema_for::<ReplyToPeerInput>()
         }),
         json!({
@@ -421,6 +421,9 @@ pub async fn handle_tools_call_typed(
                 content_taint: None,
                 handling_mode: input.handling_mode,
                 objective_id: None,
+                // The reply names the delivery it answers, signed in the
+                // envelope, so the receiver can link it.
+                in_reply_to: Some(capability.in_reply_to),
             }
             .with_objective_id(objective_id_from_dispatch_context(dispatch_context)?);
             dispatch(ctx, command).await
@@ -447,6 +450,8 @@ pub async fn handle_tools_call_typed(
                 content_taint: None,
                 handling_mode: input.handling_mode,
                 objective_id: None,
+                // A fresh message answers no delivery.
+                in_reply_to: None,
             }
             .with_objective_id(objective_id_from_dispatch_context(dispatch_context)?);
             dispatch(ctx, command).await
@@ -533,9 +538,11 @@ pub fn comms_tool_operation_target(
         }
         "reply_to_peer" => {
             let input: ReplyToPeerInput = parse_input(args)?;
-            let reply_context = peer_reply_dispatch_context(dispatch_context)?;
+            let reply_context =
+                peer_reply_dispatch_context(dispatch_context).map_err(|error| error.to_string())?;
             let capability =
-                select_reply_capability(&reply_context.deliveries, input.reply_to.as_deref())?;
+                select_reply_capability(&reply_context.deliveries, input.reply_to.as_deref())
+                    .map_err(|error| error.to_string())?;
             Ok(delivery(capability.peer_id, PeerSendKind::Message))
         }
         "send_request" => {
@@ -748,65 +755,167 @@ fn project_peer_response_command(
     })
 }
 
-/// Read the typed peer-reply dispatch context minted by the runtime for this
-/// turn. Absent key => the turn was not triggered by a peer message; a
-/// present-but-malformed value fails closed with a distinct typed code
-/// instead of being coerced or ignored.
+/// Why `reply_to_peer` cannot pick the delivery it answers. Each message
+/// starts with the stable code the tool contract documents, and nothing is
+/// sent for any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplySelectionError {
+    /// The turn carries no peer message delivery to answer.
+    NoReplyCapability,
+    /// The turn's runtime-minted reply context does not decode.
+    InvalidReplyContext(meerkat_core::comms::PeerReplyContextError),
+    /// `reply_to` names no delivery of this turn.
+    UnknownReplyTo {
+        selector: String,
+        available: Vec<PeerReplyCapability>,
+    },
+    /// The selection does not name exactly one sender's delivery: either
+    /// `reply_to` matches deliveries from more than one sender (each sender
+    /// chooses its own ids, so two can share one), or no `reply_to` was
+    /// given and the turn carries more than one delivery.
+    AmbiguousReply {
+        reply_to: Option<String>,
+        candidates: Vec<PeerReplyCapability>,
+    },
+}
+
+/// One delivery as an error names it: its id and its sender.
+struct DeliveryLabel<'a>(&'a PeerReplyCapability);
+
+impl std::fmt::Display for DeliveryLabel<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let capability = self.0;
+        write!(formatter, "{} from ", capability.in_reply_to)?;
+        match capability.display_name.as_deref() {
+            Some(name) => write!(formatter, "{name} ({})", capability.peer_id),
+            None => write!(formatter, "{}", capability.peer_id),
+        }
+    }
+}
+
+/// A list of deliveries as an error names them.
+struct DeliveryLabels<'a>(&'a [PeerReplyCapability]);
+
+impl std::fmt::Display for DeliveryLabels<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, capability) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{}", DeliveryLabel(capability))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ReplySelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoReplyCapability => formatter.write_str(
+                "no_reply_capability: this turn carries no peer message delivery; \
+                 use peers + send_message instead",
+            ),
+            Self::InvalidReplyContext(error) => write!(formatter, "invalid_reply_context: {error}"),
+            Self::UnknownReplyTo {
+                selector,
+                available,
+            } => write!(
+                formatter,
+                "unknown_reply_to: no peer delivery in this turn matches '{selector}'; \
+                 available delivery ids: [{}]",
+                DeliveryLabels(available)
+            ),
+            Self::AmbiguousReply {
+                reply_to: Some(selector),
+                candidates,
+            } => write!(
+                formatter,
+                "ambiguous_reply: delivery id {selector} arrived from more than one peer \
+                 this turn: [{}]; nothing was sent. reply_to cannot tell them apart; \
+                 use peers + send_message to answer one of them",
+                DeliveryLabels(candidates)
+            ),
+            Self::AmbiguousReply {
+                reply_to: None,
+                candidates,
+            } => write!(
+                formatter,
+                "ambiguous_reply: multiple peer messages arrived this turn; \
+                 set reply_to to one of the delivery ids: [{}]",
+                DeliveryLabels(candidates)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplySelectionError {}
+
+impl From<ReplySelectionError> for CommsToolCallError {
+    fn from(error: ReplySelectionError) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+/// Every peer delivery this turn can answer: the turn-start deliveries the
+/// runtime minted and the ones that joined the running turn at a model
+/// boundary ([`ToolDispatchContext::peer_reply_deliveries`]). A malformed
+/// turn-start value fails closed with its own code instead of being coerced
+/// or ignored.
 fn peer_reply_dispatch_context(
     dispatch_context: &ToolDispatchContext,
-) -> Result<PeerReplyDispatchContext, String> {
-    let value = dispatch_context
-        .turn_metadata(COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY)
-        .ok_or_else(|| {
-            "no_reply_capability: this turn was not triggered by a peer message; \
-             use peers + send_message instead"
-                .to_string()
-        })?;
-    let context: PeerReplyDispatchContext = serde_json::from_value(value.clone())
-        .map_err(|err| format!("invalid_reply_context: malformed peer reply context: {err}"))?;
+) -> Result<&PeerReplyDispatchContext, ReplySelectionError> {
+    let context = dispatch_context
+        .peer_reply_deliveries()
+        .map_err(ReplySelectionError::InvalidReplyContext)?;
     if context.deliveries.is_empty() {
-        return Err(
-            "no_reply_capability: this turn carries no peer message deliveries".to_string(),
-        );
+        return Err(ReplySelectionError::NoReplyCapability);
     }
     Ok(context)
 }
 
 /// Select the delivery to reply to. One delivery with no selector resolves to
 /// it; multiple deliveries require an explicit `reply_to`; a selector must
-/// match one of the turn's delivery ids.
+/// match the deliveries of exactly one sender. Deliveries are keyed by
+/// (sender, delivery id), and the sender chooses the id, so a selector that
+/// matches more than one sender is ambiguous: it never takes the first match.
 fn select_reply_capability<'a>(
     deliveries: &'a [PeerReplyCapability],
     reply_to: Option<&str>,
-) -> Result<&'a PeerReplyCapability, String> {
+) -> Result<&'a PeerReplyCapability, ReplySelectionError> {
     match reply_to {
-        Some(selector) => deliveries
-            .iter()
-            .find(|capability| capability.in_reply_to.to_string() == selector)
-            .ok_or_else(|| {
-                format!(
-                    "unknown_reply_to: no peer delivery in this turn matches '{selector}'; \
-                     available delivery ids: [{}]",
-                    delivery_ids(deliveries)
-                )
-            }),
+        Some(selector) => {
+            let candidates = deliveries
+                .iter()
+                .filter(|capability| capability.in_reply_to.to_string() == selector)
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [] => Err(ReplySelectionError::UnknownReplyTo {
+                    selector: selector.to_string(),
+                    available: deliveries.to_vec(),
+                }),
+                [first, rest @ ..]
+                    if rest
+                        .iter()
+                        .all(|capability| capability.peer_id == first.peer_id) =>
+                {
+                    Ok(*first)
+                }
+                _ => Err(ReplySelectionError::AmbiguousReply {
+                    reply_to: Some(selector.to_string()),
+                    candidates: candidates.into_iter().cloned().collect(),
+                }),
+            }
+        }
         None => match deliveries {
             [single] => Ok(single),
-            _ => Err(format!(
-                "ambiguous_reply: multiple peer messages arrived this turn; \
-                 set reply_to to one of the delivery ids: [{}]",
-                delivery_ids(deliveries)
-            )),
+            [] => Err(ReplySelectionError::NoReplyCapability),
+            _ => Err(ReplySelectionError::AmbiguousReply {
+                reply_to: None,
+                candidates: deliveries.to_vec(),
+            }),
         },
     }
-}
-
-fn delivery_ids(deliveries: &[PeerReplyCapability]) -> String {
-    deliveries
-        .iter()
-        .map(|capability| capability.in_reply_to.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn peer_name(value: &str, field: &str) -> Result<PeerName, String> {
@@ -922,6 +1031,7 @@ async fn dispatch_without_runtime(
             content_taint,
             handling_mode,
             objective_id,
+            in_reply_to,
             ..
         } => {
             reject_runtime_less_blob_blocks(blocks.as_deref())?;
@@ -938,6 +1048,7 @@ async fn dispatch_without_runtime(
                         content_taint: None,
                         handling_mode: Some(handling_mode),
                         objective_id,
+                        in_reply_to: in_reply_to.map(|delivery| delivery.0),
                     },
                     content_taint,
                 )
@@ -1157,8 +1268,8 @@ mod tests {
         supervisor_bridge_current_protocol_version,
     };
     use meerkat_core::comms::{
-        CommsTrustMutation, PeerAddress, PeerCapabilitySet, PeerDirectorySource, PeerSendability,
-        PeerTransport, TrustedPeerDescriptor,
+        COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY, CommsTrustMutation, PeerAddress, PeerCapabilitySet,
+        PeerDirectorySource, PeerSendability, PeerTransport, TrustedPeerDescriptor,
     };
     use parking_lot::Mutex;
     use tokio::sync::Notify;
@@ -1328,6 +1439,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[allow(clippy::expect_used)]
     fn test_peer_projection_reconcile_obligation(
         session_id: impl Into<String>,
@@ -1402,6 +1514,7 @@ mod tests {
         (dsl, obligations.pop().expect("obligation count checked"))
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn add_generated_peer_projection_trust(
         runtime: &CommsRuntime,
         peer: TrustedPeerDescriptor,
@@ -1410,6 +1523,7 @@ mod tests {
         add_generated_peer_projection_trust_batch(runtime, vec![peer], context).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn add_generated_peer_projection_trust_batch(
         runtime: &CommsRuntime,
         peers: Vec<TrustedPeerDescriptor>,
@@ -1447,6 +1561,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_trusted_runtime_less_context(
         peer_keypair: &Keypair,
     ) -> (ToolContext, meerkat_core::comms::PeerId) {
@@ -1481,11 +1596,13 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_runtime_less_trust_only_context() -> (ToolContext, meerkat_core::comms::PeerId) {
         let peer_keypair = Keypair::generate();
         make_trusted_runtime_less_context(&peer_keypair).await
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_runtime_less_inproc_delivery_pair() -> (
         ToolContext,
         meerkat_core::comms::PeerId,
@@ -1546,6 +1663,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_runtime_finalization(
         receiver: Arc<CommsRuntime>,
         finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
@@ -1806,6 +1924,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_dispatches_peer_message_to_capability_peer() {
         let peer_keypair = Keypair::generate();
@@ -1842,6 +1961,119 @@ mod tests {
         assert_eq!(*handling_mode, HandlingMode::Queue);
     }
 
+    /// The comms runtime signs a message's `in_reply_to` into its envelope.
+    #[tokio::test]
+    async fn runtime_send_signs_the_peer_message_in_reply_to_onto_the_wire() {
+        let (_ctx, peer_id, sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
+        let answered = meerkat_core::InteractionId(uuid::Uuid::new_v4());
+
+        CoreCommsRuntime::send(
+            sender.as_ref(),
+            CommsCommand::PeerMessage {
+                to: meerkat_core::comms::PeerRoute::new(peer_id),
+                body: "reply through the runtime".to_string(),
+                blocks: None,
+                content_taint: None,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                objective_id: None,
+                in_reply_to: Some(answered),
+            },
+        )
+        .await
+        .expect("the runtime sends the reply");
+
+        let candidate = finalize.await.expect("finalization task");
+        assert!(
+            matches!(
+                &candidate.interaction.content,
+                meerkat_core::InteractionContent::Message { in_reply_to: Some(id), .. }
+                    if *id == answered
+            ),
+            "the receiver sees the delivery the reply answers: {:?}",
+            candidate.interaction.content
+        );
+    }
+
+    /// A reply names the delivery it answers: `reply_to_peer` stamps the
+    /// selected capability's id as `in_reply_to`, which the comms runtime
+    /// signs into the envelope. `send_message` answers nothing and stamps
+    /// nothing.
+    #[tokio::test]
+    async fn test_runtime_less_reply_to_peer_names_the_delivery_it_answers() {
+        let (ctx, peer_id, _sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
+        let capability = reply_capability(peer_id, 7);
+        let dispatch_context = reply_dispatch_context(vec![capability.clone()]);
+
+        handle_tools_call_with_context(
+            &ctx,
+            "reply_to_peer",
+            &json!({"body": "on it", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("the runtime-less reply dispatches");
+
+        let candidate = finalize.await.expect("finalization task");
+        assert!(
+            matches!(
+                &candidate.interaction.content,
+                meerkat_core::InteractionContent::Message { in_reply_to: Some(id), .. }
+                    if *id == capability.in_reply_to
+            ),
+            "the receiver sees the delivery the reply answers: {:?}",
+            candidate.interaction.content
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_to_peer_names_the_delivery_it_answers_and_send_message_names_none() {
+        let peer_keypair = Keypair::generate();
+        let (mut ctx, peer_id) = make_trusted_runtime_less_context(&peer_keypair).await;
+        let runtime = Arc::new(RecordingRuntime::new());
+        ctx.runtime = Some(RuntimeCommsCommandHandle::new(runtime.clone()));
+        let capability = reply_capability(peer_id, 7);
+        let dispatch_context = reply_dispatch_context(vec![capability.clone()]);
+
+        handle_tools_call_with_context(
+            &ctx,
+            "reply_to_peer",
+            &json!({"body": "on it", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("single-delivery reply must dispatch without a selector");
+        handle_tools_call_with_context(
+            &ctx,
+            "send_message",
+            &json!({"peer_id": peer_id.to_string(), "body": "fresh", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("send_message dispatches");
+
+        let sent = runtime.sent.lock();
+        let [
+            CommsCommand::PeerMessage {
+                in_reply_to: reply_in_reply_to,
+                ..
+            },
+            CommsCommand::PeerMessage {
+                in_reply_to: send_in_reply_to,
+                ..
+            },
+        ] = sent.as_slice()
+        else {
+            panic!("expected two peer messages, got {sent:?}");
+        };
+        assert_eq!(*reply_in_reply_to, Some(capability.in_reply_to));
+        assert_eq!(*send_in_reply_to, None);
+    }
+
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_without_capability_returns_no_reply_capability() {
         let peer_keypair = Keypair::generate();
@@ -1865,6 +2097,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0, "nothing may be dispatched");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_with_multiple_deliveries_requires_selector() {
         let peer_keypair = Keypair::generate();
@@ -1911,6 +2144,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_with_unknown_selector_returns_unknown_reply_to() {
         let peer_keypair = Keypair::generate();
@@ -1939,9 +2173,261 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0, "nothing may be dispatched");
     }
 
+    /// A delivery id is chosen by its sender, so two senders can carry the
+    /// same one into a turn. A selector matching both must answer ambiguous,
+    /// name both senders and send nothing; before 0.9.4 it routed to
+    /// whichever delivery came first. The governed target resolution uses
+    /// the same selector, so it cannot authorize the first match either.
+    #[tokio::test]
+    async fn reply_to_peer_selector_matching_two_senders_is_ambiguous_and_sends_nothing() {
+        let peer_keypair = Keypair::generate();
+        let (mut ctx, first_sender) = make_trusted_runtime_less_context(&peer_keypair).await;
+        let runtime = Arc::new(RecordingRuntime::new());
+        ctx.runtime = Some(RuntimeCommsCommandHandle::new(runtime.clone()));
+        let second_sender = PeerId::new();
+        let first = reply_capability(first_sender, 31);
+        let mut second = reply_capability(second_sender, 31);
+        second.display_name = Some("other-agent".to_string());
+        let dispatch_context = reply_dispatch_context(vec![first.clone(), second.clone()]);
+        let args = json!({
+            "reply_to": first.in_reply_to.to_string(),
+            "body": "on it",
+            "handling_mode": "queue"
+        });
+
+        let err = handle_tools_call_with_context(&ctx, "reply_to_peer", &args, &dispatch_context)
+            .await
+            .expect_err("a selector matching two senders must not pick one");
+
+        assert!(
+            err.starts_with("ambiguous_reply"),
+            "expected typed ambiguous_reply error, got: {err}"
+        );
+        assert!(
+            err.contains(&first_sender.to_string())
+                && err.contains(&second_sender.to_string())
+                && err.contains("other-agent"),
+            "the ambiguity must name both senders, by id and display name: {err}"
+        );
+        assert_eq!(runtime.sent_len(), 0, "nothing may be dispatched");
+        let target = comms_tool_operation_target("reply_to_peer", &args, &dispatch_context)
+            .expect_err("the governed target of an ambiguous reply has no addressee");
+        assert!(target.starts_with("ambiguous_reply"), "{target}");
+        assert_eq!(
+            select_reply_capability(
+                &dispatch_context
+                    .peer_reply_deliveries()
+                    .expect("well-formed reply context")
+                    .deliveries,
+                Some(&first.in_reply_to.to_string()),
+            ),
+            Err(ReplySelectionError::AmbiguousReply {
+                reply_to: Some(first.in_reply_to.to_string()),
+                candidates: vec![first, second],
+            })
+        );
+    }
+
+    /// The same sender's delivery id appears once, so a selector that matches
+    /// only one sender still routes even when that sender's capability was
+    /// recorded twice (turn start and a later boundary).
+    #[test]
+    fn reply_selector_routes_a_single_sender_matched_twice() {
+        let sender = PeerId::new();
+        let capability = reply_capability(sender, 41);
+        let deliveries = [capability.clone(), capability.clone()];
+        assert_eq!(
+            select_reply_capability(&deliveries, Some(&capability.in_reply_to.to_string())),
+            Ok(&capability)
+        );
+    }
+
+    /// A malformed turn-start reply context fails closed with its own code,
+    /// typed, and never coerces into "no capability".
+    #[test]
+    fn malformed_reply_context_fails_closed_typed() {
+        let context =
+            ToolDispatchContext::default().with_turn_metadata(std::collections::BTreeMap::from([
+                (
+                    COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY.to_string(),
+                    json!({"deliveries": "not a list"}),
+                ),
+            ]));
+        let error = peer_reply_dispatch_context(&context).expect_err("malformed context");
+        assert!(
+            matches!(error, ReplySelectionError::InvalidReplyContext(_)),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().starts_with("invalid_reply_context"),
+            "{error}"
+        );
+    }
+
+    /// Distinct delivery ids from two senders each select their own sender,
+    /// in the selector and in the typed operation target the governed path
+    /// authorizes.
+    #[test]
+    fn reply_selector_routes_distinct_ids_to_their_own_senders() {
+        let first = reply_capability(PeerId::new(), 51);
+        let second = reply_capability(PeerId::new(), 52);
+        let deliveries = [first, second];
+        let dispatch_context = reply_dispatch_context(deliveries.to_vec());
+        for capability in &deliveries {
+            let selector = capability.in_reply_to.to_string();
+            assert_eq!(
+                select_reply_capability(&deliveries, Some(&selector)),
+                Ok(capability)
+            );
+            assert_eq!(
+                comms_tool_operation_target(
+                    "reply_to_peer",
+                    &json!({"reply_to": selector, "body": "on it", "handling_mode": "queue"}),
+                    &dispatch_context,
+                ),
+                Ok(ToolOperationTarget::PeerSend {
+                    peer: capability.peer_id,
+                    kind: PeerSendKind::Message,
+                })
+            );
+        }
+    }
+
+    /// Counts the authorizations governed work prepares, allowing each.
+    struct CountingAllow(Arc<std::sync::atomic::AtomicUsize>);
+    struct CountedAllowed;
+
+    impl meerkat_core::WorkAuthorization for CountingAllow {
+        fn prepare(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(CountedAllowed))
+        }
+    }
+
+    impl meerkat_core::PreparedOperationAuthorization for CountedAllowed {
+        fn review_tier(&self) -> meerkat_core::OperationReviewTier {
+            meerkat_core::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _: &meerkat_core::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    /// Governed work that names no single addressee is refused before
+    /// authorization: a `reply_to` matching two senders' deliveries fails
+    /// plan resolution with the typed `ambiguous_reply` reason, so no
+    /// authorization is prepared and nothing is sent. In the same governed
+    /// context, a selector naming one sender's delivery prepares one
+    /// authorization and delivers once (control).
+    #[tokio::test]
+    async fn governed_ambiguous_reply_is_refused_before_authorization() {
+        let peer_keypair = Keypair::generate();
+        let (ctx, sender) = make_trusted_runtime_less_context(&peer_keypair).await;
+        let runtime = Arc::new(RecordingRuntime::new());
+        let dispatcher: Arc<dyn meerkat_core::AgentToolDispatcher> = Arc::new(
+            crate::agent::dispatcher::CommsToolDispatcher::new_with_runtime(
+                ctx.router.clone(),
+                ctx.trusted_peers.clone(),
+                runtime.clone(),
+            ),
+        );
+        let prepared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared = reply_capability(sender, 61);
+        let mut other = reply_capability(PeerId::new(), 61);
+        other.display_name = Some("other-agent".to_string());
+        let only = reply_capability(sender, 62);
+        let governed = reply_dispatch_context(vec![shared.clone(), other, only.clone()])
+            .with_work_authorization(Some(meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(CountingAllow(Arc::clone(&prepared))),
+                meerkat_core::OperationExecutionScope::Domain,
+            )));
+        let resolution = meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(600),
+                ),
+            ])
+            .expect("valid test deadline chain"),
+        );
+        let reply_args = |capability: &PeerReplyCapability| {
+            serde_json::value::RawValue::from_string(
+                json!({
+                    "reply_to": capability.in_reply_to.to_string(),
+                    "body": "on it",
+                    "handling_mode": "queue"
+                })
+                .to_string(),
+            )
+            .expect("valid args")
+        };
+
+        let ambiguous = reply_args(&shared);
+        let call = meerkat_core::ToolCallView {
+            id: "reply-ambiguous",
+            name: "reply_to_peer",
+            args: &ambiguous,
+        };
+        let resolved = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &governed,
+            &resolution,
+        );
+        assert!(
+            matches!(
+                &resolved,
+                Err(meerkat_core::ToolExecutionResolutionError::InvalidArguments { reason, .. })
+                    if reason.starts_with("ambiguous_reply")
+            ),
+            "{resolved:?}"
+        );
+        assert_eq!(
+            prepared.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no authorization is prepared for an ambiguous reply"
+        );
+        assert_eq!(runtime.sent_len(), 0, "nothing may be dispatched");
+
+        let single = reply_args(&only);
+        let call = meerkat_core::ToolCallView {
+            id: "reply-single",
+            name: "reply_to_peer",
+            args: &single,
+        };
+        let plan = meerkat_core::agent::resolve_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &governed,
+            &resolution,
+        )
+        .expect("a selector naming one sender resolves");
+        meerkat_core::agent::dispatch_tool_execution_plan_fenced(
+            &dispatcher,
+            call,
+            &governed,
+            &plan,
+        )
+        .await
+        .expect("the governed reply to one sender delivers");
+        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(runtime.sent_len(), 1);
+    }
+
     /// Trust is re-validated at dispatch time: a capability naming a peer that
     /// is not (or no longer) trusted must fail closed, never route on the
     /// minted identity alone.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_revalidates_trust_at_dispatch() {
         let peer_keypair = Keypair::generate();
@@ -1969,6 +2455,7 @@ mod tests {
 
     /// A present-but-malformed reply context is a distinct fail-closed error,
     /// never coerced into "no capability" or a successful dispatch.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_rejects_malformed_reply_context() {
         let peer_keypair = Keypair::generate();
@@ -2021,6 +2508,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_resolves_current_turn_image_ref_to_peer_message_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2082,6 +2570,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_request_resolves_current_turn_image_ref_to_peer_request_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2137,6 +2626,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_resolves_blob_image_ref_to_peer_message_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2187,6 +2677,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_request_resolves_blob_image_ref_to_peer_request_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2236,6 +2727,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn blob_image_ref_rejects_current_turn_index() {
         let peer_keypair = Keypair::generate();
@@ -2262,6 +2754,7 @@ mod tests {
         assert_eq!(err, "invalid image_ref: source blob does not accept index");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_synthesizes_body_text_when_blocks_only_reference_image() {
         let peer_keypair = Keypair::generate();
@@ -2316,6 +2809,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_does_not_duplicate_body_when_text_blocks_split_it() {
         let peer_keypair = Keypair::generate();
@@ -2364,6 +2858,7 @@ mod tests {
     /// ROW #94 gate: when a comms message carries blocks, blocks are the single
     /// content authority and the carried `body` is provably a projection of the
     /// text blocks — it cannot diverge from a contradicting `body` input.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_body_is_projection_of_text_blocks_when_blocks_present() {
         let peer_keypair = Keypair::generate();
@@ -2471,6 +2966,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ping_request_projection_send_response_is_accepted_by_tool_boundary() {
         let requester = Keypair::generate();
@@ -2546,6 +3042,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers() {
         let runtime = Arc::new(
@@ -2599,6 +3096,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers_runtime_payload_uses_typed_directory_contract() {
         let peer_id = PeerId::new();
@@ -2636,6 +3134,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers_runtime_less_payload_uses_authorized_sendability() {
         let peer_keypair = Keypair::generate();
@@ -2696,6 +3195,7 @@ mod tests {
     /// once with the typed, model-visible refusal, never a silent wait. A
     /// voice executor told to ask an unwired member reports exactly this
     /// (Turbo S S102 round 1).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_fails_typed_when_recipient_is_not_trusted() {
         let peer_keypair = Keypair::generate();
@@ -2786,6 +3286,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_without_runtime_command_authority_fails_closed() {
         let (ctx, peer_id) = make_runtime_less_trust_only_context().await;
@@ -2809,6 +3310,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_without_runtime_command_authority_fails_closed() {
         let (ctx, peer_id) = make_runtime_less_trust_only_context().await;
@@ -2833,6 +3335,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_unknown_intent_fails_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2860,6 +3363,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_malformed_params_fail_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2888,6 +3392,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_malformed_result_fails_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2917,6 +3422,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_checksum_token_requires_request_subject() {
         let peer_keypair = Keypair::generate();
@@ -2948,6 +3454,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_message_returns_typed_delivery_outcome() {
         let peer_keypair = Keypair::generate();
@@ -2993,6 +3500,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_inproc_send_message_returns_typed_delivery_outcome() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
@@ -3026,6 +3534,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_send_message_rejects_sender_local_blob_before_transport() {
         let (ctx, peer_id, _sender, _receiver, _finalizer) =
@@ -3053,6 +3562,7 @@ mod tests {
         assert!(error.contains("runtime_less_blob_transport_unavailable"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_inproc_fenced_send_has_peer_message_receipt_parity() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
@@ -3091,6 +3601,7 @@ mod tests {
             .expect("fenced tool-send finalization task must complete");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_request_returns_typed_receipt() {
         let peer_keypair = Keypair::generate();
@@ -3132,6 +3643,7 @@ mod tests {
         assert_eq!(params, &bridge_command_json());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_response_returns_typed_receipt() {
         let peer_keypair = Keypair::generate();
@@ -3169,6 +3681,7 @@ mod tests {
         assert_eq!(result, &bridge_reply_json());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_response_resolves_blob_image_ref_to_peer_response_blocks() {
         let peer_keypair = Keypair::generate();
@@ -3218,6 +3731,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_response_accepts_checksum_token_subject() {
         let peer_keypair = Keypair::generate();

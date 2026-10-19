@@ -793,7 +793,10 @@ async fn exercise_a8(server: &Server, barrier: &Arc<EntryBarrier>) {
     let refused_payload: Value = serde_json::from_str(&wire_text(&refused["content"])).unwrap();
     assert_eq!(
         refused_payload,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     assert_eq!(
         wire_text(&result_in(&bodies[3], LAST_CALL)["content"]),
@@ -873,7 +876,7 @@ async fn exercise_a8(server: &Server, barrier: &Arc<EntryBarrier>) {
         .iter()
         .find(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == SECOND_CALL && tool_name == "delete_record"))
         })

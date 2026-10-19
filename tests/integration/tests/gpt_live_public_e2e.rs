@@ -65,10 +65,11 @@ use tokio::time::{Duration, Instant, sleep, timeout};
 
 use support::evidence::{self, Journal, Record as EvidenceRecord, Stage as EvidenceStage};
 use support::{
-    Anchor, BrowserPeer, BrowserPeerProtocol, DisconnectMode, ExplicitScenarioBindingAuthority,
-    FixedConfigSource, JsonlRpcClient, PlayAt, PlaybackHintRelay, TimelineEntry, TimelineKind,
-    delegated_executor_diagnostic, execution_identity, format_timeline, playback_hint_tee,
-    wait_for_events, wait_for_spoken_output,
+    Anchor, AssistantQuiet, BrowserPeer, BrowserPeerProtocol, DisconnectMode,
+    ExplicitScenarioBindingAuthority, FixedConfigSource, JsonlRpcClient, PlayAt,
+    PlaybackAudioPolicy, PlaybackHintRelay, QuestionOnset, QuietObservation, QuietPoll,
+    QuietReport, TimelineEntry, TimelineKind, delegated_executor_diagnostic, execution_identity,
+    format_timeline, playback_hint_tee, wait_for_events, wait_for_spoken_output,
 };
 
 const REALM: &str = "scenario-97-gpt-live-public";
@@ -527,8 +528,7 @@ fn is_user_input(event: &Value) -> bool {
 }
 
 fn is_assistant_output(event: &Value) -> bool {
-    event["type"] == "session.output_transcript.delta"
-        || event["type"] == "session.output_audio.delta"
+    support::is_assistant_output_event(event)
 }
 
 fn is_client_delegation(event: &Value) -> bool {
@@ -668,6 +668,9 @@ struct PublicLiveHarness {
     /// current browser peer (#1638), as a client's notification handler
     /// would.
     playback_hints: PlaybackHintRelay,
+    /// Owned instructions-lane append texts and thinking-lane attempts
+    /// already reported by S99's `context_before_question` metric.
+    s99_context_reported: (usize, usize),
     _temp: tempfile::TempDir,
 }
 
@@ -1691,6 +1694,7 @@ async fn open_public_live_with(
             media_fault_heard_utterances: Vec::new(),
             sign_off_onset_ms: None,
             playback_hints,
+            s99_context_reported: (0, 0),
             _temp: temp,
         });
     }
@@ -1780,6 +1784,7 @@ async fn open_public_live_with(
         media_fault_heard_utterances: Vec::new(),
         sign_off_onset_ms: None,
         playback_hints,
+        s99_context_reported: (0, 0),
         _temp: temp,
     })
 }
@@ -1953,7 +1958,7 @@ async fn run_s97_client_context_vertical(
     // The greeting acknowledgement above fires at the start of the barge-in
     // reply, not its end. Let that reply finish before speaking again; a
     // request spoken into it is a second barge-in the provider may drop.
-    wait_for_assistant_quiet(&mut peer).await?;
+    wait_for_assistant_quiet(&mut peer, Some(&evidence), PlaybackAudioPolicy::BestEffort).await?;
     let before = peer.events().await?.len();
     peer.call(json!({"type":"play","name":"delegation"}))
         .await?;
@@ -3205,6 +3210,44 @@ async fn s99_verify_delegated_lookup(
     readout_contract(&evidence, live, channel, "S99").await
 }
 
+/// Record which owned context reached the provider since the previous S99
+/// question (#1719): append counts per lane, and the first words of each
+/// instructions-lane append text, which stands for the rest of the session.
+/// A delegation's in-progress notice and #1820's finished notices ride
+/// there, so a soak can tell which questions followed which notices.
+fn s99_record_context_before_question(
+    live: &mut PublicLiveHarness,
+    fixture: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let evidence = s99_evidence(live)?.clone();
+    let texts = evidence.instructions_append_attempt_texts()?;
+    let thinking = evidence.owner_appends()?.thinking_attempts;
+    let (reported_texts, reported_thinking) = live.s99_context_reported;
+    let fresh = texts.get(reported_texts..).unwrap_or_default();
+    let heads: Vec<String> = fresh
+        .iter()
+        .map(|text| {
+            text.split_whitespace()
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    record_metric(
+        &evidence,
+        evidence.current_channel()?,
+        "S99",
+        "context_before_question",
+        format!(
+            "fixture={fixture} instructions={} thinking={} instruction_heads={heads:?}",
+            fresh.len(),
+            thinking.saturating_sub(reported_thinking)
+        ),
+    )?;
+    live.s99_context_reported = (texts.len(), thinking);
+    Ok(())
+}
+
 async fn s99_exchange(
     live: &mut PublicLiveHarness,
     fixture: &str,
@@ -3212,9 +3255,11 @@ async fn s99_exchange(
     allow_delegation: bool,
 ) -> Result<S99Exchange, Box<dyn std::error::Error>> {
     s99_assert_unmeasured(live)?;
+    s99_record_context_before_question(live, fixture)?;
     let start = live.peer.events().await?.len();
     let baseline = live.peer.audio_evidence().await?;
     let exchange = s99_evidence(live)?.exchange(start, baseline)?;
+    let (_, before_play) = live.peer.quiet_probe().await?;
     live.peer
         .call(json!({"type":"play","name":fixture}))
         .await?;
@@ -3223,12 +3268,35 @@ async fn s99_exchange(
         exchange,
         timeout_ms: 90_000,
     })?;
+    // Whether the question began while the assistant was still audible
+    // (#1719): decoded playback between the play call and the question's
+    // first input delta. Recorded on every exchange; a failure of a
+    // native-only exchange names it as a harness fault.
+    let mut onset = None;
     loop {
         let events = live.peer.events().await?;
         let user_start = events[start..]
             .iter()
             .position(is_user_input)
             .map(|i| start + i);
+        if onset.is_none() && user_start.is_some() {
+            let (_, at_first_input) = live.peer.quiet_probe().await?;
+            let classified = QuestionOnset::classify(before_play, at_first_input);
+            let evidence = s99_evidence(live)?;
+            record_metric(
+                evidence,
+                evidence.current_channel()?,
+                "S99",
+                "question_onset",
+                format!("fixture={fixture} over_playback={}", classified.label()),
+            )?;
+            onset = Some(classified);
+        }
+        let harness_fault = if onset == Some(QuestionOnset::OverPlayback) {
+            "; harness fault: question spoken over assistant playback"
+        } else {
+            ""
+        };
         if let Some(delegation) = events[start..]
             .iter()
             .find(|event| is_client_delegation(event))
@@ -3253,7 +3321,7 @@ async fn s99_exchange(
             }
             assert!(
                 allow_delegation,
-                "history and correction exchanges must use native voice, not delegated text or TTS"
+                "history and correction exchanges must use native voice, not delegated text or TTS{harness_fault}"
             );
             let audio = live.peer.audio_evidence().await?;
             s99_evidence(live)?.record(EvidenceRecord::ExchangeEnd {
@@ -3337,7 +3405,7 @@ async fn s99_exchange(
                 audio,
             })?;
             return Err(format!(
-                "S99 native exchange lacked fresh matching transcript/decoded speech; fixture={fixture} answer={text:?} audio={audio:?}; {}",
+                "S99 native exchange lacked fresh matching transcript/decoded speech; fixture={fixture} answer={text:?} audio={audio:?}{harness_fault}; {}",
                 live.peer.event_summary(&events[start..])
             ).into());
         }
@@ -3378,13 +3446,30 @@ fn s99_resends_current_answer(append: &str) -> bool {
 /// Let the assistant finish whatever it is saying before the next question,
 /// as a person would: queued context the provider voices after the user
 /// stops speaking must not be mistaken for the reply to the next question.
+/// S99's exchanges require decoded speech, so its wait requires measured
+/// playback too.
 async fn s99_wait_for_assistant_quiet(
     live: &mut PublicLiveHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_assistant_quiet(&mut live.peer).await
+    let (report, waited) = wait_for_assistant_quiet(
+        &mut live.peer,
+        live.evidence.as_ref(),
+        PlaybackAudioPolicy::Required,
+    )
+    .await?;
+    let evidence = s99_evidence(live)?;
+    record_metric(
+        evidence,
+        evidence.current_channel()?,
+        "S99",
+        "quiet_wait",
+        report.describe(waited),
+    )?;
+    Ok(())
 }
 
-/// Wait until the assistant has produced no output event for three seconds.
+/// Wait until the assistant has finished: [`AssistantQuiet`] over the peer's
+/// events, its decoded playback audio and the journal's owned appends.
 ///
 /// The public API keeps the assistant turn open and streams its answer for
 /// seconds after the transcript settles. Speaking into that answer is a
@@ -3392,29 +3477,59 @@ async fn s99_wait_for_assistant_quiet(
 /// the reply to a previous barge-in (observed as a phase with no admitted
 /// user speech at all). A real user waits for the answer to end; so do the
 /// scenarios, at every point where a spoken fixture follows assistant output.
+/// Event arrival alone does not show that end: S99 asked its recall question
+/// into a still-audible readout of delegated results whose cues were still
+/// owed (#1719, Live gate run 39205621248), so playback and the appends that
+/// make the assistant speak again restart the window too.
 async fn wait_for_assistant_quiet(
     peer: &mut BrowserPeer,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Follows the assistant's output to its end: every assistant output
-    // event restarts the quiet window, and the wait ends after 3 s without
-    // one. There is no ceiling while output keeps arriving: a legitimate
-    // long readout (S99's spelled-out pwd, about 28 s in check run 6a779d8e
-    // R2) is not a fault. The scenario's overall deadline still bounds it.
-    const QUIET_FOR: Duration = Duration::from_secs(3);
-    let mut last_len = peer.events().await?.len();
-    let mut quiet_since = Instant::now();
+    journal: Option<&Journal>,
+    policy: PlaybackAudioPolicy,
+) -> Result<(QuietReport, Duration), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut quiet: Option<AssistantQuiet> = None;
     loop {
-        let events = peer.events().await?;
-        if events.len() != last_len {
-            if events[last_len..].iter().any(is_assistant_output) {
-                quiet_since = Instant::now();
+        let (events, audio) = peer.quiet_probe().await?;
+        let owned_appends = match journal {
+            Some(journal) => {
+                let appends = journal.owner_appends()?;
+                Some(appends.thinking_attempts + appends.instructions_attempts)
             }
-            last_len = events.len();
+            None => None,
+        };
+        let seen = QuietObservation {
+            events: &events,
+            audio,
+            owned_appends,
+        };
+        let now = Instant::now();
+        let poll = quiet
+            .get_or_insert_with(|| AssistantQuiet::new(now, &seen, policy))
+            .observe(now, &seen);
+        match poll {
+            QuietPoll::Waiting => sleep(Duration::from_millis(100)).await,
+            QuietPoll::Quiet(report) => {
+                let waited = started.elapsed();
+                println!("GPT_LIVE_QUIET {}", report.describe(waited));
+                return Ok((report, waited));
+            }
+            QuietPoll::Unmeasured => {
+                return Err(
+                    "harness fault: the browser peer does not measure assistant \
+                            playback (no MediaStreamTrackProcessor, or its reader failed), so \
+                            the assistant-quiet wait cannot tell when an answer ends"
+                        .into(),
+                );
+            }
+            QuietPoll::CeilingExceeded(restart) => {
+                return Err(format!(
+                    "harness fault: the assistant-quiet wait ran past {:?}; {restart:?} kept \
+                     restarting it",
+                    AssistantQuiet::CEILING
+                )
+                .into());
+            }
         }
-        if quiet_since.elapsed() >= QUIET_FOR {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -12517,7 +12632,12 @@ async fn run_s98_real_audio_and_context(
     // then after any speech has ended.
     let channel = evidence.current_channel()?;
     wait_typed_turn_mirrored(&mut live, &evidence, channel, S98_TYPED_UPDATE, "S98").await?;
-    wait_for_assistant_quiet(&mut live.peer).await?;
+    wait_for_assistant_quiet(
+        &mut live.peer,
+        Some(&evidence),
+        PlaybackAudioPolicy::BestEffort,
+    )
+    .await?;
     let before_updated_recall = live.peer.events().await?.len();
     let audio_baseline = live.peer.audio_evidence().await?;
     // `recall` asks for the word the user asked to remember, which stays

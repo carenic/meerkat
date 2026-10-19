@@ -3050,7 +3050,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         field = {"confinement_refusal": refusal} if present else {}
         status = {"kind": "external_tool_delta", "phase": "failed",
             "detail": "required execution confinement is unsupported by this backend", **field}
-        payload = {"operation": "reload", "target": "local-server", "persisted": True,
+        payload = {"operation": "reload", "target": "local-server", "settled": True,
             "status_info": status}
         event = parse_event({"type": "tool_config_changed", "payload": payload})
         assert isinstance(event, ToolConfigChanged)
@@ -3058,7 +3058,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         assert event.payload.status_info.phase == "failed"
         assert event.payload.status_info.confinement_refusal == (refusal if present else None)
         for block in [
-            {"type": "mcp", "server_id": "local-server", "phase": "failed", "persisted": True, **field},
+            {"type": "mcp", "server_id": "local-server", "phase": "failed", "settled": True, **field},
             {"type": "tool_config", "payload": payload},
         ]:
             message = {"role": "system_notice", "kind": "mcp", "body": "Continue with available tools.",
@@ -3069,7 +3069,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
 
 @pytest.mark.parametrize("refusal", ["future_reason", "", 7, False, {}, []])
 def test_malformed_mcp_refusal_preserves_raw_event_without_hiding_sibling(refusal):
-    payload = {"operation": "add", "target": "local-server", "persisted": True,
+    payload = {"operation": "add", "target": "local-server", "settled": True,
         "status_info": {"kind": "external_tool_delta", "phase": "failed", "confinement_refusal": refusal}}
     raw = {"type": "tool_config_changed", "payload": payload}
     events = [parse_event(value) for value in [raw, {"type": "text_delta", "delta": "permitted sibling"}]]
@@ -3111,7 +3111,7 @@ def test_parse_tool_config_changed():
                 "visible_changed": False,
                 "revision": 9,
             },
-            "persisted": False,
+            "settled": True,
             "applied_at_turn": 7,
         },
     }
@@ -3123,7 +3123,7 @@ def test_parse_tool_config_changed():
     assert event.payload.status_info.base_changed is True
     assert event.payload.status_info.visible_changed is False
     assert event.payload.status_info.revision == 9
-    assert event.payload.persisted is False
+    assert event.payload.settled is True
     assert event.payload.applied_at_turn == 7
 
 
@@ -3145,7 +3145,7 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": True,
+            "settled": True,
             "applied_at_turn": "oops",
         },
     }
@@ -3154,20 +3154,108 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
     assert event.payload.applied_at_turn is None
 
 
-def test_parse_tool_config_changed_with_non_boolean_persisted():
+@pytest.mark.parametrize("field", ["settled", "persisted"])
+def test_parse_tool_config_changed_with_non_boolean_settled(field):
     raw = {
         "type": "tool_config_changed",
         "payload": {
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": "false",
+            field: "false",
         },
     }
     event = parse_event(raw)
     assert isinstance(event, UnknownEvent)
     assert event.type == "malformed_event"
     assert event.data == raw
+
+
+def test_parse_tool_config_changed_derives_settled_from_status_info():
+    """rkat-rpc derives the lifecycle fact from ``status_info``. Payloads
+    stored by 0.9.3 and earlier are served back with their ``persisted``,
+    which was ``False`` for changes that had already applied; only a status
+    this SDK does not know falls back to the stored bit."""
+    boundary = {
+        "kind": "boundary_applied",
+        "base_changed": True,
+        "visible_changed": True,
+        "revision": 2,
+    }
+    catalog = {
+        "kind": "deferred_catalog_delta",
+        "added_hidden_count": 1,
+        "removed_hidden_count": 0,
+        "pending_source_count": 0,
+    }
+    failed_closed = {"kind": "warning_failed_closed", "error": "scope refused"}
+
+    def delta(phase):
+        return {"kind": "external_tool_delta", "phase": phase}
+
+    for status_info, fields, settled in [
+        (boundary, {"persisted": False}, True),
+        (catalog, {"persisted": False}, True),
+        (failed_closed, {"persisted": False}, True),
+        (boundary, {"settled": True}, True),
+        (delta("pending"), {"persisted": True}, False),
+        (delta("draining"), {"settled": True}, False),
+        (delta("applied"), {"persisted": False}, True),
+        (delta("forced"), {"settled": False}, True),
+        (delta("failed"), {"persisted": False}, True),
+        (delta("pending"), {"settled": False, "persisted": True}, False),
+        ({"kind": "a_later_kind"}, {"settled": True}, True),
+        ({"kind": "a_later_kind"}, {"persisted": False}, False),
+        ({"kind": "a_later_kind"}, {"settled": False, "persisted": True}, False),
+        (delta("a_later_phase"), {"persisted": True}, True),
+    ]:
+        raw = {
+            "type": "tool_config_changed",
+            "payload": {
+                "operation": "add",
+                "target": "filesystem",
+                "status_info": status_info,
+                **fields,
+            },
+        }
+        event = parse_event(raw)
+        assert isinstance(event, ToolConfigChanged), (status_info, fields)
+        assert event.payload.settled is settled, (status_info, fields)
+    raw = {
+        "type": "tool_config_changed",
+        "payload": {"operation": "add", "target": "filesystem", "status_info": boundary},
+    }
+    event = parse_event(raw)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"
+    assert event.data == raw
+
+
+def test_tool_config_transcript_blocks_read_settled_or_persisted():
+    """Stored notices from rkat-rpc 0.9.3 and earlier carry ``persisted``."""
+    status_info = {"kind": "external_tool_delta", "phase": "applied"}
+    for fields in [{"settled": True}, {"persisted": False}]:
+        payload = {"operation": "add", "target": "local-server", "status_info": status_info, **fields}
+        for block in [
+            {"type": "tool_config", "payload": payload},
+            {"type": "mcp", "server_id": "local-server", **fields},
+        ]:
+            message = {"role": "system_notice", "kind": "mcp", "body": "Tools changed.",
+                "blocks": [block], "created_at": "2026-05-26T10:00:00Z"}
+            parsed = MeerkatClient._parse_session_message(message)
+            assert MeerkatClient._serialize_transcript_rewrite_message(parsed) == message
+    for block in [
+        {"type": "tool_config", "payload": {"operation": "add", "target": "local-server",
+            "status_info": status_info}},
+        {"type": "mcp", "settled": "false"},
+        {"type": "mcp", "persisted": "false"},
+    ]:
+        with pytest.raises(MeerkatError) as error:
+            MeerkatClient._parse_session_message({
+                "role": "system_notice", "kind": "mcp", "blocks": [block],
+                "created_at": "2026-05-26T10:00:00Z",
+            })
+        assert error.value.code == "INVALID_RESPONSE", block
 
 
 def test_parse_background_job_completed_uses_typed_terminal_status():
@@ -3270,6 +3358,53 @@ def test_parse_turn_completed_with_usage():
     assert event.usage.input_tokens == 50
     assert event.usage.output_tokens == 20
     assert event.usage.cache_creation_tokens is None
+
+
+def test_parse_run_failed_content_filtered_reason():
+    """A content-filtered failure keeps its typed stop and the provider's
+    tagged detail; a missing or malformed detail reads as absent, and an
+    unknown stop falls back to an unknown reason (#1888)."""
+    detail = {
+        "provider": "gemini",
+        "stage": "prompt",
+        "reason": "BLOCKLIST",
+        "blocked_categories": ["HARM_CATEGORY_HARASSMENT"],
+    }
+
+    def run_failed(reason):
+        return parse_event(
+            {
+                "type": "run_failed",
+                "session_id": "s1",
+                "error_report": {
+                    "class": "content_filtered",
+                    "message": "Content filtered on turn 1",
+                    "reason": reason,
+                },
+            }
+        )
+
+    event = run_failed(
+        {"reason_type": "content_filtered", "stop": "content_filter", "detail": detail}
+    )
+    assert isinstance(event, RunFailed)
+    assert event.error_report.reason.reason_type == "content_filtered"
+    assert event.error_report.reason.stop == "content_filter"
+    assert event.error_report.reason.detail == detail
+    assert event.error_report.reason["stop"] == "content_filter"
+
+    for raw_detail in (None, "not an object", {"stage": "prompt"}):
+        reason = {"reason_type": "content_filtered", "stop": "refusal"}
+        if raw_detail is not None:
+            reason["detail"] = raw_detail
+        event = run_failed(reason)
+        assert event.error_report.reason.reason_type == "content_filtered"
+        assert event.error_report.reason.stop == "refusal"
+        assert event.error_report.reason.detail is None
+
+    event = run_failed({"reason_type": "content_filtered", "stop": "a_future_stop"})
+    assert event.error_report.reason.reason_type == "unknown"
+    assert event.error_report.reason.raw_reason_type == "content_filtered"
 
 
 def test_parse_run_failed_preserves_policy_stop():
@@ -3394,10 +3529,22 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "add",
                     "target": "filesystem",
                     "status": "staged",
+                    "settled": "false",
+                },
+            },
+            "non-boolean settled must not become false",
+        ),
+        (
+            {
+                "type": "tool_config_changed",
+                "payload": {
+                    "operation": "add",
+                    "target": "filesystem",
+                    "status": "staged",
                     "persisted": "false",
                 },
             },
-            "non-boolean persisted must not become false",
+            "non-boolean persisted from rkat-rpc 0.9.3 must not become false",
         ),
         (
             {
@@ -3406,7 +3553,7 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "bogus",
                     "target": 0,
                     "status": 0,
-                    "persisted": "false",
+                    "settled": "false",
                 },
             },
             "malformed operation/status semantics must not become an empty typed payload",
@@ -5809,6 +5956,125 @@ async def test_wait_mob_members_carry_preview_unavailable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hook_call",
+    [
+        "select_destination",
+        "select_agent_mandate",
+        "prepare_member_surface",
+        "verify_member_surface",
+    ],
+)
+async def test_mob_member_status_surfaces_registration_refusal(hook_call):
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": hook_call,
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["registration_refusal"] == hook_call
+    assert status["status"] == "broken"
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_omits_absent_or_null_registration_refusal():
+    client = MeerkatClient()
+    responses = [
+        {},
+        {"registration_refusal": None},
+    ]
+
+    for extra in responses:
+
+        async def fake_request(_method, _params, extra=extra):
+            return {
+                "status": "active",
+                "member_ref": _make_member_ref("mob-1", "agent-a"),
+                "tokens_used": 3,
+                "is_final": False,
+                **extra,
+            }
+
+        client._request = fake_request  # type: ignore[method-assign]
+        status = await client.mob_member_status("mob-1", "agent-a")
+        assert "registration_refusal" not in status
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_rejects_unknown_registration_refusal():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": "SelectDestination",
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match="invalid registration_refusal"):
+        await client.mob_member_status("mob-1", "agent-a")
+
+    async def fake_object_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": {"kind": "select_destination"},
+        }
+
+    client._request = fake_object_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match="invalid registration_refusal"):
+        await client.mob_member_status("mob-1", "agent-a")
+
+
+@pytest.mark.asyncio
+async def test_wait_mob_members_carry_registration_refusal():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "members": [
+                {
+                    "agent_identity": "lead",
+                    "status": "broken",
+                    "tokens_used": 0,
+                    "is_final": False,
+                    "registration_refusal": "select_destination",
+                },
+                {
+                    "agent_identity": "writer",
+                    "status": "active",
+                    "tokens_used": 7,
+                    "is_final": False,
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    for members in (
+        await client.wait_mob_kickoff("mob-1"),
+        await client.wait_mob_ready("mob-1"),
+    ):
+        assert members[0]["registration_refusal"] == "select_destination"
+        assert "registration_refusal" not in members[1]
+
+
+@pytest.mark.asyncio
 async def test_mob_member_status_rejects_unknown_peer_connectivity_tag():
     client = MeerkatClient()
 
@@ -6792,6 +7058,7 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
         WireLiveAdapterObservationError,
         WireLiveAdapterObservationReady,
         WireLiveAdapterObservationStatusChanged,
+        WireLiveAdapterObservationTurnFailed,
         WireLiveAdapterObservationTurnInterrupted,
         WireLiveAdapterObservationUserContentCommitted,
     )
@@ -6805,6 +7072,30 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     assert WireLiveAdapterObservationStatusChanged in union_members
     assert WireLiveAdapterObservationTurnInterrupted in union_members
     assert WireLiveAdapterObservationUserContentCommitted in union_members
+    # #1883: a response that ended without completing is its own variant.
+    assert WireLiveAdapterObservationTurnFailed in union_members
+    failed_hints = get_type_hints(WireLiveAdapterObservationTurnFailed)
+    assert get_args(failed_hints["observation"]) == ("turn_failed",)
+    # #1883: the failure is typed by name, so a client routes on
+    # `failure.status`; an unrecognized status arrives as `unknown.debug`.
+    from meerkat import WireLiveResponseFailure, WireLiveResponseFailureStatus
+
+    assert failed_hints["failure"] is WireLiveResponseFailure
+    failure_hints = get_type_hints(WireLiveResponseFailure)
+    assert failure_hints["status"] == WireLiveResponseFailureStatus
+    status_members = get_args(WireLiveResponseFailureStatus)
+    known_statuses = {
+        value
+        for member in status_members
+        if get_origin(member) is Literal
+        for value in get_args(member)
+    }
+    assert known_statuses == {"failed", "incomplete", "in_progress"}
+    (unknown_status,) = [
+        member for member in status_members if get_origin(member) is not Literal
+    ]
+    unknown_payload = get_type_hints(unknown_status)["unknown"]
+    assert get_type_hints(unknown_payload)["debug"] is str
     # Sanity: each variant is tagged on `observation` with the snake_case
     # discriminator value.
     audio_hints = get_type_hints(WireLiveAdapterObservationAssistantAudioChunk)
@@ -8747,3 +9038,108 @@ def test_generated_claim_token_fields_stay_out_of_repr():
     assert token not in repr(created)
     assert token not in repr(params)
     assert "m1" in repr(created)
+
+
+def test_parse_compaction_completed_summary_source():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.summary_source is None
+
+    trimmed = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "trimmed", "through": "tool_results"},
+        },
+    })
+    assert isinstance(trimmed, CompactionCompleted)
+    assert trimmed.summary_source == CompactionSummarySource(
+        kind="provider_call",
+        source_bound=SummarizationSourceBound(kind="trimmed", through="tool_results"),
+    )
+
+    requests_only = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "requests_only", "kept": 3, "of": 40},
+        },
+    })
+    assert requests_only.summary_source.source_bound == SummarizationSourceBound(
+        kind="requests_only", kept=3, of=40,
+    )
+
+    curator = parse_event({**base, "summary_source": {"kind": "host_curator"}})
+    assert curator.summary_source == CompactionSummarySource(kind="host_curator")
+
+
+def test_parse_compaction_completed_estimated_history_tokens_after():
+    from meerkat.events import CompactionCompleted
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.estimated_history_tokens_after is None
+    assert parse_event({**base, "estimated_history_tokens_after": None}) == legacy
+
+    reported = parse_event({**base, "estimated_history_tokens_after": 9_800})
+    assert isinstance(reported, CompactionCompleted)
+    assert reported.estimated_history_tokens_after == 9_800
+
+    for malformed in ("9800", -1, True, 1.5):
+        event = parse_event({**base, "estimated_history_tokens_after": malformed})
+        assert isinstance(event, UnknownEvent)
+        assert event.type == "malformed_event"
+
+
+def test_parse_compaction_completed_unknown_summary_source_kinds():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    future_source = {"kind": "future_author", "detail": 1}
+    event = parse_event({**base, "summary_source": future_source})
+    assert isinstance(event, CompactionCompleted)
+    assert event.summary_source == CompactionSummarySource(
+        kind="unknown", raw_kind="future_author", raw=future_source,
+    )
+
+    future_bound = {"kind": "sampled", "ratio": 2}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_bound},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="sampled", raw=future_bound,
+    )
+
+    future_stage = {"kind": "trimmed", "through": "attachments"}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_stage},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="trimmed", raw=future_stage,
+    )
+
+    malformed = {**base, "summary_source": "provider_call"}
+    event = parse_event(malformed)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"

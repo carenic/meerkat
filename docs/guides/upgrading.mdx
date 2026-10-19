@@ -19,7 +19,7 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
   patch connects without complaint. Upgrade `rkat-rpc`, `meerkat-sdk`,
   `@rkat/sdk` and `@rkat/web` together.
 - **Bump Rust pins together.** The `meerkat*` crates are versioned in lock
-  step: move every `=0.8.x` pin at once.
+  step: move every `=0.9.x` pin at once.
 - **Expect one-way migrations.** A release can migrate durable state forward
   the first time it opens it, after which older binaries refuse it. Each
   release section below says whether it does.
@@ -54,6 +54,377 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
 - `rkat doctor` passes.
 - `rkat storage doctor` reports no new problems.
 - An SDK `connect()` succeeds.
+
+## Upgrading to 0.9.4
+
+This section is for systems running 0.9.3. The full list of changes is in
+the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
+0.9.3: on 0.8.x, read their CHANGELOG sections as well.
+
+### Before you upgrade
+
+- **There is no downgrade to 0.9.3 once 0.9.4 has written to a runtime
+  store.** 0.9.4 writes stored input state at version 7, including any input
+  row it read at an older version, and a 0.9.3 or older binary refuses a
+  version 7 row (it leaves the stored bytes in place). 0.9.4 still reads rows
+  that 0.9.0 to 0.9.3 wrote (version 6).
+- **Other records 0.9.3 cannot read back:**
+  - a session event log that holds a content-filtered `run_failed` event
+    (see [Refusals and content filters](#refusals-and-content-filters));
+  - an authorization grant journal that holds an owner-scoped resource-domain
+    restriction (0.9.3 refuses to restore that grant owner with
+    `RestartRequired`);
+  - a session transcript that holds a tool-configuration notice 0.9.4 wrote
+    (a tool-scope, deferred-catalog or failed-closed notice; see
+    [Tool configuration events](#tool-configuration-events));
+  - a session that recorded a failed realtime response (realtime sidecar
+    event schema 4; 0.9.3 refuses it with "unsupported realtime event schema
+    4"; see [Realtime responses that fail](#realtime-responses-that-fail)).
+- **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
+  fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
+  downloads its own matching `rkat-rpc` only when you supply none, so this
+  happens when it runs a binary you supply: `MEERKAT_BIN_PATH`, an explicit
+  path, or an `rkat-rpc` on `PATH` (for example one Homebrew upgraded).
+  SDKs older than 0.9.4 also do not know the `turn_failed` live observation
+  or the `assistant_turn_failed` transcript event.
+- **Upgrade every process that shares a runtime store together:** stop them
+  all, back up the state root, then start 0.9.4 on all of them (steps 1, 2
+  and 5 of [How to upgrade](#how-to-upgrade)).
+
+### Breaking changes and what to do
+
+#### Skill frontmatter
+
+`SKILL.md` frontmatter is parsed by a new YAML parser (serde-saphyr), which
+refuses frontmatter the old parser accepted:
+
+- a key given twice, at any level (a top-level extension key or a `metadata`
+  key; the old parser kept the last value);
+- a null `description`, or a null value under `metadata` (`~` or an empty
+  value);
+- an unrecognized tag such as `!custom`, anywhere;
+- nesting deeper than 64 levels, or 100 or more aliases that outnumber their
+  anchors more than ten to one;
+- a `...` document end marker line.
+
+**Do:** remove duplicate keys, give `description` and every `metadata` key a
+value, drop custom tags and `...` lines. A block scalar (`|`, `>`) that ends
+the frontmatter now keeps its final line break.
+
+Extension values read back through `SkillDocument.extensions` are rendered by
+the new parser. A structured value's YAML uses double quotes where a string
+needs quoting (`'1.10'` is now `"1.10"`), and some unquoted scalars now
+resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, `tRUE` is
+`true`, an integer past u64 is a float, `1e999` is `.inf`, and a `!!binary`
+value is decoded. **Do:** quote a value that must stay text, such as a file
+mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
+
+#### Mobs
+
+- **`MobHandle::shutdown` now closes the mob's admission** before its
+  teardown, as its contract says. From the moment a Shutdown is admitted, a
+  spawn, respawn, work submission, flow run, wiring change, host bind, live
+  commit, resume, reset, reload or owner lease is refused with
+  `MobError::AdmissionClosed` (reason `shutdown`). If the Shutdown later
+  fails, those commands stay refused for the actor's life; Stop, Shutdown and
+  Destroy stay available.
+- **Other requests during a Shutdown's drain** (Stop, Destroy, Complete, a
+  read, a status probe) get the new `MobError::ShutdownInProgress` instead of
+  `MobError::ActorCommandChannelClosed`. It is retryable, with the authority
+  retained (wire code `SessionBusy`). `ActorCommandChannelClosed` now means
+  the actor has exited or is exiting.
+- **Owner leases end with the mob.** `MobHandle::acquire_owner` is refused
+  with `MobError::AdmissionClosed` once a destroy is admitted (reason
+  `destroyed`), after a durability fail-stop (`durability fail-stop`), after
+  the actor task is lost (`actor lost`), and after a composition dispatch
+  failure stops the actor (`dispatch failure`). A mob restored with a durable
+  destroy marker starts with admission closed.
+- **Do:** treat `AdmissionClosed` as final for that mob and retry
+  `ShutdownInProgress` later. `MobError` is now `#[non_exhaustive]`: add a
+  wildcard arm to any exhaustive match on it. `MobAdmissionCloseReason` gains
+  `Shutdown`, `Destroyed`, `DurabilityFailStop`, `ActorLost` and
+  `DispatchFailed`.
+- **Child tool bundle opt-in** (Rust hosts): the new
+  `ChildToolBundleAvailability::ChildOffered` offers a bundle to child mobs
+  without supplying it. A child mob's inline profile mounts it by naming it in
+  `tools.bundles`; a name the host does not offer is refused with the new
+  `MobError::ToolBundleNotOffered`. `ChildToolBundleAvailability` and
+  `ChildMcpServerRegistrationError` are now `#[non_exhaustive]` (add a
+  wildcard arm), and `ToolConfig` and the wire `MobToolConfigInput` gain
+  `bundles` (set it in struct literals, or build `ToolConfig` with
+  `..ToolConfig::default()`).
+- **A member unregister a Shutdown left pending can be followed:**
+  `MemberShutdownOutcome::UnregisterPending` carries a `settlement`
+  (`MemberUnregisterSettlement`) and is `#[non_exhaustive]`; match it with
+  `{ stage, .. }`. `settlement.try_state()` reads where the unregister stands
+  and `settle_within(deadline)` waits for it, also after the actor exited
+  (`MemberUnregisterState`: `Settled`, `Pending`, `Failed`, or `HandedOver`
+  when a later owner took the registration over).
+
+#### Tool configuration events
+
+- The lifecycle bit of tool configuration changes is named `settled`, not
+  `persisted`: `tool_config_changed` event payloads, stored `tool_config`
+  notices and `mcp` notice blocks that 0.9.4 builds carry `settled`. Rows and
+  events stored by 0.9.3 and earlier keep `persisted` when they are read back,
+  replayed or served in history. The bit says whether the change is a settled
+  lifecycle fact; whether a configuration write happened is still the
+  `persisted` of `mcp/add`, `mcp/remove` and `mcp/reload`, which keep their
+  name.
+- The tool-scope, deferred-catalog and failed-closed events and the MCP
+  restore-refusal delta now report `settled: true` where they reported
+  `persisted: false`: each is a change that has already applied or failed.
+- **Do:** accept either key when you read stored notices. The Python and
+  TypeScript SDKs expose `ToolConfigChangedPayload.settled` (it was
+  `persisted`) and derive it from `status_info`. In Rust, read
+  `ToolConfigChangedPayload::settled()`, `ExternalToolDelta::settled()` and
+  `SystemNoticeBlock::lifecycle_settled()`; `ToolConfigChangedPayload::new`
+  takes no lifecycle argument, `SystemNoticeBlock::Mcp` carries
+  `lifecycle_bit`, and `meerkat-mcp`'s
+  `ExternalToolSurfaceEffect::EmitExternalToolDelta` carries `settled`.
+
+#### Refusals and content filters
+
+- **A provider refusal or content filter now fails the run as
+  `content_filtered`**, with the stop the provider ended on (`refusal` or
+  `content_filter`) and the provider's own detail when it sent one. An OpenAI
+  refusal is no longer committed as the answer, an Anthropic refusal carries
+  its `stop_details`, and a Gemini prompt blocked before any candidate fails
+  after one call instead of being retried.
+- **Wire change:** `error_report.reason` of a content-filtered `run_failed`
+  event is now
+  `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` (it was
+  `null`; `detail` is omitted when the provider sent none).
+  SDKs older than 0.9.4 keep it as an unknown, raw reason.
+- **`web_search`:** a search the provider refused or filtered, one that filled
+  its context window and a cancelled one now come back `failed`, naming the
+  stop reason, with no answer. A search cut at its output cap (`max_tokens`)
+  or paused by the provider (`pause_turn`) keeps its status and answer, and
+  its `error` now says the answer may be incomplete.
+- **Do (Rust):** build `LlmDoneOutcome::Success` with
+  `LlmDoneOutcome::success(stop_reason)` or `success_with_detail(..)` and match
+  it with `Success { stop_reason, .. }`. `AgentError::ContentFiltered` gains
+  `stop` and `detail` (a pattern that names `turn` without `..` needs them),
+  and `AgentErrorReason`, an exhaustive enum, gains
+  `ContentFiltered { stop, detail }`: add the arm to every `match` on it.
+
+#### Realtime responses that fail
+
+- **A realtime response the provider ends without completing it** (OpenAI
+  `response.done` with status `failed` or `in_progress`, or `incomplete` for
+  a reason other than `max_output_tokens` or `content_filter`) now arrives as
+  the `turn_failed` live observation with its typed `failure.status`. 0.9.3
+  reported it as a completed turn and committed its partial text as an
+  ordinary reply, and a failed response without usage closed the channel.
+- It is not terminal: the channel stays open, nothing of the response is
+  committed (the transcript records `assistant_turn_failed`), a WebRTC peer
+  stops its queued audio, and Meerkat neither cancels nor retries it. Usage
+  the provider reported is charged; otherwise the session event stream
+  carries `turn_usage_accounting_unmeasured`.
+- **Do:** route on `failure.status` (`failed`, `incomplete`, `in_progress`,
+  or `{"unknown": {"debug": ...}}`), treat the provider's `reason`, `code`
+  and `message` as diagnostics, and decide in the client whether to ask
+  again. Upgrade the SDKs with the server.
+- **Do (Rust):** `RealtimeSessionEvent` gains
+  `TurnFailed { response_id, failure, accounting }`,
+  `RealtimeTranscriptEvent` gains `AssistantTurnFailed { response_id }` and
+  `RealtimeTranscriptStopReasonKind` gains `Failed`; all are exhaustive, so
+  add the arms. `LiveProjectionSink` gains the required method
+  `signal_turn_failed(session_id, response_id, failure, accounting)`.
+
+#### Changing the model of a running session
+
+`Agent::replace_client`, `Agent::replace_client_with_request_policy` and the
+ephemeral service's `SessionService::set_session_client` no longer change the
+session's model: a client, or a request-policy model, whose provider or model
+differs from the session's durable identity is refused with
+`AgentError::ClientModelChangeRequiresHotSwap` before anything changes.
+
+**Do:** change the model with `Agent::hot_swap_llm_identity` or
+`SessionService::hot_swap_session_llm_identity`. A replacement client for the
+same model, and any client on a session without a durable identity, is
+accepted as before.
+
+#### Custom compactors
+
+`Compactor::prepare_for_summarization` takes the summarizing model's source
+budget and returns the source with its bound:
+`(messages: &[Message], budget: Option<SummarizationSourceBudget>) ->
+SummarizationSource`. It has no default implementation.
+
+**Do:** to keep the old behaviour, return
+`SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+and ignore the budget. To fit the summarizing model, bound the source by the
+budget and report the bound, as `DefaultCompactor` does. A
+`CompactionContext` built by hand sets `last_rewrite_history_tokens: None`.
+
+The compaction types around it change too:
+
+- `SessionCompactionCadence` gains `last_rewrite_history_tokens` (set it in
+  struct literals).
+- `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source` and `estimated_history_tokens_after` (patterns without
+  `..` need them).
+- `CompactionSummarySource` is `#[non_exhaustive]` (add a wildcard arm), and
+  its `ProviderCall` variant carries the call's `source_bound`.
+
+#### Governed realms and authorization (Rust hosts)
+
+- `StockGovernance::bind_prompt` binds only a prompt of the local operator
+  (`Input::Prompt`); any other input is refused with
+  `StockGovernanceError::RequesterUnsupported` before anything is written.
+  **Do:** bind an outcome your own process reports (for example a connector
+  finalization submitted as an external event) with the new
+  `StockGovernance::bind_host_outcome`.
+- A host-authenticated stock composition refuses its own stock ingress
+  principal as a requester, as it already refused the operator.
+- `SessionAgentMandate::new` drops its `catalog` argument
+  (`new(executor, servers, represented_subject)`) and must select at least one
+  MCP server (`AgentMandateError::NoSelection` otherwise).
+  `SessionAgentMandate::catalog_lineage` and `AgentGrantRefs::catalog_lineage`
+  are removed.
+- `ExecutionRestrictions.resource_domains` is a `DomainRestriction`: build it
+  with `DomainRestriction::{unrestricted, exact, owned_by, unresolved}` and
+  read it with `DomainRestriction::bound`. Exact and unrestricted bounds keep
+  their wire bytes.
+- `AuditObservation` is `#[non_exhaustive]`, `AuditObservation::Refused`
+  gains `read`, and `AuditPolicyRead` gains `publication_instance`.
+- `OperationRefused` equality includes whether the refused call's tool code
+  ran (`OperationRefused::dispatch`): compare `kind()` and `dispatch()`
+  instead of comparing with `OperationRefused::new(kind)`.
+- A model-reviewed (R2) tool call whose owner publication changes during its
+  review is prepared again and reviewed once more, as a second review attempt
+  for the same `tool_call_id`, where 0.9.3 settled it as `review_unsatisfied`
+  (`context_changed`). An `OperationReviewObserver` can therefore see an
+  attempt retired as `ContextChanged` followed by a second attempt (the audit
+  shows a second `ReviewAttemptStarted`). **Do:** do not treat that
+  retirement as the call's final outcome; only the last attempt settles it.
+- A governed helper admission fence and a helper child issuance that refuse
+  to rebuild (`ReprepareRequired`) now answer `Unavailable` instead of
+  `Denied`: a later attempt may succeed. A denial and malformed facts stay
+  `Denied`.
+
+#### Runtime and registration (Rust hosts)
+
+- `ConfiguredMcpAttachmentProvider::configured` and
+  `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
+  session's exact `RuntimeSessionRegistrationWitness` instead of its
+  `SessionId`; read the id with `registration.session_id()`.
+- `AuthenticatedOriginalSource::retained_original` is replaced by
+  `retained_custody`, which returns `RetainedCustody` (`Retained`,
+  `AdmissionPending` or `NotRetained`). Answer `NotRetained` where you
+  answered `None`.
+- `ContinuationAdmitError` and `BlockedDeliveryReason` gain
+  `NotReady(ControllerReadinessFailure)`; `ContinuationAdmitError` is
+  `#[non_exhaustive]`, and `BlockedDeliveryReason`'s variants no longer have
+  defined discriminants (an `as` cast on it no longer compiles). The wire
+  `WireControllerReadinessFailure` gains `original_admission_pending`, which a
+  Rust decoder built before 0.9.4 rejects.
+- `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` (wrap
+  it in `std::panic::AssertUnwindSafe` to move it into `catch_unwind`), and
+  `SqliteMobObserverDrainReport` gains `retained_registrations`.
+- `RuntimeDeliveryOwnerRetirement::join` returns a `#[must_use]`
+  `RuntimeDeliveryOwnerRetired` report instead of `()`: match `Ok(_)` or read
+  the report.
+- GPT Live adapters: `LiveDelegationNarrationKind` gains `FinishedPending`
+  and `GptLiveBrokerObservation` gains `InstructionsContextAppendWithdrawn`
+  (both appended last), and `LiveSidebandProviderCommand` gains
+  `NoteDelegationFinishedContext`, which a provider adapter lowers or
+  refuses. An exhaustive match needs the new arms.
+
+#### Generated machine types
+
+Struct literals and exhaustive matches over generated machine types need the
+new fields and variants: `SessionPersistenceVersionAuthorityMachineState`
+gains `stored_input_state_migration_v6`; `MobMachineState` and the kernel
+`State` gain `identity_generation_highwater` and
+`identity_generation_highwater_sealed`; the mob machine signals and kernel
+transition ids gain the identity generation high-water variants, appended
+last.
+
+### Other behaviour changes
+
+- **Compaction is sized for the model that writes the summary.** The summary
+  source may take two bytes per token of that model's context window left
+  after `max_summary_tokens` (capped by a declared input ceiling, at least
+  4 KiB), instead of a quarter of the compaction threshold. With the default threshold that is about ten times
+  more, so a summary call can cost more input tokens on a large window; it
+  never costs more than the history being compacted plus the compaction
+  prompt.
+- **Compaction no longer pays for a summary at every boundary** when no
+  rewrite can get the history under the threshold (for example when the
+  System rows alone exceed an explicit `auto_compact_threshold`). It waits for
+  its cadence and logs a warning that names the remedies.
+- The `compaction_completed` event reports the summary's source
+  (`summary_source`) and the estimated history left
+  (`estimated_history_tokens_after`).
+- **Multiprocess hosting** no longer refuses a runtime store whose file
+  notifications cannot be registered (an inotify watch limit, for example):
+  the store watch's sweep is the cross-process wake.
+- **Work that names an original its source owner has not settled yet** is
+  reported not ready (`ControllerReadinessUnavailable` with
+  `original_admission_pending`) and stays retryable, instead of being refused
+  as malformed or denied.
+- **Fixed known issue:** stores no longer refuse to open with "schema domain
+  ... has no ledger row but already owns objects" when another process
+  creates the same schema domain at that moment.
+- **macOS:** starting a SQLite change watch no longer waits for FSEvents
+  registration, which held the first mob storage open for over 30 seconds.
+- **Governed tool refusals tell the model whether the tool ran:** the
+  `operation_refused` tool result carries `data`
+  `{"kind": ..., "tool_invoked": false | "unknown"}`. Neither field grants
+  anything; a new call is a new operation. A mob member upcall refusal with
+  no known kind now reads as `operation_authorization_unavailable`, not
+  `operation_refused` with `malformed_facts`.
+- **SQLite session store:** a whole-blob session compacted more often than
+  `history_retained_rewrites` (default 4) is laid out instead of refused.
+- **Public GPT Live:** a delegation result held behind the user's unanswered
+  question first sends a finished notice, so the voice model no longer says
+  the work is still in progress.
+- **Session forks:** a child of `session/fork_at` or `session/fork_replace`
+  now gets a build state derived from its source's and can run a turn. It
+  carries the source's session configuration, without the source's
+  `shell_env`, MCP attachments or mob operator authority (see
+  [What a fork child inherits](/api/rpc#what-a-fork-child-inherits)). A
+  source with session metadata but no build state is refused before anything
+  is committed (`INVALID_PARAMS`, data kind
+  `fork_source_build_state_missing`). A child forked by 0.9.3 that never ran
+  a turn still fails `turn/start` with "missing session build state": fork
+  its source again.
+- **`@rkat/sdk`:** a Node process that calls `MeerkatClient.close()` exits as
+  soon as it has nothing else to do, instead of about 5 seconds later.
+- **SDK clients and a child that exits:** the TypeScript and Python clients
+  settle on the `rkat-rpc` child's exit, not on its output pipes closing, so
+  requests to a child that exited by itself fail within about a second
+  (`PROCESS_EXITED` in TypeScript, `CONNECTION_CLOSED` in Python) and
+  `close()` returns once the child has exited.
+- **Published crates:** `cargo test` in an unpacked published Meerkat crate
+  passes (`meerkat`, `meerkat-runtime` and `meerkat-mob` with the features
+  their README prints), and `rkat` builds without its default features.
+
+### Upgrade checklist
+
+1. Stop every 0.9.3 process that shares a runtime store.
+2. Back up the realm state root; there is no downgrade to 0.9.3 after 0.9.4
+   writes to it.
+3. Upgrade the binaries, the Python and TypeScript SDKs and the Rust crates
+   together, then start 0.9.4 on all of those processes.
+4. Fix `SKILL.md` frontmatter the new parser refuses (duplicate keys, null
+   values, custom tags, `...` lines), and quote extension values that must
+   stay text (`'0755'`).
+5. Handle `MobError::AdmissionClosed` and `MobError::ShutdownInProgress`, and
+   add wildcard arms for the non-exhaustive mob errors.
+6. Read `content_filtered` run failures with their typed reason, and stop
+   treating refusal text as an answer.
+7. Move model changes on a running session to `hot_swap_llm_identity`.
+8. Update custom compactors for the new `prepare_for_summarization`.
+9. Governed hosts: bind host-reported outcomes with `bind_host_outcome`, and
+   do not treat a review attempt retired as `ContextChanged` as the call's
+   final outcome.
+10. Read tool configuration changes by `settled` (accepting `persisted` on
+    rows stored before 0.9.4).
+11. Realtime clients: handle the `turn_failed` observation, and add the new
+    arms and `signal_turn_failed` in Rust.
 
 ## Upgrading to 0.8.51
 
@@ -189,7 +560,8 @@ lost.
   by your own deadline (for example below a Kubernetes termination grace
   period).
 - While a Shutdown runs, commands other than a second Shutdown get
-  `ActorCommandChannelClosed`. Treat it as "mob shutting down".
+  `ActorCommandChannelClosed`. Treat it as "mob shutting down". (0.9.4
+  changes these answers; see [Mobs](#mobs) under Upgrading to 0.9.4.)
 - A retirement that started and failed answers `MemberRetirementStuck`.
   **Do:** call `MobHandle::redrive_retirement` or resume the mob.
 - A spawn that completes into a Stopped mob leaves it Stopped and holds the

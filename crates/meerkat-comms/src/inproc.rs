@@ -831,10 +831,12 @@ mod tests {
     /// delivery semantics rather than accidentally asserting the deadline.
     const TEST_PARK_BOUND: Duration = Duration::from_secs(30);
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox() -> (Inbox, crate::InboxSender) {
         classified_inbox_with_auth(false)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_with_auth(require_peer_auth: bool) -> (Inbox, crate::InboxSender) {
         Inbox::new_classified(test_support::classification_context(
             TrustStore::new(),
@@ -842,6 +844,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_with_runtime() -> (
         Inbox,
         crate::InboxSender,
@@ -860,6 +863,7 @@ mod tests {
         (inbox, sender, Arc::new(finalizer))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_runtime_finalization(
         inbox: Arc<Inbox>,
         finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
@@ -916,6 +920,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_register_and_lookup() {
         let registry = InprocRegistry::new();
@@ -938,6 +943,7 @@ mod tests {
         assert!(registry.get_by_pubkey(&pubkey).is_some());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_rejects_zero_pubkey_registration() {
         let registry = InprocRegistry::new();
@@ -951,6 +957,7 @@ mod tests {
         assert!(registry.get_by_pubkey(&zero_pubkey).is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_zero_pubkey_registration_does_not_shadow_valid_name() {
         let registry = InprocRegistry::new();
@@ -976,6 +983,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_unregister() {
         let registry = InprocRegistry::new();
@@ -997,6 +1005,7 @@ mod tests {
         assert!(!removed_again);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_replace_on_same_pubkey() {
         let registry = InprocRegistry::new();
@@ -1020,6 +1029,7 @@ mod tests {
 
     /// There is no takeover opt-in left: a name held by another live key is
     /// refused and the incumbent's maps are untouched.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_refuses_same_name_different_pubkey() {
         let registry = InprocRegistry::new();
@@ -1063,6 +1073,7 @@ mod tests {
             blocks: None,
             body: body.to_string(),
             handling_mode: None,
+            in_reply_to: None,
         }
     }
 
@@ -1071,6 +1082,7 @@ mod tests {
     /// routes stay live and both deliver. Namespaces are the isolation seam;
     /// nothing about a same-name neighbour in another namespace may unbind a
     /// live route.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn same_name_in_distinct_namespaces_keeps_both_routes_and_both_deliver() {
         let registry = InprocRegistry::new();
@@ -1149,7 +1161,11 @@ mod tests {
             (second_candidate, "to realm two"),
         ] {
             match candidate.interaction.content {
-                meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks: None,
+                    in_reply_to: _,
+                } => {
                     assert_eq!(body, expected);
                 }
                 other => panic!("expected Message interaction, got {other:?}"),
@@ -1162,6 +1178,7 @@ mod tests {
     /// incumbent only found out by no longer receiving peer messages. The
     /// registration is now refused before any mutation, and there is no
     /// takeover opt-in for any registrant to reach for.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn same_name_in_one_namespace_refuses_takeover_and_incumbent_still_delivers() {
         let registry = InprocRegistry::new();
@@ -1237,7 +1254,11 @@ mod tests {
         ));
         let candidate = finalize.await.expect("incumbent finalizer completes");
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "incumbent keeps routing");
             }
             other => panic!("expected Message interaction, got {other:?}"),
@@ -1277,6 +1298,7 @@ mod tests {
     /// Now the second claim is refused and the PREDECESSOR keeps receiving. The
     /// delivery leg is the point: this asserts a live route, not a surviving map
     /// entry.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn same_key_registration_over_a_live_route_leaves_the_predecessor_receiving() {
         let registry = InprocRegistry::new();
@@ -1343,7 +1365,11 @@ mod tests {
             .await
             .expect("predecessor finalizer completes");
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "after the refused claim");
             }
             other => panic!("expected Message interaction, got {other:?}"),
@@ -1366,6 +1392,7 @@ mod tests {
     ///    resolving and now resolves to the newest generation, and the
     ///    superseded predecessor's later generation-checked unregistration (its
     ///    `Drop`) cannot unbind the successor.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn same_identity_generational_move_goes_through_the_replacing_seam_only() {
         let registry = InprocRegistry::new();
@@ -1447,6 +1474,7 @@ mod tests {
     /// A name released by its holder is reusable by a *different* identity: the
     /// refusal is a liveness boundary on the incumbent route, not a permanent
     /// reservation of the name.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn a_released_name_is_claimable_by_a_different_identity() {
         let registry = InprocRegistry::new();
@@ -1509,6 +1537,7 @@ mod tests {
     /// live name over, because the caller has to present the predecessor
     /// generation it is replacing. A caller that presents a stale generation is
     /// refused and the live route is untouched.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn exact_generation_replacement_is_the_authorized_reconstruction_seam() {
         let registry = InprocRegistry::new();
@@ -1577,6 +1606,7 @@ mod tests {
     /// ROW #292 gate: registration returns a typed [`RegistrationOutcome`] that
     /// surfaces its own rename, name occupancy and zero-pubkey rejection,
     /// instead of silently evicting and returning `()`.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn registration_outcome_is_typed_for_rename_and_rejection() {
         let registry = InprocRegistry::new();
@@ -1635,6 +1665,7 @@ mod tests {
     /// released and re-registered under a new identity, a late unregister from
     /// the old owner (its `Drop`) must be a safe no-op rather than unbinding
     /// the successor.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_aba_scenario_safe() {
         let registry = InprocRegistry::new();
@@ -1689,6 +1720,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_peer_names_in_namespace() {
         let registry = InprocRegistry::new();
@@ -1713,6 +1745,7 @@ mod tests {
         assert!(registry.peer_names_in_namespace("realm-other").is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_peers_snapshot() {
         let registry = InprocRegistry::new();
@@ -1727,6 +1760,7 @@ mod tests {
         assert_eq!(peers[0].pubkey, pubkey);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_clear() {
         let registry = InprocRegistry::new();
@@ -1742,6 +1776,7 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_registry_send_delivers_to_inbox() {
         let registry = InprocRegistry::new();
@@ -1768,6 +1803,7 @@ mod tests {
                     blocks: None,
                     body: "hello inproc".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -1787,13 +1823,18 @@ mod tests {
             sender_keypair.public_key().to_pubkey_string()
         );
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "hello inproc");
             }
             other => panic!("expected Message interaction, got {other:?}"),
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retrying_same_envelope_deduplicates_before_exact_claim_commit() {
         let registry = InprocRegistry::new();
@@ -1809,6 +1850,7 @@ mod tests {
             blocks: None,
             body: "stable retry".to_string(),
             handling_mode: None,
+            in_reply_to: None,
         };
 
         let first_finalize = spawn_runtime_finalization(Arc::clone(&inbox), Arc::clone(&finalizer));
@@ -1878,6 +1920,7 @@ mod tests {
         assert!(correlation.existing_runtime_input_id.is_some());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn response_preserves_legacy_queued_inproc_semantics() {
         let registry = InprocRegistry::new();
@@ -1936,6 +1979,7 @@ mod tests {
             blocks: None,
             body: body.to_string(),
             handling_mode: None,
+            in_reply_to: None,
         }
     }
 
@@ -1946,6 +1990,7 @@ mod tests {
     ///
     /// The bounded park must return a fact that is neither a drop nor a
     /// success: the envelope IS queued and may still be drained later.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn parked_inproc_sender_resolves_when_receiver_drain_dies() {
         let registry = InprocRegistry::new();
@@ -2011,6 +2056,7 @@ mod tests {
 
     /// Companion: a drain that is alive but never claims (stalled, not dead)
     /// parks the sender at exactly the same await. Same bound, same fact.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn inproc_sender_park_is_bounded_when_drain_never_claims() {
         let registry = InprocRegistry::new();
@@ -2053,6 +2099,7 @@ mod tests {
     /// Expiry BEFORE admission is not ambiguous - nothing was delivered - so it
     /// keeps the existing typed `InboxFull` fact rather than claiming the
     /// envelope reached the peer.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn inproc_sender_capacity_park_is_bounded_when_receiver_never_drains() {
         let registry = InprocRegistry::new();
@@ -2125,6 +2172,7 @@ mod tests {
     /// The park bound here is deliberately huge, so the only way this test can
     /// finish inside its outer deadline is if `Response` never waits on a
     /// drain that does not exist.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn response_inproc_send_never_waits_for_a_receiver_drain() {
         let registry = InprocRegistry::new();
@@ -2166,6 +2214,7 @@ mod tests {
         drop(inbox);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn supervisor_bridge_request_is_auth_exempt_volatile_control() {
         let registry = InprocRegistry::new();
@@ -2245,6 +2294,7 @@ mod tests {
                     blocks: None,
                     body: "hello".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2254,6 +2304,7 @@ mod tests {
         assert!(matches!(result, Err(InprocSendError::PeerNotFound(_))));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_registry_send_inbox_closed() {
         let registry = InprocRegistry::new();
@@ -2278,6 +2329,7 @@ mod tests {
                     blocks: None,
                     body: "hello".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2287,6 +2339,7 @@ mod tests {
         assert!(matches!(result, Err(InprocSendError::InboxClosed)));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_registry_namespace_isolation_for_lookup_and_send() {
         let registry = InprocRegistry::new();
@@ -2328,6 +2381,7 @@ mod tests {
                     blocks: None,
                     body: "hello scoped".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2354,6 +2408,7 @@ mod tests {
                     blocks: None,
                     body: "should not deliver".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2364,6 +2419,7 @@ mod tests {
         finalize.await.expect("runtime finalizer completes");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_to_pubkey_in_namespace_ignores_display_name_collision() {
         let registry = InprocRegistry::new();
@@ -2403,6 +2459,7 @@ mod tests {
                     blocks: None,
                     body: "hello canonical".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2423,6 +2480,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, delivery.envelope_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_to_pubkey_any_namespace_rejects_ambiguous_identity() {
         let registry = InprocRegistry::new();
@@ -2458,6 +2516,7 @@ mod tests {
                     blocks: None,
                     body: "ambiguous identity".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2469,6 +2528,7 @@ mod tests {
         assert!(beta_inbox.try_drain_classified().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_same_name_can_exist_in_different_namespaces() {
         let registry = InprocRegistry::new();
@@ -2511,6 +2571,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_global_registry() {
         // Access global registry
@@ -2531,6 +2592,7 @@ mod tests {
         registry.unregister(&keypair.public_key());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_register_with_meta() {
         let registry = InprocRegistry::new();
@@ -2557,6 +2619,7 @@ mod tests {
         assert_eq!(peers[0].meta, meta);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_registry_peers_returns_default_meta_for_plain_register() {
         let registry = InprocRegistry::new();

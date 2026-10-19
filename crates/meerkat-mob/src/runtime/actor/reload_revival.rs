@@ -773,13 +773,7 @@ impl MobActor {
                 .member_revival_pending
                 .contains(&identity)
             && let Err(error) = self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
-                    agent_identity: identity,
-                    reason: format!(
-                        "machine-authorized revival of bridge session '{}' failed: {error}",
-                        work.session_id,
-                    ),
-                },
+                Self::member_revival_failure_signal(identity, &work.session_id, &error).0,
                 "resolve_warm_revival_failure",
             )
         {
@@ -813,11 +807,20 @@ impl MobActor {
                     bridge_session_id: Some(work.session_id.clone()),
                     reason: reason.clone(),
                     hold,
+                    registration_refusal: None,
                 },
             )
             .await;
             if hold.is_some() {
                 work.reply(Err(error));
+                return;
+            }
+            if let Some(refusal) = self.recorded_registration_refusal(
+                &work.entry.agent_identity,
+                Some(work.session_id.clone()),
+                reason.clone(),
+            ) {
+                work.reply(Err(refusal));
                 return;
             }
             work.reply(Err(MobError::MemberRestoreFailed {

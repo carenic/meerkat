@@ -20,6 +20,8 @@ exclude = [
     "tests/fixtures/v0_8_10_recovery_migration_session.provenance.json",
     # Its integration test embeds the two files above, so it is excluded too.
     "tests/v0_8_10_recovery_migration.rs",
+    # needs meerkat-machine-schema, which depends on this crate
+    "tests/session_document_strict_read_parity.rs",
 ]
 
 [dependencies]
@@ -65,8 +67,17 @@ __meerkat-facade-agent-factory-build = []
 __meerkat-generated-authority-bridge = []
 __meerkat-live-authority-bridge = []
 test-support = []
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-core = { path = ".", features = ["workspace-tests"] }
 # Path-only (no version): dev-deps that cycle back to meerkat-core are
 # stripped from the published tarball, which is the canonical cargo answer
 # to dev-dependency cycles (consumers never see dev-deps).

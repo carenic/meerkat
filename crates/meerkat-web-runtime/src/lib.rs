@@ -897,7 +897,8 @@ fn session_error_envelope(e: meerkat_core::SessionError) -> serde_json::Value {
         | meerkat_core::SessionError::DurableEvidenceQuarantined { .. }
         | meerkat_core::SessionError::WholeBlobAuditedEndpointDivergence { .. }
         | meerkat_core::SessionError::ServedElsewhere { .. }
-        | meerkat_core::SessionError::HostingUnavailable { .. } => {
+        | meerkat_core::SessionError::HostingUnavailable { .. }
+        | meerkat_core::SessionError::ForkInstructionRefused(_) => {
             let mut envelope = e.structured_data().unwrap_or_else(|| serde_json::json!({}));
             if let serde_json::Value::Object(map) = &mut envelope {
                 map.insert(

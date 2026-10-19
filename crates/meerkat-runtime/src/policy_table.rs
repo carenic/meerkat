@@ -74,9 +74,27 @@ pub(crate) fn generated_admission_projection_for_kind(
         kind.kind(),
         None,
         mm_dsl::AdmissionContinuationKind::Ordinary,
-        mm_dsl::AdmissionTurnAppendShape::Untyped,
+        kind_projection_turn_append_shape(kind.kind()),
         runtime_idle,
     )
+}
+
+/// The turn-append shape a per-kind projection reports, with no input at
+/// hand: admission refuses `Untyped` for a content kind and a typed shape for
+/// any other kind, so a content kind reports the fail-closed `FollowUpOnly`
+/// and every other kind `Untyped`.
+fn kind_projection_turn_append_shape(kind: InputKind) -> mm_dsl::AdmissionTurnAppendShape {
+    match kind {
+        InputKind::Prompt
+        | InputKind::PeerMessage
+        | InputKind::PeerRequest
+        | InputKind::FlowStep
+        | InputKind::ExternalEvent => mm_dsl::AdmissionTurnAppendShape::FollowUpOnly,
+        InputKind::PeerResponseProgress
+        | InputKind::PeerResponseTerminal
+        | InputKind::Continuation
+        | InputKind::Operation => mm_dsl::AdmissionTurnAppendShape::Untyped,
+    }
 }
 
 fn generated_admission_projection(
@@ -209,5 +227,97 @@ mod tests {
         assert_eq!(running.apply_mode, ApplyMode::StageRunStart);
         assert_eq!(running.wake_mode, WakeMode::InterruptYielding);
         assert_eq!(generated_default_policy_version(), idle.policy_version);
+    }
+
+    /// Admission pairs the turn-append shape with the input kind: a content
+    /// kind (prompt, peer message, request or lifecycle notice, external
+    /// event, flow step) carries a typed shape, every other kind `Untyped`.
+    /// A content kind admitted `Untyped` would resolve request-only as a
+    /// steer and reach one model request without a transcript row.
+    #[test]
+    fn admission_refuses_an_untyped_shape_for_a_content_kind() {
+        use mm_dsl::{AdmissionContinuationKind, AdmissionTurnAppendShape, InputLane};
+        let admit = |kind: InputKind,
+                     lane: Option<InputLane>,
+                     shape: AdmissionTurnAppendShape,
+                     runtime_idle: bool| {
+            generated_admission_projection(
+                format!("shape-guard:{kind:?}:{lane:?}:{shape:?}:{runtime_idle}"),
+                kind,
+                lane,
+                AdmissionContinuationKind::Ordinary,
+                shape,
+                runtime_idle,
+            )
+        };
+        for runtime_idle in [true, false] {
+            for kind in [
+                InputKind::Prompt,
+                InputKind::PeerMessage,
+                InputKind::PeerRequest,
+                InputKind::ExternalEvent,
+                InputKind::FlowStep,
+            ] {
+                for lane in [None, Some(InputLane::Queue), Some(InputLane::Steer)] {
+                    assert!(
+                        admit(kind, lane, AdmissionTurnAppendShape::Untyped, runtime_idle).is_err(),
+                        "{kind:?} on {lane:?} (idle {runtime_idle}) admitted Untyped"
+                    );
+                    for shape in [
+                        AdmissionTurnAppendShape::FollowUpOnly,
+                        AdmissionTurnAppendShape::InTurnEligible,
+                    ] {
+                        assert!(
+                            admit(kind, lane, shape, runtime_idle).is_ok(),
+                            "{kind:?} on {lane:?} (idle {runtime_idle}) refused {shape:?}"
+                        );
+                    }
+                }
+            }
+            for kind in [
+                InputKind::PeerResponseProgress,
+                InputKind::PeerResponseTerminal,
+                InputKind::Continuation,
+                InputKind::Operation,
+            ] {
+                assert!(
+                    admit(kind, None, AdmissionTurnAppendShape::Untyped, runtime_idle).is_ok(),
+                    "{kind:?} (idle {runtime_idle}) refused Untyped"
+                );
+                for shape in [
+                    AdmissionTurnAppendShape::FollowUpOnly,
+                    AdmissionTurnAppendShape::InTurnEligible,
+                ] {
+                    assert!(
+                        admit(kind, None, shape, runtime_idle).is_err(),
+                        "{kind:?} (idle {runtime_idle}) admitted {shape:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every kind still resolves its per-kind policy projection.
+    #[test]
+    fn every_kind_resolves_its_policy_projection() {
+        for kind in [
+            InputKind::Prompt,
+            InputKind::PeerMessage,
+            InputKind::PeerRequest,
+            InputKind::PeerResponseProgress,
+            InputKind::PeerResponseTerminal,
+            InputKind::FlowStep,
+            InputKind::ExternalEvent,
+            InputKind::Continuation,
+            InputKind::Operation,
+        ] {
+            for runtime_idle in [true, false] {
+                assert!(
+                    DefaultPolicyTable::try_resolve_by_kind(KindId::new(kind), runtime_idle)
+                        .is_ok(),
+                    "{kind:?} (idle {runtime_idle})"
+                );
+            }
+        }
     }
 }

@@ -446,6 +446,49 @@ fn test_credential_store(
     }
 }
 
+/// This crate's unit tests hold an [`AppState`] one test at a time.
+///
+/// Plain `cargo test` runs the unit tests as threads of one process, as many
+/// at once as the host has cores, and nearly every one builds an `AppState`
+/// over SQLite stores. The bundled SQLite counts each allocation under one
+/// process-wide mutex (its memory statistics, on by default), and states
+/// working at once turn that mutex into a convoy. On a 192-core host the
+/// suite passed in 43 s one test at a time; with every test at once, and
+/// still with eight states at once, it took 580 to 1290 s, creates missed
+/// their 10 s bound and explicit stops outlived the runtime's 2 s caller
+/// grace (`RuntimeStopInProgress`). nextest runs each test in its own process
+/// and never shares the mutex. A test thread takes the permit with the first
+/// state it builds and keeps it until the thread exits, so a test that builds
+/// a second state (a restart) never waits on itself. The permit belongs to the
+/// thread, so a test builds every state on its own thread: under a
+/// multi-thread runtime, a state built inside a spawned task (on a worker
+/// thread) would wait forever for the permit the test thread holds.
+#[cfg(test)]
+mod test_state_admission {
+    use std::cell::RefCell;
+
+    use tokio::sync::{Semaphore, SemaphorePermit};
+
+    const CONCURRENT_TEST_STATES: usize = 1;
+
+    static PERMITS: Semaphore = Semaphore::const_new(CONCURRENT_TEST_STATES);
+
+    thread_local! {
+        static HELD: RefCell<Option<SemaphorePermit<'static>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) async fn admit() {
+        if HELD.with(|held| held.borrow().is_some()) {
+            return;
+        }
+        let permit = match PERMITS.acquire().await {
+            Ok(permit) => permit,
+            Err(closed) => unreachable!("the test state permits are never closed: {closed}"),
+        };
+        HELD.with(|held| *held.borrow_mut() = Some(permit));
+    }
+}
+
 impl AppState {
     pub async fn load() -> Result<Self, Box<dyn std::error::Error>> {
         Self::load_with_bootstrap_and_options(RuntimeBootstrap::default(), false).await
@@ -586,6 +629,8 @@ impl AppState {
         confinement: Option<meerkat_core::LaunchConfinement>,
         customize: impl FnOnce(AgentFactory) -> AgentFactory + Send,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        test_state_admission::admit().await;
         let (event_tx, _) = broadcast::channel(256);
         // Realm-id-first dual-root resolution through the storage layout
         // (the single path authority; the layout's realm-root candidates arm
@@ -9757,6 +9802,8 @@ mod tests {
             summary: Some("Peer terminal response".to_string()),
             payload: None,
             content: Vec::new(),
+            delivery_id: None,
+            in_reply_to: None,
         }];
         let content = CoreRenderable::SystemNotice {
             kind: meerkat_core::types::SystemNoticeKind::Comms,
@@ -9884,9 +9931,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -9934,9 +9979,7 @@ mod tests {
                     ),
                 });
                 yield Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 });
             })
         }
@@ -9978,11 +10021,10 @@ mod tests {
     }
 
     fn hooks_override_fixture() -> HookRunOverrides {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/hooks/run_override.json");
-        let payload = std::fs::read_to_string(path).expect("hook override fixture must exist");
-        serde_json::from_str::<HookRunOverrides>(&payload)
-            .expect("hook override fixture must deserialize")
+        serde_json::from_str::<HookRunOverrides>(
+            meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON,
+        )
+        .expect("hook override fixture must deserialize")
     }
 
     fn self_hosted_test_config(inline_video: bool) -> Config {
@@ -15376,9 +15418,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }

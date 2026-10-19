@@ -248,6 +248,7 @@ fn drain(rx: &mut mpsc::Receiver<AgentEvent>) -> ObservedRun {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn turn_rows_cover_every_call_while_the_run_total_is_session_cumulative() {
     assert_eq!(
@@ -561,6 +562,7 @@ impl AgentLlmClient for StructuredOutputClient {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn every_request_of_a_structured_output_run_publishes_one_usage_row() {
     let schema = meerkat_core::OutputSchema::new(serde_json::json!({
@@ -650,6 +652,7 @@ async fn every_request_of_a_structured_output_run_publishes_one_usage_row() {
 /// Guards the agent's normalized run baseline: on a pre-0.8.22 session the
 /// first run's `run_usage` is that run's calls, not `None` and not the legacy
 /// raw sums.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn legacy_session_first_run_reports_its_own_run_usage() {
     let client = Arc::new(ScriptedAnthropicClient::new(vec![DocumentedCall {

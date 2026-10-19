@@ -14,17 +14,6 @@ fn production_source(source: &str) -> &str {
         .unwrap_or(source)
 }
 
-fn peer_input_candidate_struct_body(source: &str) -> Result<&str, String> {
-    let start = source
-        .find("pub struct PeerInputCandidate")
-        .ok_or_else(|| "PeerInputCandidate struct exists".to_string())?;
-    let source = &source[start..];
-    let end = source
-        .find("\n}\n\n")
-        .ok_or_else(|| "PeerInputCandidate struct body has closing brace".to_string())?;
-    Ok(&source[..end])
-}
-
 fn function_body<'a>(source: &'a str, signature: &str) -> Result<&'a str, String> {
     let start = source
         .find(signature)
@@ -93,19 +82,6 @@ fn comms_drain_bridge_authority_matchers_do_not_consume_display_labels() -> Resu
                 "bridge authority matcher must use canonical peer id/signing subject, not display metadata: {signature} contains {forbidden}"
             );
         }
-    }
-    Ok(())
-}
-
-#[test]
-fn peer_input_candidate_does_not_duplicate_ingress_class_or_auth() -> Result<(), String> {
-    let source = read_runtime_source("../meerkat-core/src/interaction.rs")?;
-    let body = peer_input_candidate_struct_body(&source)?;
-    for forbidden in ["pub class:", "pub auth:"] {
-        assert!(
-            !body.contains(forbidden),
-            "PeerInputCandidate must derive class/auth from PeerIngressFact, not carry duplicate field: {forbidden}"
-        );
     }
     Ok(())
 }

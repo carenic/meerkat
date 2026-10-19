@@ -13,6 +13,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(feature = "test-support")]
 mod support;
 
 use meerkat::{
@@ -412,6 +413,7 @@ async fn send_peer_message_direct(
             body: body.to_string(),
             blocks: None,
             handling_mode: HandlingMode::Steer,
+            in_reply_to: None,
         })
         .await
         .expect("direct peer message send");
@@ -3188,4 +3190,105 @@ async fn mob_retirement_recovers_reload_required_runtime_before_normal_archive()
             "durable recovery and retirement must retain exactly one '{token}': {history}"
         );
     }
+}
+
+/// A delivery scope captured before a mob reset names an incarnation the
+/// reset ended. After a cold restart, an explicit Resume of the same session
+/// mints a later incarnation (the generation high-water survives the reset),
+/// so the old scope is refused as stale and retires nothing, although its
+/// session is the member's binding again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_from_before_a_reset_never_retires_the_resumed_member() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.id = MobId::from("reset-scope-mob");
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+
+    // ---------------- Lifetime 1: spawn, capture the scope, reset ---------
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    let worker = AgentIdentity::from("w-reset-scope");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("spawn before the reset");
+    let old_scope = handle_1
+        .capture_member_delivery_scope(&worker)
+        .await
+        .expect("capture the scope before the reset");
+    handle_1.reset().await.expect("reset the mob");
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    drop(handle_1);
+    drop(service_1);
+
+    // ---------------- Lifetime 2: resume, Resume the old session ----------
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store.clone());
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume mob after the reset and a cold restart");
+    handle_2
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", worker.clone())
+                .with_resume_bridge_session_id(old_scope.session_id().clone()),
+        )
+        .await
+        .expect("resume the reset member's session");
+    let resumed = handle_2
+        .capture_member_delivery_scope(&worker)
+        .await
+        .expect("capture the resumed member's scope");
+    assert_eq!(
+        resumed.session_id(),
+        old_scope.session_id(),
+        "the resumed incarnation holds the old session"
+    );
+    assert!(
+        resumed.generation() > old_scope.generation(),
+        "the resumed incarnation is a later one: {resumed:?} after {old_scope:?}"
+    );
+
+    let error = handle_2
+        .retire_at_scope(&old_scope)
+        .await
+        .expect_err("a scope from before the reset must not retire the resumed member");
+    assert!(
+        matches!(
+            &error,
+            meerkat_mob::MobError::StaleFenceToken { runtime_id, .. }
+                if runtime_id == old_scope.runtime_id()
+        ),
+        "the old scope is refused as stale: {error:?}"
+    );
+    assert!(
+        handle_2
+            .get_member(&worker)
+            .await
+            .expect("read the roster")
+            .is_some(),
+        "the resumed member stays"
+    );
+
+    handle_2.shutdown().await.expect("final shutdown");
 }

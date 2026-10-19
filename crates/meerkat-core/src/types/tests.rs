@@ -367,6 +367,8 @@ fn peer_terminal_notice_projection_does_not_default_missing_status() {
         summary: None,
         payload: Some(json!({"ok": true})),
         content: Vec::new(),
+        delivery_id: None,
+        in_reply_to: None,
     };
 
     let projection = block.model_projection_text();
@@ -451,6 +453,8 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
         }],
+        delivery_id: None,
+        in_reply_to: None,
     };
 
     let undeclared = block(None);
@@ -486,6 +490,122 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
 }
 
 #[test]
+fn comms_message_notice_renders_in_reply_to_after_the_delivery_id() {
+    // A reply names the delivery it answers as an `In reply to` line after
+    // its own `Delivery ID`; the declared-taint marker stays the last line.
+    let delivery = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5e));
+    let answered = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5f));
+    let block = |in_reply_to, sender_taint| SystemNoticeBlock::Comms {
+        kind: CommsNoticeKind::Message,
+        direction: SystemNoticeDirection::Incoming,
+        peer: Some(SystemNoticePeer {
+            id: crate::comms::PeerId::new(),
+            display_name: Some("Peer A".to_string()),
+        }),
+        sender_taint,
+        request_id: None,
+        intent: None,
+        status: None,
+        summary: Some("Peer message".to_string()),
+        payload: None,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }],
+        delivery_id: Some(delivery),
+        in_reply_to,
+    };
+
+    let without = block(None, None).model_projection_text();
+    let with = block(Some(answered), None).model_projection_text();
+    assert!(!without.contains("In reply to"), "{without}");
+    assert_eq!(with, format!("{without}\nIn reply to: {answered}"));
+    let tainted = block(
+        Some(answered),
+        Some(crate::comms::SenderContentTaint::Tainted),
+    )
+    .model_projection_text();
+    assert_eq!(
+        tainted,
+        format!("{with}\n[sender declared this content tainted]")
+    );
+
+    // The field rides the wire only when present, and round-trips.
+    let wire = serde_json::to_value(block(Some(answered), None)).unwrap();
+    assert_eq!(wire["in_reply_to"], json!(answered.to_string()));
+    assert!(
+        serde_json::to_value(block(None, None))
+            .unwrap()
+            .get("in_reply_to")
+            .is_none()
+    );
+    let decoded: SystemNoticeBlock = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        decoded,
+        SystemNoticeBlock::Comms {
+            in_reply_to: Some(id),
+            ..
+        } if id == answered
+    ));
+}
+
+#[test]
+fn comms_message_notice_renders_its_delivery_id_before_the_taint_marker() {
+    // The id `reply_to_peer` takes as `reply_to` is model-visible on the
+    // message notice it names; a notice without one renders as before, and
+    // the declared-taint marker stays the last line.
+    let delivery = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5e));
+    let block = |delivery_id, sender_taint| SystemNoticeBlock::Comms {
+        kind: CommsNoticeKind::Message,
+        direction: SystemNoticeDirection::Incoming,
+        peer: Some(SystemNoticePeer {
+            id: crate::comms::PeerId::new(),
+            display_name: Some("Peer A".to_string()),
+        }),
+        sender_taint,
+        request_id: None,
+        intent: None,
+        status: None,
+        summary: Some("Peer message".to_string()),
+        payload: None,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }],
+        delivery_id,
+        in_reply_to: None,
+    };
+
+    let without = block(None, None).model_projection_text();
+    let with = block(Some(delivery), None).model_projection_text();
+    assert!(!without.contains("Delivery ID"), "{without}");
+    assert_eq!(with, format!("{without}\nDelivery ID: {delivery}"));
+
+    let tainted = block(
+        Some(delivery),
+        Some(crate::comms::SenderContentTaint::Tainted),
+    )
+    .model_projection_text();
+    assert_eq!(
+        tainted,
+        format!("{with}\n[sender declared this content tainted]")
+    );
+
+    // The field rides the wire only when present, and round-trips.
+    let wire = serde_json::to_value(block(Some(delivery), None)).unwrap();
+    assert_eq!(wire["delivery_id"], json!(delivery.to_string()));
+    assert!(
+        serde_json::to_value(block(None, None))
+            .unwrap()
+            .get("delivery_id")
+            .is_none()
+    );
+    let decoded: SystemNoticeBlock = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        decoded,
+        SystemNoticeBlock::Comms { delivery_id: Some(id), .. } if id == delivery
+    ));
+}
+
+#[test]
 fn comms_block_round_trips_through_wire_with_typed_peer_id() {
     // The peer routing identity is typed but serializes as a hyphenated UUID
     // string on the wire, so persisted transcripts stay byte-stable.
@@ -504,6 +624,8 @@ fn comms_block_round_trips_through_wire_with_typed_peer_id() {
         summary: None,
         payload: None,
         content: Vec::new(),
+        delivery_id: None,
+        in_reply_to: None,
     };
 
     let value = serde_json::to_value(&block).unwrap();
@@ -529,6 +651,8 @@ fn system_notice_explicit_null_payloads_round_trip_without_becoming_absent() {
             summary: Some("Peer response terminal".to_string()),
             payload: Some(Value::Null),
             content: Vec::new(),
+            delivery_id: None,
+            in_reply_to: None,
         },
         SystemNoticeBlock::ExternalEvent {
             source: "connector".to_string(),
@@ -3118,5 +3242,152 @@ mod tool_artifact_refusal {
         );
         let error = crate::error::AgentError::ToolArtifactRefused(Box::new(refusal.clone()));
         assert_eq!(error.to_string(), refusal.to_string());
+    }
+}
+
+/// #1888: provider stop text is capped at a character boundary and
+/// ends with the truncation marker; shorter text is kept as it is.
+#[test]
+fn provider_stop_detail_text_is_capped_with_a_marker() {
+    let short = ProviderStopDetail::openai("refusal", Some("I can't help with that.".to_string()));
+    assert_eq!(
+        short,
+        ProviderStopDetail::OpenAi {
+            reason: "refusal".to_string(),
+            refusal: Some("I can't help with that.".to_string()),
+        }
+    );
+
+    // Multi-byte characters straddle the cap, so the cut must find a boundary.
+    let long = "\u{00e9}".repeat(PROVIDER_STOP_DETAIL_TEXT_CAP);
+    let ProviderStopDetail::Anthropic {
+        explanation: Some(explanation),
+        ..
+    } = ProviderStopDetail::anthropic(None, Some(long.clone()))
+    else {
+        panic!("anthropic detail keeps its explanation");
+    };
+    assert!(
+        explanation.len() <= PROVIDER_STOP_DETAIL_TEXT_CAP,
+        "{}",
+        explanation.len()
+    );
+    assert!(explanation.ends_with(PROVIDER_STOP_DETAIL_TRUNCATION_MARKER));
+    let kept = &explanation[..explanation.len() - PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len()];
+    assert!(long.starts_with(kept));
+    assert!(kept.len() > PROVIDER_STOP_DETAIL_TEXT_CAP / 2);
+
+    let exact = "a".repeat(PROVIDER_STOP_DETAIL_TEXT_CAP);
+    let ProviderStopDetail::OpenAi {
+        refusal: Some(refusal),
+        ..
+    } = ProviderStopDetail::openai("refusal", Some(exact.clone()))
+    else {
+        panic!("openai detail keeps its refusal");
+    };
+    assert_eq!(refusal, exact, "text at the cap is kept whole");
+}
+
+/// The detail's wire shape: tagged by provider, raw provider strings as data.
+#[test]
+fn provider_stop_detail_wire_shape_is_provider_tagged() {
+    let cases = [
+        (
+            ProviderStopDetail::anthropic(Some("cyber".to_string()), None),
+            json!({"provider": "anthropic", "category": "cyber"}),
+        ),
+        (
+            ProviderStopDetail::openai("content_filter", None),
+            json!({"provider": "open_ai", "reason": "content_filter"}),
+        ),
+        (
+            ProviderStopDetail::gemini(
+                GeminiStopStage::Prompt,
+                "BLOCKLIST",
+                vec!["HARM_CATEGORY_HARASSMENT".to_string()],
+            ),
+            json!({
+                "provider": "gemini",
+                "stage": "prompt",
+                "reason": "BLOCKLIST",
+                "blocked_categories": ["HARM_CATEGORY_HARASSMENT"]
+            }),
+        ),
+    ];
+    for (detail, wire) in cases {
+        assert_eq!(serde_json::to_value(&detail).unwrap(), wire);
+        let back: ProviderStopDetail = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, detail);
+    }
+}
+
+/// The closed pair of refusing stops, and nothing else.
+#[test]
+fn content_filtered_stop_names_only_the_refusing_stops() {
+    for stop_reason in [
+        StopReason::EndTurn,
+        StopReason::ToolUse,
+        StopReason::MaxTokens,
+        StopReason::StopSequence,
+        StopReason::Cancelled,
+        StopReason::PauseTurn,
+        StopReason::ContextWindowExceeded,
+    ] {
+        assert_eq!(
+            ContentFilteredStop::from_stop_reason(stop_reason),
+            None,
+            "{stop_reason:?}"
+        );
+    }
+    for (stop_reason, stop, wire) in [
+        (StopReason::Refusal, ContentFilteredStop::Refusal, "refusal"),
+        (
+            StopReason::ContentFilter,
+            ContentFilteredStop::ContentFilter,
+            "content_filter",
+        ),
+    ] {
+        assert_eq!(
+            ContentFilteredStop::from_stop_reason(stop_reason),
+            Some(stop)
+        );
+        assert_eq!(stop.stop_reason(), stop_reason);
+        assert_eq!(serde_json::to_value(stop).unwrap(), json!(wire));
+        assert_eq!(serde_json::to_value(stop_reason).unwrap(), json!(wire));
+    }
+}
+
+/// An `mcp` block reports its lifecycle fact from its phase, whatever bit it
+/// stored (`settled`, or `persisted` from 0.9.3); a block without a phase
+/// reports its stored bit, the only record it has. Either way the block is
+/// written back with the key and value it was stored with.
+#[test]
+fn mcp_notice_block_derives_settled_from_its_phase_on_decode() {
+    for (phase, stored, settled) in [
+        (Some("pending"), true, false),
+        (Some("draining"), true, false),
+        (Some("applied"), false, true),
+        (Some("failed"), false, true),
+        (None, true, true),
+        (None, false, false),
+    ] {
+        for key in ["persisted", "settled"] {
+            let mut raw = json!({"type": "mcp", "server_id": "server", key: stored});
+            if let Some(phase) = phase {
+                raw["phase"] = json!(phase);
+            }
+            let block: SystemNoticeBlock = serde_json::from_value(raw.clone()).unwrap();
+            assert!(matches!(block, SystemNoticeBlock::Mcp { .. }), "{block:?}");
+            assert_eq!(
+                block.lifecycle_settled(),
+                Some(settled),
+                "phase {phase:?}, stored {key}={stored}"
+            );
+            assert_eq!(
+                serde_json::to_value(&block).unwrap(),
+                raw,
+                "phase {phase:?}, stored {key}={stored}: written back unchanged"
+            );
+        }
     }
 }

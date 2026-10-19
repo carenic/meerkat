@@ -84,7 +84,7 @@ service APIs. For agents that run in the browser itself, use the
 | Method | Description |
 |--------|-------------|
 | `connect(options?)` | Spawn `rkat-rpc`, handshake, fetch capabilities |
-| `close()` | Kill the subprocess |
+| `close()` | Stop the `rkat-rpc` child: end its stdin, signal it, wait up to 5 seconds for it to exit, then `SIGKILL`. Since 0.9.4 it resolves as soon as the child exits, so Node can exit at once instead of about 5 seconds later |
 | `createSession(prompt, options?)` | Create a session, run the first turn, return a `Session` |
 | `createSessionStreaming(prompt, options?)` | Create a session and stream typed events from the first turn |
 | `listSessions(options?)` | List active sessions |

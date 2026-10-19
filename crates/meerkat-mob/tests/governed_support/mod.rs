@@ -423,17 +423,23 @@ impl AuthenticatedOriginalSource for Adapter {
             }))
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
-        Ok(sources()
-            .contains(original)
-            .then(|| WorkAuthorityBasis::HostPolicy {
-                policy: evidence("source-policy"),
-            }))
+    ) -> Result<
+        meerkat_runtime::meerkat_machine::RetainedCustody,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        Ok(if sources().contains(original) {
+            meerkat_runtime::meerkat_machine::RetainedCustody::Retained(
+                WorkAuthorityBasis::HostPolicy {
+                    policy: evidence("source-policy"),
+                },
+            )
+        } else {
+            meerkat_runtime::meerkat_machine::RetainedCustody::NotRetained
+        })
     }
 }
 
@@ -558,9 +564,7 @@ impl LlmClient for ScriptedProvider {
                 })
             })
             .chain(futures::stream::iter([Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             })])),
         )
     }

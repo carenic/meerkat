@@ -347,6 +347,10 @@ STRUCTURAL_EXTRACTORS = {
     # "enum {{name}} in <file>:<line>" (v0.51.0 template; first seen on the
     # 0.9.0 readiness report for TokenStoreError). Names only the enum.
     "enum_marked_non_exhaustive": _symbols_enum_missing,
+    # "variant Enum:Variant in <file>:<line>" (single colon, v0.50.0
+    # template; first seen on the 0.9.4 report for
+    # `MemberShutdownOutcome:UnregisterPending`). Names enum and variant.
+    "enum_variant_marked_non_exhaustive": _symbols_enum_variant_missing,
     "enum_variant_added": _symbols_enum_variant_added,
     "enum_variant_missing": _symbols_enum_variant_missing,
     "derive_trait_impl_removed": _symbols_derive_trait_impl_removed,
@@ -371,6 +375,10 @@ STRUCTURAL_EXTRACTORS = {
     # "trait <path>, previously in file <file>:<line>" (v0.50.0 template).
     "trait_missing": _symbols_trait_missing,
     "trait_method_added": _symbols_trait_method_added,
+    # "trait method <path>::<method> in file <file>:<line>", the
+    # trait_method_added shape (v0.50.0 template; first seen on the 0.9.4
+    # report for `Compactor::prepare_for_summarization`).
+    "trait_method_default_impl_removed": _symbols_trait_method_added,
     # "method <name> of trait <path>, previously in file <file>:<line>"
     # (v0.51.0 template; first seen on the 0.8.52 main-push report).
     "trait_method_missing": _symbols_trait_method_missing,

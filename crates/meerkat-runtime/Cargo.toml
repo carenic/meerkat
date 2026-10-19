@@ -11,6 +11,15 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # reads meerkat-core, meerkat-machine-schema, meerkat-mcp-server and surface sources
+    "tests/core_apply_terminal_truth.rs",
+    # reads meerkat-contracts' wire source to pin the command manifest against the BridgeCommand enum
+    "tests/supervisor_bridge_command_manifest.rs",
+]
 
 [dependencies]
 meerkat-core = { workspace = true, features = ["__meerkat-generated-authority-bridge"] }
@@ -90,6 +99,16 @@ meerkat-comms = { workspace = true }
 # unit tests commit a concurrent schema change inside an open's preflight.
 meerkat-sqlite = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
+
+# The feature set this crate's own tests need. The published package
+# has no self dev-dependency to turn them on, so its README.md prints the
+# command with these features, and the standalone test lane
+# (scripts/published_crates_standalone.py) reads them from here.
+[package.metadata.meerkat.standalone-tests]
+features = ["test-support", "sqlite-store", "live", "local-authorization"]
+# The README's command sets this thread stack, the workspace's
+# (.cargo/config.toml [env]); the suite is not checked at Rust's 2 MiB default.
+min-stack = 8388608
 
 [lints]
 workspace = true

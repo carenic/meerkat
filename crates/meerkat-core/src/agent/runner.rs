@@ -933,14 +933,47 @@ where
         self.mob_authority_handle = Some(handle);
     }
 
-    /// Replace the LLM client for subsequent turns.
+    /// Replace the LLM client for subsequent turns with another client for
+    /// the session's current model, such as one with a fresh transport or
+    /// credentials. The new client takes effect on the next `run()` /
+    /// `run_with_events()` call.
     ///
-    /// Enables hot-swapping the model/provider on a live session without
-    /// rebuilding the agent. The new client takes effect on the next
-    /// `run()` / `run_with_events()` call.
+    /// A client whose provider or model differs from the session's durable
+    /// identity is refused with `AgentError::ClientModelChangeRequiresHotSwap`:
+    /// the durable identity is what the active model profile, and with it the
+    /// context and compaction budgets, describe. Change the model with
+    /// `hot_swap_llm_identity`, which publishes the client, the durable
+    /// identity and the active model profile together. A session without a
+    /// durable identity has no model to keep and admits any client.
     pub fn replace_client(&mut self, client: Arc<C>) -> Result<(), AgentError> {
+        self.refuse_client_model_change(client.provider(), client.model())?;
         self.client = client;
         Ok(())
+    }
+
+    /// Refuse a provider or model other than the session's durable identity.
+    fn refuse_client_model_change(
+        &self,
+        provider: crate::Provider,
+        model: &str,
+    ) -> Result<(), AgentError> {
+        let Some(metadata) = self.session.try_session_metadata().map_err(|error| {
+            AgentError::ConfigError(format!(
+                "failed to read the session's durable LLM identity before replacing its client: {error}"
+            ))
+        })?
+        else {
+            return Ok(());
+        };
+        if metadata.provider == provider && metadata.model == model {
+            return Ok(());
+        }
+        Err(AgentError::ClientModelChangeRequiresHotSwap {
+            durable_provider: metadata.provider,
+            durable_model: metadata.model,
+            requested_provider: provider,
+            requested_model: model.to_string(),
+        })
     }
 
     /// Apply the live LLM request policy paired with an identity hot-swap.
@@ -958,11 +991,16 @@ where
     }
 
     /// Replace the LLM client and its next-turn request policy together.
+    ///
+    /// Like `replace_client`, this keeps the session's model: a client or a
+    /// policy model other than the durable identity is refused with
+    /// `AgentError::ClientModelChangeRequiresHotSwap`, before anything changes.
     pub fn replace_client_with_request_policy(
         &mut self,
         client: Arc<C>,
         policy: crate::SessionLlmRequestPolicy,
     ) -> Result<(), AgentError> {
+        self.refuse_client_model_change(client.provider(), &policy.model)?;
         self.replace_client(client)?;
         self.apply_llm_request_policy(policy);
         Ok(())
@@ -1252,10 +1290,7 @@ where
         {
             return Ok(crate::ops::terminal_tool_outcome_for_error(call.id, error));
         }
-        let context = self
-            .tool_dispatch_context
-            .clone()
-            .with_operation_review(self.operation_review.clone());
+        let context = self.observed_tool_dispatch_context(self.operation_review.clone());
         let outcome = self
             .dispatch_host_tool_call(call, timeout_policy, context)
             .await?;
@@ -1607,7 +1642,10 @@ where
     /// Called in the same synchronous segment that took the delivery (no await
     /// in between), so a hard-cancel future drop cannot split the witness from
     /// the Session write. The messages were lowered when the runtime built the
-    /// delivery, so the write itself cannot fail. Returns the events to
+    /// delivery, so the write itself cannot fail. The delivery's peer reply
+    /// capabilities join the running turn's dispatch context in the same
+    /// segment (typed, so that cannot fail either), so `reply_to_peer` can
+    /// answer it from the next tool call on. Returns the events to
     /// publish when the appends were written (`BoundaryAppendApplied`, then
     /// one `PeerContentIngested` per incoming comms block, exactly as the
     /// turn-start path publishes them); `None` when the delivery was withdrawn
@@ -1630,6 +1668,7 @@ where
             messages,
             model_projection,
             peer_ingested_events,
+            peer_reply_capabilities,
         } = appends.into_parts();
         let append_count = u32::try_from(messages.len()).unwrap_or(u32::MAX);
         let transcript_start = self.session.messages().len() as u64;
@@ -1646,6 +1685,8 @@ where
             }
             self.session.push(message);
         }
+        self.tool_dispatch_context
+            .record_boundary_peer_replies(peer_reply_capabilities);
         let mut events = Vec::with_capacity(1 + peer_ingested_events.len());
         events.push(AgentEvent::BoundaryAppendApplied {
             run_id: run_id.clone(),
@@ -1746,7 +1787,7 @@ where
     ) -> Result<Vec<Message>, AgentError> {
         self.session
             .validate_instruction_activation_turn_readiness()
-            .map_err(|error| AgentError::ConfigError(error.to_string()))?;
+            .map_err(AgentError::InstructionActivation)?;
         let mut messages = self.session.messages_for_model_boundary();
         if let Some(instructions) = self.output_schema_request_instructions() {
             crate::structured_output::project_output_schema_instructions(
@@ -3272,6 +3313,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             last_pending_catalog_sources: Default::default(),
             tool_dispatch_context: Default::default(),
             operation_review: self.operation_review.clone(),
+            refusal_observer: self.refusal_observer.clone(),
             run_consent_attempts: Default::default(),
             live_bridge_dispatch_admission: Some(dispatch_admission),
             live_bridge_tool_defs: Some(frozen_tool_defs),
@@ -3848,6 +3890,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn build_agent_with_engine<E: SkillEngine + 'static>(
         engine: E,
     ) -> Agent<StaticLlmClient, NoTools, NoopStore> {
@@ -3871,6 +3914,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_lowering_preserves_mixed_appends_and_media() {
         use crate::types::{ContentBlock, ImageData};
@@ -3910,6 +3954,8 @@ mod skill_activation_effect_tests {
                         summary: None,
                         payload: None,
                         content: vec![image.clone()],
+                        delivery_id: None,
+                        in_reply_to: None,
                     }],
                 },
             ),
@@ -4022,6 +4068,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_activation_commits_once_with_identity_and_hook_input() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -4088,6 +4135,7 @@ mod skill_activation_effect_tests {
         assert_eq!(started, 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_skill_activation_keeps_typed_context() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -4115,6 +4163,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_activation_preserves_system_only_turns() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -4177,6 +4226,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_activation_hook_denial_commits_no_appends() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -4210,6 +4260,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_skill_activation_invalid_user_shape_fails_before_any_append() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -4241,6 +4292,7 @@ mod skill_activation_effect_tests {
         assert_eq!(agent.session().messages(), before);
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn with_test_turn_state_handle(builder: AgentBuilder) -> AgentBuilder {
         use crate::agent::test_turn_state_handle::TestTurnStateHandle;
 
@@ -4256,6 +4308,7 @@ mod skill_activation_effect_tests {
             )
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_dispatch_preserves_observation_infrastructure_and_settlement_companion() {
         struct ErrorTools(ToolError);
@@ -4438,6 +4491,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn application_observation_is_visible_while_final_model_is_pending_and_clears_on_exit() {
         for cancel in [false, true] {
@@ -4495,6 +4549,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_never_accepts_disposable_live_bridge_results() {
         let client = Arc::new(ObservationLlmClient {
@@ -4640,6 +4695,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_action_uses_committed_invocation_and_fresh_context_separate_from_model_visibility()
     {
@@ -4825,6 +4881,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_action_hooks_refuse_entry_or_withhold_publication_without_losing_effects() {
         for (deny, fail, revoke, missing_build_state) in [
@@ -5100,6 +5157,7 @@ mod skill_activation_effect_tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_returns_pure_actions_while_model_holds_agent_and_keeps_results_private() {
         let client = Arc::new(ObservationLlmClient {
@@ -5154,6 +5212,7 @@ mod skill_activation_effect_tests {
         assert!(!transcript.contains("clicked") && !transcript.contains("private-app-result"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_is_revoked_by_canonical_rewrite_and_exact_agent_drop() {
         let entered = Arc::new(AtomicBool::new(false));
@@ -5248,6 +5307,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_revalidates_exact_invocation_after_resolution_and_admission_close() {
         for close in [false, true] {
@@ -5302,6 +5362,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_projection_error_retains_entered_settlement_diagnostics() {
         for effects in [
@@ -5507,6 +5568,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_revalidates_async_ingress_after_pending_operation_review() {
         let entered = Arc::new(AtomicBool::new(false));
@@ -5597,6 +5659,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_preserves_all_hook_notices_on_pre_and_post_errors_until_actor_settlement()
     {
@@ -5642,6 +5705,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn app_executor_partial_effect_failure_stays_dirty_and_rejects_another_actor() {
         let authority = crate::service::MobToolAuthorityContext::generated_for_test(
@@ -5706,6 +5770,76 @@ mod skill_activation_effect_tests {
         let (result, dirty) = other.settle_tool_application(outcome).into_parts();
         assert!(!dirty && matches!(result, Err(AgentError::ConfigError(_))));
         assert!(other.session.messages().is_empty());
+    }
+
+    /// The operation refusal observer of the host that composed the agent
+    /// sees a host's external tool call refused under governed work, as that
+    /// call's result, from the same fenced dispatch the loop's calls take,
+    /// with the dispatch fact the model payload carries.
+    #[tokio::test]
+    async fn an_external_tool_call_refusal_reaches_the_host_observer() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<crate::authorization::OperationRefusalObservation>>);
+        impl crate::authorization::OperationRefusalObserver for Recording {
+            fn observe(&self, observation: &crate::authorization::OperationRefusalObservation) {
+                self.0.lock().unwrap().push(observation.clone());
+            }
+        }
+        let observer = Arc::new(Recording::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let mut agent = with_test_turn_state_handle(
+            AgentBuilder::new().with_operation_refusal_observer(Arc::clone(&observer) as _),
+        )
+        .build_standalone(
+            Arc::new(StaticLlmClient),
+            Arc::new(AppTestTools {
+                entered: entered.clone(),
+                effects: Vec::new(),
+                settlement_failures: Vec::new(),
+            }),
+            Arc::new(NoopStore),
+        )
+        .await;
+        agent.tool_dispatch_context = crate::ToolDispatchContext::default()
+            .with_work_authorization(Some(attachment_context()));
+        let outcome = agent
+            .dispatch_external_tool_call(crate::ToolCall::new(
+                "external-call".into(),
+                "show".into(),
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("a refusal is the call's result");
+        assert!(outcome.result.is_error);
+        assert!(!entered.load(Ordering::SeqCst), "no tool code ran");
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).expect("typed payload");
+        assert_eq!(
+            payload["data"],
+            serde_json::json!({"kind": "denied", "tool_invoked": false})
+        );
+        let observed = observer.0.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        let observation = &observed[0];
+        assert_eq!(observation.session_id(), agent.session.id());
+        assert_eq!(
+            observation.surface(),
+            &crate::authorization::OperationRefusalSurface::ToolCall {
+                tool_use_id: "external-call".into()
+            }
+        );
+        assert_eq!(
+            observation.outcome(),
+            crate::authorization::OperationRefusalOutcome::Refused {
+                kind: crate::OperationRefusalKind::Denied,
+                dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+            }
+        );
+        assert_eq!(
+            observation.disposition(),
+            crate::authorization::OperationRefusalDisposition::ToolResult
+        );
+        assert!(observation.operation_id().is_some());
     }
 
     struct AttachmentOnlyAuthorization;
@@ -5924,6 +6058,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn work_authorization_scope_replaces_some_and_none_and_clears_on_drop() {
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
@@ -5972,6 +6107,7 @@ mod skill_activation_effect_tests {
     /// unspent human consent admitted under its work context is withdrawn
     /// (cancelled, recorded and announced), so a late decision cannot
     /// approve it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_closed_run_scope_withdraws_the_consent_it_admitted() {
         use crate::approval::consent::{
@@ -6131,6 +6267,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dropping_polled_work_authorized_run_clears_dispatch_context() {
         let client = AttachmentRunClient::new(true);
@@ -6158,6 +6295,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dropping_unpolled_work_authorized_run_does_not_install_context() {
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
@@ -6182,6 +6320,7 @@ mod skill_activation_effect_tests {
         assert_eq!(agent.session().messages(), before);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn work_authorization_clears_after_completion_and_early_refusal() {
         let client = AttachmentRunClient::new(false);
@@ -6225,6 +6364,7 @@ mod skill_activation_effect_tests {
         assert!(agent.tool_dispatch_context.work_authorization().is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn work_authorization_clears_after_pending_boundary_refusal() {
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
@@ -6252,6 +6392,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dropping_polled_pending_work_run_clears_dispatch_context() {
         let client = AttachmentRunClient::new(true);
@@ -6314,6 +6455,7 @@ mod skill_activation_effect_tests {
     /// engine fails with the typed `NoSkillEngine` reason, emits the native
     /// `SkillResolutionFailed` event, and never reaches the provider. The old
     /// behavior returned an empty activation and ran an ordinary turn.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_skill_selection_without_engine_fails_typed_before_provider() {
         let client = Arc::new(CountingLlmClient {
@@ -6367,6 +6509,7 @@ mod skill_activation_effect_tests {
     }
 
     /// Without an engine, a turn that selects no skills still runs normally.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn empty_skill_selection_without_engine_runs_ordinary_turn() {
         let client = Arc::new(CountingLlmClient {
@@ -6388,6 +6531,7 @@ mod skill_activation_effect_tests {
     /// `SkillResolutionFailed` event (carrying the typed `SkillKey` + typed
     /// reason). The old behavior only logged and returned the input untouched,
     /// so no event reaches the channel — this test fails on that behavior.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn failed_skill_resolution_emits_typed_failure_event() {
         let mut agent = build_agent_with_engine(FailingSkillEngine).await;
@@ -6448,6 +6592,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_fails_closed_when_per_turn_skill_resolution_fails() {
         let mut agent = build_agent_with_engine(FailingSkillEngine).await;
@@ -6506,6 +6651,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_transcript_identity_is_persisted_on_user_and_assistant_messages() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6626,6 +6772,7 @@ mod skill_activation_effect_tests {
         assert!(start_index < first_output);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn peer_notice_ids_do_not_override_runtime_owned_run_lineage() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6690,6 +6837,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn equal_content_in_distinct_interactions_retains_distinct_live_lineage() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6733,6 +6881,7 @@ mod skill_activation_effect_tests {
         assert_ne!(run_ids[0], run_ids[1]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_failure_carries_the_exact_started_identity() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6784,6 +6933,7 @@ mod skill_activation_effect_tests {
     /// `RunFailed` leaves the tap holding that terminal and the stream
     /// without one: the dropped-run terminal goes to the stream only, so each
     /// sink ends with exactly one terminal.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_terminal_dropped_mid_send_is_owed_to_the_stream_only() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6825,6 +6975,7 @@ mod skill_activation_effect_tests {
     /// #1233: a drop mid-send of `RunStarted` leaves the stream without the
     /// run's start. The stream then gets no terminal either, while the tap,
     /// which saw the start, gets one.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_start_dropped_mid_send_owes_the_stream_no_terminal() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6856,6 +7007,7 @@ mod skill_activation_effect_tests {
         assert!(lifecycle_kinds(&mut rx).is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn failure_before_execution_keeps_interaction_without_inventing_a_run() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6882,6 +7034,7 @@ mod skill_activation_effect_tests {
     /// read a console session-history backfill performs), so backfilled
     /// frames can be stamped with the same id as the live
     /// `InteractionComplete` frames.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn transcript_interaction_id_survives_session_persist_reload() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6947,6 +7100,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn append_assistant_blocks_effect_stamps_active_transcript_identity_and_run_id() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -6986,6 +7140,7 @@ mod skill_activation_effect_tests {
         assert_eq!(assistant.identity.run_id, Some(run_id));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn noncommitting_live_bridge_rejects_deferred_tool_effect_without_mutation() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7045,6 +7200,7 @@ mod skill_activation_effect_tests {
         assert_eq!(agent.tool_scope_snapshot(), tool_scope_before);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn live_bridge_cancellation_preserves_pending_ordinary_transient_context_boundary() {
         let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(SucceedingSkillEngine)));
@@ -7143,6 +7299,7 @@ mod skill_activation_effect_tests {
     /// Ask 1 direct-path lowering: each injected-context entry materializes as
     /// a SEPARATE typed injected-context user-channel message immediately
     /// BEFORE the turn's user message, in delivery order.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_path_materializes_injected_context_before_user_message() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7198,6 +7355,7 @@ mod skill_activation_effect_tests {
     /// Exactly one lowering owner per mode: when the runtime authored the
     /// turn's typed appends, a direct-path injected-context carrier must fail
     /// closed instead of double-appending or silently dropping.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn injected_context_with_typed_turn_appends_fails_closed() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7233,6 +7391,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn provider_projection_failure_does_not_retract_authored_system_row() {
         use crate::agent::test_turn_state_handle::TestTurnStateHandle;
@@ -7344,6 +7503,7 @@ mod skill_activation_effect_tests {
     /// Runtime-mode lowering owner: an `InjectedContext`-role typed append
     /// lowers into a typed injected-context user message, preserving append
     /// order relative to the user append.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn injected_context_typed_append_lowers_to_typed_user_message() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7398,6 +7558,7 @@ mod skill_activation_effect_tests {
 
     /// An `InjectedContext` append only accepts operator text or content
     /// blocks — the same operator-renderable restriction as the user role.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn injected_context_typed_append_rejects_non_operator_renderable() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7426,6 +7587,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn queued_notice_retry_preserves_origin_and_stamps_actual_run() {
         use crate::lifecycle::run_primitive::RuntimeAppendSource;
@@ -7505,6 +7667,7 @@ mod skill_activation_effect_tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn queued_notice_seed_requires_started_runtime_authority() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7533,6 +7696,7 @@ mod skill_activation_effect_tests {
         assert!(notice.runtime_origin.is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn keyed_system_append_converges_mirrors_and_conflicts_fail_closed() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7588,6 +7752,7 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn unkeyed_system_role_lowering_preserves_empty_whitespace_and_duplicates() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7623,6 +7788,7 @@ mod skill_activation_effect_tests {
     /// from the operator text. The old behavior folded activation purely into
     /// the prompt string and emitted no typed effect — this test fails on that
     /// behavior because no `SkillsResolved` event reaches the channel.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn successful_skill_activation_emits_typed_activation_record() {
         let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
@@ -7759,6 +7925,7 @@ mod skill_activation_effect_tests {
     /// is recorded as a typed `collection_fault` inside the run result —
     /// surfaces never receive absent or healthy-looking diagnostics in place
     /// of failure truth.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn skill_diagnostics_collection_fault_is_recorded_in_run_result() {
         let skill_runtime = Arc::new(SkillRuntime::new(Arc::new(HealthFaultSkillEngine)));

@@ -741,6 +741,60 @@ impl LiveSidebandNarrationAuthority {
     }
 }
 
+/// Non-forgeable authority for one finished-pending notice: an exact
+/// delegation's work has finished while its result has not been delivered
+/// (the channel's one result slot is held by another result, or the delivery
+/// waits for the channel's summary acknowledgement, for example).
+/// It carries no text and is never spoken, and it is built only from the
+/// generated narration authority of that kind, bound to the delegation that
+/// authority was checked against.
+#[derive(Clone)]
+pub struct LiveSidebandFinishedNoticeAuthority {
+    binding: ProviderWebrtcBinding,
+    attempt: LiveSidebandAppendAttempt,
+    delegation: LiveSidebandDelegationRef,
+    consumed: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for LiveSidebandFinishedNoticeAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveSidebandFinishedNoticeAuthority")
+            .field("binding", &self.binding)
+            .field("attempt", &self.attempt)
+            .field("delegation", &self.delegation)
+            .field("consumed", &self.consumed.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl LiveSidebandFinishedNoticeAuthority {
+    #[cfg(feature = "__meerkat-generated-authority-bridge")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __from_generated_finished_notice_authority(
+        binding: ProviderWebrtcBinding,
+        narration_id: String,
+        delegation: LiveSidebandDelegationRef,
+    ) -> Option<Self> {
+        Some(Self {
+            binding,
+            attempt: LiveSidebandAppendAttempt::__from_generated_append_id(format!(
+                "narration:{narration_id}"
+            ))?,
+            delegation,
+            consumed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn consume_once(&self) -> Result<(), LiveSidebandCommandError> {
+        self.consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| LiveSidebandCommandError::AuthorityAlreadyConsumed)
+    }
+}
+
 /// A templated narration sentence that introduces a delegation's result and
 /// travels inside that result's release instead of as its own append
 /// ([`LiveSidebandCommand::announced_by`]). Sent separately, "Finished ...
@@ -833,6 +887,11 @@ enum LiveSidebandCommandKind {
         text: String,
         ends_delegation: bool,
     },
+    NoteDelegationFinished {
+        binding: ProviderWebrtcBinding,
+        attempt: LiveSidebandAppendAttempt,
+        delegation: LiveSidebandDelegationRef,
+    },
 }
 
 /// A command that has already consumed one machine-minted authority. Its kind
@@ -893,6 +952,14 @@ pub enum LiveSidebandProviderCommand {
         /// The narration ends the delegation without a result.
         ends_delegation: bool,
     },
+    /// One exact delegation's work finished while its result has not been
+    /// released. The provider adapter tells its session so on a quiet lane,
+    /// bound to the delegation; it carries no text and no result.
+    NoteDelegationFinishedContext {
+        binding: ProviderWebrtcBinding,
+        attempt: LiveSidebandAppendAttempt,
+        delegation: LiveSidebandDelegationRef,
+    },
 }
 
 impl fmt::Debug for LiveSidebandCommand {
@@ -903,6 +970,9 @@ impl fmt::Debug for LiveSidebandCommand {
             LiveSidebandCommandKind::AppendSession { .. } => "append_session_context",
             LiveSidebandCommandKind::ReleaseDelegation { .. } => "release_delegation_context",
             LiveSidebandCommandKind::NarrateDelegation { .. } => "narrate_delegation_context",
+            LiveSidebandCommandKind::NoteDelegationFinished { .. } => {
+                "note_delegation_finished_context"
+            }
         };
         formatter
             .debug_struct("LiveSidebandCommand")
@@ -1096,6 +1166,29 @@ impl LiveSidebandCommand {
         })
     }
 
+    /// Tell the provider session that the delegation the authority was
+    /// checked against finished its work while its result has not been
+    /// delivered. Consumes the generated finished-notice authority; the
+    /// command carries no text, no result, and is not spoken.
+    pub fn note_delegation_finished(
+        authority: LiveSidebandFinishedNoticeAuthority,
+    ) -> Result<Self, LiveSidebandCommandError> {
+        authority.consume_once()?;
+        let LiveSidebandFinishedNoticeAuthority {
+            binding,
+            attempt,
+            delegation,
+            consumed: _,
+        } = authority;
+        Ok(Self {
+            kind: LiveSidebandCommandKind::NoteDelegationFinished {
+                binding,
+                attempt,
+                delegation,
+            },
+        })
+    }
+
     /// Commentary, delegation results, and delegation narration are spoken
     /// aloud by the provider; thinking and instructions appends are quiet.
     /// Whether this command releases a delegation's result (not a
@@ -1123,7 +1216,8 @@ impl LiveSidebandCommand {
             | LiveSidebandCommandKind::AppendInstructions { binding, .. }
             | LiveSidebandCommandKind::AppendSession { binding, .. }
             | LiveSidebandCommandKind::ReleaseDelegation { binding, .. }
-            | LiveSidebandCommandKind::NarrateDelegation { binding, .. } => binding,
+            | LiveSidebandCommandKind::NarrateDelegation { binding, .. }
+            | LiveSidebandCommandKind::NoteDelegationFinished { binding, .. } => binding,
         }
     }
 
@@ -1134,7 +1228,8 @@ impl LiveSidebandCommand {
             | LiveSidebandCommandKind::AppendInstructions { attempt, .. }
             | LiveSidebandCommandKind::AppendSession { attempt, .. }
             | LiveSidebandCommandKind::ReleaseDelegation { attempt, .. }
-            | LiveSidebandCommandKind::NarrateDelegation { attempt, .. } => attempt.clone(),
+            | LiveSidebandCommandKind::NarrateDelegation { attempt, .. }
+            | LiveSidebandCommandKind::NoteDelegationFinished { attempt, .. } => attempt.clone(),
         }
     }
 
@@ -1148,7 +1243,8 @@ impl LiveSidebandCommand {
             LiveSidebandCommandKind::AppendInstructions { .. }
             | LiveSidebandCommandKind::AppendSession { .. }
             | LiveSidebandCommandKind::ReleaseDelegation { .. }
-            | LiveSidebandCommandKind::NarrateDelegation { .. } => None,
+            | LiveSidebandCommandKind::NarrateDelegation { .. }
+            | LiveSidebandCommandKind::NoteDelegationFinished { .. } => None,
         }
     }
 
@@ -1224,6 +1320,15 @@ impl LiveSidebandCommand {
                 delegation,
                 text,
                 ends_delegation,
+            },
+            LiveSidebandCommandKind::NoteDelegationFinished {
+                binding,
+                attempt,
+                delegation,
+            } => LiveSidebandProviderCommand::NoteDelegationFinishedContext {
+                binding,
+                attempt,
+                delegation,
             },
         }
     }
@@ -1856,6 +1961,50 @@ mod tests {
                     if ends_delegation == ends
             ));
         }
+    }
+
+    /// A finished notice (#1820) is quiet, never a result release and never
+    /// a thinking-lane append; it consumes its authority once across clones
+    /// and lowers to the provider's finished notice for exactly its
+    /// delegation and attempt.
+    #[test]
+    fn a_finished_notice_is_quiet_one_shot_and_bound_to_its_delegation() {
+        let delegation = || {
+            LiveSidebandDelegationRef::__from_provider_observation(
+                "delegation:4".to_string(),
+                "provider-delegation-secret".to_string(),
+            )
+            .expect("opaque provider delegation")
+        };
+        let bound = binding();
+        let authority = LiveSidebandFinishedNoticeAuthority {
+            binding: bound.clone(),
+            attempt: LiveSidebandAppendAttempt(
+                "narration:operation-4:finished-pending".to_string(),
+            ),
+            delegation: delegation(),
+            consumed: Arc::new(AtomicBool::new(false)),
+        };
+        let command = LiveSidebandCommand::note_delegation_finished(authority.clone())
+            .expect("one finished notice");
+        assert_eq!(
+            LiveSidebandCommand::note_delegation_finished(authority).err(),
+            Some(LiveSidebandCommandError::AuthorityAlreadyConsumed),
+            "the authority is one-shot across clones"
+        );
+        assert!(!command.is_spoken());
+        assert!(!command.is_result_release());
+        assert!(command.quiet_append_timing().is_none());
+        assert!(command.binding() == &bound);
+        assert!(matches!(
+            command.__into_provider_command(),
+            LiveSidebandProviderCommand::NoteDelegationFinishedContext {
+                attempt,
+                delegation,
+                ..
+            } if attempt.0 == "narration:operation-4:finished-pending"
+                && delegation.adapter_key() == "delegation:4"
+        ));
     }
 
     /// An announcement built from a narration authority rides inside the

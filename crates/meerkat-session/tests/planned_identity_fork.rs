@@ -205,6 +205,12 @@ mod planned_identity_fork_inheritance {
             .set_session_metadata(source_metadata())
             .expect("source metadata");
         source
+            .set_build_state(meerkat_core::SessionBuildState {
+                app_context: Some(serde_json::json!({"surface": "planned-fork"})),
+                ..meerkat_core::SessionBuildState::default()
+            })
+            .expect("source build state");
+        source
     }
 
     fn create_request_with_source(source: Session) -> CreateSessionRequest {
@@ -254,6 +260,8 @@ mod planned_identity_fork_inheritance {
                 planned_child.clone(),
                 None,
                 None,
+                meerkat_core::ForkInstructionPolicy::default()
+                    .effective(meerkat_core::ActivationWindow::None),
             )
             .await
             .expect("planned fork");
@@ -281,6 +289,15 @@ mod planned_identity_fork_inheritance {
         assert_eq!(
             child_metadata.realm_id, metadata.realm_id,
             "the child must inherit the source's realm"
+        );
+        assert_eq!(
+            child
+                .try_build_state()
+                .expect("child build state decodes")
+                .expect("child build state present")
+                .app_context,
+            Some(serde_json::json!({"surface": "planned-fork"})),
+            "the child must inherit the source's session configuration"
         );
         assert_eq!(child.messages().len(), 1, "the selected prefix is exact");
         assert_eq!(child.id(), &planned_child);

@@ -13,36 +13,19 @@ use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
-fn rest_binary_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_rkat-rest") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        let target_dir = PathBuf::from(target_dir);
-        let candidates = [
-            target_dir.join("debug/rkat-rest"),
-            target_dir.join("release/rkat-rest"),
-        ];
-        if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.exists()) {
-            return Some(candidate);
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent()?.parent()?;
-    let debug = workspace_root.join("target/debug/rkat-rest");
-    if debug.exists() {
-        return Some(debug);
-    }
-    let release = workspace_root.join("target/release/rkat-rest");
-    if release.exists() {
-        return Some(release);
-    }
-    None
+/// Cargo, nextest, the e2e lane harness and the Bazel graph advertise the
+/// crate's own binary through `CARGO_BIN_EXE_rkat-rest`, so a missing binary
+/// fails the test instead of skipping it.
+fn rest_binary_path() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest")
+        .map(PathBuf::from)
+        .expect("cargo advertises CARGO_BIN_EXE_rkat-rest to the crate's integration tests");
+    assert!(
+        advertised.exists(),
+        "CARGO_BIN_EXE_rkat-rest names a missing binary: {}",
+        advertised.display()
+    );
+    advertised
 }
 
 async fn wait_for_rest_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -73,10 +56,7 @@ fn allocate_port() -> u16 {
 #[tokio::test]
 #[ignore = "lane:e2e-build"]
 async fn http_e2e_create_and_continue_with_test_client() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(binary) = rest_binary_path() else {
-        eprintln!("Skipping: missing rkat-rest binary");
-        return Ok(());
-    };
+    let binary = rest_binary_path();
 
     let realm_id = "rest-binary-e2e";
     let temp = TempDir::new()?;

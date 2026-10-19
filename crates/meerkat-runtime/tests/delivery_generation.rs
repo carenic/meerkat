@@ -2,6 +2,7 @@
 //! any runtime's delivery-authority comparand: a delivery committed for one
 //! runtime must never fail another runtime's compare-and-swap.
 
+#![cfg(feature = "sqlite-store")]
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;

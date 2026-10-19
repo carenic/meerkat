@@ -581,6 +581,8 @@ fn make_session_with_compaction_intent() -> (
         summary_tokens: 5,
         messages_before: 2,
         messages_after: 1,
+        summary_source: None,
+        estimated_history_tokens_after: None,
     };
     session
         .add_compaction_projection_intent(intent.clone())
@@ -646,6 +648,7 @@ fn applied_pending_state(input: &Input, run_id: &RunId, sequence: u64) -> Stored
 /// A durably accepted content row never bound to any run: the current
 /// never-started-input shape. Recovery must retain it for ordinary redelivery,
 /// not infer consumption from its presence beside a completed candidate.
+#[cfg(feature = "sqlite-store")]
 fn accepted_unbound_state(input: &Input) -> StoredInputState {
     let mut state = InputState::new_accepted(input.id().clone());
     state.persisted_input = Some(input.clone());

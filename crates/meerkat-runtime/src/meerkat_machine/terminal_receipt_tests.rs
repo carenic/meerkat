@@ -557,6 +557,7 @@ fn response_progress(label: &str) -> Input {
         content: format!("progress {label}").into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 

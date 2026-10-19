@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use meerkat_core::Provider;
 use meerkat_core::live_adapter::{
     LiveAdapterErrorCode, LiveAdapterObservation, LiveAdapterStatus, LiveChannelCapabilities,
-    LiveConfigRejectionReason, LiveContinuityMode, LiveDegradationReason, LiveResponseModality,
-    LiveTransportBootstrap,
+    LiveConfigRejectionReason, LiveContinuityMode, LiveDegradationReason, LiveResponseAccounting,
+    LiveResponseFailure, LiveResponseFailureStatus, LiveResponseModality, LiveTransportBootstrap,
 };
 use meerkat_core::realtime_transcript::{RealtimeTranscriptEvent, RealtimeTranscriptRole};
 
@@ -1953,6 +1953,11 @@ pub enum WireRealtimeTranscriptEvent {
     AssistantTurnInterrupted {
         response_id: String,
     },
+    /// The provider ended the response without completing it; the session
+    /// discards everything the response staged (#1883).
+    AssistantTurnFailed {
+        response_id: String,
+    },
 }
 
 impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
@@ -2066,6 +2071,87 @@ impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
             RealtimeTranscriptEvent::AssistantTurnInterrupted { response_id } => {
                 Ok(Self::AssistantTurnInterrupted { response_id })
             }
+            RealtimeTranscriptEvent::AssistantTurnFailed { response_id } => {
+                Ok(Self::AssistantTurnFailed { response_id })
+            }
+        }
+    }
+}
+
+/// Wire mirror of [`LiveResponseFailureStatus`].
+///
+/// The known statuses serialize as plain strings (`"failed"`,
+/// `"incomplete"`, `"in_progress"`), so clients route on `failure.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveResponseFailureStatus {
+    Failed,
+    Incomplete,
+    InProgress,
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveResponseFailureStatus`] enum is `#[non_exhaustive]`.
+    /// When a future status lands without an explicit arm in the wire `From`
+    /// impl, the conversion surfaces as `Unknown { debug }` (serialized as
+    /// `{"unknown": {"debug": ...}}`) rather than silently coercing to
+    /// `Failed`. SDK consumers treat it as an unrecognized status.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant: `Unknown` is the floor, not
+    /// the destination.**
+    Unknown {
+        debug: String,
+    },
+}
+
+impl From<LiveResponseFailureStatus> for WireLiveResponseFailureStatus {
+    fn from(value: LiveResponseFailureStatus) -> Self {
+        match value {
+            LiveResponseFailureStatus::Failed => Self::Failed,
+            LiveResponseFailureStatus::Incomplete => Self::Incomplete,
+            LiveResponseFailureStatus::InProgress => Self::InProgress,
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }`. When a new core
+            // variant lands, add an explicit arm above this comment.
+            other => {
+                debug_assert!(
+                    false,
+                    "WireLiveResponseFailureStatus::from saw an unmapped \
+                     LiveResponseFailureStatus variant; add an explicit arm in \
+                     crates/meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// Wire mirror of [`LiveResponseFailure`]: how a live response ended without
+/// completing. Route on `status`; `reason`, `code` and `message` repeat what
+/// the provider said and are diagnostics only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireLiveResponseFailure {
+    pub status: WireLiveResponseFailureStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl From<LiveResponseFailure> for WireLiveResponseFailure {
+    fn from(value: LiveResponseFailure) -> Self {
+        Self {
+            status: value.status.into(),
+            reason: value.reason,
+            code: value.code,
+            message: value.message,
         }
     }
 }
@@ -2256,6 +2342,18 @@ pub enum WireLiveAdapterObservation {
     Unknown {
         debug: String,
     },
+    /// The provider ended a response without completing it (#1883). Not
+    /// terminal: the channel stays open and the next turn proceeds. Nothing
+    /// of the response is committed and it is not retried. `usage` is the
+    /// response's usage when the provider sent one; absent means the
+    /// provider reported none.
+    TurnFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        failure: WireLiveResponseFailure,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::wire::WireTurnUsage>,
+    },
 }
 
 impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
@@ -2437,6 +2535,18 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
             LiveAdapterObservation::CommandRejected { code, message } => Self::CommandRejected {
                 code: code.into(),
                 message,
+            },
+            LiveAdapterObservation::TurnFailed {
+                response_id,
+                failure,
+                accounting,
+            } => Self::TurnFailed {
+                response_id,
+                failure: failure.into(),
+                usage: match accounting {
+                    LiveResponseAccounting::Measured { usage } => Some(usage.into()),
+                    LiveResponseAccounting::Unmeasured { .. } => None,
+                },
             },
             // Core enum is `#[non_exhaustive]`. R3-6 (P2): surface unknown
             // variants explicitly via `Unknown { debug }` rather than
@@ -2985,6 +3095,9 @@ mod tests {
             RealtimeTranscriptEvent::AssistantTurnInterrupted {
                 response_id: "resp_interrupted".into(),
             },
+            RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".into(),
+            },
         ]
     }
 
@@ -3212,6 +3325,16 @@ mod tests {
                 },
                 message: "adapter rejected image".into(),
             },
+            WireLiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".into()),
+                failure: WireLiveResponseFailure {
+                    status: WireLiveResponseFailureStatus::Incomplete,
+                    reason: Some("provider_reason".into()),
+                    code: None,
+                    message: None,
+                },
+                usage: None,
+            },
         ];
 
         for case in cases {
@@ -3348,6 +3471,66 @@ mod tests {
         let core_json = serde_json::to_value(&core).expect("round-trip should succeed");
         let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
         assert_eq!(core_json, wire_json);
+    }
+
+    #[test]
+    fn turn_failed_projects_its_failure_and_only_measured_usage() {
+        let failure = LiveResponseFailure {
+            status: LiveResponseFailureStatus::Failed,
+            reason: None,
+            code: Some("server_error".into()),
+            message: Some("provider failed".into()),
+        };
+        let usage = meerkat_core::TurnUsage::host_declared(
+            meerkat_core::Provider::OpenAI,
+            "wire-turn-failed-test",
+            meerkat_core::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..meerkat_core::Usage::default()
+            },
+        );
+        let measured: WireLiveAdapterObservation = LiveAdapterObservation::TurnFailed {
+            response_id: Some("resp_failed".into()),
+            failure: failure.clone(),
+            accounting: LiveResponseAccounting::Measured {
+                usage: usage.clone(),
+            },
+        }
+        .into();
+        assert_eq!(
+            measured,
+            WireLiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".into()),
+                failure: WireLiveResponseFailure {
+                    status: WireLiveResponseFailureStatus::Failed,
+                    reason: None,
+                    code: Some("server_error".into()),
+                    message: Some("provider failed".into()),
+                },
+                usage: Some(usage.into()),
+            }
+        );
+        let json = serde_json::to_value(&measured).expect("serialize");
+        assert_eq!(json["observation"], "turn_failed");
+        assert_eq!(json["failure"]["status"], "failed");
+
+        let unmeasured: WireLiveAdapterObservation = LiveAdapterObservation::TurnFailed {
+            response_id: Some("resp_failed".into()),
+            failure,
+            accounting: LiveResponseAccounting::Unmeasured {
+                unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                    meerkat_core::Provider::OpenAI,
+                    "gpt-realtime-2",
+                ),
+            },
+        }
+        .into();
+        let json = serde_json::to_value(&unmeasured).expect("serialize");
+        assert!(
+            json.get("usage").is_none(),
+            "an unmeasured response carries no usage, never a zero: {json}"
+        );
     }
 
     // R3-6 (P2) — explicit Unknown variant fail-loud regression tests.

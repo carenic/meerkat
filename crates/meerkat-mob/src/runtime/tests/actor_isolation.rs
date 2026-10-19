@@ -28,8 +28,12 @@ use crate::ids::WorkOrigin;
 use crate::runtime::handle::{MEMBER_ADMISSION_LANE_CAPACITY, MemberReloadDisposition};
 use crate::runtime::state::MobCommand;
 
+#[path = "degraded_shutdown.rs"]
+mod degraded_shutdown;
 #[path = "reload_lane.rs"]
 mod reload_lane;
+#[path = "run_start_staging.rs"]
+mod run_start_staging;
 
 /// `RuntimeStore` decorator (an `InMemoryRuntimeStore` by default) with
 /// per-session fault switches.

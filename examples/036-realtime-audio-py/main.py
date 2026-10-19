@@ -39,6 +39,26 @@ def read_field(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def describe_turn_failure(observation: dict[str, Any]) -> str:
+    """One status line for a `turn_failed` observation.
+
+    Route on `failure.status`; the provider's reason, code and message are
+    diagnostics only.
+    """
+    failure = observation.get("failure") or {}
+    status = read_field(failure, "status", "unknown")
+    if not isinstance(status, str):
+        # A status without a wire name arrives as {"unknown": {"debug": ...}}.
+        status = "unknown"
+    details = [
+        str(detail)
+        for detail in (read_field(failure, "reason"), read_field(failure, "code"), read_field(failure, "message"))
+        if detail
+    ]
+    suffix = f": {'; '.join(details)}" if details else ""
+    return f"response failed ({status}){suffix}; nothing of it is kept"
+
+
 @dataclass(frozen=True)
 class AudioFormat:
     mime_type: str
@@ -82,6 +102,7 @@ class SharedState:
 class TextProbeSignals:
     tool_requested: asyncio.Event = field(default_factory=asyncio.Event)
     turn_completed: asyncio.Event = field(default_factory=asyncio.Event)
+    turn_failed: asyncio.Event = field(default_factory=asyncio.Event)
     channel_closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -513,6 +534,13 @@ async def live_receiver(
             elif kind == "turn_interrupted":
                 await playback.interrupt(obs)
                 printer.status("interrupted")
+            elif kind == "turn_failed":
+                # Not terminal: the channel stays open and nothing of the
+                # response is kept, so its queued audio goes as on an interrupt.
+                await playback.interrupt(obs)
+                printer.status(describe_turn_failure(obs))
+                if text_probe_signals is not None:
+                    text_probe_signals.turn_failed.set()
             elif kind == "assistant_transcript_truncated":
                 await playback.interrupt(obs)
                 printer.status("assistant transcript truncated")
@@ -589,6 +617,7 @@ async def run_text_probe(
         {
             "tool request": signals.tool_requested,
             "turn completion": signals.turn_completed,
+            "turn failure": signals.turn_failed,
             "channel close": signals.channel_closed,
         },
         timeout_s=timeout_s,
@@ -598,6 +627,10 @@ async def run_text_probe(
             completed = "tool request"
         elif signals.turn_completed.is_set():
             completed = "turn completion"
+        elif signals.turn_failed.is_set():
+            completed = "turn failure"
+    if completed == "turn failure":
+        raise RuntimeError("text probe response failed; see the response failed status line")
     if completed == "channel close":
         raise RuntimeError("text probe channel closed before a tool request or turn completion event")
     printer.status(f"text probe observed {completed}")

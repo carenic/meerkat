@@ -8,10 +8,10 @@ use meerkat_core::lifecycle::run_primitive::{GeminiProviderTag, ProviderTag};
 use meerkat_core::provider_matrix::google::GoogleBackendKind;
 use meerkat_core::schema::{CompiledSchema, SchemaCompat, SchemaError, SchemaWarning};
 use meerkat_core::{
-    AssistantBlock, BlockAssistantMessage, ContentBlock, GeminiImageMetadata, ImageData,
-    ImageGenerationIntent, ImageProviderErrorCode, ImageProviderTerminalObservation, Message,
-    OutputSchema, Provider, ProviderImageMetadata, ServerToolKind, StopReason, SystemNoticeBlock,
-    SystemNoticeMessage, ToolResult, Usage, UserMessage,
+    AssistantBlock, BlockAssistantMessage, ContentBlock, GeminiImageMetadata, GeminiStopStage,
+    ImageData, ImageGenerationIntent, ImageProviderErrorCode, ImageProviderTerminalObservation,
+    Message, OutputSchema, Provider, ProviderImageMetadata, ProviderStopDetail, ServerToolKind,
+    StopReason, SystemNoticeBlock, SystemNoticeMessage, ToolResult, Usage, UserMessage,
 };
 use meerkat_llm_core::LlmError;
 #[cfg(target_arch = "wasm32")]
@@ -2276,6 +2276,11 @@ impl GeminiClient {
                     buffer.drain(..=newline_pos);
 
                     if let Some(resp) = parsed_response {
+                        // Read before the candidates are consumed (#1888).
+                        let prompt_block = gemini_prompt_block(
+                            resp.prompt_feedback.as_ref(),
+                            resp.candidates.as_deref(),
+                        );
                         if let Some(usage) = resp.usage_metadata {
                             chunk_yielded.set(true);
                             yield LlmEvent::UsageUpdate {
@@ -2353,13 +2358,34 @@ impl GeminiClient {
                                 }
                                 if let Some(reason) = cand.finish_reason {
                                     let outcome = match gemini_finish_reason_stop(&reason) {
-                                        Ok(stop_reason) => LlmDoneOutcome::Success { stop_reason },
+                                        Ok(StopReason::ContentFilter) => {
+                                            LlmDoneOutcome::success_with_detail(
+                                                StopReason::ContentFilter,
+                                                ProviderStopDetail::gemini(
+                                                    GeminiStopStage::Candidate,
+                                                    reason,
+                                                    gemini_blocked_categories(
+                                                        cand.safety_ratings.as_ref(),
+                                                    ),
+                                                ),
+                                            )
+                                        }
+                                        Ok(stop_reason) => LlmDoneOutcome::success(stop_reason),
                                         Err(error) => LlmDoneOutcome::Error { error },
                                     };
                                     chunk_yielded.set(true);
                                     yield LlmEvent::Done { outcome };
                                 }
                             }
+                        }
+                        if let Some(detail) = prompt_block {
+                            chunk_yielded.set(true);
+                            yield LlmEvent::Done {
+                                outcome: LlmDoneOutcome::success_with_detail(
+                                    StopReason::ContentFilter,
+                                    detail,
+                                ),
+                            };
                         }
                     }
                 }
@@ -2377,6 +2403,48 @@ impl GeminiClient {
     }
 }
 
+/// The block of a prompt Gemini refused before any candidate:
+/// `promptFeedback.blockReason` and no candidate, so no `finishReason`
+/// follows (#1888). Every block reason reads as a content filter, `OTHER`
+/// and one this adapter does not know included: the prompt is refused as a
+/// whole and the same prompt is blocked again, so it is never an incomplete
+/// response to retry. A chunk that still carries a candidate leaves the
+/// outcome to that candidate's `finishReason`. The raw reason and the
+/// blocked safety categories travel as the stop's provider detail.
+fn gemini_prompt_block(
+    feedback: Option<&PromptFeedback>,
+    candidates: Option<&[Candidate]>,
+) -> Option<ProviderStopDetail> {
+    let feedback = feedback?;
+    let reason = feedback
+        .block_reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())?;
+    candidates.is_none_or(<[Candidate]>::is_empty).then(|| {
+        ProviderStopDetail::gemini(
+            GeminiStopStage::Prompt,
+            reason,
+            gemini_blocked_categories(feedback.safety_ratings.as_ref()),
+        )
+    })
+}
+
+/// The categories of the safety ratings Gemini marked `blocked`. Ratings are
+/// evidence of the block, read best-effort so that their shape never fails
+/// the chunk that carries it: a rating counts only when its `blocked` is
+/// JSON `true`, only a string `category` is kept, and any other shape is
+/// skipped.
+fn gemini_blocked_categories(ratings: Option<&Value>) -> Vec<String> {
+    ratings
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rating| rating.get("blocked") == Some(&Value::Bool(true)))
+        .filter_map(|rating| rating.get("category").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Map one Gemini `finishReason`.
 ///
 /// The safety family (the candidate was blocked or flagged for safety,
@@ -2386,6 +2454,10 @@ impl GeminiClient {
 /// way. A malformed or unexpected tool call, `OTHER`, and any reason this
 /// adapter does not know refuse the response instead of reading it as a
 /// natural end of turn: `IncompleteResponse` is retried with nothing committed.
+/// A prompt-level block ([`gemini_prompt_block`]) differs on purpose: it is
+/// decided on the request itself, which a retry resends unchanged, so every
+/// block reason there is a content filter and is never retried, while a
+/// candidate's `OTHER` belongs to one generation and is worth a retry.
 fn gemini_finish_reason_stop(reason: &str) -> Result<StopReason, LlmError> {
     match reason {
         "STOP" => Ok(StopReason::EndTurn),
@@ -2511,6 +2583,8 @@ struct CodeAssistGenerateContentResponse {
 #[serde(rename_all = "camelCase")]
 struct PromptFeedback {
     block_reason: Option<String>,
+    /// Raw evidence, read by [`gemini_blocked_categories`].
+    safety_ratings: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2519,6 +2593,8 @@ struct Candidate {
     content: Option<CandidateContent>,
     finish_reason: Option<String>,
     grounding_metadata: Option<Value>,
+    /// Raw evidence, read by [`gemini_blocked_categories`].
+    safety_ratings: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2615,6 +2691,18 @@ mod tests {
     /// tool results, then the durable system notice written at the next
     /// model boundary, then the model's next assistant message.
     fn durable_in_turn_notice_transcript() -> Vec<Message> {
+        durable_in_turn_transcript_with(Message::SystemNotice(
+            meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            ),
+        ))
+    }
+
+    /// The same transcript with `steer_row` as the row the steer wrote after
+    /// the tool results: a system notice, or the User row of a text-only
+    /// prompt steer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
         vec![
             Message::User(UserMessage::text("start the job")),
             Message::BlockAssistant(BlockAssistantMessage::new(
@@ -2631,10 +2719,7 @@ mod tests {
                 "lookup result".to_string(),
                 false,
             )]),
-            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
-                meerkat_core::SystemNoticeKind::Generic,
-                "background job finished",
-            )),
+            steer_row,
             Message::BlockAssistant(BlockAssistantMessage::new(
                 vec![AssistantBlock::Text {
                     text: "noted".to_string(),
@@ -2643,6 +2728,11 @@ mod tests {
                 StopReason::EndTurn,
             )),
         ]
+    }
+
+    /// The User row a text-only prompt steer writes into the running turn.
+    fn durable_in_turn_user_row() -> Message {
+        Message::User(UserMessage::text("also check the second file"))
     }
 
     #[test]
@@ -2665,6 +2755,39 @@ mod tests {
             "the functionResponse immediately follows its functionCall"
         );
         assert!(contents[3].to_string().contains("background job finished"));
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_gemini_body() {
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-3-pro",
+            durable_in_turn_transcript_with(durable_in_turn_user_row()),
+        );
+        let body = client
+            .build_request_body(&request)
+            .expect("a User row after tool results is a valid Gemini contents sequence");
+        let contents = body["contents"].as_array().expect("contents array");
+        let roles = contents
+            .iter()
+            .map(|content| content["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "model", "user", "user", "model"]);
+        assert!(contents[1]["parts"][0].get("functionCall").is_some());
+        let response_parts = contents[2]["parts"].as_array().expect("response parts");
+        assert_eq!(
+            response_parts.len(),
+            1,
+            "the steer text is not merged into the functionResponse content"
+        );
+        assert!(
+            response_parts[0].get("functionResponse").is_some(),
+            "the functionResponse immediately follows its functionCall"
+        );
+        assert_eq!(
+            contents[3]["parts"][0]["text"],
+            "also check the second file"
+        );
     }
     use tokio::net::TcpListener;
 
@@ -4458,6 +4581,223 @@ mod tests {
             }) => assert!(message.contains("'MALFORMED_FUNCTION_CALL'"), "{message}"),
             other => panic!("expected Done{{Error{{IncompleteResponse}}}}, got {other:?}"),
         }
+    }
+
+    /// One stubbed stream through the real client: every event it yields.
+    async fn gemini_stream_events(payload: String) -> Vec<LlmEvent> {
+        let (base_url, handle) = spawn_gemini_stream_stub(
+            "gemini-3.5-flash",
+            payload,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let client = GeminiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gemini-3.5-flash",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let events: Vec<LlmEvent> = client
+            .stream(&request)
+            .map(|event| event.expect("stream wrapper should convert errors to Done"))
+            .collect()
+            .await;
+        handle.abort();
+        events
+    }
+
+    /// #1888: a prompt blocked by `promptFeedback.blockReason` streams no
+    /// candidate and so no `finishReason`. Every block reason, `OTHER` and
+    /// one this adapter does not know included, ends the response as a
+    /// content filter, never as an incomplete stream that is retried.
+    #[tokio::test]
+    async fn gemini_stream_with_prompt_block_ends_as_content_filter() {
+        for block_reason in [
+            "SAFETY",
+            "BLOCKLIST",
+            "PROHIBITED_CONTENT",
+            "IMAGE_SAFETY",
+            "OTHER",
+            "SOMETHING_NEW",
+        ] {
+            let payload = format!(
+                "data: {{\"promptFeedback\":{{\"blockReason\":\"{block_reason}\"}},\"usageMetadata\":{{\"promptTokenCount\":3,\"totalTokenCount\":3}}}}\n"
+            );
+            let events = gemini_stream_events(payload).await;
+            assert_eq!(
+                done_success(&events),
+                Some((
+                    StopReason::ContentFilter,
+                    Some(ProviderStopDetail::gemini(
+                        GeminiStopStage::Prompt,
+                        block_reason,
+                        Vec::new(),
+                    )),
+                )),
+                "{block_reason}: {:?}",
+                events.last()
+            );
+        }
+    }
+
+    /// The last event's success outcome: its stop reason and provider detail.
+    fn done_success(events: &[LlmEvent]) -> Option<(StopReason, Option<ProviderStopDetail>)> {
+        match events.last()? {
+            LlmEvent::Done {
+                outcome:
+                    LlmDoneOutcome::Success {
+                        stop_reason,
+                        stop_detail,
+                        ..
+                    },
+            } => Some((*stop_reason, stop_detail.as_deref().cloned())),
+            _ => None,
+        }
+    }
+
+    /// #1888: the raw block reason and the blocked safety categories ride
+    /// the stop's provider detail, so a SAFETY block and a BLOCKLIST block
+    /// of the prompt, and of a candidate, can be told apart.
+    #[tokio::test]
+    async fn gemini_blocks_carry_their_raw_reason_and_blocked_categories() {
+        let ratings = r#"[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","probability":"HIGH","blocked":true},{"category":"HARM_CATEGORY_HARASSMENT","probability":"NEGLIGIBLE"}]"#;
+        let cases = [
+            (
+                format!(
+                    "data: {{\"promptFeedback\":{{\"blockReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}}}\n"
+                ),
+                ProviderStopDetail::gemini(
+                    GeminiStopStage::Prompt,
+                    "SAFETY",
+                    vec!["HARM_CATEGORY_DANGEROUS_CONTENT".to_string()],
+                ),
+            ),
+            (
+                "data: {\"promptFeedback\":{\"blockReason\":\"BLOCKLIST\"}}\n".to_string(),
+                ProviderStopDetail::gemini(GeminiStopStage::Prompt, "BLOCKLIST", Vec::new()),
+            ),
+            (
+                format!(
+                    "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"Partial\"}}]}},\"finishReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}]}}\n"
+                ),
+                ProviderStopDetail::gemini(
+                    GeminiStopStage::Candidate,
+                    "SAFETY",
+                    vec!["HARM_CATEGORY_DANGEROUS_CONTENT".to_string()],
+                ),
+            ),
+            (
+                "data: {\"candidates\":[{\"finishReason\":\"BLOCKLIST\"}]}\n".to_string(),
+                ProviderStopDetail::gemini(GeminiStopStage::Candidate, "BLOCKLIST", Vec::new()),
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (payload, expected) in cases {
+            let events = gemini_stream_events(payload).await;
+            assert_eq!(
+                done_success(&events),
+                Some((StopReason::ContentFilter, Some(expected.clone()))),
+                "{expected:?}"
+            );
+            assert!(
+                !seen.contains(&expected),
+                "details must differ: {expected:?}"
+            );
+            seen.push(expected);
+        }
+    }
+
+    /// #1888: safety ratings are evidence, read best-effort, so a rating
+    /// whose shape the adapter does not expect never fails the blocked
+    /// chunk: the block still ends as a content filter with its raw reason.
+    /// A rating counts only when `blocked` is JSON `true`, and only a string
+    /// category is kept.
+    #[tokio::test]
+    async fn malformed_safety_ratings_never_fail_a_block() {
+        let ratings = r#"[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","blocked":"yes"},{"category":7,"blocked":true},"not a rating",{"category":"HARM_CATEGORY_HARASSMENT","blocked":true}]"#;
+        let kept = vec!["HARM_CATEGORY_HARASSMENT".to_string()];
+        let cases = [
+            (
+                format!(
+                    "data: {{\"promptFeedback\":{{\"blockReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}}}\n"
+                ),
+                ProviderStopDetail::gemini(GeminiStopStage::Prompt, "SAFETY", kept.clone()),
+            ),
+            (
+                format!(
+                    "data: {{\"candidates\":[{{\"finishReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}]}}\n"
+                ),
+                ProviderStopDetail::gemini(GeminiStopStage::Candidate, "SAFETY", kept),
+            ),
+            (
+                "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\",\"safetyRatings\":\"none\"}}\n"
+                    .to_string(),
+                ProviderStopDetail::gemini(GeminiStopStage::Prompt, "SAFETY", Vec::new()),
+            ),
+        ];
+        for (payload, expected) in cases {
+            let events = gemini_stream_events(payload).await;
+            assert_eq!(
+                done_success(&events),
+                Some((StopReason::ContentFilter, Some(expected.clone()))),
+                "{expected:?}: {events:?}"
+            );
+        }
+    }
+
+    /// #1888: a Code Assist-wrapped prompt block unwraps to the same
+    /// response and ends as a content filter with its prompt detail.
+    #[tokio::test]
+    async fn code_assist_wrapped_prompt_block_ends_as_content_filter() {
+        let payload = concat!(
+            r#"data: {"response":{"promptFeedback":{"blockReason":"SAFETY"}},"traceId":"t"}"#,
+            "\n"
+        )
+        .to_string();
+        let (base_url, handle) =
+            spawn_code_assist_stream_stub(payload, Arc::new(Mutex::new(Vec::new()))).await;
+        let client =
+            GeminiClient::new_with_base_url(String::new(), base_url).with_code_assist_wire();
+        let request = LlmRequest::new(
+            "gemini-3.1-flash-lite-preview",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let events: Vec<LlmEvent> = client
+            .stream(&request)
+            .map(|event| event.expect("stream wrapper should convert errors to Done"))
+            .collect()
+            .await;
+        handle.abort();
+        assert_eq!(
+            done_success(&events),
+            Some((
+                StopReason::ContentFilter,
+                Some(ProviderStopDetail::gemini(
+                    GeminiStopStage::Prompt,
+                    "SAFETY",
+                    Vec::new(),
+                )),
+            )),
+            "{:?}",
+            events.last()
+        );
+    }
+
+    /// Prompt feedback without a block reason (safety ratings only) leaves
+    /// the candidate's `finishReason` in charge.
+    #[tokio::test]
+    async fn gemini_prompt_feedback_without_block_reason_keeps_the_finish_reason() {
+        let payload = [
+            r#"data: {"promptFeedback":{"safetyRatings":[{"category":"HARM_CATEGORY_HARASSMENT","probability":"NEGLIGIBLE"}]},"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1}}"#,
+            "",
+        ]
+        .join("\n");
+        let events = gemini_stream_events(payload).await;
+        assert_eq!(
+            done_success(&events),
+            Some((StopReason::EndTurn, None)),
+            "{:?}",
+            events.last()
+        );
     }
 
     /// Regression: Multiple tool calls to the same tool must get unique IDs.
@@ -6711,6 +7051,8 @@ mod tests {
                             ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
                                 .expect("structured response block"),
                         ],
+                        delivery_id: None,
+                        in_reply_to: None,
                     },
                 ),
             )],

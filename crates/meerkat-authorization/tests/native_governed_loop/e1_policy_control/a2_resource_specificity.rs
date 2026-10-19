@@ -450,7 +450,10 @@ fn assert_feedback(body: &Value, order: Order) {
     let diagnostic: Value = serde_json::from_str(&wire_text(&refused["content"])).unwrap();
     assert_eq!(
         diagnostic,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     for (id, expected) in [(READ_T, READ_RESULT), (DELETE_T2, DELETE_RESULT)] {
         let result = results
@@ -663,7 +666,7 @@ async fn exercise_a2(server: &Server, order: Order) {
         );
     }
     let refused: Vec<_> = audit.iter().filter(|record| matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == DELETE_T && tool_name == "delete_record"))).collect();
     assert_eq!(refused.len(), 1);
     let denied_operation_id = refused[0].observation.operation_id.clone();

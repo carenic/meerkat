@@ -145,6 +145,10 @@ pub enum BlockedDeliveryReason {
     /// No handler for its delivery kind is armed on this owner. Visible, and
     /// never treated as corruption.
     UnsupportedKind,
+    /// The runtime is not ready to admit it, for this typed cause (for
+    /// example an original whose admission its source owner has not settled
+    /// yet); it is retried on the next wake for its runtime.
+    NotReady(meerkat_core::authorization::ControllerReadinessFailure),
 }
 
 /// A continuation delivery settled as refused this pass: a terminal policy
@@ -186,6 +190,9 @@ fn blocked_delivery(
 ) -> BlockedRuntimeJobDelivery {
     let reason = match error {
         JobOutboxProjectionError::UnsupportedKind(_) => BlockedDeliveryReason::UnsupportedKind,
+        JobOutboxProjectionError::NotReady { reason, .. } => {
+            BlockedDeliveryReason::NotReady(*reason)
+        }
         _ => BlockedDeliveryReason::ApplyFailed,
     };
     BlockedRuntimeJobDelivery {
@@ -1147,6 +1154,14 @@ pub enum JobOutboxProjectionError {
     /// The delivery host is gone: the owner stops.
     #[error("the job delivery host is gone")]
     DeliveryHostGone,
+    /// A continuation delivery the runtime is not ready to admit, for a typed
+    /// cause: it stays pending and is retried, and the drain reports it as
+    /// [`BlockedDeliveryReason::NotReady`].
+    #[error("delivery {delivery_id} is not ready: {reason}")]
+    NotReady {
+        delivery_id: String,
+        reason: meerkat_core::authorization::ControllerReadinessFailure,
+    },
 }
 
 #[derive(Clone)]
@@ -1546,5 +1561,42 @@ impl meerkat_tools::builtin::shell::ShellJobDeliveryProjector for JobOutboxProje
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod not_ready_tests {
+    use super::*;
+    use meerkat_core::authorization::ControllerReadinessFailure;
+
+    /// A continuation the runtime is not ready to admit is blocked with the
+    /// runtime's typed cause, never as a bare apply failure.
+    #[test]
+    fn a_not_ready_continuation_is_blocked_with_its_typed_cause() {
+        let record = RuntimeDeliveryRecord {
+            sequence: 1,
+            submission: meerkat_runtime::RuntimeDeliverySubmission::new(
+                RuntimeDeliveryId::new("continuation:pending").expect("id"),
+                RuntimeDeliveryKind::Continuation,
+                "fork_off",
+                1,
+                "fork_off:job-1",
+                b"completion".to_vec(),
+            )
+            .expect("submission"),
+        };
+        let blocked = blocked_delivery(
+            &record,
+            &JobOutboxProjectionError::NotReady {
+                delivery_id: "continuation:pending".into(),
+                reason: ControllerReadinessFailure::OriginalAdmissionPending,
+            },
+        );
+        assert_eq!(
+            blocked.reason,
+            BlockedDeliveryReason::NotReady(ControllerReadinessFailure::OriginalAdmissionPending)
+        );
+        assert!(blocked.error.contains("not ready"), "{}", blocked.error);
     }
 }

@@ -1,0 +1,690 @@
+{
+  "written_by": "meerkat-core 0.9.3 (tag v0.9.3)",
+  "how": "Each session is a System message, a User message, the case's notice(s) and a User message. rows[i] is serde_json::to_string(&message), head is SessionHead::from_session(&session, TranscriptStrandId::root(), 0) and session_document is serde_json::to_string(&session), all as v0.9.3 wrote them; events[i] is serde_json::to_string(&AgentEvent::ToolConfigChanged { payload }) for the case's payloads. The generator is v0_9_3_tool_config_notice_sessions.generator.rs.txt.",
+  "cases": [
+    {
+      "case": "plain",
+      "description": "control: no tool-config or MCP notice",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 125068910,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:d2d99260d63d58d78a9cc759ef00f35e2200796a04366ae182c6d4dd5f76a152",
+        "id": "01a153ca-212d-73b2-b5b7-12c83332019b",
+        "message_count": 3,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:59e68d451ad21242395a3f8f86489c351ba7fe65f12eefda9104b7770ae5fc5a",
+          "row_count": 3,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:59e68d451ad21242395a3f8f86489c351ba7fe65f12eefda9104b7770ae5fc5a",
+            "row_count": 3,
+            "version": 1
+          },
+          "message_count": 3,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:59e68d451ad21242395a3f8f86489c351ba7fe65f12eefda9104b7770ae5fc5a",
+            "row_count": 3,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 125243382,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.125151053Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.125209822Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.125231694Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-212d-73b2-b5b7-12c83332019b\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.125151053Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.125209822Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.125231694Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":125068910},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":125243382},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "mcp_no_phase_persisted_true",
+      "description": "mcp block without a phase, persisted true",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 125863232,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:f327ce4cba2ec42de78fe7e527d9ad937f506907e078af6d27e1607adf3f4662",
+        "id": "01a153ca-212d-73b2-b5b7-12dc218de196",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:0afffadc5f1230b5769f4bdae336a32039d73e0e9fb7cb97ef32698e2b58765d",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:0afffadc5f1230b5769f4bdae336a32039d73e0e9fb7cb97ef32698e2b58765d",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:0afffadc5f1230b5769f4bdae336a32039d73e0e9fb7cb97ef32698e2b58765d",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 125945475,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.125876522Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.125893777Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":true}],\"created_at\":\"2026-10-19T10:51:58.125040858Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.125934018Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-212d-73b2-b5b7-12dc218de196\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.125876522Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.125893777Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":true}],\"created_at\":\"2026-10-19T10:51:58.125040858Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.125934018Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":125863232},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":125945475},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "mcp_no_phase_persisted_false",
+      "description": "mcp block without a phase, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 126487127,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:4aeb2d878ead5ab398ad4173d4f9dfb2091863aa29cdf732e7166a766d1d20b7",
+        "id": "01a153ca-212e-7940-b492-65be6f36f372",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:c107c32afda29df44c7bb12d8ce8cf2f74baf735dce4ce9b745fa4ca8bcc3d9c",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:c107c32afda29df44c7bb12d8ce8cf2f74baf735dce4ce9b745fa4ca8bcc3d9c",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:c107c32afda29df44c7bb12d8ce8cf2f74baf735dce4ce9b745fa4ca8bcc3d9c",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 126558514,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.126499516Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.126515510Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":false}],\"created_at\":\"2026-10-19T10:51:58.125041098Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.126546977Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-212e-7940-b492-65be6f36f372\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.126499516Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.126515510Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":false}],\"created_at\":\"2026-10-19T10:51:58.125041098Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.126546977Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":126487127},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":126558514},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "mcp_pending_phase",
+      "description": "the agent's McpPending block: phase pending, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 127061629,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:262e475e4e149218aba620a38bbfe662ad88c7b2e35e108fe474cf0ebc9bc65b",
+        "id": "01a153ca-212f-7223-8c73-f8a4dfb537f0",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:568d94a21acad25dadeb8bed95ba87d16447404d60b2b444d7f1ec49cebb04e0",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:568d94a21acad25dadeb8bed95ba87d16447404d60b2b444d7f1ec49cebb04e0",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:568d94a21acad25dadeb8bed95ba87d16447404d60b2b444d7f1ec49cebb04e0",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 127137623,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.127073807Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.127088950Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"phase\":\"pending\",\"persisted\":false,\"detail\":\"Servers connecting: server. Tools will appear when ready.\",\"pending_sources\":[\"server\"]}],\"created_at\":\"2026-10-19T10:51:58.125041479Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.127126126Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-212f-7223-8c73-f8a4dfb537f0\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.127073807Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.127088950Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"phase\":\"pending\",\"persisted\":false,\"detail\":\"Servers connecting: server. Tools will appear when ready.\",\"pending_sources\":[\"server\"]}],\"created_at\":\"2026-10-19T10:51:58.125041479Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.127126126Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":127061629},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":127137623},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "mcp_setup_failure",
+      "description": "setup failure notice: phase failed, persisted true",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 127672205,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:90872613ec077b4154a0fe7311540c833befbb8e14a2b6a22c01c59782513c60",
+        "id": "01a153ca-212f-7223-8c73-f8b32c17a0b3",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:7e26d543a66aaf884d333be8b1357ce145b385e28d3e766aca197b7ee9637d1e",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:7e26d543a66aaf884d333be8b1357ce145b385e28d3e766aca197b7ee9637d1e",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:7e26d543a66aaf884d333be8b1357ce145b385e28d3e766aca197b7ee9637d1e",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 127750703,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.127685054Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.127701569Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":true,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125042901Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.127739206Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-212f-7223-8c73-f8b32c17a0b3\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.127685054Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.127701569Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":true,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125042901Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.127739206Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":127672205},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":127750703},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "mcp_restore_refusal",
+      "description": "restore refusal notice: phase failed, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 128278014,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:6a24c6b3b74cb76b622682d3d26e1080f10a3fa023b1f6009c74c943bc70efb3",
+        "id": "01a153ca-2130-7bd0-a22e-25cfc2e2a865",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:fff71cfadfafc64bc8730dc16606ae934daf3696937f5d03b8177a52bd252daf",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:fff71cfadfafc64bc8730dc16606ae934daf3696937f5d03b8177a52bd252daf",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:fff71cfadfafc64bc8730dc16606ae934daf3696937f5d03b8177a52bd252daf",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 128353217,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.128290132Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.128305956Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":false,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125043652Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.128341789Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2130-7bd0-a22e-25cfc2e2a865\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.128290132Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.128305956Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":false,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125043652Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.128341789Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":128278014},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":128353217},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": []
+    },
+    {
+      "case": "tool_scope_boundary_applied",
+      "description": "tool_config boundary_applied, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 128886066,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:5d2830ae79e55347b91ee62b14e191da47d783695bc9aa0bd87bf60f6ccaa30a",
+        "id": "01a153ca-2130-7bd0-a22e-25dca78cfc1e",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:4867f98d4fa3dfcc32e6ca30f88a54caef43e77a274e5d58ed7bb5c56dac135e",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:4867f98d4fa3dfcc32e6ca30f88a54caef43e77a274e5d58ed7bb5c56dac135e",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:4867f98d4fa3dfcc32e6ca30f88a54caef43e77a274e5d58ed7bb5c56dac135e",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 128969571,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.128897934Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.128913587Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Tool configuration changed at turn boundary: boundary_applied(base_changed=true,visible_changed=false,revision=3)\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125023462Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.128958194Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2130-7bd0-a22e-25dca78cfc1e\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.128897934Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.128913587Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Tool configuration changed at turn boundary: boundary_applied(base_changed=true,visible_changed=false,revision=3)\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125023462Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.128958194Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":128886066},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":128969571},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}"
+      ]
+    },
+    {
+      "case": "deferred_catalog_delta",
+      "description": "tool_config deferred_catalog_delta, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 129580247,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:6f5a51644b2a268ded9653c20601e5b1db29a7d0d68b6157645be175975f183a",
+        "id": "01a153ca-2131-7a91-9064-b915a2b891b0",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:947a4ab82b8377f6af73a6075c36305c577a371878c181ecf300a21cbfae8774",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:947a4ab82b8377f6af73a6075c36305c577a371878c181ecf300a21cbfae8774",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:947a4ab82b8377f6af73a6075c36305c577a371878c181ecf300a21cbfae8774",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 129684934,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.129592466Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.129622731Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Deferred catalog changed at turn boundary: new deferred tools available: search; sources still connecting: server\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}],\"created_at\":\"2026-10-19T10:51:58.125037613Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.129673557Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2131-7a91-9064-b915a2b891b0\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.129592466Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.129622731Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Deferred catalog changed at turn boundary: new deferred tools available: search; sources still connecting: server\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}],\"created_at\":\"2026-10-19T10:51:58.125037613Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.129673557Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":129580247},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":129684934},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}"
+      ]
+    },
+    {
+      "case": "warning_failed_closed",
+      "description": "tool_config warning_failed_closed, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 130348129,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:7a724f6db93159b27a5f94f99bdfc2a64560d266fa2233d5357e612a82257396",
+        "id": "01a153ca-2132-7dd0-b4b9-c25537db7945",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:1cbc35c94401914ab75515b747cb819e15b16a2b82fd85a502bedd7a3b56dbfe",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:1cbc35c94401914ab75515b747cb819e15b16a2b82fd85a502bedd7a3b56dbfe",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:1cbc35c94401914ab75515b747cb819e15b16a2b82fd85a502bedd7a3b56dbfe",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 130428319,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.130360948Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.130377904Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope_warning\",\"body\":\"Tool scope apply failed (injected scope failure); closing the visible tool set until the next boundary.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125038284Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.130416852Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2132-7dd0-b4b9-c25537db7945\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.130360948Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.130377904Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope_warning\",\"body\":\"Tool scope apply failed (injected scope failure); closing the visible tool set until the next boundary.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125038284Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.130416852Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":130348129},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":130428319},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}"
+      ]
+    },
+    {
+      "case": "external_tool_delta_pending",
+      "description": "tool_config external_tool_delta pending, persisted false",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 131021539,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:08aca77137fa6ffc2ee111808132e7ce75a1723bc63e869bd61ad1b3dbf62c4c",
+        "id": "01a153ca-2133-7d42-9bd7-432ae202b87b",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:15f88436eb6ba9bc9a56c83ba746d353f499ccbcf4890fa7d45f28f094348358",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:15f88436eb6ba9bc9a56c83ba746d353f499ccbcf4890fa7d45f28f094348358",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:15f88436eb6ba9bc9a56c83ba746d353f499ccbcf4890fa7d45f28f094348358",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 131097733,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.131034088Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.131050422Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server is pending.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125039997Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.131086096Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2133-7d42-9bd7-432ae202b87b\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.131034088Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.131050422Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server is pending.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125039997Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.131086096Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":131021539},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":131097733},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}"
+      ]
+    },
+    {
+      "case": "external_tool_delta_applied",
+      "description": "tool_config external_tool_delta applied, persisted true",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 131643041,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:e0cc53f358664b48a0ff9938191c43ecca969581f35ecb1fd0b205481487d26a",
+        "id": "01a153ca-2133-7d42-9bd7-433e8156a320",
+        "message_count": 4,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:aa5c36d79be7ef9b77381ec22b1e37805c7610c104dfcf3080dc5d4c2f3bd632",
+          "row_count": 4,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:aa5c36d79be7ef9b77381ec22b1e37805c7610c104dfcf3080dc5d4c2f3bd632",
+            "row_count": 4,
+            "version": 1
+          },
+          "message_count": 4,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:aa5c36d79be7ef9b77381ec22b1e37805c7610c104dfcf3080dc5d4c2f3bd632",
+            "row_count": 4,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 131717874,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.131655610Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.131671895Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server was added.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125040387Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.131706557Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2133-7d42-9bd7-433e8156a320\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.131655610Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.131671895Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server was added.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125040387Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.131706557Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":131643041},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":131717874},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}"
+      ]
+    },
+    {
+      "case": "all_notices",
+      "description": "every shape above in one transcript",
+      "head": {
+        "created_at": {
+          "nanos_since_epoch": 132245906,
+          "secs_since_epoch": 1792407118
+        },
+        "head_revision": "sha256:227abeb6834588922c2d4e883994fe7885cdff28d921924072f5296baf342d14",
+        "id": "01a153ca-2134-7423-bdd3-14f72cbb69ca",
+        "message_count": 13,
+        "message_row_prefix": {
+          "digest": "row-lineage-v1-sha256:3908a084ec4fd9e7e688a73d0a16260f2a2c0c77717f4bd1b2bbe34bae3c342c",
+          "row_count": 13,
+          "version": 1
+        },
+        "metadata": {},
+        "rewrite_count": 0,
+        "row_lineage_anchor": {
+          "materialized_prefix": {
+            "digest": "row-lineage-v1-sha256:3908a084ec4fd9e7e688a73d0a16260f2a2c0c77717f4bd1b2bbe34bae3c342c",
+            "row_count": 13,
+            "version": 1
+          },
+          "message_count": 13,
+          "prefix": {
+            "digest": "row-lineage-v1-sha256:3908a084ec4fd9e7e688a73d0a16260f2a2c0c77717f4bd1b2bbe34bae3c342c",
+            "row_count": 13,
+            "version": 1
+          },
+          "rewrite_count": 0,
+          "strand": "root"
+        },
+        "strand": "root",
+        "updated_at": {
+          "nanos_since_epoch": 132532345,
+          "secs_since_epoch": 1792407118
+        },
+        "usage": {
+          "cache_creation_tokens": null,
+          "cache_read_tokens": null,
+          "input_tokens": 0,
+          "output_tokens": 0
+        },
+        "version": 4
+      },
+      "rows": [
+        "{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.132258094Z\"}",
+        "{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.132273687Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":true}],\"created_at\":\"2026-10-19T10:51:58.125040858Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":false}],\"created_at\":\"2026-10-19T10:51:58.125041098Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"phase\":\"pending\",\"persisted\":false,\"detail\":\"Servers connecting: server. Tools will appear when ready.\",\"pending_sources\":[\"server\"]}],\"created_at\":\"2026-10-19T10:51:58.125041479Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":true,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125042901Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":false,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125043652Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Tool configuration changed at turn boundary: boundary_applied(base_changed=true,visible_changed=false,revision=3)\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125023462Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Deferred catalog changed at turn boundary: new deferred tools available: search; sources still connecting: server\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}],\"created_at\":\"2026-10-19T10:51:58.125037613Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"tool_scope_warning\",\"body\":\"Tool scope apply failed (injected scope failure); closing the visible tool set until the next boundary.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125038284Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server is pending.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125039997Z\"}",
+        "{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server was added.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125040387Z\"}",
+        "{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.132520948Z\"}"
+      ],
+      "session_document": "{\"version\":4,\"id\":\"01a153ca-2134-7423-bdd3-14f72cbb69ca\",\"messages\":[{\"role\":\"system\",\"content\":\"base system\",\"created_at\":\"2026-10-19T10:51:58.132258094Z\"},{\"role\":\"user\",\"content\":\"hello\",\"created_at\":\"2026-10-19T10:51:58.132273687Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":true}],\"created_at\":\"2026-10-19T10:51:58.125040858Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"persisted\":false}],\"created_at\":\"2026-10-19T10:51:58.125041098Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp_pending\",\"body\":\"Servers connecting: server. Tools will appear when ready.\",\"blocks\":[{\"type\":\"mcp\",\"phase\":\"pending\",\"persisted\":false,\"detail\":\"Servers connecting: server. Tools will appear when ready.\",\"pending_sources\":[\"server\"]}],\"created_at\":\"2026-10-19T10:51:58.125041479Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":true,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125042901Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\",\"blocks\":[{\"type\":\"mcp\",\"server_id\":\"server\",\"operation\":\"add\",\"phase\":\"failed\",\"persisted\":false,\"detail\":\"An MCP server could not be started or reloaded. Continue with the tools that are currently available.\"}],\"created_at\":\"2026-10-19T10:51:58.125043652Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Tool configuration changed at turn boundary: boundary_applied(base_changed=true,visible_changed=false,revision=3)\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125023462Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope\",\"body\":\"Deferred catalog changed at turn boundary: new deferred tools available: search; sources still connecting: server\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}],\"created_at\":\"2026-10-19T10:51:58.125037613Z\"},{\"role\":\"system_notice\",\"kind\":\"tool_scope_warning\",\"body\":\"Tool scope apply failed (injected scope failure); closing the visible tool set until the next boundary.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}],\"created_at\":\"2026-10-19T10:51:58.125038284Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server is pending.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125039997Z\"},{\"role\":\"system_notice\",\"kind\":\"mcp\",\"body\":\"MCP server server was added.\",\"blocks\":[{\"type\":\"tool_config\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}],\"created_at\":\"2026-10-19T10:51:58.125040387Z\"},{\"role\":\"user\",\"content\":\"after\",\"created_at\":\"2026-10-19T10:51:58.132520948Z\"}],\"created_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":132245906},\"updated_at\":{\"secs_since_epoch\":1792407118,\"nanos_since_epoch\":132532345},\"metadata\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_tokens\":null,\"cache_read_tokens\":null}}",
+      "events": [
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"boundary_applied\",\"base_changed\":true,\"visible_changed\":false,\"revision\":3},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}",
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"deferred_catalog\",\"status_info\":{\"kind\":\"deferred_catalog_delta\",\"added_hidden_count\":1,\"removed_hidden_count\":0,\"pending_source_count\":1},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"deferred_catalog\",\"deferred_catalog_delta\":{\"added_hidden_names\":[\"search\"],\"pending_sources\":[\"server\"]}}}",
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"reload\",\"target\":\"tool_scope\",\"status_info\":{\"kind\":\"warning_failed_closed\",\"error\":\"injected scope failure\"},\"persisted\":false,\"applied_at_turn\":2,\"domain\":\"tool_scope\"}}",
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"pending\"},\"persisted\":false,\"applied_at_turn\":2}}",
+        "{\"type\":\"tool_config_changed\",\"payload\":{\"operation\":\"add\",\"target\":\"server\",\"status_info\":{\"kind\":\"external_tool_delta\",\"phase\":\"applied\"},\"persisted\":true,\"applied_at_turn\":2}}"
+      ]
+    }
+  ]
+}

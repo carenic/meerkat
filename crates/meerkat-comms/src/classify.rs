@@ -553,6 +553,7 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Arc;
 
+    #[cfg(feature = "workspace-tests")]
     pub(crate) fn runtime_peer_comms_handle_with_silent<I, S>(
         silent_intents: I,
     ) -> Arc<dyn meerkat_core::handles::PeerCommsHandle>
@@ -563,10 +564,12 @@ pub(crate) mod test_support {
         meerkat_runtime::test_peer_comms_handle_with_silent(silent_intents)
     }
 
+    #[cfg(feature = "workspace-tests")]
     pub(crate) fn runtime_peer_comms_handle() -> Arc<dyn meerkat_core::handles::PeerCommsHandle> {
         runtime_peer_comms_handle_with_silent(std::iter::empty::<String>())
     }
 
+    #[cfg(feature = "workspace-tests")]
     pub(crate) fn classification_context(
         trusted_peers: TrustStore,
         require_peer_auth: bool,
@@ -577,6 +580,7 @@ pub(crate) mod test_support {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     pub(crate) fn classification_context_shared(
         trusted_peers: Arc<parking_lot::RwLock<TrustStore>>,
         require_peer_auth: bool,
@@ -614,6 +618,7 @@ mod tests {
         inner: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RecordingPeerCommsHandle {
         fn accepting() -> Arc<Self> {
             Self::accepting_with_silent(std::iter::empty::<&str>())
@@ -722,6 +727,7 @@ mod tests {
         delegate: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectingPeerCommsHandle {
         fn external() -> Self {
             Self {
@@ -809,6 +815,7 @@ mod tests {
         Keypair::generate()
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn make_context(
         require_peer_auth: bool,
         trusted_peers: TrustStore,
@@ -825,6 +832,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn make_context_with_namespace(
         require_peer_auth: bool,
         trusted_peers: TrustStore,
@@ -911,6 +919,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn transport_classifier_uses_machine_admission_output_not_local_decision() {
         let sender = make_keypair();
@@ -953,6 +962,7 @@ mod tests {
         assert_eq!(machine.external_calls(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_message_as_actionable_message() {
         let sender = make_keypair();
@@ -966,6 +976,7 @@ mod tests {
                 body: "hello".to_string(),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let item = InboxItem::External { envelope };
@@ -980,6 +991,7 @@ mod tests {
         assert!(result.lifecycle_peer.is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_message_prefers_inproc_source_label_for_prompt_display() {
         let sender = make_keypair();
@@ -1006,6 +1018,7 @@ mod tests {
                 body: "hello".to_string(),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let item = InboxItem::External { envelope };
@@ -1024,6 +1037,7 @@ mod tests {
         assert!(InprocRegistry::global().unregister_in_namespace(&namespace, &sender_pubkey));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_request_as_actionable_request() {
         let sender = make_keypair();
@@ -1052,6 +1066,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn signed_tcp_request_reply_endpoint_is_confined_to_observed_source_ip() {
         let sender = make_keypair();
@@ -1103,6 +1118,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn reply_endpoint_is_not_propagated_without_authenticated_tcp_ingress() {
         let sender = make_keypair();
@@ -1145,6 +1161,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn reply_endpoint_rejects_non_tcp_and_invalid_declared_ports() {
         let sender = make_keypair();
@@ -1189,6 +1206,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_completed_response_as_terminal_response() {
         let sender = make_keypair();
@@ -1313,6 +1331,7 @@ mod tests {
     /// hold the request; a frame signed by any other peer, or one the machine
     /// cannot judge, is rejected before it is queued. The machine is asked
     /// with the request id and the canonical id of the envelope's signer.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn a_response_is_queued_only_when_its_signer_is_admitted() {
         use meerkat_core::PeerResponseSenderVerdict;
@@ -1376,6 +1395,7 @@ mod tests {
     /// for the frame, as the sender identity is (R084), never on the shell's
     /// copy of the envelope field. A response the machine echoes no request
     /// id for is rejected before the question is asked.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn a_response_sender_is_judged_on_the_machine_echoed_request_id() {
         let sender = make_keypair();
@@ -1431,6 +1451,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_ack_as_ack() {
         let sender = make_keypair();
@@ -1447,6 +1468,7 @@ mod tests {
         assert_eq!(result.class, PeerInputClass::Ack);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_peer_added_lifecycle() {
         let sender = make_keypair();
@@ -1470,6 +1492,7 @@ mod tests {
         assert_eq!(result.lifecycle_peer.as_deref(), Some("new-agent"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_peer_retired_lifecycle() {
         let sender = make_keypair();
@@ -1493,6 +1516,7 @@ mod tests {
         assert_eq!(result.lifecycle_peer.as_deref(), Some("old-agent"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_silent_request() {
         let sender = make_keypair();
@@ -1515,6 +1539,7 @@ mod tests {
         assert_eq!(result.class, PeerInputClass::SilentRequest);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_builtin_intent_in_silent_list() {
         // Silent matching must work for built-in intent names (e.g. "review"),
@@ -1539,6 +1564,7 @@ mod tests {
         assert_eq!(result.class, PeerInputClass::SilentRequest);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_untrusted_supervisor_bridge_request_remains_admissible() {
         let sender = make_keypair();
@@ -1589,6 +1615,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn auth_exempt_supervisor_intent_cannot_bypass_machine_rejection() {
         let sender = make_keypair();
@@ -1710,6 +1737,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn machine_classification_controls_auth_lifecycle_and_terminality() {
         let sender = make_keypair();
@@ -1806,6 +1834,7 @@ mod tests {
         assert_eq!(response_machine.external_calls(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn machine_handoff_precedes_silent_routing_and_lifecycle_extraction() {
         let sender = make_keypair();
@@ -1857,6 +1886,7 @@ mod tests {
         assert_eq!(machine.external_calls(), 2);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn rendered_request_projection_is_created_only_after_machine_accepts() {
         let sender = make_keypair();
@@ -1898,6 +1928,7 @@ mod tests {
         assert_eq!(machine.external_calls(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_plain_event() {
         let ctx = make_context(false, TrustStore::new(), vec![]);
@@ -1916,6 +1947,7 @@ mod tests {
         assert!(result.from_peer.is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn plain_event_projection_requires_machine_classification() {
         let machine = RecordingPeerCommsHandle::accepting();
@@ -1947,6 +1979,7 @@ mod tests {
         assert_eq!(machine.plain_calls(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn plain_event_machine_rejection_fails_closed() {
         let machine = RecordingPeerCommsHandle::rejecting_plain();
@@ -1975,6 +2008,7 @@ mod tests {
         assert_eq!(machine.plain_calls(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn no_lifecycle_leakage_plain_events_remain_the_only_non_peer_inbox_class() {
         let ctx = make_context(false, TrustStore::new(), vec![]);
@@ -1992,6 +2026,7 @@ mod tests {
         assert_eq!(result.class, PeerInputClass::PlainEvent);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_lifecycle_without_peer_subject_is_rejected_at_ingress() {
         // K15: a peer lifecycle notice without a valid typed peer subject is
@@ -2026,6 +2061,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn classify_lifecycle_prefers_typed_peer_spec_subject() {
         // K15: `peer_spec` (the canonical typed identity from the wire
@@ -2059,6 +2095,7 @@ mod tests {
         assert_eq!(result.lifecycle_peer.as_deref(), Some("mob/new-agent"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn prepare_plain_event_assigns_interaction_id_and_projection() {
         let ctx = make_context(false, TrustStore::new(), vec![]);

@@ -11,6 +11,23 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_flow_runtime.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_generated_image_comms.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_idle_burn.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_pictionary.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_resume.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_mob_turn_latency.rs",
+]
 
 [dependencies]
 # Internal crates
@@ -189,6 +206,16 @@ path = "../../examples/018-mob-research-team-rs/main.rs"
 [[example]]
 name = "019-mob-pipeline"
 path = "../../examples/019-mob-pipeline-rs/main.rs"
+
+# The feature set this crate's own tests need. The published package
+# has no self dev-dependency to turn them on, so its README.md prints the
+# command with these features, and the standalone test lane
+# (scripts/published_crates_standalone.py) reads them from here.
+[package.metadata.meerkat.standalone-tests]
+features = ["test-support"]
+# The README's command sets this thread stack, the workspace's
+# (.cargo/config.toml [env]); the suite is not checked at Rust's 2 MiB default.
+min-stack = 8388608
 
 [lints]
 workspace = true

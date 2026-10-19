@@ -9,7 +9,10 @@
 //! it per member.
 
 use super::*;
-use crate::runtime::{MemberShutdownOutcome, RetirementSettlement, ShutdownOptions};
+use crate::runtime::{
+    MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, RetirementSettlement,
+    ShutdownOptions,
+};
 
 /// Bound for test steps that must happen promptly; it only turns a hang into
 /// a failure.
@@ -448,6 +451,92 @@ async fn a_shutdown_deadline_reports_a_held_unregister_as_pending() {
     service.release_runtime_turns.notify_waiters();
 }
 
+/// The pending unregister a Shutdown deadline reports carries the member's
+/// exact registration's settlement, and the settlement outlives the mob's
+/// actor: while the held turn runs it stays pending; once the turn ends,
+/// settling it joins the runtime's coordinator for that registration and
+/// proves the registration gone.
+#[tokio::test]
+async fn a_pending_unregister_settles_after_the_shutdown_returns() {
+    let (handle, service) = turn_driven_mob().await;
+    let (busy, session) = spawn_member(&handle, "held-turn").await;
+    service.set_block_runtime_turns(true);
+    // Register before the turn starts: the start is a `notify_waiters` signal.
+    let turn_started = service.runtime_turn_started.notified();
+    tokio::pin!(turn_started);
+    turn_started.as_mut().enable();
+    let _turn = handle
+        .member(&busy)
+        .await
+        .expect("member handle")
+        .start_turn(
+            ContentInput::Text("a turn that holds its runtime loop".into()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("turn admitted");
+    tokio::time::timeout(STEP, turn_started)
+        .await
+        .expect("the turn is running");
+
+    let report = tokio::time::timeout(
+        STEP,
+        handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("shutdown returns at the caller's deadline")
+    .expect("shutdown succeeds");
+    let mut settlement = match report.members.get(&busy) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "shutdown_runtime_unregister");
+            settlement.clone()
+        }
+        other => panic!("expected the held member's unregister pending, got {other:?}"),
+    };
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&session)
+            .await
+            .is_some(),
+        "the held turn keeps the member's registration current"
+    );
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "the unregister stays pending while the turn holds it"
+    );
+
+    service.set_block_runtime_turns(false);
+    service.release_runtime_turns();
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&session)
+            .await
+            .is_none(),
+        "the member's registration is gone"
+    );
+    assert_eq!(
+        settlement.try_state(),
+        MemberUnregisterState::Settled,
+        "the settled state is kept"
+    );
+}
+
 /// Each member's Shutdown outcome is logged as it settles, so a process killed
 /// mid-Shutdown still leaves a per-member record.
 #[tokio::test]
@@ -635,11 +724,575 @@ async fn shutdown_teardown_progresses_past_a_held_registration_transaction() {
         "{report:?}"
     );
     match report.members.get(&held) {
-        Some(MemberShutdownOutcome::UnregisterPending { stage }) => {
+        Some(MemberShutdownOutcome::UnregisterPending { stage, .. }) => {
             assert_eq!(stage, "registration_transaction_admission");
         }
         other => panic!("expected the held session pending at admission, got {other:?}"),
     }
+}
+
+/// When Shutdown's deadline passes before the member's exact unregister is
+/// admitted, its settlement admits that unregister itself, through the same
+/// exact registration, once the registration transaction is free, and
+/// proves the registration gone.
+#[tokio::test]
+async fn a_pending_unregister_admission_settles_once_the_registration_is_free() {
+    let (handle, service) = turn_driven_mob().await;
+    let (held, held_session) = spawn_member(&handle, "held-registration").await;
+    let guard = service
+        .runtime_adapter
+        .hold_session_registration_transaction_for_test(&held_session)
+        .await;
+    let report = tokio::time::timeout(
+        STEP,
+        handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("shutdown returns at the caller's deadline")
+    .expect("shutdown succeeds");
+    let mut settlement = match report.members.get(&held) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "registration_transaction_admission");
+            settlement.clone()
+        }
+        other => panic!("expected the held session pending at admission, got {other:?}"),
+    };
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "the held registration transaction keeps the admission pending"
+    );
+
+    drop(guard);
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
+    assert!(
+        service
+            .runtime_adapter
+            .current_session_registration_witness(&held_session)
+            .await
+            .is_none(),
+        "the member's registration is gone"
+    );
+}
+
+/// A settlement holds the mob's runtime handle only weakly. Dropping that
+/// handle ends nothing: the runtime and an unregister coordinator can still
+/// run through another handle, and the registration stays current there. So
+/// the settlement stays pending until the exact registration has ended, and
+/// settles only then.
+#[tokio::test]
+async fn a_dropped_runtime_handle_settles_only_once_the_registration_has_ended() {
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let session = SessionId::new();
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let registration_use = runtime.session_registration_use(&registration).await;
+    let mut settlement =
+        MemberUnregisterSettlement::new(registration, registration_use, None, &runtime, None);
+    let other_handle = (*runtime).clone();
+    drop(runtime);
+
+    assert_eq!(settlement.try_state(), MemberUnregisterState::Pending);
+    assert_eq!(
+        settlement
+            .settle_within(Instant::now() + Duration::from_millis(200))
+            .await,
+        MemberUnregisterState::Pending,
+        "a dropped handle is no evidence that the registration ended"
+    );
+    assert!(
+        other_handle
+            .current_session_registration_witness(&session)
+            .await
+            .is_some(),
+        "the registration is still current through the other handle"
+    );
+
+    other_handle
+        .unregister_session(&session)
+        .await
+        .expect("unregister through the other handle");
+    assert_eq!(
+        settlement.settle_within(Instant::now() + STEP).await,
+        MemberUnregisterState::Settled
+    );
+}
+
+/// A later owner's runtime executor. It never runs anything: the tests only
+/// need its attachment to exist.
+struct LaterOwnerExecutor;
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutor for LaterOwnerExecutor {
+    async fn apply(
+        &mut self,
+        _run_id: meerkat_core::RunId,
+        _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        Err(
+            meerkat_core::lifecycle::core_executor::CoreExecutorError::Internal(
+                "the later owner's fixture executor runs nothing".to_string(),
+            ),
+        )
+    }
+
+    async fn cancel_after_boundary(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(
+        &mut self,
+        _reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// R1, the in-place adoption: Shutdown returned with a member's exact
+/// unregister not admitted, and its registration has no runtime loop. A
+/// later owner then adopts that registration in place (the runtime upgrades
+/// a loop-less registration and keeps its witness), so the exact
+/// registration the settlement follows is now the later owner's. Settling
+/// must not unregister it.
+#[tokio::test]
+async fn a_pending_unregister_leaves_a_registration_a_later_owner_adopted_in_place() {
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let session = SessionId::new();
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        runtime
+            .current_executor_attachment_witness(&session)
+            .await
+            .is_none(),
+        "the registration has no runtime loop when Shutdown returns"
+    );
+    let registration_use = runtime.session_registration_use(&registration).await;
+    let mut settlement = MemberUnregisterSettlement::new(
+        registration.clone(),
+        registration_use,
+        None,
+        &runtime,
+        None,
+    );
+
+    runtime
+        .ensure_session_with_executor(session.clone(), Box::new(LaterOwnerExecutor))
+        .await
+        .expect("a later owner adopts the registration in place");
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the in-place adoption keeps the exact registration witness"
+    );
+    let adopted = runtime
+        .current_executor_attachment_witness(&session)
+        .await
+        .expect("the later owner's executor is attached");
+
+    let state = settlement.settle_within(Instant::now() + STEP).await;
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the later owner's registration stays registered (settlement: {state:?})"
+    );
+    assert_eq!(
+        runtime
+            .current_executor_attachment_witness(&session)
+            .await
+            .as_ref(),
+        Some(&adopted),
+        "the later owner's executor stays attached (settlement: {state:?})"
+    );
+    assert_eq!(state, MemberUnregisterState::HandedOver);
+}
+
+/// R1, the loop-less reuse: Shutdown returned with a member's exact
+/// unregister not admitted, and its registration has no runtime loop. A
+/// later owner reuses that registration as it is (`register_session` finds
+/// it and returns it, no runtime loop attached) and admits an input. The
+/// settlement must not unregister the later owner's registration, and the
+/// later owner's input stays queued.
+#[tokio::test]
+async fn a_pending_unregister_leaves_a_registration_a_later_owner_reused_without_a_loop() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let session = SessionId::new();
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let registration_use = runtime.session_registration_use(&registration).await;
+    let mut settlement = MemberUnregisterSettlement::new(
+        registration.clone(),
+        registration_use,
+        None,
+        &runtime,
+        None,
+    );
+
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("a later owner reuses the existing registration");
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the reuse keeps the exact registration witness"
+    );
+    let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+        "the later owner's queued input",
+        None,
+    ));
+    let input_id = input.id().clone();
+    runtime
+        .accept_input(&session, input)
+        .await
+        .expect("the later owner's input is admitted");
+
+    let state = settlement.settle_within(Instant::now() + STEP).await;
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the later owner's registration stays registered (settlement: {state:?})"
+    );
+    let input_state = runtime.input_state(&session, &input_id).await;
+    assert!(
+        matches!(
+            &input_state,
+            Ok(Some(stored))
+                if stored.seed.phase == meerkat_runtime::InputLifecycleState::Queued
+        ),
+        "the later owner's input stays queued: {input_state:?} (settlement: {state:?})"
+    );
+    assert_eq!(state, MemberUnregisterState::HandedOver);
+}
+
+/// R1, the loop-less reuse on a runtime with a durable store: as above, but
+/// the later owner's `register_session` reuses the registration through the
+/// stored registration path.
+#[tokio::test]
+async fn a_pending_unregister_leaves_a_stored_registration_a_later_owner_reused_without_a_loop() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+
+    let runtime_store: Arc<dyn meerkat_runtime::store::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let runtime = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent(runtime_store, blob_store)
+            .expect("construct runtime authority"),
+    );
+    let session = SessionId::new();
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let registration_use = runtime.session_registration_use(&registration).await;
+    let mut settlement = MemberUnregisterSettlement::new(
+        registration.clone(),
+        registration_use,
+        None,
+        &runtime,
+        None,
+    );
+
+    runtime
+        .register_session(session.clone())
+        .await
+        .expect("a later owner reuses the existing stored registration");
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the reuse keeps the exact registration witness"
+    );
+    let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+        "the later owner's queued input",
+        None,
+    ));
+    let input_id = input.id().clone();
+    runtime
+        .accept_input(&session, input)
+        .await
+        .expect("the later owner's input is admitted");
+
+    let state = settlement.settle_within(Instant::now() + STEP).await;
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the later owner's registration stays registered (settlement: {state:?})"
+    );
+    let input_state = runtime.input_state(&session, &input_id).await;
+    assert!(
+        matches!(
+            &input_state,
+            Ok(Some(stored))
+                if stored.seed.phase == meerkat_runtime::InputLifecycleState::Queued
+        ),
+        "the later owner's input stays queued: {input_state:?} (settlement: {state:?})"
+    );
+    assert_eq!(state, MemberUnregisterState::HandedOver);
+}
+
+/// R1, the reclaimed live attachment: Shutdown returned with a member's exact
+/// unregister not admitted while its runtime loop was still attached. A later
+/// owner's executor registration then takes that live committed attachment
+/// over as it is (the runtime answers that the session is already claimed and
+/// keeps the registration's witness). Settling must neither unregister the
+/// registration nor stop its loop.
+#[tokio::test]
+async fn a_pending_unregister_leaves_a_live_attachment_a_later_owner_reclaimed() {
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let session = SessionId::new();
+    runtime
+        .register_session_with_executor(session.clone(), Box::new(LaterOwnerExecutor))
+        .await
+        .expect("register with a runtime loop");
+    let registration = runtime
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let attachment = runtime
+        .current_executor_attachment_witness(&session)
+        .await
+        .expect("the runtime loop is attached when Shutdown returns");
+    let registration_use = runtime.session_registration_use(&registration).await;
+    let mut settlement = MemberUnregisterSettlement::new(
+        registration.clone(),
+        registration_use,
+        None,
+        &runtime,
+        None,
+    );
+
+    runtime
+        .ensure_session_with_executor(session.clone(), Box::new(LaterOwnerExecutor))
+        .await
+        .expect("a later owner takes the live attachment over");
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the takeover keeps the exact registration witness"
+    );
+    assert_eq!(
+        runtime
+            .current_executor_attachment_witness(&session)
+            .await
+            .as_ref(),
+        Some(&attachment),
+        "the later owner took over the same live attachment"
+    );
+
+    let state = settlement.settle_within(Instant::now() + STEP).await;
+    assert_eq!(
+        runtime
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the later owner's registration stays registered (settlement: {state:?})"
+    );
+    assert_eq!(
+        runtime
+            .current_executor_attachment_witness(&session)
+            .await
+            .as_ref(),
+        Some(&attachment),
+        "the later owner's loop stays attached (settlement: {state:?})"
+    );
+    assert_eq!(state, MemberUnregisterState::HandedOver);
+}
+
+/// R1 end to end: member m's mob stops cleanly, and its Shutdown's deadline
+/// passes before m's exact unregister is admitted. The same mob is then
+/// reconstructed in-process over the same stores and session service: the
+/// new incarnation's startup prepares m's bindings on the registration the
+/// old incarnation left, adopting it in place under the same witness.
+/// Settling the old incarnation's pending unregister then reports the
+/// takeover and leaves that registration registered and attached, and the
+/// new incarnation's explicit resume revives m on the same session.
+#[tokio::test]
+async fn an_old_incarnations_pending_unregister_leaves_the_resumed_member_registered() {
+    let definition = with_unique_mob_id(sample_definition(), "r1-resumed-member");
+    let mob_id = definition.id.clone();
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let member = AgentIdentity::from("r1-resumed-member");
+    let mut spec = SpawnMemberSpec::new("worker", member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spec).await.expect("spawn member");
+    let session = handle
+        .get_member(&member)
+        .await
+        .expect("read the member")
+        .and_then(|entry| entry.bridge_session_id().cloned())
+        .expect("the member has a bridge session");
+    handle.stop().await.expect("persist a clean stop");
+    let registration = adapter
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the member's registration is current");
+
+    let guard = adapter
+        .hold_session_registration_transaction_for_test(&session)
+        .await;
+    let report = tokio::time::timeout(
+        STEP,
+        handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(1)),
+        ),
+    )
+    .await
+    .expect("shutdown returns at the caller's deadline")
+    .expect("shutdown succeeds");
+    let mut settlement = match report.members.get(&member) {
+        Some(MemberShutdownOutcome::UnregisterPending {
+            stage, settlement, ..
+        }) => {
+            assert_eq!(stage, "registration_transaction_admission");
+            settlement.clone()
+        }
+        other => panic!("expected the member's unregister pending at admission, got {other:?}"),
+    };
+    drop(guard);
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
+    let use_at_shutdown = adapter.session_registration_use(&registration).await;
+    assert!(
+        use_at_shutdown.is_some(),
+        "the old incarnation left its registration current"
+    );
+
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("reconstruct the stopped mob in-process");
+    assert_eq!(resumed.status().await.expect("phase"), MobState::Stopped);
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the new incarnation adopted the old registration in place"
+    );
+    assert_ne!(
+        adapter.session_registration_use(&registration).await,
+        use_at_shutdown,
+        "the adoption gave the registration a new use"
+    );
+    let attachment = adapter.current_executor_attachment_witness(&session).await;
+
+    let state = settlement.settle_within(Instant::now() + STEP).await;
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the new incarnation's registration stays registered (settlement: {state:?})"
+    );
+    assert_eq!(
+        adapter.current_executor_attachment_witness(&session).await,
+        attachment,
+        "the new incarnation's attachment is untouched (settlement: {state:?})"
+    );
+    assert_eq!(state, MemberUnregisterState::HandedOver);
+
+    tokio::time::timeout(STEP, resumed.resume())
+        .await
+        .expect("resume is bounded")
+        .expect("explicit resume of the reconstructed mob");
+    let revived = resumed
+        .get_member(&member)
+        .await
+        .expect("read the revived member")
+        .and_then(|entry| entry.bridge_session_id().cloned());
+    assert_eq!(
+        revived.as_ref(),
+        Some(&session),
+        "the member revives on the same session"
+    );
+    assert!(
+        adapter
+            .current_session_registration_witness(&session)
+            .await
+            .is_some(),
+        "the revived member is registered"
+    );
+    assert_eq!(settlement.try_state(), MemberUnregisterState::HandedOver);
+    resumed.shutdown().await.expect("shutdown the resumed mob");
 }
 
 /// The Shutdown admission check fails closed, as the Stop arm's does: every

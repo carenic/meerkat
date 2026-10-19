@@ -2,6 +2,7 @@
 //! decoder refuses is diagnosed and re-anchored on its live rows without
 //! losing a message, through the ordinary store compare-and-swap.
 
+#![cfg(all(feature = "sqlite-store", feature = "test-support"))]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use meerkat_core::Session;

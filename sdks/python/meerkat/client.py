@@ -201,6 +201,7 @@ from .generated.types import (
     WireProjectionProvenance,
     WireReachability,
     WireMemberPreviewUnavailable,
+    WireMemberRegistrationHookCall,
     WireExternalRouteInstallObligation,
     WireRouteInstallObligation,
     WireRuntimeBinding,
@@ -280,6 +281,7 @@ from .types import (
     ForkCacheLoweredRequestProvenance,
     ForkCacheProvider,
     ForkCacheTtl,
+    ForkInstructionPolicy,
     ForkPoint,
     HelpExecutionMode,
     InstructionActivationAbsent,
@@ -354,34 +356,81 @@ _logger = logging.getLogger(__name__)
 # and again between SIGKILL and giving up on reaping it.
 CHILD_EXIT_TIMEOUT_SECS = 5.0
 
+# How long a child that exited by itself gets for its stdout to close before
+# its exit is settled anyway.
+CHILD_EXIT_PIPE_GRACE_SECS = 1.0
 
-async def _terminate_child(process: asyncio.subprocess.Process) -> None:
+
+class _ExitWatchingStreamProtocol(asyncio.subprocess.SubprocessStreamProtocol):
+    """The stream protocol of ``asyncio.create_subprocess_exec``, plus an
+    event set as soon as the child exits.
+
+    ``Process.wait()`` on Python 3.11 and 3.12, and on 3.13 and 3.14 before
+    the fix for CPython issue 119710, also waits for the child's pipes to
+    close, and a descendant that inherited them can keep them open long
+    after the child is gone.
+    """
+
+    def __init__(self, limit: int, loop: asyncio.AbstractEventLoop) -> None:
+        super().__init__(limit=limit, loop=loop)
+        self.exited = asyncio.Event()
+
+    def process_exited(self) -> None:
+        super().process_exited()
+        self.exited.set()
+
+
+async def _spawn_child(
+    program: str, *args: str, limit: int
+) -> tuple[asyncio.subprocess.Process, asyncio.SubprocessTransport, asyncio.Event]:
+    """``asyncio.create_subprocess_exec`` with piped stdio, returning the
+    transport and an event set when the child exits as well."""
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.subprocess_exec(
+        lambda: _ExitWatchingStreamProtocol(limit=limit, loop=loop),
+        program,
+        *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    return asyncio.subprocess.Process(transport, protocol, loop), transport, protocol.exited
+
+
+async def _terminate_child(
+    process: asyncio.subprocess.Process, exited: asyncio.Event | None = None
+) -> None:
     """Stop a child process, treating one that already exited as stopped.
 
     ``returncode`` is checked first so a reaped child gets no signal at all.
     A child that exited but has not been reaped yet, or whose transport was
     closed by asyncio after exit, raises ``ProcessLookupError`` from
     ``terminate()``/``kill()``; that is the same "already gone" outcome, not
-    a failure. ``wait()`` on an exited child returns at once.
+    a failure. ``wait()`` on an exited child returns at once. ``exited``, the
+    event from ``_spawn_child``, is waited on instead of ``wait()`` when
+    given, so a descendant holding the child's pipes cannot delay it.
     """
+
+    async def wait_exited() -> bool:
+        waiter = exited.wait() if exited is not None else process.wait()
+        try:
+            await asyncio.wait_for(waiter, timeout=CHILD_EXIT_TIMEOUT_SECS)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     if process.returncode is None:
         try:
             process.terminate()
         except ProcessLookupError:
             pass
-    try:
-        await asyncio.wait_for(process.wait(), timeout=CHILD_EXIT_TIMEOUT_SECS)
+    if await wait_exited():
         return
-    except asyncio.TimeoutError:
-        pass
     try:
         process.kill()
     except ProcessLookupError:
         return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=CHILD_EXIT_TIMEOUT_SECS)
-    except asyncio.TimeoutError:
-        pass
+    await wait_exited()
 
 _MEERKAT_REPO = ("lukacf", "meerkat")
 _MEERKAT_BINARY = "rkat-rpc"
@@ -740,6 +789,9 @@ class MeerkatClient:
         self._rkat_path = rkat_path
         self._legacy_rpc_subcommand = False
         self._process: asyncio.subprocess.Process | None = None
+        self._child_transport: asyncio.SubprocessTransport | None = None
+        self._child_exited: asyncio.Event | None = None
+        self._child_exit_watch: asyncio.Task[None] | None = None
         self._request_id = 0
         self._capabilities: list[Capability] | None = None
         self._methods: set[str] = set()
@@ -905,13 +957,8 @@ class MeerkatClient:
             live_webrtc=live_webrtc,
         )
 
-        self._process = await asyncio.create_subprocess_exec(
-            self._rkat_path,
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=RPC_STDOUT_LIMIT_BYTES,
+        self._process, self._child_transport, self._child_exited = await _spawn_child(
+            self._rkat_path, *args, limit=RPC_STDOUT_LIMIT_BYTES
         )
         assert self._process.stdout is not None
         # Drain stderr for the child's whole lifetime: an unread pipe blocks a
@@ -927,6 +974,11 @@ class MeerkatClient:
         if self._process.stdin:
             self._dispatcher.set_stdin_writer(self._process.stdin)
         self._dispatcher.start()
+        self._child_exit_watch = asyncio.get_running_loop().create_task(
+            self._settle_child_exit(
+                self._child_exited, self._child_transport, self._dispatcher
+            )
+        )
 
         # `initialize` returns the generated `ServerCapabilities` contract.
         result: ServerCapabilities | dict[str, Any] = await self._request(
@@ -1006,20 +1058,53 @@ class MeerkatClient:
         caller's ``finally`` after the ``MeerkatError`` that explained the
         exit, so it must never raise ``ProcessLookupError`` over that error.
         """
+        if self._child_exit_watch is not None:
+            self._child_exit_watch.cancel()
+            try:
+                await self._child_exit_watch
+            except asyncio.CancelledError:
+                pass
+            self._child_exit_watch = None
         if self._dispatcher:
             await self._dispatcher.stop()
             self._dispatcher = None
         process = self._process
         self._process = None
+        transport = self._child_transport
+        self._child_transport = None
+        exited = self._child_exited
+        self._child_exited = None
         if process is not None:
             if process.stdin:
                 process.stdin.close()
-            await _terminate_child(process)
+            await _terminate_child(process, exited)
+        # Let go of the child's pipes: a descendant that inherited them can
+        # keep them open after the child is gone.
+        if transport is not None:
+            transport.close()
         # Stop the stderr drain after the child is gone so it reads the pipe
         # to EOF while the child is still shutting down.
         if self._stderr_tail:
             await self._stderr_tail.stop()
             self._stderr_tail = None
+
+    @staticmethod
+    async def _settle_child_exit(
+        exited: asyncio.Event,
+        transport: asyncio.SubprocessTransport,
+        dispatcher: _StdoutDispatcher,
+    ) -> None:
+        """Fail the waiters of a child that exits by itself.
+
+        The read loop does that once the child's stdout reaches EOF, which
+        normally follows the exit at once, with the whole stderr tail. A
+        descendant that inherited the pipes can keep them open, so after a
+        short grace this closes them, and the read loop ends the same way
+        with the stderr read so far.
+        """
+        await exited.wait()
+        if not await dispatcher.wait_read_loop_done(CHILD_EXIT_PIPE_GRACE_SECS):
+            transport.close()
 
     # -- Auth (Phase 4c.11 wrapper over auth.* RPC methods) ---------------
 
@@ -1898,8 +1983,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session at a transcript message index."""
+        """Fork an idle session at a transcript message index.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -1908,6 +1998,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_at", params
         )
@@ -1921,8 +2013,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session and apply a typed transcript replacement."""
+        """Fork an idle session and apply a typed transcript replacement.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -1932,6 +2029,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_replace", params
         )
@@ -3770,6 +3869,9 @@ class MeerkatClient:
         preview_unavailable = self._parse_member_preview_unavailable(
             result, "Invalid mob/member_status response"
         )
+        registration_refusal = self._parse_member_registration_refusal(
+            result, "Invalid mob/member_status response"
+        )
         return {
             "status": self._require_string_field(
                 result,
@@ -3841,6 +3943,11 @@ class MeerkatClient:
                 if preview_unavailable is not None
                 else {}
             ),
+            **(
+                {"registration_refusal": registration_refusal}
+                if registration_refusal is not None
+                else {}
+            ),
         }
 
     async def wait_mob_kickoff(
@@ -3876,6 +3983,9 @@ class MeerkatClient:
                 "Invalid mob/wait_kickoff response",
             )
             preview_unavailable = self._parse_member_preview_unavailable(
+                entry, "Invalid mob/wait_kickoff response"
+            )
+            registration_refusal = self._parse_member_registration_refusal(
                 entry, "Invalid mob/wait_kickoff response"
             )
             normalized.append(
@@ -3921,6 +4031,11 @@ class MeerkatClient:
                         if preview_unavailable is not None
                         else {}
                     ),
+                    **(
+                        {"registration_refusal": registration_refusal}
+                        if registration_refusal is not None
+                        else {}
+                    ),
                 }
             )
         return normalized
@@ -3958,6 +4073,9 @@ class MeerkatClient:
                 "Invalid mob/wait_ready response",
             )
             preview_unavailable = self._parse_member_preview_unavailable(
+                entry, "Invalid mob/wait_ready response"
+            )
+            registration_refusal = self._parse_member_registration_refusal(
                 entry, "Invalid mob/wait_ready response"
             )
             normalized.append(
@@ -4001,6 +4119,11 @@ class MeerkatClient:
                     **(
                         {"preview_unavailable": preview_unavailable}
                         if preview_unavailable is not None
+                        else {}
+                    ),
+                    **(
+                        {"registration_refusal": registration_refusal}
+                        if registration_refusal is not None
                         else {}
                     ),
                 }
@@ -6380,7 +6503,9 @@ class MeerkatClient:
                 "INVALID_RESPONSE",
                 f"{context}: unsupported tool-config operation {operation!r}",
             )
-        MeerkatClient._require_bool_field(payload, "persisted", context)
+        # rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+        settled_field = "settled" if "settled" in payload else "persisted"
+        MeerkatClient._require_bool_field(payload, settled_field, context)
         MeerkatClient._require_present_string_field(payload, "target", context)
         MeerkatClient._validate_tool_config_status(
             payload.get("status_info"),
@@ -6518,7 +6643,9 @@ class MeerkatClient:
                     block["pending_sources"],
                     f"{context}: pending_sources",
                 )
-            MeerkatClient._validate_optional_response_bool(block, "persisted", context)
+            # rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+            for field in ("settled", "persisted"):
+                MeerkatClient._validate_optional_response_bool(block, field, context)
             if "phase" in block and block["phase"] is not None:
                 phase = MeerkatClient._require_string_field(block, "phase", context)
                 if phase not in {
@@ -7958,6 +8085,29 @@ class MeerkatClient:
         return cast(WireMemberPreviewUnavailable, value)
 
     @staticmethod
+    def _parse_member_registration_refusal(
+        raw: dict[str, Any], context: str
+    ) -> WireMemberRegistrationHookCall | None:
+        """Return the hook call that refused a restored member's registration.
+
+        Absent or ``null`` means no host refused the member; a value outside
+        the closed vocabulary fails closed.
+        """
+        value = raw.get("registration_refusal")
+        if value is None:
+            return None
+        if not isinstance(value, str) or value not in {
+            "select_destination",
+            "select_agent_mandate",
+            "prepare_member_surface",
+            "verify_member_surface",
+        }:
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid registration_refusal"
+            )
+        return cast(WireMemberRegistrationHookCall, value)
+
+    @staticmethod
     def _optional_string_field(
         raw: dict[str, Any], field: str, context: str
     ) -> str | None:
@@ -8572,6 +8722,10 @@ class MeerkatClient:
                 data.get("cache_inheritance"),
                 context,
             ),
+            reactivated_instruction_count=MeerkatClient._optional_non_negative_integer_field(
+                data, "reactivated_instruction_count", context
+            )
+            or 0,
         )
 
     @staticmethod

@@ -904,6 +904,153 @@ pub enum ProviderMeta {
     },
 }
 
+/// The byte cap on each text field of a [`ProviderStopDetail`]. Longer text
+/// is cut at a character boundary and ends with
+/// [`PROVIDER_STOP_DETAIL_TRUNCATION_MARKER`].
+pub const PROVIDER_STOP_DETAIL_TEXT_CAP: usize = 4 * 1024;
+
+/// The marker that ends a [`ProviderStopDetail`] text cut at
+/// [`PROVIDER_STOP_DETAIL_TEXT_CAP`].
+pub const PROVIDER_STOP_DETAIL_TRUNCATION_MARKER: &str = " [truncated]";
+
+/// A provider's own account of why it refused or filtered a response, held
+/// as tagged provider data.
+///
+/// The meaning is the [`StopReason`] (and, for a failed run,
+/// [`ContentFilteredStop`]); this is evidence. Its fields are the provider's
+/// raw strings, tagged by provider, and nothing in the agent loop, retry,
+/// error classification or error codes reads them: provider crates build a
+/// detail with the constructors below and core only carries it to the
+/// caller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]
+/// bytes.
+#[non_exhaustive]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ProviderStopDetail {
+    /// Anthropic `stop_details` of a `refusal` stop.
+    #[non_exhaustive]
+    Anthropic {
+        /// The policy category that triggered the refusal (for example
+        /// `cyber`); absent when the refusal maps to no named category.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        /// Anthropic's human-readable explanation, for display only: the
+        /// text is not stable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    /// OpenAI: what refused or filtered the response.
+    #[non_exhaustive]
+    OpenAi {
+        /// `refusal` for a refusal output, otherwise the raw filter reason
+        /// (`incomplete_details.reason`, a Chat `finish_reason` or a
+        /// realtime `status_details.reason`).
+        reason: String,
+        /// The model's refusal text, for a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<String>,
+    },
+    /// Gemini: the raw reason a prompt or a candidate was blocked.
+    #[non_exhaustive]
+    Gemini {
+        /// Whether the prompt or a candidate was blocked.
+        stage: GeminiStopStage,
+        /// `promptFeedback.blockReason` for the prompt, the candidate's
+        /// `finishReason` otherwise.
+        reason: String,
+        /// The `safetyRatings` categories Gemini marked `blocked`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked_categories: Vec<String>,
+    },
+}
+
+impl ProviderStopDetail {
+    /// Anthropic `stop_details` of a refusal.
+    pub fn anthropic(category: Option<String>, explanation: Option<String>) -> Self {
+        Self::Anthropic {
+            category: category.map(cap_provider_stop_text),
+            explanation: explanation.map(cap_provider_stop_text),
+        }
+    }
+
+    /// An OpenAI refusal or filter: `reason` is `refusal` or the raw filter
+    /// reason, `refusal` the model's refusal text.
+    pub fn openai(reason: impl Into<String>, refusal: Option<String>) -> Self {
+        Self::OpenAi {
+            reason: cap_provider_stop_text(reason.into()),
+            refusal: refusal.map(cap_provider_stop_text),
+        }
+    }
+
+    /// A Gemini block of the prompt or of a candidate.
+    pub fn gemini(
+        stage: GeminiStopStage,
+        reason: impl Into<String>,
+        blocked_categories: Vec<String>,
+    ) -> Self {
+        Self::Gemini {
+            stage,
+            reason: cap_provider_stop_text(reason.into()),
+            blocked_categories: blocked_categories
+                .into_iter()
+                .map(cap_provider_stop_text)
+                .collect(),
+        }
+    }
+}
+
+/// Where Gemini blocked a response.
+#[non_exhaustive]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiStopStage {
+    /// The prompt itself (`promptFeedback.blockReason`, no candidate).
+    Prompt,
+    /// A generated candidate (its `finishReason`).
+    Candidate,
+}
+
+/// Cut `text` to [`PROVIDER_STOP_DETAIL_TEXT_CAP`] bytes at a character
+/// boundary, ending it with [`PROVIDER_STOP_DETAIL_TRUNCATION_MARKER`].
+fn cap_provider_stop_text(text: String) -> String {
+    if text.len() <= PROVIDER_STOP_DETAIL_TEXT_CAP {
+        return text;
+    }
+    let mut end = PROVIDER_STOP_DETAIL_TEXT_CAP - PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = String::with_capacity(end + PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len());
+    capped.push_str(&text[..end]);
+    capped.push_str(PROVIDER_STOP_DETAIL_TRUNCATION_MARKER);
+    capped
+}
+
+/// Decode an optional [`ProviderStopDetail`] leniently: an unknown provider
+/// tag or a malformed detail reads as `None`, so provider evidence never
+/// makes the record that carries it undecodable.
+pub fn deserialize_lenient_provider_stop_detail<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProviderStopDetail>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// [`deserialize_lenient_provider_stop_detail`] for a boxed detail.
+pub fn deserialize_lenient_boxed_provider_stop_detail<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<ProviderStopDetail>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lenient_provider_stop_detail(deserializer).map(|detail| detail.map(Box::new))
+}
+
 /// Deserializes `Box<RawValue>` from a possibly-buffered serde value.
 ///
 /// `Message` uses internally-tagged serde representation, which buffers enum
@@ -2279,6 +2426,26 @@ impl schemars::JsonSchema for CommsNoticeKind {
     }
 }
 
+// Schema of the lifecycle bit an `mcp` notice block carries: `settled` as
+// this version builds it, or the `persisted` a block stored by 0.9.3 and
+// earlier was written with.
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct McpNoticeLifecycleBitSchema {
+    /// Whether the block reports a settled lifecycle fact, never whether
+    /// anything was written to configuration. Readers derive it from `phase`
+    /// when the block has one and use the stored bit only for a block
+    /// without one.
+    #[serde(default)]
+    settled: bool,
+    /// The bit a block stored by 0.9.3 and earlier carries instead of
+    /// `settled`, served back unchanged. It reads like `settled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "bool")]
+    persisted: Option<bool>,
+}
+
 /// Peer identity carried in a typed comms transcript block.
 ///
 /// `id` is the canonical routing identity ([`crate::comms::PeerId`]), serialized
@@ -2324,6 +2491,20 @@ pub enum SystemNoticeBlock {
         payload: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         content: Vec<ContentBlock>,
+        /// The delivery id of an incoming peer message: the sender's envelope
+        /// id, which `reply_to_peer` takes as `reply_to`. The model reads it
+        /// as the notice's `Delivery ID` line. A correlation fact, so the
+        /// transcript content digest erases it like a notice's runtime
+        /// origin, and a reader that drops the field digests the row the
+        /// same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_id: Option<crate::interaction::InteractionId>,
+        /// The delivery an incoming peer message answers, as its sender
+        /// declared it (`reply_to_peer` sets it). The model reads it as the
+        /// notice's `In reply to` line. A correlation fact: the transcript
+        /// content digest erases it like `delivery_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<crate::interaction::InteractionId>,
     },
     ExternalEvent {
         source: String,
@@ -2347,8 +2528,12 @@ pub enum SystemNoticeBlock {
         operation: Option<crate::event::ToolConfigChangeOperation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phase: Option<crate::event::ExternalToolDeltaPhase>,
-        #[serde(default)]
-        persisted: bool,
+        // The lifecycle bit as written: `settled` for a block built by 0.9.4,
+        // or the bit a decoded row stored (`persisted` from 0.9.3), kept for
+        // byte fidelity. Readers use `SystemNoticeBlock::lifecycle_settled`.
+        #[serde(flatten)]
+        #[cfg_attr(feature = "schema", schemars(with = "McpNoticeLifecycleBitSchema"))]
+        lifecycle_bit: crate::event::ToolConfigLifecycleBit,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
         /// Bounded setup diagnostic supplied by the accepted lifecycle result.
@@ -2440,6 +2625,10 @@ enum SystemNoticeBlockKnown {
         payload: Option<Value>,
         #[serde(default)]
         content: Vec<ContentBlock>,
+        #[serde(default)]
+        delivery_id: Option<crate::interaction::InteractionId>,
+        #[serde(default)]
+        in_reply_to: Option<crate::interaction::InteractionId>,
     },
     ExternalEvent {
         source: String,
@@ -2464,7 +2653,9 @@ enum SystemNoticeBlockKnown {
         #[serde(default)]
         phase: Option<crate::event::ExternalToolDeltaPhase>,
         #[serde(default)]
-        persisted: bool,
+        settled: Option<bool>,
+        #[serde(default)]
+        persisted: Option<bool>,
         #[serde(default)]
         detail: Option<String>,
         #[serde(default)]
@@ -2537,6 +2728,8 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
             } => Self::Comms {
                 kind,
                 direction,
@@ -2548,6 +2741,8 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
             },
             SystemNoticeBlockKnown::ExternalEvent {
                 source,
@@ -2569,6 +2764,7 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 server_id,
                 operation,
                 phase,
+                settled,
                 persisted,
                 detail,
                 confinement_refusal,
@@ -2577,7 +2773,9 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 server_id,
                 operation,
                 phase,
-                persisted,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::from_stored(
+                    settled, persisted,
+                ),
                 detail,
                 confinement_refusal,
                 pending_sources,
@@ -2663,6 +2861,28 @@ impl<'de> Deserialize<'de> for SystemNoticeBlock {
 }
 
 impl SystemNoticeBlock {
+    /// Whether a tool-config or `mcp` block reports a settled lifecycle fact
+    /// (`None` for every other block). A tool-config block derives it from its
+    /// payload's status; an `mcp` block from its phase, and from the bit it
+    /// stored only when it has no phase. The stored bit
+    /// ([`crate::event::ToolConfigLifecycleBit`]) is kept for byte fidelity
+    /// and is never read otherwise.
+    #[must_use]
+    pub fn lifecycle_settled(&self) -> Option<bool> {
+        match self {
+            Self::ToolConfig { payload } => Some(payload.settled()),
+            Self::Mcp {
+                phase,
+                lifecycle_bit,
+                ..
+            } => Some(phase.map_or(
+                lifecycle_bit.stored_value(),
+                crate::event::ExternalToolDeltaPhase::is_settled,
+            )),
+            _ => None,
+        }
+    }
+
     fn unknown_from_value(value: Value) -> Self {
         let summary = value
             .get("summary")
@@ -2700,6 +2920,8 @@ impl SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
                 ..
             } => {
                 let peer_id = peer.as_ref().map(|peer| peer.id);
@@ -2809,6 +3031,17 @@ impl SystemNoticeBlock {
                     && appends_extras
                 {
                     lines.push(format!("Payload: {}", format_notice_payload(payload)));
+                }
+                // The id `reply_to_peer` takes as `reply_to` for this
+                // delivery, before the taint marker so that stays last.
+                if let Some(delivery_id) = delivery_id {
+                    lines.push(format!("Delivery ID: {delivery_id}"));
+                }
+                // The delivery the sender says this message answers. Only a
+                // label: the sender declares it, so the model reads it as the
+                // sender's claim.
+                if let Some(in_reply_to) = in_reply_to {
+                    lines.push(format!("In reply to: {in_reply_to}"));
                 }
                 // Model-visible marker for DECLARED-tainted content only.
                 // `Clean` and `None` (no declaration) deliberately render
@@ -3072,20 +3305,15 @@ impl SystemNoticeMessage {
 
     /// Whether this exact notice is an ephemeral refresh projection.
     ///
-    /// `McpPending` blocks with `persisted: true` are durable facts despite
-    /// sharing the pending kind, so kind alone is not sufficient authority
-    /// for mechanical transcript removal.
+    /// `McpPending` blocks that report a settled lifecycle fact are durable
+    /// facts despite sharing the pending kind, so kind alone is not sufficient
+    /// authority for mechanical transcript removal.
     #[must_use]
     pub fn is_synthetic_refresh_projection(&self) -> bool {
         match self.kind {
             SystemNoticeKind::McpPending => self.blocks.iter().all(|block| {
-                matches!(
-                    block,
-                    SystemNoticeBlock::Mcp {
-                        persisted: false,
-                        ..
-                    }
-                )
+                matches!(block, SystemNoticeBlock::Mcp { .. })
+                    && block.lifecycle_settled() == Some(false)
             }),
             // A persisted completion record is durable history; only
             // non-persisted background-job notices are refresh projections.
@@ -3619,6 +3847,44 @@ pub enum StopReason {
     /// (Anthropic `model_context_window_exceeded`). The agent loop commits
     /// nothing of the turn and fails the run as context exceeded.
     ContextWindowExceeded,
+}
+
+/// The refusing stop a content-filtered run ended on: the closed pair of
+/// [`StopReason`]s that fail a run as
+/// [`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFilteredStop {
+    /// The model declined the response ([`StopReason::Refusal`]).
+    Refusal,
+    /// A provider content filter blocked it ([`StopReason::ContentFilter`]).
+    ContentFilter,
+}
+
+impl ContentFilteredStop {
+    /// The refusing stop `stop_reason` names, `None` for every other stop.
+    pub fn from_stop_reason(stop_reason: StopReason) -> Option<Self> {
+        match stop_reason {
+            StopReason::Refusal => Some(Self::Refusal),
+            StopReason::ContentFilter => Some(Self::ContentFilter),
+            StopReason::EndTurn
+            | StopReason::ToolUse
+            | StopReason::MaxTokens
+            | StopReason::StopSequence
+            | StopReason::Cancelled
+            | StopReason::PauseTurn
+            | StopReason::ContextWindowExceeded => None,
+        }
+    }
+
+    /// The stop reason this refusing stop is.
+    pub fn stop_reason(self) -> StopReason {
+        match self {
+            Self::Refusal => StopReason::Refusal,
+            Self::ContentFilter => StopReason::ContentFilter,
+        }
+    }
 }
 
 /// Security mode for tool execution (e.g. shell)

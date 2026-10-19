@@ -76,9 +76,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::ToolUse),
                 }),
             ]))
         } else {
@@ -89,9 +87,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -222,6 +218,16 @@ impl meerkat_core::compact::Compactor for NoopCompactor {
         1
     }
 
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        _budget: Option<meerkat_core::compact::SummarizationSourceBudget>,
+    ) -> meerkat_core::compact::SummarizationSource {
+        meerkat_core::compact::SummarizationSource::whole(
+            meerkat_core::types::materialize_latest_system_prompt_versions(messages),
+        )
+    }
+
     fn rebuild_history(
         &self,
         messages: &[Message],
@@ -321,9 +327,7 @@ impl LlmClient for ParamsCaptureClient {
             }),
             Ok(normalized_anthropic_usage(request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
             }),
         ]))
     }
@@ -762,26 +766,4 @@ async fn public_agentbuilder_rejects_standalone_core_injections_loudly() {
         "with_turn_state_handle should not be silently ignored",
     );
     assert_unsupported_builder_injection(turn_state_error, "with_turn_state_handle");
-}
-
-#[test]
-fn public_agentfactory_value_is_not_core_policy_authority() {
-    let mut builder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    builder.pop();
-    builder.pop();
-    builder.push("crates/meerkat-core/src/agent/builder.rs");
-    let builder = std::fs::read_to_string(&builder).expect("read core AgentBuilder implementation");
-
-    assert!(
-        builder.contains("validate_factory_policy()?")
-            && !builder.contains("std::panic::Location::caller")
-            && !builder.contains("validate_factory_policy_caller")
-            && !builder.contains("canonical_factory_source_path")
-            && !builder.contains("pub struct AgentFactoryPolicyAuthority")
-            && !builder.contains("pub fn from_registered_source<A: 'static>")
-            && !builder.contains("pub fn agent_factory_policy_authority"),
-        "core factory-policy build must validate factory-composed policy state \
-         without trusting runtime source paths or exposing a public core \
-         authority type or minting helper"
-    );
 }

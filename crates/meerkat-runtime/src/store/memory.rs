@@ -1860,6 +1860,11 @@ fn ensure_compaction_intents_already_outboxed_list(
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
+    /// Its commits wait on no I/O and on no lock another process holds.
+    fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn execution_custody(&self) -> Option<&super::RuntimeStoreExecutionCustody> {
         Some(&self.execution_custody)
     }
@@ -4637,6 +4642,8 @@ mod tests {
             summary_tokens: 5,
             messages_before: 2,
             messages_after: 1,
+            summary_source: None,
+            estimated_history_tokens_after: None,
         };
         session
             .add_compaction_projection_intent(intent.clone())
@@ -4668,6 +4675,8 @@ mod tests {
             summary_tokens: 1,
             messages_before: 2,
             messages_after: 1,
+            summary_source: None,
+            estimated_history_tokens_after: None,
         }
     }
 

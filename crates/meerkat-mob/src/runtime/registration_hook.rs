@@ -6,7 +6,7 @@
 //! registration, so a host can neither skip the install nor bind another
 //! runtime owner's session. The host never receives the machine.
 
-use crate::MobError;
+use crate::{MemberRegistrationHookCall, MobError};
 use meerkat_authorization_contracts::constraints::AudienceRef;
 use meerkat_authorization_contracts::evidence::EvidenceId;
 use meerkat_authorization_contracts::work_association::NativeWorkTarget;
@@ -14,7 +14,32 @@ use meerkat_core::auth::PrincipalRef;
 use meerkat_core::{MobMemberBinding, RealmId};
 use meerkat_runtime::meerkat_machine::SessionAgentMandate;
 use meerkat_runtime::{LogicalRuntimeId, MeerkatMachine, RuntimeSessionRegistrationWitness};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// The hook call that refused one member's registration, recorded by that
+/// call itself when the host returns an error. A host may return any
+/// [`MobError`], so a refusal is never read back from an error's type or
+/// text. The first refusal is kept.
+#[derive(Clone, Default)]
+pub(super) struct HostRefusalSlot(Arc<std::sync::Mutex<Option<MemberRegistrationHookCall>>>);
+
+impl HostRefusalSlot {
+    fn record(&self, call: MemberRegistrationHookCall) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(call);
+    }
+
+    /// The call that refused, if a host refused.
+    pub(super) fn refused(&self) -> Option<MemberRegistrationHookCall> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// The destination a host selects for one member: everything of the
 /// member's scoped target except its runtime, which only the member's exact
@@ -23,6 +48,8 @@ use std::sync::Arc;
 pub struct MemberDestinationSelection {
     pub logical_owner: PrincipalRef,
     pub context: EvidenceId,
+    /// Must advance past any generation already bound on the member's
+    /// registration (see [`MemberRuntimeRegistrationHook::select_destination`]).
     pub context_generation: u64,
     pub audience: AudienceRef,
 }
@@ -145,6 +172,35 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// bound to. Called while the member's prepared registration transaction
     /// owns cleanup, before actor creation; a refusal rolls that transaction
     /// back exactly. The provisioner installs the returned target.
+    ///
+    /// For a restored member whose registration this transaction did not
+    /// insert, a refusal removes that registration exactly through the
+    /// canonical unregister: the session's durable history records it, every
+    /// input the session still holds is abandoned as Stopped, and their
+    /// completions resolve as runtime-terminated. Any other failure keeps the
+    /// restored registration for an explicit repair to reuse. A member that
+    /// `MobBuilder::resume` restores at boot is refused the same way: the
+    /// boot restore's own rollback removes the registration it inserted, and
+    /// the actor's startup registers nothing for the refused member. A member
+    /// refused either way can still be retired, respawned or destroyed: its
+    /// retirement archives the durable session without routing a retire to
+    /// the runtime the refusal released. A member the boot recreates on a
+    /// fresh session is not restored: a refusal there fails the whole resume
+    /// with the host's error unchanged. A spawn that adopts a session
+    /// registered before it (a resumed or pre-registered session) keeps that
+    /// registration on a refusal; only the transaction is rolled back.
+    ///
+    /// A failed revival's destination stays bound on the restored
+    /// registration it keeps, so a host's re-selection for that registration
+    /// must advance `context_generation`: a selection of the bound generation
+    /// is refused before anything is built, with
+    /// [`MobError::MemberDestinationNotInstalled`] carrying
+    /// `RuntimeDriverError::ScopedContextGenerationNotAdvanced`, and the
+    /// registration stays for the repair, which selects again with an
+    /// advanced `context_generation`. The recovery of an attached
+    /// member's actor (its registration still attached) asks
+    /// [`Self::expected_destination`] instead, and a refusal during that
+    /// recovery keeps the registration and answers the host's error.
     async fn select_destination(
         &self,
         identity: &MemberRuntimeBuildIdentity,
@@ -166,8 +222,10 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// member's destination is installed and before its agent or any of its
     /// tools is built; the provisioner binds the returned mandate on the
     /// member's exact registration. A refusal rolls the registration back
-    /// exactly. The default selects none: the registration stays unbound, so
-    /// its configured servers are refused as unavailable.
+    /// exactly. A restored member's refusal removes its registration the same
+    /// way (see [`Self::select_destination`]). The default selects none: the
+    /// registration stays unbound, so its configured servers are refused as
+    /// unavailable.
     async fn select_agent_mandate(
         &self,
         _identity: &MemberRuntimeBuildIdentity,
@@ -195,7 +253,11 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// provenance is attribution only: the host compares this surface with
     /// its own committed activation, which owns the association between an
     /// installed artifact and its tools. A refusal discards the member
-    /// exactly; effects its construction already started are not undone.
+    /// exactly; effects its construction already started are not undone. A
+    /// restored member's refusal removes its registration the same way (see
+    /// [`Self::select_destination`]), except during the recovery of an
+    /// attached member's actor, which keeps the registration and answers the
+    /// host's error.
     async fn verify_member_surface(
         &self,
         identity: &MemberRuntimeBuildIdentity,
@@ -210,8 +272,11 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// returns the resolved `Provider` binding with the exact surface it
     /// compiled against; the construction binds it, with its own member and
     /// registry, when it is finished. A refusal abandons the construction and
-    /// discards the member exactly. A host that selects nothing cannot
-    /// complete a member it registers: the default refuses.
+    /// discards the member exactly. A restored member's refusal removes its
+    /// registration the same way (see [`Self::select_destination`]), except
+    /// during the recovery of an attached member's actor, which keeps the
+    /// registration and answers the host's error. A host that selects nothing
+    /// cannot complete a member it registers: the default refuses.
     async fn prepare_member_surface(
         &self,
         _identity: &MemberRuntimeBuildIdentity,
@@ -248,12 +313,97 @@ impl MemberSurfaceSelectionSlot {
     }
 }
 
+/// The slots one transaction's surface decision is recorded into.
+#[derive(Clone, Default)]
+struct MemberSurfaceGateSlots {
+    selected: Option<MemberSurfaceSelectionSlot>,
+    refusals: Option<HostRefusalSlot>,
+}
+
+/// Where a member registration's surface gate records its host's decision:
+/// the slots of the transaction that prepares the registration now. A
+/// registration keeps the gate it was given, so a later transaction on it
+/// points the route at its own slots before its build asks the gate (see
+/// [`install_member_surface_gate`]). The transactions of one registration
+/// are serialized by its turn-finalization boundary.
+struct MemberSurfaceGateRoute(std::sync::Mutex<MemberSurfaceGateSlots>);
+
+impl MemberSurfaceGateRoute {
+    fn slots(&self) -> MemberSurfaceGateSlots {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn point_at(&self, slots: MemberSurfaceGateSlots) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = slots;
+    }
+}
+
+/// An installed gate's route, with the exact registration it was installed
+/// on.
+struct InstalledGateRoute {
+    registration: RuntimeSessionRegistrationWitness,
+    route: std::sync::Weak<MemberSurfaceGateRoute>,
+}
+
+/// The routes of the surface gates one owner installed, by session. Every
+/// clone of the owner shares them; a route lives no longer than its gate.
+#[derive(Clone, Default)]
+pub(super) struct MemberSurfaceGateRoutes(
+    Arc<std::sync::Mutex<HashMap<meerkat_core::types::SessionId, InstalledGateRoute>>>,
+);
+
+impl MemberSurfaceGateRoutes {
+    fn routes(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<meerkat_core::types::SessionId, InstalledGateRoute>>
+    {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The route of the gate this owner installed on exactly
+    /// `registration`, while that gate lives.
+    fn route(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+    ) -> Option<Arc<MemberSurfaceGateRoute>> {
+        self.routes()
+            .get(registration.session_id())
+            .filter(|installed| &installed.registration == registration)
+            .and_then(|installed| installed.route.upgrade())
+    }
+
+    fn record(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        route: &Arc<MemberSurfaceGateRoute>,
+    ) {
+        let mut routes = self.routes();
+        routes.retain(|_, installed| installed.route.strong_count() > 0);
+        routes.insert(
+            registration.session_id().clone(),
+            InstalledGateRoute {
+                registration: registration.clone(),
+                route: Arc::downgrade(route),
+            },
+        );
+    }
+}
+
 /// A new member registration's tool-surface gate: its host's
-/// [`MemberRuntimeRegistrationHook::prepare_member_surface`] for that member.
+/// [`MemberRuntimeRegistrationHook::prepare_member_surface`] for that member,
+/// recorded into the slots its route points at.
 struct MemberSurfaceGate {
     hook: Arc<dyn MemberRuntimeRegistrationHook>,
     identity: MemberRuntimeBuildIdentity,
-    selected: Option<MemberSurfaceSelectionSlot>,
+    route: Arc<MemberSurfaceGateRoute>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -263,12 +413,19 @@ impl meerkat_core::ToolSurfaceGate for MemberSurfaceGate {
         &self,
         surface: &meerkat_core::PreparedToolSurface,
     ) -> Result<meerkat_core::ToolSurfaceSelection, meerkat_core::ToolSurfaceRefusal> {
+        // The transaction whose build asks: the one the route points at.
+        let slots = self.route.slots();
         let selection = self
             .hook
             .prepare_member_surface(&self.identity, surface)
             .await
-            .map_err(|error| meerkat_core::ToolSurfaceRefusal::new(error.to_string()))?;
-        if let Some(selected) = &self.selected {
+            .map_err(|error| {
+                if let Some(refusals) = &slots.refusals {
+                    refusals.record(MemberRegistrationHookCall::PrepareMemberSurface);
+                }
+                meerkat_core::ToolSurfaceRefusal::new(error.to_string())
+            })?;
+        if let Some(selected) = &slots.selected {
             selected.record(&selection);
         }
         Ok(selection)
@@ -278,28 +435,39 @@ impl meerkat_core::ToolSurfaceGate for MemberSurfaceGate {
 /// Install the host's surface selection on the member's exact registration,
 /// before its agent is built: a new member's, or a recovered member's whose
 /// registration carries none yet (a registration keeps the gate it was
-/// given; a replaced registration starts without one).
+/// given; a replaced registration starts without one). The gate records into
+/// this transaction's `selected` and `refusals`: a gate this owner installed
+/// for an earlier transaction on the same registration (`routes`) is pointed
+/// at them, so its decision reaches the transaction that asks. A gate another
+/// owner installed records into that owner's slots.
 pub(super) async fn install_member_surface_gate(
     machine: &MeerkatMachine,
     hook: Arc<dyn MemberRuntimeRegistrationHook>,
     registration: &RuntimeSessionRegistrationWitness,
     identity: &MemberRuntimeBuildIdentity,
+    routes: &MemberSurfaceGateRoutes,
     selected: Option<MemberSurfaceSelectionSlot>,
+    refusals: Option<HostRefusalSlot>,
 ) -> Result<(), MobError> {
+    let slots = MemberSurfaceGateSlots { selected, refusals };
     if machine
         .session_tool_surface_gate(registration.session_id())
         .await
         .is_some()
     {
+        if let Some(route) = routes.route(registration) {
+            route.point_at(slots);
+        }
         return Ok(());
     }
+    let route = Arc::new(MemberSurfaceGateRoute(std::sync::Mutex::new(slots)));
     machine
         .bind_session_tool_surface_gate(
             registration,
             Arc::new(MemberSurfaceGate {
                 hook,
                 identity: identity.clone(),
-                selected,
+                route: Arc::clone(&route),
             }),
         )
         .await
@@ -307,7 +475,9 @@ pub(super) async fn install_member_surface_gate(
             MobError::WiringError(format!(
                 "member tool-surface decision could not be installed on its registration: {error}"
             ))
-        })
+        })?;
+    routes.record(registration, &route);
+    Ok(())
 }
 
 /// Bind the host's selected agent mandate on the member's exact registration,
@@ -317,8 +487,13 @@ pub(super) async fn install_selected_agent_mandate(
     hook: &dyn MemberRuntimeRegistrationHook,
     registration: &RuntimeSessionRegistrationWitness,
     identity: &MemberRuntimeBuildIdentity,
+    refusals: &HostRefusalSlot,
 ) -> Result<(), MobError> {
-    let Some(mandate) = hook.select_agent_mandate(identity).await? else {
+    let Some(mandate) = hook
+        .select_agent_mandate(identity)
+        .await
+        .inspect_err(|_| refusals.record(MemberRegistrationHookCall::SelectAgentMandate))?
+    else {
         return Ok(());
     };
     machine
@@ -331,10 +506,14 @@ pub(super) async fn install_selected_agent_mandate(
         })
 }
 
-/// The runtime owner and host selected for one backend; present only when
-/// both are configured.
-pub(super) type MemberRegistrationComposition =
-    Option<(Arc<MeerkatMachine>, Arc<dyn MemberRuntimeRegistrationHook>)>;
+/// The runtime owner and host selected for one backend, with the routes of
+/// the surface gates that backend installed; present only when the owner and
+/// the host are configured.
+pub(super) type MemberRegistrationComposition = Option<(
+    Arc<MeerkatMachine>,
+    Arc<dyn MemberRuntimeRegistrationHook>,
+    MemberSurfaceGateRoutes,
+)>;
 
 /// Select and install a newly registered member's destination on the exact
 /// registration's own machine.
@@ -343,20 +522,21 @@ pub(super) async fn install_selected_destination(
     hook: &dyn MemberRuntimeRegistrationHook,
     registration: &RuntimeSessionRegistrationWitness,
     req: &meerkat_core::service::CreateSessionRequest,
+    refusals: &HostRefusalSlot,
 ) -> Result<MemberRuntimeBuildIdentity, MobError> {
     require_deferred_first_turn(req)?;
     let identity = MemberRuntimeBuildIdentity::from_request(req, registration)?;
     let target = hook
         .select_destination(&identity)
-        .await?
+        .await
+        .inspect_err(|_| refusals.record(MemberRegistrationHookCall::SelectDestination))?
         .target_for(registration, &identity)?;
     machine
         .bind_scoped_context(registration, &target)
         .await
-        .map_err(|error| {
-            MobError::WiringError(format!(
-                "member destination could not be installed on its registration: {error}"
-            ))
+        .map_err(|error| MobError::MemberDestinationNotInstalled {
+            session_id: registration.session_id().clone(),
+            error,
         })?;
     Ok(identity)
 }
@@ -382,6 +562,7 @@ pub(super) async fn verify_member_surface(
     session_service: &dyn super::MobSessionService,
     session_id: &meerkat_core::types::SessionId,
     identity: &MemberRuntimeBuildIdentity,
+    refusals: Option<&HostRefusalSlot>,
 ) -> Result<(), MobError> {
     let surface = session_service
         .live_visible_tool_defs(session_id)
@@ -392,7 +573,13 @@ pub(super) async fn verify_member_surface(
                 "the member's session service cannot report its actual tool surface".into(),
             )
         })?;
-    hook.verify_member_surface(identity, &surface).await
+    hook.verify_member_surface(identity, &surface)
+        .await
+        .inspect_err(|_| {
+            if let Some(refusals) = refusals {
+                refusals.record(MemberRegistrationHookCall::VerifyMemberSurface);
+            }
+        })
 }
 
 /// The destination the host still expects for an attached member, as the

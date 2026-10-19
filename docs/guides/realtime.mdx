@@ -371,6 +371,17 @@ event with `reason.kind: "stream_lagged"` and `reason.dropped`, then continues
 from the retained tail. This reports a gap in that subscriber's view, not a
 truncated transcript or durable event log.
 
+A response the provider ends without completing it arrives as a
+`turn_failed` observation. Route on `failure.status` (`failed`, `incomplete`
+or `in_progress`; a status without a wire name arrives as
+`{"unknown": {"debug": ...}}`); the provider's `reason`, `code` and `message`
+are diagnostics only. It is not terminal: the channel stays open and the next
+turn proceeds. Nothing of the failed response is committed to the transcript,
+a WebRTC peer stops playing the audio still queued for it, and Meerkat does
+not retry it; the client decides whether to ask again. Its
+`usage`, when present, is charged to the session; when it is absent, the
+session event stream carries `turn_usage_accounting_unmeasured` instead.
+
 Built-in realm-backed persistent sessions can feed a separate durable event
 audit projector through an unbounded queue independent of the UI ring. The
 audit projection is asynchronous derived state, so when event evidence matters,
@@ -655,6 +666,24 @@ Meerkat does not finish assistant output after a quiet interval or after a
 delegation-result acknowledgement: a delayed readout retains its output identity.
 Applications must keep transcript grouping, playback evidence, and backend task
 completion separate; see [OpenAI's session guidance](https://developers.openai.com/api/docs/guides/live-conversations).
+
+While the user's latest utterance is unanswered, Meerkat holds a delegation's
+result (and its narration) behind it, so the voice model answers the user
+first; the model's next output, the utterance's own delegation, or 1.6 s of
+the user's silence releases it. Each delegation carries a trusted in-progress
+instruction until its result arrives, so a result held back that way is
+finished work the model has not been told about. Meerkat therefore sends a
+notice bound to the delegation as soon as it holds a result, always before
+the result itself can be released: the work has
+finished and its result has not arrived, so the model may say it has just
+finished but must not state, guess or imply the outcome before the result
+reaches it. The notice carries no result content, and the result itself is
+still released only by those triggers. A finished delegation whose result
+Meerkat cannot deliver yet, for example while another delegation's result
+holds the channel's one result slot or while results wait for the provider to
+acknowledge a concurrent historical summary, gets the same notice. While the
+model is speaking, that notice waits until the response ends or the user takes
+the floor, and it is dropped if the result arrives first.
 
 On open and reopen, the selected canonical dialogue is supplied in native
 `session.input` at provider session creation. User text and visible assistant
@@ -1207,6 +1236,7 @@ least one release.
 - **Deferred sessions are model-gated.** `live/open` may materialize a deferred session whose resolved model is realtime-capable; a deferred non-realtime session is rejected before channel creation.
 - **Live rows wait for a running member turn.** Transcript rows commit in arrival order behind a running turn of the member, so the persisted transcript can lag the conversation by that turn's length; rows handed to a channel close are held in memory until they commit and are lost if the process exits first, and a row released mid-close can commit ahead of an earlier held row (see [Transcript rows while the member's turn runs](#transcript-rows-while-the-members-turn-runs)).
 - **Ordinary Realtime refresh is not instruction/history replay.** Supported mutable settings such as visible tools can refresh; canonical `System`-sequence changes, model/provider swaps, and canonical transcript or user-content-registry rewrites require `live/close` + `live/open`. The adapter remains fixed to PCM 24 kHz mono, including after reopen.
+- **GPT Live may delegate a question asked over its own playback.** Public `gpt-live-1` sessions use client delegation for the whole session, and the provider's delegation events carry no typed reason, so Meerkat cannot keep a single turn native. A question that starts while the assistant is still speaking, before the cue for a delegated result has been sent, can be routed to the executor even when it asks about the conversation itself.
 
 ## See also
 

@@ -58,6 +58,7 @@ rust_library(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -95,6 +96,7 @@ rust_library(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -140,6 +142,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -156,11 +159,6 @@ rust_test(
     size = "medium",
     data = [
         "//:test_fixtures",
-        "//:workspace_cargo_manifests",
-        "//:workspace_metadata",
-        "//crates/meerkat-runtime:cargo_manifest",
-        "//crates/meerkat-runtime:package_runfiles",
-        "//crates/meerkat-store:cargo_manifest",
         "//tests/fixtures/machine-dsl-tests:package_runfiles",
         "//tests/fixtures/mcp-test-server:package_runfiles",
         "//tests/fixtures/surface-build-fixtures:package_runfiles",
@@ -207,6 +205,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -266,6 +265,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -325,6 +325,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -384,6 +385,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -401,6 +403,73 @@ rust_test(
     ],
     size = "medium",
     data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-store",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-schedule:meerkat_schedule",
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+        "//crates/meerkat-store-conformance:meerkat_store_conformance",
+        "//crates/meerkat-store:meerkat_store",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-store",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "released_0810_corpus_copy_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-store",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "released_0810_corpus_copy",
+    crate_root = "tests/released_0810_corpus_copy.rs",
+    crate_features = [
+        "jsonl",
+        "memory",
+        "sqlite",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
+        "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
+        "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
+    ],
+    srcs = [
+        "tests/released_0810_corpus_copy.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "released_0810_corpus_copy",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-store",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [
+        ":package_runfiles",
+        "//:test_fixtures",
+        "//crates/meerkat-runtime:package_runfiles",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
+    ],
     env = {
         "RUST_MIN_STACK": "8388608",
         "RUST_TEST_THREADS": "1",
@@ -443,6 +512,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -502,6 +572,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -561,6 +632,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -620,6 +692,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -679,6 +752,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -738,6 +812,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -797,6 +872,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -856,6 +932,7 @@ rust_test(
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
         "Cargo.toml",
+        "tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/expected.json",
         "tests/fixtures/v0_8_50_rotated_anchor_live_tail/sessions.sqlite3",
     ],
@@ -903,6 +980,7 @@ test_suite(
         ":meerkat_store_unit_test",
         ":model_routing_handoff_resume_test",
         ":rct_contracts_test",
+        ":released_0810_corpus_copy_test",
         ":schedule_atomic_mutation_test",
         ":schedule_live_waiter_gate_test",
         ":schedule_machine_state_projection_test",

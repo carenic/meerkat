@@ -7924,7 +7924,6 @@ mod tests {
             meerkat_core::ToolConfigChangeOperation::Add,
             "shell",
             meerkat_core::ToolConfigChangeStatus::boundary_applied(true, false, 7),
-            true,
         );
         store
             .append(

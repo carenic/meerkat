@@ -94,6 +94,24 @@ fn agent_event_subscription_error(
     }
 }
 
+/// Type a durable member fork's session failure. A fork refused because of
+/// inherited instruction activations names its source member; everything else
+/// keeps its session error.
+fn fork_session_error(
+    source_identity: &AgentIdentity,
+    error: meerkat_core::SessionError,
+) -> MobError {
+    match error {
+        meerkat_core::SessionError::ForkInstructionRefused(refusal) => {
+            MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal,
+            }
+        }
+        error => MobError::from(error),
+    }
+}
+
 const DEFAULT_KICKOFF_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Pause between wait polls of a member that is not yet terminal.
 const MEMBER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -172,11 +190,105 @@ pub(super) struct RetirementOperationKey {
     generation: Generation,
     fence_token: FenceToken,
     transport: RetirementTransportIncarnationKey,
+    /// A scoped retire's root scope and step. A scoped step never shares a
+    /// slot with an unscoped retire, so an unscoped caller never joins a
+    /// step that a scope re-check can decline.
+    scope: Option<RetirementScopeKey>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetirementScopeKey {
+    root_runtime_id: AgentRuntimeId,
+    root_fence_token: FenceToken,
+    root_session_id: SessionId,
+    step: RetirementScopeStep,
+}
+
+impl RetirementScopeKey {
+    fn new(root: &super::MemberDeliveryScope, step: RetirementScopeStep) -> Self {
+        Self {
+            root_runtime_id: root.runtime_id().clone(),
+            root_fence_token: root.fence_token(),
+            root_session_id: root.session_id().clone(),
+            step,
+        }
+    }
+}
+
+/// One step of [`MobHandle::retire_at_scope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RetirementScopeStep {
+    /// A descendant of the root, while the root's incarnation is current.
+    DescendantBeforeRoot,
+    /// The root incarnation the scope names.
+    Root,
+    /// A descendant of the root, once no incarnation of the root is current.
+    DescendantAfterRoot,
+}
+
+/// What one singleflight retirement step retires.
+enum RetireStepTarget {
+    Exact(super::state::RetireMemberIncarnation),
+    ScopedDescendant {
+        expected: super::state::RetireMemberIncarnation,
+        root: super::MemberDeliveryScope,
+        step: RetirementScopeStep,
+    },
+    ScopedRoot(super::MemberDeliveryScope),
+}
+
+impl RetireStepTarget {
+    /// The actor command's target, and for a scoped step the receiver of
+    /// its root-scope verdict.
+    fn into_command_target(
+        self,
+    ) -> (
+        super::state::RetireTarget,
+        Option<tokio::sync::oneshot::Receiver<super::state::ScopedRetireVerdict>>,
+    ) {
+        let (root, kind) = match self {
+            Self::Exact(expected) => return (super::state::RetireTarget::Exact(expected), None),
+            Self::ScopedDescendant {
+                expected,
+                root,
+                step,
+            } => (
+                root,
+                if step == RetirementScopeStep::DescendantAfterRoot {
+                    super::state::ScopedRetireStepKind::DescendantAfterRoot(expected)
+                } else {
+                    super::state::ScopedRetireStepKind::DescendantBeforeRoot(expected)
+                },
+            ),
+            Self::ScopedRoot(root) => (root, super::state::ScopedRetireStepKind::Root),
+        };
+        let (verdict_tx, verdict_rx) = tokio::sync::oneshot::channel();
+        (
+            super::state::RetireTarget::Scoped(super::state::ScopedRetireStep {
+                root,
+                kind,
+                verdict_tx,
+            }),
+            Some(verdict_rx),
+        )
+    }
+}
+
+/// How one singleflight retirement step ended.
+#[derive(Debug, Clone)]
+pub(super) enum RetireStepOutcome {
+    /// The step ran to its result, or found nothing left to retire.
+    Ran,
+    /// A scoped step's re-check of the root scope declined it: the step
+    /// retired nothing.
+    NotAdmitted(super::state::ScopedRetireVerdict),
+}
+
+pub(super) type SharedRetirementResult = Arc<Result<RetireStepOutcome, Arc<MobError>>>;
 
 struct PendingRetirementOperation {
     deadline: Instant,
-    result_rx: tokio::sync::watch::Receiver<Option<Arc<Result<(), Arc<MobError>>>>>,
+    result_rx: tokio::sync::watch::Receiver<Option<SharedRetirementResult>>,
     admission_rx: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -309,6 +421,53 @@ impl ResumeOperationRegistry {
     }
 }
 
+/// What a caller that joined a singleflight retirement slot answers for the
+/// slot's published result. A scoped step's declined re-check is an outcome,
+/// not an error, so every error a slot publishes reaches its joiners exactly
+/// as before: anything but an in-progress, admission-pending or stuck answer
+/// is a shared retirement failure.
+fn joined_retirement_result(
+    result: &Result<RetireStepOutcome, Arc<MobError>>,
+) -> Result<RetireStepOutcome, MobError> {
+    match result {
+        Ok(outcome) => Ok(outcome.clone()),
+        Err(error) => Err(match error.as_ref() {
+            MobError::RetirementInProgress { session_id, stage } => {
+                MobError::RetirementInProgress {
+                    session_id: session_id.clone(),
+                    stage: stage.clone(),
+                }
+            }
+            MobError::MemberRetirementInProgress { member_id, stage } => {
+                MobError::MemberRetirementInProgress {
+                    member_id: member_id.clone(),
+                    stage: stage.clone(),
+                }
+            }
+            MobError::MemberRetirementAdmissionPending { member_id, stage } => {
+                MobError::MemberRetirementAdmissionPending {
+                    member_id: member_id.clone(),
+                    stage: stage.clone(),
+                }
+            }
+            MobError::MemberRetirementStuck {
+                member_id,
+                stage,
+                cause,
+            } => MobError::MemberRetirementStuck {
+                member_id: member_id.clone(),
+                stage: stage.clone(),
+                cause: Arc::clone(cause),
+            },
+            // The actor already shares its typed cause.
+            MobError::SharedRetirementFailure(cause) => {
+                MobError::SharedRetirementFailure(Arc::clone(cause))
+            }
+            _ => MobError::SharedRetirementFailure(Arc::clone(error)),
+        }),
+    }
+}
+
 fn pending_retirement_operations()
 -> &'static std::sync::Mutex<HashMap<RetirementOperationKey, Arc<PendingRetirementOperation>>> {
     static OPERATIONS: std::sync::OnceLock<
@@ -341,12 +500,80 @@ pub(super) fn retirement_result_slot_removed_check_count(key: &RetirementOperati
 #[cfg(test)]
 pub(super) fn pending_retirement_result_publication(
     key: &RetirementOperationKey,
-) -> Option<tokio::sync::watch::Receiver<Option<Arc<Result<(), Arc<MobError>>>>>> {
+) -> Option<tokio::sync::watch::Receiver<Option<SharedRetirementResult>>> {
     pending_retirement_operations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(key)
         .map(|pending| pending.result_rx.clone())
+}
+
+/// Test-only holds between the steps of a scoped retire, keyed by the root
+/// identity, which each test keeps unique. A hold applies to the next time
+/// that root's scoped retire reaches its point.
+#[cfg(test)]
+pub(super) mod retire_at_scope_hold {
+    use crate::ids::AgentIdentity;
+    use crate::tokio;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// Before the first descendant pass.
+    pub(crate) const BEFORE_DESCENDANTS: &str = "before-descendants";
+    /// After the root's own step answered `Ok`, before the second pass.
+    pub(crate) const AFTER_ROOT: &str = "after-root";
+
+    type Holds = Vec<(AgentIdentity, &'static str, Arc<RetireAtScopeHold>)>;
+
+    static HOLDS: Mutex<Holds> = Mutex::new(Vec::new());
+
+    pub(crate) struct RetireAtScopeHold {
+        entered: tokio::sync::watch::Sender<bool>,
+        released: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl RetireAtScopeHold {
+        /// Resolve once the scoped retire waits at the held point.
+        pub(crate) async fn entered(&self) {
+            let mut entered = self.entered.subscribe();
+            let _closed = entered.wait_for(|entered| *entered).await;
+        }
+
+        /// Let the scoped retire continue.
+        pub(crate) fn release(&self) {
+            self.released.send_replace(true);
+        }
+    }
+
+    /// Hold `root`'s next scoped retire at `point` until the returned hold
+    /// is released.
+    pub(crate) fn install(root: &AgentIdentity, point: &'static str) -> Arc<RetireAtScopeHold> {
+        let hold = Arc::new(RetireAtScopeHold {
+            entered: tokio::sync::watch::channel(false).0,
+            released: tokio::sync::watch::channel(false).0,
+        });
+        HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            root.clone(),
+            point,
+            Arc::clone(&hold),
+        ));
+        hold
+    }
+
+    /// Wait at `point` while a hold installed for `root` there is unreleased.
+    pub(super) async fn reached(root: &AgentIdentity, point: &str) {
+        let held = {
+            let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
+            holds
+                .iter()
+                .position(|(held, held_point, _)| held == root && *held_point == point)
+                .map(|index| holds.remove(index).2)
+        };
+        if let Some(hold) = held {
+            hold.entered.send_replace(true);
+            let mut released = hold.released.subscribe();
+            let _closed = released.wait_for(|released| *released).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1094,6 +1321,10 @@ pub struct MobMemberSnapshot {
     pub lifecycle_capabilities: Option<meerkat_contracts::wire::WireMemberLifecycleCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_portable_disabled: Option<Vec<meerkat_contracts::wire::WireNonPortableResourceKind>>,
+    /// The host hook call that refused this restored member's registration:
+    /// the member is Broken until an explicit repair. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 /// Whether the member currently owns an open execution run.
@@ -1305,7 +1536,29 @@ impl MobMemberSnapshot {
             lifecycle_capabilities: self.lifecycle_capabilities,
             non_portable_disabled: self.non_portable_disabled.clone(),
             preview_unavailable: self.preview_unavailable.map(wire_preview_unavailable),
+            registration_refusal: self.registration_refusal.map(wire_registration_hook_call),
         })
+    }
+}
+
+/// Project the refusing [`crate::MemberRegistrationHookCall`] into its closed
+/// wire twin.
+fn wire_registration_hook_call(
+    call: crate::MemberRegistrationHookCall,
+) -> meerkat_contracts::WireMemberRegistrationHookCall {
+    match call {
+        crate::MemberRegistrationHookCall::SelectDestination => {
+            meerkat_contracts::WireMemberRegistrationHookCall::SelectDestination
+        }
+        crate::MemberRegistrationHookCall::SelectAgentMandate => {
+            meerkat_contracts::WireMemberRegistrationHookCall::SelectAgentMandate
+        }
+        crate::MemberRegistrationHookCall::PrepareMemberSurface => {
+            meerkat_contracts::WireMemberRegistrationHookCall::PrepareMemberSurface
+        }
+        crate::MemberRegistrationHookCall::VerifyMemberSurface => {
+            meerkat_contracts::WireMemberRegistrationHookCall::VerifyMemberSurface
+        }
     }
 }
 
@@ -1419,6 +1672,18 @@ pub fn stored_realm_profile_to_wire(
         created_at: Some(stored.created_at.to_rfc3339()),
         updated_at: Some(stored.updated_at.to_rfc3339()),
     }
+}
+
+/// A tool bundle a profile opted into (`tools.bundles`) that this mob does not
+/// register, so every build of that profile's members withholds it: the host
+/// no longer offers the bundle. See [`MobHandle::withheld_tool_bundles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WithheldToolBundle {
+    /// The profile whose opt-in names the bundle.
+    pub profile: ProfileName,
+    /// The withheld bundle.
+    pub bundle: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2162,6 +2427,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::AgentEventCursorRejected { .. }
         | MobError::RuntimeOwnerConflict
         | MobError::ToolBundleUnavailable { .. }
+        | MobError::ToolBundleNotOffered { .. }
         | MobError::HeldProvisionUnsupported { .. }
         | MobError::DeliveryScopeUnavailable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
@@ -2214,11 +2480,12 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Durable-fork provisioning and bounded helper projection are
-        // separate composite operations. None can originate from a
+        // Durable-fork provisioning and refusal and bounded helper projection
+        // are separate composite operations. None can originate from a
         // spawn-many row, so exposing a session/transport classification here
         // would invent a modeled spawn cause that MobMachine never observed.
         MobError::ForkMemberProvisionFailed { .. }
+        | MobError::ForkInstructionRefused { .. }
         | MobError::InvalidBoundedHelperResult { .. }
         | MobError::ForkJobOwnerNotSource { .. }
         | MobError::BoundedHelperResultUnavailable { .. }
@@ -2231,6 +2498,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         MobError::WiringError(_) | MobError::RetirementTopologyIncomplete(_) => {
+            mob_dsl::MobSpawnManyFailureObservationKind::WiringError
+        }
+        // A destination install the runtime refused is the wiring failure
+        // it was before it was typed.
+        MobError::MemberDestinationNotInstalled { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::WiringError
         }
         MobError::SupervisorRotationIncomplete { .. } => {
@@ -2365,6 +2637,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::PlacedInteractionIdAlreadyUsed { .. }
         | MobError::InvalidPlacedInteractionId { .. }
         | MobError::DeliveryInteractionConflict { .. }
+        // Only a restored member's revival answers a host refusal with this
+        // variant; spawn-many provisions with no revival intent, so a host
+        // refusal there keeps the host's own error.
+        | MobError::MemberRegistrationRefused { .. }
         // A mob's creation record is read by its create and resume, never by
         // a spawn-many row.
         | MobError::IncarnationInconsistent { .. }
@@ -2395,6 +2671,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // So does a shutting-down one.
+        MobError::ShutdownInProgress { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         MobError::MemberRetirementInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -5470,6 +5750,10 @@ pub struct MobHandle {
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) definition: Arc<MobDefinition>,
     pub(super) events: Arc<dyn MobEventStore>,
+    /// The built-in atomic identity/member store, when the storage
+    /// composition has one: member binding history reads its journal and
+    /// identity intent rows in one store transaction. Read-only here.
+    pub(super) identity_member: Option<Arc<dyn crate::store::MobIdentityMemberStore>>,
     pub(super) run_store: Arc<dyn MobRunStore>,
     pub(super) runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
     pub(super) flow_streams:
@@ -5502,6 +5786,9 @@ pub struct MobHandle {
     /// provided (production mob paths typically wire the factory at the
     /// surface layer directly).
     pub(super) realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+    /// The host's fork instruction policy
+    /// ([`super::MobBuilder::with_fork_instruction_policy`]).
+    pub(super) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     pub(super) flow_target_provisioner: Arc<StdRwLock<Option<FlowTargetProvisioner>>>,
     pub(super) explicit_resume_operations: Arc<ResumeOperationRegistry>,
     /// Read-only view of the actor's per-member admission lanes (#1102).
@@ -5527,6 +5814,12 @@ pub struct MobHandle {
     /// The incarnation this mob was created at, which its resumes keep; see
     /// [`MobHandle::incarnation`].
     pub(super) incarnation: meerkat_core::service::MobIncarnationId,
+    /// The tool bundle names this incarnation's builder registered: the
+    /// ceiling every member build reads a profile's opt-ins against.
+    pub(super) registered_tool_bundles: Arc<BTreeSet<String>>,
+    /// The realm profile store member builds read realm-referenced roles
+    /// from.
+    pub(super) realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -5756,6 +6049,12 @@ pub(crate) struct RestoreFailureDiagnostic {
     /// carries it, so a host classifies the Broken member typed instead of
     /// parsing `reason`.
     pub(crate) hold: Option<meerkat_core::service::DurableResumeHold>,
+    /// The hook call that refused the member's registration when its boot
+    /// restore was refused by its host, set only from the provision's
+    /// refusal slot. It feeds only the MobMachine seed
+    /// (`RecoverMemberRestoreHostRefused`); every typed refusal is minted
+    /// from the machine's code, never from this record.
+    pub(crate) registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 /// The machine's per-member subscribe verdict (phase 6): a local
@@ -7189,6 +7488,38 @@ impl MobHandle {
             generation: expected.generation,
             fence_token: expected.fence_token,
             transport: RetirementTransportIncarnationKey::from(&expected.member_ref),
+            scope: None,
+        }
+    }
+
+    /// The singleflight slot of one retirement step. A scoped root step's
+    /// slot is keyed by the scope alone: the handle reads no roster entry
+    /// for it.
+    fn retirement_step_key(&self, target: &RetireStepTarget) -> RetirementOperationKey {
+        match target {
+            RetireStepTarget::Exact(expected) => self.retirement_operation_key(expected),
+            RetireStepTarget::ScopedDescendant {
+                expected,
+                root,
+                step,
+            } => RetirementOperationKey {
+                scope: Some(RetirementScopeKey::new(root, *step)),
+                ..self.retirement_operation_key(expected)
+            },
+            RetireStepTarget::ScopedRoot(root) => RetirementOperationKey {
+                // The process-local incarnation of this Mob authority, as in
+                // `retirement_operation_key`.
+                event_store_identity: Arc::as_ptr(&self.events).cast::<()>() as usize,
+                mob_id: self.definition.id.to_string(),
+                agent_identity: root.agent_identity().clone(),
+                agent_runtime_id: root.runtime_id().clone(),
+                generation: root.generation(),
+                fence_token: root.fence_token(),
+                transport: RetirementTransportIncarnationKey::Session {
+                    session_id: root.session_id().to_string(),
+                },
+                scope: Some(RetirementScopeKey::new(root, RetirementScopeStep::Root)),
+            },
         }
     }
 
@@ -7208,47 +7539,11 @@ impl MobHandle {
         &self,
         key: &RetirementOperationKey,
         pending: Arc<PendingRetirementOperation>,
-    ) -> Result<(), MobError> {
+    ) -> Result<RetireStepOutcome, MobError> {
         let mut result_rx = pending.result_rx.clone();
         loop {
             if let Some(result) = result_rx.borrow().clone() {
-                return match result.as_ref() {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(match error.as_ref() {
-                        MobError::RetirementInProgress { session_id, stage } => {
-                            MobError::RetirementInProgress {
-                                session_id: session_id.clone(),
-                                stage: stage.clone(),
-                            }
-                        }
-                        MobError::MemberRetirementInProgress { member_id, stage } => {
-                            MobError::MemberRetirementInProgress {
-                                member_id: member_id.clone(),
-                                stage: stage.clone(),
-                            }
-                        }
-                        MobError::MemberRetirementAdmissionPending { member_id, stage } => {
-                            MobError::MemberRetirementAdmissionPending {
-                                member_id: member_id.clone(),
-                                stage: stage.clone(),
-                            }
-                        }
-                        MobError::MemberRetirementStuck {
-                            member_id,
-                            stage,
-                            cause,
-                        } => MobError::MemberRetirementStuck {
-                            member_id: member_id.clone(),
-                            stage: stage.clone(),
-                            cause: Arc::clone(cause),
-                        },
-                        // The actor already shares its typed cause.
-                        MobError::SharedRetirementFailure(cause) => {
-                            MobError::SharedRetirementFailure(Arc::clone(cause))
-                        }
-                        _ => MobError::SharedRetirementFailure(Arc::clone(error)),
-                    }),
-                };
+                return joined_retirement_result(result.as_ref());
             }
 
             let remaining = pending.deadline.saturating_duration_since(Instant::now());
@@ -7299,7 +7594,10 @@ impl MobHandle {
         else {
             return Ok(());
         };
-        self.wait_for_retirement_operation(&key, pending).await
+        // An unscoped slot re-checks no scope, so its step only ever runs.
+        self.wait_for_retirement_operation(&key, pending)
+            .await
+            .map(|_ran| ())
     }
 
     /// Retire `agent_identity`'s exact incarnation and join its singleflight
@@ -7336,7 +7634,7 @@ impl MobHandle {
                 .clone()
                 .expect("wait_for returns a published retirement result");
             match result.as_ref() {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(error)
                     if matches!(
                         error.as_ref(),
@@ -7355,6 +7653,29 @@ impl MobHandle {
     async fn join_or_start_retirement_operation(
         &self,
         agent_identity: AgentIdentity,
+        operation_deadline: Instant,
+        bound_admission: bool,
+        redrive: bool,
+    ) -> Result<Option<(RetirementOperationKey, Arc<PendingRetirementOperation>)>, MobError> {
+        self.join_or_start_retirement_step(
+            agent_identity,
+            None,
+            operation_deadline,
+            bound_admission,
+            redrive,
+        )
+        .await
+    }
+
+    /// [`Self::join_or_start_retirement_operation`] for one step of a retire:
+    /// unscoped when `scoped` is `None`, else one step of
+    /// [`Self::retire_at_scope`] under its root scope. A scoped root step
+    /// reads no roster entry: the actor resolves the incarnation only after
+    /// MobMachine classified the scope in the step's own command.
+    async fn join_or_start_retirement_step(
+        &self,
+        agent_identity: AgentIdentity,
+        scoped: Option<(&super::MemberDeliveryScope, RetirementScopeStep)>,
         operation_deadline: Instant,
         bound_admission: bool,
         redrive: bool,
@@ -7379,34 +7700,46 @@ impl MobHandle {
         } else {
             admission.await?;
         }
-        let entry = {
-            let roster = if bound_admission {
-                let remaining = operation_deadline.saturating_duration_since(Instant::now());
-                tokio::time::timeout(remaining, self.roster.read())
-                    .await
-                    .map_err(|_| MobError::MemberRetirementAdmissionPending {
-                        member_id: agent_identity.clone(),
-                        stage: "roster_incarnation_observation".to_string(),
-                    })?
-            } else {
-                self.roster.read().await
+        let target = if let Some((root, RetirementScopeStep::Root)) = scoped {
+            RetireStepTarget::ScopedRoot(root.clone())
+        } else {
+            let entry = {
+                let roster = if bound_admission {
+                    let remaining = operation_deadline.saturating_duration_since(Instant::now());
+                    tokio::time::timeout(remaining, self.roster.read())
+                        .await
+                        .map_err(|_| MobError::MemberRetirementAdmissionPending {
+                            member_id: agent_identity.clone(),
+                            stage: "roster_incarnation_observation".to_string(),
+                        })?
+                } else {
+                    self.roster.read().await
+                };
+                roster.get(&agent_identity).cloned()
             };
-            roster.get(&agent_identity).cloned()
+            let Some(entry) = entry else {
+                // Retirement is idempotent. Once the exact roster incarnation is
+                // absent there is no authority to enqueue an identity-only command
+                // that could retire a later successor.
+                return Ok(None);
+            };
+            let expected = super::state::RetireMemberIncarnation {
+                agent_identity: entry.agent_identity.clone(),
+                agent_runtime_id: entry.agent_runtime_id.clone(),
+                generation: entry.generation,
+                fence_token: entry.fence_token,
+                member_ref: entry.member_ref.clone(),
+            };
+            match scoped {
+                Some((root, step)) => RetireStepTarget::ScopedDescendant {
+                    expected,
+                    root: root.clone(),
+                    step,
+                },
+                None => RetireStepTarget::Exact(expected),
+            }
         };
-        let Some(entry) = entry else {
-            // Retirement is idempotent. Once the exact roster incarnation is
-            // absent there is no authority to enqueue an identity-only command
-            // that could retire a later successor.
-            return Ok(None);
-        };
-        let expected = super::state::RetireMemberIncarnation {
-            agent_identity: entry.agent_identity.clone(),
-            agent_runtime_id: entry.agent_runtime_id.clone(),
-            generation: entry.generation,
-            fence_token: entry.fence_token,
-            member_ref: entry.member_ref.clone(),
-        };
-        let key = self.retirement_operation_key(&expected);
+        let key = self.retirement_step_key(&target);
 
         let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
             .map_err(|error| MobError::Internal(error.to_string()))?;
@@ -7427,6 +7760,7 @@ impl MobHandle {
                 });
                 operations.insert(key.clone(), Arc::clone(&pending));
 
+                let (target, verdict_rx) = target.into_command_target();
                 let task_handle = self.clone();
                 let task_key = key.clone();
                 let task_pending = Arc::clone(&pending);
@@ -7435,7 +7769,7 @@ impl MobHandle {
                         std::panic::AssertUnwindSafe(task_handle.send_actor_command(|reply_tx| {
                             MobCommand::Retire {
                                 agent_identity,
-                                expected_incarnation: expected,
+                                target,
                                 redrive,
                                 deadline,
                                 admission_tx,
@@ -7449,7 +7783,18 @@ impl MobHandle {
                                 "process-owned exact retirement actor command panicked".to_string(),
                             ))
                         })
-                        .and_then(std::convert::identity);
+                        .and_then(std::convert::identity)
+                        // A scoped step its root-scope re-check declined
+                        // answers `Ok` without retiring anything; its
+                        // verdict says so.
+                        .map(|()| {
+                            match verdict_rx.map(|mut verdict_rx| verdict_rx.try_recv()) {
+                                Some(Ok(verdict)) if !verdict.admitted => {
+                                    RetireStepOutcome::NotAdmitted(verdict)
+                                }
+                                _ => RetireStepOutcome::Ran,
+                            }
+                        });
                     let mut operations = pending_retirement_operations()
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -8169,6 +8514,39 @@ impl MobHandle {
         &self.definition
     }
 
+    /// The tool bundles this mob's profiles opted into (`tools.bundles`)
+    /// that this incarnation does not register, so their members' builds
+    /// withhold them: the host no longer offers them.
+    ///
+    /// Computed from the current definition and this incarnation's
+    /// registrations, the same inputs every member build reads; a
+    /// realm-referenced role is read from the realm profile store as a build
+    /// reads it. Nothing is stored.
+    pub async fn withheld_tool_bundles(&self) -> Result<Vec<WithheldToolBundle>, MobError> {
+        let mut withheld = Vec::new();
+        for role in self.definition.profiles.keys() {
+            let Some(profile) = crate::build::current_role_profile(
+                &self.definition,
+                role,
+                self.realm_profile_store.as_ref(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            withheld.extend(
+                super::tools::withheld_profile_bundles(&profile, |bundle| {
+                    self.registered_tool_bundles.contains(bundle)
+                })
+                .map(|bundle| WithheldToolBundle {
+                    profile: role.clone(),
+                    bundle: bundle.clone(),
+                }),
+            );
+        }
+        Ok(withheld)
+    }
+
     /// Resolve the execution profile currently carried by one live member.
     ///
     /// Per-spawn profile and model overrides are applied. A definition-level
@@ -8650,6 +9028,7 @@ impl MobHandle {
                 roster_entry.and_then(|entry| entry.kickoff.as_ref()),
             ),
             progress: None,
+            registration_refusal: machine_state.member_registration_refusal_for_identity(identity),
         });
         let snapshot = material.to_snapshot();
         let current_bridge_session_id = snapshot.current_bridge_session_id().cloned();
@@ -8931,9 +9310,12 @@ impl MobHandle {
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
+                // A shutting-down source answers without revoking: the
+                // recovery transport revokes instead, as once it has exited.
                 Err(
                     error @ (MobError::ActorCommandChannelClosed
-                    | MobError::ActorReplyChannelClosed),
+                    | MobError::ActorReplyChannelClosed
+                    | MobError::ShutdownInProgress { .. }),
                 ) => error,
                 Err(error) => return Err(error),
             }
@@ -9966,6 +10348,8 @@ impl MobHandle {
                 peer_connectivity: None,
                 kickoff,
                 progress: None,
+                registration_refusal: machine_state
+                    .member_registration_refusal_for_identity(&dsl_identity),
             })
             .to_snapshot()
             .with_preview_unavailable(preview_unavailable),
@@ -11938,6 +12322,54 @@ impl MobHandle {
                 "unexpected command result variant".into(),
             )),
         }
+    }
+
+    /// Retire the member incarnation that `scope` names, with
+    /// [`Self::retire`]'s process-tree semantics: the member's `spawned_by`
+    /// descendants deepest first, then the member, then descendants again.
+    ///
+    /// Nothing is retired unless generated MobMachine authority admits the
+    /// scope. Every step, each descendant and the member itself, re-checks
+    /// the scope in the same actor command that retires it, so a successor
+    /// minted while the call runs (respawn, reset) is never retired through
+    /// an older scope. Refusals:
+    /// - [`MobError::StaleFenceToken`] when another incarnation of the
+    ///   identity is current (its runtime id or fence moved);
+    /// - [`MobError::StaleDeliveryScope`] when the scope's incarnation is
+    ///   current but its session is neither the member's binding nor the
+    ///   session its retirement is releasing;
+    /// - [`MobError::InvalidTransition`] in a completed or destroyed mob.
+    ///
+    /// A step that the scope's verdict does not admit retires nothing: a
+    /// declined descendant step ends its pass, and a declined member step
+    /// ends the call with the refusal. Once the member's incarnation is
+    /// retired, the second descendant pass runs only while no incarnation of
+    /// the identity is current, so a successor minted after the member
+    /// settled keeps its own tree.
+    ///
+    /// `Ok(())` is the same terminal lifecycle barrier as `retire`'s. When no
+    /// incarnation of the identity is current, the call first waits out a
+    /// retirement the mob still owns for it, then answers `Ok(())` only once
+    /// the identity has no roster entry and no stuck retirement; a stuck
+    /// retirement answers [`MobError::MemberRetirementStuck`]. A retry after
+    /// a lost reply therefore converges to `Ok(())` at the barrier, never
+    /// before it.
+    ///
+    /// The scope is a selector, not a permission. The call enters the same
+    /// `Retire` control-scope admission as `retire`, and, like
+    /// `retire(identity)`, a scope naming an identity that was never a member
+    /// of this mob answers `Ok(())`.
+    pub async fn retire_at_scope(
+        &self,
+        scope: &super::MemberDeliveryScope,
+    ) -> Result<(), MobError> {
+        let handle = self.clone();
+        let scope = scope.clone();
+        // Like `retire`, run the cascade off the caller's stack.
+        meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+            handle.retire_member_tree_at_scope(scope).await
+        })
+        .await
     }
 
     /// Retire a member and respawn with the same profile, labels, wiring, and mode.
@@ -14394,6 +14826,16 @@ impl MobHandle {
     }
 
     /// Retire active members, clear persisted mob storage, and terminate the actor.
+    ///
+    /// Once the destroy is admitted (its durable destroy marker is written)
+    /// admission closes, before any destroy cleanup (D67; the reason is
+    /// [`MobAdmissionCloseReason::Destroyed`](crate::runtime::MobAdmissionCloseReason::Destroyed)
+    /// unless admission had already closed): [`Self::acquire_owner`] and every
+    /// command the Closing state refuses then fail with
+    /// [`MobError::AdmissionClosed`]. A destroy left incomplete after its
+    /// admission keeps admission closed; retry the destroy. A mob restored
+    /// with that marker starts with admission closed: `MobBuilder::resume`
+    /// returns its handle already closed.
     pub async fn destroy(&self) -> Result<MobDestroyReport, MobDestroyError> {
         match self
             .execute_destroy_machine_command(MobMachineCommand::Destroy)
@@ -14557,7 +14999,8 @@ impl MobHandle {
     /// `options.deadline` is the caller's own bound (for example below a
     /// process supervisor's termination grace period): when it elapses,
     /// every member Shutdown is still waiting on is reported (an unfinished
-    /// runtime unregister as `UnregisterPending`) and Shutdown returns.
+    /// runtime unregister as `UnregisterPending`, whose settlement follows
+    /// the member's exact registration afterwards) and Shutdown returns.
     /// Without a deadline the member lifecycle hang guard is the failure
     /// bound. Durable state stays re-drivable on the next start either way.
     pub async fn shutdown_with_report(
@@ -14572,6 +15015,16 @@ impl MobHandle {
     }
 
     /// Shut down the actor. After this, no more commands are accepted.
+    ///
+    /// The admitted Shutdown closes admission first, before any teardown
+    /// (D67; the reason is
+    /// [`MobAdmissionCloseReason::Shutdown`](crate::runtime::MobAdmissionCloseReason::Shutdown)
+    /// unless admission had already closed): from then on
+    /// [`Self::acquire_owner`] and every command the Closing state refuses
+    /// fail with [`MobError::AdmissionClosed`], and [`Self::admission_closed`]
+    /// reports the reason. A Shutdown that fails after its admission leaves
+    /// admission closed: the mob can still be torn down (Shutdown again, or
+    /// Destroy) but admits no new work. A Stop leaves admission open.
     ///
     /// Shutdown makes progress past members it cannot settle instead of
     /// waiting on them:
@@ -14690,6 +15143,23 @@ impl MobHandle {
             "member turn admission test gate already armed for this identity and stage"
         );
         (entered_rx, release_tx)
+    }
+
+    /// Hold this mob's next Shutdown in its inline drain: the actor spawns a
+    /// member-live task that the drain joins, and that task ends once the
+    /// returned sender is used or dropped. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn hold_shutdown_drain_for_test(
+        &self,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, MobError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.send_actor_command(|reply_tx| MobCommand::SpawnHeldLiveMutationForTest {
+            release_rx,
+            reply_tx,
+        })
+        .await??;
+        Ok(release_tx)
     }
 
     /// Move `identity`'s session binding to `session_id` under its current
@@ -15471,6 +15941,7 @@ impl MobHandle {
             member,
             message_count,
             meerkat_core::DurableForkSourceAdmission::Quiescent,
+            meerkat_core::ActivationWindow::HostDriven,
         )
         .await
     }
@@ -15498,11 +15969,14 @@ impl MobHandle {
         message_count: Option<usize>,
         bound: Duration,
     ) -> Result<ForkMemberAtTurnBoundary, MobError> {
+        // The delegation that asks for this fork admits the child's bounded
+        // turn itself, so the host has no window to activate the child.
         let (source_session_id, fork_target) = self
             .admit_fork_member(
                 source_identity,
                 &member,
                 meerkat_core::DurableForkSourceAdmission::Quiescent,
+                meerkat_core::ActivationWindow::None,
             )
             .await?;
         let fork = self
@@ -15517,7 +15991,7 @@ impl MobHandle {
             .await
             // The owner reports a source it could not fork after winning the
             // boundary as `SourceBusy`, never as `Busy`.
-            .map_err(MobError::from)?;
+            .map_err(|error| fork_session_error(source_identity, error))?;
         let fork = match fork {
             meerkat_core::DurableForkAtTurnBoundary::Forked(fork) => fork,
             meerkat_core::DurableForkAtTurnBoundary::SourceBusy { waited } => {
@@ -15531,11 +16005,17 @@ impl MobHandle {
 
     /// Admission shared by every durable member fork: control scope, source
     /// and child identities, placement, and the source's bridge session.
+    ///
+    /// `activation_window` says whether the host can activate inherited
+    /// instruction keys on the child before its first turn; the host's
+    /// [`meerkat_core::ForkInstructionPolicy`] resolves against it here, once,
+    /// for every member fork path.
     async fn admit_fork_member(
         &self,
         source_identity: &AgentIdentity,
         member: &SpawnMemberSpec,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
     ) -> Result<
         (
             meerkat_core::SessionId,
@@ -15585,6 +16065,7 @@ impl MobHandle {
             // alive. See `ForkCacheInheritance`.
             cache_identity: None,
             source_admission,
+            inherited_instructions: self.fork_instruction_policy.effective(activation_window),
         };
         Ok((source_session_id, fork_target))
     }
@@ -15719,7 +16200,7 @@ impl MobHandle {
         let child_identity = member.identity.clone();
         let fork_session_id = fork.session_id.clone();
         if let Some(job) = member.fork_job.as_mut() {
-            job.prefix_message_count = fork.message_count;
+            job.prefix_message_count = fork.prefix_message_count();
         }
         member.launch_mode = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: fork_session_id.clone(),
@@ -15838,6 +16319,7 @@ impl MobHandle {
         mut member: SpawnMemberSpec,
         message_count: Option<usize>,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
     ) -> Result<ForkMemberResult, MobError> {
         let fork = self
             .fork_source_session(
@@ -15845,6 +16327,7 @@ impl MobHandle {
                 &mut member,
                 message_count,
                 source_admission,
+                activation_window,
                 None,
             )
             .await?;
@@ -15867,12 +16350,13 @@ impl MobHandle {
         member: &mut SpawnMemberSpec,
         message_count: Option<usize>,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
         caller_turn_job_owner: Option<&meerkat_core::SessionId>,
     ) -> Result<meerkat_core::SessionForkResult, MobError> {
         #[cfg(test)]
         pause_fork_admission_if_requested(source_identity).await;
         let (source_session_id, fork_target) = self
-            .admit_fork_member(source_identity, member, source_admission)
+            .admit_fork_member(source_identity, member, source_admission, activation_window)
             .await?;
         if let Some(owner_session_id) = caller_turn_job_owner
             && owner_session_id != &source_session_id
@@ -15903,7 +16387,7 @@ impl MobHandle {
                     source_member_id: source_identity.to_string(),
                     cause: crate::error::ForkSourceUnavailableCause::Running,
                 },
-                error => MobError::from(error),
+                error => fork_session_error(source_identity, error),
             })
     }
 
@@ -15946,12 +16430,15 @@ impl MobHandle {
         ) {
             member.spawned_by = Some(source_identity.clone());
         }
+        // This call admits the child's turn itself: the host has no window to
+        // activate inherited instruction keys on the child first.
         let fork = self
             .fork_member_with_source_admission(
                 source_identity,
                 member,
                 message_count,
                 source_admission,
+                meerkat_core::ActivationWindow::None,
             )
             .await?;
         let turn = self
@@ -16066,12 +16553,15 @@ impl MobHandle {
             // provably the spawner and owns the child.
             member.spawned_by = Some(source_identity.clone());
         }
+        // This call admits the child's turn itself: the host has no window to
+        // activate inherited instruction keys on the child first.
         let session_fork = self
             .fork_source_session(
                 source_identity,
                 &mut member,
                 message_count,
                 source_admission,
+                meerkat_core::ActivationWindow::None,
                 caller_turn_job_owner.as_ref(),
             )
             .await?;
@@ -17601,6 +18091,125 @@ impl MobHandle {
         );
     }
 
+    /// The core of [`Self::retire_at_scope`]: [`Self::retire_member_tree`]
+    /// with every step admitted by MobMachine's re-check of the root scope
+    /// in the step's own actor command.
+    async fn retire_member_tree_at_scope(
+        &self,
+        scope: super::MemberDeliveryScope,
+    ) -> Result<(), MobError> {
+        let root = scope.agent_identity().clone();
+        let mut first_error = None;
+        let mut attempted = std::collections::BTreeSet::new();
+        #[cfg(test)]
+        retire_at_scope_hold::reached(&root, retire_at_scope_hold::BEFORE_DESCENDANTS).await;
+        self.retire_scoped_descendants_until_stable(
+            &scope,
+            RetirementScopeStep::DescendantBeforeRoot,
+            &mut attempted,
+            &mut first_error,
+        )
+        .await;
+        let own = match self
+            .retire_scoped_step(root.clone(), &scope, RetirementScopeStep::Root)
+            .await
+        {
+            Ok(RetireStepOutcome::Ran) => Ok(()),
+            Ok(RetireStepOutcome::NotAdmitted(verdict)) => Err(verdict.root_refusal(&scope)),
+            Err(error) => Err(error),
+        };
+        if own.is_ok() {
+            #[cfg(test)]
+            retire_at_scope_hold::reached(&root, retire_at_scope_hold::AFTER_ROOT).await;
+            self.retire_scoped_descendants_until_stable(
+                &scope,
+                RetirementScopeStep::DescendantAfterRoot,
+                &mut attempted,
+                &mut first_error,
+            )
+            .await;
+        }
+        match (own, first_error) {
+            (Err(error), _) | (Ok(()), Some(error)) => Err(error),
+            (Ok(()), None) => Ok(()),
+        }
+    }
+
+    /// One descendant pass of [`Self::retire_member_tree_at_scope`],
+    /// re-collected until none remain as in
+    /// [`Self::retire_descendants_until_stable`]. A step that the root
+    /// scope's re-check declines retired nothing and ends the pass.
+    async fn retire_scoped_descendants_until_stable(
+        &self,
+        scope: &super::MemberDeliveryScope,
+        step: RetirementScopeStep,
+        attempted: &mut std::collections::BTreeSet<AgentIdentity>,
+        first_error: &mut Option<MobError>,
+    ) {
+        // The bound of `retire_descendants_until_stable`.
+        const MAX_CASCADE_PASSES: usize = 8;
+        let ancestor = scope.agent_identity();
+        for _ in 0..MAX_CASCADE_PASSES {
+            let pending: Vec<AgentIdentity> = self
+                .descendants_deepest_first(ancestor)
+                .await
+                .into_iter()
+                .filter(|descendant| !attempted.contains(descendant))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            for descendant in pending {
+                match self
+                    .retire_scoped_step(descendant.clone(), scope, step)
+                    .await
+                {
+                    Ok(RetireStepOutcome::Ran) => {}
+                    Ok(RetireStepOutcome::NotAdmitted(_)) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            member = %descendant,
+                            ancestor = %ancestor,
+                            error = %error,
+                            "cascading scoped retirement of a descendant failed"
+                        );
+                        first_error.get_or_insert(error);
+                    }
+                }
+                attempted.insert(descendant);
+            }
+        }
+        tracing::warn!(
+            ancestor = %ancestor,
+            passes = MAX_CASCADE_PASSES,
+            "cascading scoped retirement stopped re-collecting descendants"
+        );
+    }
+
+    /// One step of a scoped retire through its singleflight slot.
+    async fn retire_scoped_step(
+        &self,
+        agent_identity: AgentIdentity,
+        scope: &super::MemberDeliveryScope,
+        step: RetirementScopeStep,
+    ) -> Result<RetireStepOutcome, MobError> {
+        let operation_deadline = Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT;
+        let Some((key, pending)) = self
+            .join_or_start_retirement_step(
+                agent_identity,
+                Some((scope, step)),
+                operation_deadline,
+                true,
+                false,
+            )
+            .await?
+        else {
+            // The descendant is already absent: nothing is left to retire.
+            return Ok(RetireStepOutcome::Ran);
+        };
+        self.wait_for_retirement_operation(&key, pending).await
+    }
+
     /// Resolve admission for observing or retiring one member.
     ///
     /// The caller supplies manage scope and the member it acts as (resolved
@@ -18515,6 +19124,47 @@ mod tests {
     use super::*;
     use crate::ids::Generation;
 
+    /// A scoped retire's refusal travels as a step outcome, so a joiner keeps
+    /// seeing a stale fence or a moved session that the actor answered as a
+    /// shared retirement failure, and a stuck retirement as stuck.
+    #[test]
+    fn a_joined_retirement_maps_published_errors_as_before() {
+        let identity = AgentIdentity::from("joined-retirement");
+        let stale = MobError::StaleFenceToken {
+            runtime_id: AgentRuntimeId::new(identity.clone(), Generation::INITIAL),
+            expected: FenceToken::new(2),
+            actual: FenceToken::new(1),
+        };
+        assert!(matches!(
+            joined_retirement_result(&Err(Arc::new(stale))),
+            Err(MobError::SharedRetirementFailure(cause))
+                if matches!(cause.as_ref(), MobError::StaleFenceToken { .. })
+        ));
+        let moved = MobError::StaleDeliveryScope {
+            agent_identity: identity.clone(),
+            expected_session: SessionId::new(),
+            actual_session: None,
+        };
+        assert!(matches!(
+            joined_retirement_result(&Err(Arc::new(moved))),
+            Err(MobError::SharedRetirementFailure(cause))
+                if matches!(cause.as_ref(), MobError::StaleDeliveryScope { .. })
+        ));
+        let stuck = MobError::MemberRetirementStuck {
+            member_id: identity,
+            stage: "retire-session-archive".to_string(),
+            cause: Arc::new(MobError::Internal("stuck".to_string())),
+        };
+        assert!(matches!(
+            joined_retirement_result(&Err(Arc::new(stuck))),
+            Err(MobError::MemberRetirementStuck { .. })
+        ));
+        assert!(matches!(
+            joined_retirement_result(&Ok(RetireStepOutcome::Ran)),
+            Ok(RetireStepOutcome::Ran)
+        ));
+    }
+
     // Dogma #282 gate: a command-layer fault must surface as `Err(MobError)`,
     // never be laundered into a "not found" (`Ok(None)`) or "empty match"
     // (`Ok(vec![])`) result. We drive each public method's result mapping with
@@ -18590,6 +19240,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         }
         .with_current_bridge_session_id(Some(sid.clone()));
         let snapshot_value =
@@ -18631,6 +19282,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         };
 
         let snapshot_value =
@@ -18674,6 +19326,7 @@ mod tests {
             lifecycle_capabilities: None,
             non_portable_disabled: None,
             preview_unavailable: None,
+            registration_refusal: None,
         };
         assert_eq!(
             snapshot.agent_identity(),
@@ -18699,6 +19352,7 @@ mod tests {
             peer_connectivity: None,
             kickoff: None,
             progress: None,
+            registration_refusal: None,
         }
         .to_snapshot();
 

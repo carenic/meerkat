@@ -225,6 +225,10 @@ class AgentErrorReason:
     provider_error_kind: str | None = None
     provider_error_retryability: Literal["retryable", "non_retryable"] | None = None
     provider_error: Any = None
+    # ``content_filtered``: the refusing stop, and the provider's own account
+    # of it (tagged by ``provider``; ``None`` when it sent none).
+    stop: Literal["refusal", "content_filter"] | None = None
+    detail: dict[str, Any] | None = None
 
     def __getitem__(self, key: str) -> Any:
         if key == "reason_type":
@@ -423,12 +427,51 @@ class CompactionStarted(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class SummarizationSourceBound:
+    """How much of the history a compaction summary's source carried.
+
+    ``kind`` is ``whole``, ``trimmed`` (with ``through``: ``tool_results``,
+    ``context`` or ``user_requests``) or ``requests_only`` (the newest ``kept``
+    of ``of`` user requests). A kind this SDK version does not know is
+    ``unknown``, with the wire object in ``raw``.
+    """
+
+    kind: str = "unknown"
+    through: str | None = None
+    kept: int | None = None
+    of: int | None = None
+    raw_kind: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionSummarySource:
+    """Who wrote a compaction summary.
+
+    ``kind`` is ``provider_call`` (with ``source_bound``), ``host_curator`` or
+    ``mechanical_fallback``. A kind this SDK version does not know is
+    ``unknown``, with the wire object in ``raw``.
+    """
+
+    kind: str = "unknown"
+    source_bound: SummarizationSourceBound | None = None
+    raw_kind: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class CompactionCompleted(Event):
     """Context compaction finished."""
 
     summary_tokens: int = 0
     messages_before: int = 0
     messages_after: int = 0
+    # None only for a completion recorded before the source was reported.
+    summary_source: CompactionSummarySource | None = None
+    # Estimated history tokens the rewrite left, in the unit of
+    # CompactionStarted.estimated_history_tokens. None for a completion
+    # recorded before it was reported, or when the history was not measured.
+    estimated_history_tokens_after: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,12 +726,20 @@ ToolConfigChangeStatus = (
 
 @dataclass(frozen=True, slots=True)
 class ToolConfigChangedPayload:
-    """Payload for tool configuration change notifications."""
+    """Payload for tool configuration change notifications.
+
+    ``settled`` says whether the change is a settled lifecycle fact rather than
+    a pending or draining step. It is derived from ``status_info`` the way
+    rkat-rpc derives it, so payloads stored by 0.9.3 and earlier read
+    correctly. It says nothing about configuration: whether a change was
+    written there is the ``persisted`` of the ``mcp_add`` / ``mcp_remove``
+    response.
+    """
 
     operation: str | None = None
     target: str | None = None
     status_info: ToolConfigChangeStatus | None = None
-    persisted: bool | None = None
+    settled: bool | None = None
     applied_at_turn: int | None = None
 
 
@@ -934,6 +985,26 @@ def _parse_agent_error_reason(raw: Any) -> AgentErrorReason | None:
             provider_error_kind=provider_error_kind,
             provider_error_retryability=retryability,
             provider_error=raw["provider_error"],
+        )
+
+    if reason_type == "content_filtered":
+        stop = raw.get("stop")
+        if stop not in ("refusal", "content_filter"):
+            return AgentErrorReason(
+                reason_type="unknown",
+                raw_reason_type=reason_type,
+                raw=dict(raw),
+            )
+        detail = raw.get("detail")
+        # Provider evidence never fails the report: a detail that is not a
+        # provider-tagged object reads as absent, as Core decodes it.
+        if not (isinstance(detail, dict) and isinstance(detail.get("provider"), str)):
+            detail = None
+        return AgentErrorReason(
+            reason_type=reason_type,
+            raw=dict(raw),
+            stop=stop,
+            detail=dict(detail) if detail is not None else None,
         )
 
     if reason_type not in {
@@ -1265,6 +1336,44 @@ def _require_bool(raw: dict[str, Any], field_name: str) -> bool:
     return value
 
 
+def _tool_config_settled_field(payload: dict[str, Any]) -> str:
+    """The field that carries a tool config payload's stored lifecycle bit.
+
+    rkat-rpc 0.9.4 and later write ``settled``; 0.9.3 and earlier wrote the
+    bit as ``persisted``, and rkat-rpc serves payloads stored then unchanged.
+    """
+    return "settled" if "settled" in payload else "persisted"
+
+
+_SETTLED_TOOL_CONFIG_STATUS_KINDS = frozenset(
+    {"boundary_applied", "deferred_catalog_delta", "warning_failed_closed"}
+)
+
+
+def _tool_config_settled(payload: dict[str, Any]) -> bool:
+    """A tool config payload's lifecycle fact, derived like rkat-rpc derives it.
+
+    Tool-scope, deferred-catalog and failed-closed changes are settled, and an
+    external tool delta is settled unless it is pending or draining. Only a
+    status this SDK does not know falls back to the stored bit: the
+    ``persisted`` that 0.9.3 and earlier stored was ``False`` for tool-scope,
+    deferred-catalog and failed-closed changes that had already applied.
+    """
+    stored = _require_bool(payload, _tool_config_settled_field(payload))
+    status = payload.get("status_info")
+    if isinstance(status, dict):
+        kind = status.get("kind")
+        if kind in _SETTLED_TOOL_CONFIG_STATUS_KINDS:
+            return True
+        if kind == "external_tool_delta":
+            phase = status.get("phase")
+            if phase in {"applied", "forced", "failed"}:
+                return True
+            if phase in {"pending", "draining"}:
+                return False
+    return stored
+
+
 def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
     if not isinstance(raw, dict):
         raise ValueError("interaction_failed.reason must be object")
@@ -1284,6 +1393,52 @@ def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
             detail=_require_str(raw, "detail"),
         )
     return InteractionFailureReason(
+        kind="unknown",
+        raw_kind=kind,
+        raw=dict(raw),
+    )
+
+
+_SUMMARIZATION_TRIM_STAGES = frozenset({"tool_results", "context", "user_requests"})
+
+
+def _parse_summarization_source_bound(raw: Any) -> SummarizationSourceBound:
+    if not isinstance(raw, dict):
+        raise ValueError("summary_source.source_bound must be object")
+    kind = _require_str(raw, "kind")
+    if kind == "whole":
+        return SummarizationSourceBound(kind=kind)
+    if kind == "trimmed":
+        through = _require_str(raw, "through")
+        if through in _SUMMARIZATION_TRIM_STAGES:
+            return SummarizationSourceBound(kind=kind, through=through)
+    elif kind == "requests_only":
+        return SummarizationSourceBound(
+            kind=kind,
+            kept=_require_non_negative_int(raw, "kept"),
+            of=_require_non_negative_int(raw, "of"),
+        )
+    return SummarizationSourceBound(
+        kind="unknown",
+        raw_kind=kind,
+        raw=dict(raw),
+    )
+
+
+def _parse_compaction_summary_source(raw: Any) -> CompactionSummarySource | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("summary_source must be object")
+    kind = _require_str(raw, "kind")
+    if kind == "provider_call":
+        return CompactionSummarySource(
+            kind=kind,
+            source_bound=_parse_summarization_source_bound(raw.get("source_bound")),
+        )
+    if kind in {"host_curator", "mechanical_fallback"}:
+        return CompactionSummarySource(kind=kind)
+    return CompactionSummarySource(
         kind="unknown",
         raw_kind=kind,
         raw=dict(raw),
@@ -1574,7 +1729,7 @@ def _validate_known_event(event_type: str, raw: dict[str, Any]) -> None:
         if operation not in {"add", "remove", "reload"}:
             raise ValueError("payload.operation must be add, remove, or reload")
         _require_str(payload, "target")
-        _require_bool(payload, "persisted")
+        _require_bool(payload, _tool_config_settled_field(payload))
         return
     if event_type == "turn_completed":
         stop_reason = raw.get("stop_reason")
@@ -1718,6 +1873,16 @@ def parse_event(raw: dict[str, Any]) -> Event:
                 kwargs["reason"] = _parse_interaction_failure_reason(raw.get("reason"))
             elif f == "reason" and cls is StreamTruncated:
                 kwargs["reason"] = _parse_stream_truncation_reason(raw.get("reason"))
+            elif f == "summary_source" and cls is CompactionCompleted:
+                kwargs["summary_source"] = _parse_compaction_summary_source(
+                    raw.get("summary_source"),
+                )
+            elif f == "estimated_history_tokens_after" and cls is CompactionCompleted:
+                kwargs[f] = (
+                    None
+                    if raw.get(f) is None
+                    else _require_non_negative_int(raw, f)
+                )
             elif f == "payload" and cls is ToolConfigChanged:
                 payload_raw = raw["payload"]
                 assert isinstance(payload_raw, dict)
@@ -1728,7 +1893,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
                     status_info=_parse_tool_config_change_status(
                         payload_raw.get("status_info")
                     ),
-                    persisted=payload_raw["persisted"],
+                    settled=_tool_config_settled(payload_raw),
                     applied_at_turn=(
                         applied_at_turn_raw
                         if isinstance(applied_at_turn_raw, int)

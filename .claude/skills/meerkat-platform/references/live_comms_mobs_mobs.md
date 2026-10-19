@@ -1,13 +1,13 @@
-Covers: Meerkat mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy,
-admission close, cancelling member work, member lifetime, helpers, fork_off,
-council, profile keys (tools.deny hides tools), flows and runs (run-flow
-waits, --detach), multi-host mobs, mobpacks and deploy (budgets, known issues),
-error codes. Live: live_comms_mobs_live.md. Comms:
-live_comms_mobs_comms.md.
+Covers: Meerkat mob changes since 0.8.40 (through 0.9.4): stop, shutdown
+(ShutdownInProgress), destroy, admission close reasons, cancelling member work,
+member lifetime, reset and re-spawn, member binding history, helpers,
+fork_off, council, profile keys, flows and runs (run-flow waits, --detach),
+multi-host mobs, mobpacks and deploy budgets, error codes. Live:
+live_comms_mobs_live.md. Comms: live_comms_mobs_comms.md.
 
 # Mob Changes Since 0.8.40 (0.9)
 
-The 0.9.0 guide to what changed for mobs since 0.8.40. `references/mobs.md`
+What changed for mobs since 0.8.40, through 0.9.4. `references/mobs.md`
 stays the baseline for mob definitions, flows and agent mob tools; where
 they disagree, this file wins. Member live channels are in
 live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
@@ -31,17 +31,45 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   before Stop runs only after Resume. The result carries `stop_report` with
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
-  A spawn that finishes into a stopped mob leaves it stopped.
+  A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
+  member reloaded while the mob is stopped stays held until Resume, as does
+  one spawned into a stopped mob or held again after a failed Resume;
+  retire, Shutdown and destroy release the hold for the members they dispose
+  of, so a later registration of the same session is not held, and a mob
+  reopened in the same process holds its members only if it is restored
+  stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. While a mob shuts down, every other command fails
-  with `ActorCommandChannelClosed`.
+  and reports each member. Since 0.9.4 a member reported
+  `UnregisterPending { stage, settlement, .. }` carries a
+  `MemberUnregisterSettlement` that keeps following its exact registration
+  after Shutdown returns (`try_state()`, `settle_within(deadline)`;
+  `HandedOver` when a later owner took the registration over), and a
+  durability-degraded member is unregistered after the reload-required
+  discard instead of staying registered until the process exits (details in
+  `references/mobs.md`). Since 0.9.4 an admitted Shutdown closes the mob's
+  admission before any teardown (reason `Shutdown`). While it runs, a command
+  the closed admission refuses (spawn, respawn, work, a flow run, wiring, a
+  host bind, a live commit, resume, reset, reload, an owner lease) fails with
+  `AdmissionClosed`, and every other request (stop, destroy, complete,
+  retirement, reads, `status()`) gets `MobError::ShutdownInProgress`:
+  retryable, wire `SESSION_BUSY`, data kind `mob_shutdown_in_progress`;
+  `stop()` returns it at once. 0.9.3 and earlier answered these with
+  `ActorCommandChannelClosed`, which now means only that the actor has
+  exited or is exiting. A Shutdown that fails keeps the actor serving with
+  admission closed: Stop, Shutdown and Destroy stay available. A command sent
+  while the actor exits after a shutdown now fails instead of waiting
+  forever. `MobError` is `#[non_exhaustive]` since 0.9.4.
 - Destroy deletes the mob's database files only after its actor ended and its
   observer drained. Until then it answers `mob_destroy_incomplete` with
   `destroy_report` and `retryable: true` (JSON-RPC and MCP: internal error
   data; REST session archive: HTTP 500). Drop every `MobHandle` or store in
   your process and retry as the same caller. The mob id cannot be re-created
-  until the cleanup finishes.
+  until the cleanup finishes. Since 0.9.4 an admitted destroy (its durable
+  marker written) closes admission first (reason `Destroyed`); an incomplete
+  destroy keeps it closed while the retry stays available, and a mob restored
+  with an unfinished destroy starts with admission closed, so nothing is
+  spawned into it.
 
 ## Admission close (Rust hosts)
 
@@ -55,6 +83,17 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
 `close_admission(reason)`, and watch `admission_closed()`. Mobs managed by
 `rkat-rpc`, `rkat-rest` or `rkat-mcp` stay owned by the server's registry.
 
+Since 0.9.4 admission also closes, before the actor stops, when a Shutdown is
+admitted (`Shutdown`), a destroy is admitted (`Destroyed`), the actor
+fail-stops on an uncertain durable write or a failed durable recovery
+(`DurabilityFailStop`), the actor task is lost to a panic or abort
+(`ActorLost`), or a composition dispatch failure stops it (`DispatchFailed`).
+These are `MobAdmissionCloseReason` variants next to `IdleClose`,
+`LastOwnerReleased` and `StandDown`, and an earlier close keeps its reason.
+No actor exit leaves admission open: `acquire_owner()` is refused and
+`admission_closed()` names the reason, where 0.9.3 and earlier could still
+hand out an owner lease on a stopped actor.
+
 ## Stopping and cancelling member work
 
 | Need | Use |
@@ -65,7 +104,9 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
 
 - `force_cancel` cancels the current run at its next boundary and drops
   input queued before the cancel. It is idempotent, and an idle member answers
-  ok. Only a never-seen identity fails with `MemberNotFound`.
+  ok. A never-seen identity fails with `MemberNotFound`; since 0.9.4 a member
+  whose runtime needs a durability reload fails with `MemberReloadRequired`
+  (`-32029`) until it is reloaded.
 - The run id comes from the `run_started` event. A stale id returns the
   receipt `not_current`, not an error; other outcomes are `stopped` and
   `not_stoppable`.
@@ -88,6 +129,19 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   re-drives it once per request.
 - `rkat mob respawn <MOB_ID> <AGENT_IDENTITY> [--initial-message <MSG>]`
   (RPC `mob/respawn`) replaces the member under a new runtime binding.
+- Since 0.9.4 a mob that was reset and then re-spawned a member under an
+  identity it had before the reset resumes after a restart (0.9.3 and earlier
+  failed that resume with an internal error), and the re-spawned member always
+  gets a generation above every earlier one, so it never reuses its pre-reset
+  runtime id or member address. A store written before 0.9.4 whose last epoch
+  already reused a generation still resumes; that identity's next spawn goes
+  above the recovered high-water.
+- Since 0.9.4 a Rust host can read which member incarnation held which
+  session: `MobHandle::member_binding_history()` (also on `read_handle()`;
+  needs `ControlScope::List`) answers per session across mob resets, and per
+  identity (live or retired) since the latest reset, without the actor queue.
+  `MobStorage::read_member_binding_history(path)` reads a stopped mob's store
+  read-only. Details in `references/mobs.md`.
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
@@ -157,6 +211,12 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   accept an optional `placement`. Host-only fields such as `mcp_servers` and
   `rust_bundles` are refused, and managed hosts without a child tool policy
   refuse `mob_create` and `delegate` (`child_tool_policy_required`).
+- Since 0.9.4 a child mob's inline profile (a mob a member creates with
+  `mob_create`) can mount a tool bundle the host offers to child mobs by
+  naming it in `tools.bundles`. A name the host does not offer is refused
+  (`ToolBundleNotOffered`, which lists the offered names). The opt-in persists
+  with the definition; a member whose host no longer offers the bundle is
+  built without it (`MobHandle::withheld_tool_bundles` reports it).
 - `tooling` (any mode) needs a source identity for every tool the child
   keeps. Tools from a named Rust tool bundle get one automatically (0.8.52+);
   external tools a host mounts outside a bundle need `ToolDef.provenance` or
@@ -174,6 +234,7 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
 | `tools.comms = true` | Required for every spawned member |
 | `tools.read_only = true` | Only tools declared read-only may execute; tools stay listed, other calls are refused `access_denied` |
 | `tools.deny = [...]` | Named tools are hidden from members (0.8.52+) and refused by name; an unknown name fails the build (`DeclaredToolUnknown`) |
+| `tools.bundles = [...]` | 0.9.4+: host tool bundles a child mob's inline profile opts into; only bundles the host offers to child mobs |
 | `model_fallback` / top-level `[runtime] model_fallback` | Fallback model; precedence is profile, then mob runtime, then host config |
 | `resume_overrides = ["model", "provider", "provider_params"]` | Profile fields that win over a resumed member's durable session |
 | `external_addressable = true` | Required for `mob/member_send` and external `mob/submit_work` |
@@ -255,10 +316,13 @@ rkat --realm team mob hosts <MOB_ID> --json
   members also sets `listen_tcp` and `advertise_tcp` so hosts can reach it.
 - Spawn a placed member with `placement: "<HOST_ID>"` on `mob/spawn`,
   `mob/spawn_many`, `delegate` or `mob_spawn_member`. Placement needs a
-  portable spec: Rust tool bundles, WorkGraph tools, shell or MCP secrets in
-  env or headers are refused.
+  portable spec: Rust tool bundles (`tools.bundles` opt-ins too), WorkGraph
+  tools, shell or MCP secrets in env or headers are refused.
 - Also: `rkat mob revoke-host`, `member-history` and `route-installs`
   (pending external trust installs show as `outstanding_external`).
+- Since 0.9.4 a recorded placed lifecycle intent (such as a Reset) is not
+  retried while the mob's admission is closed (0.9.3 and earlier retried it
+  every 2 s with a warning); it stays recorded and the next start drives it.
 - Grants for delegated principals: `rkat mob grant <MOB_ID> <PRINCIPAL>
   --scope <SCOPE>... [--expires-at-ms N | --expires-in 30m]`, `revoke-grant`
   (no `--scope` revokes all) and `grants`. The scopes are `list`,
@@ -319,7 +383,7 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
 
 | Code | JSON-RPC | HTTP | Meaning |
 |---|---|---|---|
-| `SESSION_BUSY` | -32002 | 409 | Retry later (also a full 256-entry member lane, a retirement or teardown in progress) |
+| `SESSION_BUSY` | -32002 | 409 | Retry later (also a full 256-entry member lane, a retirement or teardown in progress, a Shutdown draining: `mob_shutdown_in_progress`) |
 | `CAPABILITY_UNAVAILABLE` | -32020 | 501 | Feature not available here |
 | `SUPERVISOR_ROTATION_INCOMPLETE` | -32024 | 409 | Finish supervisor rotation |
 | `SCOPE_DENIED` | -32025 | 403 | Principal lacks a control scope |

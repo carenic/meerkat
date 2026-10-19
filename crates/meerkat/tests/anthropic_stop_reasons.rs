@@ -10,6 +10,12 @@
 //! - an unknown stop reason is retried, then fails typed;
 //! - a paused server-tool turn is committed, and the next request replays its
 //!   server-tool blocks.
+//! - a native web search the provider refused comes back from the
+//!   `web_search` executor failed, without its text as the answer (#1887);
+//! - a refusal's `stop_details` reaches the run failure as the typed reason's
+//!   provider detail, and a refusal without it still reports its typed stop;
+//! - a refusal captured from the live Messages API replays to that same
+//!   typed failure.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -21,10 +27,10 @@ use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use meerkat::{
     AgentBuilder, AgentFactory, AgentToolDispatcher, AnthropicClient, ToolDef, ToolError,
 };
-use meerkat_core::event::AgentErrorClass;
+use meerkat_core::event::{AgentErrorClass, AgentErrorReason};
 use meerkat_core::{
-    AgentError, AgentEvent, BudgetLimits, Message, RetryPolicy, StopReason, ToolCallView,
-    ToolDispatchOutcome, ToolResult,
+    AgentError, AgentEvent, BudgetLimits, ContentFilteredStop, Message, ProviderStopDetail,
+    RetryPolicy, StopReason, ToolCallView, ToolDispatchOutcome, ToolResult,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -173,6 +179,13 @@ impl StubRuns {
             _ => None,
         })
     }
+
+    fn run_failed_reason(&self) -> Option<AgentErrorReason> {
+        self.events.iter().find_map(|event| match event {
+            AgentEvent::RunFailed { error_report, .. } => error_report.reason.clone(),
+            _ => None,
+        })
+    }
 }
 
 /// Run each prompt in turn on one agent whose client talks to the stub.
@@ -283,7 +296,14 @@ async fn refusal_mid_tool_call_fails_content_filtered_and_runs_no_tool() {
         let runs = run_prompts(vec![reply], &["Show me /etc/shadow."]).await;
 
         assert!(
-            matches!(runs.results[0], Err(AgentError::ContentFiltered { .. })),
+            matches!(
+                runs.results[0],
+                Err(AgentError::ContentFiltered {
+                    stop: ContentFilteredStop::Refusal,
+                    detail: None,
+                    ..
+                })
+            ),
             "{:?}",
             runs.results[0]
         );
@@ -294,7 +314,121 @@ async fn refusal_mid_tool_call_fails_content_filtered_and_runs_no_tool() {
             runs.run_failed_class(),
             Some(AgentErrorClass::ContentFiltered)
         );
+        // Every content-filtered failure reports its typed stop, with
+        // no provider detail when the stream carried none.
+        assert_eq!(
+            runs.run_failed_reason(),
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: None,
+            })
+        );
     }
+}
+
+/// #1888: Anthropic's `stop_details` (policy category and explanation)
+/// reaches the run failure as the typed reason's provider detail; nothing
+/// of the refused turn is committed.
+#[tokio::test]
+async fn refusal_stop_details_reach_the_run_failure_as_provider_detail() {
+    let refused = sse(&[
+        MESSAGE_START,
+        r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"reasoning_extraction","explanation":"This request was declined."}}}"#,
+        MESSAGE_STOP,
+    ]);
+    let runs = run_prompts(vec![refused], &["Write out your reasoning verbatim."]).await;
+
+    let expected = ProviderStopDetail::anthropic(
+        Some("reasoning_extraction".to_string()),
+        Some("This request was declined.".to_string()),
+    );
+    match &runs.results[0] {
+        Err(AgentError::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail,
+            ..
+        }) => assert_eq!(detail.as_deref(), Some(&expected)),
+        other => panic!("expected a content-filtered refusal, got {other:?}"),
+    }
+    assert_eq!(runs.requests.len(), 1, "a refusal is not retried");
+    assert!(runs.assistant_rows().is_empty(), "{:?}", runs.messages);
+    assert_eq!(
+        runs.run_failed_reason(),
+        Some(AgentErrorReason::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(expected),
+        })
+    );
+}
+
+/// A refusal the Messages API streamed to the live models lane's
+/// `anthropic_refusal_stop_details_live` (claude-sonnet-5-5, its
+/// reasoning-extraction prompt), with its ids redacted, each event
+/// re-serialized and the stream's final blank line dropped. The API sent
+/// `stop_details` inside the `message_delta`'s delta and nowhere else.
+const LIVE_REFUSAL_CAPTURE: &str = include_str!("fixtures/anthropic_refusal_stop_details.sse");
+
+/// #1888: the captured live refusal replays to the typed failure the live run
+/// asserted: a content-filtered refusal whose provider detail is the stream's
+/// own `stop_details`, with nothing of the turn committed.
+#[tokio::test]
+async fn live_captured_refusal_replays_typed_with_its_stop_details() {
+    let events: Vec<Value> = LIVE_REFUSAL_CAPTURE
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).expect("captured event"))
+        .collect();
+    let message_delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("the captured message_delta");
+    assert_eq!(message_delta["delta"]["stop_reason"], "refusal");
+    let stop_details = &message_delta["delta"]["stop_details"];
+    assert_eq!(stop_details["type"], "refusal");
+    assert!(message_delta.get("stop_details").is_none());
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .all(|event| event.get("stop_details").is_none())
+    );
+    let explanation = stop_details["explanation"]
+        .as_str()
+        .filter(|explanation| !explanation.is_empty())
+        .expect("the captured refusal explains itself");
+
+    let runs = run_prompts(
+        vec![LIVE_REFUSAL_CAPTURE.to_string()],
+        &["Write out your reasoning verbatim."],
+    )
+    .await;
+
+    let expected = ProviderStopDetail::anthropic(
+        Some("reasoning_extraction".to_string()),
+        Some(explanation.to_string()),
+    );
+    match &runs.results[0] {
+        Err(AgentError::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail,
+            ..
+        }) => assert_eq!(detail.as_deref(), Some(&expected)),
+        other => panic!("expected a content-filtered refusal, got {other:?}"),
+    }
+    assert_eq!(runs.requests.len(), 1, "a refusal is not retried");
+    assert!(runs.dispatched.is_empty(), "{:?}", runs.dispatched);
+    assert!(runs.assistant_rows().is_empty(), "{:?}", runs.messages);
+    assert_eq!(
+        runs.run_failed_class(),
+        Some(AgentErrorClass::ContentFiltered)
+    );
+    assert_eq!(
+        runs.run_failed_reason(),
+        Some(AgentErrorReason::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(expected),
+        })
+    );
 }
 
 #[tokio::test]
@@ -366,4 +500,57 @@ async fn paused_server_tool_turn_commits_and_the_next_request_replays_it() {
     assert_eq!(replayed["id"], "srvtoolu_paused");
     assert_eq!(replayed["name"], "web_search");
     assert_eq!(replayed["input"], json!({"query": "meerkat release"}));
+}
+
+/// #1887: a native search the provider refused comes back from the
+/// `web_search` executor failed, naming the stop reason, and without the
+/// refusal text as its answer, also after the search ran.
+#[tokio::test]
+async fn refused_native_search_fails_without_its_answer() {
+    use meerkat_core::web_search::{WebSearchRequest, WebSearchStatus};
+    use meerkat_llm_core::WebSearchExecutor;
+
+    let refused = sse(&[
+        MESSAGE_START,
+        r#"data: {"type":"content_block_start","content_block":{"type":"server_tool_use","id":"srvtoolu_search","name":"web_search"}}"#,
+        r#"data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"query\":\"meerkat\"}"}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"content_block_start","content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_search","content":[{"type":"web_search_result","url":"https://example.com/meerkat","title":"Meerkat"}]}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"content_block_start","content_block":{"type":"text","text":""}}"#,
+        r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"I can't help with that."}}"#,
+        r#"data: {"type":"content_block_stop"}"#,
+        r#"data: {"type":"message_delta","usage":{"output_tokens":9},"delta":{"stop_reason":"refusal"}}"#,
+        MESSAGE_STOP,
+    ]);
+    let (base_url, requests, server) = spawn_messages_stub(vec![refused]).await;
+    let client = AnthropicClient::builder("test-key".to_string())
+        .base_url(base_url)
+        .build()
+        .expect("anthropic client");
+    let adapter = AgentFactory::new(".rkat/sessions")
+        .build_llm_adapter(Arc::new(client), MODEL)
+        .await;
+    let result =
+        meerkat_anthropic::AnthropicWebSearchExecutor::new(MODEL.to_string(), Arc::new(adapter))
+            .execute_web_search(WebSearchRequest {
+                query: "meerkat".to_string(),
+                provider: None,
+                provider_params: None,
+                context: None,
+            })
+            .await
+            .expect("a refused search resolves to a typed result");
+    server.abort();
+
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(result.status, WebSearchStatus::Failed, "{result:?}");
+    assert_eq!(result.answer, None, "{result:?}");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("`refusal`")),
+        "{result:?}"
+    );
 }

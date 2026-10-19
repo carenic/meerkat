@@ -613,6 +613,7 @@ mod experimental_realtime_admission_tests {
         Ok(authorize_explicit_auth_binding_use(&request, &[grant]).into_result()?)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn target(model: &str, auth_binding: AuthBindingRef) -> TestResult<ResolvedRealtimeTarget> {
         let credential_identity = AuthCredentialIdentity::from_auth_binding(&auth_binding);
         let registry = ModelRegistry::from_config(&Config::default(), meerkat_models::canonical())?;
@@ -725,6 +726,7 @@ mod experimental_realtime_admission_tests {
         Ok(())
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn admission_rejects_foreign_authority_and_protocol_digest() -> TestResult<()> {
         let owner = authority("voice", "ab")?;
@@ -763,6 +765,7 @@ mod experimental_realtime_admission_tests {
         Ok(())
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn admission_rejects_binding_witness_mismatch() -> TestResult<()> {
         let owner = authority("voice", "ab")?;
@@ -783,6 +786,7 @@ mod experimental_realtime_admission_tests {
         Ok(())
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn admission_rejects_stable_and_nonrealtime_targets() -> TestResult<()> {
         for model in ["gpt-realtime-2", "gpt-5.3-codex"] {
@@ -809,6 +813,7 @@ mod experimental_realtime_admission_tests {
         Ok(())
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn admitted_carrier_retains_lower_authority_until_provider_consumes_it() -> TestResult<()> {
         let owner = authority("voice", "ab")?;

@@ -94,14 +94,18 @@ expect_red "stale inventory row" "${TEST_ROOT}/stale.log" \
 
 # RED: a row whose named test its build compiles out. meerkat-store's
 # release-corpus test sits in the sqlite module (cfg(feature = "sqlite"),
-# not a default feature); without the feature its row runs no test.
+# not a default feature); a row naming it without the feature runs no test.
+# The row replaces the corpus copy's byte-identity row for the same corpus.
 node - "$INVENTORY" "${TEST_ROOT}/compiled-out.json" <<'NODE'
 const fs = require("node:fs");
 const [from, to] = process.argv.slice(2);
 const doc = JSON.parse(fs.readFileSync(from, "utf8"));
 const rows = doc.paths["crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3"] ?? [];
-const row = rows.find((candidate) => candidate.package === "meerkat-store" && candidate.target === "lib");
-if (!row?.features?.includes("sqlite")) throw new Error("fixture: no meerkat-store lib row with the sqlite feature");
+const row = rows.find((candidate) => candidate.package === "meerkat-store" && candidate.target === "test:released_0810_corpus_copy");
+if (!row) throw new Error("fixture: no meerkat-store corpus copy row for the released corpus");
+row.target = "lib";
+row.tests = ["exact_released_0810_corpus_imports_and_fully_loads_current_session"];
+row.sources = ["crates/meerkat-store/src/sqlite_store.rs"];
 delete row.features;
 fs.writeFileSync(to, JSON.stringify(doc, null, 2));
 NODE

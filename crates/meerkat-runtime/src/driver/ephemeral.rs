@@ -197,6 +197,11 @@ pub struct EphemeralRuntimeDriver {
     /// admission (see `MeerkatMachine::wait_input_admitted_by_idempotency_key`)
     /// is woken by the admission itself rather than re-reading on a timer.
     admissions: Arc<crate::tokio::sync::watch::Sender<u64>>,
+    /// Bumped on every committed step of an admitted input's lifecycle (its
+    /// run association, a phase step or its terminal), so a waiter for an
+    /// input's next step (see `MeerkatMachine::cancel_input_if_present`) is
+    /// woken by the commit itself rather than re-reading on a timer.
+    input_transitions: Arc<crate::tokio::sync::watch::Sender<u64>>,
     /// Typed post-admission signal replacing boolean wake/process flags.
     ///
     /// Accumulates the strongest signal across all ingress effects since last
@@ -240,6 +245,115 @@ pub struct EphemeralRuntimeDriver {
     /// It names its run; a stale value fails the caller's active-run check.
     /// Passive data, never permission.
     staged_retained_work: StagedRetainedWork,
+    /// Order of the durable-class live-boundary Steer work of this session.
+    /// Shared with clones (rollback snapshots never restore it): it tracks
+    /// live ingress tasks, not runtime state.
+    durable_steer_order: Arc<DurableSteerOrder>,
+}
+
+/// Session-local order of durable-class live-boundary Steer deliveries.
+///
+/// Each boundary of a running run accepts one durable delivery, so durable
+/// Steer inputs prepare one at a time, oldest first in the steer lane. A
+/// durable Steer whose live-boundary work finds an older durable Steer still
+/// in the lane waits until that one's work settles, then reads the lane
+/// again: once the older one has joined the run it prepares for the next
+/// boundary, and if the older one went back to its follow-up turn it follows
+/// it there. The generated lanes stay the order authority; this only
+/// sequences the live ingress tasks and is never persisted.
+#[derive(Debug, Default)]
+pub(crate) struct DurableSteerOrder {
+    state: std::sync::Mutex<DurableSteerOrderState>,
+    settled: crate::tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct DurableSteerOrderState {
+    /// Durable Steer inputs whose live-boundary work is still running.
+    working: HashSet<InputId>,
+    /// The one of them preparing its boundary delivery, if any.
+    preparing: Option<InputId>,
+}
+
+/// What a durable Steer's live-boundary work does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableSteerTurn {
+    /// It is the oldest durable Steer in the steer lane and no other durable
+    /// delivery is preparing: prepare it for the next boundary.
+    Prepare,
+    /// An older durable Steer's work, or the previous delivery's, is still
+    /// running: wait for it to settle.
+    Wait,
+    /// An older durable Steer waits in the lane with no work running (it went
+    /// back to its follow-up turn): follow it there, in order.
+    FollowUp,
+}
+
+/// One durable Steer's membership in [`DurableSteerOrder`] for as long as its
+/// live-boundary work runs. Dropping it (on every return, error or
+/// cancellation) ends the work and its preparation and wakes the waiters.
+pub(crate) struct DurableSteerWork {
+    order: Arc<DurableSteerOrder>,
+    input_id: InputId,
+}
+
+impl DurableSteerOrder {
+    fn state(&self) -> std::sync::MutexGuard<'_, DurableSteerOrderState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Start `input_id`'s live-boundary work.
+    pub(crate) fn begin(self: &Arc<Self>, input_id: &InputId) -> DurableSteerWork {
+        self.state().working.insert(input_id.clone());
+        DurableSteerWork {
+            order: Arc::clone(self),
+            input_id: input_id.clone(),
+        }
+    }
+}
+
+impl DurableSteerWork {
+    /// Notified whenever some durable Steer's work in this work's own order
+    /// settles. A waiter waits here, not on whatever order its session's
+    /// driver holds now, so it waits on the order its blocker signals.
+    /// Enable the `Notified` before [`Self::turn`] reads the order, so a
+    /// settlement after the read still wakes the wait.
+    pub(crate) fn settled(&self) -> &crate::tokio::sync::Notify {
+        &self.order.settled
+    }
+
+    /// Decide this work's next step. `oldest` is the oldest durable Steer in
+    /// the steer lane, read under the session mutation gate with this input
+    /// still in the lane. `Prepare` makes this work the preparing one.
+    pub(crate) fn turn(&self, oldest: Option<&InputId>) -> DurableSteerTurn {
+        let mut state = self.order.state();
+        match oldest {
+            Some(oldest) if oldest == &self.input_id => match &state.preparing {
+                Some(preparing) if preparing != &self.input_id => DurableSteerTurn::Wait,
+                _ => {
+                    state.preparing = Some(self.input_id.clone());
+                    DurableSteerTurn::Prepare
+                }
+            },
+            Some(oldest) if state.working.contains(oldest) => DurableSteerTurn::Wait,
+            _ => DurableSteerTurn::FollowUp,
+        }
+    }
+}
+
+impl Drop for DurableSteerWork {
+    fn drop(&mut self) {
+        {
+            let mut state = self.order.state();
+            state.working.remove(&self.input_id);
+            if state.preparing.as_ref() == Some(&self.input_id) {
+                state.preparing = None;
+            }
+        }
+        self.order.settled.notify_waiters();
+    }
 }
 
 /// Wrapper around the DSL authority that provides `Debug` output.
@@ -338,6 +452,7 @@ impl EphemeralRuntimeDriver {
             ledger: InputLedger::new(),
             events: Vec::new(),
             admissions: Arc::new(crate::tokio::sync::watch::Sender::new(0)),
+            input_transitions: Arc::new(crate::tokio::sync::watch::Sender::new(0)),
             post_admission_signal: PostAdmissionSignal::None,
             dsl: DslAuthority(dsl),
             run_start_window: crate::run_progress::SharedRunStartWindowCell::default(),
@@ -352,7 +467,13 @@ impl EphemeralRuntimeDriver {
             admission_order: HashSet::new(),
             live_boundary_join_witnesses: HashMap::new(),
             staged_retained_work: StagedRetainedWork::default(),
+            durable_steer_order: Arc::new(DurableSteerOrder::default()),
         }
+    }
+
+    /// The session's durable live-boundary Steer order (shell coordination).
+    pub(crate) fn durable_steer_order(&self) -> Arc<DurableSteerOrder> {
+        Arc::clone(&self.durable_steer_order)
     }
 
     pub(crate) fn set_work_authorization_host(
@@ -1293,7 +1414,21 @@ impl EphemeralRuntimeDriver {
     /// the DSL decided (WakeLoop / InterruptYielding / RequestImmediateProcessing)
     /// so the runtime loop's `take_post_admission_signal` / `take_wake_requested`
     /// observe exactly what the machine authorized.
+    ///
+    /// Every input-lifecycle input this driver commits either applies through
+    /// `dsl_apply` or hands its effects here (admission and run failure
+    /// through `absorb_post_admission_effects`, the terminal archive), which
+    /// makes this the single commit point of the input lifecycle: a
+    /// transition that associates an input with a run, steps its phase or
+    /// records its terminal emits one of the lifecycle effects below, and
+    /// waiters for an input's next step are told once per such commit. Some
+    /// transitions (comms and handle inputs, for example) apply on the shared
+    /// authority without passing here. An input-lifecycle input applied that
+    /// way would skip the step signal, and each waiter would then sit out its
+    /// settle bound before it reads the input again: keep every such input on
+    /// this path.
     fn absorb_dsl_effects(&mut self, effects: &[mm_dsl::MeerkatMachineEffect]) {
+        let mut input_transition = false;
         for effect in effects {
             if let mm_dsl::MeerkatMachineEffect::PostAdmissionSignal { signal } = effect {
                 let new_signal = match signal {
@@ -1309,7 +1444,52 @@ impl EphemeralRuntimeDriver {
                     self.post_admission_signal = new_signal;
                 }
             }
+            input_transition |= matches!(
+                effect,
+                mm_dsl::MeerkatMachineEffect::RecordRunAssociation
+                    | mm_dsl::MeerkatMachineEffect::InputLifecycleNotice
+                    | mm_dsl::MeerkatMachineEffect::RecordTerminalOutcome
+            );
         }
+        if input_transition {
+            self.publish_input_transition();
+        }
+    }
+
+    /// Tell the waiters subscribed through
+    /// [`Self::subscribe_input_transitions`] that an input lifecycle step
+    /// committed.
+    fn publish_input_transition(&self) {
+        self.input_transitions
+            .send_modify(|transitions| *transitions = transitions.wrapping_add(1));
+    }
+
+    /// Subscribe to committed input lifecycle steps. Subscribe while holding
+    /// the driver before reading an input, so a step committed after the read
+    /// is a change on this receiver.
+    pub(crate) fn subscribe_input_transitions(&self) -> crate::tokio::sync::watch::Receiver<u64> {
+        self.input_transitions.subscribe()
+    }
+
+    /// Step a queued input to `AppliedPendingConsumption` with no run
+    /// association: an input caught between steps, neither queued nor
+    /// terminal, with no run to cancel.
+    #[cfg(test)]
+    pub(crate) fn apply_without_run_for_test(
+        &mut self,
+        input_id: &InputId,
+    ) -> Result<(), RuntimeDriverError> {
+        let key = Self::dsl_key(input_id);
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkApplied {
+                input_id: key.clone(),
+            },
+            "MarkApplied(test)",
+        )?;
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::MarkAppliedPendingConsumption { input_id: key },
+            "MarkAppliedPendingConsumption(test)",
+        )
     }
 
     pub(crate) fn absorb_post_admission_effects(
@@ -1455,15 +1635,30 @@ impl EphemeralRuntimeDriver {
             let mut authority = self.dsl.lock();
             let mut commit = || {
                 if let Some(input) = input.take() {
-                    applied = Some(mm_dsl::MeerkatMachineMutator::apply(&mut *authority, input));
+                    // The bound generation, read under the authority the
+                    // transition is decided under.
+                    let bound = authority.state().scoped_context_generation;
+                    applied = Some((
+                        bound,
+                        mm_dsl::MeerkatMachineMutator::apply(&mut *authority, input),
+                    ));
                 }
             };
             within(&mut commit)
         };
         match (applied, decided) {
-            (Some(applied), _) => {
+            (Some((bound, applied)), _) => {
                 let transition = applied.map_err(|err| {
-                    RuntimeDriverError::Internal(format!("DSL rejected BindScopedContext: {err:?}"))
+                    if generation <= bound {
+                        RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                            bound,
+                            requested: generation,
+                        }
+                    } else {
+                        RuntimeDriverError::Internal(format!(
+                            "DSL rejected BindScopedContext: {err:?}"
+                        ))
+                    }
                 })?;
                 self.absorb_dsl_effects(transition.effects());
                 Ok(())
@@ -5849,6 +6044,7 @@ mod tests {
             content: "peer body".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -5890,6 +6086,45 @@ mod tests {
         driver.with_dsl_state(|state| {
             assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
             assert_eq!(state.scoped_context_generation, 1);
+        });
+    }
+
+    /// A bind whose generation does not advance past the bound one is refused
+    /// with the typed answer naming both generations, and changes nothing.
+    #[test]
+    fn a_bind_that_does_not_advance_the_generation_is_refused_with_its_type() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("scoped-binding-generation"));
+        driver
+            .bind_scoped_context_within("binding-1".into(), "scope".into(), 3, |commit| {
+                commit();
+                Ok(())
+            })
+            .expect("the first binding commits");
+        for requested in [3, 2] {
+            let refused = driver.bind_scoped_context_within(
+                "binding-2".into(),
+                "scope".into(),
+                requested,
+                |commit| {
+                    commit();
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    refused,
+                    Err(RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                        bound: 3,
+                        requested: answered,
+                    }) if answered == requested
+                ),
+                "generation {requested} is refused with its type, got {refused:?}"
+            );
+        }
+        driver.with_dsl_state(|state| {
+            assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
+            assert_eq!(state.scoped_context_generation, 3);
         });
     }
 
@@ -5945,6 +6180,7 @@ mod tests {
             content: format!("progress {label}").into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -7150,6 +7386,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Text(String::new()),
             payload: Some(serde_json::json!({"ok": false})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let outcome = driver.accept_input(input).await.unwrap();
@@ -7202,6 +7439,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Text(String::new()),
             payload: Some(serde_json::json!({"ok": false})),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 

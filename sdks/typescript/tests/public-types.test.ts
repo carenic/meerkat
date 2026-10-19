@@ -128,6 +128,9 @@ import type {
   WireLiveAdapterObservation,
   WireLiveAdapterObservationAssistantAudioChunk,
   WireLiveAdapterObservationCommandRejected,
+  WireLiveAdapterObservationTurnFailed,
+  WireLiveResponseFailure,
+  WireLiveResponseFailureStatus,
   WireLiveAdapterObservationUserContentCommitted,
   WireLiveConfigRejectionReason,
   WireMemberHistoryPageBody,
@@ -1592,6 +1595,27 @@ function readRejectionCode(
   return rejected.code;
 }
 
+// #1883: a response that ended without completing narrows to its own
+// variant; the channel stays open.
+function readFailedResponseId(obs: WireLiveAdapterObservation): string | null {
+  if (obs.observation !== "turn_failed") return null;
+  const failed: WireLiveAdapterObservationTurnFailed = obs;
+  return failed.response_id ?? null;
+}
+
+// #1883: the failure is typed by name, so a client routes on its status; an
+// unrecognized status arrives as `unknown.debug`.
+function readFailureStatus(obs: WireLiveAdapterObservation): string | null {
+  if (obs.observation !== "turn_failed") return null;
+  const failure: WireLiveResponseFailure = obs.failure;
+  const status: WireLiveResponseFailureStatus = failure.status;
+  if (typeof status === "string") {
+    const known: "failed" | "incomplete" | "in_progress" = status;
+    return known;
+  }
+  return status.unknown.debug;
+}
+
 function readCommittedImageIdentity(
   obs: WireLiveAdapterObservation,
 ): { idempotencyKey: string; itemId: string; contentIndex: number; mediaType: string } | null {
@@ -1620,6 +1644,8 @@ void liveObsUserContentCommitted;
 void liveObsUntyped;
 void readAudioIdentity;
 void readRejectionCode;
+void readFailedResponseId;
+void readFailureStatus;
 void readCommittedImageIdentity;
 
 // The root transcript alias is the public-safe wire union. Its variants can

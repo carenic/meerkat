@@ -61,6 +61,7 @@ async fn required_mcp_confinement_never_falls_back_to_an_unconfined_child() {
     assert!(!root.join("entered").exists());
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn required_mcp_staged_refusal_is_a_failed_notice_not_a_stuck_pending_surface() {
     let temp = tempfile::tempdir().unwrap();
@@ -146,6 +147,7 @@ impl McpAuthResolver for CountingResolver {
 /// trust) fails at its boundary with its typed refusal and the model's
 /// failed-add notice: a remote server is never authorized or connected
 /// (zero credential reads, zero arrivals) and a local one never spawns.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_refused_add_fails_typed_before_resolution_connection_or_spawn() {
     let temp = tempfile::tempdir().unwrap();
@@ -231,6 +233,7 @@ mod supported_native {
         server: PathBuf,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
@@ -296,6 +299,7 @@ exec "$SERVER"
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -370,6 +374,7 @@ exec "$SERVER"
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -407,6 +412,7 @@ exec "$SERVER"
         connection.close().await.unwrap();
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -461,6 +467,7 @@ done
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -552,6 +559,7 @@ done
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -608,6 +616,7 @@ done
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -656,6 +665,7 @@ done
     /// A confined server's stderr is a fresh pipe its custody drains into
     /// the attempt's own record: the failure is classified, the tail holds
     /// the server's output, and the returned error never carries it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",

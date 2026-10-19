@@ -14,21 +14,25 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use meerkat::{
     AttemptClaim, CanonicalArgumentsHash, DeliveryRoute, DetachedJobService, InteractionLineageId,
     JobDeliveryApplication, JobDeliveryApplyError, JobDeliveryKind, JobDeliverySink, JobResultRef,
-    JobSpec, JobSubmissionKey, JobSubscription, JobSubscriptionId, MemoryDetachedJobStore,
-    RestartClass, RunnerHandleRef, RunnerIdentity, RuntimeDeliveryHost, RuntimeDeliveryOwner,
-    RuntimeDeliveryPass, SessionId, ToolIdentity, WorkerId,
+    JobSpec, JobSubmissionKey, JobSubscription, JobSubscriptionId, MemoryBlobStore,
+    MemoryDetachedJobStore, MemoryStore, PersistenceBundle, RestartClass, RunnerHandleRef,
+    RunnerIdentity, RuntimeDeliveryHost, RuntimeDeliveryOwner, RuntimeDeliveryPass, SessionId,
+    ToolIdentity, WorkerId,
 };
+use meerkat_core::config::HostingMode;
 use meerkat_runtime::{
     HostingCapability, HostingClaim, HostingOwner, HostingPaths, HostingRefused,
-    RuntimeDeliveryInbox, SessionHostingAuthority, SessionServing, SqliteRuntimeStore,
+    InMemoryRuntimeStore, RuntimeDeliveryInbox, SessionHostingAuthority, SessionServing,
+    SqliteRuntimeStore,
 };
+use meerkat_sqlite::watch::test_support::{HeldRegistrations, hold_registrations_in};
 use tokio::sync::{Mutex, watch};
 
 /// Hang guard for awaited typed events; never a pacing mechanism.
@@ -59,6 +63,7 @@ struct Shared {
     _dir: tempfile::TempDir,
     paths: HostingPaths,
     capability: HostingCapability,
+    store: Arc<SqliteRuntimeStore>,
     inbox: RuntimeDeliveryInbox,
 }
 
@@ -80,7 +85,8 @@ fn shared_store() -> Shared {
         _dir: dir,
         paths,
         capability,
-        inbox: RuntimeDeliveryInbox::new(store),
+        inbox: RuntimeDeliveryInbox::new(store.clone()),
+        store,
     }
 }
 
@@ -361,4 +367,209 @@ async fn a_lock_unavailable_after_startup_hosts_and_delivers_nothing_unclaimed()
     )
     .await;
     assert_eq!(sink.applied.lock().await.as_slice(), &[cold_session]);
+}
+
+/// The bound on arming, a hosting check or a retirement that must not wait
+/// for a held notification registration. The hold itself lasts until the
+/// test releases it.
+const HELD_BOUND: Duration = Duration::from_secs(5);
+
+/// The directory of the shared store's database: the one its store watches
+/// register for file notifications.
+fn store_directory(shared: &Shared) -> PathBuf {
+    shared
+        .capability
+        .paths()
+        .and_then(|paths| paths.database.as_deref())
+        .and_then(Path::parent)
+        .expect("the shared store names its database")
+        .to_path_buf()
+}
+
+/// Hold the file notification registration of every watch started on the
+/// shared store from now on, as a stalled macOS FSEvents registration holds
+/// it, until the hold is released or dropped.
+fn hold_store_registrations(shared: &Shared) -> HeldRegistrations {
+    hold_registrations_in(&store_directory(shared)).expect("hold the store's registrations")
+}
+
+/// The registrations this process keeps for watches on `directory` that
+/// are gone.
+fn retained_in(directory: &Path) -> usize {
+    meerkat_sqlite::watch::retained_registrations()
+        .iter()
+        .filter(|retained| retained.directory == directory)
+        .count()
+}
+
+/// A held notification registration does not hold the multi-process hosting
+/// check: `require_hosting_mode(Multiprocess)` needs only the store watch's
+/// sweep, and returns while the registration is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_registration_does_not_hold_the_multiprocess_hosting_check() {
+    let shared = shared_store();
+    let held = hold_store_registrations(&shared);
+    let bundle = PersistenceBundle::new(
+        Arc::new(MemoryStore::new()),
+        shared.store.clone(),
+        Arc::new(MemoryBlobStore::new()),
+    )
+    .expect("bundle");
+    // A check that waited for the registration would block its thread until
+    // the hold ends, which the unwind of a failed assertion does. The check
+    // drops its watch at once, so the registration is cancelled before or
+    // while the hold holds it; neither keeps the check waiting.
+    let checked = tokio::time::timeout(
+        HELD_BOUND,
+        tokio::task::spawn_blocking(move || bundle.require_hosting_mode(HostingMode::Multiprocess)),
+    )
+    .await
+    .expect("the hosting check does not wait for the held notification registration")
+    .expect("the hosting check returns");
+    assert!(checked.is_ok(), "{checked:?}");
+    held.release();
+}
+
+/// A held notification registration holds neither the arming of a delivery
+/// owner on a shared store nor its cross-process wake: arming returns while
+/// the registration is held, and the store watch's sweep alone hands a dead
+/// peer's recipient to the cold owner, which delivers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_registration_holds_neither_arming_nor_the_store_sweep() {
+    let shared = shared_store();
+    let held = hold_store_registrations(&shared);
+    let peer_session = SessionId::new();
+    let peer_claim = peer_lock(&meerkat_core::session_hosting::session_hosting_lock_path(
+        &shared.paths.hosting_lock_dir,
+        &peer_session,
+    ));
+    let job_store = completed_job_for(&peer_session, "held-registration").await;
+
+    let sink = Arc::new(RecordingSink::default());
+    let owner =
+        RuntimeDeliveryOwner::new(job_store, shared.inbox.clone()).with_store_sweep(TEST_SWEEP);
+    let host = Arc::new(ClaimHost::new(&shared.capability, sink.clone()));
+    // Arming that waited for the registration would block its thread until
+    // the hold ends, which the unwind of a failed assertion does.
+    let handle = tokio::time::timeout(
+        HELD_BOUND,
+        tokio::task::spawn_blocking(move || owner.arm(host)),
+    )
+    .await
+    .expect("arming does not wait for the held notification registration")
+    .expect("arming returns")
+    .expect("arm owner");
+    assert!(
+        held.wait_entered(1, HELD_BOUND),
+        "the store watch's registration reached its platform call"
+    );
+    let mut passes = handle.subscribe_passes();
+    let first = wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    assert!(first.cross_process_wake_unavailable.is_none(), "{first:?}");
+    assert_eq!(first.awaiting_other_hosts, 1, "{first:?}");
+
+    // While the registration is held no notification can arrive: the sweep
+    // alone notices the peer's death.
+    drop(peer_claim);
+    wait_for_pass(
+        &mut passes,
+        "cold delivery after the peer's death",
+        |pass| pass.applied >= 1,
+    )
+    .await;
+    assert_eq!(sink.applied.lock().await.as_slice(), &[peer_session]);
+    held.release();
+}
+
+/// Retiring an owner whose store watch's notification registration is held
+/// reports that registration, typed, with the directory the process listing
+/// names. The retirement does not wait for it: the process keeps its thread
+/// until the platform call returns, then joins it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_an_owner_reports_its_held_notification_registration() {
+    let shared = shared_store();
+    let directory = store_directory(&shared)
+        .canonicalize()
+        .expect("canonical store directory");
+    let held = hold_store_registrations(&shared);
+    let handle = RuntimeDeliveryOwner::new(
+        Arc::new(MemoryDetachedJobStore::new()),
+        shared.inbox.clone(),
+    )
+    .with_store_sweep(TEST_SWEEP)
+    .arm(Arc::new(ClaimHost::new(
+        &shared.capability,
+        Arc::new(RecordingSink::default()),
+    )))
+    .expect("arm owner");
+    assert!(
+        held.wait_entered(1, HELD_BOUND),
+        "the store watch's registration reached its platform call"
+    );
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+
+    let retired = handle
+        .retire()
+        .join(HELD_BOUND)
+        .await
+        .expect("the owner stops without waiting for the registration");
+    let retained = retired
+        .notification_registration_retained
+        .expect("the held registration is reported");
+    assert_eq!(retained.directory, directory);
+    assert_eq!(
+        retained_in(&directory),
+        1,
+        "the process keeps the registration's thread"
+    );
+    assert_eq!(held.live_sources(), 1);
+
+    held.release();
+    let deadline = std::time::Instant::now() + HELD_BOUND;
+    while retained_in(&directory) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        retained_in(&directory),
+        0,
+        "the process joins the thread once the platform call returns"
+    );
+    assert_eq!(
+        (held.live_sources(), held.dropped_sources()),
+        (0, 1),
+        "the cancelled registration discarded its source"
+    );
+}
+
+/// An owner of a store without cross-process hosting runs no store watch,
+/// and its retirement reports no registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_an_owner_of_an_unshared_store_reports_no_registration() {
+    let inbox = RuntimeDeliveryInbox::new(Arc::new(InMemoryRuntimeStore::new()));
+    let capability = inbox.hosting_capability();
+    assert!(!capability.is_cross_process());
+    let handle = RuntimeDeliveryOwner::new(Arc::new(MemoryDetachedJobStore::new()), inbox)
+        .arm(Arc::new(ClaimHost::new(
+            &capability,
+            Arc::new(RecordingSink::default()),
+        )))
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    let retired = handle
+        .retire()
+        .join(HELD_BOUND)
+        .await
+        .expect("the owner stops");
+    assert_eq!(retired.notification_registration_retained, None);
 }

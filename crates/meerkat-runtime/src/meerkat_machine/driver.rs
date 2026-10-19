@@ -822,6 +822,10 @@ impl IngressView<'_> {
         self.driver.steer_lane()
     }
 
+    pub(crate) fn durable_steer_order(&self) -> Arc<crate::driver::ephemeral::DurableSteerOrder> {
+        self.driver.durable_steer_order()
+    }
+
     pub(crate) fn admission_order(&self) -> Vec<InputId> {
         self.driver.admission_order()
     }
@@ -980,6 +984,20 @@ pub(crate) struct PreparedDestroy {
 }
 
 impl DriverEntry {
+    /// How long a runtime loop over this driver waits for its boundary
+    /// commits and run terminalizations: the store's declared commit outcome
+    /// deadline, with the session durability health a missed deadline
+    /// degrades. `None` for an ephemeral driver, a persistent driver without
+    /// durability health, or a store whose commits cannot stall.
+    pub(crate) fn runtime_loop_commit_deadline(
+        &self,
+    ) -> Option<crate::runtime_loop::RuntimeLoopCommitDeadline> {
+        match self {
+            DriverEntry::Ephemeral(_) => None,
+            DriverEntry::Persistent(driver) => driver.runtime_loop_commit_deadline(),
+        }
+    }
+
     fn shell_driver_mut(&mut self) -> &mut EphemeralRuntimeDriver {
         match self {
             DriverEntry::Ephemeral(driver) => driver,
@@ -4434,6 +4452,42 @@ impl DriverEntry {
         match self {
             DriverEntry::Ephemeral(d) => d.subscribe_admissions(),
             DriverEntry::Persistent(d) => d.inner_ref().subscribe_admissions(),
+        }
+    }
+
+    /// Committed input lifecycle steps of this driver; see
+    /// [`EphemeralRuntimeDriver::subscribe_input_transitions`]. A persistent
+    /// driver commits every input step through its inner driver.
+    pub(crate) fn subscribe_input_transitions(&self) -> crate::tokio::sync::watch::Receiver<u64> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.subscribe_input_transitions(),
+            DriverEntry::Persistent(d) => d.inner_ref().subscribe_input_transitions(),
+        }
+    }
+
+    /// See [`EphemeralRuntimeDriver::apply_without_run_for_test`].
+    #[cfg(test)]
+    pub(crate) fn apply_without_run_for_test(
+        &mut self,
+        input_id: &InputId,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.apply_without_run_for_test(input_id),
+            DriverEntry::Persistent(d) => d.inner_mut().apply_without_run_for_test(input_id),
+        }
+    }
+
+    /// Consume inputs at `AppliedPendingConsumption` through the generated
+    /// lifecycle, as a completed run's boundary does.
+    #[cfg(test)]
+    pub(crate) fn consume_inputs_for_test(
+        &mut self,
+        input_ids: &[InputId],
+        run_id: &RunId,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.consume_inputs(input_ids, run_id),
+            DriverEntry::Persistent(d) => d.inner_mut().consume_inputs(input_ids, run_id),
         }
     }
 

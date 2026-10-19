@@ -451,9 +451,18 @@ When `session-compaction` is enabled:
   OR the measured request budget for the boundary (hydrated messages + exact
   visible tool definitions + effective output reserve) crosses the threshold on
   its input side
-- **Guards**: Never on first turn. Ordinary compactions wait at least 3 turns;
-  a live history-token or exact provider-byte capacity crossing bypasses that
-  cost guard so an already-oversized request can recover immediately. A
+- **Guards**: Never at the session's first pre-LLM boundary. An ordinary
+  compaction waits at least `min_turns_between_compactions` (default 3)
+  pre-LLM boundaries after the last compaction or failed compaction attempt.
+  Every LLM call is a boundary, including each call of a tool loop, so several
+  can fall in one turn, and the session keeps the count across runs. A live
+  history-token or exact provider-byte capacity crossing bypasses that cost
+  guard so an already-oversized request can recover immediately. A
+  history-token crossing bypasses it only while the last rewrite got the
+  history under the threshold, or when the request no longer fits the model
+  window and the history added since that rewrite covers the overage: when
+  the rows a rewrite keeps cross the threshold on their own, compacting again
+  cannot recover it, and it waits for the cadence. A
   request-budget crossing does not bypass it: tool definitions and the output
   reserve survive compaction, so a crossing they cause is a cost decision, not a
   recovery one.

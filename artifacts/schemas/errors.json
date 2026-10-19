@@ -150,6 +150,11 @@
         "const": "STALE_DELIVERY_SCOPE",
         "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
         "type": "string"
+      },
+      {
+        "const": "FORK_INSTRUCTION_REFUSED",
+        "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
+        "type": "string"
       }
     ],
     "title": "ErrorCode"
@@ -306,6 +311,11 @@
           {
             "const": "STALE_DELIVERY_SCOPE",
             "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
             "type": "string"
           }
         ]

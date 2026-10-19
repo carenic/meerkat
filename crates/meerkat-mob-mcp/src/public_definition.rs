@@ -115,12 +115,38 @@ fn decode_resume_override_field(
 /// Decode the canonical public profile input into the internal profile.
 ///
 /// Host-only fields (`mcp_servers`, `rust_bundles`) have no public input and
-/// stay empty.
+/// stay empty. A standalone profile (a realm profile write, a spawn-time
+/// profile) cannot opt into tool bundles: the opt-in belongs to an inline
+/// profile of a child mob's own definition, so a `tools.bundles` entry is
+/// refused.
 pub fn decode_public_profile(input: MobProfileInput) -> Result<Profile, String> {
+    if let Some(bundle) = input.tools.bundles.first() {
+        return Err(format!(
+            "tools.bundles names tool bundle '{bundle}', but only an inline profile of a child mob's \
+             own definition may opt into tool bundles"
+        ));
+    }
     decode_profile(input)
 }
 
+/// The `tools.bundles` opt-in, refused when a name is empty or repeated.
+/// Whether each name is offered is decided at the create, which knows what
+/// the host offers to it.
+fn decode_tool_bundles(bundles: Vec<String>) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for bundle in &bundles {
+        if bundle.trim().is_empty() {
+            return Err("tools.bundles names an empty tool bundle".to_string());
+        }
+        if !seen.insert(bundle.as_str()) {
+            return Err(format!("tools.bundles names tool bundle '{bundle}' twice"));
+        }
+    }
+    Ok(bundles)
+}
+
 fn decode_profile(input: MobProfileInput) -> Result<Profile, String> {
+    let bundles = decode_tool_bundles(input.tools.bundles)?;
     Ok(Profile {
         model_fallback: input.model_fallback,
         model: input.model,
@@ -148,6 +174,7 @@ fn decode_profile(input: MobProfileInput) -> Result<Profile, String> {
             mcp: input.tools.mcp,
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
+            bundles,
         },
         peer_description: input.peer_description,
         external_addressable: input.external_addressable,
@@ -575,5 +602,74 @@ mod tests {
             ),
             "an authored advisory frame node must decode as Continue: {root_node:?}"
         );
+    }
+
+    fn profile_input(tools: serde_json::Value) -> MobProfileInput {
+        serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "tools": tools
+        }))
+        .expect("profile input")
+    }
+
+    /// A child mob's inline profile carries its opt-in into the definition,
+    /// where it persists.
+    #[test]
+    fn decode_public_mob_definition_keeps_the_bundle_opt_in() {
+        let input: MobDefinitionInput = serde_json::from_value(serde_json::json!({
+            "id": "opting",
+            "profiles": {
+                "worker": {
+                    "model": "claude-sonnet-4-6",
+                    "tools": { "comms": true, "bundles": ["announcements"] }
+                }
+            }
+        }))
+        .expect("definition input");
+        let definition = decode_public_mob_definition(input).expect("an opt-in decodes");
+        let profile = definition
+            .profiles
+            .get(&ProfileName::from("worker"))
+            .and_then(ProfileBinding::as_inline)
+            .expect("inline profile");
+        assert_eq!(profile.tools.bundles, vec!["announcements".to_string()]);
+        assert!(profile.tools.rust_bundles.is_empty());
+    }
+
+    /// The opt-in belongs to a child mob's own definition: a realm profile
+    /// write or a spawn-time profile cannot carry one.
+    #[test]
+    fn decode_public_profile_refuses_a_bundle_opt_in() {
+        let error = decode_public_profile(profile_input(serde_json::json!({
+            "comms": true,
+            "bundles": ["announcements"]
+        })))
+        .expect_err("a standalone profile cannot opt in");
+        assert!(
+            error.contains("announcements") && error.contains("child mob"),
+            "{error}"
+        );
+    }
+
+    /// An empty or a repeated bundle name is an argument error.
+    #[test]
+    fn decode_refuses_an_empty_or_repeated_bundle_name() {
+        for (bundles, expected) in [
+            (serde_json::json!([""]), "empty"),
+            (serde_json::json!(["a", "a"]), "twice"),
+        ] {
+            let input: MobDefinitionInput = serde_json::from_value(serde_json::json!({
+                "id": "opting",
+                "profiles": {
+                    "worker": {
+                        "model": "claude-sonnet-4-6",
+                        "tools": { "comms": true, "bundles": bundles }
+                    }
+                }
+            }))
+            .expect("definition input");
+            let error = decode_public_mob_definition(input).expect_err("a malformed opt-in");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }

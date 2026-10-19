@@ -128,8 +128,8 @@ where
         stream,
         TransportCodec::new(crate::transport::MAX_PAYLOAD_SIZE),
     );
-    let envelope = match framed.next().await {
-        Some(Ok(frame)) => frame.envelope,
+    let frame = match framed.next().await {
+        Some(Ok(frame)) => frame,
         Some(Err(err)) => return Err(IoTaskError::Io(err)),
         None => {
             return Err(IoTaskError::Io(std::io::Error::new(
@@ -139,17 +139,19 @@ where
         }
     };
 
-    // Verify signature (when peer auth is enabled).
+    // Verify signature (when peer auth is enabled), over the frame as
+    // received: a signed field this build does not know is still covered.
     //
     // A rejected envelope is a *failed* admission, not successful handling.
     // Return a typed auth/address fault (mirroring the `IngressDropped` arm
     // below) so the listener's `Err -> warn` arm records the rejection fact
     // rather than treating the silent `Ok(())` as a clean connection.
-    if require_peer_auth && !envelope.verify() {
+    if require_peer_auth && !frame.verify_signature() {
         return Err(IoTaskError::InvalidSignature {
-            envelope_id: envelope.id,
+            envelope_id: frame.envelope.id,
         });
     }
+    let envelope = frame.envelope;
 
     // Verify the envelope is addressed to a resolvable local identity. One
     // typed error covers both "never registered" and "registered then
@@ -351,6 +353,7 @@ mod tests {
         Arc::new(RwLock::new(store))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_for_trust(
         trusted: &Arc<RwLock<TrustStore>>,
         require_peer_auth: bool,
@@ -361,6 +364,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_for_trust_with_runtime(
         trusted: &Arc<RwLock<TrustStore>>,
         require_peer_auth: bool,
@@ -382,6 +386,7 @@ mod tests {
         (inbox, sender, finalizer)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_finalize_next_runtime(
         inbox: Arc<Inbox>,
         finalizer: meerkat_runtime::TestPeerIngressRuntimeFinalizer,
@@ -498,6 +503,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -520,6 +526,7 @@ mod tests {
         assert_eq!(received.id, envelope_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_verifies_signature() {
         let sender_keypair = make_keypair();
@@ -538,6 +545,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -570,6 +578,7 @@ mod tests {
 
     /// ROW #300 gate: an envelope addressed to a different recipient is rejected
     /// with a typed `Misaddressed` fault, not silently swallowed as `Ok(())`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_misaddressed_returns_typed_fault() {
         let sender_keypair = make_keypair();
@@ -588,6 +597,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -611,6 +621,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_checks_trust() {
         let sender_keypair = make_keypair();
@@ -629,6 +640,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -651,6 +663,67 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn test_io_task_admits_a_signed_field_this_build_does_not_know() {
+        use crate::transport::codec::test_frames::{frame_bytes, message_kind, signed_map, text};
+
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&sender_keypair.public_key());
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
+        let kind = message_kind(vec![(text("future_field"), text("kept"))]);
+        let (expected_id, entries) = signed_map(
+            &sender_keypair,
+            &receiver_keypair.public_key(),
+            kind.clone(),
+            kind,
+        );
+        let bytes = frame_bytes(entries);
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        handle_connection(server, true, &receiver_keypair, &inbox_sender)
+            .await
+            .expect("a newer sender's optional signed field is admitted");
+        let ack = read_one_envelope(&mut client_read).await.unwrap();
+        assert!(matches!(ack.kind, MessageKind::Ack { in_reply_to } if in_reply_to == expected_id));
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_io_task_refuses_a_signed_field_altered_after_signing() {
+        use crate::transport::codec::test_frames::{frame_bytes, message_kind, signed_map, text};
+
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&sender_keypair.public_key());
+        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (_, entries) = signed_map(
+            &sender_keypair,
+            &receiver_keypair.public_key(),
+            message_kind(vec![(text("future_field"), text("kept"))]),
+            message_kind(vec![(text("future_field"), text("altered"))]),
+        );
+        let bytes = frame_bytes(entries);
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        let result = handle_connection(server, true, &receiver_keypair, &inbox_sender).await;
+        assert!(matches!(result, Err(IoTaskError::InvalidSignature { .. })));
+    }
+
     #[tokio::test]
     async fn test_io_task_accepts_invalid_signature_when_auth_disabled() {
         let sender_keypair = make_keypair();
@@ -670,6 +743,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -697,6 +771,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_accepts_untrusted_sender_when_auth_disabled() {
         let sender_keypair = make_keypair();
@@ -716,6 +791,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -742,6 +818,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_sends_ack() {
         let sender_keypair = make_keypair();
@@ -760,6 +837,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -793,6 +871,7 @@ mod tests {
         assert!(ack.verify());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_enqueues_to_inbox() {
         let sender_keypair = make_keypair();
@@ -811,6 +890,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -834,6 +914,7 @@ mod tests {
         assert_eq!(candidate.interaction.id.0, envelope_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_message() {
         let sender_keypair = make_keypair();
@@ -852,6 +933,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -879,6 +961,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_multimodal_message() {
         let sender_keypair = make_keypair();
@@ -900,6 +983,7 @@ mod tests {
                 }]),
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -926,6 +1010,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_for_request() {
         let sender_keypair = make_keypair();
@@ -973,6 +1058,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn incarnation_fenced_durable_rejection_closes_without_success_ack() {
         let sender_keypair = make_keypair();
@@ -1036,6 +1122,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tcp_handler_threads_observed_source_into_reply_endpoint_classification() {
         let sender_keypair = make_keypair();
@@ -1080,6 +1167,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_no_ack_for_ack() {
         let sender_keypair = make_keypair();
@@ -1112,6 +1200,7 @@ mod tests {
         assert!(result.is_err(), "Should not receive ack for Ack message");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_response_preserves_legacy_queued_no_ack_semantics() {
         let sender_keypair = make_keypair();
@@ -1162,6 +1251,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn supervisor_bridge_request_acknowledges_exact_volatile_handoff() {
         let sender_keypair = make_keypair();
@@ -1230,6 +1320,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_drop_invalid_signature() {
         let sender_keypair = make_keypair();
@@ -1248,6 +1339,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid
         };
@@ -1279,6 +1371,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_drop_untrusted_sender() {
         let sender_keypair = make_keypair();
@@ -1296,6 +1389,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1322,6 +1416,7 @@ mod tests {
         assert!(items.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_ack_waits_for_final_admission_outcome() {
         // DOGMA-12 defensive scan: if admission rejects the ingress item,
@@ -1341,6 +1436,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1367,6 +1463,7 @@ mod tests {
     /// peer added to the router *after* the connection is accepted is
     /// still admitted. This locks in the Wave 3 D Row 20 invariant: one
     /// trust authority, one read path, no snapshot divergence.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_io_task_reads_live_trust_after_listener_spawn() {
         let sender_keypair = make_keypair();
@@ -1389,6 +1486,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -1453,6 +1551,7 @@ mod tests {
     /// §11 demux row: an envelope addressed to member B lands in B's inbox
     /// and the ack is signed by B's keypair — the ADDRESSED identity, not
     /// any other registered identity.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_routes_by_to_and_acks_with_addressed_keypair() {
         let sender_keypair = make_keypair();
@@ -1475,6 +1574,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -1510,6 +1610,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tcp_demux_threads_observed_source_to_addressed_member_classifier() {
         let sender_keypair = make_keypair();
@@ -1557,6 +1658,7 @@ mod tests {
 
     /// §11 misaddressed row: an envelope addressed to a never-registered key
     /// is rejected with the typed `Misaddressed` fault, no ack sent.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_misaddressed_unregistered_identity_rejected() {
         let sender_keypair = make_keypair();
@@ -1575,6 +1677,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1597,6 +1700,7 @@ mod tests {
     /// typed reject as never-registered; removal requires the installed
     /// owner (a wrong owner gets a typed error and the registry is never
     /// mutated).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_registered_then_removed_identity_rejected() {
         let sender_keypair = make_keypair();
@@ -1643,6 +1747,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1663,6 +1768,7 @@ mod tests {
     /// `require_peer_auth`), so an unsigned envelope is rejected even when
     /// the registered identity's own inbox context was built from a
     /// `require_peer_auth = false` configuration.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_rejects_unsigned_envelope_despite_no_auth_context() {
         let sender_keypair = make_keypair();
@@ -1683,6 +1789,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // unsigned
         };
@@ -1708,6 +1815,7 @@ mod tests {
     /// signature verifies — no signed-region or codec drift across the
     /// refactor. The exact-byte signable-region fixtures in types.rs stand
     /// untouched as the primary pin.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_demux_accepts_hand_encoded_envelope_bytes() {
         let sender_keypair = make_keypair();
@@ -1727,6 +1835,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;

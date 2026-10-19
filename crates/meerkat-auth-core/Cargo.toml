@@ -11,6 +11,37 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/azure_ad_authorizer.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/cloud_refresh_clock.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/cloud_refresh_readiness.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/connector_login_owner.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/connector_oauth_commit.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/connector_protocol_google.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/connector_protocol_providers.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/google_auth_authorizer.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/mcp_oauth_account_use.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/mcp_oauth_owner.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/token_lifecycle_clear.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/token_lifecycle_serialization.rs",
+    # support modules of tests/mcp_oauth_account_use.rs
+    "tests/mcp_oauth_account_use_support",
+]
 
 [dependencies]
 meerkat-core = { workspace = true }
@@ -65,6 +96,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 security-framework = { version = "3", optional = true }
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-auth-core = { path = ".", features = ["workspace-tests"] }
 meerkat-runtime = { path = "../meerkat-runtime", default-features = false, features = ["sqlite-store"] } # path-only (no version): breaks packaging dev-dep cycle; SQLite exercises the actual durable flow owner
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
@@ -90,6 +124,12 @@ aws-sigv4 = [
 ]
 gcp-auth = ["dep:jsonwebtoken", "dep:urlencoding"]
 azure-ad = ["dep:urlencoding"]
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [package.metadata.cargo-machete]
 ignored = [

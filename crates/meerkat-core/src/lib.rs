@@ -5,6 +5,15 @@
 //! own the canonical config-store, config-runtime, path-layout, and maintenance
 //! fence primitives, so this crate is not a blanket no-I/O layer.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 // All WASM Tokio users share these host adapters. Time and cooperative yields
 // own cancellable JavaScript resources here; spawning retains the upstream
 // scheduler but boxes every future it hands it (`wasm_task`). Native code
@@ -151,6 +160,7 @@ mod wasm_task;
 pub mod web_search;
 
 // Re-export main types at crate root
+pub use agent::compact::CompactionSummarySource;
 pub use agent::{
     Agent, AgentBuildPolicyError, AgentBuilder, AgentControlStateError, AgentExecutionSnapshot,
     AgentLlmClient, AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch,
@@ -192,12 +202,13 @@ pub use authorization::{
     AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
     MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
-    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
-    OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
-    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
-    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
-    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
-    WorkAuthorizationContext,
+    OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalDisposition,
+    OperationRefusalKind, OperationRefusalObservation, OperationRefusalObserver,
+    OperationRefusalOutcome, OperationRefusalSurface, OperationRefused, OperationReviewTier,
+    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, RefusalDispatch,
+    SourceAuthorizationFacts, SourceAuthorizationTarget, SourceAuthorizationUse,
+    ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,
@@ -220,6 +231,8 @@ pub use compact::{
     CompactionCuratorError, CompactionDiscard, CompactionResult, CompactionRetained,
     CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
     ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
+    SummarizationSource, SummarizationSourceBound, SummarizationSourceBudget,
+    SummarizationTrimStage,
 };
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,
@@ -276,9 +289,9 @@ pub use event::{
     ExternalToolDeltaPhase, InteractionFailureReason, LiveChannelCloseReason, ScopedAgentEvent,
     SkillResolutionFailureReason, StreamScopeFrame, StreamTruncationReason, StructuredOutputOrigin,
     ToolCallArguments, ToolCallArgumentsError, ToolConfigChangeOperation, ToolConfigChangeStatus,
-    ToolConfigChangedPayload, TurnErrorMetadata, VerboseEventConfig, agent_event_type,
-    compare_event_envelopes, format_verbose_event, format_verbose_event_with_config,
-    turn_usage_summary, usage_summary,
+    ToolConfigChangedPayload, ToolConfigLifecycleBit, TurnErrorMetadata, VerboseEventConfig,
+    agent_event_type, compare_event_envelopes, format_verbose_event,
+    format_verbose_event_with_config, turn_usage_summary, usage_summary,
 };
 pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{
@@ -464,8 +477,9 @@ pub use realtime_transcript::{
 };
 pub use realtime_transcript_sidecar::{
     REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1, REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V2,
-    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3, RealtimeTranscriptSidecarError,
-    RealtimeTranscriptSidecarRecord, RealtimeTranscriptSnapshotReasonV1,
+    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V3, REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V4,
+    RealtimeTranscriptSidecarError, RealtimeTranscriptSidecarRecord,
+    RealtimeTranscriptSnapshotReasonV1,
 };
 pub use retry::{
     DEFAULT_STREAM_INACTIVITY_TIMEOUT, LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan,
@@ -504,10 +518,11 @@ pub use service::{
     WorkGraphNamespaceGrant,
 };
 pub use session::{
-    AUDITED_ENDPOINT_WRITE_REFUSAL_PREFIX, AuditedEndpointDivergence,
+    AUDITED_ENDPOINT_WRITE_REFUSAL_PREFIX, ActivationWindow, AuditedEndpointDivergence,
     AuditedEndpointDivergenceKind, AuditedEndpointRelation, AuthorizedSessionToolVisibilityState,
     ConsumedDeferredTurnInputs, DecodedWholeBlobMetadataDocument, DeferredFirstTurnPhase,
-    DeferredToolLoadAuthority, INSTRUCTION_ACTIVATION_RENDER_VERSION_V1,
+    DeferredToolLoadAuthority, ForkInstructionPolicy, ForkInstructionRefusal,
+    ForkInstructionRefusalCause, INSTRUCTION_ACTIVATION_RENDER_VERSION_V1,
     ImportedReleased0810Session, InheritedToolVisibilityAuthority,
     InstructionActivationAdmissionErrorCode, InstructionActivationDisposition,
     InstructionActivationError, InstructionActivationErrorCode, InstructionActivationExpectation,
@@ -559,11 +574,13 @@ pub use session_recovery::{
 };
 pub use session_store::{
     HeadCanonicalAuthorityCrossing, HeadCanonicalStoreActivation, IncrementalSessionStore,
-    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight, SessionFilter,
-    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, SessionStore,
-    SessionStoreError, StrandLayout, StrandRewriteLayout, TranscriptRowRetention,
-    TranscriptStrandId, VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
+    PreparedHeadCanonicalMutationRoute, PreparedHeadCanonicalRewritePreflight,
+    RetainedStrandLayout, SessionFilter, SessionHead, SessionHeadCas,
+    SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
+    StrandRewriteLayout, TranscriptRowRetention, TranscriptStrandId,
+    VerifiedHeadCanonicalAuthority, VerifiedSessionHeadMaterialization,
     head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
+    strand_layout_for_retained_history,
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{
@@ -656,12 +673,14 @@ pub use turn_execution_authority::{
 pub use turn_terminal::{ClassifiedTurnTerminal, TurnTerminalClassifier, TurnTerminalKind};
 pub use types::{
     ArtifactRef, AssistantBlock, AssistantMessageId, BlockAssistantMessage, CommsNoticeKind,
-    ContentBlock, ContentInput, CumulativeUsage, ExtractionError, HandlingMode, ImageData,
-    InstructionActivationId, InstructionActivationIdentity, InstructionContentDigest,
-    InstructionKey, InstructionNamespace, InstructionRevisionId, InstructionRevisionRef,
-    InvalidInstructionContentDigest, InvalidInstructionIdentifier, LiveContextObservationId,
-    MemoryIndexExclusion, MemoryIndexableContent, Message, OutputSchema, ProviderMeta, RunInput,
-    RunResult, SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
+    ContentBlock, ContentFilteredStop, ContentInput, CumulativeUsage, ExtractionError,
+    GeminiStopStage, HandlingMode, ImageData, InstructionActivationId,
+    InstructionActivationIdentity, InstructionContentDigest, InstructionKey, InstructionNamespace,
+    InstructionRevisionId, InstructionRevisionRef, InvalidInstructionContentDigest,
+    InvalidInstructionIdentifier, LiveContextObservationId, MemoryIndexExclusion,
+    MemoryIndexableContent, Message, OutputSchema, PROVIDER_STOP_DETAIL_TEXT_CAP,
+    PROVIDER_STOP_DETAIL_TRUNCATION_MARKER, ProviderMeta, ProviderStopDetail, RunInput, RunResult,
+    SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
     SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,
     SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, SystemNoticeRecord, SystemPromptKey,
     SystemPromptVersion, SystemPromptVersionIdentity, TOOL_ARTIFACT_REF_PART_MAX_BYTES,

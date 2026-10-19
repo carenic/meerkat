@@ -66,6 +66,7 @@ use crate::ops::{
 use crate::tool_catalog::{ToolCatalogCapabilities, ToolCatalogEntry};
 use crate::types::{ToolCallView, ToolDef, ToolNameSet};
 use async_trait::async_trait;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Process-local authority consulted immediately before an actual tool call.
@@ -468,6 +469,64 @@ impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
             effect_kind,
         })
     }
+
+    /// The gate's own entry for one call, before any staging: its dispatch
+    /// admissions, its policy and its consequence policy. An error met here
+    /// comes back already settled with the admissions it held.
+    async fn admit(
+        &self,
+        call: ToolCallView<'_>,
+        context: Option<&ToolDispatchContext>,
+    ) -> Result<DispatchAdmissionCustody, ToolError> {
+        let custody = self.await_dispatch_admission(call, context).await?;
+        let pre_dispatch = async {
+            if !self.permits_inner_call(call.name) {
+                return Err(self.denial_error(call.name));
+            }
+            self.evaluate_consequence_policy(call, context).await
+        }
+        .await;
+        match pre_dispatch {
+            Ok(()) => Ok(custody),
+            Err(error) => Err(custody.settle_refused(call, context, error).await),
+        }
+    }
+
+    /// Everything this gate runs for a call with a dispatch context before
+    /// it invokes its inner dispatcher: [`Self::admit`], the read-only
+    /// narrowing, and the entry staging after the gate's own awaits, where
+    /// an owner change in progress meanwhile is waited out within the
+    /// dispatch attempt's own bounds, as at the root staging. Returns the
+    /// admissions to settle with the inner result and the context to
+    /// dispatch under; an error met here comes back already settled with
+    /// the admissions it held.
+    async fn enter_with_context<'c>(
+        &self,
+        call: ToolCallView<'_>,
+        context: &'c ToolDispatchContext,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+    ) -> Result<(DispatchAdmissionCustody, Cow<'c, ToolDispatchContext>), ToolError> {
+        let custody = self.admit(call, Some(context)).await?;
+        let base = if self.policy.requires_mutation_declaration() {
+            let mut narrowed = context.clone();
+            narrowed.require_read_only_execution();
+            Cow::Owned(narrowed)
+        } else {
+            Cow::Borrowed(context)
+        };
+        let staged = base
+            .observe_tool_entry_after_owner_change_at(
+                call,
+                plan,
+                crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+            )
+            .await;
+        match staged {
+            Ok(Some(current)) => Ok((custody, Cow::Owned(current))),
+            Ok(None) => Ok((custody, base)),
+            Err(error) => Err(custody.settle_refused(call, Some(context), error).await),
+        }
+    }
 }
 
 struct DispatchAdmissionCustody {
@@ -497,6 +556,20 @@ impl DispatchAdmissionCustody {
             }
         }
         failures
+    }
+
+    /// Settle an error met before the inner dispatcher ran: the dispatch
+    /// failed, and the error carries any settlement failure.
+    async fn settle_refused(
+        self,
+        call: ToolCallView<'_>,
+        context: Option<&ToolDispatchContext>,
+        error: ToolError,
+    ) -> ToolError {
+        let failures = self
+            .settle(call, context, crate::LiveBridgeEffectOutcome::Failed)
+            .await;
+        error.with_settlement_failures(failures)
     }
 
     async fn settle_result(
@@ -648,24 +721,12 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         &self,
         call: ToolCallView<'_>,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        let custody = self.await_dispatch_admission(call, None).await?;
-        let pre_dispatch = async {
-            if !self.permits_inner_call(call.name) {
-                return Err(self.denial_error(call.name));
-            }
-            self.evaluate_consequence_policy(call, None).await
-        }
-        .await;
-        if let Err(error) = pre_dispatch {
-            return custody
-                .settle_result(
-                    call,
-                    None,
-                    crate::LiveBridgeEffectOutcome::Failed,
-                    Err(error),
-                )
-                .await;
-        }
+        let custody = match self.admit(call, None).await {
+            Ok(custody) => custody,
+            // The gate's one certification boundary: met before its inner
+            // dispatcher ran.
+            Err(refused) => return Err(refused.not_dispatched()),
+        };
         let result = if self.policy.requires_mutation_declaration() {
             let mut context = ToolDispatchContext::default();
             context.require_read_only_execution();
@@ -686,53 +747,15 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         call: ToolCallView<'_>,
         context: &ToolDispatchContext,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        let custody = self.await_dispatch_admission(call, Some(context)).await?;
-        let pre_dispatch = async {
-            if !self.permits_inner_call(call.name) {
-                return Err(self.denial_error(call.name));
-            }
-            self.evaluate_consequence_policy(call, Some(context)).await
-        }
-        .await;
-        if let Err(error) = pre_dispatch {
-            return custody
-                .settle_result(
-                    call,
-                    Some(context),
-                    crate::LiveBridgeEffectOutcome::Failed,
-                    Err(error),
-                )
-                .await;
-        }
-        let mut narrowed;
-        let base = if self.policy.requires_mutation_declaration() {
-            narrowed = context.clone();
-            narrowed.require_read_only_execution();
-            &narrowed
-        } else {
-            context
+        let (custody, dispatch_context) = match self.enter_with_context(call, context, None).await {
+            Ok(entered) => entered,
+            // The gate's one certification boundary: met before its inner
+            // dispatcher ran.
+            Err(refused) => return Err(refused.not_dispatched()),
         };
-        let current_context = match base.observe_tool_entry_at(
-            call,
-            None,
-            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
-        ) {
-            Ok(current) => current,
-            Err(error) => {
-                return custody
-                    .settle_result(
-                        call,
-                        Some(context),
-                        crate::LiveBridgeEffectOutcome::Failed,
-                        Err(error),
-                    )
-                    .await;
-            }
-        };
-        let dispatch_context = current_context.as_ref().unwrap_or(base);
         let result = self
             .inner
-            .dispatch_with_context(call, dispatch_context)
+            .dispatch_with_context(call, &dispatch_context)
             .await;
         let result = dispatch_context.observe_tool_outcome(custody.effect_kind, result);
         let outcome = if result.is_ok() {
@@ -751,53 +774,16 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         context: &ToolDispatchContext,
         plan: &crate::ResolvedToolExecutionPlan,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        let custody = self.await_dispatch_admission(call, Some(context)).await?;
-        let pre_dispatch = async {
-            if !self.permits_inner_call(call.name) {
-                return Err(self.denial_error(call.name));
-            }
-            self.evaluate_consequence_policy(call, Some(context)).await
-        }
-        .await;
-        if let Err(error) = pre_dispatch {
-            return custody
-                .settle_result(
-                    call,
-                    Some(context),
-                    crate::LiveBridgeEffectOutcome::Failed,
-                    Err(error),
-                )
-                .await;
-        }
-        let mut narrowed;
-        let base = if self.policy.requires_mutation_declaration() {
-            narrowed = context.clone();
-            narrowed.require_read_only_execution();
-            &narrowed
-        } else {
-            context
-        };
-        let current_context = match base.observe_tool_entry_at(
-            call,
-            Some(plan),
-            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
-        ) {
-            Ok(current) => current,
-            Err(error) => {
-                return custody
-                    .settle_result(
-                        call,
-                        Some(context),
-                        crate::LiveBridgeEffectOutcome::Failed,
-                        Err(error),
-                    )
-                    .await;
-            }
-        };
-        let dispatch_context = current_context.as_ref().unwrap_or(base);
+        let (custody, dispatch_context) =
+            match self.enter_with_context(call, context, Some(plan)).await {
+                Ok(entered) => entered,
+                // The gate's one certification boundary: met before its
+                // inner dispatcher ran.
+                Err(refused) => return Err(refused.not_dispatched()),
+            };
         let result = self
             .inner
-            .dispatch_resolved_with_context(call, dispatch_context, plan)
+            .dispatch_resolved_with_context(call, &dispatch_context, plan)
             .await;
         let result = dispatch_context.observe_tool_outcome(custody.effect_kind, result);
         let outcome = if result.is_ok() {
@@ -2209,6 +2195,8 @@ pub(crate) mod tests {
 
     struct FixedConsequenceSnapshot {
         verdict: ToolConsequenceVerdict,
+        /// Runs at each evaluation, before the verdict.
+        on_evaluate: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl ToolConsequencePolicySnapshot for FixedConsequenceSnapshot {
@@ -2220,6 +2208,9 @@ pub(crate) mod tests {
         }
 
         fn evaluate(&self, _request: &ToolConsequenceRequest) -> ToolConsequenceVerdict {
+            if let Some(on_evaluate) = &self.on_evaluate {
+                on_evaluate();
+            }
             self.verdict.clone()
         }
     }
@@ -2250,12 +2241,39 @@ pub(crate) mod tests {
         verdict: ToolConsequenceVerdict,
         deadline: std::time::Duration,
     ) -> BoundToolConsequencePolicy {
+        bound_fixed_consequence_policy(
+            FixedConsequenceSnapshot {
+                verdict,
+                on_evaluate: None,
+            },
+            deadline,
+        )
+    }
+
+    /// An allowing consequence policy that runs `on_evaluate` at each
+    /// evaluation (on the policy's own worker thread).
+    pub(crate) fn allowing_consequence_policy_running(
+        on_evaluate: impl Fn() + Send + Sync + 'static,
+    ) -> BoundToolConsequencePolicy {
+        bound_fixed_consequence_policy(
+            FixedConsequenceSnapshot {
+                verdict: ToolConsequenceVerdict::Allow,
+                on_evaluate: Some(Box::new(on_evaluate)),
+            },
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    fn bound_fixed_consequence_policy(
+        snapshot: FixedConsequenceSnapshot,
+        deadline: std::time::Duration,
+    ) -> BoundToolConsequencePolicy {
         let provider_id = PolicyProviderId::new("test-provider").expect("provider id");
         let policy_id = PolicyId::new("test-policy").expect("policy id");
         let provider: Arc<dyn ToolConsequenceNarrowingPolicy> =
             Arc::new(FixedConsequenceProvider {
                 provider_id: provider_id.clone(),
-                snapshot: Arc::new(FixedConsequenceSnapshot { verdict }),
+                snapshot: Arc::new(snapshot),
             });
         let registry = Arc::new(
             ToolConsequencePolicyRegistry::new(

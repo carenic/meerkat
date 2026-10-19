@@ -545,6 +545,7 @@ fn render_event(
             messages_before,
             messages_after,
             summary_tokens,
+            ..
         } => {
             chrome_line(
                 mux,

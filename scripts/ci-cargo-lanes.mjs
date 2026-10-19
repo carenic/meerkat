@@ -99,7 +99,9 @@
 // wave take runners first. The measurements are ROW_DURATIONS
 // (--row-durations), regenerated from green runs with
 // scripts/ci-row-durations.mjs; a stale entry only moves a row between
-// waves, never out of the plan.
+// waves, never out of the plan. A row is measured under its rowKey, its name
+// without the member count of a packed row, so a repack that moves line
+// counts keeps the row's measurement while its anchor stays the same.
 //
 // Cargo.lock. A lock change that is the only global path is scoped: the
 // package entries the diff adds, removes or changes (version, source,
@@ -509,28 +511,56 @@ export const ROW_DURATIONS = "scripts/ci-row-durations.json";
 export const WAVE_LANES = ["clippy", "main-unit", "closure-tests", "feature-check"];
 const MEASURED_LANES = ["unit", ...WAVE_LANES];
 
-// The measured row durations, `<lane>:<row name>` to whole seconds.
+// The measured row durations, `<lane>:<rowKey>` to whole seconds.
 export function readRowDurations(path) {
-  const data = JSON.parse(readFileSync(path, "utf8"));
-  if (data?.schema_version !== 1 || !data.rows || typeof data.rows !== "object" || Array.isArray(data.rows)) {
-    throw new Error(`${path} is not a schema-1 row-duration table`);
+  return checkRowDurations(JSON.parse(readFileSync(path, "utf8")), path);
+}
+
+// A row-duration table's rows, or an error: schema 2, every key a measured
+// lane and a rowKey, whole positive seconds. The generator checks the table
+// it writes with this too, so it cannot write one the planner refuses.
+export function checkRowDurations(data, label) {
+  if (data?.schema_version !== 2 || !data.rows || typeof data.rows !== "object" || Array.isArray(data.rows)) {
+    throw new Error(`${label} is not a schema-2 row-duration table`);
   }
   for (const [key, seconds] of Object.entries(data.rows)) {
     if (!MEASURED_LANES.includes(key.slice(0, key.indexOf(":"))) || !Number.isInteger(seconds) || seconds <= 0) {
-      throw new Error(`${path}: row ${JSON.stringify(key)} has no measured lane or no whole positive seconds`);
+      throw new Error(`${label}: row ${JSON.stringify(key)} has no measured lane or no whole positive seconds`);
+    }
+    const row = key.slice(key.indexOf(":") + 1);
+    if (rowKey(row) !== row) {
+      throw new Error(`${label}: row ${JSON.stringify(key)} carries a member count, so it matches no row; regenerate the table with scripts/ci-row-durations.mjs`);
     }
   }
   return data.rows;
+}
+
+// The key a row is measured under: its name without the member count of a
+// packed row ("+N" after the anchor that names it). Packing is by Rust line
+// count, so a merge that moves line counts changes N but not the anchor:
+// "core+12" is "core", "openai+8 bazel set" is "openai bazel set", and
+// "tests meerkat 1/5+3" is "tests meerkat 1/5". A lane's rows have disjoint
+// members, so their anchors, and their keys, differ.
+export function rowKey(name) {
+  return name.replace(/\+\d+(?= |$)/, "");
 }
 
 // A lane's rows in their two waves, by name.
 export function waveOf(lane, rows, durations) {
   const names = rows.map((row) => row.name);
   if (new Set(names).size !== names.length) throw new Error(`internal error: ${lane} rows repeat a name`);
+  const named = new Map();
+  for (const name of names) {
+    const key = rowKey(name);
+    if (named.has(key)) {
+      throw new Error(`internal error: ${lane} rows ${JSON.stringify(named.get(key))} and ${JSON.stringify(name)} share the measurement key ${JSON.stringify(key)}`);
+    }
+    named.set(key, name);
+  }
   const lookup = lane === "main-unit" ? [lane, "unit"] : [lane];
   const wave = { first: [], rest: [] };
   for (const row of rows) {
-    const seconds = lookup.map((name) => durations[`${name}:${row.name}`]).find((value) => value !== undefined);
+    const seconds = lookup.map((name) => durations[`${name}:${rowKey(row.name)}`]).find((value) => value !== undefined);
     wave[seconds === undefined || seconds >= WAVE_FIRST_SECONDS ? "first" : "rest"].push(row.name);
   }
   return wave;
@@ -1268,8 +1298,9 @@ function isLaneDefinitionPath(path) {
 
 // Paths whose change can alter the Bazel graph without touching Rust code:
 // generated or hand-written BUILD files, Starlark, module and lock inputs,
-// the BUILD generator, the Bazel toolchain and lane definitions, and every
-// Cargo manifest and the lockfile (crate_universe reads them).
+// the BUILD generator and the modules and lists it reads, the Bazel
+// toolchain and lane definitions, and every Cargo manifest and the lockfile
+// (crate_universe reads them).
 function isBazelGraphPath(path) {
   const base = path.split("/").pop();
   return (
@@ -1285,6 +1316,9 @@ function isBazelGraphPath(path) {
     path === "Cargo.lock" ||
     base === "Cargo.toml" ||
     path === "scripts/generate-bazel-rust-builds.mjs" ||
+    path === "scripts/rust-source-text.mjs" ||
+    path === "scripts/rust-test-selector.mjs" ||
+    path === "scripts/non-shipping-features.json" ||
     path.startsWith("tools/bazel/") ||
     path.startsWith("tools/buildbuddy/")
   );
@@ -1983,6 +2017,7 @@ function plan(args) {
     bazel_graph: false,
     examples_browser: false,
     example_web: false,
+    example_web_wasm: false,
     docs_only: false,
     release_projection: releaseProjection,
   };
@@ -2188,6 +2223,7 @@ function plan(args) {
     governed_jsonl: false,
     mcp_confinement_positive: false,
     reader_rows: [],
+    example_web_wasm: false,
   };
   result.reader_not_run = [];
 
@@ -2262,6 +2298,20 @@ function plan(args) {
   if (result.packages.some((name) => name === "meerkat-web-runtime" || wasmBuild?.has(name))) {
     result.wasm = true;
   }
+  // The example web suites build that closure for wasm32 at the release
+  // profile, and a change to any crate in it misses sccache from that crate
+  // up: the build step took 1181 s of pull request 39209102985's 1329 s lane
+  // after a meerkat-core change (114 s with the closure cached; the lane
+  // budget is 1080 s). The web runtime compiles meerkat-mob, so a pull
+  // request that changes a crate it builds on, or plans the whole workspace,
+  // leaves the wasm build and the browser suites to the push, like the
+  // meerkat-mob chain's lanes. It keeps the Web SDK's type and unit tests,
+  // which need no wasm. The push builds the wasm whenever the lane runs, and
+  // a release projection builds none: it reuses its parent's run.
+  const wasmClosureChanged =
+    result.mode === "workspace" || [...seeds].some((name) => name !== "meerkat-web-runtime" && wasmBuild?.has(name));
+  result.example_web_wasm = !releaseProjection && (!deferToPush || (result.example_web && !wasmClosureChanged));
+  deferred.example_web_wasm = deferToPush && result.example_web && !result.example_web_wasm;
 
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
@@ -2733,6 +2783,7 @@ function deferredSummary(deferred) {
   if (deferred.clippy_test_targets.length > 0) parts.push(`the test targets' Clippy of ${deferred.clippy_test_targets.join(", ")}`);
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");
+  if (deferred.example_web_wasm) parts.push("the web wasm build and browser suites");
   return parts.join("; ");
 }
 
@@ -2752,6 +2803,7 @@ function githubOutput(result) {
   scalar("bazel_graph", String(result.bazel_graph));
   scalar("examples_browser", String(result.examples_browser));
   scalar("example_web", String(result.example_web));
+  scalar("example_web_wasm", String(result.example_web_wasm));
   scalar("docs_only", String(result.docs_only));
   const projection = result.release_projection;
   scalar("release_projection", String(projection !== null));

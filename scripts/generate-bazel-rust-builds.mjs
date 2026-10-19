@@ -2,9 +2,22 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
+import { namesRepoScripts } from "./rust-source-text.mjs";
 import { testSourcePaths as sharedTestSourcePaths } from "./rust-test-selector.mjs";
 
 const checkOnly = process.argv.includes("--check");
+
+// Rust source text by path, read once: every target of a crate scans the
+// same files again.
+const rustSourceCache = new Map();
+function readRustSource(path) {
+  let text = rustSourceCache.get(path);
+  if (text === undefined) {
+    text = readFileSync(path, "utf8");
+    rustSourceCache.set(path, text);
+  }
+  return text;
+}
 
 // Every test of a crate that dev-depends on the mcp-test-server fixture crate
 // gets the fixture binary in its runfiles and MEERKAT_MCP_TEST_SERVER naming
@@ -260,6 +273,25 @@ function isPublishable(pkg) {
     throw new Error(
       `published crates must reach non-shipping features only through [dev-dependencies]:\n  `
         + violations.join("\n  "),
+    );
+  }
+}
+
+// Workspace-only unit tests. A published crate whose unit tests need a
+// crate its package cannot depend on (a cyclic or unpublished dev-dependency)
+// gates those test modules on its own `workspace-tests` feature, which only a
+// path-only self dev-dependency enables: `cargo package` strips that edge, so
+// the published package compiles them out, while the workspace and this graph
+// (whose union follows every dev edge) compile them in. Fail generation when a
+// crate declares the feature but the union does not carry it: its Bazel test
+// targets would otherwise drop those tests without a word.
+const WORKSPACE_TESTS_FEATURE = "workspace-tests";
+for (const pkg of localPackages.values()) {
+  if (!Object.hasOwn(pkg.features ?? {}, WORKSPACE_TESTS_FEATURE)) continue;
+  if (!activeFeatures.get(pkg.id).has(WORKSPACE_TESTS_FEATURE)) {
+    throw new Error(
+      `${pkg.name} declares ${WORKSPACE_TESTS_FEATURE}, but no path-only self dev-dependency enables it; `
+        + "its workspace-only tests would compile out of every Bazel test target",
     );
   }
 }
@@ -988,7 +1020,7 @@ function assertNativeE2eSystemCoverage() {
         || !target.name.startsWith("system_")
         || !existsSync(target.src_path)
       ) continue;
-      const source = readFileSync(target.src_path, "utf8");
+      const source = readRustSource(target.src_path);
       const ignoredTests = [...source.matchAll(ignorePattern)].map((match) => match[1]);
       if (!ignoredTests.length) continue;
       const specs = nativeE2eSystemSpecsFor(pkg, target);
@@ -1035,7 +1067,7 @@ function ensureGeneratedBlock(path, marker, block) {
 }
 
 function needsWorkspaceRunfiles(target) {
-  const source = readFileSync(target.src_path, "utf8");
+  const source = readRustSource(target.src_path);
   return [
     "workspace_root",
     "rev-parse",
@@ -1050,7 +1082,7 @@ function needsWorkspaceRunfiles(target) {
 }
 
 function needsPackageRunfiles(target) {
-  const source = readFileSync(target.src_path, "utf8");
+  const source = readRustSource(target.src_path);
   return [
     "CARGO_MANIFEST_DIR",
     "WORKSPACE_ROOT",
@@ -1082,11 +1114,11 @@ const PATH_INCLUDED_MODULE = /#\[path\s*=\s*"([^"]+)"\]\s*(?:pub(?:\([^)]*\))?\s
 // Plain `mod name;` modules are not followed: they are package-local by
 // construction and the crate root already names their runfile needs.
 function targetScanSource(target) {
-  const rootSource = readFileSync(target.src_path, "utf8");
+  const rootSource = readRustSource(target.src_path);
   const sources = [rootSource];
   for (const match of rootSource.matchAll(PATH_INCLUDED_MODULE)) {
     const included = resolve(dirname(target.src_path), match[1]);
-    if (existsSync(included)) sources.push(readFileSync(included, "utf8"));
+    if (existsSync(included)) sources.push(readRustSource(included));
   }
   return sources.join("\n");
 }
@@ -1100,7 +1132,7 @@ function crateScanSource(target, packageRoot) {
   const sources = [targetScanSource(target)];
   for (const file of rustSourceFiles(packageRoot, false)) {
     if (file === target.src_path) continue;
-    sources.push(readFileSync(file, "utf8"));
+    sources.push(readRustSource(file));
   }
   return sources.join("\n");
 }
@@ -1121,7 +1153,8 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
   if (source.includes(".github/")) {
     labels.add("//:github_workflows");
   }
-  if (source.includes("scripts/")) {
+  // A comment that mentions a script is not a read of it.
+  if (namesRepoScripts(source)) {
     labels.add("//:repo_governance_files");
   }
   if (source.includes('"clippy.toml"')) {
@@ -1150,7 +1183,8 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
   }
   for (const pkg of localPackages.values()) {
     const dir = relative(root, packageDir(pkg));
-    if (!dir) continue;
+    // Every needle below contains the directory itself.
+    if (!dir || !source.includes(dir)) continue;
     const quotedDir = source.includes(q(dir)) || source.includes(`'${dir}'`) || source.includes(`\`${dir}\``);
     const pathLikeDir =
       source.includes(`${dir}/`) ||
@@ -1264,7 +1298,7 @@ for (const consumer of localPackages.values()) {
     ...rustSourceFiles(consumerRoot, true),
   ]);
   for (const sourceFile of sourceFiles) {
-    const source = readFileSync(sourceFile, "utf8");
+    const source = readRustSource(sourceFile);
     for (const match of source.matchAll(includeMacroRe)) {
       const includePath = match[1] ?? match[2];
       if (!includePath) continue;
@@ -1291,19 +1325,30 @@ function bazelPackageDirOwning(absolute) {
   return root;
 }
 
+// The paths a Rust source's include!/include_str!/include_bytes! name, in
+// order, read once per file.
+const INCLUDE_MACRO = /\binclude_(?:str|bytes)!\(\s*"([^"]+)"\s*\)|\binclude!\(\s*"([^"]+)"\s*\)/g;
+const includedPathsCache = new Map();
+function includedPaths(sourceFile) {
+  let paths = includedPathsCache.get(sourceFile);
+  if (paths === undefined) {
+    paths = [...readRustSource(sourceFile).matchAll(INCLUDE_MACRO)].map((match) => match[1] ?? match[2]);
+    includedPathsCache.set(sourceFile, paths);
+  }
+  return paths;
+}
+
 function compileData(target, packageRoot, includeTests) {
   const paths = new Set(["Cargo.toml"]);
   const labels = new Set();
-  const includeRe = /\binclude_(?:str|bytes)!\(\s*"([^"]+)"\s*\)|\binclude!\(\s*"([^"]+)"\s*\)/g;
   const sourceFiles = new Set([target.src_path, ...rustSourceFiles(packageRoot, includeTests)]);
   const embeddedHelpSkillRoots = [
     resolve(root, ".claude/skills/meerkat-cli-reference"),
     resolve(root, ".claude/skills/meerkat-platform"),
   ];
   for (const sourceFile of sourceFiles) {
-    const source = readFileSync(sourceFile, "utf8");
-    for (const match of source.matchAll(includeRe)) {
-      const includePath = match[1] ?? match[2];
+    const source = readRustSource(sourceFile);
+    for (const includePath of includedPaths(sourceFile)) {
       if (!includePath) continue;
       const absolute = resolve(dirname(sourceFile), includePath);
       // Doc comments and test fixtures may contain include!("...") text
@@ -2193,7 +2238,7 @@ for (const pkg of localPackages.values()) {
       ? rewriteAgentFactoryDeps(rawDeps)
       : rawDeps;
     const procMacroDeps = localDeps(pkg, true, isTest);
-    const targetSourceText = isTest ? readFileSync(target.src_path, "utf8") : "";
+    const targetSourceText = isTest ? readRustSource(target.src_path) : "";
     let targetDeps = deps;
     if (key === "meerkat-machine-codegen" && target.name === "runtime_schema_parity") {
       const scheduleMachineSchemaExports = shouldRewriteAgentFactoryDepsFor(key, isTest)
@@ -2444,7 +2489,7 @@ for (const pkg of localPackages.values()) {
         env.push(`        "RUSTFMT": "$(rootpath tests/rustfmt_host.sh)",`);
         env.push(`        "RUSTFMT_DARWIN": "$(rootpath ${rustfmt})",`);
         env.push(`        "RUSTFMT_LINUX": "$(rootpath ${rustfmtLinux})",`);
-        if (readFileSync(target.src_path, "utf8").includes("rev-parse")) {
+        if (readRustSource(target.src_path).includes("rev-parse")) {
           env.push(`        "WORKSPACE_ROOT": ".",`);
         }
       }

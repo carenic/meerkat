@@ -818,9 +818,7 @@ impl meerkat_client::LlmClient for LaunchingModel {
                 },
                 LlmEvent::UsageUpdate { usage },
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                 },
             ]
         } else {
@@ -831,9 +829,7 @@ impl meerkat_client::LlmClient for LaunchingModel {
                 },
                 LlmEvent::UsageUpdate { usage },
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 },
             ]
         };

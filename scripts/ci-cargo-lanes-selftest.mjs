@@ -34,6 +34,8 @@ import {
   nextestDefaultSelection,
   parseCargoLock,
   readRowDurations,
+  rowKey,
+  waveOf,
   compiledInDocKeys,
   readerRows,
   touchesGuardLane,
@@ -59,6 +61,12 @@ function planFor(paths, extra = []) {
   const result = run(["--format", "json", ...extra, "--", ...paths]);
   assert.equal(result.status, 0, `classifier failed: ${result.stderr}`);
   return JSON.parse(result.stdout);
+}
+
+// A two-wave lane's rows from its GitHub outputs, both waves together: which
+// wave a row starts in is the duration table's call.
+function bothWaves(lines, first, rest) {
+  return [...JSON.parse(lines[first]).include, ...JSON.parse(lines[rest]).include].filter((row) => row.name !== "none");
 }
 
 function assertLanes(plan, label) {
@@ -973,6 +981,37 @@ for (const path of [
     assert.equal(web.example_web, true, `${path} runs the example web suites in the pull request`);
     if (!path.startsWith("sdks/")) assert.equal(web.wasm, true, `${path} runs wasm-check in the pull request`);
   }
+  // A pull request builds the web wasm only on a cached closure: a change to
+  // a crate the web runtime builds on, or a whole-workspace plan, compiles
+  // that closure cold (1181 s on pull request 39209102985), so the plan
+  // leaves the wasm build, the browser suites and the WASM timer lane to the
+  // push and keeps the Web SDK's type and unit tests. A change to the
+  // runtime itself, the SDK or the examples builds the wasm in the pull
+  // request; a push builds it whenever the lane runs.
+  for (const [paths, wasm] of [
+    [["crates/meerkat-contracts/src/lib.rs"], false],
+    [["crates/meerkat-core/src/lib.rs", "sdks/web/src/runtime.ts"], false],
+    [[".github/workflows/ci.yml"], false],
+    [["crates/meerkat-web-runtime/src/lib.rs"], true],
+    [["sdks/web/src/runtime.ts"], true],
+    [["examples/031-wasm-mini-diplomacy-sh/web/tests/regression.test.mjs"], true],
+  ]) {
+    const plan = planFor(paths, ["--event", "pull_request"]);
+    const label = paths.join(" + ");
+    assert.equal(plan.example_web, true, `${label} runs the example web lane in the pull request`);
+    assert.equal(plan.example_web_wasm, wasm, `${label} ${wasm ? "builds" : "leaves"} the web wasm in the pull request`);
+    assert.equal(plan.deferred_to_push.example_web_wasm, !wasm, `${label}: deferred_to_push ${wasm ? "keeps" : "names"} the web wasm`);
+    const summary = run(["--format", "github", "--event", "pull_request", "--", ...paths]).stdout;
+    assert.equal(
+      /^deferred_to_push=.*the web wasm build and browser suites/m.test(summary),
+      !wasm,
+      `${label}: the gate's deferral notice ${wasm ? "omits" : "names"} the web wasm`,
+    );
+    assert.match(summary, new RegExp(`^example_web_wasm=${wasm}$`, "m"), `${label}: GitHub output carries example_web_wasm`);
+  }
+  for (const path of ["crates/meerkat-core/src/lib.rs", "crates/meerkat-rpc/src/lib.rs", "sdks/web/src/runtime.ts"]) {
+    assert.equal(planFor([path]).example_web_wasm, true, `a push that changes ${path} builds the web wasm when the lane runs`);
+  }
   // wasm-check runs for every crate the wasm build compiles (the web
   // runtime's dependency closure in the cargo graph), the provider crates
   // included (#1108), and for no crate outside it.
@@ -1281,8 +1320,7 @@ for (const path of [
     assert.ok(key in lines, `github output has ${key}`);
   }
   assert.equal(lines.rust_changed, "true");
-  const matrix = JSON.parse(lines.shard_matrix);
-  assert.deepEqual(matrix.include, [{ name: "core", packages: "-p meerkat-core", targets: "--all-targets" }]);
+  assert.deepEqual(bothWaves(lines, "shard_matrix", "shard_rest_matrix"), [{ name: "core", packages: "-p meerkat-core", targets: "--all-targets" }]);
   assert.match(lines.closure_flags, /-p meerkat-core/);
   for (const key of ["unit_shard_count", "unit_shard_matrix", "unit_deferred", "unit_deferred_count", "unit_rows_on_main", "unit_rows_on_main_count", "main_unit_shard_count", "main_unit_shard_matrix"]) {
     assert.ok(key in lines, `github output has ${key}`);
@@ -1291,7 +1329,7 @@ for (const path of [
   // request, below).
   assert.equal(lines.unit_shard_count, "0");
   assert.equal(lines.unit_rows_on_main, "core");
-  assert.ok(JSON.parse(lines.main_unit_shard_matrix).include.some((row) => row.packages === "-p meerkat-core"));
+  assert.ok(bothWaves(lines, "main_unit_shard_matrix", "main_unit_rest_shard_matrix").some((row) => row.packages === "-p meerkat-core"));
   const prLines = Object.fromEntries(
     run(["--format", "github", "--event", "pull_request", "--", "crates/meerkat-core/src/lib.rs"]).stdout.trim().split("\n")
       .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
@@ -1368,7 +1406,7 @@ for (const path of [
   assert.equal(lines.unit_shard_count, "0", "a push's unit lane runs no row");
   assert.equal(lines.unit_rows_on_main, "core");
   assert.equal(lines.unit_rows_on_main_count, "1");
-  assert.ok(JSON.parse(lines.main_unit_shard_matrix).include.some((row) => row.name === "core" && row.packages === "-p meerkat-core"));
+  assert.ok(bothWaves(lines, "main_unit_shard_matrix", "main_unit_rest_shard_matrix").some((row) => row.name === "core" && row.packages === "-p meerkat-core"));
   assertUnitJobsMatch(readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8"), "ci.yml");
 }
 
@@ -1382,7 +1420,7 @@ for (const path of [
   try {
     const table = (rows, extra = {}) => {
       const file = join(scratch, `table-${Object.keys(rows).length}-${Math.random().toString(36).slice(2)}.json`);
-      writeFileSync(file, JSON.stringify({ schema_version: 1, rows, ...extra }));
+      writeFileSync(file, JSON.stringify({ schema_version: 2, rows, ...extra }));
       return file;
     };
     const wavesFor = (rows, paths = ["crates/meerkat-core/src/lib.rs"]) => planFor(paths, ["--event", "push", "--row-durations", table(rows)]).waves;
@@ -1417,6 +1455,68 @@ for (const path of [
       assert.ok(first.length > 0 && rest.length > 0, `${lane}: the measured table splits a workspace push`);
       assert.deepEqual([...first, ...rest].sort(), rows.map((row) => row.name).sort(), `${lane}: every row is in exactly one wave`);
     }
+    // A repack keeps a row's measurement. Packing is by Rust line count, so
+    // a merge can change a packed row's member count ("core+12" becoming
+    // "core+13"); the table measures the row under its anchor, and the plan's
+    // packed rows land by that measurement, whatever count the tree gives
+    // them.
+    assert.deepEqual(
+      ["core+12", "openai+8 bazel set", "rkat+5 matrix", "tests meerkat 1/5+3", "integration-tests+1", "mob 1/2", "mob[openai-live] 1/2", "meerkat", "e2e-fast"].map(rowKey),
+      ["core", "openai bazel set", "rkat matrix", "tests meerkat 1/5", "integration-tests", "mob 1/2", "mob[openai-live] 1/2", "meerkat", "e2e-fast"],
+      "a row's key drops only the member count after its anchor",
+    );
+    // Two rows of a lane never share a key (their bins have disjoint
+    // members); a plan in which they did is an internal error, not two rows
+    // sharing one measurement.
+    assert.throws(
+      () => waveOf("clippy", [{ name: "core+1" }, { name: "core+2" }], {}),
+      /internal error: clippy rows "core\+1" and "core\+2" share the measurement key "core"/,
+    );
+    // A packed main unit row carries its unit row's measurement by key too.
+    assert.deepEqual(
+      waveOf("main-unit", [{ name: "core+3" }], { "unit:core": below }),
+      { first: [], rest: ["core+3"] },
+      "a packed main unit row falls back to its unit row's measurement under its key",
+    );
+    // Every row of the four lanes (and the unit lane) of a whole-workspace
+    // push and pull request has a key that is its own key, and the reader
+    // accepts a table of those keys: the generator's output is the reader's
+    // form.
+    const keyed = {};
+    for (const event of ["push", "pull_request"]) {
+      const plan = planFor(["Cargo.toml"], ["--event", event, "--row-durations", table({})]);
+      for (const [lane, rows] of [
+        ["clippy", plan.shards],
+        ["unit", [...plan.unit_shards, ...plan.unit_feature_shards]],
+        ["main-unit", [...plan.main_unit_shards, ...plan.main_feature_unit_shards]],
+        ["closure-tests", plan.closure_test_rows],
+        ["feature-check", plan.feature_check_jobs],
+      ]) {
+        for (const { name } of rows) {
+          assert.equal(rowKey(rowKey(name)), rowKey(name), `${event}: ${lane} row ${name} has a fixed key`);
+          keyed[`${lane}:${rowKey(name)}`] = 1;
+        }
+      }
+    }
+    assert.ok(Object.keys(keyed).length > 0);
+    assert.deepEqual(readRowDurations(table(keyed)), keyed, "the reader accepts every row's key");
+    const unmeasured = planFor(["Cargo.toml"], ["--event", "push", "--row-durations", table({})]);
+    const anchors = {};
+    const packed = {};
+    for (const [lane, key, rows] of [
+      ["clippy", "clippy", unmeasured.shards],
+      ["main_unit", "main-unit", [...unmeasured.main_unit_shards, ...unmeasured.main_feature_unit_shards]],
+      ["closure_tests", "closure-tests", unmeasured.closure_test_rows],
+      ["feature_check", "feature-check", unmeasured.feature_check_jobs],
+    ]) {
+      packed[lane] = rows.map((row) => row.name).filter((name) => rowKey(name) !== name);
+      assert.ok(packed[lane].length > 0, `${lane}: a workspace push packs rows`);
+      for (const name of packed[lane]) anchors[`${key}:${rowKey(name)}`] = below;
+    }
+    const measured = planFor(["Cargo.toml"], ["--event", "push", "--row-durations", table(anchors)]).waves;
+    for (const [lane, names] of Object.entries(packed)) {
+      assert.deepEqual(names.filter((name) => !measured[lane].rest.includes(name)), [], `${lane}: a packed row is measured under its anchor`);
+    }
     const github = run(["--format", "github", "--event", "push", "--", "Cargo.toml"]);
     assert.equal(github.status, 0, github.stderr);
     const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
@@ -1433,9 +1533,12 @@ for (const path of [
       assert.equal(Number(lines[restCount]), real.waves[lane].rest.length, `${lane}: rest count`);
       assert.equal(Number(lines[total]), real.waves[lane].first.length + real.waves[lane].rest.length, `${lane}: the count is the lane's whole`);
     }
-    // A table the planner cannot read stops the plan.
+    // A table the planner cannot read stops the plan: schema 1 keyed rows by
+    // their full names, and a key that still carries a member count can
+    // never match a row.
     for (const [label, file] of [
-      ["another schema", table({ "clippy:core": 600 }, { schema_version: 2 })],
+      ["the previous schema", table({ "clippy:core": 600 }, { schema_version: 1 })],
+      ["a member count", table({ "clippy:core+12": 600 })],
       ["an unknown lane", table({ "integration:core": 600 })],
       ["zero seconds", table({ "clippy:core": 0 })],
       ["fractional seconds", table({ "clippy:core": 600.5 })],
@@ -1444,13 +1547,13 @@ for (const path of [
       const result = run(["--format", "json", "--row-durations", file, "--", "crates/meerkat-core/src/lib.rs"]);
       assert.equal(result.status, 1, `${label}: the plan stops`);
     }
-    // The table's generator: a row is its lane and its matrix name, and keeps
-    // the longest successful job.
+    // The table's generator: a row is its lane and its matrix name's key, and
+    // keeps the longest successful job, across packings of one anchor too.
     assert.equal(rowOf("Clippy (mob)"), "clippy:mob");
     assert.equal(rowOf("Main unit tests (meerkat[openai-live])"), "main-unit:meerkat[openai-live]");
-    assert.equal(rowOf("Closure tests (tests mob 1/4+3)"), "closure-tests:tests mob 1/4+3");
-    assert.equal(rowOf("Feature combinations (mob+4 bazel set)"), "feature-check:mob+4 bazel set");
-    assert.equal(rowOf("Unit tests (core+4)"), "unit:core+4");
+    assert.equal(rowOf("Closure tests (tests mob 1/4+3)"), "closure-tests:tests mob 1/4");
+    assert.equal(rowOf("Feature combinations (mob+4 bazel set)"), "feature-check:mob bazel set");
+    assert.equal(rowOf("Unit tests (core+4)"), "unit:core");
     assert.equal(rowOf("CI gate"), null);
     assert.equal(rowOf("Integration tests (runtime)"), null);
     const job = (name, conclusion, seconds) => ({ name, conclusion, started_at: "2026-01-01T00:00:00Z", completed_at: new Date(Date.parse("2026-01-01T00:00:00Z") + seconds * 1000).toISOString() });
@@ -1458,6 +1561,11 @@ for (const path of [
       durationsOf([job("Clippy (mob)", "success", 600), job("Clippy (mob)", "success", 700), job("Clippy (mob)", "failure", 900), job("Clippy (rpc)", "cancelled", 800), job("CI gate", "success", 30)]),
       { "clippy:mob": 700 },
       "the longest successful job of each row",
+    );
+    assert.deepEqual(
+      durationsOf([job("Clippy (core+12)", "success", 300), job("Clippy (core+13)", "success", 400)]),
+      { "clippy:core": 400 },
+      "two packings of one anchor share its row",
     );
     // The checked-in table is readable and measures only the planned lanes.
     const durations = readRowDurations(resolve(root, ROW_DURATIONS));
@@ -1637,18 +1745,83 @@ for (const path of [
     });
   }
   // The feature-check rows are compile-only, but a row whose objects are not
-  // in sccache yet runs long: the rkat+6 matrix row hit the 30-minute timeout
-  // on main push run 39186529346 and on release-branch dispatches (projected
-  // 35-38 minutes cold). Both waves allow exactly 45 minutes: room for a cold
-  // row, and no more, so a hung row still fails early.
+  // in sccache yet runs long: the rkat+6 matrix row took 41m23s cold on
+  // dispatch 39211283488 and was cancelled at the old 45-minute cap on main
+  // push 39213218053 after its commands had run 44m29s. Both waves allow
+  // exactly 60 minutes: room for a cold row, and no more, so a hung row still
+  // fails early.
   for (const job of ["feature-check", "feature-check-rest"]) {
     const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: \d+$/.test(line));
     assert.equal(
       timeout,
-      "    timeout-minutes: 45",
-      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 45 (a cold feature row needs more than 30 minutes, and a longer cap only delays a hung row)`,
+      "    timeout-minutes: 60",
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 60 (a cold feature row takes up to 45 minutes, and a longer cap only delays a hung row)`,
     );
   }
+  // The integration suites, the example web suites and the confinement lane
+  // compile cold on the first push or dispatch of a tree that changes
+  // meerkat-core: a pull request keeps its caps, a push or dispatch gets
+  // caps sized from the cold runs (the comments beside each job).
+  for (const [job, pullRequest, push] of [
+    ["integration", 30, 50],
+    ["example-web", 25, 35],
+    ["mcp-confinement-positive", 40, 50],
+  ]) {
+    const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: /.test(line));
+    assert.equal(
+      timeout,
+      `    timeout-minutes: \${{ github.event_name == 'pull_request' && ${pullRequest} || ${push} }}`,
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not ${pullRequest} minutes on a pull request and ${push} on a push or dispatch`,
+    );
+  }
+  // A pull request that leaves the web wasm to the push still runs the Web
+  // SDK's type and unit tests: every step after them that needs Rust, the
+  // wasm or a browser runs only when the plan builds the wasm.
+  {
+    const steps = [];
+    for (const line of jobLines(workflow, "example-web")) {
+      const name = /^      - name: (.*)$/.exec(line);
+      if (name) steps.push({ name: name[1], lines: [] });
+      else if (steps.length > 0) steps.at(-1).lines.push(line);
+    }
+    const wasmGate = "        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}";
+    const ungated = steps.filter((step) => !step.lines.includes(wasmGate)).map((step) => step.name);
+    assert.deepEqual(
+      ungated,
+      ["Checkout", "Setup Node", "Install the Web SDK", "Web SDK type and unit tests"],
+      "only the checkout, Node and the Web SDK's type and unit tests run without the wasm",
+    );
+    const unitTests = steps.find((step) => step.name === "Web SDK type and unit tests");
+    assert.ok(unitTests.lines.includes("        run: npm test"), "the Web SDK's type and unit tests run npm test");
+    assert.ok(
+      steps.some((step) => step.name === "Build the Web SDK wasm" && step.lines.includes("        run: npm run build:wasm")),
+      "the wasm build is its own gated step",
+    );
+    assert.ok(
+      workflow.includes("      example_web_wasm: ${{ steps.plan.outputs.example_web_wasm }}\n"),
+      "the classification job exports example_web_wasm",
+    );
+    assert.ok(
+      jobLines(workflow, "wasm-timers").includes(
+        "    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web_wasm == 'true' }}",
+      ),
+      "the WASM timer lane, which compiles the same closure, runs with the web wasm build",
+    );
+  }
+  // Every run checks the generated BUILD files against their inputs: the
+  // bazel-graph job's query and --nobuild build accept a stale graph that is
+  // still valid, and the commit hook is local and never sees a merge commit.
+  // Format + governance runs on every event, and the step has no condition.
+  const governance = jobLines(workflow, "fmt-governance");
+  assert.ok(!governance.some((line) => /^    if: /.test(line)), "Format + governance runs on every event");
+  const freshness = governance.indexOf("      - name: Generated Bazel BUILD files are current");
+  assert.ok(freshness >= 0, "Format + governance checks that the generated Bazel BUILD files are current");
+  const nextStep = governance.findIndex((line, index) => index > freshness && /^      - /.test(line));
+  assert.deepEqual(
+    governance.slice(freshness + 1, nextStep === -1 ? governance.length : nextStep),
+    ["        run: node scripts/generate-bazel-rust-builds.mjs --check"],
+    "the BUILD freshness step runs the generator's check and nothing else, on every run",
+  );
   const stagger = jobLines(workflow, "stagger").join("\n");
   assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
   assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
@@ -1893,12 +2066,12 @@ for (const path of [
     "--test gpt_live_replay",
     undefined,
   ]);
-  // A docs edit selects no suite: its integration rows are its reader rows.
+  // A docs edit selects no suite: its integration rows are its reader rows
+  // (rkat's doc-example test runs in the push's closure-tests rows).
   const docsGithub = run(["--format", "github", "--", "docs/index.mdx"]);
   const docsLines = Object.fromEntries(docsGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(docsLines.integration_count, "3");
+  assert.equal(docsLines.integration_count, "2");
   assert.deepEqual(JSON.parse(docsLines.integration_matrix).include.map((row) => row.name), [
-    "reader rkat:bin:rkat",
     "reader xtask:package",
     "reader xtask:test:machines_contracts",
   ]);
@@ -1917,7 +2090,7 @@ for (const path of [
   assert.equal(plan.examples_browser, false);
 }
 {
-  for (const path of ["MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", "tools/bazel/defs.bzl", "tools/buildbuddy/README.md", "scripts/generate-bazel-rust-builds.mjs", "Cargo.lock"]) {
+  for (const path of ["MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", "tools/bazel/defs.bzl", "tools/buildbuddy/README.md", "scripts/generate-bazel-rust-builds.mjs", "scripts/rust-source-text.mjs", "scripts/rust-test-selector.mjs", "scripts/non-shipping-features.json", "Cargo.lock"]) {
     assert.equal(planFor([path]).bazel_graph, true, `${path} selects the Bazel graph check`);
   }
 }
@@ -2235,7 +2408,7 @@ for (const path of [
     staticLanes,
   ]);
   assert.deepEqual(pullRequest.reader_rows.map((row) => row.reads), [["docs/index.mdx"], ["docs/index.mdx"], ["docs/index.mdx"]]);
-  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:bin:rkat", "xtask:package test targets"]);
+  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:test:doc_examples_fixture", "xtask:package test targets"]);
   const prLines = outputs(["--event", "pull_request", "--", "docs/index.mdx"]);
   assert.equal(prLines.integration_count, "3", "the integration lane runs the reader rows");
   assert.deepEqual(JSON.parse(prLines.integration_matrix).include.map((row) => [row.name, row.packages, row.tests]), [
@@ -2247,19 +2420,20 @@ for (const path of [
     ["reader xtask:package", "-p xtask", "--lib --bins"],
     staticLanes.split(" | "),
   ]);
-  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
+  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:test:doc_examples_fixture, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
   // Every push plans xtask's machine-authority contracts, a whole-checkout
   // audit whose test target needs a feature the closure-tests rows do not
   // build, unless an xtask integration suite with that feature runs.
   const machineContracts = "reader xtask:test:machines_contracts | -p xtask --features machine-authority | --test machines_contracts -E test(/(^|::)(canonical_machine_inventory_matches_docs_and_artifact_bundle|live_flow_runtime_reducer_transitions_are_mob_machine_command_gated|live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs)$/)";
   // The docs-only push: its closure-tests rows run the readers' test
-  // targets they build; with no main unit lane, reader rows run the lib and
-  // bin targets, the meerkat-mob chain's included.
-  assert.deepEqual(rowsOf(planFor(["docs/index.mdx"])), [
-    "reader rkat:bin:rkat | -p rkat | --bin rkat -E test(/(^|::)(fenced_rkat_doc_examples_parse_against_clap)$/)",
-    "reader xtask:package | -p xtask | --lib --bins",
-    machineContracts,
-  ]);
+  // targets they build, rkat's doc-example test among them; with no main
+  // unit lane, reader rows run the lib and bin targets.
+  const docsPush = planFor(["docs/index.mdx"]);
+  assert.deepEqual(rowsOf(docsPush), ["reader xtask:package | -p xtask | --lib --bins", machineContracts]);
+  assert.ok(
+    docsPush.closure_test_rows.some((row) => row.binaries.includes("rkat::doc_examples_fixture")),
+    "the docs-only push runs rkat's doc-example test in its closure-tests rows",
+  );
   // A Rust-relevant push runs every package's lib and bins in main unit.
   assert.deepEqual(rowsOf(planFor(["docs/index.mdx", "crates/meerkat-core/src/lib.rs"])), [machineContracts]);
   assert.deepEqual(planFor(["crates/xtask/src/lib.rs"]).reader_rows, [], "xtask's own suite runs its contracts");

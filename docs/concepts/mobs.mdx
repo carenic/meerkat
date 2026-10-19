@@ -44,7 +44,7 @@ for status, wiring, work, and events.
 AgentIdentity  -> durable member handle
 AgentRuntimeId -> current runtime binding
 FenceToken     -> stale-write guard
-Generation     -> respawn counter
+Generation     -> respawn counter (since 0.9.4 a spawn never reuses one)
 ```
 
 This is why callers wire `lead-1` to `analyst-1` instead of wiring internal

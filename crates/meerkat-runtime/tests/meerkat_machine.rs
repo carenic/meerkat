@@ -203,10 +203,12 @@ impl HarnessRuntimeStore {
         self.fail_atomic_apply.store(fail, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "test-support")]
     fn set_fail_recovery_read(&self, fail: bool) {
         self.fail_recovery_read.store(fail, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "test-support")]
     fn set_fail_durable_tail_recovery_source(&self, fail: bool) {
         self.fail_durable_tail_recovery_source
             .store(fail, Ordering::SeqCst);
@@ -2092,6 +2094,7 @@ async fn recycle_attached_runtime_wakes_preserved_queued_work() {
             content: format!("progress-{label}").into(),
             payload: Some(serde_json::json!({ "label": label })),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -4095,6 +4098,7 @@ async fn stop_terminalization_converges_after_destroy_commits_while_stop_hook_is
     );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn completed_boundary_commit_failure_stops_executor_without_false_durable_terminal() {
     use meerkat_core::lifecycle::core_executor::{
@@ -6468,6 +6472,7 @@ fn response_progress(label: &str) -> Input {
         content: format!("progress {label}").into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 

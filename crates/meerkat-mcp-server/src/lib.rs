@@ -6005,9 +6005,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -6062,9 +6060,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -6202,9 +6198,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     }),
                 ],
                 None => vec![
@@ -6214,9 +6208,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     }),
                 ],
             };
@@ -6638,9 +6630,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -7559,9 +7549,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -7787,9 +7775,7 @@ mod tests {
                         1 => Some((Ok(LlmEvent::UsageUpdate { usage }), 2)),
                         2 => Some((
                             Ok(LlmEvent::Done {
-                                outcome: LlmDoneOutcome::Success {
-                                    stop_reason: meerkat_core::StopReason::EndTurn,
-                                },
+                                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                             }),
                             3,
                         )),
@@ -8423,11 +8409,10 @@ mod tests {
     }
 
     fn hooks_override_fixture() -> HookRunOverrides {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/hooks/run_override.json");
-        let payload = std::fs::read_to_string(path).expect("hook override fixture must exist");
-        serde_json::from_str::<HookRunOverrides>(&payload)
-            .expect("hook override fixture must deserialize")
+        serde_json::from_str::<HookRunOverrides>(
+            meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON,
+        )
+        .expect("hook override fixture must deserialize")
     }
 
     #[test]

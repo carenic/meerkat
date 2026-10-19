@@ -449,7 +449,10 @@ fn assert_wire_sibling_feedback(body: &Value) {
     let diagnostic: Value = serde_json::from_str(&refused_text).expect("typed safe refusal JSON");
     assert_eq!(
         diagnostic,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     assert!(!refused_text.contains("synthetic-e3"));
     assert_ne!(allowed["is_error"], true);
@@ -673,7 +676,7 @@ async fn exercise(server: &Server) {
         );
     }
     let refused = audit.iter().find(|record| matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == DENIED_CALL && tool_name == "delete_record"))).unwrap();
     let allowed = audit.iter().find(|record| matches!(&record.observation.observation,
         AuditObservation::Prepared { target, .. }

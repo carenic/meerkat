@@ -1238,3 +1238,59 @@ async fn extraction_turn_has_its_own_id_and_no_turn_started() {
             if *assistant_message_id == Some(extraction)
     )));
 }
+
+/// A fork child that inherited an activated instruction key and never
+/// activated it in the child refuses its model call with the typed activation
+/// error (whose code names the cause), before any provider attempt, rather
+/// than a configuration string.
+#[tokio::test]
+async fn an_unactivated_fork_child_is_refused_with_the_typed_activation_error() {
+    let (tx, _rx) = mpsc::channel(1024);
+    let client = IdentityClient::new(tx.clone(), vec![Call::text("never sent")]);
+    let body = "Always state your uncertainty explicitly.";
+    let mut parent = meerkat_core::Session::new();
+    parent
+        .activate_instruction(meerkat_core::InstructionActivationRequest {
+            revision: meerkat_core::InstructionRevisionRef {
+                namespace: meerkat_core::InstructionNamespace::new("host.standing").unwrap(),
+                key: meerkat_core::InstructionKey::new("member").unwrap(),
+                revision_id: meerkat_core::InstructionRevisionId::new("rev-1").unwrap(),
+                content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+            },
+            activation_id: meerkat_core::InstructionActivationId::new("act-1").unwrap(),
+            expectation: meerkat_core::InstructionActivationExpectation::Absent,
+            supersedes: None,
+            body: body.to_string(),
+        })
+        .expect("the parent activates");
+    let mut child = parent.fork();
+    child
+        .set_build_state(meerkat_core::SessionBuildState::default())
+        .expect("build state serializes");
+    let mut agent = builder()
+        .resume_session(child)
+        .build_standalone(
+            client.clone(),
+            Arc::new(LookupTool {
+                append_image: false,
+            }),
+            Arc::new(NoopStore),
+        )
+        .await;
+
+    let error = agent
+        .run_with_events("hello".to_string().into(), tx)
+        .await
+        .expect_err("the unactivated child cannot run a turn");
+    match error.primary_error() {
+        AgentError::InstructionActivation(activation) => assert_eq!(
+            activation.code(),
+            meerkat_core::InstructionActivationErrorCode::InheritedActivationRequiresExplicitActivation
+        ),
+        other => panic!("expected the typed activation refusal, got {other:?}"),
+    }
+    assert!(
+        client.attempt_ids().is_empty(),
+        "no provider attempt was made"
+    );
+}

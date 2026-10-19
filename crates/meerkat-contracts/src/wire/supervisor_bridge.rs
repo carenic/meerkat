@@ -1158,6 +1158,14 @@ pub struct BridgeCreateForkedParticipantPayload {
     pub scope: BridgeForkedParticipantScope,
     pub reuse: BridgeForkedParticipantReuse,
     pub ttl_millis: u64,
+    /// The controller host's fork instruction policy for the participant's
+    /// fork. Sent only for `reactivate_inherited`: a member host that sees
+    /// no field applies the default, which refuses a participant that would
+    /// inherit activation rows (the council admits the participant's turns
+    /// itself, so nothing else can activate them). A member host older than
+    /// this field rejects a payload that carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<meerkat_core::ForkInstructionPolicy>,
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2498,6 +2506,12 @@ pub enum BridgeRejectionCause {
     /// rebinding any live runtime or recording an alias.
     SessionOwnershipConflict {
         session_id: String,
+    },
+    /// The member host refused a forked participant before committing any
+    /// child: the child would inherit activated host instructions that the
+    /// controller's fork instruction policy does not carry into it.
+    ForkInstructionRefused {
+        refusal: meerkat_core::ForkInstructionRefusal,
     },
 }
 
@@ -7385,6 +7399,7 @@ mod tests {
                 scope: BridgeForkedParticipantScope::InvokeAndObserve,
                 reuse: BridgeForkedParticipantReuse::BoundedReuse { max_uses: 2 },
                 ttl_millis: 60_000,
+                inherited_instructions: None,
             });
         let bytes = serde_json::to_vec(&command).expect("serialize V6 command");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("command JSON");

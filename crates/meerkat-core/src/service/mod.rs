@@ -199,6 +199,11 @@ pub enum SessionError {
     /// waiting at the physical session boundary. No target write was invoked.
     #[error("external session write fence backoff: {reason}")]
     ExternalWriteFenceBackoff { reason: String },
+
+    /// A durable fork was refused before commit because of the activation
+    /// rows its child would inherit. No child session exists.
+    #[error(transparent)]
+    ForkInstructionRefused(crate::ForkInstructionRefusal),
 }
 
 /// Why a durable session refuses to serve a resume while its content stays
@@ -488,6 +493,37 @@ impl SessionError {
         )
     }
 
+    /// Structured-data `kind` of [`Self::fork_source_build_state_missing`].
+    pub const FORK_SOURCE_BUILD_STATE_MISSING_KIND: &'static str =
+        "fork_source_build_state_missing";
+
+    /// A durable fork refused before anything was committed: its source has
+    /// canonical session metadata but no build state, so a child forked from
+    /// it could not run a turn. A session forked by an earlier release that
+    /// never ran a turn of its own is such a source; fork the session it was
+    /// forked from instead. Surfaces answer the invalid-params class.
+    pub fn fork_source_build_state_missing(source_session_id: &SessionId) -> Self {
+        Self::FailedWithData {
+            message: format!(
+                "session {source_session_id} has no build state, so a fork of it could not run a turn"
+            ),
+            data: serde_json::json!({
+                "kind": Self::FORK_SOURCE_BUILD_STATE_MISSING_KIND,
+                "source_session_id": source_session_id.to_string(),
+            }),
+        }
+    }
+
+    /// Whether this error is a [`Self::fork_source_build_state_missing`].
+    pub fn is_fork_source_build_state_missing(&self) -> bool {
+        matches!(
+            self.primary_error(),
+            Self::FailedWithData { data, .. }
+                if data.get("kind").and_then(serde_json::Value::as_str)
+                    == Some(Self::FORK_SOURCE_BUILD_STATE_MISSING_KIND)
+        )
+    }
+
     /// Structured-data `kind` of a [`Self::ServedElsewhere`] refusal on the
     /// wire, where it travels under the session-busy code.
     pub const SERVED_ELSEWHERE_KIND: &'static str = "session_served_elsewhere";
@@ -495,6 +531,11 @@ impl SessionError {
     /// Structured-data `kind` of a [`Self::HostingUnavailable`] refusal on the
     /// wire, where it travels under the runtime-unavailable code.
     pub const HOSTING_UNAVAILABLE_KIND: &'static str = "session_hosting_unavailable";
+
+    /// Structured-data `kind` of a [`Self::ForkInstructionRefused`] refusal on
+    /// the wire. The `fork_instruction_refusal` member carries the typed cause
+    /// and keys.
+    pub const FORK_INSTRUCTION_REFUSED_KIND: &'static str = "fork_instruction_refused";
 
     /// Return a stable error code string for wire formats.
     pub fn code(&self) -> &'static str {
@@ -518,6 +559,7 @@ impl SessionError {
             Self::Unsupported(_) => "SESSION_UNSUPPORTED",
             Self::ExternalWriteFenceConflict { .. } => "SESSION_EXTERNAL_WRITE_FENCE_CONFLICT",
             Self::ExternalWriteFenceBackoff { .. } => "SESSION_EXTERNAL_WRITE_FENCE_BACKOFF",
+            Self::ForkInstructionRefused(_) => "FORK_INSTRUCTION_REFUSED",
             Self::Agent(_) => "AGENT_ERROR",
             Self::FailedWithData { .. } => "SESSION_ERROR",
             Self::CapabilityUnavailable(_) => "CAPABILITY_UNAVAILABLE",
@@ -560,6 +602,10 @@ impl SessionError {
             Self::WholeBlobAuditedEndpointDivergence { id } => Some(
                 self.durable_resume_hold_data(DurableResumeHold::AuditedEndpointDivergence, id),
             ),
+            Self::ForkInstructionRefused(refusal) => Some(serde_json::json!({
+                "kind": Self::FORK_INSTRUCTION_REFUSED_KIND,
+                "fork_instruction_refusal": refusal,
+            })),
             _ => None,
         }
     }
@@ -2862,6 +2908,10 @@ pub struct SessionForkAtRequest {
     /// concrete allow/deny policies replace it on the fork only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. `None` is
+    /// [`crate::ForkInstructionPolicy::RequireExplicitActivation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<crate::ForkInstructionPolicy>,
 }
 
 /// Request to fork a session and apply a typed transcript replacement.
@@ -2879,6 +2929,10 @@ pub struct SessionForkReplaceRequest {
     /// concrete allow/deny policies replace it on the fork only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. `None` is
+    /// [`crate::ForkInstructionPolicy::RequireExplicitActivation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<crate::ForkInstructionPolicy>,
 }
 
 /// A provider-cache-compatible durable transcript fork point.
@@ -3081,6 +3135,9 @@ pub struct DurableSessionForkTarget {
     /// How the durable fork owner treats a source session whose runtime is
     /// currently running a turn.
     pub source_admission: DurableForkSourceAdmission,
+    /// The fork instruction policy this fork applies, already resolved for
+    /// the path's activation window ([`crate::ForkInstructionPolicy::effective`]).
+    pub inherited_instructions: crate::ForkInstructionPolicy,
 }
 
 /// Outcome of a durable fork that first waited, bounded, for the source
@@ -3171,6 +3228,25 @@ pub struct SessionForkResult {
     pub cache_inheritance: ForkCacheInheritance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
+    /// Instruction re-activation rows the fork appended to the child after
+    /// the copied prefix ([`crate::ForkInstructionPolicy::ReactivateInherited`]).
+    /// `message_count` counts them; [`Self::prefix_message_count`] does not.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reactivated_instruction_count: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl SessionForkResult {
+    /// Messages the child copied from its source: the fork prefix, without
+    /// the instruction re-activation rows the fork appended after it.
+    #[must_use]
+    pub fn prefix_message_count(&self) -> usize {
+        self.message_count
+            .saturating_sub(self.reactivated_instruction_count)
+    }
 }
 
 /// Request to rewrite the current transcript head without changing SessionId.
@@ -3349,12 +3425,12 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
-    /// Replace the LLM client on a live session.
-    ///
-    /// Enables mid-session model/provider hot-swap without rebuilding the
-    /// agent. The new client takes effect on the next turn. Returns
-    /// `Unsupported` by default; session services that support live agents
-    /// override this.
+    /// Replace the LLM client on a live session with another client for the
+    /// session's current model, without rebuilding the agent. The new client
+    /// takes effect on the next turn. A client for another provider or model
+    /// is refused with `AgentError::ClientModelChangeRequiresHotSwap`; change
+    /// the model with `hot_swap_session_llm_identity`. Returns `Unsupported`
+    /// by default; session services that support live agents override this.
     async fn set_session_client(
         &self,
         _id: &SessionId,

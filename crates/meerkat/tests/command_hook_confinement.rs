@@ -1,4 +1,5 @@
-#![cfg(not(target_arch = "wasm32"))]
+// Every agent here is built over meerkat-store's in-memory session store.
+#![cfg(all(not(target_arch = "wasm32"), feature = "memory-store"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! Actual composed command hooks and the existing local PreTool refusal path.
@@ -72,7 +73,7 @@ impl LlmClient for RecordingClient {
                 ),
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::success(stop_reason),
             }),
         ]))
     }
@@ -1685,7 +1686,7 @@ mod observe_refusal_locality {
                     ),
                 }));
                 events.push(Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::success(stop_reason),
                 }));
                 Box::pin(futures::stream::iter(events))
             }

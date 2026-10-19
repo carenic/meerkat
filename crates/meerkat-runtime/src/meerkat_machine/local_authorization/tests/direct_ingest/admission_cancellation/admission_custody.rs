@@ -142,7 +142,9 @@ async fn caller_abort_after_custody_transfer_cannot_restore_owned_admission() {
         .unwrap()
         .mutation_gate
         .clone();
-    let held = mutation.lock().await;
+    let held = mutation
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
     let (custody, log) = custody();
     let mut acquisition = AcquisitionObservation::install(&id);
     let caller = tokio::spawn(submit_with_custody(
@@ -219,7 +221,9 @@ async fn current_policy_refusal_after_transfer_restores_not_admitted_custody() {
         .unwrap()
         .mutation_gate
         .clone();
-    let held = mutation.lock().await;
+    let held = mutation
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
     let (custody, log) = custody();
     let mut acquisition = AcquisitionObservation::install(&id);
     let caller = tokio::spawn(submit_with_custody(

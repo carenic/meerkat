@@ -1500,6 +1500,7 @@ mod tests {
                 blocks: None,
                 body: "test".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: crate::identity::Signature::new([0u8; 64]),
         }
@@ -1616,6 +1617,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_classified_sender_error_on_closed_inbox() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -1711,6 +1713,7 @@ mod tests {
     use crate::trust::{TrustEntry, TrustStore};
     use std::sync::atomic::AtomicUsize;
 
+    #[cfg(feature = "workspace-tests")]
     fn make_classification_context(
         trusted: TrustStore,
         require_auth: bool,
@@ -1776,6 +1779,7 @@ mod tests {
         delegate: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectingPeerCommsHandle {
         fn new() -> Arc<Self> {
             Arc::new(Self {
@@ -1850,6 +1854,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_actionable_notify_fires_for_message() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -1869,6 +1874,7 @@ mod tests {
         assert!(result.is_ok(), "Actionable notify should fire for messages");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_actionable_notify_fires_for_request() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -1897,6 +1903,7 @@ mod tests {
         assert!(result.is_ok(), "Actionable notify should fire for requests");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_no_actionable_notify_for_response() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -1928,6 +1935,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_no_actionable_notify_for_ack() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -1953,6 +1961,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_no_actionable_notify_for_plain_event() {
         let ctx = make_classification_context(TrustStore::new(), false);
@@ -1981,6 +1990,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_inbox_no_actionable_notify_for_lifecycle() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2012,6 +2022,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_durable_head_requires_a_claim() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2039,6 +2050,7 @@ mod tests {
         assert_eq!(inbox.test_classified_entries_snapshot().len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn durable_claim_cancel_retains_the_exact_head() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2069,6 +2081,7 @@ mod tests {
         assert_eq!(entries[0].raw_item_id, raw_item_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn wrong_claim_id_is_rejected_without_releasing_or_removing_head() {
         use meerkat_core::interaction::PeerIngressClaimLease as _;
@@ -2099,6 +2112,7 @@ mod tests {
         assert_eq!(inbox.test_classified_entries_snapshot().len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn released_fifo_claim_reacquires_the_same_head_with_a_new_claim_id() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2136,6 +2150,7 @@ mod tests {
         assert_ne!(reacquired.entry.raw_item_id, second_raw_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn durable_raw_item_id_is_stable_across_snapshot_and_claim_cycles() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2166,6 +2181,7 @@ mod tests {
         assert_eq!(second.entry.raw_item_id, expected);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_snapshot_is_non_destructive() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2236,6 +2252,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_snapshot_preserves_request_correlation() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2266,6 +2283,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_snapshot_diagnostics_cover_admitted_shapes() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2378,6 +2396,7 @@ mod tests {
         assert_eq!(entries[4].raw_item_id, entries[4].interaction_id.unwrap());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_snapshot_trust_observation_is_diagnostic_only() {
         let ctx = make_classification_context(TrustStore::new(), false);
@@ -2412,6 +2431,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_happy_path_reports_zero_drops() {
         // Acceptance criterion: on a clean delivery scenario the drop counter
@@ -2432,6 +2452,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_untrusted_sender_returns_typed_drop_reason() {
         // Untrusted sender + require_peer_auth: drop is typed, logged, and
@@ -2453,6 +2474,7 @@ mod tests {
         assert_eq!(inbox.dropped_count(), Some(1));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn classification_then_trust_revoke_then_admission_rechecks_live_trust() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2477,6 +2499,7 @@ mod tests {
         assert_eq!(inbox.dropped_count(), Some(1));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_machine_rejection_returns_classification_rejected_drop_reason() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2525,6 +2548,7 @@ mod tests {
         assert_eq!(inbox.test_classified_entries_snapshot().len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_full_queue_returns_typed_drop_reason() {
         // InboxFull drops surface as typed `Dropped { InboxFull }` with the
@@ -2566,6 +2590,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_send_wait_backpressures_until_capacity_opens() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2616,6 +2641,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_send_wait_rechecks_trust_after_capacity_opens() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2672,6 +2698,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_send_wait_cannot_miss_capacity_notify_between_check_and_await() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2739,6 +2766,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_classified_send_wait_wakes_when_queue_closes_while_full() {
         let sender_pubkey = PubKey::new([1u8; 32]);
@@ -2800,6 +2828,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_classified_send_wait_stress_backpressures_burst_without_drops() {
         const CAPACITY: usize = 8;

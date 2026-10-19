@@ -376,6 +376,21 @@ pub enum AgentErrorReason {
         hook_id: HookId,
         reason: HookFailureReason,
     },
+    /// The provider refused or filtered the response: every
+    /// [`AgentError::ContentFiltered`] failure, with the provider's own
+    /// account when it gave one.
+    ContentFiltered {
+        /// Which refusing stop the provider ended the response with.
+        stop: crate::types::ContentFilteredStop,
+        /// The provider's tagged evidence, absent when it sent none. An
+        /// unknown provider or a malformed detail decodes as absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::types::deserialize_lenient_provider_stop_detail"
+        )]
+        detail: Option<crate::types::ProviderStopDetail>,
+    },
 }
 
 impl AgentErrorReason {
@@ -491,6 +506,10 @@ impl AgentErrorReason {
                     outcome: *outcome,
                     cause_kind: *cause_kind,
                 }),
+            AgentError::ContentFiltered { stop, detail, .. } => Some(Self::ContentFiltered {
+                stop: *stop,
+                detail: detail.as_deref().cloned(),
+            }),
             _ => None,
         }
     }
@@ -555,7 +574,11 @@ impl From<&AgentError> for AgentErrorClass {
             // was previously represented as (a `ConfigError`).
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
-            | AgentError::ControlAppendBlockedByCallbackBatch => Self::Config,
+            | AgentError::ControlAppendBlockedByCallbackBatch
+            | AgentError::ClientModelChangeRequiresHotSwap { .. }
+            // A turn refused by instruction activation history keeps the
+            // config class of its previous `ConfigError` representation.
+            | AgentError::InstructionActivation(_) => Self::Config,
         }
     }
 }
@@ -1304,12 +1327,14 @@ pub fn peer_content_ingested_events(
                 peer,
                 request_id,
                 sender_taint,
+                delivery_id,
                 ..
             } => Some(AgentEvent::PeerContentIngested {
                 kind: kind.clone(),
                 peer: peer.clone(),
                 request_id: request_id.clone(),
                 sender_taint: *sender_taint,
+                delivery_id: *delivery_id,
             }),
             _ => None,
         })
@@ -1368,17 +1393,119 @@ pub fn compare_event_envelopes<T>(a: &EventEnvelope<T>, b: &EventEnvelope<T>) ->
         .then_with(|| a.event_id.cmp(&b.event_id))
 }
 
+/// The lifecycle bit of a tool-config notice as a row stores it: its key and
+/// its value.
+///
+/// A payload or `mcp` block built by 0.9.4 and later is written with
+/// `settled`. Rows written by 0.9.3 and earlier carry the same bit as
+/// `persisted`, `false` for boundary changes that had already applied. A
+/// transcript's head revision and every save and rewrite check digest the
+/// re-serialized rows, so a decoded row keeps the key and value it was stored
+/// with and serializes back to exactly those bytes. Readers never use the
+/// stored value: [`ToolConfigChangedPayload::settled`] derives the lifecycle
+/// fact from the status, and [`crate::types::SystemNoticeBlock::lifecycle_settled`]
+/// derives an `mcp` block's from its phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConfigLifecycleBit {
+    /// Written as `settled` (0.9.4 and later).
+    Settled(bool),
+    /// Stored as `persisted` by 0.9.3 and earlier.
+    Persisted(bool),
+    /// Stored without a lifecycle bit.
+    Absent,
+}
+
+impl ToolConfigLifecycleBit {
+    /// The bit a decoded row stored: `settled` when present, else 0.9.3's
+    /// `persisted`. No release writes both.
+    #[must_use]
+    pub fn from_stored(settled: Option<bool>, persisted: Option<bool>) -> Self {
+        match (settled, persisted) {
+            (Some(value), _) => Self::Settled(value),
+            (None, Some(value)) => Self::Persisted(value),
+            (None, None) => Self::Absent,
+        }
+    }
+
+    /// The stored value, `false` when no bit was stored (the default 0.9.3
+    /// decoded a missing `mcp` block bit to).
+    #[must_use]
+    pub fn stored_value(self) -> bool {
+        match self {
+            Self::Settled(value) | Self::Persisted(value) => value,
+            Self::Absent => false,
+        }
+    }
+}
+
+/// Serialized flattened into its payload or block, at the position the bit
+/// has always had: one `settled` or `persisted` entry, or none.
+impl Serialize for ToolConfigLifecycleBit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        match *self {
+            Self::Settled(value) => {
+                let mut bit = serializer.serialize_struct("ToolConfigLifecycleBit", 1)?;
+                bit.serialize_field("settled", &value)?;
+                bit.end()
+            }
+            Self::Persisted(value) => {
+                let mut bit = serializer.serialize_struct("ToolConfigLifecycleBit", 1)?;
+                bit.serialize_field("persisted", &value)?;
+                bit.end()
+            }
+            Self::Absent => serializer
+                .serialize_struct("ToolConfigLifecycleBit", 0)?
+                .end(),
+        }
+    }
+}
+
+// Schema of the lifecycle bit: a payload this version builds carries
+// `settled`; one stored by 0.9.3 and earlier is served back with the
+// `persisted` it was stored with.
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ToolConfigChangedPayloadLifecycleBitSchema {
+    /// Whether the change is settled (not pending or draining), derived from
+    /// `status_info`. Every payload built by 0.9.4 and later carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "bool")]
+    settled: Option<bool>,
+    /// The bit a payload stored by 0.9.3 and earlier carries instead of
+    /// `settled`, served back unchanged. It was `false` for some changes that
+    /// had already applied, so derive the fact from `status_info` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "bool")]
+    persisted: Option<bool>,
+}
+
 /// Payload for tool configuration change notifications.
 ///
 /// The typed `status_info` is the sole owner of the change status; display
 /// text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+/// The lifecycle fact is derived from it too ([`Self::settled`],
+/// [`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+/// with that value as `settled`; a decoded payload keeps the bit it was stored
+/// with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+/// which carry `persisted`, serialize back unchanged.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolConfigChangedPayload {
     pub operation: ToolConfigChangeOperation,
     pub target: String,
     status_info: ToolConfigChangeStatus,
-    pub persisted: bool,
+    // The bit as written, for byte fidelity; readers use `settled()`.
+    #[serde(flatten)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(with = "ToolConfigChangedPayloadLifecycleBitSchema")
+    )]
+    lifecycle_bit: ToolConfigLifecycleBit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at_turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1387,19 +1514,53 @@ pub struct ToolConfigChangedPayload {
     pub deferred_catalog_delta: Option<DeferredCatalogDelta>,
 }
 
+impl<'de> Deserialize<'de> for ToolConfigChangedPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// The stored shape. The lifecycle bit is kept as stored, for byte
+        /// fidelity only; the status decides [`ToolConfigChangedPayload::settled`].
+        #[derive(Deserialize)]
+        struct Stored {
+            operation: ToolConfigChangeOperation,
+            target: String,
+            status_info: ToolConfigChangeStatus,
+            #[serde(default)]
+            settled: Option<bool>,
+            #[serde(default)]
+            persisted: Option<bool>,
+            #[serde(default)]
+            applied_at_turn: Option<u32>,
+            #[serde(default)]
+            domain: Option<ToolConfigChangeDomain>,
+            #[serde(default)]
+            deferred_catalog_delta: Option<DeferredCatalogDelta>,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let mut payload = Self::new(stored.operation, stored.target, stored.status_info)
+            .with_applied_at_turn(stored.applied_at_turn)
+            .with_domain(stored.domain)
+            .with_deferred_catalog_delta(stored.deferred_catalog_delta);
+        payload.lifecycle_bit =
+            ToolConfigLifecycleBit::from_stored(stored.settled, stored.persisted);
+        Ok(payload)
+    }
+}
+
 impl ToolConfigChangedPayload {
     #[must_use]
     pub fn new(
         operation: ToolConfigChangeOperation,
         target: impl Into<String>,
         status_info: ToolConfigChangeStatus,
-        persisted: bool,
     ) -> Self {
+        let lifecycle_bit = ToolConfigLifecycleBit::Settled(status_info.is_settled());
         Self {
             operation,
             target: target.into(),
             status_info,
-            persisted,
+            lifecycle_bit,
             applied_at_turn: None,
             domain: None,
             deferred_catalog_delta: None,
@@ -1409,6 +1570,24 @@ impl ToolConfigChangedPayload {
     #[must_use]
     pub fn status_info(&self) -> &ToolConfigChangeStatus {
         &self.status_info
+    }
+
+    /// Whether the change is a settled lifecycle fact rather than a pending
+    /// or draining step, derived from the status for every payload, decoded
+    /// or built. It says nothing about configuration: whether a change was
+    /// written there is the `mcp/add` / `mcp/remove` response's `persisted`,
+    /// and the realm configuration itself.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.status_info.is_settled()
+    }
+
+    /// The lifecycle bit as this payload is written: `settled` for a payload
+    /// built here, or the bit a decoded row stored. Kept for byte fidelity;
+    /// use [`Self::settled`] for the lifecycle fact.
+    #[must_use]
+    pub fn lifecycle_bit(&self) -> ToolConfigLifecycleBit {
+        self.lifecycle_bit
     }
 
     #[must_use]
@@ -1482,6 +1661,16 @@ pub enum ExternalToolDeltaPhase {
 }
 
 impl ExternalToolDeltaPhase {
+    /// Whether a delta in this phase is a settled lifecycle fact: every phase
+    /// except `Pending` and `Draining`.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        match self {
+            Self::Pending | Self::Draining => false,
+            Self::Applied | Self::Forced | Self::Failed => true,
+        }
+    }
+
     #[must_use]
     pub fn as_status(self) -> &'static str {
         match self {
@@ -1565,6 +1754,20 @@ impl ToolConfigChangeStatus {
         }
     }
 
+    /// Whether this status reports a settled lifecycle fact. A tool-scope
+    /// boundary, a deferred-catalog delta and a failed-closed warning report
+    /// changes that have already applied or closed; an external tool delta is
+    /// settled unless it is still pending or draining.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        match self {
+            Self::BoundaryApplied { .. }
+            | Self::DeferredCatalogDelta { .. }
+            | Self::WarningFailedClosed { .. } => true,
+            Self::ExternalToolDelta { phase, .. } => phase.is_settled(),
+        }
+    }
+
     #[must_use]
     pub fn status_text(&self) -> String {
         match self {
@@ -1599,12 +1802,15 @@ impl ToolConfigChangeStatus {
 }
 
 /// Canonical outward lifecycle delta for external-tool surface changes.
+///
+/// Whether the delta is settled is derived from its phase
+/// ([`Self::settled`]); it is not stored, and a stored `persisted` from 0.9.3
+/// and earlier is ignored on decode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalToolDelta {
     pub target: String,
     pub operation: ToolConfigChangeOperation,
     pub phase: ExternalToolDeltaPhase,
-    pub persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at_turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1653,7 +1859,7 @@ impl ExternalToolDelta {
                     server_id: Some(self.target.clone()),
                     operation: Some(self.operation.clone()),
                     phase: Some(self.phase),
-                    persisted: self.persisted,
+                    lifecycle_bit: ToolConfigLifecycleBit::Settled(self.settled()),
                     detail: Some(detail),
                     confinement_refusal: self.confinement_refusal,
                     pending_sources: Vec::new(),
@@ -1672,10 +1878,6 @@ impl ExternalToolDelta {
             target: target.into(),
             operation,
             phase,
-            persisted: !matches!(
-                phase,
-                ExternalToolDeltaPhase::Pending | ExternalToolDeltaPhase::Draining
-            ),
             applied_at_turn: None,
             tool_count: None,
             detail: None,
@@ -1714,6 +1916,13 @@ impl ExternalToolDelta {
         self
     }
 
+    /// Whether the delta is a settled lifecycle fact: its phase is neither
+    /// `Pending` nor `Draining`.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.phase.is_settled()
+    }
+
     #[must_use]
     pub fn status_text(&self) -> String {
         ToolConfigChangeStatus::external_tool_delta(self.phase, self.detail.clone()).status_text()
@@ -1727,13 +1936,8 @@ impl ExternalToolDelta {
             confinement_refusal: self.confinement_refusal,
             restore: self.restore,
         };
-        ToolConfigChangedPayload::new(
-            self.operation.clone(),
-            self.target.clone(),
-            status_info,
-            self.persisted,
-        )
-        .with_applied_at_turn(self.applied_at_turn)
+        ToolConfigChangedPayload::new(self.operation.clone(), self.target.clone(), status_info)
+            .with_applied_at_turn(self.applied_at_turn)
     }
 }
 
@@ -2607,6 +2811,18 @@ pub enum AgentEvent {
         messages_before: usize,
         /// Messages after compaction.
         messages_after: usize,
+        /// Who wrote the summary, and for a provider call how much of the
+        /// history its source carried. `None` only for a completion an
+        /// earlier version recorded before it reported the source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_source: Option<crate::agent::compact::CompactionSummarySource>,
+        /// Estimated history tokens the rewrite left, in the unit of
+        /// `CompactionStarted::estimated_history_tokens`; comparing the two
+        /// shows how much the compaction recovered. `None` for a completion
+        /// recorded before 0.9.4, or when the rewritten history could not be
+        /// measured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_history_tokens_after: Option<u64>,
     },
 
     /// Context compaction failed (non-fatal — agent continues with uncompacted history).
@@ -2747,11 +2963,11 @@ pub enum AgentEvent {
     ///
     /// Emitted as a pure projection of the typed transcript carrier
     /// ([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)
-    /// at the moment the agent commits it — a queued delivery appended to the
-    /// transcript at run assembly, or a steer delivery injected as a
-    /// request-local User message at the model boundary. One event per committed comms
-    /// block, so a host taint tracker classifies peer ingestion from typed
-    /// facts (canonical peer identity + the sender's signed content-taint
+    /// at the moment the agent commits it: a delivery appended to the
+    /// transcript at run assembly, or a steer written into the running turn's
+    /// transcript at a model boundary. One event per committed comms block, so
+    /// a host taint tracker classifies peer ingestion from typed facts
+    /// (canonical peer identity + the sender's signed content-taint
     /// declaration) instead of parsing rendered projection text.
     ///
     /// The event stream is best-effort observability (see `event_tap`); the
@@ -2773,6 +2989,12 @@ pub enum AgentEvent {
         /// third state that consumers must never coalesce into `Clean`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_taint: Option<crate::comms::SenderContentTaint>,
+        /// The delivery id of an incoming peer message (the sender's envelope
+        /// id, which `reply_to_peer` takes as `reply_to`), read from the same
+        /// transcript block. `None` for other kinds and for deliveries that
+        /// carry no id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_id: Option<crate::interaction::InteractionId>,
     },
 
     /// One model turn's provider token accounting was absent.
@@ -3239,9 +3461,26 @@ pub fn format_verbose_event_with_config(
             summary_tokens,
             messages_before,
             messages_after,
-        } => Some(format!(
-            "  ✓ Compaction complete: {messages_before} → {messages_after} messages, {summary_tokens} summary tokens"
-        )),
+            summary_source,
+            estimated_history_tokens_after,
+        } => {
+            let source = match summary_source {
+                Some(crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Trimmed { .. },
+                }) => ", from a trimmed source".to_string(),
+                Some(crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound:
+                        crate::compact::SummarizationSourceBound::RequestsOnly { kept, of },
+                }) => format!(", from the newest {kept} of {of} user requests"),
+                _ => String::new(),
+            };
+            let left = estimated_history_tokens_after
+                .map(|tokens| format!(", ~{tokens} history tokens left"))
+                .unwrap_or_default();
+            Some(format!(
+                "  ✓ Compaction complete: {messages_before} → {messages_after} messages, {summary_tokens} summary tokens{source}{left}"
+            ))
+        }
         AgentEvent::CompactionFailed { reason } => {
             Some(format!("  ✗ Compaction failed (continuing): {reason}"))
         }
@@ -3359,6 +3598,84 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A completion recorded before the summary source existed still reads,
+    /// with no source, and writes back to the same bytes; a current one
+    /// carries the typed source on the wire.
+    #[test]
+    fn compaction_completed_summary_source_is_typed_and_backward_compatible() {
+        let legacy = serde_json::json!({
+            "type": "compaction_completed",
+            "summary_tokens": 5,
+            "messages_before": 9,
+            "messages_after": 2,
+        });
+        let parsed: AgentEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEvent::CompactionCompleted {
+                summary_source: None,
+                estimated_history_tokens_after: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+
+        let current = AgentEvent::CompactionCompleted {
+            summary_tokens: 5,
+            messages_before: 9,
+            messages_after: 2,
+            summary_source: Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::RequestsOnly {
+                        kept: 3,
+                        of: 40,
+                    },
+                },
+            ),
+            estimated_history_tokens_after: Some(61_234),
+        };
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::json!({
+                "type": "compaction_completed",
+                "summary_tokens": 5,
+                "messages_before": 9,
+                "messages_after": 2,
+                "summary_source": {
+                    "kind": "provider_call",
+                    "source_bound": {"kind": "requests_only", "kept": 3, "of": 40},
+                },
+                "estimated_history_tokens_after": 61234,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(serde_json::to_value(&current).unwrap()).unwrap(),
+            AgentEvent::CompactionCompleted {
+                estimated_history_tokens_after: Some(61_234),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Trimmed {
+                        through: crate::compact::SummarizationTrimStage::UserRequests,
+                    },
+                }
+            )
+            .unwrap(),
+            serde_json::json!({
+                "kind": "provider_call",
+                "source_bound": {"kind": "trimmed", "through": "user_requests"},
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(crate::agent::compact::CompactionSummarySource::HostCurator)
+                .unwrap(),
+            serde_json::json!({"kind": "host_curator"})
+        );
+    }
 
     #[test]
     fn message_scoped_events_are_backward_compatible_and_carry_the_id() {
@@ -3606,6 +3923,8 @@ mod tests {
                 summary: None,
                 payload: None,
                 content: Vec::new(),
+                delivery_id: None,
+                in_reply_to: None,
             }
         }
 
@@ -3630,8 +3949,10 @@ mod tests {
                     peer,
                     request_id,
                     sender_taint,
+                    delivery_id,
                 } => {
                     assert_eq!(*kind, CommsNoticeKind::Message);
+                    assert_eq!(*delivery_id, None, "no delivery id on the block");
                     assert!(peer.is_some(), "peer identity must project");
                     assert_eq!(request_id.as_deref(), Some("req-1"));
                     assert_eq!(*sender_taint, Some(SenderContentTaint::Tainted));
@@ -4052,7 +4373,6 @@ mod tests {
                 ToolConfigChangeOperation::Reload,
                 "tool_scope",
                 status.clone(),
-                false,
             )
             .with_applied_at_turn(Some(4))
             .with_domain(Some(ToolConfigChangeDomain::ToolScope)),
@@ -4062,6 +4382,11 @@ mod tests {
         assert!(
             json["payload"].get("status").is_none(),
             "derived status text must not be serialized beside typed status_info"
+        );
+        assert_eq!(json["payload"]["settled"], true);
+        assert!(
+            json["payload"].get("persisted").is_none(),
+            "the lifecycle bit is written as settled, never as persisted"
         );
         assert_eq!(json["payload"]["status_info"]["kind"], "boundary_applied");
         assert_eq!(json["payload"]["status_info"]["base_changed"], true);
@@ -4078,6 +4403,135 @@ mod tests {
         } else {
             panic!("expected tool_config_changed event");
         }
+    }
+
+    /// A tool-scope boundary, a deferred-catalog delta and a failed-closed
+    /// warning report changes that have already applied or closed, so the
+    /// agent's payloads for them are settled; an external tool delta is
+    /// settled unless pending or draining.
+    #[test]
+    fn agent_boundary_payloads_are_settled() {
+        for status in [
+            ToolConfigChangeStatus::boundary_applied(true, false, 3),
+            ToolConfigChangeStatus::deferred_catalog_delta(1, 0, 0),
+            ToolConfigChangeStatus::warning_failed_closed("denied"),
+        ] {
+            let payload = ToolConfigChangedPayload::new(
+                ToolConfigChangeOperation::Reload,
+                "tool_scope",
+                status,
+            );
+            assert!(payload.settled(), "{:?}", payload.status_info());
+        }
+        for (phase, settled) in [
+            (ExternalToolDeltaPhase::Pending, false),
+            (ExternalToolDeltaPhase::Draining, false),
+            (ExternalToolDeltaPhase::Applied, true),
+            (ExternalToolDeltaPhase::Forced, true),
+            (ExternalToolDeltaPhase::Failed, true),
+        ] {
+            let delta = ExternalToolDelta::new("server", ToolConfigChangeOperation::Add, phase);
+            assert_eq!(delta.settled(), settled, "{phase:?}");
+            assert_eq!(
+                delta.to_tool_config_changed_payload().settled(),
+                settled,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// 0.9.3 wrote `persisted`, `false` for the three agent-boundary
+    /// statuses although those changes had applied. `settled()` derives the
+    /// fact from the status and never reads the stored bit, while the payload
+    /// writes the stored key and value back unchanged (its transcript digest
+    /// covers those bytes).
+    #[test]
+    fn tool_config_changed_payload_derives_settled_from_status_on_decode() {
+        let stored_093 = |status_info: serde_json::Value, persisted: bool| {
+            serde_json::json!({
+                "operation": "reload",
+                "target": "tool_scope",
+                "status_info": status_info,
+                "persisted": persisted,
+            })
+        };
+        for (status_info, settled) in [
+            (
+                serde_json::json!({
+                    "kind": "boundary_applied",
+                    "base_changed": true,
+                    "visible_changed": false,
+                    "revision": 2
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({
+                    "kind": "deferred_catalog_delta",
+                    "added_hidden_count": 1,
+                    "removed_hidden_count": 0,
+                    "pending_source_count": 0
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "warning_failed_closed", "error": "denied"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "applied"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "pending"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "draining"}),
+                false,
+            ),
+        ] {
+            for stored in [true, false] {
+                let payload: ToolConfigChangedPayload =
+                    serde_json::from_value(stored_093(status_info.clone(), stored)).unwrap();
+                assert_eq!(
+                    payload.settled(),
+                    settled,
+                    "{status_info} stored persisted={stored}"
+                );
+                assert_eq!(
+                    payload.lifecycle_bit(),
+                    ToolConfigLifecycleBit::Persisted(stored)
+                );
+                assert_eq!(
+                    serde_json::to_value(&payload).unwrap(),
+                    stored_093(status_info.clone(), stored),
+                    "the stored row is written back unchanged"
+                );
+            }
+        }
+        let mut current = stored_093(
+            serde_json::json!({"kind": "external_tool_delta", "phase": "pending"}),
+            false,
+        );
+        let object = current.as_object_mut().unwrap();
+        object.remove("persisted");
+        object.insert("settled".into(), serde_json::json!(true));
+        let payload: ToolConfigChangedPayload = serde_json::from_value(current.clone()).unwrap();
+        assert!(
+            !payload.settled(),
+            "a stored settled is not read back either"
+        );
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            current,
+            "but it is written back as stored"
+        );
+        let mut bare = current;
+        bare.as_object_mut().unwrap().remove("settled");
+        let payload: ToolConfigChangedPayload = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(payload.lifecycle_bit(), ToolConfigLifecycleBit::Absent);
+        assert_eq!(serde_json::to_value(&payload).unwrap(), bare);
     }
 
     #[test]
@@ -4298,6 +4752,15 @@ mod tests {
                 summary_tokens: 2048,
                 messages_before: 42,
                 messages_after: 8,
+                summary_source: Some(
+                    crate::agent::compact::CompactionSummarySource::ProviderCall {
+                        source_bound: crate::compact::SummarizationSourceBound::RequestsOnly {
+                            kept: 3,
+                            of: 40,
+                        },
+                    },
+                ),
+                estimated_history_tokens_after: Some(30_000),
             },
             AgentEvent::CompactionFailed {
                 reason: CompactionFailureReason::LlmFailed {
@@ -4331,7 +4794,6 @@ mod tests {
                         ExternalToolDeltaPhase::Pending,
                         None,
                     ),
-                    false,
                 )
                 .with_applied_at_turn(Some(12)),
             },
@@ -4777,6 +5239,113 @@ mod tests {
         );
     }
 
+    /// #1888: every content-filtered failure reports its typed stop,
+    /// with the provider's detail when it sent one. The detail is only
+    /// carried: class, Display, the turn failure source and the session
+    /// error code are the same with and without it.
+    #[test]
+    fn content_filtered_report_carries_its_stop_with_or_without_detail() {
+        use crate::types::{ContentFilteredStop, ProviderStopDetail};
+        let detail = ProviderStopDetail::anthropic(
+            Some("cyber".to_string()),
+            Some("This request was declined.".to_string()),
+        );
+        let with_detail = crate::error::AgentError::ContentFiltered {
+            turn: 2,
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(Box::new(detail.clone())),
+        };
+        let without_detail = crate::error::AgentError::ContentFiltered {
+            turn: 2,
+            stop: ContentFilteredStop::Refusal,
+            detail: None,
+        };
+
+        let report_with = AgentErrorReport::from_agent_error(&with_detail);
+        let report_without = AgentErrorReport::from_agent_error(&without_detail);
+        assert_eq!(report_with.class, AgentErrorClass::ContentFiltered);
+        assert_eq!(report_without.class, AgentErrorClass::ContentFiltered);
+        assert_eq!(with_detail.to_string(), without_detail.to_string());
+        assert_eq!(report_with.message, report_without.message);
+        assert_eq!(
+            crate::turn_execution_authority::TurnFailureSourceKind::from_agent_error(&with_detail)
+                .ok(),
+            crate::turn_execution_authority::TurnFailureSourceKind::from_agent_error(
+                &without_detail
+            )
+            .ok(),
+        );
+        assert_eq!(
+            report_with.reason,
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: Some(detail),
+            })
+        );
+        assert_eq!(
+            report_without.reason,
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: None,
+            })
+        );
+
+        let wire_with = serde_json::to_value(&report_with).expect("serialize");
+        assert_eq!(wire_with["reason"]["reason_type"], "content_filtered");
+        assert_eq!(wire_with["reason"]["stop"], "refusal");
+        assert_eq!(wire_with["reason"]["detail"]["provider"], "anthropic");
+        assert_eq!(wire_with["reason"]["detail"]["category"], "cyber");
+        let wire_without = serde_json::to_value(&report_without).expect("serialize");
+        assert_eq!(wire_without["reason"]["reason_type"], "content_filtered");
+        assert_eq!(wire_without["reason"]["stop"], "refusal");
+        assert!(wire_without["reason"].get("detail").is_none());
+
+        assert_eq!(
+            crate::service::SessionError::Agent(with_detail).code(),
+            crate::service::SessionError::Agent(without_detail).code(),
+        );
+    }
+
+    /// #1888: provider evidence never makes a record undecodable. An
+    /// unknown provider tag or a malformed detail decodes as absent, and the
+    /// typed stop survives.
+    #[test]
+    fn content_filtered_reason_decodes_unknown_or_malformed_detail_as_absent() {
+        use crate::types::{ContentFilteredStop, GeminiStopStage, ProviderStopDetail};
+        for raw in [
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"future_provider","code":7}}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"gemini","stage":"nowhere","reason":"SAFETY"}}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":"not an object"}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":null}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter"}"#,
+        ] {
+            let reason: AgentErrorReason = serde_json::from_str(raw).expect(raw);
+            assert_eq!(
+                reason,
+                AgentErrorReason::ContentFiltered {
+                    stop: ContentFilteredStop::ContentFilter,
+                    detail: None,
+                },
+                "{raw}"
+            );
+        }
+        let known: AgentErrorReason = serde_json::from_str(
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"gemini","stage":"prompt","reason":"BLOCKLIST"}}"#,
+        )
+        .expect("known detail");
+        assert_eq!(
+            known,
+            AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::ContentFilter,
+                detail: Some(ProviderStopDetail::gemini(
+                    GeminiStopStage::Prompt,
+                    "BLOCKLIST",
+                    Vec::new(),
+                )),
+            }
+        );
+    }
+
     #[test]
     fn provider_error_projection_uses_canonical_retryability() {
         for (kind, raw_retryability, expected_retryable) in [
@@ -5062,6 +5631,10 @@ mod tests {
                 summary_tokens: 1,
                 messages_before: 3,
                 messages_after: 1,
+                summary_source: Some(
+                    crate::agent::compact::CompactionSummarySource::MechanicalFallback,
+                ),
+                estimated_history_tokens_after: None,
             },
             AgentEvent::CompactionFailed {
                 reason: CompactionFailureReason::EmptySummary,
@@ -5133,7 +5706,6 @@ mod tests {
                         ExternalToolDeltaPhase::Applied,
                         None,
                     ),
-                    true,
                 )
                 .with_applied_at_turn(Some(1)),
             },

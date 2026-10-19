@@ -97,6 +97,10 @@ struct RunnerScript {
     interrupts: AtomicUsize,
     /// When set, the exact-run interrupt callback fails after counting.
     interrupt_fails: AtomicBool,
+    /// The reply capabilities each prepared durable boundary delivery
+    /// carries, in preparation order.
+    prepared_reply_capabilities:
+        std::sync::Mutex<Vec<Vec<meerkat_core::comms::PeerReplyCapability>>>,
 }
 
 impl RunnerScript {
@@ -124,6 +128,7 @@ impl RunnerScript {
             interrupt_step: std::sync::Mutex::new(Some(RunnerStep::CancelDiscardingImage)),
             interrupts: AtomicUsize::new(0),
             interrupt_fails: AtomicBool::new(false),
+            prepared_reply_capabilities: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -163,6 +168,10 @@ impl RunnerScript {
     fn applied_durable(&self) -> Vec<InputId> {
         self.applied_durable.lock().unwrap().clone()
     }
+
+    fn prepared_reply_capabilities(&self) -> Vec<Vec<meerkat_core::comms::PeerReplyCapability>> {
+        self.prepared_reply_capabilities.lock().unwrap().clone()
+    }
 }
 
 struct DurableSteerBoundaryHandle {
@@ -188,6 +197,13 @@ impl CoreExecutorBoundaryHandle for DurableSteerBoundaryHandle {
         meerkat_core::lifecycle::CoreBoundaryStageOutput,
         meerkat_core::lifecycle::CoreBoundaryStageError,
     > {
+        if let meerkat_core::TurnBoundaryDelivery::DurableAppends(appends) = &delivery {
+            self.script
+                .prepared_reply_capabilities
+                .lock()
+                .unwrap()
+                .push(appends.peer_reply_capabilities().to_vec());
+        }
         let prepared = self
             .state
             .prepare_active_turn_boundary(expected_run_id, delivery)
@@ -234,10 +250,41 @@ impl meerkat_core::lifecycle::CoreExecutorInterruptHandle for DurableSteerInterr
     }
 }
 
+/// Records the interaction terminals the runtime publishes. A directed input
+/// is admitted only by an executor that offers this capability.
+#[derive(Default)]
+struct DurableSteerTerminalPublisher {
+    events: std::sync::Mutex<Vec<meerkat_core::event::AgentEvent>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for DurableSteerTerminalPublisher {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        CoreExecutorError,
+    > {
+        self.events.lock().unwrap().extend_from_slice(events);
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
+                    event,
+                    index as u64 + 1,
+                )
+            })
+            .collect()
+    }
+}
+
 struct DurableSteerExecutor {
     turn_state: Arc<dyn TurnStateHandle>,
     state: meerkat_core::TransientTurnContextStateHandle,
     script: Arc<RunnerScript>,
+    terminal_publisher: Option<Arc<DurableSteerTerminalPublisher>>,
 }
 
 #[async_trait::async_trait]
@@ -287,6 +334,14 @@ impl CoreExecutor for DurableSteerExecutor {
         Some(Arc::new(DurableSteerInterruptHandle {
             script: Arc::clone(&self.script),
         }))
+    }
+
+    fn publication_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
+        self.terminal_publisher
+            .clone()
+            .map(|publisher| publisher as Arc<_>)
     }
 
     async fn apply(
@@ -461,7 +516,26 @@ impl DurableSteerRig {
         Self::with_adapter_for_session(adapter, SessionId::new()).await
     }
 
+    /// An ephemeral rig whose executor offers a terminal publication
+    /// capability, as directed inputs require.
+    async fn ephemeral_with_terminal_publication() -> Self {
+        Self::with_executor_options(
+            Arc::new(MeerkatMachine::ephemeral()),
+            SessionId::new(),
+            Some(Arc::new(DurableSteerTerminalPublisher::default())),
+        )
+        .await
+    }
+
     async fn with_adapter_for_session(adapter: Arc<MeerkatMachine>, session_id: SessionId) -> Self {
+        Self::with_executor_options(adapter, session_id, None).await
+    }
+
+    async fn with_executor_options(
+        adapter: Arc<MeerkatMachine>,
+        session_id: SessionId,
+        terminal_publisher: Option<Arc<DurableSteerTerminalPublisher>>,
+    ) -> Self {
         let bindings = adapter
             .prepare_bindings(session_id.clone())
             .await
@@ -475,6 +549,7 @@ impl DurableSteerRig {
                     turn_state: Arc::clone(bindings.turn_state()),
                     state: state.clone(),
                     script: Arc::clone(&script),
+                    terminal_publisher,
                 }),
             )
             .await
@@ -507,11 +582,14 @@ impl DurableSteerRig {
     }
 
     async fn admit(&self, input: Input) -> Option<crate::completion::CompletionHandle> {
-        let (outcome, completion) = self
-            .adapter
-            .accept_input_with_completion(&self.session_id, input)
-            .await
-            .expect("steer input accepted");
+        let (outcome, completion) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.adapter
+                .accept_input_with_completion(&self.session_id, input),
+        )
+        .await
+        .expect("a waiting durable delivery must not hold up later admissions")
+        .expect("steer input accepted");
         assert!(outcome.is_accepted());
         completion
     }
@@ -636,34 +714,135 @@ fn typed_steer(detail: &str, role: ConversationAppendRole) -> Input {
     Input::Prompt(prompt)
 }
 
-fn peer_steer(body: &str) -> Input {
+fn steer_header(source: crate::input::InputOrigin) -> crate::input::InputHeader {
+    crate::input::InputHeader {
+        ingress_context: None,
+        retained_resume: None,
+        authority_association: None,
+        id: InputId::new(),
+        timestamp: chrono::Utc::now(),
+        source,
+        durability: crate::input::InputDurability::Durable,
+        visibility: crate::input::InputVisibility::default(),
+        idempotency_key: None,
+        supersession_key: None,
+        correlation_id: None,
+    }
+}
+
+fn steer_metadata() -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+        handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        ..Default::default()
+    }
+}
+
+/// A peer steer of one convention, as the comms bridge admits it.
+fn peer_steer_with(convention: crate::input::PeerConvention, body: &str) -> Input {
     Input::Peer(crate::input::PeerInput {
         directed_interaction_id: None,
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
         sender_taint: None,
-        header: crate::input::InputHeader {
-            ingress_context: None,
-            retained_resume: None,
-            authority_association: None,
-            id: InputId::new(),
-            timestamp: chrono::Utc::now(),
-            source: crate::input::InputOrigin::Peer {
-                peer_id: "durable-steer-peer".into(),
-                display_identity: None,
-                runtime_id: None,
-            },
-            durability: crate::input::InputDurability::Durable,
-            visibility: crate::input::InputVisibility::default(),
-            idempotency_key: None,
-            supersession_key: None,
-            correlation_id: None,
-        },
-        convention: Some(crate::input::PeerConvention::Message),
+        header: steer_header(crate::input::InputOrigin::Peer {
+            peer_id: "durable-steer-peer".into(),
+            display_identity: None,
+            runtime_id: None,
+        }),
+        convention: Some(convention),
         content: body.into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
+    })
+}
+
+fn peer_steer(body: &str) -> Input {
+    peer_steer_with(crate::input::PeerConvention::Message, body)
+}
+
+fn peer_request_steer(body: &str) -> Input {
+    peer_steer_with(
+        crate::input::PeerConvention::Request {
+            request_id: format!("req-{}", uuid::Uuid::new_v4()),
+            intent: "checksum_token".into(),
+        },
+        body,
+    )
+}
+
+fn peer_lifecycle_steer(body: &str) -> Input {
+    peer_steer_with(
+        crate::input::PeerConvention::Lifecycle {
+            kind: meerkat_core::comms::PeerLifecycleKind::PeerAdded,
+        },
+        body,
+    )
+}
+
+/// A directed peer steer: its interaction, input, correlation and idempotency
+/// ids agree and it names the sending runtime, as a host-residency-fenced
+/// bridge delivery carries them.
+fn directed_peer_steer(body: &str) -> Input {
+    let mut input = peer_steer(body);
+    if let Input::Peer(peer) = &mut input {
+        let interaction = meerkat_core::interaction::InteractionId(peer.header.id.0);
+        peer.directed_interaction_id = Some(interaction);
+        peer.header.correlation_id =
+            Some(crate::identifiers::CorrelationId::from_uuid(interaction.0));
+        peer.header.idempotency_key = Some(crate::identifiers::IdempotencyKey::new(
+            interaction.to_string(),
+        ));
+        peer.header.source = crate::input::InputOrigin::Peer {
+            peer_id: "durable-steer-peer".into(),
+            display_identity: None,
+            runtime_id: Some(crate::identifiers::LogicalRuntimeId(
+                "durable-steer-peer-runtime".into(),
+            )),
+        };
+    }
+    input
+}
+
+/// A directed flow step, as a remote flow delivers it to the member that
+/// runs the loop: its own turn must start, since it owns a directed terminal.
+fn directed_flow_step_steer(text: &str) -> Input {
+    crate::mob_adapter::create_tracked_flow_step_input(
+        "remote-step",
+        text.into(),
+        "durable-steer-flow",
+        Some(steer_metadata()),
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .expect("tracked flow step")
+}
+
+fn text_prompt_steer(text: &str) -> Input {
+    Input::Prompt(crate::input::PromptInput::new(text, Some(steer_metadata())))
+}
+
+fn external_event_steer(body: &str) -> Input {
+    Input::ExternalEvent(crate::input::ExternalEventInput {
+        header: steer_header(crate::input::InputOrigin::External {
+            source_name: "webhook".into(),
+        }),
+        event_type: "webhook".into(),
+        payload: serde_json::json!({ "body": body }),
+        blocks: None,
+        handling_mode: meerkat_core::types::HandlingMode::Steer,
+        render_metadata: None,
+        objective_id: None,
+    })
+}
+
+fn flow_step_steer(text: &str) -> Input {
+    Input::FlowStep(crate::input::FlowStepInput {
+        header: steer_header(crate::input::InputOrigin::Operator),
+        step_id: "local-step".into(),
+        content: text.into(),
+        directed_interaction_id: None,
+        turn_metadata: Some(steer_metadata()),
     })
 }
 
@@ -706,11 +885,46 @@ async fn admission_classifies_live_boundary_delivery_from_typed_structure() {
     ));
     assert_eq!(
         class(&text_steer),
-        Some(LiveBoundaryDeliveryClass::RequestOnly)
+        Some(LiveBoundaryDeliveryClass::DurableAppend)
     );
+    for (label, input) in [
+        ("peer message", peer_steer("peer")),
+        ("peer request", peer_request_steer("peer request")),
+        ("peer lifecycle", peer_lifecycle_steer("peer lifecycle")),
+        ("external event", external_event_steer("event")),
+        ("local flow step", flow_step_steer("step")),
+    ] {
+        assert_eq!(
+            class(&input),
+            Some(LiveBoundaryDeliveryClass::DurableAppend),
+            "{label} steer"
+        );
+    }
+    for (label, input) in [
+        ("peer", directed_peer_steer("directed")),
+        ("flow step", directed_flow_step_steer("directed step")),
+    ] {
+        assert_eq!(
+            class(&input),
+            Some(LiveBoundaryDeliveryClass::FollowUpOnly),
+            "a directed {label} delivery owns a terminal its own turn must start"
+        );
+    }
+    let routed = Input::Prompt(crate::input::PromptInput::new(
+        "routed",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
+                    "claude-sonnet-4-5",
+                )),
+                ..steer_metadata()
+            },
+        ),
+    ));
     assert_eq!(
-        class(&peer_steer("peer")),
-        Some(LiveBoundaryDeliveryClass::RequestOnly)
+        class(&routed),
+        Some(LiveBoundaryDeliveryClass::FollowUpOnly),
+        "model routing applies only to a fresh turn"
     );
     let queued = Input::Prompt(crate::input::PromptInput::new("queued", None));
     assert_eq!(class(&queued), None, "queue-lane admissions carry no class");
@@ -971,8 +1185,18 @@ async fn persistent_durable_steer_applied_then_image_discarded_is_redelivered_ex
 }
 
 async fn applied_then_image_discarded_is_redelivered_exactly_once(rig: DurableSteerRig) -> InputId {
+    applied_steer_then_image_discarded_is_redelivered_exactly_once(
+        rig,
+        typed_steer("discarded", ConversationAppendRole::SystemNotice),
+    )
+    .await
+}
+
+async fn applied_steer_then_image_discarded_is_redelivered_exactly_once(
+    rig: DurableSteerRig,
+    steer: Input,
+) -> InputId {
     let batch = rig.start_busy_turn().await;
-    let steer = typed_steer("discarded", ConversationAppendRole::SystemNotice);
     let steer_id = steer.id().clone();
     rig.admit(steer).await;
     rig.wait_for_waiting_delivery().await;
@@ -1008,34 +1232,105 @@ async fn applied_then_image_discarded_is_redelivered_exactly_once(rig: DurableSt
     steer_id
 }
 
+/// Admit each input in order; only the oldest durable one prepares, so
+/// exactly one delivery is registered once they are all admitted.
+async fn admit_in_order(rig: &DurableSteerRig, inputs: Vec<Input>) -> Vec<InputId> {
+    let mut ids = Vec::new();
+    for input in inputs {
+        ids.push(input.id().clone());
+        rig.admit(input).await;
+    }
+    rig.wait_for_waiting_delivery().await;
+    // The later ones wait in the steer lane: they neither register beside
+    // the oldest nor fall back to the queue lane.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for later in &ids[1..] {
+        assert!(rig.steer_queue().await.contains(later));
+        assert!(!rig.queue().await.contains(later));
+    }
+    ids
+}
+
 #[tokio::test]
-async fn second_durable_steer_while_the_first_waits_takes_the_fifo_follow_up() {
+async fn second_durable_steer_while_the_first_waits_joins_the_following_boundary() {
     let rig = DurableSteerRig::ephemeral().await;
     rig.start_busy_turn().await;
     rig.script
         .step_and_wait(RunnerStep::BoundaryThenStream)
         .await;
-    let first = typed_steer("first", ConversationAppendRole::SystemNotice);
-    let first_id = first.id().clone();
-    rig.admit(first).await;
+    let ids = admit_in_order(
+        &rig,
+        vec![
+            typed_steer("first", ConversationAppendRole::SystemNotice),
+            typed_steer("second", ConversationAppendRole::SystemNotice),
+        ],
+    )
+    .await;
+    let [first_id, second_id] = ids.as_slice() else {
+        unreachable!("two steers")
+    };
+    let (first_id, second_id) = (first_id.clone(), second_id.clone());
+
+    // Each boundary takes one durable delivery, in arrival order: the second
+    // prepares once the first has joined, for the following boundary.
+    rig.script.step(RunnerStep::OpenNextBoundary);
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&first_id, InputLifecycleState::Staged)
+        .await;
+    rig.wait_for_applied_durable(1).await;
+    assert_eq!(
+        rig.phase(&second_id).await,
+        Some(InputLifecycleState::Queued)
+    );
     rig.wait_for_waiting_delivery().await;
-    let second = typed_steer("second", ConversationAppendRole::SystemNotice);
-    let second_id = second.id().clone();
-    rig.admit(second).await;
-    // FIFO within the durable class: the second one is normalized to the
-    // queued follow-up while the first still waits.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !rig.queue().await.contains(&second_id) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the second durable steer falls back to the queue");
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&second_id, InputLifecycleState::Staged)
+        .await;
+    rig.wait_for_applied_durable(2).await;
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&first_id, InputLifecycleState::Consumed)
+        .await;
+    rig.wait_for_phase(&second_id, InputLifecycleState::Consumed)
+        .await;
+    assert_eq!(
+        rig.script.applied_durable(),
+        vec![first_id.clone(), second_id.clone()]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        rig.script.apply_calls.load(Ordering::SeqCst),
+        1,
+        "both joined the running run; no follow-up turn ran"
+    );
+}
+
+#[tokio::test]
+async fn durable_steer_still_waiting_when_the_run_ends_takes_the_fifo_follow_up() {
+    let rig = DurableSteerRig::ephemeral().await;
+    rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+    let ids = admit_in_order(
+        &rig,
+        vec![
+            typed_steer("first", ConversationAppendRole::SystemNotice),
+            typed_steer("second", ConversationAppendRole::SystemNotice),
+        ],
+    )
+    .await;
+    let [first_id, second_id] = ids.as_slice() else {
+        unreachable!("two steers")
+    };
+    let (first_id, second_id) = (first_id.clone(), second_id.clone());
 
     rig.script.step(RunnerStep::OpenNextBoundary);
     rig.script.step(RunnerStep::BoundaryThenToolCalls);
     rig.wait_for_phase(&first_id, InputLifecycleState::Staged)
         .await;
+    // The second registers for the next boundary of the running run.
+    rig.wait_for_waiting_delivery().await;
+    // The model answers: the run ends before the boundary the second waits for.
     rig.script.step(RunnerStep::Finish);
     rig.wait_for_apply_calls(2).await;
     rig.script.step(RunnerStep::Finish);
@@ -1048,6 +1343,130 @@ async fn second_durable_steer_while_the_first_waits_takes_the_fifo_follow_up() {
     assert_eq!(contributions(&rig.script.primitives(), &second_id), 1);
 }
 
+/// A durable steer that waits behind an earlier one while the run ends, and
+/// that the runtime loop takes into the follow-up run before its wait ends,
+/// prepares nothing in that run: it registers no boundary delivery there,
+/// its boundary work settles without an error, a durable steer admitted
+/// during the follow-up still joins it, and the follow-up turn applies each
+/// of the two waiting steers exactly once.
+#[tokio::test]
+async fn durable_steer_taken_into_the_follow_up_while_it_waited_prepares_nothing_there() {
+    let rig = DurableSteerRig::ephemeral().await;
+    let (outcomes_tx, mut outcomes) = mpsc::unbounded_channel();
+    *rig.adapter
+        .test_accepted_boundary_work_outcomes
+        .lock()
+        .unwrap() = Some(outcomes_tx);
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *rig.adapter.test_durable_steer_relock_hold.lock().unwrap() = Some((reached_tx, release_rx));
+
+    rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+    // The first waits for the next boundary of the running run; the second
+    // waits behind it.
+    let ids = admit_in_order(
+        &rig,
+        vec![
+            typed_steer("first", ConversationAppendRole::SystemNotice),
+            typed_steer("second", ConversationAppendRole::SystemNotice),
+        ],
+    )
+    .await;
+    let [first_id, second_id] = ids.as_slice() else {
+        unreachable!("two steers")
+    };
+    let (first_id, second_id) = (first_id.clone(), second_id.clone());
+
+    // The run ends before that boundary. The second's wait ends, and the
+    // runtime loop takes both into the follow-up run before the second's
+    // work retakes the session's mutation gate.
+    rig.script.step(RunnerStep::Finish);
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .expect("the second's wait ends")
+        .expect("the hold is armed");
+    rig.wait_for_apply_calls(2).await;
+    rig.wait_for_phase(&first_id, InputLifecycleState::Staged)
+        .await;
+    rig.wait_for_phase(&second_id, InputLifecycleState::Staged)
+        .await;
+    release
+        .send(())
+        .expect("the second's work waits at the hold");
+
+    // Before the follow-up's first boundary: the second registers no delivery
+    // in the run it is already staged into, and its work settles cleanly.
+    let mut settled = Vec::new();
+    let second_outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(
+                !rig.state.has_waiting_delivery_for_test(),
+                "the second registered a boundary delivery in the follow-up run it is staged into"
+            );
+            while let Ok(outcome) = outcomes.try_recv() {
+                settled.push(outcome);
+            }
+            if let Some((_, outcome)) = settled
+                .iter()
+                .find(|(input_id, _)| input_id.as_ref() == Some(&second_id))
+            {
+                return outcome.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the second's boundary work settles");
+    assert_eq!(second_outcome, Ok(()));
+    assert!(!rig.state.has_waiting_delivery_for_test());
+
+    // A durable steer admitted during the follow-up joins it.
+    let third = typed_steer("third", ConversationAppendRole::SystemNotice);
+    let third_id = third.id().clone();
+    rig.admit(third).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_applied_durable(1).await;
+    assert_eq!(rig.script.applied_durable(), vec![third_id.clone()]);
+    rig.script.step(RunnerStep::Finish);
+    for input_id in [&first_id, &second_id, &third_id] {
+        rig.wait_for_phase(input_id, InputLifecycleState::Consumed)
+            .await;
+    }
+    let primitives = rig.script.primitives();
+    assert_eq!(contributions(&primitives, &first_id), 1);
+    assert_eq!(contributions(&primitives, &second_id), 1);
+    assert_eq!(contributions(&primitives, &third_id), 0);
+    assert!(primitives[1].contains(&first_id) && primitives[1].contains(&second_id));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        rig.script.apply_calls.load(Ordering::SeqCst),
+        2,
+        "the follow-up run applied all three; no further turn ran"
+    );
+    while let Ok(outcome) = outcomes.try_recv() {
+        settled.push(outcome);
+    }
+    for input_id in [&first_id, &third_id] {
+        assert_eq!(
+            settled
+                .iter()
+                .find(|(settled_id, _)| settled_id.as_ref() == Some(input_id))
+                .map(|(_, outcome)| outcome.clone()),
+            Some(Ok(())),
+            "boundary work of {input_id}"
+        );
+    }
+}
+
+/// FIFO is per delivery class: a request-only steer admitted after a durable
+/// peer steer that waits for the next boundary still heads its own class and
+/// lands in that boundary beside it. The request-only steer here is an
+/// ordinary continuation carrying a turn append, one of the kinds that stay
+/// request-only. Both land in the running turn; no follow-up turn runs.
 #[tokio::test]
 async fn request_only_steer_keeps_its_boundary_while_a_durable_steer_waits() {
     let rig = DurableSteerRig::ephemeral().await;
@@ -1055,28 +1474,45 @@ async fn request_only_steer_keeps_its_boundary_while_a_durable_steer_waits() {
     rig.script
         .step_and_wait(RunnerStep::BoundaryThenStream)
         .await;
-    let durable = typed_steer("durable", ConversationAppendRole::SystemNotice);
+    let durable = peer_steer("durable peer steer");
     let durable_id = durable.id().clone();
     rig.admit(durable).await;
     rig.wait_for_waiting_delivery().await;
     rig.script.step_and_wait(RunnerStep::OpenNextBoundary).await;
-    // A request-only peer steer admitted now is still the head of its own
-    // class and prepares the open boundary beside the durable delivery.
-    let peer = peer_steer("peer steer");
-    let peer_id = peer.id().clone();
-    rig.admit(peer).await;
+
+    let mut continuation = crate::input::ContinuationInput::detached_background_op_completed();
+    continuation.turn_append = Some(notice_append(
+        "review context",
+        ConversationAppendRole::SystemNotice,
+    ));
+    let continuation = Input::Continuation(continuation);
+    let continuation_id = continuation.id().clone();
+    assert_eq!(
+        crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(
+            &continuation,
+            false
+        )
+        .expect("generated admission")
+        .live_boundary_delivery(),
+        Some(crate::ingress_types::LiveBoundaryDeliveryClass::RequestOnly),
+        "an ordinary continuation with a turn append steers request-only"
+    );
+    rig.admit(continuation).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while !rig.state.has_registered_request_only_delivery_for_test() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the request-only peer steer prepares beside the waiting durable delivery");
+    .expect("the request-only continuation prepares beside the waiting durable delivery");
     rig.script.step(RunnerStep::BoundaryThenToolCalls);
-    rig.wait_for_phase(&peer_id, InputLifecycleState::Consumed)
+    rig.wait_for_phase(&continuation_id, InputLifecycleState::Consumed)
         .await;
     rig.wait_for_phase(&durable_id, InputLifecycleState::Staged)
         .await;
+    rig.wait_for_applied_durable(1).await;
+    assert_eq!(rig.script.applied_durable(), vec![durable_id.clone()]);
+    assert_eq!(*rig.script.request_only_taken.lock().unwrap(), vec![1]);
     rig.script.step(RunnerStep::Finish);
     rig.wait_for_phase(&durable_id, InputLifecycleState::Consumed)
         .await;
@@ -1085,6 +1521,59 @@ async fn request_only_steer_keeps_its_boundary_while_a_durable_steer_waits() {
         rig.script.apply_calls.load(Ordering::SeqCst),
         1,
         "both steers landed in the running turn; no follow-up turn ran"
+    );
+}
+
+/// Three peer steers admitted inside one gated boundary are
+/// each delivered exactly once, in arrival order: one per boundary of the
+/// running run (each prepares once the one before it has joined), and the
+/// one still waiting when the run ends in its follow-up turn.
+#[tokio::test]
+async fn three_peer_steers_in_one_gated_boundary_land_once_each_in_arrival_order() {
+    let rig = DurableSteerRig::ephemeral().await;
+    rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+    let steers = admit_in_order(
+        &rig,
+        ["peer one", "peer two", "peer three"]
+            .into_iter()
+            .map(peer_steer)
+            .collect(),
+    )
+    .await;
+    let [one, two, three] = steers.as_slice() else {
+        unreachable!("three steers")
+    };
+
+    rig.script.step(RunnerStep::OpenNextBoundary);
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_applied_durable(1).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_applied_durable(2).await;
+    rig.wait_for_waiting_delivery().await;
+    assert_eq!(rig.phase(three).await, Some(InputLifecycleState::Queued));
+    // The model answers before a third boundary: the third takes the
+    // follow-up turn.
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_apply_calls(2).await;
+    rig.script.step(RunnerStep::Finish);
+    for id in [one, two, three] {
+        rig.wait_for_phase(id, InputLifecycleState::Consumed).await;
+    }
+    assert_eq!(
+        rig.script.applied_durable(),
+        vec![one.clone(), two.clone()],
+        "the first two land at the first and second boundary of the running run"
+    );
+    assert_eq!(contributions(&rig.script.primitives(), one), 0);
+    assert_eq!(contributions(&rig.script.primitives(), two), 0);
+    assert_eq!(
+        contributions(&rig.script.primitives(), three),
+        1,
+        "the third is delivered by exactly one follow-up turn"
     );
 }
 
@@ -1298,6 +1787,14 @@ async fn persistent_crash_after_the_join_is_asserted_after_a_lagging_append_reco
 }
 
 async fn persistent_crash_after_the_join(append_record_lag: Duration) {
+    persistent_crash_after_the_join_of(
+        append_record_lag,
+        typed_steer("crash", ConversationAppendRole::SystemNotice),
+    )
+    .await;
+}
+
+async fn persistent_crash_after_the_join_of(append_record_lag: Duration, steer: Input) {
     let store: Arc<dyn crate::store::RuntimeStore> =
         Arc::new(crate::store::InMemoryRuntimeStore::new());
     let crashed = DurableSteerRig::persistent(Arc::clone(&store)).await;
@@ -1305,7 +1802,6 @@ async fn persistent_crash_after_the_join(append_record_lag: Duration) {
     let session_id = crashed.session_id.clone();
     let runtime_id = MeerkatMachine::logical_runtime_id(&session_id);
     let batch = crashed.start_busy_turn().await;
-    let steer = typed_steer("crash", ConversationAppendRole::SystemNotice);
     let steer_id = steer.id().clone();
     crashed.admit(steer).await;
     crashed.wait_for_waiting_delivery().await;
@@ -1443,6 +1939,7 @@ async fn discarded_boundary_batch_preserves_order_and_excludes_unapplied_input()
     assert_eq!(rig.script.discarded.lock().unwrap().len(), 1);
 }
 
+#[cfg(feature = "sqlite-store")]
 #[tokio::test]
 async fn boundary_discard_write_failure_emits_no_source_event() {
     use crate::store::RuntimeStore;
@@ -2297,5 +2794,320 @@ async fn owner_context_bound_to_an_ended_run_never_reaches_the_next_run() {
     assert!(
         rig.script.request_only_taken.lock().unwrap().is_empty(),
         "the stale steer never reached the second run"
+    );
+}
+
+/// One content steer joins the running run at the next boundary and is
+/// consumed with the run's commit: written once, never by a follow-up turn.
+async fn content_steer_joins_the_running_run_and_is_consumed_with_it(steer: Input) {
+    let rig = DurableSteerRig::ephemeral().await;
+    let batch = rig.start_busy_turn().await;
+    let steer_id = steer.id().clone();
+    let completion = rig.admit(steer).await.expect("completion handle");
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&steer_id, InputLifecycleState::Staged)
+        .await;
+    rig.wait_for_applied_durable(1).await;
+    assert_eq!(rig.script.applied_durable(), vec![steer_id.clone()]);
+    let mut waiter = Box::pin(completion.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err(),
+        "the joined steer is consumed with the run, not at the boundary"
+    );
+    rig.script.step(RunnerStep::Finish);
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the steer completes with the run")
+        .expect("completion outcome");
+    rig.wait_for_phase(&steer_id, InputLifecycleState::Consumed)
+        .await;
+    rig.wait_for_phase(&batch, InputLifecycleState::Consumed)
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(rig.script.apply_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(contributions(&rig.script.primitives(), &steer_id), 0);
+}
+
+#[tokio::test]
+async fn peer_message_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(peer_steer("peer message")).await;
+}
+
+#[tokio::test]
+async fn peer_request_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(peer_request_steer("peer request"))
+        .await;
+}
+
+#[tokio::test]
+async fn peer_lifecycle_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(peer_lifecycle_steer(
+        "peer lifecycle",
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn text_prompt_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(text_prompt_steer(
+        "also check the second file",
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn external_event_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(external_event_steer(
+        "deploy finished",
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn local_flow_step_steer_joins_the_running_run_and_is_consumed_with_it() {
+    content_steer_joins_the_running_run_and_is_consumed_with_it(flow_step_steer("next step")).await;
+}
+
+/// A FollowUpOnly steer never registers at a boundary of the running run
+/// and is delivered by exactly one follow-up turn.
+async fn follow_up_only_steer_never_joins_and_takes_one_follow_up(
+    rig: DurableSteerRig,
+    steer: Input,
+) {
+    rig.start_busy_turn().await;
+    let steer_id = steer.id().clone();
+    rig.admit(steer).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !rig.state.has_waiting_delivery_for_test(),
+        "a follow-up-only delivery never registers at a boundary"
+    );
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_apply_calls(2).await;
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&steer_id, InputLifecycleState::Consumed)
+        .await;
+    assert!(rig.script.applied_durable().is_empty());
+    assert_eq!(contributions(&rig.script.primitives(), &steer_id), 1);
+}
+
+#[tokio::test]
+async fn directed_peer_steer_never_joins_and_takes_one_follow_up() {
+    follow_up_only_steer_never_joins_and_takes_one_follow_up(
+        DurableSteerRig::ephemeral_with_terminal_publication().await,
+        directed_peer_steer("directed"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn directed_flow_step_steer_never_joins_and_takes_one_follow_up() {
+    follow_up_only_steer_never_joins_and_takes_one_follow_up(
+        DurableSteerRig::ephemeral_with_terminal_publication().await,
+        directed_flow_step_steer("directed step"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn model_routed_prompt_steer_never_joins_and_takes_one_follow_up() {
+    let routed = Input::Prompt(crate::input::PromptInput::new(
+        "routed",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
+                    "claude-sonnet-4-5",
+                )),
+                ..steer_metadata()
+            },
+        ),
+    ));
+    follow_up_only_steer_never_joins_and_takes_one_follow_up(
+        DurableSteerRig::ephemeral().await,
+        routed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn persistent_peer_steer_applied_then_image_discarded_is_redelivered_exactly_once() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let rig = DurableSteerRig::persistent(Arc::clone(&store)).await;
+    let runtime_id = MeerkatMachine::logical_runtime_id(&rig.session_id);
+    let steer_id = applied_steer_then_image_discarded_is_redelivered_exactly_once(
+        rig,
+        peer_steer("discarded"),
+    )
+    .await;
+    let row = store
+        .load_input_state(&runtime_id, &steer_id)
+        .await
+        .expect("load consumed row")
+        .expect("consumed row persisted");
+    assert_eq!(row.seed.phase, InputLifecycleState::Consumed);
+}
+
+/// A peer steer that joined its run before the process crashed is recovered
+/// from its stored row by the generated recovery and join-resolution
+/// transitions: the crashed join resolves into exactly one follow-up turn,
+/// with no refusal.
+#[tokio::test]
+async fn persistent_crash_after_a_peer_steer_join_recovers_for_exactly_one_follow_up() {
+    persistent_crash_after_the_join_of(Duration::ZERO, peer_steer("crash")).await;
+}
+
+/// A peer message from a canonical sender with a delivery id carries its
+/// reply capability into the durable boundary delivery the runtime
+/// prepares; a joined prompt steer carries none.
+#[tokio::test]
+async fn joined_peer_message_carries_its_reply_capability_into_the_boundary() {
+    let rig = DurableSteerRig::ephemeral().await;
+    rig.start_busy_turn().await;
+    let sender = meerkat_core::comms::PeerId::new();
+    let delivery = uuid::Uuid::new_v4();
+    let mut header = steer_header(crate::input::InputOrigin::Peer {
+        peer_id: sender.to_string(),
+        display_identity: Some("sender-member".into()),
+        runtime_id: None,
+    });
+    header.correlation_id = Some(crate::identifiers::CorrelationId(delivery));
+    let peer = Input::Peer(crate::input::PeerInput {
+        directed_interaction_id: None,
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        sender_taint: None,
+        header,
+        convention: Some(crate::input::PeerConvention::Message),
+        content: "answer this".into(),
+        payload: None,
+        handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
+    });
+    let expected = crate::input::peer_reply_capability(&peer).expect("a reply capability");
+    assert_eq!(expected.in_reply_to, meerkat_core::InteractionId(delivery));
+    assert_eq!(expected.peer_id, sender);
+    assert_eq!(
+        expected.kind,
+        meerkat_core::comms::PeerReplyDeliveryKind::Message
+    );
+    let peer_id = peer.id().clone();
+    rig.admit(peer).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&peer_id, InputLifecycleState::Staged)
+        .await;
+
+    let prompt = text_prompt_steer("plain text steer");
+    let prompt_id = prompt.id().clone();
+    rig.admit(prompt).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&prompt_id, InputLifecycleState::Staged)
+        .await;
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&prompt_id, InputLifecycleState::Consumed)
+        .await;
+
+    assert_eq!(
+        rig.script.prepared_reply_capabilities(),
+        vec![vec![expected], Vec::new()],
+        "the peer message's boundary carries its capability, the prompt's carries none"
+    );
+}
+
+/// Many durable peer steers admitted while the running turn opens no
+/// boundary do not wait on one another to be admitted: every admission
+/// returns promptly, one delivery waits for a boundary, the steer lane holds
+/// all of them in arrival order, and when the run ends each is consumed
+/// exactly once, in arrival order, by the follow-up turn.
+#[tokio::test]
+async fn twenty_five_durable_peer_steers_admit_promptly_and_drain_in_order_after_the_run() {
+    const FAN_IN: usize = 25;
+    let rig = DurableSteerRig::ephemeral().await;
+    let batch = rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+
+    let adapter = Arc::clone(&rig.adapter);
+    let session_id = rig.session_id.clone();
+    let accepts = (0..FAN_IN).map(|index| {
+        let adapter = Arc::clone(&adapter);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let steer = peer_steer(&format!("fan-in report {index}"));
+            let id = steer.id().clone();
+            let (outcome, _completion) = adapter
+                .accept_input_with_completion(&session_id, steer)
+                .await
+                .expect("durable peer steer admitted");
+            assert!(outcome.is_accepted());
+            id
+        })
+    });
+    let admitted = tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(accepts))
+        .await
+        .expect("a waiting durable delivery must not hold up later admissions");
+    let admitted: std::collections::HashSet<InputId> = admitted
+        .into_iter()
+        .map(|joined| joined.expect("admission task"))
+        .collect();
+    assert_eq!(admitted.len(), FAN_IN);
+
+    rig.wait_for_waiting_delivery().await;
+    let arrival: Vec<InputId> = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("spine snapshot")
+        .inputs
+        .admission_order
+        .iter()
+        .map(|admission| admission.input_id.clone())
+        .filter(|input_id| admitted.contains(input_id))
+        .collect();
+    assert_eq!(arrival.len(), FAN_IN);
+    assert_eq!(
+        rig.steer_queue().await,
+        arrival,
+        "the steer lane holds every waiting steer in arrival order"
+    );
+
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_apply_calls(2).await;
+    rig.script.step(RunnerStep::Finish);
+    for input_id in &arrival {
+        rig.wait_for_phase(input_id, InputLifecycleState::Consumed)
+            .await;
+    }
+    rig.wait_for_phase(&batch, InputLifecycleState::Consumed)
+        .await;
+    let primitives = rig.script.primitives();
+    for input_id in &arrival {
+        assert_eq!(
+            contributions(&primitives, input_id),
+            1,
+            "each steer is consumed exactly once"
+        );
+    }
+    let follow_up: Vec<InputId> = primitives
+        .iter()
+        .flatten()
+        .filter(|input_id| admitted.contains(input_id))
+        .cloned()
+        .collect();
+    assert_eq!(
+        follow_up, arrival,
+        "the follow-up takes them in arrival order"
+    );
+    assert!(
+        rig.script.applied_durable().is_empty(),
+        "no boundary opened"
     );
 }

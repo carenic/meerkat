@@ -1077,6 +1077,8 @@ mod tests {
                         blob_id: blob_id.clone(),
                     },
                 }],
+                delivery_id: None,
+                in_reply_to: None,
             },
         ))];
 

@@ -461,7 +461,7 @@ match event {
 
     // Compaction
     AgentEvent::CompactionStarted { input_tokens, estimated_history_tokens, message_count } => {}
-    AgentEvent::CompactionCompleted { summary_tokens, messages_before, messages_after } => {}
+    AgentEvent::CompactionCompleted { summary_tokens, messages_before, messages_after, summary_source, estimated_history_tokens_after } => {}
     AgentEvent::CompactionFailed { reason } => {}
 
     // Budget
@@ -496,7 +496,7 @@ match event {
 
     // Provider evidence and peer-content observability
     AgentEvent::ProviderCacheBreakpointsDiscarded { session_id, retained, discarded } => {}
-    AgentEvent::PeerContentIngested { kind, peer, request_id, sender_taint } => {}
+    AgentEvent::PeerContentIngested { kind, peer, request_id, sender_taint, delivery_id } => {}
     AgentEvent::TurnUsageAccountingUnmeasured { session_id, unmeasured } => {}
     AgentEvent::TurnUsageAccountingIdentityDisputed { session_id, dispute } => {}
 

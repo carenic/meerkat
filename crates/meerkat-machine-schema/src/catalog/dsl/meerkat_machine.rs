@@ -1870,6 +1870,13 @@ pub enum LiveDelegationScheduleState {
 
 /// Templated executor state narration the machine releases for one exact
 /// delegation. A kind is released at most once per schedule pass.
+///
+/// `FinishedPending` is not spoken: it tells the provider session that the
+/// delegation's work finished while its result has not been handed to
+/// delivery (the channel's one result slot is held by another result, or the
+/// delivery waits for the channel's bootstrap summary acknowledgement, for
+/// example), so the session never keeps an in-progress instruction for
+/// finished work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LiveDelegationNarrationKind {
     #[default]
@@ -1879,6 +1886,7 @@ pub enum LiveDelegationNarrationKind {
     Completed,
     SourceBusy,
     Failed,
+    FinishedPending,
 }
 
 /// Generated phase of one channel's provider-affecting authority.
@@ -2498,13 +2506,18 @@ pub enum AdmissionContinuationKind {
 /// Typed shape of the runtime-authored transcript appends carried by one
 /// admitted input, observed by the shell from structure only (never content).
 ///
-/// `InTurnEligible` means the input is a prompt whose typed appends are all of
-/// a kind every provider accepts in the middle of a conversation
-/// (`SystemNotice`, `User`, `InjectedContext`) and the input is not a directed
-/// interaction (whose terminal is owned by its own run). `FollowUpOnly` means
-/// the prompt carries typed appends that must not join a running turn. Every
-/// input without typed appends reports `Untyped`. The fail-closed default never
-/// selects in-turn delivery.
+/// `InTurnEligible` means the input is a content input (a prompt, a peer
+/// message, request or lifecycle notice, an external event or a flow step)
+/// whose transcript appends are all of a kind every provider accepts in the
+/// middle of a conversation (`SystemNotice`, `User`, `InjectedContext`), whose
+/// turn metadata carries nothing only a fresh turn can apply, and which is not
+/// a directed interaction (whose terminal is owned by its own run).
+/// `FollowUpOnly` means the content input must not join a running turn.
+/// Inputs without content of their own (peer responses, continuations,
+/// operations) report `Untyped`. Admission (`turn_append_shape_matches_kind`)
+/// refuses `Untyped` for a content kind and a typed shape for any other kind,
+/// so a content input never resolves request-only. The fail-closed default
+/// never selects in-turn delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum AdmissionTurnAppendShape {
     #[default]
@@ -2516,11 +2529,14 @@ pub enum AdmissionTurnAppendShape {
 /// Machine-owned delivery class for an admitted Steer input that reaches an
 /// active cooperative model boundary.
 ///
-/// `RequestOnly` projects the input into the next model request only (peer
-/// comms and text-only steers). `DurableAppend` writes the input's typed
-/// conversation appends into the running turn's transcript, committed with the
-/// run. `FollowUpOnly` never joins a running turn: the input takes the ordinary
-/// queued follow-up turn with its full durable projection.
+/// `DurableAppend` writes the input's conversation appends into the running
+/// turn's transcript, committed with the run; every content steer whose appends
+/// can join a running turn takes it. `RequestOnly` projects the input into the
+/// next model request only; it is left to peer responses, ordinary
+/// continuations and silent-intent requests, none of which carries a
+/// transcript row into a running turn. `FollowUpOnly` never joins a
+/// running turn: the input takes the ordinary queued follow-up turn with its
+/// full durable projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LiveBoundaryDelivery {
     #[default]
@@ -9260,6 +9276,53 @@ macro_rules! meerkat_catalog_machine_dsl {
                     == Some(LiveExecutionChannelPhase::Active))
             && for_all(channel_id in self.live_revoked_execution_channels,
                 self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Revoked))
+        }
+
+        // The custody and readiness reads answer from one snapshot; these four
+        // make each of their arms total for a bound receipt (#1606). A Pending
+        // channel has its whole stage: runtime, fence, generation and seed
+        // cursor.
+        invariant live_pending_phase_has_its_stage {
+            for_all(channel_id in self.live_execution_phase_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Pending)
+                || (self.live_experimental_staged_runtime_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_fence_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_generation_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_seed_cursor_by_channel.contains_key(channel_id)))
+        }
+
+        // An Active channel reached by its pending receipt has its activation
+        // and its execution binding; one reached by its activation receipt has
+        // its binding. The binding's fence and generation follow from
+        // live_execution_binding_is_complete_and_channel_scoped.
+        invariant live_active_pending_channel_has_its_activation {
+            for_all(channel_id in self.live_experimental_pending_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Active)
+                || (self.live_activation_receipt_by_channel.contains_key(channel_id)
+                    && self.live_execution_runtime_id_by_channel.contains_key(channel_id)))
+            && for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Active)
+                || self.live_execution_runtime_id_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_custody_receipts_have_mode_and_phase {
+            for_all(channel_id in self.live_experimental_pending_receipt_by_channel.keys(),
+                self.live_execution_mode_by_channel.contains_key(channel_id)
+                && self.live_execution_phase_by_channel.contains_key(channel_id))
+            && for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_mode_by_channel.contains_key(channel_id)
+                && self.live_execution_phase_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_activation_receipt_phase_is_active_or_revoked {
+            for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                || self.live_execution_phase_by_channel.get_copied(channel_id)
                     == Some(LiveExecutionChannelPhase::Revoked))
         }
 
@@ -18039,8 +18102,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "terminal_queue_override" {
                 input_kind == AdmissionInputKind::PeerResponseTerminal
@@ -18117,8 +18190,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "terminal_steer_override" {
                 input_kind == AdmissionInputKind::PeerResponseTerminal
@@ -18204,8 +18287,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "queue_override" {
                 requested_lane == Some(InputLane::Queue)
@@ -18306,8 +18399,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "steer_override" {
                 requested_lane == Some(InputLane::Steer)
@@ -18321,8 +18424,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                     self.input_authority_bindings.insert(input_id, authority_binding.get("value"));
                     self.input_authority_batch_keys.insert(input_id, authority_batch_key.get("value"));
                 }
-                self.admission_authorized_live_boundary_delivery.insert(input_id, if input_kind == AdmissionInputKind::Prompt
-                    && turn_append_shape == AdmissionTurnAppendShape::InTurnEligible
+                self.admission_authorized_live_boundary_delivery.insert(input_id, if turn_append_shape == AdmissionTurnAppendShape::InTurnEligible
                     && silent_intent_match == false
                 {
                     LiveBoundaryDelivery::DurableAppend
@@ -18394,8 +18496,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                     None
                 },
                 live_interrupt_required: true,
-                live_boundary_delivery: if input_kind == AdmissionInputKind::Prompt
-                    && turn_append_shape == AdmissionTurnAppendShape::InTurnEligible
+                live_boundary_delivery: if turn_append_shape == AdmissionTurnAppendShape::InTurnEligible
                     && silent_intent_match == false
                 {
                     Some(LiveBoundaryDelivery::DurableAppend)
@@ -18432,8 +18533,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "default_queue_kind" {
                 requested_lane == None
@@ -18521,8 +18632,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "default_peer_message_or_request" {
                 requested_lane == None
@@ -18613,8 +18734,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "peer_response_progress" {
                 input_kind == AdmissionInputKind::PeerResponseProgress
@@ -18700,8 +18831,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "default_peer_response_terminal" {
                 input_kind == AdmissionInputKind::PeerResponseTerminal
@@ -18778,8 +18919,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "default_continuation" {
                 input_kind == AdmissionInputKind::Continuation
@@ -18871,8 +19022,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "workgraph_attention_continuation" {
                 input_kind == AdmissionInputKind::Continuation
@@ -18958,8 +19119,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                 || (runtime_running == false && self.lifecycle_phase != Phase::Running)
             }
             guard "turn_append_shape_matches_kind" {
-                input_kind == AdmissionInputKind::Prompt
-                || turn_append_shape == AdmissionTurnAppendShape::Untyped
+                ((input_kind == AdmissionInputKind::Prompt
+                    || input_kind == AdmissionInputKind::PeerMessage
+                    || input_kind == AdmissionInputKind::PeerRequest
+                    || input_kind == AdmissionInputKind::ExternalEvent
+                    || input_kind == AdmissionInputKind::FlowStep)
+                    && turn_append_shape != AdmissionTurnAppendShape::Untyped)
+                || (input_kind != AdmissionInputKind::Prompt
+                    && input_kind != AdmissionInputKind::PeerMessage
+                    && input_kind != AdmissionInputKind::PeerRequest
+                    && input_kind != AdmissionInputKind::ExternalEvent
+                    && input_kind != AdmissionInputKind::FlowStep
+                    && turn_append_shape == AdmissionTurnAppendShape::Untyped)
             }
             guard "operation" {
                 input_kind == AdmissionInputKind::Operation
@@ -29204,6 +29375,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                             == Some(LiveDelegationScheduleState::Failed)
                         || self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
                             == Some(LiveDelegationScheduleState::Cancelled)))
+                // Finished work whose eligible result has not been handed to
+                // delivery: its release is refused, or released, its delivery
+                // waits (on the bootstrap barrier, for example). A late
+                // terminal's completion has no result on its way.
+                || (kind == LiveDelegationNarrationKind::FinishedPending
+                    && self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationScheduleState::Completed)
+                    && self.live_delegation_result_eligible_operations.contains(operation_id)
+                    && !self.live_delegation_late_terminal_operations.contains(operation_id)
+                    && !self.live_result_delivery_channel_by_operation.contains_key(operation_id)
+                    && !self.live_result_delivery_digest_by_operation.contains_key(operation_id)
+                    && !self.live_result_delivery_observation_by_operation.contains_key(operation_id))
             }
             guard "narration_advances" {
                 self.live_delegation_last_narration_by_operation.get_copied(operation_id) != Some(kind)

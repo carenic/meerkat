@@ -236,7 +236,7 @@ describe("recursive generated history validation", () => {
               type: "tool_config",
               payload: {
                 operation: "reload",
-                persisted: false,
+                settled: true,
                 target: "filesystem",
                 status_info: {
                   kind: "boundary_applied",
@@ -330,7 +330,7 @@ describe("recursive generated history validation", () => {
             type: "tool_config",
             payload: {
               operation: "add",
-              persisted: false,
+              settled: true,
               target: "tool",
               status_info: {
                 kind: "boundary_applied",

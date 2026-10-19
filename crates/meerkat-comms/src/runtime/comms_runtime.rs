@@ -603,7 +603,12 @@ fn classified_entry_to_interaction(
                     content_taint: _,
                     handling_mode: _,
                     objective_id: _,
-                } => meerkat_core::InteractionContent::Message { body, blocks },
+                    in_reply_to,
+                } => meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks,
+                    in_reply_to: in_reply_to.map(meerkat_core::InteractionId),
+                },
                 MessageKind::IncarnationFencedMessage {
                     body,
                     blocks,
@@ -697,7 +702,11 @@ fn classified_entry_to_interaction(
                 id: meerkat_core::InteractionId(interaction_id.unwrap_or(raw_item_id.0)),
                 from_route: None,
                 from: format!("event:{source}"),
-                content: meerkat_core::InteractionContent::Message { body, blocks },
+                content: meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks,
+                    in_reply_to: None,
+                },
                 rendered_text,
                 handling_mode,
                 render_metadata,
@@ -1212,6 +1221,7 @@ impl CoreCommsRuntime for CommsRuntime {
                 content_taint,
                 handling_mode,
                 objective_id,
+                in_reply_to,
             } => self
                 .send_peer_command(
                     &to,
@@ -1221,6 +1231,7 @@ impl CoreCommsRuntime for CommsRuntime {
                         content_taint: None,
                         handling_mode: Some(handling_mode),
                         objective_id,
+                        in_reply_to: in_reply_to.map(|delivery| delivery.0),
                     },
                     content_taint,
                 )
@@ -2531,6 +2542,7 @@ impl CommsRuntime {
                 content_taint,
                 handling_mode,
                 objective_id,
+                in_reply_to,
             } => {
                 self.hydrate_blocks_for_transport(&mut blocks, "comms message")
                     .await?;
@@ -2540,6 +2552,7 @@ impl CommsRuntime {
                     content_taint,
                     handling_mode,
                     objective_id,
+                    in_reply_to,
                 })
             }
             crate::types::MessageKind::IncarnationFencedMessage {
@@ -4946,11 +4959,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     struct TestProjectionTrustAuthority {
         dsl: Arc<meerkat_runtime::HandleDslAuthority>,
         authority: meerkat_core::comms::CommsTrustMutationAuthority,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl TestProjectionTrustAuthority {
         fn install_owner(&self, runtime: &CommsRuntime) {
             meerkat_runtime::RuntimePeerCommsHandle::install_generated_on(
@@ -4961,6 +4976,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn try_test_projection_add_authority(
         local: &TrustedPeerDescriptor,
         peer: &TrustedPeerDescriptor,
@@ -5048,6 +5064,7 @@ mod tests {
         Ok(TestProjectionTrustAuthority { dsl, authority })
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn test_projection_add_authority(
         local: &TrustedPeerDescriptor,
         peer: &TrustedPeerDescriptor,
@@ -5057,6 +5074,7 @@ mod tests {
             .expect("generated peer projection add authority")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn test_projection_add_authority_with_dsl(
         dsl: Arc<meerkat_runtime::HandleDslAuthority>,
         peer: &TrustedPeerDescriptor,
@@ -5084,6 +5102,7 @@ mod tests {
         TestProjectionTrustAuthority { dsl, authority }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn test_projection_remove_authority(
         local: &TrustedPeerDescriptor,
         peer: &TrustedPeerDescriptor,
@@ -5178,6 +5197,7 @@ mod tests {
         TestProjectionTrustAuthority { dsl, authority }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn test_projection_remove_authority_with_dsl(
         dsl: Arc<meerkat_runtime::HandleDslAuthority>,
         peer: &TrustedPeerDescriptor,
@@ -5206,6 +5226,7 @@ mod tests {
         TestProjectionTrustAuthority { dsl, authority }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn try_add_trusted_peer_with_generated_authority(
         runtime: &CommsRuntime,
         peer: TrustedPeerDescriptor,
@@ -5226,6 +5247,7 @@ mod tests {
         .map(|_| dsl)
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn add_trusted_peer_with_generated_authority(
         runtime: &CommsRuntime,
         peer: TrustedPeerDescriptor,
@@ -5235,6 +5257,7 @@ mod tests {
             .expect("generated add trusted peer should apply")
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn remove_trusted_peer_with_generated_authority(
         runtime: &CommsRuntime,
         peer: &TrustedPeerDescriptor,
@@ -5258,6 +5281,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generated_peer_projection_trust_requires_canonical_owner() {
         let runtime = CommsRuntime::inproc_only("trust-owner-mismatch").expect("runtime");
@@ -5344,6 +5368,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generated_trust_mutation_updates_projection() {
         let runtime = CommsRuntime::inproc_only("trust-mutator-generated").expect("runtime");
@@ -5476,6 +5501,7 @@ mod tests {
         assert_eq!(public_snapshot[0].address.to_string(), "inproc://peer");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generated_remove_does_not_remove_trust_owned_by_other_source() {
         let runtime =
@@ -5590,6 +5616,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generated_add_authority_rejects_descriptor_drift() {
         let runtime = CommsRuntime::inproc_only("trust-mutator-descriptor-drift").expect("runtime");
@@ -5620,6 +5647,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn public_trust_projection_excludes_and_cannot_remove_private_peer() {
         let runtime = CommsRuntime::inproc_only("trust-mutator-private-split").expect("runtime");
@@ -5668,10 +5696,12 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn install_test_peer_comms_handle(runtime: &CommsRuntime) {
         runtime.install_peer_comms_handle(test_support::runtime_peer_comms_handle());
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn install_test_peer_ingress_runtime(
         runtime: &CommsRuntime,
     ) -> Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer> {
@@ -5681,6 +5711,7 @@ mod tests {
         Arc::new(finalizer)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_runtime_finalization(
         runtime: Arc<CommsRuntime>,
         finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
@@ -5728,12 +5759,14 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn inproc_only_with_test_peer_authority(name: &str) -> CommsRuntime {
         let runtime = CommsRuntime::inproc_only(name).unwrap();
         install_test_peer_comms_handle(&runtime);
         runtime
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn new_with_test_peer_authority(config: ResolvedCommsConfig) -> CommsRuntime {
         let runtime = CommsRuntime::new(config).await.unwrap();
         install_test_peer_comms_handle(&runtime);
@@ -5747,6 +5780,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn trusted_inproc_pair(prefix: &str) -> (Arc<CommsRuntime>, Arc<CommsRuntime>, String) {
         let suffix = Uuid::new_v4().simple().to_string();
         let sender_name = format!("{prefix}-sender-{suffix}");
@@ -5826,6 +5860,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: meerkat_core::types::HandlingMode::Queue,
                     objective_id: None,
+                    in_reply_to: None,
                 },
             )
             .await
@@ -5937,6 +5972,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl meerkat_core::handles::PeerInteractionHandle for TestPeerInteractionHandle {
         fn request_sent(
             &self,
@@ -6243,6 +6279,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn install_test_peer_request_response_authority(runtime: &Arc<CommsRuntime>) {
         runtime.install_peer_request_response_authority(PeerRequestResponseAuthority::new(
             Arc::new(TestPeerInteractionHandle::default()),
@@ -6575,6 +6612,7 @@ mod tests {
         runtime.shutdown();
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn machine_required_tcp_runtime_rejects_ingress_before_handle_or_listener_start() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6610,6 +6648,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "must not pass local classifier".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -6750,6 +6789,92 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("prompt injection"));
     }
 
+    /// A message's signed `in_reply_to` reaches the classified interaction
+    /// as the delivery it answers; a message without one answers nothing.
+    #[tokio::test]
+    async fn hydrating_a_message_with_blocks_keeps_its_in_reply_to() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime = CommsRuntime::new(test_runtime_config("hydrate-reply", &tmp))
+            .await
+            .unwrap();
+        let answered = Uuid::new_v4();
+        let kind = runtime
+            .hydrate_message_kind_for_transport(MessageKind::Message {
+                objective_id: None,
+                content_taint: None,
+                blocks: Some(vec![meerkat_core::types::ContentBlock::Text {
+                    text: "see the attached".to_string(),
+                }]),
+                body: "reply".to_string(),
+                handling_mode: None,
+                in_reply_to: Some(answered),
+            })
+            .await
+            .expect("text blocks hydrate");
+        assert!(
+            matches!(kind, MessageKind::Message { in_reply_to: Some(id), .. } if id == answered),
+            "{kind:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn classified_snapshot_carries_a_messages_signed_in_reply_to() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_runtime_config("in-reply-to", &tmp);
+        let runtime = CommsRuntime::new(config).await.unwrap();
+        install_test_peer_comms_handle(&runtime);
+
+        let sender = Keypair::generate();
+        add_trusted_peer_with_generated_authority(
+            &runtime,
+            trusted_descriptor("sender", sender.public_key(), "tcp://127.0.0.1:4201"),
+        )
+        .await;
+
+        let answered = Uuid::new_v4();
+        let message = |body: &str, in_reply_to: Option<Uuid>| {
+            signed_envelope(
+                &sender,
+                runtime.public_key(),
+                MessageKind::Message {
+                    objective_id: None,
+                    content_taint: None,
+                    blocks: None,
+                    body: body.to_string(),
+                    handling_mode: None,
+                    in_reply_to,
+                },
+            )
+        };
+        for envelope in [message("reply", Some(answered)), message("fresh", None)] {
+            runtime
+                .router
+                .inbox_sender()
+                .send_classified(InboxItem::External { envelope })
+                .into_result()
+                .unwrap();
+        }
+
+        let interactions = snapshot_runtime_interactions(&runtime).await;
+        let in_reply_to_of = |wanted: &str| {
+            interactions
+                .iter()
+                .find_map(|interaction| match &interaction.content {
+                    meerkat_core::InteractionContent::Message {
+                        body, in_reply_to, ..
+                    } if body == wanted => Some(*in_reply_to),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted} message in {interactions:?}"))
+        };
+        assert_eq!(
+            in_reply_to_of("reply"),
+            Some(meerkat_core::InteractionId(answered))
+        );
+        assert_eq!(in_reply_to_of("fresh"), None);
+    }
+
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn classified_snapshot_converts_all_authenticated_content_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6776,6 +6901,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let req = signed_envelope(
@@ -6863,6 +6989,7 @@ mod tests {
     /// drain into `InboxInteraction.sender_taint` as content-adjacent payload.
     /// `None` (no declaration) and `Some(Clean)` stay distinct typed states —
     /// the drain never coalesces an absent declaration into `Clean`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn classified_snapshot_carries_sender_content_taint() {
         use meerkat_core::comms::SenderContentTaint;
@@ -6888,6 +7015,7 @@ mod tests {
                 blocks: None,
                 content_taint: Some(SenderContentTaint::Tainted),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let clean = signed_envelope(
@@ -6912,6 +7040,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
 
@@ -6958,6 +7087,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn lifecycle_envelopes_remain_non_responseable_request_projections() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7009,6 +7139,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn classified_snapshot_multimodal_message_keeps_body_as_projection() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7041,6 +7172,7 @@ mod tests {
                 blocks: Some(blocks.clone()),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
 
@@ -7062,6 +7194,7 @@ mod tests {
             meerkat_core::InteractionContent::Message {
                 body,
                 blocks: got_blocks,
+                in_reply_to: _,
             } => {
                 assert_eq!(body, "please inspect this");
                 assert_eq!(got_blocks.as_ref(), Some(&blocks));
@@ -7074,6 +7207,7 @@ mod tests {
     /// runtime lifecycle. It is queued as an ordinary peer message, never
     /// swallowed into a dismiss signal. Lifecycle dismissal is a typed signal
     /// owned by the runtime authority, not a peer-controlled string body.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn peer_message_body_dismiss_does_not_control_lifecycle() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7097,6 +7231,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         runtime
@@ -7129,6 +7264,7 @@ mod tests {
     /// typed ambiguity error carrying the exact envelope identity, not a
     /// `PeerRequestSent` receipt. Once an envelope may have crossed the
     /// transport boundary, connection failure cannot prove non-delivery.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn peer_request_send_failure_is_typed_send_error_not_timeout() {
@@ -7182,6 +7318,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_subscription_correlation_e2e_one_shot() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7214,6 +7351,7 @@ mod tests {
         assert!(second.is_none(), "subscriber should be one-shot");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_peer_request_reserved_stream_correlates_via_request_envelope_id() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7282,6 +7420,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn transport_only_runtime_rejects_peer_request_receipts_without_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7330,6 +7469,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn transport_only_runtime_rejects_peer_request_send_and_stream_without_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7382,6 +7522,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn transport_only_runtime_rejects_peer_response_receipts_without_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7430,6 +7571,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn terminal_peer_response_route_failure_keeps_inbound_request_retryable() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7482,6 +7624,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn terminal_peer_response_default_handling_mode_projects_from_machine_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7582,6 +7725,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn transport_only_peer_directory_does_not_advertise_semantic_request_response() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7609,6 +7753,7 @@ mod tests {
         assert_eq!(entry.sendable_kinds, vec![PeerSendability::PeerMessage]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn partial_peer_authority_does_not_advertise_semantic_request_response() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7637,6 +7782,7 @@ mod tests {
         assert_eq!(entry.sendable_kinds, vec![PeerSendability::PeerMessage]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn partial_peer_authority_rejects_peer_request_receipts_without_stream_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7686,6 +7832,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn partial_peer_authority_rejects_peer_response_receipts_without_stream_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7754,6 +7901,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn peer_directory_advertises_semantic_request_response_with_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7789,6 +7937,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_peer_lifecycle_send_stays_typed_and_non_rendered() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7855,6 +8004,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_subscription_correlation_preserves_inline_blocks() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7903,6 +8053,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_bridge_red_ok_send_and_stream_reserves_one_interaction_channel() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7944,6 +8095,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn local_input_stream_uses_installed_machine_stream_authority() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -7992,6 +8144,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_bridge_red_ok_completed_interaction_terminates_reserved_stream() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8031,6 +8184,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn plain_event_interaction_id_is_preserved_in_classified_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8060,6 +8214,7 @@ mod tests {
         assert_eq!(interactions[0].id.0, interaction_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_plain_event_preserves_handling_mode_and_render_metadata_in_classified_drain() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8097,6 +8252,7 @@ mod tests {
         assert_eq!(interaction.render_metadata, Some(render_metadata));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_plain_event_without_interaction_id_gets_stable_id_between_snapshot_and_drain() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8140,6 +8296,7 @@ mod tests {
         assert_eq!(interactions[0].id.0, ingress_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_peer_ingress_queue_snapshot_reflects_classified_queue_without_draining() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8211,6 +8368,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_peer_ingress_runtime_snapshot_reflects_trusted_peers_and_queue() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8261,6 +8419,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_peer_ingress_runtime_snapshot_reflects_dropped_peer_authority_state() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8309,6 +8468,7 @@ mod tests {
         assert!(snapshot.trusted_peers.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_live_peer_authority_syncs_trust_receive_and_drain() {
         use crate::peer_types::PeerIngressState;
@@ -8462,6 +8622,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_live_peer_authority_accepts_unknown_peer_when_auth_open() {
         use crate::peer_types::PeerIngressState;
@@ -8529,6 +8690,7 @@ mod tests {
         assert!(sender.is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_input_no_reservation() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8566,6 +8728,7 @@ mod tests {
     /// ROW #269 gate: a non-stream comms `Input` returns an `InteractionId`
     /// that matches the `interaction_id` stamped on the injected event
     /// (correlatable), not a fresh unrelated UUID.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_input_no_reservation_returns_correlated_id() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8602,6 +8765,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_input_reserves_stream() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8641,6 +8805,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_stream_attachment_duplicate_attach_fails() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8680,6 +8845,7 @@ mod tests {
         assert!(matches!(after_drop, Err(StreamError::NotReserved(_))));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_stream_not_reserved_before_send() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8713,6 +8879,7 @@ mod tests {
             .expect("should attach after send");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_and_stream_input_returns_stream_and_receipt() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8763,12 +8930,14 @@ mod tests {
             to: missing_peer_route("missing-peer"),
             body: "hello".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let result = CoreCommsRuntime::send(&runtime, cmd).await;
         assert!(matches!(result, Err(SendError::PeerNotFound(_))));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_success_and_drain() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8805,6 +8974,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "greeting".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
@@ -8831,6 +9001,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_hydrates_blob_refs_before_transport() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8878,6 +9049,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "blob-backed image".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
@@ -8902,6 +9074,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_incarnation_fenced_send_hydrates_blob_and_preserves_objective() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -8986,6 +9159,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn volatile_handoff_retains_fenced_and_ordinary_durable_messages() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-drain-fence").await;
@@ -9005,6 +9179,7 @@ mod tests {
         abort_pending_runtime_sends(sends).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_only_volatile_pop_does_not_bypass_fenced_queue_head() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-recv-fence").await;
@@ -9022,6 +9197,7 @@ mod tests {
         abort_pending_runtime_sends(sends).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_hydrates_blob_refs_on_peer_request_before_transport() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -9097,6 +9273,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_hydrates_blob_refs_on_peer_response_before_transport() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -9200,6 +9377,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "inproc-only hello".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let receipt = CoreCommsRuntime::send(&sender, cmd).await;
@@ -9212,6 +9390,7 @@ mod tests {
         assert_eq!(interactions.len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_send_requires_generated_trust_when_auth_disabled() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -9270,6 +9449,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "hello without trusted".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let expected_peer_id = receiver.public_key().to_peer_id().to_string();
@@ -9346,6 +9526,7 @@ mod tests {
         assert!(crate::InprocRegistry::global().unregister(&peer_pubkey));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_add_trusted_peer_updates_peers_and_enables_send() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -9385,6 +9566,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "hello trusted peer".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, send_cmd).await;
@@ -9399,6 +9581,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_add_trusted_peer_invalid_peer_id_is_rejected() {
         let sender = CommsRuntime::inproc_only("trust-invalid-sender").unwrap();
@@ -10215,6 +10398,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_session_scoped_inproc_identity_does_not_restore_trust_from_disk() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -10301,6 +10485,7 @@ mod tests {
         assert_eq!(peer.sendable_kinds, vec![PeerSendability::PeerMessage]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_peers_send_success_keeps_peer_directory_projection() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10344,6 +10529,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await
@@ -10360,6 +10546,7 @@ mod tests {
         assert_eq!(after.peer_id, receiver.public_key().to_peer_id());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_peers_transport_failure_keeps_directory_projection() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10382,6 +10569,7 @@ mod tests {
                 to: peer_route(&peer_name, peer_pubkey),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10398,6 +10586,7 @@ mod tests {
         assert_eq!(entry.peer_id, peer_pubkey.to_peer_id());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_to_untrusted_peer_surfaces_admission_dropped_not_offline() {
         // Regression: before typed `AdmissionOutcome`, the router collapsed a
@@ -10434,6 +10623,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "policy-rejected".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10470,6 +10660,7 @@ mod tests {
                 to: missing_peer_route(&missing_name),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10487,6 +10678,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_core_peers_resolved_peer_not_found_keeps_directory_projection() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10515,6 +10707,7 @@ mod tests {
                 to: peer_route(&missing_name, missing_pubkey),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10572,6 +10765,7 @@ mod tests {
                         to: PeerRoute::with_display_name(entry.peer_id, entry.name.clone()),
                         body: "truthfulness test".to_string(),
                         handling_mode: meerkat_core::types::HandlingMode::Queue,
+                        in_reply_to: None,
                     },
                     PeerSendability::PeerRequest => CommsCommand::PeerRequest {
                         objective_id: None,
@@ -10607,6 +10801,7 @@ mod tests {
 
     // --- M4: Reservation FSM + concurrency tests ---
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn terminal_subscriber_race_keeps_stream_claimable_and_attach_ttl_does_not_timeout_peer()
     {
@@ -10678,6 +10873,7 @@ mod tests {
         drop(stream);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn terminal_event_buffered_before_attach_completes_when_consumer_observes_it() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10747,6 +10943,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn attached_stream_observes_typed_terminal_delivery_abandonment() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10790,6 +10987,7 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn expired_unattached_stream_does_not_fabricate_peer_timeout() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10843,6 +11041,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_stream_abandonment_cleans_projection_without_expiry() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10888,6 +11087,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_m4_duplicate_close_is_safe() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10918,6 +11118,7 @@ mod tests {
         assert!(matches!(result, Err(StreamError::NotReserved(_))));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_m4_mark_interaction_complete_cleans_up() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -10988,6 +11189,7 @@ mod tests {
 
     // --- M5: send_and_stream partial-failure tests ---
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_m5_send_and_stream_non_streamable_returns_stream_attach() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11026,6 +11228,7 @@ mod tests {
             to: peer_route(&peer_name, peer.public_key()),
             body: "not streamable".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let finalize = spawn_runtime_finalization(Arc::clone(&peer), finalizer);
         let result = CoreCommsRuntime::send_and_stream(&runtime, cmd).await;
@@ -11048,6 +11251,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_m5_send_and_stream_input_none_is_not_streamable() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11083,6 +11287,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_m4_attach_after_completed_returns_not_reserved() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11138,6 +11343,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_remove_trusted_peer_removes_from_peers_and_revokes_send() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11203,6 +11409,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "should fail".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let result = CoreCommsRuntime::send(&sender, cmd).await;
         assert!(
@@ -11239,6 +11446,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_remove_trusted_peer_returns_false_for_absent_peer() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11261,6 +11469,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_remove_trusted_peer_rejects_pubkey_string_argument() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11371,6 +11580,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: None,
                     objective_id: None,
+                    in_reply_to: None,
                 },
                 None,
             )
@@ -11431,6 +11641,7 @@ mod tests {
     /// T-13: skip-if-routable — staging for a peer the trust store already
     /// resolves is a no-op (trust-store-wins), so no one-shot entry is left
     /// behind to go stale.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stage_declared_reply_endpoint_skips_already_routable_peer() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11611,6 +11822,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_peer_request_at_endpoint_uses_standard_lifecycle_without_inproc_callback_route() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11698,6 +11910,7 @@ mod tests {
     /// BEFORE dispatch (a response racing the send return still finds it)
     /// and records the outbound DSL lifecycle exactly like the
     /// `CommsCommand::PeerRequest` arm.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_peer_request_with_reply_waiter_registers_waiter_and_dsl_lifecycle() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -11895,6 +12108,7 @@ mod tests {
     /// to, before the request frame leaves: when the transport hands the
     /// frame to the addressee, the request is `Sent` and the machine accepts
     /// responses to it from the addressee.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn the_addressee_is_recorded_before_the_request_frame_leaves() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -12036,6 +12250,7 @@ mod tests {
     /// admitted response, so its send succeeds. The same sender's response
     /// to a request id the requester does not hold, and the addressee's
     /// response, are queued as before.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_tcp_response_from_a_peer_the_request_was_not_sent_to_is_never_queued() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -12155,6 +12370,7 @@ mod tests {
 
     /// T-13: a failed send removes the waiter (no stale registration) and
     /// fires `request_send_failed` — the typed error is returned verbatim.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_peer_request_with_reply_waiter_removes_waiter_on_send_failure() {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -12181,6 +12397,7 @@ mod tests {
     /// T-13/§5.3: tombstoning replaces a live waiter; the entry still
     /// answers `has_bridge_reply_waiter` (so the drain discards the late
     /// reply) but `take` yields no sender and consumes the tombstone.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tombstoned_bridge_reply_waiter_discards_instead_of_delivering() {
         let suffix = Uuid::new_v4().simple().to_string();

@@ -18,7 +18,6 @@ use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use meerkat_core::lifecycle::InputId;
-#[cfg(test)]
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::lifecycle::core_executor::CoreApplyTerminal;
 use meerkat_core::types::{RunResult, SessionId};
@@ -40,6 +39,7 @@ use crate::tokio::sync::oneshot;
 /// channel or missing generated completion authority is not a public runtime
 /// result class.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CompletionWaitError {
     #[error("completion channel closed without an authorized result")]
     ChannelClosed,
@@ -62,6 +62,22 @@ pub enum CompletionWaitError {
         /// reached, without its result or callback arguments.
         observed: crate::meerkat_machine::dsl::RuntimeCompletionObservedOutcome,
     },
+    /// The run's boundary commit was rejected and rolled back, so none of the
+    /// run landed. The session needs a reload, and the input stays durably
+    /// admitted: it runs again after the reload. Do not resubmit it; read it
+    /// after the reload. `detail` is the commit's rejection.
+    #[error(
+        "the boundary commit of run {run_id} rolled back ({detail}); the input runs again after its session reloads"
+    )]
+    BoundaryRolledBack { run_id: RunId, detail: String },
+    /// The run's boundary commit or terminalization reported no durable
+    /// outcome within its store's declared deadline, and it may still land.
+    /// The session needs a reload, and the input stays durably admitted. Do
+    /// not resubmit it; read its outcome after the reload.
+    #[error(
+        "the durable outcome of run {run_id} is unknown: its store did not answer within its commit deadline; read the input after its session reloads"
+    )]
+    DurableOutcomeUnknown { run_id: RunId },
 }
 
 impl CompletionWaitError {
@@ -74,7 +90,10 @@ impl CompletionWaitError {
             Self::ChannelClosed => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::ChannelClosed,
             ),
-            Self::AttachmentReplaced | Self::AuthorityUnavailable(_) => Some(
+            Self::AttachmentReplaced
+            | Self::AuthorityUnavailable(_)
+            | Self::BoundaryRolledBack { .. }
+            | Self::DurableOutcomeUnknown { .. } => Some(
                 crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
             ),
             Self::DisclosureRefused { .. } => None,
@@ -92,6 +111,20 @@ impl CompletionWaitError {
     #[must_use]
     pub const fn is_attachment_replaced(&self) -> bool {
         matches!(self, Self::AttachmentReplaced)
+    }
+
+    /// Stable typed predicate: the run's boundary rolled back, so it is known
+    /// not to have landed. The input stays admitted.
+    #[must_use]
+    pub const fn is_boundary_rolled_back(&self) -> bool {
+        matches!(self, Self::BoundaryRolledBack { .. })
+    }
+
+    /// Stable typed predicate: whether the run's boundary landed is unknown
+    /// until its session reloads. The input stays admitted.
+    #[must_use]
+    pub const fn is_durable_outcome_unknown(&self) -> bool {
+        matches!(self, Self::DurableOutcomeUnknown { .. })
     }
 }
 

@@ -2647,6 +2647,8 @@ mod tests {
                     content: vec![crate::types::ContentBlock::Text {
                         text: "What is the token?".to_string(),
                     }],
+                    delivery_id: None,
+                    in_reply_to: None,
                 }],
             },
         };
@@ -2742,6 +2744,8 @@ mod tests {
                     summary: None,
                     payload: Some(serde_json::json!({"result_marker_q7": true})),
                     content: vec![block.clone()],
+                    delivery_id: None,
+                    in_reply_to: None,
                 }],
             },
         }]);

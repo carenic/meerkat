@@ -378,16 +378,47 @@ impl MeerkatMachine {
                     let sessions = self.sessions.read().await;
                     sessions.keys().cloned().collect()
                 };
+                // Sessions that degraded while another holder keeps their
+                // gate keep their producers until they are reloaded. The
+                // abort goes on with the others and then names them.
+                let mut skipped = String::new();
+                let mut first_cause = None;
                 for session_id in session_ids {
                     let Some(gate) = self.session_mutation_gate(&session_id).await else {
                         continue;
                     };
-                    let _gate_guard = gate.lock().await;
+                    let _gate_guard = match self
+                        .lock_live_session_mutation_gate(&session_id, &gate)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(required) => {
+                            tracing::warn!(
+                                %session_id,
+                                reason = %required,
+                                "comms abort skipped a durability-degraded session whose gate is held"
+                            );
+                            if !skipped.is_empty() {
+                                skipped.push_str(", ");
+                            }
+                            skipped.push_str(&session_id.to_string());
+                            first_cause.get_or_insert(required);
+                            continue;
+                        }
+                    };
                     let _ = self
                         .stop_and_abort_session_comms_producers(&session_id, true)
                         .await;
                 }
-                Ok(MeerkatMachineCommandResult::Unit)
+                match first_cause {
+                    None => Ok(MeerkatMachineCommandResult::Unit),
+                    Some(cause) => Err(RuntimeDriverError::RecoveryRepairBlocked {
+                        evidence_digest: None,
+                        reason: format!(
+                            "aborted every other session's comms producers; durability-degraded sessions whose mutation gate another holder keeps keep theirs until reloaded: {skipped} (first cause: {cause})"
+                        ),
+                    }),
+                }
             }
             MeerkatMachineCommand::Abort { session_id } => {
                 // Guard: session must be registered.
@@ -401,7 +432,10 @@ impl MeerkatMachine {
                         state: RuntimeState::Destroyed,
                     });
                 };
-                let _gate_guard = gate.lock().await;
+                let _gate_guard = self
+                    .lock_live_session_mutation_gate(&session_id, &gate)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?;
                 let _ = self
                     .stop_and_abort_session_comms_producers(&session_id, true)
                     .await;

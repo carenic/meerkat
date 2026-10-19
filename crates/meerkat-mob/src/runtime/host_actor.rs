@@ -2928,6 +2928,11 @@ fn forked_participant_error_cause(error: &ForkedParticipantError) -> BridgeRejec
         ForkedParticipantError::ConcurrentUpdate { .. } => {
             BridgeRejectionCause::ForkedParticipantBusy
         }
+        ForkedParticipantError::Session(meerkat_core::SessionError::ForkInstructionRefused(
+            refusal,
+        )) => BridgeRejectionCause::ForkInstructionRefused {
+            refusal: refusal.clone(),
+        },
         ForkedParticipantError::Store(_) | ForkedParticipantError::Session(_) => {
             BridgeRejectionCause::Unavailable
         }
@@ -7967,7 +7972,17 @@ impl MobHostActor {
                 return;
             }
         };
-        match service.create(&request, chrono::Utc::now()).await {
+        // A payload without the field applies the default policy, which
+        // refuses a participant that would inherit activation rows.
+        let inherited_instructions = payload.inherited_instructions.unwrap_or_default();
+        match service
+            .create_with_fork_instruction_policy(
+                &request,
+                inherited_instructions,
+                chrono::Utc::now(),
+            )
+            .await
+        {
             Ok(reference) => {
                 self.send_reply(
                     candidate,

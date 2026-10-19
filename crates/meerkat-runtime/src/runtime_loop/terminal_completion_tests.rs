@@ -129,6 +129,7 @@ impl Fixture {
                 content: body.into(),
                 payload: None,
                 handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+                in_reply_to: None,
             });
             inputs.push(input.id().clone());
             assert!(
@@ -161,7 +162,7 @@ impl Fixture {
             ));
             if attempt == 2 {
                 let gate = Arc::new(crate::tokio::sync::Mutex::new(()));
-                let (_, outcome) = realize_runtime_loop_terminal_owned(
+                let waited = realize_runtime_loop_terminal_owned(
                     gate.lock_owned().await,
                     carrier.clone(),
                     driver.clone(),
@@ -172,12 +173,16 @@ impl Fixture {
                         failure: failure.clone(),
                         contributor_disposition: owner::FailedRunContributorDisposition::Replayed,
                     },
+                    None,
                 )
                 .await
                 .unwrap();
                 assert!(matches!(
-                    outcome,
-                    OwnedRuntimeLoopTerminalizationOutcome::Persisted
+                    waited,
+                    OwnedRuntimeLoopChildWait::Settled(
+                        _,
+                        OwnedRuntimeLoopTerminalizationOutcome::Persisted
+                    )
                 ));
             } else {
                 owner::fail_runtime_loop_run(
@@ -501,6 +506,7 @@ async fn stage_refusal_terminal_remains_recoverable_after_a_prior_abandoned_fail
         content: "directed input after an abandoned failure".into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
     assert!(
         fixture

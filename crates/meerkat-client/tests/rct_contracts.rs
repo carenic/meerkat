@@ -74,9 +74,7 @@ async fn test_llm_adapter_streaming_contract() -> Result<(), Box<dyn std::error:
             })),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
         },
     ];
 
@@ -147,9 +145,7 @@ async fn test_llm_adapter_event_tap_mirrors_text_delta() -> Result<(), Box<dyn s
             meta: None,
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
         },
     ];
 

@@ -1,9 +1,10 @@
 name: Setup sccache for CI
 description: >-
   Install sccache and point it at the GCS object cache through the repository's
-  GCP workload identity: the client writes for push and schedule runs and only
-  reads for every other run (pull requests from this repository included), a
-  setting of the client, not of the identity. When that
+  GCP workload identity: the client writes for push and schedule runs and for
+  a dispatch on a release branch (rel/** or release/**), and only reads for
+  every other run (pull requests from this repository included), a setting of
+  the client, not of the identity. When that
   identity is unavailable (pull requests from forks have no id-token, or the
   variables are unset) run with a local disk cache only, with no remote cache,
   instead of failing the lane. When the sccache release cannot be downloaded,
@@ -140,12 +141,19 @@ runs:
         KEY_PREFIX: ${{ inputs.key_prefix }}
         GCP_OUTCOME: ${{ steps.gcp.outcome }}
         CREDENTIALS_FILE: ${{ steps.gcp.outputs.credentials_file_path }}
-        # Only a push (main or a release branch) or a schedule has sccache
-        # write the bucket, whose objects the push to main compiles from
-        # before it attests; every other run, a pull request included, has
-        # it only read. The mode binds the client: the credentials file
-        # exported below is the same identity's in every run.
-        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
+        # Only a push (main or a release branch), a schedule, or a dispatch
+        # on a release branch (rel/** or release/**) has sccache write the
+        # bucket, whose objects the push to main compiles from before it
+        # attests; every other run, a pull request or a dispatch on any
+        # other ref included, has it only read. The ref prefix is no
+        # authorization control: any writer can create such a branch and
+        # dispatch it, as any writer can push to release/**, so the write
+        # boundary stays repository write access. It keeps the writes to the
+        # integration branches, whose dispatch warms the bucket for the same
+        # tree's pull request and main push. The mode binds the client: the
+        # credentials file exported below is the same identity's in every
+        # run.
+        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (startsWith(github.ref, 'refs/heads/rel/') || startsWith(github.ref, 'refs/heads/release/')))) && 'READ_WRITE' || 'READ_ONLY' }}
       run: |
         set -euo pipefail
         if [[ -n "${BUCKET}" && "${GCP_OUTCOME}" == "success" && -n "${CREDENTIALS_FILE}" && -s "${CREDENTIALS_FILE}" ]]; then
@@ -156,6 +164,7 @@ runs:
             echo "SCCACHE_GCS_KEY_PATH=${CREDENTIALS_FILE}"
           } >> "${GITHUB_ENV}"
           echo "backend=gcs" >> "${GITHUB_OUTPUT}"
+          echo "rw_mode=${RW_MODE}" >> "${GITHUB_OUTPUT}"
           echo "sccache backend: gcs://${BUCKET}/${KEY_PREFIX} (${RW_MODE})"
         else
           # No remote cache: a fresh runner's local disk cache, so the lane
@@ -170,7 +179,9 @@ runs:
       shell: bash
       env:
         BACKEND: ${{ steps.select.outputs.backend }}
-        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}
+        # The mode the select step gave the client (empty for the local
+        # backend), so the two steps cannot disagree.
+        RW_MODE: ${{ steps.select.outputs.rw_mode }}
       run: |
         set -euo pipefail
         # sccache probes the bucket with one shared object (.sccache_check)

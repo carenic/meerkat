@@ -1503,6 +1503,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "workspace-tests"))]
 #[path = "oauth/ce_native_progress.rs"]
 mod ce_native_progress;

@@ -1,0 +1,239 @@
+# Generated from docs/**/*.mdx; do not edit by hand. Refresh: UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture
+# Adding or changing an rkat example in docs/ means refreshing this file, as with schemas and BUILD files.
+# Each line is <docs path><TAB><invocation>; src/main.rs parses every invocation against the CLI.
+docs/api/mcp.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+docs/api/mcp.mdx	rkat mcp list
+docs/api/mcp.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+docs/api/mcp.mdx	rkat mcp add api --url https://mcp.example.com/api
+docs/api/mcp.mdx	rkat mcp add --transport http remote https://mcp.example.com/api
+docs/api/mcp.mdx	rkat mcp add tracker --url https://tracker.example.com/mcp --oauth-account-selection discover
+docs/api/mcp.mdx	rkat mcp login tracker
+docs/api/mcp.mdx	rkat mcp list
+docs/api/mcp.mdx	rkat mcp remove filesystem
+docs/cli/commands.mdx	rkat "summarize this repository"
+docs/cli/commands.mdx	rkat run "summarize this repository"
+docs/cli/commands.mdx	rkat run --resume last "keep going"
+docs/cli/commands.mdx	rkat mob pack ./mobs/release-triage -o dist/release-triage.mobpack
+docs/cli/commands.mdx	rkat "summarize this repository"
+docs/cli/commands.mdx	rkat run -t workspace "fix the failing test"
+docs/cli/commands.mdx	rkat run --yolo --param temperature=0.2 "take the gloves off"
+docs/cli/commands.mdx	rkat run --help
+docs/cli/commands.mdx	rkat -m claude-sonnet-4-6 --param temperature=0.2 --param max_output_tokens=4000 "triage this incident"
+docs/cli/commands.mdx	rkat --schema ./triage.schema.json "extract issues from this diff"
+docs/cli/commands.mdx	rkat run --html "explain how prompt caching works in this repo"
+docs/cli/commands.mdx	rkat run --browser "create a visual implementation plan for this change"
+docs/cli/commands.mdx	rkat run --html --html-template polished "Explain this design"
+docs/cli/commands.mdx	rkat run --html --html-template-file ./html/review.md "Review this change"
+docs/cli/commands.mdx	rkat run --resume last "keep going"
+docs/cli/commands.mdx	rkat run --resume '~2' "pick this thread back up"
+docs/cli/commands.mdx	rkat run --resume -m gemma-4-31b "Continue with the local model"
+docs/cli/commands.mdx	rkat realm current
+docs/cli/commands.mdx	rkat realm list
+docs/cli/commands.mdx	rkat config get --format toml
+docs/cli/commands.mdx	rkat config set ./.rkat/config.toml
+docs/cli/commands.mdx	rkat config patch --json '{"agent":{"model":"gpt-5.5"}}'
+docs/cli/commands.mdx	rkat config patch --json '{"self_hosted":{"servers":{"ollama":{"transport":"openai_compatible","base_url":"http://127.0.0.1:11434","api_style":"chat_completions"}}}}'
+docs/cli/commands.mdx	rkat auth connector-client list
+docs/cli/commands.mdx	rkat models
+docs/cli/commands.mdx	rkat doctor
+docs/cli/commands.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
+docs/cli/commands.mdx	rkat mcp add api --url https://mcp.example.com/api
+docs/cli/commands.mdx	rkat mcp add --transport http remote https://mcp.example.com/api --oauth-account-selection discover
+docs/cli/commands.mdx	rkat mcp login remote
+docs/cli/commands.mdx	rkat mcp list
+docs/cli/commands.mdx	rkat mcp get filesystem --scope project
+docs/cli/commands.mdx	rkat mob pack ./mobs/release-triage -o dist/release-triage.mobpack
+docs/cli/commands.mdx	rkat mob inspect dist/release-triage.mobpack
+docs/cli/commands.mdx	rkat mob validate dist/release-triage.mobpack --trust-policy permissive
+docs/cli/commands.mdx	rkat mob run dist/release-triage.mobpack --prompt "triage the latest release regressions" --trust-policy permissive
+docs/cli/commands.mdx	rkat mob run release-triage --flow main --param severity='"high"' --detach
+docs/cli/commands.mdx	rkat mob web build dist/release-triage.mobpack -o dist/release-triage-web --wasm ./meerkat-web-runtime/pkg --trust-policy permissive
+docs/cli/commands.mdx	rkat capabilities
+docs/cli/commands.mdx	rkat init
+docs/cli/configuration.mdx	rkat --confinement workspace --confinement-network unrestricted --confinement-read /opt/toolchain run "Build and test the project"
+docs/cli/configuration.mdx	rkat --confinement trusted-host run "Inspect the system"
+docs/cli/configuration.mdx	rkat --state-root ~/.local/share/meerkat/realms --confinement workspace run "Build and test the project"
+docs/concepts/configuration.mdx	rkat --realm team-alpha config get --format json
+docs/concepts/configuration.mdx	rkat --realm team-alpha config get --format json --with-generation
+docs/concepts/configuration.mdx	rkat --realm team-alpha config patch --json '{"agent":{"model":"gpt-5.5"}}' --expected-generation 4
+docs/concepts/configuration.mdx	rkat run --html --html-template polished "Explain this design"
+docs/concepts/configuration.mdx	rkat run --html --html-template-file ./templates/incident.html "Summarize this incident"
+docs/concepts/providers.mdx	rkat models
+docs/concepts/providers.mdx	rkat run --model claude-sonnet-4-6 --params-json '{"provider_tag":{"provider":"anthropic","thinking_budget_tokens":10000,"cache_control":"disabled"}}' "Solve this problem"
+docs/concepts/providers.mdx	rkat run --model gpt-5.6-terra --params-json '{"provider_tag":{"provider":"open_ai","reasoning_effort":"max","reasoning_mode":"pro","reasoning_context":"all_turns","text_verbosity":"high"}}' "Prove this theorem"
+docs/concepts/providers.mdx	rkat run --model gemini-3.8-flash --params-json '{"provider_tag":{"provider":"gemini","thinking_level":"medium"}}' "Analyze this data"
+docs/concepts/realms.mdx	rkat realm current
+docs/concepts/realms.mdx	rkat realm list
+docs/concepts/realms.mdx	rkat storage doctor
+docs/concepts/realms.mdx	rkat storage migrate
+docs/concepts/realms.mdx	rkat --state-root /srv/meerkat/realms --realm team-alpha run "Draft release plan"
+docs/concepts/realms.mdx	rkat --state-root /srv/meerkat/realms --realm team-alpha session list
+docs/concepts/tools.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+docs/concepts/tools.mdx	rkat mcp add api --url https://mcp.example.com/api
+docs/concepts/tools.mdx	rkat mcp add --transport http knowledge https://mcp.example.com/v1
+docs/connect/library/local-install.mdx	rkat --realm work run --wait-for-mcp --mcp-auth stored "Use the connected service to complete my task."
+docs/connect/quickstart.mdx	rkat --realm work run --wait-for-mcp --mcp-auth stored "Read the three leading Hacker News stories and summarize them."
+docs/examples/comms.mdx	rkat run --comms-name agent-a --keep-alive "You are a coordinator."
+docs/examples/comms.mdx	rkat run --comms-name remote-reviewer --comms-listen-tcp 0.0.0.0:4200 --comms-advertise-tcp reviewer.example.com:4200 --comms-binding-out ./remote-reviewer.binding.json --keep-alive "You review work sent over signed comms."
+docs/examples/memory.mdx	rkat run "Analyze the full codebase" --tools full
+docs/examples/memory.mdx	rkat run "Research this topic" --max-tokens 10000 --max-duration 30s --max-tool-calls 5
+docs/examples/mobpack.mdx	rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack
+docs/examples/mobpack.mdx	rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack --sign ./keys/release.key --signer-id team@example.com
+docs/examples/mobpack.mdx	rkat mob inspect ./dist/release-triage.mobpack
+docs/examples/mobpack.mdx	rkat mob validate ./dist/release-triage.mobpack --trust-policy permissive
+docs/examples/mobpack.mdx	rkat mob deploy ./dist/release-triage.mobpack "triage latest regressions" --max-duration 15m --trust-policy permissive
+docs/examples/mobpack.mdx	rkat mob run ./dist/release-triage.mobpack --flow main --prompt "triage latest regressions" --param severity='"high"' --trust-policy permissive --json
+docs/examples/mobpack.mdx	rkat mob run ./dist/release-triage.mobpack --flow main --prompt "triage latest regressions" --param severity='"high"' --detach --trust-policy permissive
+docs/examples/mobpack.mdx	rkat mob runs release-triage --json
+docs/examples/mobs.mdx	rkat --realm worker-west-host mob host --listen-tcp 0.0.0.0:4300 --advertise-tcp tcp://worker-west.example.com:4300 --allow-remote --descriptor-out ./worker-west.host.json
+docs/examples/mobs.mdx	rkat --realm team-alpha mob bind-host release-triage --descriptor ./worker-west.host.json
+docs/examples/mobs.mdx	rkat --realm team-alpha mob hosts release-triage --json
+docs/examples/mobs.mdx	rkat --realm team-alpha mob hosts release-triage --json
+docs/examples/mobs.mdx	rkat --realm team-alpha mob route-installs release-triage
+docs/examples/mobs.mdx	rkat --realm team-alpha mob member-history release-triage west-analyst-1
+docs/examples/mobs.mdx	rkat mob run release-triage --flow triage --param severity='"high"'
+docs/examples/mobs.mdx	rkat mob runs release-triage
+docs/examples/mobs.mdx	rkat mob run-flow release-triage --flow triage --stream
+docs/examples/mobs.mdx	rkat mob spawn-helper release-triage "Summarize the release status." --profile lead --agent-identity release-summary-helper --result-label release-summary --max-text-bytes 4096
+docs/examples/mobs.mdx	rkat mob fork-helper release-triage lead-1 "Investigate the flaky test history." --profile analyst --agent-identity flaky-review-helper --result-label flaky-test-review --max-text-bytes 4096
+docs/examples/mobs.mdx	rkat mob member-status release-triage lead-1 --json
+docs/examples/mobs.mdx	rkat mob respawn release-triage analyst-2 --initial-message "Resume with a fresh runtime."
+docs/examples/mobs.mdx	rkat mob wait-kickoff release-triage --json
+docs/examples/sessions.mdx	rkat run --model claude-sonnet-4-6 "What is the capital of France?"
+docs/examples/sessions.mdx	rkat run --resume last "Now explain it in more detail"
+docs/examples/sessions.mdx	rkat run --resume ~2 "Now explain it in more detail"
+docs/examples/sessions.mdx	rkat run --resume 01936f8a-7b2c-7000-8000-000000000001 "Keep going"
+docs/examples/sessions.mdx	rkat run --resume 019c8b99 "Keep going"
+docs/examples/sessions.mdx	rkat run --resume last "Keep going"
+docs/examples/sessions.mdx	rkat run --resume ~1 "Go back to this one"
+docs/examples/sessions.mdx	rkat --resume "Keep going"
+docs/examples/sessions.mdx	rkat session list
+docs/examples/sessions.mdx	rkat session list --limit 10
+docs/examples/sessions.mdx	rkat session list --limit 10 --offset 20
+docs/examples/sessions.mdx	rkat run --stream "Tell me a story"
+docs/examples/sessions.mdx	rkat run --model gpt-5.5 --provider openai "Hello"
+docs/examples/sessions.mdx	rkat run --model gemini-3.8-flash --provider gemini "Hello"
+docs/examples/sessions.mdx	rkat run --model claude-opus-5 "Hello"
+docs/examples/sessions.mdx	rkat config get
+docs/examples/sessions.mdx	rkat config get --format json --with-generation
+docs/examples/sessions.mdx	rkat config set --json '{"agent": {"model": "gpt-5.5"}}'
+docs/examples/sessions.mdx	rkat config patch --json '{"limits": {"budget": 50000}}' --expected-generation 3
+docs/examples/sessions.mdx	rkat --state-root /data/meerkat --realm team-alpha run "Plan release"
+docs/examples/sessions.mdx	rkat --state-root /data/meerkat --realm team-alpha --instance worker-1 session list
+docs/examples/sessions.mdx	rkat --state-root /data/meerkat --realm team-alpha --realm-backend sqlite run --resume last "Continue"
+docs/examples/skills.mdx	rkat skill list
+docs/examples/skills.mdx	rkat skill list --json
+docs/examples/skills.mdx	rkat skill inspect task-workflow --source-uuid 00000000-0000-4b11-8111-000000000001
+docs/examples/skills.mdx	rkat skill inspect task-workflow --source-uuid 00000000-0000-4b11-8111-000000000001 --json
+docs/examples/skills.mdx	rkat run "Track the implementation and use the shell safely" --tools workspace --skill task-workflow --skill shell-patterns
+docs/examples/structured-output.mdx	rkat run --schema ./schemas/city.json "Tell me about Tokyo"
+docs/examples/structured-output.mdx	rkat run --schema ./schema.json "Extract entities"
+docs/examples/structured-output.mdx	rkat run --schema ./schema.json "Extract data"
+docs/examples/tools.mdx	rkat run --tools workspace "List files in /tmp"
+docs/examples/tools.mdx	rkat run -t workspace "List files in /tmp"
+docs/examples/tools.mdx	rkat run --tools full "Coordinate the team"
+docs/examples/tools.mdx	rkat run --yolo "Coordinate the team"
+docs/examples/tools.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+docs/examples/tools.mdx	rkat mcp add remote-api --url https://mcp.example.com/api
+docs/examples/tools.mdx	rkat mcp add --transport http knowledge https://mcp.example.com/v1 --oauth-account-selection discover
+docs/examples/tools.mdx	rkat mcp login knowledge
+docs/examples/tools.mdx	rkat mcp list
+docs/examples/tools.mdx	rkat mcp list --scope project --json
+docs/examples/tools.mdx	rkat mcp get filesystem
+docs/examples/tools.mdx	rkat mcp remove filesystem
+docs/examples/wasm.mdx	rkat mob web build ./dist/my-mob.mobpack -o ./dist/web-bundle --wasm ./meerkat-web-runtime/pkg --trust-policy permissive
+docs/examples/workgraph.mdx	rkat --realm home workgraph goal-create SESSION_ID "Review client visit transport preparation" --namespace default --mode review --completion-policy self-attest --json
+docs/examples/workgraph.mdx	rkat --realm home workgraph snapshot --namespace default --json
+docs/guides/auth.mdx	rkat run --provider anthropic "What's the weather like in 2026?"
+docs/guides/auth.mdx	rkat auth login anthropic
+docs/guides/auth.mdx	rkat run --auth-binding global:default_openai "Summarize this change"
+docs/guides/auth.mdx	rkat auth login copilot
+docs/guides/comms.mdx	rkat run --comms-name mdm-target-1 --comms-listen-tcp 0.0.0.0:4200 --comms-advertise-tcp target.example.com:4200 --comms-pairing-password-env RKAT_PAIRING_PASSWORD --comms-binding-out ./target-binding.json --agent-description "Remote MDM target" --agent-label site=gcp --keep-alive "You are the remote target. Stay available for signed peer work."
+docs/guides/comms.mdx	rkat run --comms-name reviewer --agent-description "Reviews pull requests for style issues" --agent-label lang=rust --agent-label team=infra --keep-alive "You review code when asked."
+docs/guides/comms.mdx	rkat run --comms-name orchestrator --keep-alive "You are a project coordinator."
+docs/guides/comms.mdx	rkat run --comms-name monitor --keep-alive --stdin lines "You are a monitoring agent."
+docs/guides/image-generation.mdx	rkat run --allow-tool generate_image "Use generate_image to create a square PNG of a cozy tabby cat by a sunlit window. Return the blob id and a one-sentence caption."
+docs/guides/image-generation.mdx	rkat mob run image-studio --prompt "Use generate_image to create a square PNG of a cozy tabby cat by a sunlit window. Return the blob id and a one-sentence caption."
+docs/guides/mobpack.mdx	rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack
+docs/guides/mobpack.mdx	rkat mob inspect ./dist/release-triage.mobpack
+docs/guides/mobpack.mdx	rkat mob validate ./dist/release-triage.mobpack --trust-policy permissive
+docs/guides/mobpack.mdx	rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack --sign ./keys/release.key --signer-id release@example.com
+docs/guides/mobpack.mdx	rkat mob run ./dist/release-triage.mobpack --prompt "triage release regressions" --trust-policy permissive
+docs/guides/mobpack.mdx	rkat mob deploy ./dist/release-triage.mobpack "triage latest incidents" --max-duration 15m --trust-policy permissive
+docs/guides/mobpack.mdx	rkat mob run ./dist/release-triage.mobpack --flow main --param severity='"high"' --prompt "triage latest incidents" --trust-policy permissive
+docs/guides/mobpack.mdx	rkat mob run ./dist/release-triage.mobpack --flow main --prompt "triage latest incidents" --param severity='"high"' --detach --trust-policy permissive
+docs/guides/mobpack.mdx	rkat mob runs release-triage --json
+docs/guides/mobpack.mdx	rkat mob web build ./dist/release-triage.mobpack -o ./dist/release-triage-web --wasm ./meerkat-web-runtime/pkg --trust-policy permissive
+docs/guides/mobs.mdx	rkat run --tools full "Ask one helper to inspect the test failure, then summarize what it found."
+docs/guides/mobs.mdx	rkat run --tools full "Create a release-triage mob with a lead and two analysts, then report member status."
+docs/guides/mobs.mdx	rkat mob spawn-helper release-triage "Investigate the latest failing check" --agent-identity analyst-3 --profile analyst --result-label failing-check --max-text-bytes 4096 --json
+docs/guides/mobs.mdx	rkat mob wait-kickoff release-triage --timeout-ms 30000 --json
+docs/guides/mobs.mdx	rkat mob run release-triage --flow triage --param severity='"critical"'
+docs/guides/mobs.mdx	rkat --realm worker-west-host mob host --listen-tcp 0.0.0.0:4300 --advertise-tcp tcp://worker-west.example.com:4300 --allow-remote --descriptor-out ./worker-west.host.json
+docs/guides/mobs.mdx	rkat --realm team-alpha mob bind-host release-triage --descriptor ./worker-west.host.json
+docs/guides/mobs.mdx	rkat --realm team-alpha mob hosts release-triage --json
+docs/guides/mobs.mdx	rkat run --comms-name worker-west-1 --comms-listen-tcp 0.0.0.0:4200 --comms-advertise-tcp worker-west-1.example.com:4200 --comms-binding-out ./worker-west-1.binding.json --keep-alive "You are worker-west-1."
+docs/guides/mobs.mdx	rkat mob pack ./mobs/release-triage -o ./dist/release-triage.mobpack
+docs/guides/mobs.mdx	rkat mob inspect ./dist/release-triage.mobpack
+docs/guides/mobs.mdx	rkat mob validate ./dist/release-triage.mobpack --trust-policy permissive
+docs/guides/mobs.mdx	rkat mob run ./dist/release-triage.mobpack --prompt "triage latest release regressions" --trust-policy permissive
+docs/guides/realms.mdx	rkat realm current
+docs/guides/realms.mdx	rkat realm list
+docs/guides/realms.mdx	rkat run --verbose "hello"
+docs/guides/realms.mdx	rkat realm show team-alpha
+docs/guides/realms.mdx	rkat run "summarize this repo"
+docs/guides/realms.mdx	rkat --state-root /srv/meerkat/realms --realm team-alpha run "draft release notes"
+docs/guides/realms.mdx	rkat --state-root /srv/meerkat/realms --realm team-alpha session list
+docs/guides/realms.mdx	rkat --context-root /work/app run "use the app workspace identity"
+docs/guides/realms.mdx	rkat --isolated run "try this without reusing my workspace realm"
+docs/guides/realms.mdx	rkat --realm team-alpha --state-root /srv/meerkat/realms run "use the explicitly selected store"
+docs/guides/realms.mdx	rkat --realm audit --realm-backend sqlite run "start audit"
+docs/guides/realms.mdx	rkat --realm team-alpha storage doctor
+docs/guides/realms.mdx	rkat --realm team-alpha storage migrate
+docs/guides/realms.mdx	rkat --realm team-alpha storage migrate --apply --adopt-root /path/to/chosen/realms
+docs/guides/self-hosting-models.mdx	rkat run -m gemma-4-31b "Summarize this repository"
+docs/guides/self-hosting-models.mdx	rkat run --resume -m gemma-4-e4b "Keep going, but use the faster local model"
+docs/guides/self-hosting-models.mdx	rkat models
+docs/guides/self-hosting-models.mdx	rkat doctor
+docs/guides/self-hosting-models.mdx	rkat models
+docs/guides/self-hosting-models.mdx	rkat doctor
+docs/guides/self-hosting-models.mdx	rkat auth bindings --realm global
+docs/guides/self-hosting-models.mdx	rkat auth test --realm global local
+docs/guides/self-hosting-models.mdx	rkat run --auth-binding global:local -m gemma-4-31b "Say hello in one sentence."
+docs/guides/self-hosting-models.mdx	rkat run --auth-binding global:local -m gemma-4-e4b "Say hello in one sentence."
+docs/guides/skills.mdx	rkat run "Track the implementation work as tasks" --skill task-workflow
+docs/guides/storage-operations.mdx	rkat --realm home storage doctor --json
+docs/guides/storage-operations.mdx	rkat --state-root /srv/meerkat/realms --realm home storage doctor --json
+docs/guides/storage-operations.mdx	rkat --realm home storage doctor --root /srv/generation-a/realms --root /srv/generation-b/realms
+docs/guides/storage-operations.mdx	rkat --realm home storage doctor
+docs/guides/storage-operations.mdx	rkat --realm home storage doctor --json
+docs/guides/storage-operations.mdx	rkat --realm home storage migrate --json
+docs/guides/storage-operations.mdx	rkat --realm home storage migrate --apply
+docs/guides/storage-operations.mdx	rkat --realm home storage doctor --root /srv/root-a --root /srv/root-b --json
+docs/guides/storage-operations.mdx	rkat --realm home storage migrate --root /srv/root-a --root /srv/root-b --apply --adopt-root /srv/root-a
+docs/guides/storage-operations.mdx	rkat --state-root /srv/meerkat/realms --realm home storage migrate --apply --bridge-pre-0-8-10
+docs/guides/storage-operations.mdx	rkat --realm home storage prune
+docs/guides/storage-operations.mdx	rkat --realm home storage prune --apply
+docs/guides/storage-operations.mdx	rkat --realm home storage prune --apply --older-than-days 90
+docs/guides/structured-output.mdx	rkat run "Analyze this code" --schema schema.json
+docs/guides/workgraph.mdx	rkat --realm home workgraph goal-create SESSION_ID "Prepare client visit transport reminder" --namespace default --mode pursue --completion-policy self-attest
+docs/internal/archive/public-docs-removed-2026-05-11/guides/self-hosted-gemma4.mdx	rkat run -m gemma-4-31b "Summarize the architecture of this repository"
+docs/internal/archive/public-docs-removed-2026-05-11/guides/self-hosted-gemma4.mdx	rkat run --resume -m gemma-4-e4b "Keep going, but faster"
+docs/internal/archive/public-docs-removed-2026-05-11/guides/self-hosted-gemma4.mdx	rkat models
+docs/internal/archive/public-docs-removed-2026-05-11/guides/self-hosted-gemma4.mdx	rkat doctor
+docs/quickstart.mdx	rkat run "What is the capital of France? Answer in one sentence."
+docs/quickstart.mdx	rkat run --model claude-sonnet-4-6 "Explain async/await"
+docs/quickstart.mdx	rkat run --model gemini-3.8-flash "Explain async/await"
+docs/quickstart.mdx	rkat --state-root /srv/meerkat/realms --realm team-alpha run "Draft a release note"
+docs/quickstart.mdx	rkat mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /tmp
+docs/quickstart.mdx	rkat run --wait-for-mcp "List the files in /tmp"
+docs/quickstart.mdx	rkat mcp add --transport http knowledge https://mcp.example.com --oauth-account-selection discover
+docs/quickstart.mdx	rkat mcp login knowledge
+docs/quickstart.mdx	rkat run --wait-for-mcp "Search the knowledge base for onboarding docs"
+docs/quickstart.mdx	rkat run --max-tokens 4000 --max-duration 30s --max-tool-calls 5 "Inspect this project and summarize the main risks"
+docs/quickstart.mdx	rkat run --tools full "Create a small mob to inspect src/, collect the findings, and summarize them."
+docs/reference/mob-architecture.mdx	rkat mob pack ./mob -o ./dist/mob.mobpack
+docs/reference/mob-architecture.mdx	rkat mob inspect ./dist/mob.mobpack
+docs/reference/mob-architecture.mdx	rkat mob validate ./dist/mob.mobpack --trust-policy permissive
+docs/reference/mob-architecture.mdx	rkat mob run ./dist/mob.mobpack --prompt "run this mob" --trust-policy permissive
+docs/reference/mob-architecture.mdx	rkat mob web build ./dist/mob.mobpack -o ./dist/web --wasm ./meerkat-web-runtime/pkg --trust-policy permissive

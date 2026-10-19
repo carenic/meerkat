@@ -435,6 +435,11 @@ pub(crate) enum RuntimeRevivalIntent {
     #[default]
     None,
     MissingLiveMaterialization,
+    /// `MobBuilder::resume` restoring a durable member at boot. It provisions
+    /// as `None` does; a host refusal of the registration it prepared comes
+    /// back typed (`MobError::MemberRegistrationRefused`), and the
+    /// transaction's own rollback removes that registration.
+    ColdRestore,
 }
 
 #[doc(hidden)]
@@ -1458,6 +1463,27 @@ pub(super) enum MemberRunCancelOutcome {
     },
 }
 
+/// The answer for a member work cancel its runtime refused. The runtime's
+/// typed `RecoveryRepairBlocked` from the cancel point is the authority that
+/// the member needs a durability reload: it answers the member's
+/// `MemberReloadRequired`, whose repair is
+/// `MobHandle::reload_member_registration`. Any other refusal stays internal.
+pub(super) fn member_work_cancel_error(
+    member_identity: &AgentIdentity,
+    error: meerkat_runtime::RuntimeDriverError,
+    context: impl FnOnce() -> String,
+) -> MobError {
+    match error {
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { reason, .. } => {
+            MobError::MemberReloadRequired {
+                member_id: member_identity.clone(),
+                reason,
+            }
+        }
+        error => MobError::Internal(format!("{}: {error}", context())),
+    }
+}
+
 /// Classify an exact-run cancel's result for the cancel verbs, by type.
 ///
 /// `InterruptDispatchOutcomeUnknown` is a cancel the runtime accepted and
@@ -1639,6 +1665,29 @@ pub trait MobProvisioner: Send + Sync {
         member_identity: &AgentIdentity,
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
+
+    /// Retire a member whose host refused its registration, as MobMachine
+    /// records it. The refusal left the member no owner operation binding in
+    /// this process, so its retirement projects into one only when one is
+    /// bound, where the fresh archive of any other member fails closed on a
+    /// missing binding. `deadline` bounds it as in
+    /// [`Self::retire_member_until`]; without one it retires under
+    /// [`Self::retire_member`]'s budget. The default retires it as any
+    /// member.
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        match deadline {
+            Some(deadline) => {
+                self.retire_member_until(member_ref, member_identity, deadline)
+                    .await
+            }
+            None => self.retire_member(member_ref).await,
+        }
+    }
     async fn interrupt_member(
         &self,
         member_ref: &MemberRef,
@@ -1685,11 +1734,13 @@ pub trait MobProvisioner: Send + Sync {
     /// (force cancel, cancel all work): its current run, exactly that run, at
     /// its next boundary, and the input it held queued. Input admitted after
     /// the cancel is untouched. `Ok(())` means the member has no admitted work
-    /// left that this cancel is responsible for. The default interrupts the
-    /// member.
+    /// left that this cancel is responsible for. A member runtime that needs a
+    /// durability reload refuses typed as `member_identity`'s
+    /// [`MobError::MemberReloadRequired`]. The default interrupts the member.
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        _member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         self.interrupt_member(member_ref, expected_member).await
@@ -1709,6 +1760,35 @@ pub trait MobProvisioner: Send + Sync {
     /// released. Only a runtime this process hosts can be held this way; the
     /// default holds nothing.
     async fn stage_member_registration_run_start_hold(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
+    /// Stage a run-start hold that the member's next runtime registration
+    /// applies (#1500), without holding the registration that is current: a
+    /// mob Stop stages `MobStop` this way and then holds the member with
+    /// [`Self::stop_member_runtime`], so a registration that replaces the
+    /// held one while the mob is Stopped (a reload) is held too. The reason
+    /// stays staged until [`Self::release_member_run_starts`] releases it or
+    /// [`Self::unstage_member_registration_run_start_hold`] removes it. Only
+    /// a runtime this process hosts is staged; the default stages nothing.
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
+    /// Remove a run-start hold staged for the member's runtime registration
+    /// (#1500), and nothing more: a hold the current registration already
+    /// applies stays in place. For a member that is gone for good (retired,
+    /// torn down by Shutdown, disposed by destroy), so that a later
+    /// registration of the same session is not held for it, and for a
+    /// restore that drops a `MobStop` an earlier incarnation staged before
+    /// any member registers. The default removes nothing.
+    async fn unstage_member_registration_run_start_hold(
         &self,
         _member_ref: &MemberRef,
         _reason: meerkat_runtime::RunStartHoldReason,
@@ -2275,6 +2355,10 @@ pub struct SessionBackend {
     // Optional host selection of each member's scoped destination; the
     // backend installs it on the member's exact registration.
     member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
+    // The routes of the surface gates this backend installed, shared by its
+    // clones, so a later transaction on a registration that kept its gate
+    // receives that gate's decision.
+    member_surface_gate_routes: super::registration_hook::MemberSurfaceGateRoutes,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -2835,6 +2919,44 @@ pub struct MemberSessionDisposalArc {
     /// executor-residency sidecar map (ADJ-23) so disposal clears the same
     /// entries the materializer registered.
     runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
+}
+
+/// What a durability-degraded registration became ahead of its exact
+/// unregister ([`MemberSessionDisposalArc::discard_degraded_registration_first`]).
+#[cfg(feature = "runtime-adapter")]
+pub(super) enum DegradedUnregisterStep {
+    /// Not degraded, or no longer this exact registration: its exact
+    /// unregister proceeds unchanged. Also when the runtime refuses the
+    /// discard until a repair (`RecoveryRepairBlocked`), which it does for
+    /// reasons it does not type apart: another owner still holds the
+    /// registration's teardown (an unregister, stop-cleanup or unregister
+    /// finalization coordinator), a user-interrupt dispatch on it has not
+    /// settled, or its cold recovery cannot run yet. It also refuses an
+    /// attachment without a teardown slot, which only guards the invariant
+    /// that every attachment has one. The exact unregister then joins that
+    /// owner, waits within its own deadline, or is refused until the repair
+    /// too, and a settlement retries the discard on its next call. A
+    /// registration whose runtime loop is still attached keeps its fence
+    /// until that loop hands it back, and the discard waits for that
+    /// handoff. A registration that no runtime loop holds (none was ever
+    /// attached, or its teardown completed) is not refused for a missing
+    /// handoff: nothing retains its mutation fence, and the discard takes it.
+    Unchanged,
+    /// The discard replaced the degraded process shell with `successor`, the
+    /// exact cold registration it published, whose use starts at
+    /// `successor_use`. The successor's exact unregister follows.
+    Replaced {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: meerkat_runtime::RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after its expected use
+    /// was read. Nothing was discarded, and the registration is not the
+    /// caller's to unregister.
+    HandedOver,
+    /// The deadline passed before the discard settled.
+    TimedOut,
+    /// The discard failed.
+    Failed(String),
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -4077,6 +4199,88 @@ impl MemberSessionDisposalArc {
         })
     }
 
+    /// Before an exact unregister: discard `registration` first when its
+    /// session is durability-degraded, bounded by `deadline`.
+    ///
+    /// A failed boundary commit leaves the session `ReloadRequired`, and its
+    /// exited runtime loop can keep the session's mutation fence in its
+    /// published handoff. Only the reload-required discard releases that
+    /// fence; an exact unregister admitted first waits on it for good. The
+    /// discard replaces the degraded process shell with a cold successor
+    /// recovered from durable authority, retaining the member's bound
+    /// operation as retire's discard does, and the caller unregisters that
+    /// successor: the exact registration the discard returns as published,
+    /// never the session's registration read after the discard returned,
+    /// which can already be a later owner's.
+    ///
+    /// With `expected_use`, the discard runs only while the registration's
+    /// use is still that one: a caller that handed the registration back
+    /// passes the use it had then. Any other use means a later owner took the
+    /// registration over, which is reported as
+    /// [`DegradedUnregisterStep::HandedOver`] without discarding.
+    pub(super) async fn discard_degraded_registration_first(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        expected_use: Option<meerkat_runtime::RuntimeSessionRegistrationUse>,
+        deadline: Instant,
+    ) -> DegradedUnregisterStep {
+        let session_id = registration.session_id();
+        if adapter
+            .durability_reload_required(session_id)
+            .await
+            .is_none()
+        {
+            return DegradedUnregisterStep::Unchanged;
+        }
+        let prior_ops_binding = match Self::recoverable_ops_binding_witness(ops_adapter, session_id)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                return DegradedUnregisterStep::Failed(format!(
+                    "durability-reload discard of runtime session {session_id} could not capture its bound operation: {error}"
+                ));
+            }
+        };
+        let discarded = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            adapter.reload_required_registration_settlement_if_current(
+                registration,
+                expected_use,
+                prior_ops_binding
+                    .as_ref()
+                    .map(|witness| witness.retention_request()),
+            ),
+        )
+        .await;
+        match discarded {
+            Err(_) => DegradedUnregisterStep::TimedOut,
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Discarded {
+                successor,
+                successor_use,
+            })) => DegradedUnregisterStep::Replaced {
+                successor,
+                successor_use,
+            },
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Changed)) => {
+                DegradedUnregisterStep::HandedOver
+            }
+            Ok(
+                Ok(
+                    meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotDegraded
+                    | meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotCurrent,
+                )
+                | Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }),
+            ) => DegradedUnregisterStep::Unchanged,
+            Ok(Ok(settlement)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} answered an unknown settlement: {settlement:?}"
+            )),
+            Ok(Err(error)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} failed: {error}"
+            )),
+        }
+    }
+
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
         runtime_adapter: Option<&Arc<MeerkatMachine>>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
@@ -5042,6 +5246,7 @@ impl SessionBackend {
     async fn cancel_member_admitted_work_exact(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         let session_id = Self::require_session(member_ref, "cancel")?;
@@ -5052,9 +5257,9 @@ impl SessionBackend {
             .abandon_queued_inputs_at_cancel_point(&session_id, "member work cancelled")
             .await
             .map_err(|error| {
-                MobError::Internal(format!(
-                    "abandoning the queued input of '{session_id}' failed: {error}"
-                ))
+                member_work_cancel_error(member_identity, error, || {
+                    format!("abandoning the queued input of '{session_id}' failed")
+                })
             })?;
         let Some(admitted) = admitted else {
             // An unregistered runtime has no queue and no run.
@@ -5069,9 +5274,9 @@ impl SessionBackend {
                 run_id,
             )
             .map_err(|error| {
-                MobError::Internal(format!(
-                    "cancelling the current run of '{session_id}' failed: {error}"
-                ))
+                member_work_cancel_error(member_identity, error, || {
+                    format!("cancelling the current run of '{session_id}' failed")
+                })
             })?,
         };
         let outcome = MemberWorkCancelOutcome {
@@ -5712,7 +5917,14 @@ impl SessionBackend {
             disposal,
             settlement_ledger: None,
             member_runtime_registration_hook: None,
+            member_surface_gate_routes: Default::default(),
         }
+    }
+
+    /// Whether this backend still holds an operation binding for `session_id`.
+    #[cfg(test)]
+    pub(super) fn has_session_ops_binding_for_test(&self, session_id: &SessionId) -> bool {
+        self.ops_adapter.has_session_binding_for_test(session_id)
     }
 
     pub fn with_member_runtime_registration_hook(
@@ -5727,7 +5939,13 @@ impl SessionBackend {
         self.runtime_adapter
             .as_ref()
             .zip(self.member_runtime_registration_hook.as_ref())
-            .map(|(machine, hook)| (Arc::clone(machine), Arc::clone(hook)))
+            .map(|(machine, hook)| {
+                (
+                    Arc::clone(machine),
+                    Arc::clone(hook),
+                    self.member_surface_gate_routes.clone(),
+                )
+            })
     }
 
     /// A cheap clone of this backend scoped to ONE provisioning attempt's
@@ -5806,6 +6024,58 @@ impl SessionBackend {
             MobError::Internal(format!(
                 "session-backed provisioner cannot {operation} member without session bridge: {member_ref:?}"
             ))
+        })
+    }
+
+    /// Dispose a session-backed member's session under `deadline`, then
+    /// project its retirement into its owner operation binding. A member
+    /// whose host refused its registration holds no such binding here (see
+    /// [`MobProvisioner::retire_refused_member`]), so its projection runs
+    /// only when one is bound.
+    async fn retire_session_member_until(
+        &self,
+        member_ref: &MemberRef,
+        deadline: Instant,
+        registration_refused: bool,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        tracing::debug!(
+            member_ref = ?member_ref,
+            registration_refused,
+            "SessionBackend::retire_member start"
+        );
+        let session_id = Self::require_session(member_ref, "retire")?;
+        let disposal = match self.disposal.dispose_until(&session_id, deadline).await {
+            Ok(disposal) => disposal,
+            Err(error) => {
+                return Err(MemberSessionDisposalArc::map_runtime_retirement_error(
+                    &session_id,
+                    error,
+                ));
+            }
+        };
+        if !matches!(
+            disposal,
+            MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+        ) {
+            if registration_refused {
+                self.ops_adapter
+                    .mark_member_retired_if_bound(member_ref)
+                    .await?;
+            } else {
+                self.ops_adapter
+                    .mark_member_retired_after_disposal(member_ref, disposal)
+                    .await?;
+            }
+        }
+        Ok(match disposal {
+            MemberSessionDisposalVerdict::Archived
+            | MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+            | MemberSessionDisposalVerdict::AlreadyArchived => {
+                crate::machines::mob_machine::MemberSessionDisposal::Archived
+            }
+            MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned => {
+                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned
+            }
         })
     }
 
@@ -7583,6 +7853,7 @@ async fn create_attached_session_actor_recovery_owned(
                             session_service.as_ref(),
                             &session_id,
                             identity,
+                            None,
                         )
                         .await
                     }
@@ -7637,6 +7908,84 @@ async fn create_attached_session_actor_recovery_owned(
             "owned actor-only recovery for '{wait_session_id}' ended without a result: {error}"
         ))
     })?
+}
+
+/// What a restored member's revival needs to settle a host refusal of the
+/// member's registration (see [`settle_restored_member_refusal`]).
+#[cfg(feature = "runtime-adapter")]
+pub(super) struct RestoredMemberRefusalCleanup {
+    pub(super) member_id: AgentIdentity,
+    pub(super) ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
+    /// The member's operation binding observed when this revival began,
+    /// before it bound anything itself: the owner context the restore bound
+    /// to the restored registration.
+    pub(super) superseded_ops_binding: Option<super::ops_adapter::SessionOpsBindingWitness>,
+}
+
+/// The registration a host was asked about, with whether this transaction's
+/// own prepare inserted it.
+#[cfg(feature = "runtime-adapter")]
+struct AskedRegistration {
+    machine: Arc<MeerkatMachine>,
+    registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+    inserted_by_this_transaction: bool,
+}
+
+/// Settle a host refusal of a restored member's registration once the
+/// transaction's own exact abort has returned, so no runtime turn boundary is
+/// held. A registration this revival inserted was rolled back by that abort.
+/// One it did not insert (the restore prepared it) was outside the abort's
+/// authority: remove exactly that registration through the canonical
+/// unregister, by the witness the host was asked about, and release the owner
+/// context the restore bound to it. `Ok(false)` means a successor already
+/// replaced the registration: the successor, and the operation binding it
+/// owns, are left alone. The answer is the typed refusal. A failed abort,
+/// removal or release is reported as cleanup uncertainty, never as a clean
+/// refusal.
+#[cfg(feature = "runtime-adapter")]
+async fn settle_restored_member_refusal(
+    restored: RestoredMemberRefusalCleanup,
+    call: crate::MemberRegistrationHookCall,
+    asked: AskedRegistration,
+    refusal: MobError,
+    abort: Result<(), MobError>,
+) -> (MobError, Result<(), MobError>) {
+    if let Err(error) = abort {
+        return (refusal, Err(error));
+    }
+    let session_id = asked.registration.session_id().clone();
+    let refused = MobError::MemberRegistrationRefused {
+        member_id: restored.member_id,
+        session_id: Some(session_id.clone()),
+        call,
+        reason: refusal.to_string(),
+    };
+    if asked.inserted_by_this_transaction {
+        return (refused, Ok(()));
+    }
+    let removed = match asked
+        .machine
+        .unregister_session_registration_until_terminal_if_current(&asked.registration)
+        .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            return (
+                refused,
+                Err(MobError::Internal(format!(
+                    "removing the refused restored registration of session '{session_id}' failed: {error}"
+                ))),
+            );
+        }
+    };
+    if !removed {
+        return (refused, Ok(()));
+    }
+    let released = restored
+        .ops_adapter
+        .release_session_binding_for_explicit_resume(&session_id, restored.superseded_ops_binding)
+        .map(|_| ());
+    (refused, released)
 }
 
 /// Cancellation-safe owner of the service actor and exact prepared machine
@@ -7852,6 +8201,7 @@ impl PreparedServiceActorTransaction {
         route: super::session_service::SessionActorMaterializationRoute,
         registration_composition: super::registration_hook::MemberRegistrationComposition,
         held_bound: Option<super::held_spawn::HeldProvisionBound>,
+        restored: Option<RestoredMemberRefusalCleanup>,
     ) -> Result<(meerkat_core::RunResult, Self), MobError> {
         let cleanup_spawner = self.cleanup_spawner.clone();
         let session_id = self.session_id.clone();
@@ -7860,9 +8210,13 @@ impl PreparedServiceActorTransaction {
         cleanup_spawner.spawn_detached(async move {
             let mut transaction = self;
             let revivable = route.is_revivable();
+            let refusals = super::registration_hook::HostRefusalSlot::default();
+            let mut asked = None;
             let create_result = {
                 let transaction = &mut transaction;
                 let result_tx = &result_tx;
+                let refusals = &refusals;
+                let asked = &mut asked;
                 async move {
                     let held_stop = || {
                         held_bound
@@ -7870,7 +8224,7 @@ impl PreparedServiceActorTransaction {
                             .and_then(super::held_spawn::HeldProvisionBound::ended_failure)
                     };
                     let mut surface_check = None;
-                    if let Some((machine, hook)) = registration_composition {
+                    if let Some((machine, hook, gate_routes)) = registration_composition {
                         #[cfg(test)]
                         {
                             let hook = OWNED_CREATE_REGISTRATION_WITNESS_TEST_HOOKS
@@ -7882,8 +8236,9 @@ impl PreparedServiceActorTransaction {
                                 let _ = release_rx.await;
                             }
                         }
-                        let registration = transaction
-                            .prepared()?
+                        let prepared = transaction.prepared()?;
+                        let inserted_by_this_transaction = prepared.inserted_registration();
+                        let registration = prepared
                             .registration_witness()
                             .await
                             .ok_or_else(|| {
@@ -7892,6 +8247,11 @@ impl PreparedServiceActorTransaction {
                                         .into(),
                                 )
                             })?;
+                        *asked = Some(AskedRegistration {
+                            machine: Arc::clone(&machine),
+                            registration: registration.clone(),
+                            inserted_by_this_transaction,
+                        });
                         // The witness waits for the session's mutation gate. A
                         // held setup whose bound ended meanwhile stops before
                         // the host's destination callback starts.
@@ -7903,6 +8263,7 @@ impl PreparedServiceActorTransaction {
                             hook.as_ref(),
                             &registration,
                             &req,
+                            refusals,
                         )
                         .await?;
                         if let Some(stop) = held_stop() {
@@ -7915,6 +8276,7 @@ impl PreparedServiceActorTransaction {
                             hook.as_ref(),
                             &registration,
                             &identity,
+                            refusals,
                         )
                         .await?;
                         if let Some(stop) = held_stop() {
@@ -7925,7 +8287,9 @@ impl PreparedServiceActorTransaction {
                             Arc::clone(&hook),
                             &registration,
                             &identity,
+                            &gate_routes,
                             Some(transaction.surface_selection.clone()),
+                            Some(refusals.clone()),
                         )
                         .await?;
                         surface_check = Some((hook, identity));
@@ -7961,6 +8325,7 @@ impl PreparedServiceActorTransaction {
                             transaction.session_service.as_ref(),
                             &created.session_id,
                             &identity,
+                            Some(refusals),
                         )
                         .await?;
                     }
@@ -8012,6 +8377,24 @@ impl PreparedServiceActorTransaction {
                     } else {
                         cleanup
                     };
+                    // A restored member's host refusal is settled here, after
+                    // the transaction's own abort: see
+                    // `settle_restored_member_refusal`. Every other failure,
+                    // and every failure of a new member, keeps today's answer.
+                    let (materialization_error, cleanup) =
+                        match (restored, refusals.refused(), asked) {
+                            (Some(restored), Some(call), Some(asked)) => {
+                                settle_restored_member_refusal(
+                                    restored,
+                                    call,
+                                    asked,
+                                    materialization_error,
+                                    cleanup,
+                                )
+                                .await
+                            }
+                            _ => (materialization_error, cleanup),
+                        };
                     let error = match (materialization_error, cleanup) {
                         // Preserve the service's typed build failure once
                         // exact volatile cleanup is proven. Callers can then
@@ -12630,6 +13013,24 @@ impl SessionBackend {
         } else {
             None
         };
+        // Only a restored member's revival or boot restore settles a host
+        // refusal of its registration itself; spawns keep the transaction's
+        // own rollback and the host's own error.
+        let restored_member =
+            missing_live_revival || req.runtime_revival_intent == RuntimeRevivalIntent::ColdRestore;
+        let mut restored_refusal_cleanup = restored_member.then(|| {
+            let member = req
+                .create_session
+                .build
+                .as_ref()
+                .and_then(|build| build.mob_member_binding.as_ref())
+                .map_or(req.peer_name.as_str(), |binding| binding.member.as_str());
+            RestoredMemberRefusalCleanup {
+                member_id: AgentIdentity::from(member),
+                ops_adapter: Arc::clone(&backend.ops_adapter),
+                superseded_ops_binding: superseded_ops_binding.clone(),
+            }
+        });
         let mut prepared_ops_binding: Option<(SessionId, Arc<dyn OpsLifecycleRegistry>)> = None;
         if backend.member_runtime_registration_hook.is_some() && backend.runtime_adapter.is_none() {
             return Err(MobError::Internal(
@@ -12773,6 +13174,8 @@ impl SessionBackend {
                         Arc::clone(hook),
                         &registration,
                         &identity,
+                        &backend.member_surface_gate_routes,
+                        None,
                         None,
                     )
                     .await?;
@@ -13042,6 +13445,7 @@ impl SessionBackend {
                     actor_materialization_route,
                     backend.registration_composition(),
                     held_bound.clone(),
+                    restored_refusal_cleanup.take(),
                 )
             })
             .await
@@ -13952,38 +14356,22 @@ impl MobProvisioner for SessionBackend {
         _member_identity: &AgentIdentity,
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
-        tracing::debug!(
-            member_ref = ?member_ref,
-            "SessionBackend::retire_member start"
-        );
-        let session_id = Self::require_session(member_ref, "retire")?;
-        let disposal = match self.disposal.dispose_until(&session_id, deadline).await {
-            Ok(disposal) => disposal,
-            Err(error) => {
-                return Err(MemberSessionDisposalArc::map_runtime_retirement_error(
-                    &session_id,
-                    error,
-                ));
-            }
-        };
-        if !matches!(
-            disposal,
-            MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
-        ) {
-            self.ops_adapter
-                .mark_member_retired_after_disposal(member_ref, disposal)
-                .await?;
-        }
-        Ok(match disposal {
-            MemberSessionDisposalVerdict::Archived
-            | MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
-            | MemberSessionDisposalVerdict::AlreadyArchived => {
-                crate::machines::mob_machine::MemberSessionDisposal::Archived
-            }
-            MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned => {
-                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned
-            }
-        })
+        self.retire_session_member_until(member_ref, deadline, false)
+            .await
+    }
+
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        _member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        self.retire_session_member_until(
+            member_ref,
+            deadline.unwrap_or_else(|| Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT),
+            true,
+        )
+        .await
     }
 
     async fn interrupt_member(
@@ -14063,9 +14451,10 @@ impl MobProvisioner for SessionBackend {
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
-        self.cancel_member_admitted_work_exact(member_ref, expected_member)
+        self.cancel_member_admitted_work_exact(member_ref, member_identity, expected_member)
             .await
     }
 
@@ -14108,6 +14497,30 @@ impl MobProvisioner for SessionBackend {
                     "staging a run-start hold for '{session_id}' failed: {error}"
                 ))
             })
+    }
+
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "stage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.stage_registration_run_start_hold_only(&session_id, reason);
+        }
+        Ok(())
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "unstage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.unstage_registration_run_start_hold(&session_id, reason);
+        }
+        Ok(())
     }
 
     async fn hard_cancel_member(
@@ -17604,6 +18017,32 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
     }
 
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        match member_ref {
+            // A peer-only member has no session here whose registration a
+            // host could refuse.
+            MemberRef::BackendPeer {
+                session_id: None, ..
+            } => match deadline {
+                Some(deadline) => {
+                    self.retire_member_until(member_ref, member_identity, deadline)
+                        .await
+                }
+                None => self.retire_member(member_ref).await,
+            },
+            _ => {
+                self.session
+                    .retire_refused_member(member_ref, member_identity, deadline)
+                    .await
+            }
+        }
+    }
+
     async fn interrupt_member(
         &self,
         member_ref: &MemberRef,
@@ -17806,6 +18245,7 @@ impl MobProvisioner for MultiBackendProvisioner {
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         match member_ref {
@@ -17817,7 +18257,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             }
             _ => {
                 self.session
-                    .cancel_member_admitted_work(member_ref, expected_member)
+                    .cancel_member_admitted_work(member_ref, member_identity, expected_member)
                     .await
             }
         }
@@ -17912,6 +18352,38 @@ impl MobProvisioner for MultiBackendProvisioner {
             _ => {
                 self.session
                     .stage_member_registration_run_start_hold(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .stage_member_registration_run_start_hold_only(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .unstage_member_registration_run_start_hold(member_ref, reason)
                     .await
             }
         }

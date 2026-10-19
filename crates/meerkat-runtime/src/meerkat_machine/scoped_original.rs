@@ -114,23 +114,41 @@ pub trait AuthenticatedOriginalSource: Send + Sync {
         original: &OriginalWorkRef,
     ) -> Result<Option<AuthenticatedOriginal>, ControllerReadinessFailure>;
 
-    /// The source owner's current retained custody of an original it
-    /// admitted, read without a live ingress observation: that original's
-    /// own mandate. `Ok(None)` means it no longer holds the original; an
-    /// error means it cannot say now. Read for every operation of work that
-    /// names the original as a contributor.
+    /// The source owner's current custody of an original, read without a
+    /// live ingress observation: for every operation of work that names the
+    /// original, and for every retained resume of it. An error means the
+    /// owner cannot say now.
+    ///
+    /// The owner answers [`RetainedCustody::AdmissionPending`] only for a
+    /// candidate it recorded and will settle itself, within a bound it owns:
+    /// its own recovery, trigger, budget and close, never a reader's wait. It
+    /// settles every candidate it records. It promotes the candidate once it
+    /// has verified that the runtime admitted that exact input, or it
+    /// withdraws its custody of the candidate for good. It withdraws any
+    /// candidate it cannot settle within its bound, and once it stops it
+    /// answers no candidate as `AdmissionPending`. A withdrawal is final: the
+    /// owner never promotes that candidate later, and the original then
+    /// answers [`RetainedCustody::NotRetained`], the terminal answer. A
+    /// withdrawal ends only the owner's custody. It is no fact about the
+    /// runtime's input, which the owner never reports as not admitted,
+    /// cancelled or settled because its bound expired. After a promotion or a
+    /// withdrawal the host announces it to whatever may wait on it (for a
+    /// retained resume, `ContinuationHostBindings::source_custody_changed` in
+    /// the `meerkat` crate). No reader waits on `AdmissionPending`; a caller
+    /// that retries is bounded by this obligation.
     ///
     /// The same publication contract as the native admitted-work owner
-    /// applies: every relevant custody change must use the same publication
-    /// as the grant authority, and this synchronous method performs no I/O
-    /// and takes no native lock its caller may already hold. The returned
-    /// mandate is a claim of the source owner's own custody; its grant is
-    /// resolved again, currently, in the grant owner.
-    fn retained_original(
+    /// applies: every relevant custody change, a promotion and a withdrawal
+    /// included, uses the same publication as the grant authority, and this
+    /// synchronous method performs no I/O and takes no native lock its caller
+    /// may already hold. A retained mandate is a claim of the source owner's
+    /// own custody; its grant is resolved again, currently, in the grant
+    /// owner.
+    fn retained_custody(
         &self,
         namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure>;
+    ) -> Result<RetainedCustody, ControllerReadinessFailure>;
 
     /// The original owner's current operational disposition of an original
     /// it authenticated: whether its operations are cancelled. Read for the
@@ -139,7 +157,7 @@ pub trait AuthenticatedOriginalSource: Send + Sync {
     /// contributor. A cancelled original keeps its immutable identity and
     /// controller evidence; only its operations are refused.
     ///
-    /// The same contract as [`Self::retained_original`]: a cancellation is
+    /// The same contract as [`Self::retained_custody`]: a cancellation is
     /// published on the grant authority's publication, the read performs no
     /// I/O, and an error (the owner cannot say now, or its cancellation
     /// write is uncertain) is unavailability, never permission. The default
@@ -151,6 +169,64 @@ pub trait AuthenticatedOriginalSource: Send + Sync {
     ) -> Result<OriginalDisposition, ControllerReadinessFailure> {
         Ok(OriginalDisposition::Active)
     }
+}
+
+/// The source owner's current custody of one original, for every reader
+/// that needs it as admitted custody
+/// ([`AuthenticatedOriginalSource::retained_custody`]).
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetainedCustody {
+    /// Admitted and held: the original's own mandate.
+    Retained(WorkAuthorityBasis),
+    /// The owner's submission candidate, whose admission it has not
+    /// settled yet and will settle itself, within its own bound. A not-yet
+    /// answer: never a verdict, and no fact about the runtime's input.
+    AdmissionPending,
+    /// Not held: never admitted here, released, withdrawn, or after a
+    /// restart. For a withdrawn candidate this is final.
+    NotRetained,
+}
+
+impl std::fmt::Debug for RetainedCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Retained(_) => "Retained([REDACTED])",
+            Self::AdmissionPending => "AdmissionPending",
+            Self::NotRetained => "NotRetained",
+        })
+    }
+}
+
+/// One original's custody as every native reader classifies it. A definite
+/// cancellation beats a pending admission: the disposition is read before a
+/// pending admission is answered, so a cancelled original stays a verdict.
+/// Readers that already read the disposition first keep that read.
+pub(crate) enum CustodyClass {
+    Retained(WorkAuthorityBasis),
+    /// Not yet: the owner will settle its candidate within its own bound.
+    Pending,
+    /// A pending candidate whose operations are cancelled.
+    Cancelled,
+    NotRetained,
+}
+
+/// The one classifier every reader of retained custody uses.
+pub(crate) fn classify_custody(
+    originals: &dyn AuthenticatedOriginalSource,
+    namespace: &QualifiedIngressNamespace,
+    original: &OriginalWorkRef,
+) -> Result<CustodyClass, ControllerReadinessFailure> {
+    Ok(match originals.retained_custody(namespace, original)? {
+        RetainedCustody::Retained(basis) => CustodyClass::Retained(basis),
+        RetainedCustody::AdmissionPending => {
+            match originals.original_disposition(namespace, original)? {
+                OriginalDisposition::Active => CustodyClass::Pending,
+                OriginalDisposition::OperationCancelled { .. } => CustodyClass::Cancelled,
+            }
+        }
+        RetainedCustody::NotRetained => CustodyClass::NotRetained,
+    })
 }
 
 /// The original owner's current operational disposition of one original
@@ -205,10 +281,7 @@ pub fn original_operation_grant(
         ))
     };
     require_active_operation(originals, namespace, original)?;
-    let basis = originals
-        .retained_original(namespace, original)
-        .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?
-        .ok_or_else(denied)?;
+    let basis = operation_retained_basis(originals, namespace, original)?.ok_or_else(denied)?;
     let lineage = match &basis {
         WorkAuthorityBasis::HostPolicy { .. } | WorkAuthorityBasis::ServiceMandate { .. } => {
             return Ok(None);
@@ -264,10 +337,7 @@ fn contributor_operation_ceiling(
         ))
     };
     require_active_operation(originals, namespace, original)?;
-    let basis = originals
-        .retained_original(namespace, original)
-        .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?
-        .ok_or_else(denied)?;
+    let basis = operation_retained_basis(originals, namespace, original)?.ok_or_else(denied)?;
     let lineage = match &basis {
         WorkAuthorityBasis::HostPolicy { .. } | WorkAuthorityBasis::ServiceMandate { .. } => {
             return Ok(None);
@@ -321,9 +391,25 @@ impl meerkat_authorization::work::OriginalBasisSource for SourceOriginalBasis {
         original: &OriginalWorkRef,
     ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::OperationAuthorizationError> {
         require_active_operation(self.0.as_ref(), namespace, original)?;
-        self.0
-            .retained_original(namespace, original)
-            .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
+        operation_retained_basis(self.0.as_ref(), namespace, original)
+    }
+}
+
+/// An operation's view of `original`'s retained custody: its mandate while
+/// it is held, `None` when it is not held (or its pending candidate is
+/// cancelled), and unavailable while its admission is pending or the owner
+/// cannot say. A pending admission is never a refusal and never waited on.
+fn operation_retained_basis(
+    originals: &dyn AuthenticatedOriginalSource,
+    namespace: &QualifiedIngressNamespace,
+    original: &OriginalWorkRef,
+) -> Result<Option<WorkAuthorityBasis>, meerkat_core::OperationAuthorizationError> {
+    match classify_custody(originals, namespace, original)
+        .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?
+    {
+        CustodyClass::Retained(basis) => Ok(Some(basis)),
+        CustodyClass::Pending => Err(meerkat_core::OperationAuthorizationError::Unavailable),
+        CustodyClass::Cancelled | CustodyClass::NotRetained => Ok(None),
     }
 }
 
@@ -1046,20 +1132,35 @@ impl ScopedOriginalIngress {
         // longer current refuses the original that names it. The
         // requester-bound lookup alone cannot tell a contributor from a
         // submission's own pending original, so the adapter's retained
-        // (admitted) custody of the contributor is required as well.
+        // (admitted) custody of the contributor is required as well, and is
+        // read first: a contributor whose admission its owner has not settled
+        // yet is not yet admissible, never a malformed claim. A cancelled one
+        // is still refused.
         for contributor in &claims.contributing_work {
+            match classify_custody(
+                self.originals.as_ref(),
+                &claims.ingress_namespace,
+                contributor,
+            )
+            .map_err(NativeAdmissionError::Readiness)?
+            {
+                CustodyClass::Retained(_) => {}
+                CustodyClass::Pending => {
+                    return Err(NativeAdmissionError::Readiness(
+                        ControllerReadinessFailure::OriginalAdmissionPending,
+                    ));
+                }
+                CustodyClass::Cancelled => return Err(refused(OperationRefusalKind::Denied)),
+                CustodyClass::NotRetained => {
+                    return Err(refused(OperationRefusalKind::MalformedFacts));
+                }
+            }
             let custody = self
                 .originals
                 .authenticated_original(ingress, &claims.ingress_namespace, contributor)
                 .map_err(NativeAdmissionError::Readiness)?
                 .ok_or_else(|| refused(OperationRefusalKind::MalformedFacts))?;
-            if &custody.original_work != contributor
-                || self
-                    .originals
-                    .retained_original(&claims.ingress_namespace, contributor)
-                    .map_err(NativeAdmissionError::Readiness)?
-                    .is_none()
-            {
+            if &custody.original_work != contributor {
                 return Err(refused(OperationRefusalKind::MalformedFacts));
             }
             self.require_active_admission(&claims.ingress_namespace, contributor)?;
@@ -1120,7 +1221,9 @@ impl ScopedOriginalIngress {
 ///
 /// # Errors
 /// A source owner that no longer retains the original, or reports it
-/// cancelled, refuses; a source owner that cannot say now is unavailable.
+/// cancelled, refuses; a source owner that cannot say now is unavailable,
+/// and one whose admission of the original is still pending is not yet
+/// ready ([`ControllerReadinessFailure::OriginalAdmissionPending`]).
 pub fn require_source_original_live(
     grants: &LocalGrantAuthority,
     originals: &dyn AuthenticatedOriginalSource,
@@ -1138,10 +1241,19 @@ pub fn require_source_original_live(
             return Err(refused(OperationRefusalKind::Denied));
         }
     }
-    let basis = originals
-        .retained_original(namespace, original)
+    let basis = match classify_custody(originals, namespace, original)
         .map_err(NativeAdmissionError::Readiness)?
-        .ok_or_else(|| refused(OperationRefusalKind::Denied))?;
+    {
+        CustodyClass::Retained(basis) => basis,
+        CustodyClass::Pending => {
+            return Err(NativeAdmissionError::Readiness(
+                ControllerReadinessFailure::OriginalAdmissionPending,
+            ));
+        }
+        CustodyClass::Cancelled | CustodyClass::NotRetained => {
+            return Err(refused(OperationRefusalKind::Denied));
+        }
+    };
     resolve_original_basis(grants, &basis, executor, represented_subject)
 }
 

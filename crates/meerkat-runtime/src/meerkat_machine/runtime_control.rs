@@ -7604,6 +7604,19 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        Self::live_pending_stage_from_state(&state, session_id, channel_id, pending_receipt)
+    }
+
+    /// The sealed pending carrier `pending_receipt` names in one machine
+    /// snapshot. Every read that answers from the stage uses this one
+    /// projection over its own snapshot, so no answer combines two snapshots.
+    #[cfg(feature = "live")]
+    fn live_pending_stage_from_state(
+        state: &crate::meerkat_machine::dsl::MeerkatMachineState,
+        session_id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+        pending_receipt: &str,
+    ) -> Result<ExperimentalLiveExecutionStageAuthority, RuntimeDriverError> {
         let channel = channel_id.as_str();
         if state.live_channel_session_by_channel.get(channel) != Some(&session_id.to_string())
             || state.live_execution_phase_by_channel.get(channel)
@@ -7618,6 +7631,10 @@ impl MeerkatMachine {
                 reason: "opaque live pending receipt is not current".to_string(),
             });
         }
+        // The phase is Pending here, and `live_pending_phase_has_its_stage`
+        // gives a Pending channel all four stage records, so these four
+        // lookups cannot fail while it holds; kept as typed fail-closed
+        // answers.
         let runtime_id = state
             .live_experimental_staged_runtime_by_channel
             .get(channel)
@@ -7656,6 +7673,10 @@ impl MeerkatMachine {
         })
     }
 
+    /// Reacquire the playback-owner readiness of a pending channel. The stage
+    /// and the readiness come from one machine snapshot. Unlike the custody
+    /// projections, this read has no revoked or closed answer: a revocation or
+    /// close that the snapshot holds fails it with the stage reason.
     #[cfg(feature = "live")]
     pub async fn validate_live_playback_owner_readiness(
         &self,
@@ -7664,14 +7685,15 @@ impl MeerkatMachine {
         pending_receipt: &str,
         readiness_id: &str,
     ) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
-        let stage = self
-            .validate_live_pending_channel_receipt(session_id, channel_id, pending_receipt)
-            .await?;
         let state = self.session_dsl_state(session_id).await.map_err(|reason| {
             RuntimeDriverError::ValidationFailed {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
+        let stage =
+            Self::live_pending_stage_from_state(&state, session_id, channel_id, pending_receipt)?;
         let owner_id = state
             .live_playback_owner_by_channel
             .get(channel_id.as_str())
@@ -7709,6 +7731,19 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        Self::live_activation_from_state(&state, session_id, channel_id, activation_receipt)
+    }
+
+    /// The active execution `activation_receipt` names in one machine
+    /// snapshot. Every read that answers from the activation uses this one
+    /// projection over its own snapshot, so no answer combines two snapshots.
+    #[cfg(feature = "live")]
+    fn live_activation_from_state(
+        state: &crate::meerkat_machine::dsl::MeerkatMachineState,
+        session_id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+        activation_receipt: &str,
+    ) -> Result<LiveChannelActivationReceipt, RuntimeDriverError> {
         let channel = channel_id.as_str();
         if state.live_channel_session_by_channel.get(channel) != Some(&session_id.to_string())
             || state.live_execution_phase_by_channel.get(channel)
@@ -7724,6 +7759,12 @@ impl MeerkatMachine {
                 reason: "opaque live activation receipt is not current".to_string(),
             });
         }
+        // The phase is Active and the activation receipt is bound here.
+        // `live_active_pending_channel_has_its_activation` gives such a
+        // channel its runtime binding, and
+        // `live_execution_binding_is_complete_and_channel_scoped` its fence and
+        // generation, so these three lookups cannot fail while both hold; kept
+        // as typed fail-closed answers.
         let runtime_id = state
             .live_execution_runtime_id_by_channel
             .get(channel)
@@ -7754,6 +7795,11 @@ impl MeerkatMachine {
         })
     }
 
+    /// Reacquire the playback-owner readiness of an active channel. The
+    /// activation and the readiness come from one machine snapshot. Unlike
+    /// the custody projections, this read has no revoked or closed answer: a
+    /// revocation or close that the snapshot holds fails it with the
+    /// activation reason.
     #[cfg(feature = "live")]
     pub async fn validate_live_active_playback_owner_readiness(
         &self,
@@ -7763,14 +7809,15 @@ impl MeerkatMachine {
         pending_receipt: &str,
         readiness_id: &str,
     ) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
-        let activation = self
-            .validate_live_channel_activation_receipt(session_id, channel_id, activation_receipt)
-            .await?;
         let state = self.session_dsl_state(session_id).await.map_err(|reason| {
             RuntimeDriverError::ValidationFailed {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
+        let activation =
+            Self::live_activation_from_state(&state, session_id, channel_id, activation_receipt)?;
         let channel = channel_id.as_str();
         let owner_id = state
             .live_playback_owner_by_channel
@@ -7805,6 +7852,18 @@ impl MeerkatMachine {
     /// Reacquire pending, active, revoked, or closed custody from the original
     /// opaque pending receipt. The active variant contains the exact generated
     /// activation receipt, so stateless facades never mint transition truth.
+    ///
+    /// The answer comes from one machine snapshot, so a transition in progress
+    /// (activation, revocation, close) reads as the phase that snapshot holds,
+    /// never as an error. The generated invariants
+    /// `live_pending_phase_has_its_stage`,
+    /// `live_active_pending_channel_has_its_activation`,
+    /// `live_custody_receipts_have_mode_and_phase` and
+    /// `live_activation_receipt_phase_is_active_or_revoked` make every arm
+    /// total for a bound receipt; the arms they rule out stay typed
+    /// fail-closed answers. `ValidationFailed` therefore means the receipt
+    /// names no custody here: a wrong receipt, an abandoned open, or an owner
+    /// session that is gone.
     #[cfg(feature = "live")]
     pub async fn validate_live_channel_custody_by_pending_receipt(
         &self,
@@ -7817,6 +7876,8 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
         let channel = channel_id.as_str();
         let preparation =
             crate::live_execution::LiveContextPreparationStatus::from_state(&state, channel)
@@ -7855,60 +7916,55 @@ impl MeerkatMachine {
                 reason: "opaque live pending receipt is not bound to this session".to_string(),
             });
         }
-        match state.live_execution_phase_by_channel.get(channel).copied() {
+        let custody = match state.live_execution_phase_by_channel.get(channel).copied() {
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Pending) => {
-                drop(state);
-                self.validate_live_pending_channel_receipt(session_id, channel_id, pending_receipt)
-                    .await
-                    .map(|stage| LiveChannelCustodyProjection {
-                        session_id: session_id.clone(),
-                        channel_id: channel_id.clone(),
-                        mode,
-                        state: LiveChannelCustodyState::Pending(stage),
-                        preparation,
-                    })
+                LiveChannelCustodyState::Pending(Self::live_pending_stage_from_state(
+                    &state,
+                    session_id,
+                    channel_id,
+                    pending_receipt,
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Active) => {
                 let activation_receipt = state
                     .live_activation_receipt_by_channel
                     .get(channel)
-                    .cloned()
                     .ok_or_else(|| RuntimeDriverError::ValidationFailed {
                         reason: "active live channel has no activation receipt".to_string(),
                     })?;
-                drop(state);
-                self.validate_live_channel_activation_receipt(
+                LiveChannelCustodyState::Active(Self::live_activation_from_state(
+                    &state,
                     session_id,
                     channel_id,
-                    &activation_receipt,
-                )
-                .await
-                .map(|activation| LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Active(activation),
-                    preparation,
-                })
+                    activation_receipt,
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Revoked) => {
-                Ok(LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Revoked,
-                    preparation,
-                })
+                LiveChannelCustodyState::Revoked
             }
-            None => Err(RuntimeDriverError::ValidationFailed {
-                reason: "opaque live pending receipt has no channel phase".to_string(),
-            }),
-        }
+            None => {
+                return Err(RuntimeDriverError::ValidationFailed {
+                    reason: "opaque live pending receipt has no channel phase".to_string(),
+                });
+            }
+        };
+        Ok(LiveChannelCustodyProjection {
+            session_id: session_id.clone(),
+            channel_id: channel_id.clone(),
+            mode,
+            state: custody,
+            preparation,
+        })
     }
 
     /// Reacquire active, revoked, or closed custody from an exact activation
     /// receipt. Revocation disables active controls but retains this opaque
     /// tombstone so an Active handle can still close or poll terminal status.
+    ///
+    /// The answer comes from one machine snapshot, so a revocation or close in
+    /// progress reads as the phase that snapshot holds, never as an error (see
+    /// [`Self::validate_live_channel_custody_by_pending_receipt`] for the
+    /// invariants that make every arm total).
     #[cfg(feature = "live")]
     pub async fn validate_live_channel_custody_by_activation_receipt(
         &self,
@@ -7921,6 +7977,8 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
         let channel = channel_id.as_str();
         let preparation =
             crate::live_execution::LiveContextPreparationStatus::from_state(&state, channel)
@@ -7959,38 +8017,31 @@ impl MeerkatMachine {
                 reason: "opaque live activation receipt is not bound to this session".to_string(),
             });
         }
-        match state.live_execution_phase_by_channel.get(channel).copied() {
+        let custody = match state.live_execution_phase_by_channel.get(channel).copied() {
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Active) => {
-                drop(state);
-                self.validate_live_channel_activation_receipt(
+                LiveChannelCustodyState::Active(Self::live_activation_from_state(
+                    &state,
                     session_id,
                     channel_id,
                     activation_receipt,
-                )
-                .await
-                .map(|activation| LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Active(activation),
-                    preparation,
-                })
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Revoked) => {
-                Ok(LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Revoked,
-                    preparation,
-                })
+                LiveChannelCustodyState::Revoked
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Pending) | None => {
-                Err(RuntimeDriverError::ValidationFailed {
+                return Err(RuntimeDriverError::ValidationFailed {
                     reason: "activation receipt has no active or terminal custody".to_string(),
-                })
+                });
             }
-        }
+        };
+        Ok(LiveChannelCustodyProjection {
+            session_id: session_id.clone(),
+            channel_id: channel_id.clone(),
+            mode,
+            state: custody,
+            preparation,
+        })
     }
 
     /// Revoke all exact channel-scoped execution custody before physical
@@ -16776,7 +16827,7 @@ impl MeerkatMachine {
                 }
             };
             let (captured_session_gate, preacquired_gate_guard) = match &member_lease {
-                Some(lease) => (Arc::clone(&lease.session_mutation_gate), None),
+                Some(lease) => (lease.session_mutation_gate.clone(), None),
                 None => {
                     let guard = self
                         .lock_current_durability_ready_session_mutation_gate(session_id)
@@ -16789,14 +16840,17 @@ impl MeerkatMachine {
                                 .ok_or(RuntimeDriverError::NotReady {
                                     state: RuntimeState::Destroyed,
                                 })?;
-                        Arc::clone(&entry.mutation_gate)
+                        entry.mutation_gate.clone()
                     };
                     (gate, Some(guard))
                 }
             };
             let held_mutation_gate = match preacquired_gate_guard {
                 Some(guard) => guard,
-                None => Arc::clone(&captured_session_gate).lock_owned().await,
+                None => self
+                    .lock_live_session_mutation_gate(session_id, &captured_session_gate)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?,
             };
             let captured_dsl_authority = {
                 let sessions = self.sessions.read().await;
@@ -16811,7 +16865,7 @@ impl MeerkatMachine {
                         }
                     });
                 };
-                if !Arc::ptr_eq(&entry.mutation_gate, &captured_session_gate) {
+                if !entry.mutation_gate.same_gate(&captured_session_gate) {
                     return Err(RuntimeDriverError::StaleAuthority {
                         reason: "boundary-cancel runtime session was replaced".to_string(),
                     });
@@ -17009,7 +17063,7 @@ impl MeerkatMachine {
                     },
                 ));
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &captured_session_gate)
+            if !entry.mutation_gate.same_gate(&captured_session_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_dsl_authority)
             {
                 drop(sessions);
@@ -17519,7 +17573,6 @@ impl MeerkatMachine {
         use crate::input_state::{InputAbandonReason, InputLifecycleState};
 
         const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
-        const RETRY: std::time::Duration = std::time::Duration::from_millis(25);
         let deadline = Instant::now() + SETTLE;
         loop {
             enum Action {
@@ -17527,7 +17580,7 @@ impl MeerkatMachine {
                 PublishQueued {
                     driver: crate::meerkat_machine::driver::SharedDriver,
                     completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
-                    mutation_gate: Arc<crate::tokio::sync::Mutex<()>>,
+                    mutation_gate: SessionMutationGate,
                     publication_handle: Option<
                         std::sync::Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
                     >,
@@ -17545,7 +17598,7 @@ impl MeerkatMachine {
             let authority = self
                 .lock_member_effect_authority(session_id, expected_member)
                 .await?;
-            let (driver, completions, mutation_gate, publication_handle) = {
+            let (driver, completions, mutation_gate, publication_handle, durability_health) = {
                 let sessions = self.sessions.read().await;
                 let entry =
                     sessions
@@ -17557,16 +17610,25 @@ impl MeerkatMachine {
                 (
                     entry.driver.clone(),
                     entry.completions.clone(),
-                    Arc::clone(&entry.mutation_gate),
+                    entry.mutation_gate.clone(),
                     entry.publication_handle(),
+                    entry.durability_health.clone(),
                 )
             };
-            let action = {
-                let mut driver_guard = driver.lock().await;
+            let (action, mut input_transitions) = {
+                // The member authority above is not M, so a commit past its
+                // deadline can still hold the driver: end typed once the
+                // session degrades instead of waiting for the store.
+                let mut driver_guard = super::lock_driver_live(&driver, durability_health.as_ref())
+                    .await
+                    .map_err(super::degraded_gate_wait_refusal)?;
+                // Subscribed under the driver before the read: a lifecycle
+                // step committed after it is a change on this receiver.
+                let input_transitions = driver_guard.subscribe_input_transitions();
                 let input_id = driver_guard
                     .as_driver()
                     .input_id_for_idempotency_key(idempotency_key);
-                match input_id {
+                let action = match input_id {
                     None => Action::Done,
                     Some(input_id) => {
                         let stored = driver_guard.as_driver().stored_input_state(&input_id);
@@ -17595,7 +17657,7 @@ impl MeerkatMachine {
                                 Action::PublishQueued {
                                     driver: driver.clone(),
                                     completions: completions.clone(),
-                                    mutation_gate: Arc::clone(&mutation_gate),
+                                    mutation_gate: mutation_gate.clone(),
                                     publication_handle: publication_handle.clone(),
                                     input_id,
                                     candidate_owner_input_id,
@@ -17607,7 +17669,8 @@ impl MeerkatMachine {
                                 .map_or(Action::Retry, Action::CancelRun),
                         }
                     }
-                }
+                };
+                (action, input_transitions)
             };
             match action {
                 Action::Done => return Ok(()),
@@ -17692,12 +17755,18 @@ impl MeerkatMachine {
                 }
                 Action::Retry => drop(authority),
             }
+            // Only a read that still finds the input between steps reports
+            // the settle bound: a wait that reaches it falls through to one
+            // more read.
             if Instant::now() >= deadline {
                 return Err(RuntimeDriverError::Internal(format!(
                     "tracked input '{idempotency_key}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
-            crate::tokio::time::sleep(RETRY).await;
+            // Park without the driver, so teardown can drop it and close the
+            // step signal.
+            drop(driver);
+            Self::await_input_transition(&mut input_transitions, deadline).await;
         }
     }
 
@@ -17737,7 +17806,7 @@ impl MeerkatMachine {
         })?
     }
 
-    async fn cancel_input_if_present_owned(
+    pub(super) async fn cancel_input_if_present_owned(
         &self,
         session_id: &SessionId,
         input_id: &meerkat_core::lifecycle::InputId,
@@ -17754,7 +17823,7 @@ impl MeerkatMachine {
         .await
     }
 
-    async fn cancel_input_if_present_owned_before(
+    pub(super) async fn cancel_input_if_present_owned_before(
         &self,
         session_id: &SessionId,
         input_id: &meerkat_core::lifecycle::InputId,
@@ -17763,18 +17832,20 @@ impl MeerkatMachine {
     ) -> Result<bool, RuntimeDriverError> {
         use crate::input_state::{InputAbandonReason, InputLifecycleState};
 
-        const RETRY: std::time::Duration = std::time::Duration::from_millis(25);
-
-        let driver = {
+        // Each pass holds the driver only while it reads and acts. A pass
+        // that waits for the input's next lifecycle step parks without it,
+        // so teardown can drop the driver and close the step signal.
+        let attached_driver = {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(false);
             };
-            entry.driver.clone()
+            Arc::downgrade(&entry.driver)
         };
         loop {
             enum Action {
                 Missing,
+                Settled,
                 DrainTerminal {
                     completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
                     publication_handle: Option<
@@ -17792,6 +17863,9 @@ impl MeerkatMachine {
                 Retry,
             }
 
+            let Some(driver) = attached_driver.upgrade() else {
+                return Ok(false);
+            };
             // Bound before the driver gate so that it drops after it: a
             // committed cancellation is told once M is released, even if a
             // later step fails.
@@ -17820,17 +17894,33 @@ impl MeerkatMachine {
                 (
                     entry.completions.clone(),
                     entry.publication_handle(),
-                    Arc::clone(&entry.mutation_gate),
+                    entry.mutation_gate.clone(),
                 )
             };
-            let action = {
+            let (action, mut input_transitions) = {
                 let mut driver_guard = driver.lock().await;
-                match driver_guard.as_driver().stored_input_state(input_id) {
+                // Subscribed under the driver before the read: a lifecycle
+                // step committed after it is a change on this receiver.
+                let input_transitions = driver_guard.subscribe_input_transitions();
+                let action = match driver_guard.as_driver().stored_input_state(input_id) {
                     None => Action::Missing,
                     Some(stored) if stored.seed.terminal_outcome.is_some() => {
-                        Action::DrainTerminal {
-                            completions,
-                            publication_handle,
+                        // A read that starts after the settle deadline (the
+                        // one after a wait that reached it) waits for
+                        // nothing, and a terminal input answers at once. A
+                        // runless terminal still owed its publication keeps
+                        // the drain, which at the spent deadline reports the
+                        // publication outstanding instead of success.
+                        if Instant::now() >= deadline
+                            && !self.runless_terminal_publication_dispatch_pending(&driver)
+                            && !Self::owes_runless_runtime_termination(&driver_guard).await?
+                        {
+                            Action::Settled
+                        } else {
+                            Action::DrainTerminal {
+                                completions,
+                                publication_handle,
+                            }
                         }
                     }
                     Some(stored) if stored.seed.phase == InputLifecycleState::Queued => {
@@ -17859,11 +17949,13 @@ impl MeerkatMachine {
                         .seed
                         .last_run_id
                         .map_or(Action::Retry, Action::CancelRun),
-                }
+                };
+                (action, input_transitions)
             };
 
             match action {
                 Action::Missing => return Ok(false),
+                Action::Settled => return Ok(true),
                 Action::DrainTerminal {
                     completions,
                     publication_handle,
@@ -17992,13 +18084,55 @@ impl MeerkatMachine {
                 }
             }
 
+            // Only a read that still finds the input between steps reports
+            // the settle bound: a wait that reaches it falls through to one
+            // more read.
             if Instant::now() >= deadline {
                 return Err(RuntimeDriverError::Internal(format!(
                     "input '{input_id}' did not reach a runtime terminal before the cancellation settle deadline"
                 )));
             }
-            crate::tokio::time::sleep(RETRY).await;
+            drop(driver);
+            Self::await_input_transition(&mut input_transitions, deadline).await;
         }
+    }
+
+    /// Wait for the input lifecycle step committed after `input_transitions`
+    /// was subscribed: that step, not a timer, orders the caller's next read
+    /// of an input caught between steps. Callers subscribe under the driver
+    /// lock before they read the input. The publisher bumps from
+    /// `EphemeralRuntimeDriver::absorb_dsl_effects` while it holds that lock,
+    /// so no bump can fall between the read and the subscribe. A closed
+    /// signal (the driver was torn down or rebuilt) also ends the wait: the
+    /// next read resolves the session again. So does `deadline`, and a wait
+    /// that reaches it is no answer either: the caller reads once more and
+    /// reports the settle bound only if that read still finds the input
+    /// between steps. A step committed without the signal therefore costs at
+    /// most the bound, never a false settle error.
+    async fn await_input_transition(
+        input_transitions: &mut crate::tokio::sync::watch::Receiver<u64>,
+        deadline: Instant,
+    ) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A step, a closed signal and the deadline all send the caller back
+        // to read the input.
+        let _ = crate::tokio::time::timeout(remaining, input_transitions.changed()).await;
+    }
+
+    /// Whether a committed runless runtime-termination carrier on this driver
+    /// still waits for its publication: what the terminal drain of an exact
+    /// cancellation publishes before it answers. The row predicate of
+    /// `control_plane::has_committed_runless_recovery_carrier`, without its
+    /// stop-only runtime phase gate, since a queued-input abandon commits its
+    /// carrier while the runtime runs.
+    async fn owes_runless_runtime_termination(
+        driver: &crate::meerkat_machine::driver::DriverEntry,
+    ) -> Result<bool, RuntimeDriverError> {
+        Ok(driver
+            .pending_terminal_input_states()
+            .await?
+            .iter()
+            .any(crate::control_plane::carries_unpublished_runless_termination))
     }
 
     pub fn accept_input_with_completion_boxed<'a>(

@@ -1,8 +1,9 @@
 Covers: Meerkat 0.9 state and configuration: realm ids and where state lives
 (project-local and user-global roots, fallback realm), backends, JSONL index
-degradation, multiprocess hosting claims, SQLite WAL and error codes,
-forward-only versions and upgrade notes, `rkat storage doctor|migrate|prune`;
-runtime behaviour, health and shutdown; WorkGraph limits, join policies and
+degradation, multiprocess hosting claims and cross-process wakes (store
+watch sweep, notification limits), SQLite WAL and error codes, forward-only
+versions and upgrade notes, `rkat storage doctor|migrate|prune`; runtime
+behaviour, health, shutdown and job delivery retries; WorkGraph limits, join policies and
 store errors; schedules; `rkat config` get/set/patch, precedence and keys.
 
 # Storage, Runtime, WorkGraph, Schedules and Config (Meerkat 0.9)
@@ -101,6 +102,35 @@ session applies that session's job deliveries. A claim is a file lock the
 kernel releases when the hosting process exits; there is no lease, expiry or
 heartbeat.
 
+A process learns of rows another process committed from a store watch: a
+bounded sweep (every 5 seconds by default) that file notifications only
+shorten. Since 0.9.4:
+
+- `multiprocess` no longer refuses to start when the runtime store's file
+  notifications cannot be registered (at an inotify watch or instance limit,
+  for example); the sweep is the cross-process wake. It still refuses when the
+  sweep cannot start.
+- A watch whose registration fails keeps its sweep (0.9.3 and earlier did not
+  start the watch, so a mob event observer had no cross-process catch-up).
+  It logs "sqlite change watch notifications are unavailable; the watch runs
+  on its sweep alone" with the reason; wakes then take up to one sweep. To get
+  notifications back, raise the limit (Linux
+  `fs.inotify.max_user_watches`, `fs.inotify.max_user_instances`) and restart.
+- Starting a watch no longer waits for the operating system to register
+  notifications. On macOS, FSEvents registration held the first mob storage
+  open for over 30 seconds and every other mob storage open waited behind it.
+  Registration runs on a thread of its own; at most 64 run at once in a
+  process, and a watch started while 64 are pending runs on its sweep alone
+  and logs the same warning. Stopping a watch never waits for a registration
+  still in progress: its thread stays with the process until the platform
+  call returns, then discards the result. A retired runtime delivery owner
+  whose watch left one logs (info) "runtime delivery owner retired; its store
+  watch's file notification registration stays with the process until the
+  platform call returns".
+- A registration that cannot start notify's inotify event-loop thread (the
+  process at its thread limit) no longer aborts the process; that watch runs
+  on its sweep alone.
+
 Blobs: fetch bytes with `rkat blob get <BLOB-ID> --output <FILE>` (or `--json`
 for the payload), RPC `blob/get {blob_id}`, MCP `meerkat_blob_get`, SDK
 `get_blob` / `getBlob`. Blob ids come from session history (for example
@@ -120,6 +150,15 @@ Upgrade every process that shares a realm together.
 | 0.8.51 | Session envelopes written as v4; SQLite session schema v5; memory store schema v3 |
 | 0.8.52 | Runtime delivery schema v3 |
 | 0.9.0 | Stored runtime input state version 6 (versions 3 to 5 are read and rewritten) |
+| 0.9.4 | Stored runtime input state version 7 (versions 3 to 6 are read; every row written is version 7) |
+
+Since 0.9.4 every input row a binary writes is version 7, including a row it
+read at an older version. 0.9.3 and older refuse a version 7 row before
+installing state (the stored bytes stay in place), so once a 0.9.4 binary has
+written any input row there is no downgrade to 0.9.3. Upgrade every process
+that shares a runtime store together. Likewise a HeadCanonical session that
+records a failed realtime response writes realtime sidecar event schema 4,
+which 0.9.3 and earlier refuse ("unsupported realtime event schema 4").
 
 A database whose ledger is newer than the binary is refused as
 `SchemaFromTheFuture` before any write. SQLite files must be regular files with
@@ -130,7 +169,12 @@ the conversion stayed lock-contended for N ms" (`WalConversionContended`,
 go. Runtime-store failures read "SQLite operation failed: <message>;
 primary_code=..; extended_code=..; path=..; operation=..; caller=.."
 (`SqliteOperationFailed`, 0.8.36; 5 is `SQLITE_BUSY`); the codes do not make
-retrying a write whose outcome is unknown safe.
+retrying a write whose outcome is unknown safe. Since 0.9.4 a store no longer
+refuses to open with "schema domain ... has no ledger row but already owns
+objects" when another process creates the same schema domain at that moment
+(most often two processes making their first durable delivery write, the
+0.9.3 known issue "First concurrent durable delivery"): the open-time check
+reads the schema ledger and the catalog in one snapshot.
 
 ```bash
 rkat storage doctor [--json] [--root PATH]...      # read-only, safe on live realms; exit 1 on errors
@@ -161,6 +205,12 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   retained transcript revision, which can take minutes for a session with a
   large retained history ("head-canonical profile activation is required for
   runtime ..." until it completes). Prune such sessions before converting.
+- Since 0.9.4 the SQLite session store lays out a whole-blob session whose
+  transcript graph retired its oldest occurrences (any session compacted more
+  often than `[compaction] history_retained_rewrites`, default 4), so the
+  one-time migration of such a blob row no longer refuses typed; it writes the
+  retired base and rewrite rows for the retained generations only. The
+  in-memory store still refuses such a session.
 
 ## Runtime behaviour you can observe
 
@@ -182,6 +232,17 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - Job results and subscription events reach their origin session on every
   surface (CLI, REST, MCP server and RPC), and an `Event` job delivery wakes
   an idle session instead of waiting for an unrelated turn (0.8.52).
+- Job delivery retries (since 0.9.4): a delivery whose projection into the
+  runtime inbox failed is retried on the delivery owner's next wake of any
+  kind; while it keeps failing, each further retry waits for twice as many
+  wakes (up to 64). 0.9.3 and earlier retried it only on a job commit or a
+  delivery generation change, so it could stay pending until the process
+  restarted. A continuation the runtime is not ready to admit stays pending
+  with its typed cause and is retried; the warning "durable job delivery left
+  rows pending until the next delivery wake" names it (for example
+  `... is blocked (NotReady(OriginalAdmissionPending)): ...`, an original
+  whose source owner has not settled its admission yet). Nothing is stored for
+  the cause; each retry reads it again.
 - `rkat-rpc` shuts down gracefully on SIGTERM or Ctrl-C as on stdin EOF: with
   `--tcp` it stops accepting, drains connections, then stops the runtime
   (0.9.0). Shutdown also closes MCP login admission and retires pending MCP
@@ -202,6 +263,10 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - `RKAT_WORKER_THREADS` sets the host's Tokio worker count (default: one per
   available CPU; `TOKIO_WORKER_THREADS` is read when it is unset). Set it
   below a container's pids limit, which counts threads.
+- Since 0.9.4 creating a persistent runtime over one store no longer waits for
+  another store's OAuth flow rehydration: each store has its own slot in the
+  process-wide provider-auth cache, and runtimes over one store still share
+  one authority, rehydrated once.
 
 ## WorkGraph
 

@@ -43,8 +43,9 @@ use crate::approval::consent::{
 use crate::approval::{ApprovalId, RefusedReviewCommit, SettledReports};
 use crate::authorization::{
     OperationAuthorizationError, OperationAuthorizationFacts, OperationObservationError,
-    PolicyPublicationObservation, PreparedAuthorizationBinding, PreparedOperationCheck,
-    ReviewOperationContext, ReviewOperationContextResolution, WorkAuthorizationContext,
+    OwnerChangeChurn, PolicyPublicationObservation, PreparedAuthorizationBinding,
+    PreparedOperationCheck, ReviewOperationContext, ReviewOperationContextResolution,
+    WorkAuthorizationContext,
 };
 use crate::lifecycle::identifiers::RunId;
 
@@ -69,6 +70,11 @@ pub enum ReviewUnsatisfiedKind {
     Escalated,
     /// Authorization was re-prepared while the review was retained, so the
     /// reviewed context is no longer current. A fresh attempt is reviewed anew.
+    /// When only the owner publication moved (the same operation is still
+    /// permitted at R2, with the same review material) before any dispatcher
+    /// code ran, the fenced dispatch reviews it once more itself, as a second
+    /// attempt for the same tool call; the first attempt's retirement is then
+    /// not the call's outcome.
     ContextChanged,
     /// R3 requires a fresh qualified human decision; a model allow cannot
     /// satisfy it.
@@ -309,6 +315,12 @@ impl fmt::Display for ReviewAttemptRef {
 
 /// Projection of one generated review transition. Projections never
 /// authorize entry. The `Used` projection is delivered only after the effect.
+///
+/// One tool call can have two attempts: an attempt retired as
+/// `ContextChanged` before any dispatcher code ran can be followed by a
+/// second attempt (another `attempt`, the same `tool_call_id`) when the
+/// fenced dispatch reviews the operation once more under its current
+/// decision. Only the last attempt's projections settle the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewObservation {
     pub attempt: ReviewAttemptRef,
@@ -454,6 +466,17 @@ impl From<crate::ToolError> for EntryRefusal {
     fn from(error: crate::ToolError) -> Self {
         Self::Settled(error)
     }
+}
+
+/// A refused verdict record: the attempt was retired under the reservation,
+/// or queued without waiting.
+struct RefusedVerdict {
+    error: crate::ToolError,
+    pending: PendingObservations,
+    /// The final check under the reservation found the reviewed decision
+    /// no longer current (a re-preparation is required): the one refusal a
+    /// superseding decision can follow.
+    stale: bool,
 }
 
 /// A refused spend. When the spend already committed (`spent`), the entry
@@ -707,6 +730,239 @@ impl BoundOperationReview {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Supersession: one more model review when only the owner publication moved.
+// ---------------------------------------------------------------------------
+
+/// What a model review attempt produced before a publication change
+/// superseded the decision it reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupersededOutcome {
+    /// The reviewer allowed the stale candidate.
+    Allowed,
+    /// The reviewer produced no verdict (an ordinary reviewer failure).
+    NoVerdict,
+    /// The reviewer denied or escalated.
+    Negative,
+}
+
+impl SupersededOutcome {
+    fn of(verdict: Option<ReviewVerdict>) -> Self {
+        match verdict {
+            Some(ReviewVerdict::Allow) => Self::Allowed,
+            None => Self::NoVerdict,
+            Some(ReviewVerdict::Deny | ReviewVerdict::Escalate) => Self::Negative,
+        }
+    }
+}
+
+/// A model review attempt retired because a completed owner publication
+/// change superseded the decision it reviewed, before any dispatcher code
+/// ran. Built only here, from typed facts: the current decision that the
+/// canonical re-prepare of the same binding returned
+/// ([`PreparedOperationCheck::current`]), never an error or a retirement
+/// reason. Only [`ReviewSupersession::readmit`] consumes it.
+#[derive(Debug)]
+pub(crate) struct SupersededReview {
+    /// The retired attempt's own settlement, which stands when nothing is
+    /// admitted again.
+    settled: crate::ToolError,
+    /// The current decision of the same binding and work.
+    successor: PreparedOperationCheck,
+    /// The tier of the decision the retired attempt reviewed.
+    reviewed_tier: OperationReviewTier,
+    outcome: SupersededOutcome,
+    /// The owner material the retired attempt was shown.
+    material: ReviewOperationContextResolution,
+}
+
+/// Why admission retained no review entry.
+#[derive(Debug)]
+pub(crate) enum ReviewAdmissionRefusal {
+    /// Settled locally, exactly as without supersession.
+    Settled(crate::ToolError),
+    /// The attempt was retired as superseded; what follows is
+    /// [`ReviewSupersession::readmit`]'s decision.
+    Superseded(Box<SupersededReview>),
+}
+
+impl From<crate::ToolError> for ReviewAdmissionRefusal {
+    fn from(error: crate::ToolError) -> Self {
+        Self::Settled(error)
+    }
+}
+
+impl ReviewAdmissionRefusal {
+    fn superseded(
+        settled: crate::ToolError,
+        successor: PreparedOperationCheck,
+        reviewed: &PreparedOperationCheck,
+        outcome: SupersededOutcome,
+        material: ReviewOperationContextResolution,
+    ) -> Self {
+        Self::Superseded(Box::new(SupersededReview {
+            settled,
+            successor,
+            reviewed_tier: reviewed.review_tier(),
+            outcome,
+            material,
+        }))
+    }
+
+    /// The settlement that stands when nothing is admitted again.
+    pub(crate) fn into_settled(self) -> crate::ToolError {
+        match self {
+            Self::Settled(error) => error,
+            Self::Superseded(superseded) => superseded.into_settled(),
+        }
+    }
+}
+
+impl SupersededReview {
+    /// The retired attempt's own settlement, when nothing is admitted again.
+    pub(crate) fn into_settled(self) -> crate::ToolError {
+        self.settled
+    }
+}
+
+/// The one supersession decision of one fenced dispatch. A model review
+/// superseded by a completed owner publication change before any dispatcher
+/// code ran is admitted again once, as a new attempt reviewed from the start
+/// under the current decision; otherwise the retired attempt's own
+/// settlement stands. A verdict is never reused.
+///
+/// Every rule must hold:
+/// - the dispatch's budget of one is unspent;
+/// - the reviewed decision and its successor are both R2: human consent,
+///   a consent attempt and a changed tier never re-admit;
+/// - the retired attempt allowed or produced no verdict: a denial or an
+///   escalation is never asked again, and an expired attempt settles;
+/// - the tool time left fits a whole review deadline;
+/// - the successor's owner material equals what the retired attempt was
+///   shown: changed material reaches the model as the retired attempt's
+///   feedback, and the model decides.
+///
+/// With the owner-change waits this bounds one fenced dispatch: at most
+/// three wait states (its dispatch-entry preparation and each of at most two
+/// review attempts), so at most 9 free rebuilds (3 x
+/// [`OWNER_CHANGE_FREE_REBUILDS`](crate::authorization::OWNER_CHANGE_FREE_REBUILDS))
+/// and 6 s of waiting (3 x
+/// [`OWNER_CHANGE_WAIT_BOUND`](crate::authorization::OWNER_CHANGE_WAIT_BOUND)),
+/// all inside the plan's tool timeout.
+#[derive(Debug, Default)]
+pub(crate) struct ReviewSupersession {
+    spent: bool,
+}
+
+/// A successor admitted for one new model review attempt, with the owner
+/// material that attempt is shown (read for it once, by the decision).
+pub(crate) struct Readmission {
+    pub(crate) successor: PreparedOperationCheck,
+    pub(crate) material: ReviewOperationContextResolution,
+}
+
+impl ReviewSupersession {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide what follows `superseded`. The typed rules come first; the
+    /// successor's material is read only when they all hold, and is then the
+    /// new attempt's own single read.
+    pub(crate) fn readmit(
+        &mut self,
+        review: Option<&Arc<BoundOperationReview>>,
+        superseded: SupersededReview,
+        remaining_tool_time: Option<std::time::Duration>,
+    ) -> Result<Readmission, crate::ToolError> {
+        let SupersededReview {
+            settled,
+            successor,
+            reviewed_tier,
+            outcome,
+            material,
+        } = superseded;
+        let eligible = review.is_some_and(|review| {
+            !self.spent
+                && reviewed_tier == OperationReviewTier::R2
+                && successor.review_tier() == OperationReviewTier::R2
+                && matches!(
+                    outcome,
+                    SupersededOutcome::Allowed | SupersededOutcome::NoVerdict
+                )
+                && remaining_tool_time.is_none_or(|remaining| remaining >= review.deadline)
+        });
+        if !eligible {
+            return Err(settled);
+        }
+        match resolve_operation_context(&successor) {
+            Ok(current) if current == material => {
+                self.spent = true;
+                Ok(Readmission {
+                    successor,
+                    material: current,
+                })
+            }
+            // Changed, newly required or unreadable material: the model is
+            // told the review is no longer current, and decides.
+            Ok(_) | Err(_) => Err(settled),
+        }
+    }
+}
+
+/// How a reviewed decision stands once its review window closed.
+enum CurrentDecision {
+    /// Still current: the verdict may be recorded.
+    Unchanged,
+    /// A completed owner publication change superseded it with this current
+    /// decision of the same binding and work.
+    Superseded(PreparedOperationCheck),
+    /// The owner refused or failed, or a change in progress did not complete
+    /// within the wait: the authority changed.
+    Failed(OperationAuthorizationError),
+    /// The attempt's own deadline passed (possibly while waiting).
+    Expired,
+}
+
+/// Classify the reviewed decision through the canonical current/reprepare
+/// path ([`PreparedOperationCheck::current`]). A re-preparation refused while
+/// an owner change is still in progress on the work's own publication waits
+/// for that change, within the attempt's own deadline and `churn`'s bounds,
+/// and classifies again: a fact read while a change is half published is
+/// never used, and waiting weakens no refusal.
+async fn current_decision(
+    prepared: &PreparedOperationCheck,
+    work: &WorkAuthorizationContext,
+    retained: &RetainedReview,
+    churn: &mut OwnerChangeChurn,
+) -> CurrentDecision {
+    loop {
+        if retained.expired() {
+            return CurrentDecision::Expired;
+        }
+        let error = match prepared.current() {
+            Ok(current) if current.same_check(prepared) => return CurrentDecision::Unchanged,
+            Ok(successor) => return CurrentDecision::Superseded(successor),
+            Err(error) => error,
+        };
+        if let OperationAuthorizationError::Refused(refusal) = &error
+            && refusal.kind() == crate::authorization::OperationRefusalKind::ReprepareRequired
+            && let Some(wait) = churn
+                .wait_for_settled_change(
+                    work.authorization().as_ref(),
+                    Some(retained.remaining()),
+                    "review_currentness",
+                    Some(&prepared.binding().facts().operation_id),
+                )
+                .await
+            && wait.settled()
+        {
+            continue;
+        }
+        return CurrentDecision::Failed(error);
+    }
+}
+
 /// Admission at the common prepared entry, before entry staging.
 ///
 /// R1 proceeds. R3 settles locally. R2 without a composed reviewer, or for a
@@ -714,13 +970,27 @@ impl BoundOperationReview {
 /// unavailable feedback before any attempt. Otherwise one bounded review
 /// runs; expiry and currentness are validated before a verdict is accepted,
 /// and an allow is retained (not spent) for the leaf.
-pub(crate) async fn admit_operation_review(
+///
+/// A decision that a completed owner publication change superseded during
+/// the review, or at the verdict's commit, retires the attempt and comes back
+/// typed ([`ReviewAdmissionRefusal::Superseded`]) with its current successor,
+/// for the fenced dispatch's [`ReviewSupersession`] (as does the retained
+/// allow's check point at that dispatch's own root staging; see
+/// [`ReviewEntry::check_superseding`]). An owner change still in
+/// progress on the work's own publication is first waited out through
+/// `churn`, this attempt's own wait state, within the attempt's own deadline.
+/// `successor_material` is the owner material a re-admitted successor was
+/// already read with ([`Readmission`]); without it the material is read
+/// here, once.
+pub(crate) async fn admit_operation_review_attempt(
     review: Option<&Arc<BoundOperationReview>>,
     support: ReviewEntrySupport,
     call: ToolCallView<'_>,
     prepared: &PreparedOperationCheck,
     work: &WorkAuthorizationContext,
-) -> Result<ReviewEntry, crate::ToolError> {
+    successor_material: Option<ReviewOperationContextResolution>,
+    churn: &mut OwnerChangeChurn,
+) -> Result<ReviewEntry, ReviewAdmissionRefusal> {
     match prepared.review_tier() {
         OperationReviewTier::R1 => return Ok(ReviewEntry::not_required()),
         // A model allow can never satisfy R3. Without a host human route it
@@ -728,7 +998,7 @@ pub(crate) async fn admit_operation_review(
         // retained for this exact candidate and it still settles locally:
         // nothing parks, and only a fresh explicit attempt can spend it.
         OperationReviewTier::R3 => {
-            return Err(
+            return Err(ReviewAdmissionRefusal::Settled(
                 match review.and_then(|review| {
                     review
                         .human_consent
@@ -746,7 +1016,7 @@ pub(crate) async fn admit_operation_review(
                         Err(error) => error,
                     },
                 },
-            );
+            ));
         }
         OperationReviewTier::R2 => {}
     }
@@ -755,17 +1025,22 @@ pub(crate) async fn admit_operation_review(
             refusal: crate::authorization::OperationRefused::new(
                 crate::authorization::OperationRefusalKind::MalformedFacts,
             ),
-        });
+        }
+        .into());
     }
     let Some(review) = review else {
-        return Err(unavailable(ReviewUnavailableKind::ReviewerMissing));
+        return Err(unavailable(ReviewUnavailableKind::ReviewerMissing).into());
     };
     if support == ReviewEntrySupport::Unsupported {
-        return Err(unavailable(ReviewUnavailableKind::UnsupportedEntry));
+        return Err(unavailable(ReviewUnavailableKind::UnsupportedEntry).into());
     }
     // Read the owners' passive material once, before any attempt exists, so
-    // a missing required context or an owner denial leaves no attempt.
-    let operation_context = resolve_operation_context(prepared)?;
+    // a missing required context or an owner denial leaves no attempt. A
+    // re-admitted successor brings the material its decision read for it.
+    let operation_context = match successor_material {
+        Some(successor_material) => successor_material,
+        None => resolve_operation_context(prepared)?,
+    };
     // The deadline starts before the first access to the owner. Beginning
     // the attempt takes the owner's reservation without waiting (this runs
     // on an async thread): a held owner refuses locally at once, typed, with
@@ -789,6 +1064,7 @@ pub(crate) async fn admit_operation_review(
         admitted: prepared.clone(),
         deadline,
         tool_call_id,
+        material: operation_context.clone(),
     };
 
     // Stage the candidate-to-attempt join in the existing protected input
@@ -797,7 +1073,7 @@ pub(crate) async fn admit_operation_review(
     if let Err(error) = prepared.observe_review_attempt_started(attribution.attempt_ref().clone()) {
         let (error, pending) = retained.retire(ReviewRetirementReason::Abandoned, error.into());
         review.deliver(pending);
-        return Err(error);
+        return Err(error.into());
     }
 
     let candidate = ReviewCandidate {
@@ -815,7 +1091,9 @@ pub(crate) async fn admit_operation_review(
                 unavailable(ReviewUnavailableKind::DeadlineExpired),
             );
             review.deliver(pending);
-            return Err(human_fallback(review, call, prepared, &operation_context).unwrap_or(error));
+            return Err(human_fallback(review, call, prepared, &operation_context)
+                .unwrap_or(error)
+                .into());
         }
     };
 
@@ -827,57 +1105,62 @@ pub(crate) async fn admit_operation_review(
             // currentness check. Disposal cannot turn it into a review verdict.
             let (error, pending) = retained.retire(ReviewRetirementReason::Abandoned, error.into());
             review.deliver(pending);
-            return Err(error);
+            return Err(error.into());
         }
     };
+    let outcome = SupersededOutcome::of(verdict);
 
     // Validate before accepting any verdict: a result that is ready only at
     // or after the absolute deadline never wins, and a stale result is
-    // retired rather than recorded.
-    if retained.expired() {
-        let (error, pending) = retained.retire(
-            ReviewRetirementReason::DeadlineExpired,
-            unavailable(ReviewUnavailableKind::DeadlineExpired),
-        );
-        review.deliver(pending);
-        return Err(human_fallback(review, call, prepared, &operation_context).unwrap_or(error));
-    }
-    match prepared.current() {
-        Err(error) => {
+    // retired rather than recorded. A decision that a completed owner change
+    // superseded comes back typed, with its successor.
+    match current_decision(prepared, work, &retained, churn).await {
+        CurrentDecision::Unchanged => {}
+        CurrentDecision::Expired => {
+            let (error, pending) = retained.retire(
+                ReviewRetirementReason::DeadlineExpired,
+                unavailable(ReviewUnavailableKind::DeadlineExpired),
+            );
+            review.deliver(pending);
+            return Err(human_fallback(review, call, prepared, &operation_context)
+                .unwrap_or(error)
+                .into());
+        }
+        CurrentDecision::Failed(error) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::AuthorityChanged,
                 crate::ToolError::from(error),
             );
             review.deliver(pending);
-            return Err(error);
+            return Err(error.into());
         }
-        Ok(current) if !current.same_check(prepared) => {
+        CurrentDecision::Superseded(successor) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
             );
             review.deliver(pending);
-            return Err(error);
+            return Err(ReviewAdmissionRefusal::superseded(
+                error,
+                successor,
+                prepared,
+                outcome,
+                operation_context,
+            ));
         }
-        Ok(_) => {}
     }
 
     // Every verdict is accepted only under the owner's commit reservation,
     // after the same deadline/currentness checks are repeated there.
     let escalated = matches!(verdict, Some(ReviewVerdict::Escalate));
     let settled = match verdict {
-        Some(ReviewVerdict::Allow) => {
-            return match retained.record_verdict(ReviewVerdict::Allow) {
-                Ok(pending) => {
-                    review.deliver(pending);
-                    Ok(ReviewEntry::retained(retained))
-                }
-                Err((error, pending)) => {
-                    review.deliver(pending);
-                    Err(error)
-                }
-            };
-        }
+        Some(ReviewVerdict::Allow) => match retained.record_verdict(ReviewVerdict::Allow) {
+            Ok(pending) => {
+                review.deliver(pending);
+                return Ok(ReviewEntry::retained(retained));
+            }
+            Err(refused) => Err(refused),
+        },
         Some(ReviewVerdict::Deny) => retained
             .record_verdict(ReviewVerdict::Deny)
             .map(|pending| (pending, unsatisfied(ReviewUnsatisfiedKind::Denied))),
@@ -886,7 +1169,14 @@ pub(crate) async fn admit_operation_review(
             .map(|pending| (pending, unsatisfied(ReviewUnsatisfiedKind::Escalated))),
         None => retained
             .record_unavailable()
-            .map(|pending| (pending, unavailable(ReviewUnavailableKind::ReviewerFailed))),
+            .map(|pending| (pending, unavailable(ReviewUnavailableKind::ReviewerFailed)))
+            .map_err(|(error, pending)| {
+                Box::new(RefusedVerdict {
+                    error,
+                    pending,
+                    stale: false,
+                })
+            }),
     };
     match settled {
         Ok((mut pending, error)) => {
@@ -897,13 +1187,60 @@ pub(crate) async fn admit_operation_review(
             Err(escalated
                 .then(|| human_fallback(review, call, prepared, &operation_context))
                 .flatten()
-                .unwrap_or(error))
+                .unwrap_or(error)
+                .into())
         }
-        Err((error, pending)) => {
+        Err(refused) => {
+            let RefusedVerdict {
+                error,
+                pending,
+                stale,
+            } = *refused;
             review.deliver(pending);
-            Err(error)
+            if !stale {
+                return Err(error.into());
+            }
+            // The decision went stale at the commit itself. The attempt was
+            // retired there; its successor is searched for after the
+            // reservation was released, as after the verdict.
+            match current_decision(prepared, work, &retained, churn).await {
+                CurrentDecision::Superseded(successor) => Err(ReviewAdmissionRefusal::superseded(
+                    error,
+                    successor,
+                    prepared,
+                    outcome,
+                    operation_context,
+                )),
+                CurrentDecision::Unchanged
+                | CurrentDecision::Expired
+                | CurrentDecision::Failed(_) => Err(error.into()),
+            }
         }
     }
+}
+
+/// [`admit_operation_review_attempt`] with no supersession owner after it:
+/// the attempt reads its own material and has its own wait state, and a
+/// superseded attempt settles with its own settlement.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn admit_operation_review(
+    review: Option<&Arc<BoundOperationReview>>,
+    support: ReviewEntrySupport,
+    call: ToolCallView<'_>,
+    prepared: &PreparedOperationCheck,
+    work: &WorkAuthorizationContext,
+) -> Result<ReviewEntry, crate::ToolError> {
+    admit_operation_review_attempt(
+        review,
+        support,
+        call,
+        prepared,
+        work,
+        None,
+        &mut OwnerChangeChurn::new(),
+    )
+    .await
+    .map_err(ReviewAdmissionRefusal::into_settled)
 }
 
 /// R2 human fallback after the model attempt was already settled and
@@ -1121,9 +1458,23 @@ impl ReviewEntry {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Test adapter: the check point's settled projection.
+    #[cfg(test)]
+    pub(crate) fn check(&self, entering: &PreparedOperationCheck) -> Result<(), crate::ToolError> {
+        self.check_superseding(entering)
+            .map_err(ReviewAdmissionRefusal::into_settled)
+    }
+
     /// Non-consuming, repeatable check point, run by every entry staging after
     /// its final authorization check with the decision that staging returned.
-    pub(crate) fn check(&self, entering: &PreparedOperationCheck) -> Result<(), crate::ToolError> {
+    /// A retained model review whose decision a completed owner publication
+    /// change superseded (the entering decision is the canonical re-prepare
+    /// of the same binding) is retired and comes back typed; only the fenced
+    /// dispatch's own root staging acts on that, every other staging settles.
+    pub(crate) fn check_superseding(
+        &self,
+        entering: &PreparedOperationCheck,
+    ) -> Result<(), ReviewAdmissionRefusal> {
         let (result, pending, review) = {
             let mut inner = self.0.lock();
             let review = inner.review.clone();
@@ -1314,7 +1665,7 @@ impl Drop for ReviewDispatchGuard {
 
 type Transition = (
     ReviewEntryState,
-    Result<(), crate::ToolError>,
+    Result<(), ReviewAdmissionRefusal>,
     PendingObservations,
 );
 
@@ -1329,14 +1680,14 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
         // The consented decision is no longer the entering one: fresh consent.
         (_, Consent(consent)) => {
             let (error, pending) = consent.retire_changed();
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R3, Retained(mut retained)) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         // Terminal states keep their disposition for every tier, before the
         // R3 catch-all: a spent clone stays spent (its spend refuses as
@@ -1344,29 +1695,39 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
         (_, Consumed) => (Consumed, Ok(()), PendingObservations::default()),
         (_, Settled) => (
             Settled,
-            Err(unavailable(ReviewUnavailableKind::DispatchEnded)),
+            Err(unavailable(ReviewUnavailableKind::DispatchEnded).into()),
             PendingObservations::default(),
         ),
         (OperationReviewTier::R3, _) => (
             Settled,
-            Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired)),
+            Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired).into()),
             PendingObservations::default(),
         ),
         // A decision re-prepared after review (or a changed tier, which only
-        // a re-prepared decision can carry) means the reviewed context changed.
+        // a re-prepared decision can carry) means the reviewed context
+        // changed. The entering decision is the staging's canonical re-prepare
+        // of the same binding: it is handed back as the successor, and the
+        // supersession decision alone says whether it is reviewed once more.
         (_, Retained(mut retained)) if !entering.same_check(&retained.admitted) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
             );
-            (Settled, Err(error), pending)
+            let superseded = ReviewAdmissionRefusal::superseded(
+                error,
+                entering.clone(),
+                &retained.admitted,
+                SupersededOutcome::Allowed,
+                retained.material.clone(),
+            );
+            (Settled, Err(superseded), pending)
         }
         (OperationReviewTier::R2, Retained(mut retained)) if retained.expired() => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::DeadlineExpired,
                 unavailable(ReviewUnavailableKind::DeadlineExpired),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R2, Retained(retained)) => {
             (Retained(retained), Ok(()), PendingObservations::default())
@@ -1379,11 +1740,11 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R2, NotRequired) => (
             Settled,
-            Err(unsatisfied(ReviewUnsatisfiedKind::ContextChanged)),
+            Err(unsatisfied(ReviewUnsatisfiedKind::ContextChanged).into()),
             PendingObservations::default(),
         ),
     }
@@ -1510,11 +1871,19 @@ pub(crate) struct RetainedReview {
     admitted: PreparedOperationCheck,
     deadline: tokio::time::Instant,
     tool_call_id: Arc<str>,
+    /// The owner material this attempt's reviewer was shown.
+    material: ReviewOperationContextResolution,
 }
 
 impl RetainedReview {
     fn expired(&self) -> bool {
         tokio::time::Instant::now() >= self.deadline
+    }
+
+    /// Time left before the attempt's absolute deadline.
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
     }
 
     /// Run under the owner's commit reservation, immediately before the
@@ -1710,12 +2079,13 @@ impl RetainedReview {
     fn record_verdict(
         &mut self,
         verdict: ReviewVerdict,
-    ) -> Result<PendingObservations, (crate::ToolError, PendingObservations)> {
+    ) -> Result<PendingObservations, Box<RefusedVerdict>> {
         let Some(handle) = self.handle.as_ref() else {
-            return Err((
-                unavailable(ReviewUnavailableKind::OwnerUnavailable),
-                PendingObservations::default(),
-            ));
+            return Err(Box::new(RefusedVerdict {
+                error: unavailable(ReviewUnavailableKind::OwnerUnavailable),
+                pending: PendingObservations::default(),
+                stale: false,
+            }));
         };
         let recorded = self.review.approvals.record_review_verdict(
             handle,
@@ -1735,8 +2105,16 @@ impl RetainedReview {
             // Called outside every entry lock, and the owner's reservation
             // is already released: observe a refused authority now.
             Err(refused) => {
+                let stale = matches!(
+                    refused.error,
+                    ReservedReviewError::FinalCheck(FinalCheckFailure::ContextChanged)
+                );
                 let (refusal, pending) = self.refused_commit(refused);
-                Err((refusal.resolve(), pending))
+                Err(Box::new(RefusedVerdict {
+                    error: refusal.resolve(),
+                    pending,
+                    stale,
+                }))
             }
         }
     }
@@ -2606,6 +2984,69 @@ mod reservation_tests {
                 ),
             ]
         );
+    }
+
+    /// A decision that went stale at the verdict's own commit is superseded,
+    /// not settled, once the owner's re-prepare returns it current: the
+    /// dispatch's one supersession decision admits the successor, whose new
+    /// attempt is reviewed from the start and allowed.
+    #[tokio::test]
+    async fn a_verdict_commit_superseded_by_a_completed_change_is_reviewed_once_more() {
+        let h = harness();
+        let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let owner = Arc::clone(&h.owner);
+        h.on_probe(move || {
+            owner.sequence.fetch_add(1, Ordering::AcqRel);
+        });
+        let args = serde_json::value::RawValue::from_string("{}".into()).expect("args");
+        let call = ToolCallView {
+            id: "call",
+            name: "tool",
+            args: &args,
+        };
+        let superseded = match admit_operation_review_attempt(
+            Some(&review),
+            ReviewEntrySupport::ConsumesAtEntry,
+            call,
+            &h.check,
+            &h.work,
+            None,
+            &mut OwnerChangeChurn::new(),
+        )
+        .await
+        {
+            Err(ReviewAdmissionRefusal::Superseded(superseded)) => superseded,
+            other => unreachable!("the stale verdict commit is superseded: {other:?}"),
+        };
+        assert_eq!(superseded.outcome, SupersededOutcome::Allowed);
+        assert!(!superseded.successor.same_check(&h.check));
+        let readmission = ReviewSupersession::new()
+            .readmit(Some(&review), *superseded, None)
+            .expect("one more review");
+        let entry = admit_operation_review_attempt(
+            Some(&review),
+            ReviewEntrySupport::ConsumesAtEntry,
+            call,
+            &readmission.successor,
+            &h.work,
+            Some(readmission.material),
+            &mut OwnerChangeChurn::new(),
+        )
+        .await
+        .expect("the successor is reviewed and its allow retained");
+        assert_eq!(
+            observer.statuses(),
+            vec![
+                (ReviewAttemptStatus::Pending, None),
+                (
+                    ReviewAttemptStatus::Retired,
+                    Some(ReviewRetirementReason::ContextChanged)
+                ),
+                (ReviewAttemptStatus::Pending, None),
+                (ReviewAttemptStatus::Allowed, None),
+            ]
+        );
+        drop(entry);
     }
 
     /// A held owner is never waited for: the spend refuses locally at once

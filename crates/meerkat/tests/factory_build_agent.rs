@@ -98,9 +98,7 @@ impl LlmClient for MockLlmClient {
                 request,
             )),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }
@@ -4056,9 +4054,7 @@ impl LlmClient for ParamsCaptureClient {
             }),
             Ok(normalized_llm_usage(self.provider, request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }
@@ -5631,6 +5627,52 @@ async fn declared_deny_may_name_a_composed_bundle_tool() {
         .expect("a composed bundle tool is deniable");
     assert!(!gate_admits(&mut agent, "bundle_write").await);
     assert!(gate_admits(&mut agent, "bundle_read").await);
+}
+
+/// While a bundle the configuration opted into is withheld, its tool names
+/// cannot be known: a deny name in no vocabulary is deferred to the execution
+/// gate instead of failing the build, and the gate still refuses it by name
+/// should a tool of that name be dispatched. Without the withheld entry the
+/// same deny name fails the build.
+#[tokio::test]
+async fn declared_deny_defers_unknown_names_while_an_opted_bundle_is_withheld() {
+    let temp = tempfile::tempdir().unwrap();
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
+    let build = |withheld: bool| {
+        let mut restriction = declared_restriction(&["withheld_lookup"], false);
+        if withheld {
+            restriction.vocabulary.insert(
+                meerkat_core::ToolVocabularySource::WithheldBundle("withdrawn".to_string()),
+                meerkat_core::ToolNameSet::new(),
+            );
+        }
+        AgentBuildConfig {
+            llm_client_override: Some(Arc::new(MockLlmClient)),
+            external_tools: Some(Arc::new(PolicyProbeDispatcher::new(
+                &["echo", "withheld_lookup"],
+                Arc::clone(&dispatched),
+            ))),
+            declared_tool_restriction: Some(restriction),
+            ..AgentBuildConfig::new("claude-sonnet-4-5")
+        }
+    };
+    let mut agent = temp_factory(&temp)
+        .build_agent(build(true), &Config::default())
+        .await
+        .expect("a deny name of a withheld bundle is deferred, not a build error");
+    assert!(!gate_admits(&mut agent, "withheld_lookup").await);
+    assert!(gate_admits(&mut agent, "echo").await);
+    assert_eq!(*dispatched.lock().unwrap(), ["echo".to_string()]);
+
+    let err = temp_factory(&temp)
+        .build_agent(build(false), &Config::default())
+        .await
+        .err()
+        .expect("with nothing withheld the unknown deny name fails the build");
+    assert!(
+        matches!(&err, BuildAgentError::DeclaredToolUnknown(unknown) if unknown.tool == "withheld_lookup"),
+        "{err:?}"
+    );
 }
 
 /// A bundle tool in the restriction's vocabulary that the build did not

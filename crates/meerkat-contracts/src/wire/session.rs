@@ -82,6 +82,14 @@ pub struct ForkSessionAtParams {
     pub running_behavior: TranscriptEditRunningBehavior,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<WireToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. Absent is
+    /// `require_explicit_activation`, which this fork cannot honour (the
+    /// child is not materialized, so it cannot be activated before its
+    /// first turn): a source whose prefix carries activation rows is then
+    /// refused. `reactivate_inherited` carries the source's effective
+    /// activations into the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<meerkat_core::ForkInstructionPolicy>,
 }
 
 /// Request payload for `session/fork_replace`.
@@ -101,6 +109,14 @@ pub struct ForkSessionReplaceParams {
     pub running_behavior: TranscriptEditRunningBehavior,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<WireToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. Absent is
+    /// `require_explicit_activation`, which this fork cannot honour (the
+    /// child is not materialized, so it cannot be activated before its
+    /// first turn): a source whose prefix carries activation rows is then
+    /// refused. `reactivate_inherited` carries the source's effective
+    /// activations into the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<meerkat_core::ForkInstructionPolicy>,
 }
 
 /// Public transcript message accepted by same-session rewrite APIs.

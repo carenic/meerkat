@@ -898,6 +898,71 @@ async fn placed_revoke_routes_by_capability_owner_host_after_the_source_is_absen
     assert_eq!(repeat, ForkedParticipantRevocationOutcome::Converged);
 }
 
+/// While the source mob's Shutdown drains its own work, its actor answers a
+/// revocation `ShutdownInProgress` without running it. Revocation with
+/// recovery then revokes through the recovery transport, as it does once the
+/// source has exited.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_revoke_uses_the_transport_while_the_source_shuts_down() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let source_host = spawn_scripted_host_peer("fp-draining-source-host").await;
+    let source = create_controlling_mob("fp-draining-source").await;
+    let source_report = source.bind_scripted(&source_host).await;
+    source
+        .spawn_placed("worker", "remote", &source_report.host_id)
+        .await
+        .expect("placed spawn commits");
+    let capability = create(&source, "remote", "req-draining-source")
+        .await
+        .expect("placed create");
+    let transport = create_controlling_mob("fp-draining-transport").await;
+
+    let release = source
+        .handle
+        .hold_shutdown_drain_for_test()
+        .await
+        .expect("hold the source's next Shutdown drain");
+    let mut closed = source.handle.admission_closed();
+    let shutdown_handle = source.handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(10), closed.wait_for(Option::is_some))
+        .await
+        .expect("the source's Shutdown is admitted")
+        .expect("admission watch");
+
+    let recovered = source
+        .handle
+        .revoke_forked_participant_with_recovery(
+            MobControlPrincipal::Owner,
+            Some(&transport.handle),
+            &capability,
+        )
+        .await
+        .expect("a draining source revokes through the recovery transport");
+    assert!(matches!(
+        recovered,
+        ForkedParticipantRevocationOutcome::Revoked { .. }
+    ));
+    assert_eq!(
+        source_host
+            .received_revoke_forked_participant_payloads()
+            .len(),
+        1,
+        "the recovery transport sends exactly one revoke"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the source's Shutdown still drains"
+    );
+
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(30), shutdown)
+        .await
+        .expect("the source's Shutdown returns")
+        .expect("join")
+        .expect("the source's Shutdown finishes");
+}
+
 /// Recovered revocation refuses persisted authority that cannot prove the
 /// capability's exact owner route or V6 support. Neither refusal may send the
 /// bearer capability to a host.
@@ -1060,5 +1125,122 @@ async fn recovered_revoke_refuses_under_versioned_and_corrupt_owner_routes() {
             .received_revoke_forked_participant_payloads()
             .is_empty(),
         "a pre-V6 host must never receive the capability"
+    );
+}
+
+/// The controller carries the host's fork instruction policy to the member
+/// host that holds a placed source, and only when it asks for something a
+/// member host cannot assume: `reactivate_inherited`. Without it the payload
+/// keeps its pre-policy shape, and the member host applies the default.
+#[tokio::test(flavor = "multi_thread")]
+async fn placed_create_carries_the_fork_instruction_policy_only_when_it_reactivates() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    for (label, policy, expected) in [
+        ("fp-placed-policy-default", None, None),
+        (
+            "fp-placed-policy-refuse",
+            Some(meerkat_core::ForkInstructionPolicy::Refuse),
+            None,
+        ),
+        (
+            "fp-placed-policy-reactivate",
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        ),
+    ] {
+        let scripted = spawn_scripted_host_peer(&format!("{label}-host")).await;
+        let controlling = create_controlling_mob_with_builder(label, |builder| match policy {
+            Some(policy) => builder.with_fork_instruction_policy(policy),
+            None => builder,
+        })
+        .await;
+        let report = controlling.bind_scripted(&scripted).await;
+        controlling
+            .spawn_placed("worker", "remote", &report.host_id)
+            .await
+            .expect("placed spawn commits");
+        create(&controlling, "remote", &format!("req-{label}"))
+            .await
+            .expect("placed create routes over the supervisor bridge");
+        let payloads = scripted.received_create_forked_participant_payloads();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].inherited_instructions, expected,
+            "{label}: the policy field the payload carries"
+        );
+    }
+}
+
+/// A member host that predates the fork instruction policy rejects a create
+/// payload carrying it (its payload type denies unknown fields) as an
+/// unsupported command. The controller that sent the field reports a typed
+/// version-skew refusal, not a bridge detail string.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_host_without_the_fork_instruction_policy_is_a_typed_skew_refusal() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let scripted = spawn_scripted_host_peer("fp-placed-skew-host").await;
+    let controlling = create_controlling_mob_with_builder("fp-placed-skew", |builder| {
+        builder
+            .with_fork_instruction_policy(meerkat_core::ForkInstructionPolicy::ReactivateInherited)
+    })
+    .await;
+    let report = controlling.bind_scripted(&scripted).await;
+    controlling
+        .spawn_placed("worker", "remote", &report.host_id)
+        .await
+        .expect("placed spawn commits");
+    // What a member host without the field answers: its payload decode fails
+    // and it rejects the command as unsupported.
+    scripted.reject_next_create_forked_participant(
+        BridgeRejectionCause::Unsupported,
+        "invalid bridge command: unknown field `inherited_instructions`",
+    );
+
+    let error = create(&controlling, "remote", "req-placed-skew")
+        .await
+        .expect_err("an older member host cannot fork with the policy");
+    match error {
+        MobError::ForkInstructionRefused {
+            source_member_id,
+            refusal,
+        } => {
+            assert_eq!(source_member_id, identity("remote"));
+            assert_eq!(
+                refusal.cause,
+                meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported
+            );
+        }
+        other => panic!("expected a typed version-skew refusal, got {other:?}"),
+    }
+}
+
+/// Control: without the policy field an unsupported rejection is not a
+/// version skew of the policy; it stays the plain bridge rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_rejection_without_the_policy_field_stays_a_bridge_rejection() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let scripted = spawn_scripted_host_peer("fp-placed-unsupported-host").await;
+    let controlling = create_controlling_mob("fp-placed-unsupported").await;
+    let report = controlling.bind_scripted(&scripted).await;
+    controlling
+        .spawn_placed("worker", "remote", &report.host_id)
+        .await
+        .expect("placed spawn commits");
+    scripted.reject_next_create_forked_participant(
+        BridgeRejectionCause::Unsupported,
+        "the host does not serve this command",
+    );
+    let error = create(&controlling, "remote", "req-placed-unsupported")
+        .await
+        .expect_err("the host rejected the command");
+    assert!(
+        matches!(
+            error,
+            MobError::BridgeCommandRejected {
+                cause: BridgeRejectionCause::Unsupported,
+                ..
+            }
+        ),
+        "the plain bridge rejection, got {error:?}"
     );
 }

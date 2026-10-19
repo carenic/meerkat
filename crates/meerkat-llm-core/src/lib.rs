@@ -9,6 +9,15 @@
 //! `meerkat-client` alongside per-provider crates. The `meerkat` facade
 //! re-exports the public surface so downstream SDKs continue to work.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 #[cfg(target_arch = "wasm32")]
 pub mod tokio {
     pub use meerkat_core::time_compat::wasm as time;
@@ -41,6 +50,7 @@ pub use types::{
     ImageGenerationExecutor, LlmClient, LlmDoneOutcome, LlmEvent, LlmReplayProjection, LlmRequest,
     LlmRequestRouteWitness, LlmResponse, LlmStream, PlainModelRoute, PreparedLlmRequest,
     ProviderGeneratedImage, ProviderImageGenerationOutput, ProviderImageGenerationRequest,
-    ToolCallBuffer, WebSearchExecutor, dimensions_from_size_preference,
-    media_type_from_format_preference, normalize_base64_image_data,
+    ToolCallBuffer, WebSearchExecutor, WebSearchStop, classify_web_search_stop,
+    dimensions_from_size_preference, media_type_from_format_preference,
+    normalize_base64_image_data,
 };

@@ -2108,6 +2108,7 @@ async fn a_source_change_published_during_a_blocked_pass_is_retried() {
 /// every facade host arms: a retained completion that blocked before its job
 /// owner was bound is resumed by the binding alone, with no attachment, run
 /// or custody signal ever raised.
+#[cfg(all(feature = "session-store", feature = "memory-store"))]
 #[tokio::test]
 async fn binding_the_job_owner_alone_resumes_a_blocked_retained_completion() {
     let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
@@ -3003,5 +3004,124 @@ async fn a_continuation_behind_a_job_row_on_a_session_address_is_admitted_into_t
             .expect("backlog"),
         0,
         "the job row ahead of it was applied too"
+    );
+}
+
+/// The retained admission keeps a typed readiness cause: not admitted yet and
+/// retried, with the cause the runtime named. A terminal refusal stays a
+/// refusal.
+#[test]
+fn a_retained_admission_keeps_a_typed_readiness_cause() {
+    use meerkat_core::authorization::ControllerReadinessFailure;
+    assert_eq!(
+        meerkat::retained_admission_outcome(Err(
+            meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable {
+                reason: ControllerReadinessFailure::OriginalAdmissionPending,
+            }
+        )),
+        Err(ContinuationAdmitError::NotReady(
+            ControllerReadinessFailure::OriginalAdmissionPending
+        ))
+    );
+    assert_eq!(
+        meerkat::retained_admission_outcome(Err(
+            meerkat_runtime::RuntimeDriverError::RetainedResumeRefused {
+                reason: meerkat_runtime::retained_work::RetainedResumeRefusal::AuthorityDenied,
+            }
+        )),
+        Err(ContinuationAdmitError::Refused(
+            meerkat_runtime::RuntimeDeliveryRefusalReason::AuthorityDenied
+        ))
+    );
+}
+
+async fn status_of(fixture: &Fixture, owner: &ContinuationOwner, key: &str) -> ContinuationStatus {
+    fixture
+        .continuations
+        .continuation_status(owner, &ContinuationKey::new(key).expect("key"))
+        .await
+        .expect("status")
+}
+
+/// CONTROL-stuck (row part): a retained completion whose original's admission
+/// its source owner has not settled is not ready, never refused. Its row stays
+/// pending and is reported blocked with the typed cause, and the row behind it
+/// in the same runtime waits too. Once the owner withdraws the original (the
+/// sink then refuses the resume for good) and the host announces the
+/// settlement, the row settles refused and the row behind it proceeds.
+#[tokio::test]
+async fn a_pending_admission_blocks_its_row_with_the_typed_cause_until_announced() {
+    use meerkat_core::authorization::ControllerReadinessFailure;
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let identity = work_identity("pending");
+    let jobs = FakeJobs::holding("job-1", committed_job(&session, &identity));
+    retained_fork_completion(&fixture, &session, &jobs).await;
+    fixture
+        .continuations
+        .submit(&owner, delivery("after", host_producer()), 1)
+        .await
+        .expect("commit the row behind it");
+    let sink = Arc::new(RecordingSink::governed());
+    *sink.resume_verdict.lock().expect("lock") = Some(ContinuationAdmitError::NotReady(
+        ControllerReadinessFailure::OriginalAdmissionPending,
+    ));
+    let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), jobs.clone())
+        .expect("bind");
+    let handle = fixture
+        .owner()
+        .with_source_changes(bindings.subscribe_source_changes())
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::clone(&bindings),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let blocked = wait_for_pass(&mut passes, "blocked with its typed cause", |pass| {
+        pass.failures
+            .iter()
+            .any(|line| line.contains("NotReady(OriginalAdmissionPending)"))
+    })
+    .await;
+    assert_eq!(blocked.refused, 0, "never refused while pending");
+    assert!(matches!(
+        status_of(&fixture, &owner, "fork_off:job-1").await,
+        ContinuationStatus::Pending { .. }
+    ));
+    assert!(
+        matches!(
+            status_of(&fixture, &owner, "after").await,
+            ContinuationStatus::Pending { .. }
+        ),
+        "the row behind it waits"
+    );
+    assert!(sink.resumes().is_empty());
+
+    *sink.resume_verdict.lock().expect("lock") = Some(ContinuationAdmitError::Refused(
+        meerkat_runtime::RuntimeDeliveryRefusalReason::AuthorityDenied,
+    ));
+    bindings.source_custody_changed();
+    wait_for_pass(&mut passes, "settled after the announcement", |pass| {
+        pass.refused >= 2
+    })
+    .await;
+    assert!(matches!(
+        status_of(&fixture, &owner, "fork_off:job-1").await,
+        ContinuationStatus::Refused {
+            reason: meerkat_runtime::RuntimeDeliveryRefusalReason::AuthorityDenied,
+            ..
+        }
+    ));
+    assert!(
+        matches!(
+            status_of(&fixture, &owner, "after").await,
+            ContinuationStatus::Refused { .. }
+        ),
+        "the row behind it proceeds"
     );
 }

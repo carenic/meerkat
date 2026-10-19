@@ -1598,6 +1598,9 @@ impl CommsCommandRequest {
                 content_taint,
                 handling_mode: handling_mode.unwrap_or_default(),
                 objective_id: None,
+                // Host sends never answer a delivery: only `reply_to_peer`
+                // labels a reply.
+                in_reply_to: None,
             },
             CommsCommandRequest::PeerLifecycle {
                 to,
@@ -1732,6 +1735,11 @@ pub enum CommsCommand {
         content_taint: Option<SendTaintOverride>,
         handling_mode: HandlingMode,
         objective_id: Option<crate::interaction::ObjectiveId>,
+        /// The delivery this message answers. `reply_to_peer` sets it to the
+        /// selected delivery id; `send_message` never does. It travels signed
+        /// in the envelope and only labels the reply for the receiver: it is
+        /// never routing or authority.
+        in_reply_to: Option<InteractionId>,
     },
     /// One-way peer message whose actual member sender is preserved while the
     /// receiver must match a mandatory exact residency before admission.
@@ -1912,6 +1920,36 @@ pub struct PeerReplyCapability {
 pub struct PeerReplyDispatchContext {
     /// Reply capabilities in batch delivery order.
     pub deliveries: Vec<PeerReplyCapability>,
+}
+
+impl PeerReplyDispatchContext {
+    /// Add `delivery` unless this context already holds the same sender's
+    /// delivery with the same interaction id. Returns whether it was added.
+    ///
+    /// Deliveries are keyed by (sender, interaction id), never by the id
+    /// alone: the sender chooses the id, so two senders can carry the same
+    /// one, and each keeps its own capability (`reply_to_peer` then answers
+    /// `ambiguous_reply` instead of picking one).
+    pub fn insert_delivery(&mut self, delivery: PeerReplyCapability) -> bool {
+        let present = self.deliveries.iter().any(|existing| {
+            existing.peer_id == delivery.peer_id && existing.in_reply_to == delivery.in_reply_to
+        });
+        if !present {
+            self.deliveries.push(delivery);
+        }
+        !present
+    }
+}
+
+/// Why a turn's peer-reply context cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PeerReplyContextError {
+    /// The turn-start value under [`COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY`]
+    /// does not decode as a [`PeerReplyDispatchContext`]. It fails closed
+    /// instead of being coerced or ignored.
+    #[error("malformed peer reply context: {0}")]
+    Malformed(String),
 }
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

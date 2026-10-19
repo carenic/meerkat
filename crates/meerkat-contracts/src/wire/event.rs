@@ -254,6 +254,83 @@ mod tests {
         assert_eq!(decoded_identity, identity);
     }
 
+    /// #1888: a content-filtered run failure carries its typed
+    /// stop and, when the provider sent one, the provider-tagged detail; a
+    /// failure without detail still names its stop. Both round-trip.
+    #[test]
+    fn wire_event_content_filtered_carries_typed_stop_and_detail() {
+        use meerkat_core::error::AgentError;
+        use meerkat_core::event::AgentErrorReport;
+        use meerkat_core::{ContentFilteredStop, GeminiStopStage, ProviderStopDetail};
+
+        let detail = ProviderStopDetail::gemini(
+            GeminiStopStage::Prompt,
+            "BLOCKLIST",
+            vec!["HARM_CATEGORY_HARASSMENT".to_string()],
+        );
+        for (error, expected) in [
+            (
+                AgentError::ContentFiltered {
+                    turn: 1,
+                    stop: ContentFilteredStop::ContentFilter,
+                    detail: Some(Box::new(detail)),
+                },
+                serde_json::json!({
+                    "reason_type": "content_filtered",
+                    "stop": "content_filter",
+                    "detail": {
+                        "provider": "gemini",
+                        "stage": "prompt",
+                        "reason": "BLOCKLIST",
+                        "blocked_categories": ["HARM_CATEGORY_HARASSMENT"]
+                    }
+                }),
+            ),
+            (
+                AgentError::ContentFiltered {
+                    turn: 1,
+                    stop: ContentFilteredStop::Refusal,
+                    detail: None,
+                },
+                serde_json::json!({
+                    "reason_type": "content_filtered",
+                    "stop": "refusal"
+                }),
+            ),
+        ] {
+            let report = AgentErrorReport::from_agent_error(&error);
+            let session_id = SessionId::new();
+            let identity = meerkat_core::types::TranscriptMessageIdentity {
+                interaction_id: Some(meerkat_core::interaction::InteractionId::new()),
+                run_id: Some(meerkat_core::lifecycle::RunId::new()),
+                ..Default::default()
+            };
+            let event = WireEvent {
+                session_id: session_id.clone(),
+                sequence: 1,
+                event: AgentEvent::RunFailed {
+                    identity,
+                    session_id,
+                    error_report: report.clone(),
+                    terminal_cause_kind: None,
+                },
+                contract_version: ContractVersion::CURRENT,
+            };
+            let encoded = serde_json::to_value(&event).expect("serialize content filtered");
+            assert_eq!(
+                encoded["event"]["error_report"]["class"],
+                "content_filtered"
+            );
+            assert_eq!(encoded["event"]["error_report"]["reason"], expected);
+            let decoded: WireEvent =
+                serde_json::from_value(encoded).expect("deserialize content filtered");
+            let AgentEvent::RunFailed { error_report, .. } = decoded.event else {
+                panic!("a content-filtered failure stays a failed run");
+            };
+            assert_eq!(error_report, report);
+        }
+    }
+
     #[test]
     fn wire_event_roundtrip_tool_config_changed() {
         let event = WireEvent {
@@ -267,7 +344,6 @@ mod tests {
                         meerkat_core::ExternalToolDeltaPhase::Pending,
                         None,
                     ),
-                    false,
                 )
                 .with_applied_at_turn(Some(3)),
             },
@@ -275,13 +351,16 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(&event).expect("serialize");
+        // The lifecycle bit is written as `settled`, never as `persisted`.
+        assert_eq!(encoded["event"]["payload"]["settled"], false);
+        assert!(encoded["event"]["payload"].get("persisted").is_none());
         let decoded: WireEvent = serde_json::from_value(encoded).expect("deserialize");
         match decoded.event {
             AgentEvent::ToolConfigChanged { payload } => {
                 assert_eq!(payload.operation, ToolConfigChangeOperation::Remove);
                 assert_eq!(payload.target, "filesystem");
                 assert_eq!(payload.status_text(), "pending");
-                assert!(!payload.persisted);
+                assert!(!payload.settled());
                 assert_eq!(payload.applied_at_turn, Some(3));
             }
             other => panic!("expected tool_config_changed, got {other:?}"),

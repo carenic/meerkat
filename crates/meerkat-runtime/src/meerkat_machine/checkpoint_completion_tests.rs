@@ -322,6 +322,7 @@ fn checkpoint_peer_input(input_id: InputId) -> Input {
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
+        in_reply_to: None,
     })
 }
 

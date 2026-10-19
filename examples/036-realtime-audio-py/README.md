@@ -70,8 +70,9 @@ python3 examples/036-realtime-audio-py/main.py --realm live-demo
 
 `--text-probe` keeps the live WebSocket path but sends one text chunk
 instead of opening local audio devices. It waits for a tool request or turn
-completion event, so it is useful for checking runtime plumbing on
-machines without a microphone.
+completion event, and fails at once if the provider fails the response
+(`turn_failed`), so it is useful for checking runtime plumbing on machines
+without a microphone.
 
 ## Troubleshooting
 
@@ -83,9 +84,12 @@ live authentication is unavailable.
 If audio devices fail to open, run `python3 -m sounddevice` to list device names
 and pass `--input-device` or `--output-device`.
 
-Playback has one device owner. Interruptions discard queued audio for the
-affected response, reject its late chunks, and abort buffered device output
-without waiting for an in-progress write. Item-scoped truncations affect only
+Playback has one device owner. Interruptions, and responses the provider
+fails (`turn_failed`), discard queued audio for the affected response, reject
+its late chunks, and abort buffered device output without waiting for an
+in-progress write. A failed response is printed as a status line; the channel
+stays open and nothing of the response is kept.
+Item-scoped truncations affect only
 that item/content. Missing identities conservatively suppress anonymous late
 audio; subsequent identified output still plays. Samples already heard cannot be recalled.
 Written transcript display is independent of playback.
@@ -106,7 +110,8 @@ PYTHONPATH=sdks/python python3 -m unittest discover -s examples/036-realtime-aud
 ```
 
 These execute the receiver and playback owner with a synthetic blocked output
-device, including interrupt/truncate, late audio, cancellation, and no-speaker /
-text-probe behavior. No physical media device or provider is used. They are not
+device, including interrupt/truncate, failed responses, late audio,
+cancellation, and no-speaker / text-probe behavior. No physical media device or
+provider is used. They are not
 a live barge-in or provider smoke test; those still require OpenAI credentials
 and permission to use the selected microphone/speaker.

@@ -125,6 +125,83 @@ them.
   verdict before the host is asked, as it already refused the operator.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
+- `meerkat-mob`: `MobError` is now `#[non_exhaustive]`, and gains the variant
+  `MobError::ShutdownInProgress { mob_id }`, appended last (see the next
+  entry). A downstream exhaustive `match` on `MobError` needs a wildcard arm.
+- Behaviour-only (not measured by the gate): an admitted `MobHandle::shutdown`
+  or `MobHandle::shutdown_with_report` closes the mob's admission before its
+  teardown (see Fixed). From the Shutdown's admission (while it drains its own
+  work, and while it is parked on its members' stops or on its runtime
+  teardown), a command the Closing state refuses is refused with
+  `MobError::AdmissionClosed` (reason `MobAdmissionCloseReason::Shutdown`): a
+  spawn, respawn, work submission or flow run got
+  `MobError::ActorCommandChannelClosed` there; while the Shutdown drained, so
+  did the other refused commands (for example wiring, a host bind, a live
+  commit, resume, reset or reload), which waited for the Shutdown or ran while
+  it was parked. `MobHandle::acquire_owner` after the Shutdown's admission is
+  refused the same way where it granted an owner lease. Every other request
+  the actor answers while the Shutdown drains (a Stop, Destroy, Complete or
+  retirement, a read, a status probe, `MobHandle::status` included) gets the
+  new `MobError::ShutdownInProgress`, where v0.9.3 answered
+  `MobError::ActorCommandChannelClosed`: retryable with the authority
+  retained (wire code `SessionBusy`), returned by `MobHandle::stop` at once.
+  Requests on the actor's internal lane, sent by the tasks the drain joins,
+  keep `ActorCommandChannelClosed`, which otherwise now means the actor has
+  exited or is exiting.
+- Behaviour-only (not measured by the gate): a Shutdown that fails after its
+  admission keeps the actor alive as the retry owner with admission closed,
+  so the Closing set (spawn, work submission, flows, wiring, a host bind, a
+  live commit, resume, reset, reload, owner leases and identity realization)
+  stays refused with `MobError::AdmissionClosed` for the actor's life, where
+  the actor admitted all of it again before. Stop, Shutdown and Destroy stay
+  available.
+- Behaviour-only (not measured by the gate): once a destroy is admitted (its
+  durable destroy marker is written), `MobHandle::acquire_owner` is refused
+  with `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::Destroyed`) where it granted an owner lease, and a
+  command the Closing state refuses gets that error before the destroyed
+  mob's own refusal (see Fixed). A mob restored with that marker starts
+  closed: `MobBuilder::resume` returns its handle with admission already
+  closed.
+- Behaviour-only (not measured by the gate): after a durability fail-stop,
+  `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
+  (reason `MobAdmissionCloseReason::DurabilityFailStop`) where it granted an
+  owner lease on the exited actor (see Fixed).
+- Behaviour-only (not measured by the gate): after the mob's actor task is
+  lost (it ends without its loop returning, as on a panic),
+  `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
+  (reason `MobAdmissionCloseReason::ActorLost`) where it granted an owner
+  lease (see Fixed).
+- Behaviour-only (not measured by the gate): after a composition dispatch
+  failure stops the mob's actor, `MobHandle::acquire_owner` is refused with
+  `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::DispatchFailed`) where it granted an owner lease
+  on the stopped actor (see Fixed).
+- Behaviour-only (not measured by the gate): `meerkat-skills` parses SKILL.md
+  frontmatter with serde-saphyr 2.0 (pure Rust, no `unsafe`) instead of
+  serde_yaml 0.9, and refuses frontmatter serde_yaml accepted:
+  - a key given twice, at any level: a top-level extension key (however it
+    is spelled) or a metadata key, where serde_yaml kept the last value. A
+    duplicated known field or key inside a structured value was refused
+    already;
+  - a null (`~` or an empty value) as the `description` or a `metadata`
+    value, which serde_yaml stored as the text `~` or an empty string;
+  - an unrecognized tag (`!custom`) anywhere: on a typed field (`name`,
+    `description`, `version`, a `metadata` value, a capability) serde_yaml
+    dropped the tag and kept the value; on an extension value it was refused
+    already;
+  - nesting deeper than 64 levels, or 100 or more aliases that outnumber
+    their anchors more than ten to one: the parser's default budget;
+  - a `...` document end marker line, because serde-saphyr 2.0.0 ignores
+    whatever follows one (malformed text included).
+
+  A block scalar (`|`, `|+`, `>`) that ends the frontmatter now keeps its
+  final line break, as YAML specifies and as it already did anywhere else in
+  the frontmatter: the frontmatter was cut before that line break, so a
+  `description: |` written last lost its trailing newline. Unchanged: YAML
+  1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
+  and refusal of a second document. An alias expansion bomb is still
+  refused; ordinary aliases now count against the budget above.
 - MobMachine records each member identity's generation high-water across mob
   resets: `MobMachineState` (meerkat-machine-schema and meerkat-mob) and the
   kernel `State` (meerkat-machine-kernels) gain the fields
@@ -145,6 +222,431 @@ them.
   `SealIdentityGenerationHighwaterDestroyed`, also appended last, so no
   existing variant's discriminant moves. Exhaustive matches must add the
   arms.
+- `meerkat-runtime`: `AuthenticatedOriginalSource::retained_original` is
+  replaced by `retained_custody`, which returns `RetainedCustody`
+  (`Retained`, `AdmissionPending` or `NotRetained`; non-exhaustive) instead of
+  `Option<WorkAuthorityBasis>`. An implementor answers `AdmissionPending` only
+  for a submission candidate that it will promote or withdraw itself, within
+  its own bound; it withdraws any candidate it cannot settle, and a withdrawn
+  candidate answers `NotRetained` from then on (see the method
+  documentation). A candidate the implementor has not enrolled in such a
+  settlement answers `NotRetained`, the earlier `None`.
+- `meerkat`: `ContinuationAdmitError` gains `NotReady(ControllerReadinessFailure)`
+  and is now `#[non_exhaustive]`. `retained_admission_outcome` maps a runtime
+  that is not ready to admit a retained continuation, for a typed cause, to
+  it: the continuation stays pending and is retried, as for `Failed`, and
+  keeps the cause the runtime named.
+- `meerkat`: `BlockedDeliveryReason` gains `NotReady(ControllerReadinessFailure)`,
+  its first variant that carries data, so its variants no longer have defined
+  discriminants. The drain blocks a continuation row the runtime is not ready
+  to admit with it, and the delivery owner's pass failure line names the cause
+  (for example `NotReady(OriginalAdmissionPending)`).
+- `meerkat-contracts`: `WireControllerReadinessFailure` gains
+  `OriginalAdmissionPending` (kind `original_admission_pending`), which
+  `ControllerReadinessFailure::OriginalAdmissionPending` now maps to instead
+  of `Unknown`. A Rust decoder of this type built before it rejects the new
+  kind; the Python, TypeScript and Web SDKs keep error details as untyped
+  data.
+- `meerkat-llm-core`: `LlmDoneOutcome::Success` gains the field
+  `stop_detail: Option<Box<ProviderStopDetail>>` (the provider's own account
+  of a refusal or filter) and is `#[non_exhaustive]`: build it with
+  `LlmDoneOutcome::success(stop_reason)` or
+  `LlmDoneOutcome::success_with_detail(stop_reason, detail)`, and match it with
+  `LlmDoneOutcome::Success { stop_reason, .. }`. The field is omitted from the
+  serialized form when absent, so recorded frames keep their bytes.
+- `meerkat-core`: `AgentError::ContentFiltered` gains the fields
+  `stop: ContentFilteredStop` (`refusal` or `content_filter`, the refusing stop
+  the provider ended on) and `detail: Option<Box<ProviderStopDetail>>`. A
+  pattern that names `turn` without `..` needs the new fields.
+- `meerkat-core`: `AgentErrorReason` gains the variant
+  `ContentFiltered { stop, detail }`, appended last. The enum is exhaustive,
+  so a `match` on it needs the new arm. Wire change: every
+  content-filtered run failure now carries it, so `error_report.reason` of a
+  `run_failed` event with class `content_filtered` goes from `null` to
+  `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` (`detail`
+  omitted when the provider sent none). SDKs of earlier versions read it as an
+  unknown reason and keep it raw. Downgrade: the session event store decodes
+  every line strictly, so a 0.9.3 binary cannot read a session event log that
+  holds such a `run_failed` line.
+- `meerkat-core`: a compaction summary reports what its source carried.
+  `Compactor::prepare_for_summarization` takes the summarization source budget
+  and returns the source with its bound, `(messages: &[Message], budget:
+  Option<SummarizationSourceBudget>) -> SummarizationSource`, and has no
+  default implementation: every compactor states how it bounds the transcript
+  it sends to the model that writes the summary. The budget is that model's
+  (`SummarizationSourceBudget::for_summary_model`), `None` when the model
+  declares no context window. `CompactionSummarySource` is `#[non_exhaustive]`
+  and its `ProviderCall` variant carries the call's `source_bound`, and
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source`, `None` only for one recorded before this release (on the
+  wire the field is optional). A
+  compactor that used the default keeps its old behaviour by returning
+  `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+  and ignoring the budget; to fit the summarizing model, it also bounds the
+  result by the budget and reports the bound, as `DefaultCompactor` does. The
+  implementors in this repository (`DefaultCompactor` and the test
+  compactors) are updated; no published example implements the trait.
+- `meerkat-core`: `Agent::replace_client` and
+  `Agent::replace_client_with_request_policy`, and through them the ephemeral
+  service's `SessionService::set_session_client`, no longer change the
+  session's model. A client, or a request-policy model, whose provider or
+  model differs from the session's durable identity is refused with
+  `AgentError::ClientModelChangeRequiresHotSwap` before anything changes: such
+  a swap left the durable identity and the active model profile, which size
+  the context and compaction budgets, on the previous model. Change the model
+  with `Agent::hot_swap_llm_identity` or
+  `SessionService::hot_swap_session_llm_identity`, which publish the client,
+  the durable identity and the profile together. A replacement client for the
+  same model, or any client on a session without a durable identity, is
+  accepted as before.
+- `meerkat-core`: a compaction rewrite records the history it left.
+  `SessionCompactionCadence` and `CompactionContext` gain
+  `last_rewrite_history_tokens`, the estimated history tokens the last rewrite
+  left (`None` before the first), which `Compactor::should_compact` reads; the
+  session persists it with its compaction cadence.
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `estimated_history_tokens_after`, the same estimate in the unit of
+  `estimated_history_tokens`, `None` for one recorded before this release or
+  when the history could not be measured (on the wire the field is optional;
+  the Python SDK reads it as `CompactionCompleted.estimated_history_tokens_after`
+  and the TypeScript SDK as
+  `CompactionCompletedEvent.estimatedHistoryTokensAfter`). A
+  `CompactionContext` built by hand keeps the previous decisions with
+  `last_rewrite_history_tokens: None`. A 0.9.3 binary ignores the persisted
+  field and drops it when it next writes the cadence; back on this release,
+  that session compacts as before until its next rewrite records the field
+  again, so a downgrade and upgrade cost at most one extra summary call.
+- `meerkat-authorization-contracts`: `AuditObservation` is now
+  `#[non_exhaustive]`, so a match outside the crate needs a wildcard arm.
+  `AuditObservation::Refused` gains `read: Option<AuditRefusalRead>`
+  (patterns without `..` and literals need it), and the exhaustively
+  constructible `AuditPolicyRead` gains `publication_instance:
+  Option<uuid::Uuid>` (struct literals need it).
+- Child tool bundle opt-in (see Added):
+  - `meerkat-mob-mcp`: `ChildToolBundleAvailability` gains `ChildOffered`
+    and is now `#[non_exhaustive]`; `ChildMcpServerRegistrationError` gains
+    `OfferNotSupported` and is now `#[non_exhaustive]`. A `match` over either
+    needs a wildcard arm.
+  - `meerkat-mob`: `ToolConfig` gains the field `bundles: Vec<String>`, and
+    `MobError` gains the variant `ToolBundleNotOffered`. Code that builds a
+    `ToolConfig` with a struct literal sets the field, or uses
+    `..ToolConfig::default()`.
+  - `meerkat-contracts`: `MobToolConfigInput` gains the field
+    `bundles: Vec<String>` (the public `tools.bundles`). Code that builds it
+    with a struct literal sets the field.
+- `meerkat-core`, `meerkat-mcp`, wire and SDKs: the lifecycle bit of tool
+  configuration changes is named `settled`, not `persisted` (#1658). It says
+  whether a change is a settled lifecycle fact rather than a pending or
+  draining step. It never said whether anything was written to
+  configuration: that is the `persisted` of the `mcp/add`, `mcp/remove` and
+  `mcp/reload` requests and responses, which keep their name and meaning.
+  - Wire: `tool_config_changed` event payloads, stored `tool_config` notice
+    payloads and `mcp` notice blocks that 0.9.4 builds carry `settled`
+    instead of `persisted`. Rows and events stored by 0.9.3 and earlier keep
+    the key and value they were stored with when they are read back, served
+    in history or replayed, so their transcript digests, session heads and
+    rewrite records still verify. Readers must accept either key; the
+    schemas list both and require neither.
+  - Readers derive the fact instead of trusting the stored bit:
+    `ToolConfigChangedPayload::settled()` from `status_info`, and
+    `SystemNoticeBlock::lifecycle_settled()` from an `mcp` block's `phase`
+    (an `mcp` block without a phase reports its stored bit, `settled` or
+    0.9.3's `persisted`). The tool-scope, deferred-catalog and failed-closed
+    notices that 0.9.3 stored with `persisted: false` read as settled.
+  - Rust API: `ToolConfigChangedPayload::new` takes no lifecycle argument
+    (the status decides it), and the public `ToolConfigChangedPayload`
+    field `persisted` is replaced by `ToolConfigChangedPayload::settled()`.
+    The public `ExternalToolDelta` field `persisted` is removed in favour of
+    `ExternalToolDelta::settled()`, derived from `phase` and not serialized.
+    `SystemNoticeBlock::Mcp { persisted }` is now
+    `SystemNoticeBlock::Mcp { lifecycle_bit }`, a `ToolConfigLifecycleBit`
+    (`Settled`, `Persisted` or `Absent`) that keeps the stored spelling; read
+    the fact through `SystemNoticeBlock::lifecycle_settled()`. `meerkat-mcp`'s
+    `ExternalToolSurfaceEffect::EmitExternalToolDelta { persisted }` is now
+    `{ settled }`. New: `ToolConfigLifecycleBit`,
+    `ToolConfigChangedPayload::lifecycle_bit`,
+    `SystemNoticeBlock::lifecycle_settled`,
+    `ExternalToolDeltaPhase::is_settled` and
+    `ToolConfigChangeStatus::is_settled`.
+  - SDKs: the Python and TypeScript `ToolConfigChangedPayload.persisted` is
+    now `settled`. Their event parsers derive it from `status_info` the way
+    rkat-rpc does and use the stored bit (`settled`, or `persisted` from
+    rkat-rpc 0.9.3 and earlier) only for a status they do not know. Stored
+    notices in session history stay raw and carry either key. The generated
+    Python, TypeScript and Web types follow the schemas, with both keys
+    optional.
+  - Version skew: the 0.9.3 Python and TypeScript SDKs require `persisted`,
+    so a 0.9.3 SDK talking to a 0.9.4 rkat-rpc fails on every
+    `tool_config_changed` event that 0.9.4 builds. An SDK downloads its own
+    matching rkat-rpc only when it is given none, so this happens with a
+    binary it is given: `MEERKAT_BIN_PATH`, an explicit path, or an rkat-rpc
+    on `PATH` (a Homebrew upgrade, for example); the remedy is to upgrade the
+    SDK.
+  - Stored transcripts: 0.9.3 cannot read back a transcript that 0.9.4 wrote
+    with a `tool_config` notice (a tool-scope, deferred-catalog or
+    failed-closed notice), because 0.9.3 requires the payload's `persisted`.
+    An `mcp` notice block reads back on 0.9.3 with `persisted: false`, which
+    0.9.3 consults only for `McpPending` blocks, where 0.9.4 also writes
+    `false`.
+- Not measured by the gate (a return type change): `meerkat`:
+  `RuntimeDeliveryOwnerRetirement::join` returns
+  `Result<RuntimeDeliveryOwnerRetired, RuntimeDeliveryOwnerRetirementIncomplete>`
+  instead of `Result<(), RuntimeDeliveryOwnerRetirementIncomplete>`: the
+  report names the store watch's notification registration the retirement
+  left with the process (see Added). The report is `#[must_use]`: code that
+  uses `?` or otherwise discards it now gets an `unused_must_use` warning
+  and binds or reads it; code that matches `Ok(())` matches `Ok(_)` or
+  reads the report.
+- `meerkat-machine-schema`, `meerkat-machine-kernels` and `meerkat-runtime`:
+  the live delegation narration kind `LiveDelegationNarrationKind` gains
+  `FinishedPending`, appended last, in the schema catalog's DSL enum, the
+  kernels' generated copy and the runtime's copy
+  (`meerkat_runtime::live_execution::LiveDelegationNarrationKind`). It is
+  never spoken: the machine authorizes it for a delegation whose work has
+  finished with an eligible result not yet handed to delivery (see Fixed).
+  The enums are exhaustive, so a `match` on one adds the arm.
+- `meerkat-live`: the provider adapter carrier `LiveSidebandProviderCommand`
+  gains `NoteDelegationFinishedContext { binding, attempt, delegation }`,
+  which only `LiveSidebandCommand::note_delegation_finished` produces, from
+  the new one-shot `LiveSidebandFinishedNoticeAuthority`. A provider adapter
+  that matches the carrier lowers or refuses it.
+- `meerkat-openai`: `GptLiveBrokerObservation` gains
+  `InstructionsContextAppendWithdrawn { token }`, appended last: a
+  delegation's finished notice that waited while the model was speaking and
+  was withdrawn unsent because a result of the delegation reached the session
+  first (see Fixed). The enum is exhaustive, so a `match` on it adds the arm.
+- `meerkat-llm-core`: `RealtimeSessionEvent` gains the variant
+  `TurnFailed { response_id, failure, accounting }` (#1883). The enum is
+  exhaustive, so a `match` over it needs the new arm.
+- `meerkat-core`: `RealtimeTranscriptEvent` gains the variant
+  `AssistantTurnFailed { response_id }` (#1883). The enum is exhaustive.
+- `meerkat-machine-schema`, `meerkat-core` and `meerkat-machine-kernels`:
+  `RealtimeTranscriptStopReasonKind` (the session document's DSL enum and
+  its two generated copies) gains the variant `Failed`, appended after
+  `Other` (#1883). All three are exhaustive.
+- `meerkat-live`: `LiveProjectionSink` gains the required method
+  `signal_turn_failed(session_id, response_id, failure, accounting)` (#1883).
+  It has no default body: every sink decides what a failed response
+  discards and records.
+- Storage: a HeadCanonical session that records a failed realtime response
+  writes realtime sidecar event schema 4 (#1883). Meerkat 0.9.3 and earlier
+  refuse such a session with "unsupported realtime event schema 4", so a
+  session cannot be opened by an older binary once a failed realtime response
+  has been recorded in it.
+- `meerkat-mob`: `MemberShutdownOutcome::UnregisterPending` carries
+  `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
+  it with `{ stage, .. }`. The settlement follows the exact registration's
+  runtime unregister after Shutdown returns.
+- Behaviour (no type change): every content steer admitted while a turn runs
+  (a prompt, a peer message, request or lifecycle notice, an external event or
+  a local flow step) is now written into the running turn's transcript at a
+  model boundary (`MeerkatMachine` delivery class `DurableAppend`) or, when it
+  carries something only a fresh turn applies or is a directed delivery,
+  taken by exactly one follow-up turn. Before, peer message and request
+  steers and text-only prompt steers reached exactly one model request and
+  never the transcript. Hosts and consoles now see their rows in history,
+  `boundary_append_applied` when the runner writes them, and one
+  `peer_content_ingested` per incoming comms notice. Durable steers join one
+  per boundary, in arrival order: a steer admitted while an earlier one still
+  waits joins the boundary after it, in the same run, instead of falling back
+  to the follow-up turn; steers still waiting when the run ends take the
+  follow-up turn in arrival order. Before, every peer or text steer admitted
+  during one boundary reached the next model request; now one durable steer
+  joins per boundary, and the later ones land at later boundaries of the run
+  or in the follow-up turn.
+- `meerkat-core`: `SystemNoticeBlock::Comms` and
+  `AgentEvent::PeerContentIngested` gain the field
+  `delivery_id: Option<InteractionId>`: the delivery id of an incoming peer
+  message, which `reply_to_peer` takes as `reply_to` (see Fixed). Struct
+  literals and exhaustive patterns of either variant name it. On the wire it
+  is optional (`delivery_id` on the notice block and on
+  `peer_content_ingested`) and omitted when absent.
+- `meerkat-core`: `CommsCommand::PeerMessage`, `InteractionContent::Message`
+  and `SystemNoticeBlock::Comms` gain `in_reply_to: Option<InteractionId>`;
+  `meerkat-comms`: `MessageKind::Message` gains `in_reply_to: Option<Uuid>`;
+  `meerkat-runtime`: `PeerInput` gains `in_reply_to`. It is the delivery a
+  `reply_to_peer` reply answers (see Added). Struct literals and exhaustive
+  patterns name it. On the wire it is optional (`in_reply_to` on the notice
+  block) and omitted when absent.
+- Behaviour (no type change): the text the model reads for an incoming peer
+  message notice now carries a `Delivery ID: <id>` line after its payload, and
+  an `In reply to: <id>` line when the message is a reply.
+- Compatibility (not measured by the gate): the transcript content digest
+  erases a comms notice's `delivery_id` and `in_reply_to`, as it erases a
+  notice's runtime origin, so a row's revision is the same with or without
+  them. A 0.9.3 reader, which drops the keys when it decodes the row, computes
+  the revision 0.9.4 stored and loads the session. One residual: an append
+  retried after a crash over rows already stored compares the re-serialized
+  rows byte for byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote
+  would refuse the retry; the stored input state 7 entry above already keeps
+  0.9.3 off a runtime store that 0.9.4 wrote.
+- Compatibility (wire): a 0.9.3 receiver that checks signatures (the default,
+  and always at a host acceptor) refuses a `reply_to_peer` reply from 0.9.4.
+  Its message kind does not know `in_reply_to`, so it re-serializes the signed
+  envelope without the field, the signature check fails, and it drops the
+  envelope; the sender sees no acknowledgement, and `reply_to_peer` reports an
+  ambiguous delivery outcome, not a failure. A 0.9.3 receiver with peer auth
+  off accepts the reply without the label. `send_message` and every other
+  message kind are unchanged, so a 0.9.3 peer still receives them.
+- `meerkat-runtime`: `CompletionWaitError` is `#[non_exhaustive]` and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (see Changed). A match on it outside the crate needs a wildcard arm.
+  `wait_failure_observation()` maps both new variants to
+  `AuthorityUnavailable`, as it maps `AuthorityUnavailable(_)`, and
+  `is_boundary_rolled_back()` and `is_durable_outcome_unknown()` name them.
+- `meerkat-core`: `SessionError` gains `ForkInstructionRefused`: a durable
+  fork refused before commit by the host's fork instruction policy (see
+  Added). Exhaustive matches handle it; on the wire it is
+  `FORK_INSTRUCTION_REFUSED`. `DurableSessionForkTarget` gains
+  `inherited_instructions`, the policy the fork applies, already resolved for
+  its path. `SessionForkAtRequest` and `SessionForkReplaceRequest` gain
+  `inherited_instructions` (`None` is the default policy), and
+  `SessionForkResult` gains `reactivated_instruction_count`. Struct literals
+  set the new fields.
+- `meerkat-session`: `PersistentSessionService::fork_durable_session_with_planned_identity`
+  takes the fork instruction policy of a fork without a target.
+  `meerkat-mob`: `PlannedForkRequest` gains `inherited_instructions`, and
+  `MobError` gains `ForkInstructionRefused { source_member_id, refusal }`.
+  `meerkat-contracts`: `BridgeCreateForkedParticipantPayload` gains
+  `inherited_instructions`, `BridgeRejectionCause` gains
+  `ForkInstructionRefused`, and `ErrorCode` gains `ForkInstructionRefused`.
+  Every `MobSessionService` decorator that forwards planned forks forwards the
+  field.
+- Behaviour (not measured by the gate): forks whose copied prefix carries
+  activated host instructions. Under the default fork instruction policy,
+  `require_explicit_activation`, the forks that start the child's first turn
+  themselves are now refused before anything is committed, with the typed
+  refusal: `fork_off`, `MobHandle::fork_member_then_run_bounded` and
+  `fork_member_then_run_detached`, `fork_member_at_turn_boundary` (and so the
+  live delegation's durable fork), and council participants, local or
+  host-placed. So are the RPC forks `session/fork_at` and `session/fork_replace`,
+  whose child nobody can activate before its first turn. 0.9.3 committed such a
+  child and its first turn failed. `fork_member` keeps the host's activation
+  window. A host that wants the fork to carry the activations sets
+  `reactivate_inherited`; an RPC client passes `inherited_instructions`. Forks of
+  sources without activation rows are unchanged.
+- Behaviour (not measured by the gate): `meerkat-core`: a model turn refused
+  because a fork child never activated its inherited instruction keys fails
+  with `AgentError::InstructionActivation`, carrying the typed activation error,
+  instead of `AgentError::ConfigError(String)`. Its error class and wire code
+  are unchanged.
+- Council records: `TemporaryCouncilExitReason` gains
+  `ParticipantForkInstructionRefused { participant_order, refusal }`, and
+  `TemporaryCouncilAcquisition` gains `Refused`: the owner refused that
+  participant's create before committing anything, so cleanup neither revokes
+  nor records debt for the slot. A 0.9.3 reader of a record that holds either
+  cannot decode it.
+- Mixed versions: a 0.9.3 member host does not know the fork instruction
+  policy. A controller with `reactivate_inherited` gets the typed refusal cause
+  `member_host_unsupported` from it; under the other policies the controller
+  sends no field and a 0.9.3 member host forks a participant as before, without
+  re-activation. Upgrade member hosts before their controller: until then a
+  0.9.3 member host forks participants, council participants included, without
+  the policy, and a participant whose source has activated host instructions
+  fails its first turn.
+- MobMachine classifies a member delivery scope: `MobMachineInput`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineInputVariant` (meerkat-machine-schema), and the kernel `Input`
+  and `InputKind` gain the variant `RetireAtScope`; `MobMachineEffect`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineEffectVariant` (meerkat-machine-schema), and the kernel `Effect`
+  and `EffectKind` gain `RetireAtScopeResolved`. The kernel
+  `generated::mob::TransitionId` gains `RetireAtScopeCurrentRunning`,
+  `RetireAtScopeCurrentStopped`, `RetireAtScopeNoCurrentIncarnationRunning`,
+  `RetireAtScopeNoCurrentIncarnationStopped`,
+  `RetireAtScopeStaleFenceTokenRunning`, `RetireAtScopeStaleFenceTokenStopped`,
+  `RetireAtScopeStaleSessionBindingRunning`,
+  `RetireAtScopeStaleSessionBindingStopped`,
+  `RetireAtScopeMobNotRunningCompleted` and
+  `RetireAtScopeMobNotRunningDestroyed`. Every new variant is appended last,
+  so no existing variant's discriminant moves. Exhaustive matches must add
+  the arms.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a host refusal
+  of a restored member's registration (`select_destination`,
+  `select_agent_mandate`, `prepare_member_surface` or
+  `verify_member_surface`) now removes that registration exactly, as a new
+  member's refusal does. The removal is the canonical unregister: it is
+  recorded in the session's durable history, and it terminates every input
+  the session still holds (abandoned as `Stopped`, their completions
+  resolved as runtime-terminated). The owner context the restore bound to
+  the member is released with it. The member stays Broken with the typed
+  refusal (`MobError::MemberRegistrationRefused`, shown in
+  `MobMemberSnapshot::registration_refusal`) until an explicit repair, and
+  `ensure_member_live` returns that refusal without asking the host again.
+  A member that `MobBuilder::resume` restores at boot (a mob running at the
+  crash) gets the same typed refusal, and no registration of its session is
+  current after the refusal: the boot restore's own rollback removes the
+  registration it inserted, as before, and the actor's startup no longer
+  registers the refused member's session again. A refused member, on either
+  path, can be retired, respawned or destroyed: the retirement archives its
+  durable session without routing a retire to the runtime the refusal
+  released. A member the boot recreates on a fresh session still fails the
+  whole resume with the host's error. A failure that is not the host's
+  refusal keeps the restored registration for the repair to reuse, and a
+  spawn that adopts a session registered before it keeps that registration
+  on a refusal, as does the recovery of an attached member's actor.
+- `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
+  member_id, session_id, call, reason }`: a restored member's host refused
+  its registration at `call` (see above). Its RPC error data has the kind
+  `mob_member_registration_refused` with the refusing `hook_call`. Code that
+  matches `MobError` exhaustively adds an arm.
+- `meerkat-mob`: `MobError` gains the variant `MemberDestinationNotInstalled {
+  session_id, error }`, appended last: the member's runtime did not install
+  the destination its host selected, and `error` is the runtime's own
+  verdict. It is the runtime's answer, not a host refusal: a restored member
+  keeps its registration. Such a failure was a `MobError::WiringError`
+  before. Its `failure_class()` is `MobFailureClass::RuntimeRejected`, where
+  the `WiringError` was `MobRejected`, so schedule delivery now records the
+  failure reason `runtime_rejected` instead of `mob_rejected` for a delivery
+  whose member revival hits it. Its RPC error data has the kind
+  `mob_member_destination_not_installed` with the `session_id`, the runtime
+  verdict as a stable snake_case `cause` (for example
+  `scoped_context_generation_not_advanced` or `validation_failed`), the
+  `bound_generation` and `requested_generation` of a selection that does
+  not advance (null for any other cause) and `retryable: false`. A failed
+  revival's destination stays bound on the restored registration it keeps,
+  so a host's re-selection for that registration must advance
+  `context_generation`: a selection of the bound generation gets this
+  variant with the cause `scoped_context_generation_not_advanced`, and the
+  repair selects again with an advanced generation. Code that matches
+  `MobError` exhaustively adds an arm.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance past the bound one with the new
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound,
+  requested }`, appended last, instead of `RuntimeDriverError::Internal`.
+  `RuntimeDriverError` is `non_exhaustive`, so the variant itself breaks
+  no match.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
+  the wire unless a restored member's host refused its registration. Code
+  that builds the result with a struct literal sets it.
+- `MobMachineSignal` (meerkat-machine-schema and meerkat-mob), its variant
+  enum `MobMachineSignalVariant` (meerkat-machine-schema), and the kernel
+  `Signal` and `SignalKind` (meerkat-machine-kernels) gain the variants
+  `ResolveMemberRevivalHostRefused` and `RecoverMemberRestoreHostRefused`,
+  appended last: they record a host's refusal of a restored member's
+  registration with the refusing hook call's code. The kernel
+  `generated::mob::TransitionId` gains `ResolveMemberRevivalHostRefusedRunning`
+  and `RecoverMemberRestoreHostRefusedRunning`, appended last. Code that
+  matches these enums exhaustively adds the arms.
+
+### Security
+
+- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
+  (deprecated) and the archived unsafe-libyaml it brought in
+  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
+  including from the `@rkat/web` wasm module, and `deny.toml` no longer
+  ignores that advisory. serde-saphyr is pinned exactly; its parser
+  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
+  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
+  that could).
+- Behaviour-only (not measured by the gate): `OperationRefused` equality now
+  includes whether the refused call's tool code ran
+  (`OperationRefused::dispatch`, see Added). A refusal the fenced dispatch or
+  the execution policy gate certifies as not dispatched is no longer equal to
+  `OperationRefused::new(kind)` of the same kind. Compare `kind()` and
+  `dispatch()` instead.
 - The mob operator grant functions take a
   `meerkat_core::service::LiveMobIncarnation`, the witness a mob runtime's
   own handle hands out (`meerkat_mob::MobHandle::live_incarnation`),
@@ -249,6 +751,40 @@ them.
   check that `preflight_schema_eligibility` runs and returns the ledger
   version it verified (`None` for a fresh domain), read in the same snapshot
   as the check.
+- `meerkat-core`: `strand_layout_for_retained_history` lays out the retained
+  part of a session's transcript graph, including a graph that retired its
+  oldest occurrences after compaction, and returns `RetainedStrandLayout`:
+  that layout and the retired base a store persists beside its rows.
+  `strand_layout_for_history` still refuses a re-anchored graph.
+- `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`
+  converts a standalone WholeBlob runtime database in place to the
+  HeadCanonical profile, co-located with the SQLite session store in the same
+  file. A standalone database is one a host composed with
+  `SqliteRuntimeStore::new` on a file of its own, such as a Meta 0.9.3
+  persistent gateway's `runtime.sqlite`; it holds no physical session, so
+  `new_head_canonical` refuses it. The conversion requires the session store's
+  schema in the file (open `SqliteSessionStore` on it first; without it the
+  conversion refuses typed and leaves the database file unchanged). Before it
+  writes, it checks every runtime it would convert: a WholeBlob body that is
+  missing, differs from its digest, or does not lay out as the session
+  store's rows, or a session the guard below refuses, refuses typed before
+  anything is written, so a file the conversion has not pinned stays a
+  WholeBlob database. It then pins the file and seeds each runtime's session
+  that the co-located store holds no row for from its digest-verified WholeBlob
+  body, in the transaction that installs the runtime's authority and completes
+  its activation receipt. It seeds only while the co-located store holds no
+  session beyond the ones the file's completed activations own; any other
+  session refuses that runtime typed (`SessionPersistenceAuthorityConflict`)
+  without seeding, and runtimes to seed convert before runtimes whose session
+  has a row, so a session written into the file before the conversion always
+  refuses. The caller writes no session row into the co-located store before
+  the conversion returns. A stopped conversion finishes on the next call. It
+  returns `StandaloneWholeBlobConversionReport`: per converted runtime, its
+  session, `StandaloneWholeBlobSessionSource` and boundary message count, with
+  `seeded_count` and `derived_count`. The caller asserts that the file is
+  standalone; a SQLite realm never uses it. `new_head_canonical` is unchanged
+  and never seeds a session, so a session deleted from a realm's session store
+  does not come back.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
   member's exact runtime registration, so every
   `MemberRuntimeRegistrationHook` call names the registration it is made
@@ -257,6 +793,29 @@ them.
   registration instead of to an identity it derives from the member's
   session id or labels; a later registration of the same session is a
   different registration.
+- `meerkat-mob`: member binding history reads over the mob's durable member
+  journal. `MobHandle::member_binding_history` folds the journal and Core's
+  identity intent rows, read in one store transaction, into a
+  `MemberBindingHistory`. `member_binding_for_session` answers the latest
+  binding that named a session (a resume keeps a session across
+  generations); `last_member_binding` an identity's latest incarnation since
+  the latest mob reset, live or retired, with the session a resume can
+  restore; `durable_identity_members` the live members spawned with
+  `SpawnContinuityIntent::DurableIdentity`; and `identity_management`
+  whether Core holds an identity intent row for an identity
+  (`MemberIdentityManagement`: command-driven, intent-managed, or an intent
+  row this build cannot read). Each
+  `MemberBinding` carries its session, generation, role, continuity intent,
+  a typed `MemberBindingState` (live, moved by a binding recovery, or
+  retired) and that intent-row fact;
+  `MemberBindingHistory::durable_identity_bindings` lists every durable
+  identity's last binding, live or retired. `MobReadHandle` has the
+  same reads, under the same `List` control scope.
+  `MobStorage::read_member_binding_history` reads a stopped mob's store at a
+  path with the same fold: it opens the file read-only, never creates or
+  migrates a store, and refuses a missing store or a schema it does not read
+  with a typed `MemberBindingHistoryReadError`. Every event kind the history
+  reads is a retention anchor, so pruning never removes it.
 - `meerkat-authorization-contracts`: an owner-scoped resource-domain bound,
   `DomainBound::OwnedBy`: every domain whose typed authority is one of a
   non-empty set of owners, under any namespace. A parent grant can now fix the
@@ -294,6 +853,315 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat-core`: `ControllerReadinessFailure::OriginalAdmissionPending`: an
+  original that an input or operation relies on is still its source owner's
+  submission candidate, whose admission the owner has not settled yet.
+- `meerkat-runtime`: `RetainedCustody`, a source owner's custody of one
+  original: retained with its mandate, admission pending, or not retained.
+- `meerkat`: `JobOutboxProjectionError::NotReady` carries that cause for a
+  continuation row the runtime is not ready to admit; the drain reports it as
+  `BlockedDeliveryReason::NotReady` (above). Nothing is stored; the cause is
+  read again on every retry.
+- `meerkat-core`: `ProviderStopDetail`, the provider's own account of why it
+  refused or filtered a response, held as provider-tagged data (`anthropic`:
+  the refusal's `stop_details` category and explanation; `open_ai`: the filter
+  reason of a Responses, Chat Completions or realtime text turn, or `refusal`
+  with the refusal text; `gemini`: the raw
+  `promptFeedback.blockReason` or candidate `finishReason` with the safety
+  categories marked `blocked`). Nothing in core reads it; each text field is
+  capped at 4 KiB, and an unknown provider or a malformed detail decodes as
+  absent. The provider adapters read this evidence best-effort as well: a
+  `stop_details`, safety rating or refusal value of an unexpected shape reads
+  as absent and never turns the stop that carries it into a stream parse
+  error. With `GeminiStopStage` and `ContentFilteredStop`, and
+  `LlmStreamResult::stop_detail`.
+- `meerkat-llm-core`: `classify_web_search_stop` and `WebSearchStop`, one
+  classification of a native web-search call's stop reason for every
+  provider's executor.
+- `meerkat-core`: `SummarizationSourceBudget`, the serialized-byte budget for
+  the transcript a compactor sends to the summarizing model.
+  `for_summary_model` derives it from that model's context window and
+  `from_compaction_threshold` from a compaction threshold.
+- `meerkat-core`: `SummarizationSource` and `SummarizationSourceBound`
+  (`whole`, `trimmed` with the last `SummarizationTrimStage` cut, or
+  `requests_only` with how many of the user requests it kept);
+  `CompactionSummarySource` is serializable and exported from the crate root.
+  The `compaction_completed` wire event carries it as `summary_source`, and
+  the Python (`CompactionCompleted.summary_source`) and TypeScript
+  (`CompactionCompletedEvent.summarySource`) SDKs parse it; a kind they do
+  not know parses to `unknown` with the wire object.
+- `meerkat-core`: `AgentError::ClientModelChangeRequiresHotSwap`, a
+  configuration-class error that names the durable and the requested provider
+  and model and points to `hot_swap_llm_identity`.
+- `meerkat_core::authorization::OwnerChangeChurn`, with `OwnerChangeWait`,
+  `OwnerChangeInProgress`, `OWNER_CHANGE_WAIT_BOUND` (2 s) and
+  `OWNER_CHANGE_FREE_REBUILDS` (3): one bounded wait, for a site that rebuilds
+  an operation after a `ReprepareRequired` refusal, until an owner change in
+  progress on the work's own authorization publication completes.
+  `WorkAuthorization::owner_change_in_progress` (provided, default `None`)
+  reports such a change as a waiting hint, never a permission;
+  `LocalAuthorizationPublication::change_in_progress` answers it for the local
+  owners, and the native run and audit wrappers forward it.
+  `OwnerChangeChurn::wait_for_settled_change` takes the wait's trace site and
+  operation: it records each wait as the debug event below
+  (`OwnerChangeWait::trace`) and reports it to the host's operation refusal
+  observer (see below). `ToolDispatchContext::owner_change_churn` gives a
+  delegate operation of a tool call, such as the `web_search` helper's model
+  request, the waiting state that reports as that call's.
+- `ToolDispatchContext::remaining_tool_time`: the tool time a fenced
+  dispatch has left, measured from its start against its plan's effective
+  timeout, for a tool that waits inside its body. The `web_search` helper's
+  owner-change wait is bounded by it.
+- The protected authorization audit says where a refusal was decided. A
+  `Refused` record carries an `AuditRefusalRead`: when it was observed, its
+  basis (`AuditRefusalBasis`: the owners answered at one coherent
+  publication, the publication changed under the attempt and the change
+  completed, or a change was still in progress), the sequence the attempt
+  read, the live sequence when the publication changed under it, and the
+  publication instance. A refusal to rebuild that a prepared decision
+  observes at its check reads as a changed publication against the live
+  sequence, since the publication moved after the decision's own read; a
+  denial at the check, one from the decision's own validity window
+  included, is an owner answer. A `Prepared` record's policy read names its
+  publication instance too, since sequences of different instances do not
+  compare. Rows carry both at stored input state version 7; a row stamped
+  before v7 that carries either is refused. Records written earlier read
+  with neither.
+- Child-profile tool bundle opt-in. A host registers a bundle with
+  `ChildToolBundleAvailability::ChildOffered` to offer it to child mobs
+  without supplying it: an inline profile of a child mob, a mob a member
+  creates with `mob_create`, mounts it only by naming it in `tools.bundles`.
+  A name the host does not offer is refused with
+  `MobError::ToolBundleNotOffered`, which lists the offered names (an
+  argument error for the agent tool, invalid params on `mob/create`); an
+  empty or repeated name is an argument error; a create that is not a child
+  mob's, and a realm or spawn-time profile given as public profile input,
+  cannot opt in. The opt-in persists with the definition and the host's
+  offer is its ceiling at every build, a resume included: an opted bundle
+  the host no longer offers is withheld, never failing the member build, and
+  `MobHandle::withheld_tool_bundles` (`WithheldToolBundle`) reports it.
+  While any opted bundle is withheld, every deny name in no vocabulary is
+  checked only at call time (`ToolVocabularySource::WithheldBundle`), so a
+  typo is reported at build only once the bundle is mounted again. The
+  adaptive `LayerDecision` schema stays the released one and does not list
+  `tools.bundles`. A host may still set `bundles` where it names
+  `rust_bundles` itself, on a realm profile it stores or on a definition it
+  composes with `MobBuilder`, as the lenient twin of the strict
+  `rust_bundles`. Like a `rust_bundles` entry, an opted bundle makes a
+  profile non-portable, so a placed member is refused, and adaptive policy
+  evidence counts it. Registering an MCP server as `ChildOffered` is refused
+  with `ChildMcpServerRegistrationError::OfferNotSupported`: MCP descriptors
+  have no opt-in. A binary older than this release ignores the persisted
+  `bundles` key, so after a downgrade those members run without the bundle
+  and without the marker.
+- `meerkat`: a retired runtime delivery owner reports the file notification
+  registration of its store watch when the operating system still held it
+  as the owner stopped the watch:
+  `RuntimeDeliveryOwnerRetirement::join` returns `RuntimeDeliveryOwnerRetired`,
+  whose `notification_registration_retained` names the registered directory
+  (`meerkat_runtime::RetainedNotificationRegistration`). Nothing can
+  interrupt that platform call (macOS FSEvents can hold it for tens of
+  seconds), so the retirement cancels the registration without waiting for
+  it, and its thread stays with the process until the call returns, as a
+  mob observer drain reports its own (`retained_registrations`). The join
+  traces the retained directory once, as an info event.
+  `meerkat-runtime`: `DeliveryStoreWatch::stop` stops a watch as dropping it
+  does and returns that registration. `meerkat-sqlite`:
+  `SqliteChangeWatch::pending_registration` describes the registration a
+  watch would leave with the process, as
+  `meerkat_sqlite::watch::retained_registrations` lists it.
+- `meerkat_core::authorization::RefusalDispatch` (`NotDispatched`, `Unknown`;
+  non-exhaustive) and `OperationRefused::dispatch`: whether the tool code
+  that the certifying core component guards ran for a refused call. The
+  fenced dispatch (and the retained consent attempt) certifies
+  `NotDispatched` for every operation refusal it meets before it invokes the
+  dispatcher, and the execution policy gate for every one it meets before it
+  invokes its inner dispatcher. Every other refusal, one a dispatcher
+  returns included, is `Unknown`, which makes no claim. A dispatcher layer
+  that runs tool code of its own before delegating to a certifying
+  component forwards `OperationRefused::new(refusal.kind())`.
+- `meerkat_core::authorization::OperationRefusalObserver`, installed with
+  `AgentBuilder::with_operation_refusal_observer` or the facade's
+  `AgentFactory::with_operation_refusal_observer`: the Rust host that
+  composed an agent receives each refusal disposition the agent decides for
+  a governed operation, as an `OperationRefusalObservation` with the session,
+  the run and the refused operation, the surface (the model request, a tool
+  call by its tool-use id, or a compaction summary), the outcome (the closed
+  refusal kind with its `RefusalDispatch`, read from the same value the
+  model payload renders, or owners that could not decide) and what was done
+  with it: waited for an owner change (how long, and whether it settled),
+  rebuilt, sent to the controller, returned as the tool result, skipped the
+  compaction or failed the run. It is a diagnostic at decision time, not
+  exactly-once across a crash, called synchronously and never blocking, and
+  host-only: no observation enters the event stream, a wire type or any
+  model context. `OperationRefusalSurface`, `OperationRefusalOutcome` and
+  `OperationRefusalDisposition` are non-exhaustive.
+- `meerkat-core`: `SessionBuildState::fork_child_projection`, the build state
+  a durable transcript fork commits for its child, and
+  `SessionError::fork_source_build_state_missing`, with
+  `SessionError::FORK_SOURCE_BUILD_STATE_MISSING_KIND` and
+  `SessionError::is_fork_source_build_state_missing`: the typed refusal of a
+  fork whose source has session metadata but no build state (see Fixed).
+- `meerkat-core`: `LiveAdapterObservation::TurnFailed`, `LiveResponseFailure`,
+  `LiveResponseFailureStatus` (`failed`, `incomplete`, `in_progress`) and
+  `LiveResponseAccounting` (`measured` usage or the `unmeasured` fact) for a
+  live response that ended without completing (#1883). The wire mirrors are
+  `WireLiveAdapterObservation::TurnFailed` (observation `turn_failed`),
+  `WireLiveResponseFailure`, `WireLiveResponseFailureStatus` and
+  `WireRealtimeTranscriptEvent::AssistantTurnFailed` (event
+  `assistant_turn_failed`). `meerkat-live` routes the observation as
+  `ObservationRouting::SignalTurnFailed` and reports
+  `ObservationOutcome::TurnFailureProjected`. The session seam that records
+  the accounting is `record_live_turn_accounting` on the ephemeral and
+  persistent session services and on the RPC `SessionRuntime`, backed by the
+  provided `SessionAgent::record_external_turn_usage`.
+  `LiveResponseFailureStatus` and `WireLiveResponseFailureStatus` are
+  non-exhaustive, so a later release can name a further status; a status
+  without a wire name is sent as `{"unknown": {"debug": ...}}` rather than
+  coerced to `failed`. `LiveResponseAccounting` is exhaustive: the
+  provider either reported the response's usage or it did not. The Python and
+  TypeScript SDKs type `turn_failed.failure` as `WireLiveResponseFailure` and
+  export it and `WireLiveResponseFailureStatus` from their package roots.
+- `meerkat-mob`: `MemberUnregisterSettlement` and `MemberUnregisterState`
+  (`Settled`, `Pending`, `Failed`, `HandedOver`; non-exhaustive). A
+  settlement reads its state without waiting (`try_state`) or waits for it
+  until a deadline (`settle_within`), also after the mob's actor exited. It
+  joins the runtime's unregister coordinator for the member's exact
+  registration, admits that unregister through the same exact-registration
+  path when Shutdown's deadline passed before it was admitted, and holds the
+  mob's runtime handle only weakly: a dropped handle settles only once the
+  registration has provably ended. It admits that unregister, or the
+  reload-required discard before it, only while nobody has taken the
+  registration over since Shutdown returned; otherwise it reports the
+  terminal `HandedOver` and touches nothing, leaving the registration to its
+  new owner.
+- `meerkat-runtime`: `RuntimeSessionRegistrationWitness::has_ended`, whether
+  an exact registration has ended for good (no runtime holds its entry).
+- `meerkat-runtime`: `RuntimeSessionRegistrationUse` and
+  `MeerkatMachine::session_registration_use`. A registration can be handed to
+  a new user without being replaced, keeping its witness: a
+  `register_session` that reuses it as it is, an executor attachment or an
+  actor materialization that adopts it in place. Each such adoption stamps
+  the registration with a fresh use, so a use read earlier differs from the
+  current one once anyone has taken the registration since. Opaque; compare
+  for equality only.
+- `meerkat-runtime`: `MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`
+  and `RuntimeSessionUnregisterUseAdmission` (`Admitted`, `Changed`;
+  non-exhaustive): the exact unregister admission of
+  `observe_unregister_session_registration_if_current`, started or joined
+  only while the registration's use is the one the caller read, and
+  answering `Changed` without starting or joining anything otherwise.
+- `meerkat-runtime`: `MeerkatMachine::reload_required_registration_settlement_if_current`
+  and `ReloadRequiredRegistrationUseSettlement` (`NotCurrent`, `NotDegraded`,
+  `Discarded { successor, successor_use }`, `Changed`; non-exhaustive): the
+  reload-required discard of an exact registration, answering with the exact
+  successor it published and the use that successor starts at, read where it
+  is published. With an expected use, it starts or joins the discard only
+  while the registration's use is still that one, and answers `Changed`
+  without discarding otherwise.
+- `meerkat-runtime`: `MeerkatMachine::stage_registration_run_start_hold_only`
+  and `MeerkatMachine::unstage_registration_run_start_hold`. The first stages
+  a run-start hold that the session's next registration applies, without
+  trying to hold the registration that is current; the second removes a
+  staged reason and leaves a hold the current registration applies in place.
+  A runtime unregister keeps staged reasons, so a registration that replaces
+  the session's (a reload) applies them.
+- `meerkat-comms`: a receiver checks a peer envelope's signature over the
+  envelope as received, including message-kind fields it does not know, and
+  drops such fields only after the check. A newer sender can add an optional
+  field to a signed message kind without 0.9.4 receivers refusing the
+  message. An envelope whose encoding repeats a map key, or keys a map by
+  anything but a text string, at any depth is refused. A request carrying an
+  unknown field keeps its delivery but not its TCP callback route.
+- `meerkat-core`: `ToolDispatchContext::peer_reply_deliveries` returns the
+  running turn's reply capabilities as one typed list (the deliveries that
+  started the turn and those that joined it at a model boundary, one per
+  sender and delivery id), or `PeerReplyContextError::Malformed` when the
+  turn-start list does not parse. `PeerReplyDispatchContext::insert_delivery`
+  adds a delivery unless the same sender's delivery with that id is listed.
+  `DurableTurnBoundaryAppends::with_peer_reply_capabilities` and
+  `peer_reply_capabilities` carry a durable in-turn delivery's reply
+  capabilities to the runner.
+- `meerkat-comms`: `ReplySelectionError` (`#[non_exhaustive]`), the typed
+  refusals of reply selection (`NoReplyCapability`, `InvalidReplyContext`,
+  `UnknownReplyTo`, `AmbiguousReply`); `reply_to_peer` reports each with its
+  stable code prefix.
+- A reply sent with `reply_to_peer` names the delivery it answers: the
+  signed message carries that delivery id as `in_reply_to`, and the
+  receiver's message notice shows it as an `In reply to` line (`meerkat-comms`,
+  `meerkat-core`, `meerkat-runtime`). It is a label the sender declares:
+  routing and authorization never read it, and `send_message` never sets it.
+- `RuntimeStore::commit_outcome_deadline` declares the longest a boundary
+  commit or run terminalization through the store may legitimately take
+  before it reports its durable outcome (see Changed). The backend declares
+  it through the new `RuntimeSessionAuthorityOps::commit_outcome_deadline`,
+  so a pure decorator forwards it. A composed store whose commit runs
+  lock-acquiring transactions of its own declares its inner store's
+  declaration plus the busy timeout of each such transaction. The default is
+  `DEFAULT_COMMIT_OUTCOME_DEADLINE`, two `COMMIT_BUSY_WINDOW`s of 60 s.
+  `SqliteRuntimeStore` declares the same from the shared SQLite busy timeout,
+  and `InMemoryRuntimeStore` declares none.
+- `meerkat-core`: `ForkInstructionPolicy` (`require_explicit_activation`, the
+  default; `reactivate_inherited`; `refuse`) and `ActivationWindow`, with
+  `ForkInstructionPolicy::effective`, which resolves the default to `refuse`
+  on a fork that leaves the host no activation window. The typed
+  `ForkInstructionRefusal` names its keys and a `ForkInstructionRefusalCause`:
+  `policy_refuses`, `not_effective_in_source`, `lineage_body_budget_exceeded`,
+  `activation` or `member_host_unsupported`.
+  `Session::apply_fork_instruction_policy` applies a policy to a fork child
+  before its save; under `reactivate_inherited` it appends one origin-local
+  activation per inherited key, re-activating the key's head at the fork
+  boundary, in (namespace, key) order and through the ordinary activation
+  rules. `Session::fork_reactivation_suffix_len` verifies those rows by
+  reproducing them, and `SessionForkResult::prefix_message_count()` gives the
+  copied prefix without them.
+- `meerkat-mob`: `MobBuilder::with_fork_instruction_policy`, and
+  `meerkat-mob-mcp`: `MobMcpState::with_fork_instruction_policy`, set the
+  host's policy for every mob built or resumed. It is never a tool argument or
+  part of a mob definition.
+- `meerkat-contracts`: the error code `FORK_INSTRUCTION_REFUSED` (JSON-RPC
+  -32037, HTTP 422, CLI exit 57), whose `data` carries
+  `kind: "fork_instruction_refused"` and the typed `fork_instruction_refusal`.
+  `session/fork_at` and `session/fork_replace` take `inherited_instructions`
+  and report `reactivated_instruction_count`. The Python and TypeScript SDKs
+  take the option on their fork calls and read the count.
+- `meerkat-machine-schema`: MobMachine decides whether a member delivery
+  scope still names its member's current incarnation. The runtime-internal
+  input `RetireAtScope` names an identity, a runtime id, the identity's fence
+  and a session, and answers without a state change through the effect
+  `RetireAtScopeResolved` and its `RetireAtScopeVerdictKind`: `Current` when
+  the identity maps to that runtime id, its fence is the scope's, and the
+  session is the member's binding or the session its retirement is
+  releasing; `NoCurrentIncarnation` when the identity maps to no
+  incarnation; `StaleFenceToken` when another incarnation is current;
+  `StaleSessionBinding` when the incarnation is current but the session is
+  not one it holds; and `MobNotRunning` in a completed or destroyed mob. The
+  verdicts are total and mutually exclusive. The member lifecycle TLC audit
+  checks both in every state its domains reach and for every scope they can
+  name, and that a Current verdict admits a Retire of that incarnation; five
+  `meerkat_mob_seam` witnesses reach each verdict.
+- `meerkat-mob`: `MobHandle::retire_at_scope` retires exactly the member
+  incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
+  semantics. Each step, every descendant and the member itself, is admitted
+  by MobMachine's `RetireAtScope` verdict on the scope in the same actor
+  command that retires it, so a successor minted while the call runs is
+  never retired through an older scope. A scope whose incarnation was
+  replaced answers `StaleFenceToken`, a moved session binding
+  `StaleDeliveryScope`, and a completed or destroyed mob
+  `InvalidTransition`; a refusal stops the call. After the member's own
+  step, descendants are retired only while no incarnation of the identity
+  is current. `Ok(())` is `retire`'s barrier:
+  with no incarnation current, the call waits out a retirement the mob still
+  owns for the identity, answers `Ok(())` only once the identity has no
+  roster entry and no stuck retirement, and answers a stuck retirement with
+  `MemberRetirementStuck`.
+- `meerkat-mob`: `MemberRegistrationHookCall`, the registration hook call
+  that refused a restored member's registration, and
+  `MobMemberSnapshot::registration_refusal`, which carries it for a Broken
+  member. `meerkat-contracts` mirrors it as `WireMemberRegistrationHookCall`.
+- `meerkat-runtime`: `PreparedSessionMaterialization::inserted_registration()`
+  tells whether the materialization's own prepare inserted the session's
+  registration or found one already current.
 - `meerkat_core::service::LiveMobIncarnation` (with `incarnation()`) and
   `meerkat_mob::MobHandle::live_incarnation`: the witness the mob operator
   grant functions take (see Breaking).
@@ -358,9 +1226,176 @@ them.
   opt-in `turn_projection_cost` benchmarks (ignored timing tests in
   `meerkat-runtime` and `meerkat`) a snapshot read takes about 25% less time
   and a whole scripted turn with three tool calls about 23% less.
+- `meerkat-runtime`: `MeerkatMachine::cancel_input_if_present` and
+  `cancel_tracked_input_for_member_incarnation` no longer re-read an input
+  caught between lifecycle steps (neither queued nor terminal, with no run
+  yet) every 25 ms. They wait for that input's next committed lifecycle step
+  (its run association, a phase step or its terminal), which the runtime
+  driver signals at its single commit point, and re-read then; the
+  5-second settle bound remains only as a hang guard, and a cancellation
+  reads the input once more before it reports that bound (#1655).
+- `SkillDocument.extensions` values are a projection of the frontmatter's
+  YAML data, now rendered by serde-saphyr, and the field's doc says so. A
+  structured value's block YAML uses double quotes where a string needs
+  quoting (`'1.10'` is now `"1.10"`), a signed exponent (`6.02e23` is now
+  `6.02e+23`, `1e16` is `1.0e+16`) and a quoted `<<` key; the data is
+  unchanged. Untyped scalars that serde_yaml kept as text, or refused, now
+  resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, an integer past
+  u64 is a float, `1e999` is `.inf`, `tRUE` is `true`, and a `!!binary`
+  value is decoded. Other scalars keep serde_yaml's text (`1.10` is `1.1`,
+  `0x1F` is `31`, `~` is `null`). Quote a value with leading zeros, such as
+  a file mode (`'0755'`), to keep it as text: unquoted, `0755` is `755.0`
+  (upstream serde-saphyr issue #225).
+- The compaction summary is sized for the model that writes it: the
+  session's active model (after any model fallback) or the admitted
+  controller's. Its source may take two bytes per token of that model's
+  context window left after `max_summary_tokens` (capped by a declared input
+  ceiling, at least 4 KiB), instead of a quarter of the compaction threshold.
+  With the model-aware default threshold that is about ten times more (for a
+  200,000-token window, about 390 KB instead of 40 KB), so a summary call can
+  cost more input tokens as the model window grows; it never costs more than
+  the history being compacted plus the compaction prompt, because the source
+  is never larger than that history. A model with a small window and a large
+  explicit threshold gets a source its window holds instead of one sized for
+  the threshold; only a window too small for the 4 KiB minimum still
+  overflows, and the capacity fallback then writes a mechanical summary. A
+  model that declares no context window keeps the threshold rule.
+- Compaction no longer pays for a summary at every boundary when no rewrite
+  can get the history under the threshold. A history crossing bypassed
+  `min_turns_between_compactions` as capacity recovery even when the last
+  rewrite had left the history over the threshold, for example when the
+  System rows alone exceed an explicit `auto_compact_threshold`: every
+  boundary compacted again and paid for a summary call that recovered
+  nothing. Such a crossing now waits for the cadence, and a warning names the
+  remedies (raise `auto_compact_threshold` above that floor, omit it so it
+  derives from the model window, or shrink the System rows). A history
+  crossing still bypasses the cadence while the last rewrite got the history
+  under the threshold, and when the request no longer fits the model window
+  and the history added since that rewrite covers the overage; a model that
+  declares no context window has no overage, so there it waits. The
+  request-byte crossing keeps its bypass.
+- `meerkat-core`: the agent's tool-scope boundary, deferred-catalog and
+  failed-closed tool-scope events, and the MCP restore-refusal delta, now
+  report `settled: true` where they reported `persisted: false`: each is a
+  change that has already applied or failed. A consumer that showed them as
+  pending now shows them as settled. Rows stored by 0.9.3 keep their
+  `persisted: false`; the Rust accessors and the SDK event parsers derive the
+  fact from the status and report those as settled too (#1658).
+- The model-facing payload of an `operation_refused` tool result now
+  carries `data` with exactly the closed refusal kind and whether the tool
+  ran: `{"kind": "reprepare_required" | "denied" | "malformed_facts",
+  "tool_invoked": false | "unknown"}`. `tool_invoked` is always present, so
+  its absence never reads as not invoked. The kind carries no policy detail,
+  owner data or audit content, and neither field is a permission: a typed
+  reason never grants replay after entry, and a new call is a new operation
+  with fresh admission. The message, `Display`, `Debug` and tracing stay
+  uniform. The mob member upcall keeps carrying the bare kind, so a 0.9.3
+  peer decodes it as before; whether the tool ran does not cross it, and
+  the receiving side's model reads `"unknown"`.
+- A mob member upcall refusal whose data is absent or names no known kind
+  now decodes as `operation_authorization_unavailable` instead of
+  `operation_refused` with `malformed_facts`: it is no verdict the peer
+  gave.
+- Every crate the release publishes now passes its own tests standalone:
+  `cargo test` in the unpacked published package builds with the default
+  features, and passes with the features its
+  `[package.metadata.meerkat.standalone-tests]` declares (meerkat,
+  meerkat-runtime and meerkat-mob, whose packages now carry a README.md
+  that prints the command). Those three also declare the 8 MiB test thread
+  stack the workspace runs them with, and their README command sets
+  `RUST_MIN_STACK=8388608`; no suite has been measured at Rust's 2 MiB
+  default, so the other 43 published crates' tests may need the same
+  setting. Plain `cargo test` runs a binary's tests as
+  threads of one process, and three suites no longer collide there:
+  meerkat's realtime pipeline tests take the process-wide open reservation
+  one at a time, meerkat-rpc's callback-ownership tests give each case its
+  own mob, and meerkat-rest's unit tests build their app states one at a
+  time (concurrent states queued on SQLite's process-wide allocation
+  statistics mutex until creates and stops missed their bounds). A test
+  that needs the repository, or a crate the package cannot depend on (a
+  cyclic or unpublished dev-dependency), is workspace-only and does not
+  reach the package: its file is left out
+  (`[package] exclude`, each entry with its reason, the same list as
+  `ci/standalone-workspace-only.toml`), or it compiles only with the
+  crate's `workspace-tests` feature (meerkat, meerkat-auth-core,
+  meerkat-authorization, meerkat-comms, meerkat-core, meerkat-llm-core,
+  meerkat-mcp, meerkat-openai and meerkat-rpc). `workspace-tests` is
+  internal, not for consumers: only the crate's path-only self
+  dev-dependency enables it, and `cargo package` strips that dependency.
+  Tests that read another crate's files now read their own copy or a shared
+  constant: meerkat-store embeds its own copy of meerkat-runtime's released
+  0.8.10 corpus, pinned byte-identical, and the REST, MCP server and rkat
+  hook-override tests parse `meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON`
+  (meerkat-core's `test-support`). The rkat-rpc, rkat-rest and rkat-mcp
+  binary tests take their binary from Cargo (`CARGO_BIN_EXE_*`) and fail
+  when it is missing instead of passing without running. rkat's
+  docs-examples test parses `tests/fixtures/doc_examples.txt`, which the
+  package carries, instead of reading `docs/`; after adding or changing an
+  `rkat` example in `docs/`, refresh it with
+  `UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture`
+  (that test fails until the fixture matches).
+- A nightly workflow, `published-crates-standalone.yml`, packages every
+  release crate, runs each one's tests in its unpacked package, and compares
+  every test target's test names with the workspace's. Publication does not
+  wait for it yet: the release gate on a passing run at the release commit
+  returns once a nightly run has passed and its duration is measured.
+  `scripts/release-require-standalone-green` checks that a run on main passed
+  at a given commit.
+- `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
+  holds the member, so a member reloaded while the mob is Stopped stays held
+  until Resume; a member spawned into a Stopped mob, or held again after a
+  failed Resume, stages it too. A restore drops a `MobStop` that an earlier
+  incarnation in the same process staged before any member registers, so a
+  mob reopened with released run starts (after a Stop that fail-stopped)
+  does not come up held; a restored Stopped mob stages it again. Retire,
+  Shutdown and destroy drop it for the members they dispose of, so a later
+  registration of the same session is not held for them.
+- `meerkat-mob`: a runtime refusal of a member's unregister until its
+  registration's durability is repaired
+  (`RuntimeDriverError::RecoveryRepairBlocked`) is reported
+  `UnregisterPending` at the stage `durability_reload_discard`, not as a
+  Shutdown teardown failure: its settlement runs the reload-required discard
+  and admits the unregister again.
+- `MobHandle::force_cancel_member` on a member whose runtime requires a
+  durability reload answers `MobError::MemberReloadRequired` at once, naming
+  the member, where it failed with `MobError::Internal` wrapping the
+  runtime's repair-blocked error. `MobHandle::cancel_all_work` answers the
+  same. On the wire this is the dedicated `MEMBER_RELOAD_REQUIRED` error:
+  JSON-RPC `-32029` from `mob/force_cancel`, HTTP 409 from
+  `POST /mob/{id}/members/{agent_identity}/cancel`, and exit 49 from
+  `rkat mob force-cancel`. Reload the member with
+  `MobHandle::reload_member_registration`, then cancel again. This was a
+  0.9.3 known limitation.
+- A persistent session's boundary commit or run terminalization that reports
+  no durable outcome within its store's declared deadline (120 s for the
+  SQLite store) now marks the session reload-required. The runtime loop
+  stops waiting and leaves the commit running; it keeps the session's
+  mutation gate until the store answers. The run's completion waiters fail
+  with `CompletionWaitError::DurableOutcomeUnknown`, and a run whose boundary
+  commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
+  where they got `AuthorityUnavailable` with a message. In both cases the
+  input stays durably admitted: read it after the reload instead of
+  resubmitting it. A reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
+  replaces the registration from durable truth. A mob member's tracked turn
+  stays pending on either failure, as on `AuthorityUnavailable`, and a
+  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
 
 ### Fixed
 
+- `meerkat-store`: the SQLite session store lays out a whole-blob session
+  whose transcript graph retired its oldest occurrences, which every session
+  compacted more often than `history_retained_rewrites` (default 4) has. It
+  refused such a session typed before. The realm's one-time migration of a
+  blob row, the standalone WholeBlob conversion's seeding and read-only head
+  synthesis now write or derive the rows the store keeps after retiring the
+  same occurrences incrementally: the retired base as a
+  `session_transcript_retirements` row and rewrite rows for the retained
+  generations only, and the synthesized head is the head the migration
+  writes. A host that reads such a session's head at every committed
+  boundary, like a persistent Meta gateway without a roster, no longer stops
+  accepting work for a member after its fifth compaction. The in-memory store
+  still refuses such a session typed.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved
@@ -461,6 +1496,91 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- A request a mob's actor answers while a Shutdown drains its own work is
+  refused with the new `MobError::ShutdownInProgress`, no longer with
+  `MobError::ActorCommandChannelClosed`, which a caller could not tell from
+  an exited actor: `MobHandle::stop` reported the mob gone while its Shutdown
+  could still fail and leave the actor serving, and the actor's own recovery
+  retries stopped. A retry now runs on the actor once its Shutdown fails, and
+  finds the channel closed once it finishes. The `meerkat-mob-mcp`
+  stand-down counts a shutting-down mob's admission as closed, and
+  `MobHandle::revoke_forked_participant_with_recovery` revokes through its
+  recovery transport while the source mob shuts down, as both did when the
+  drain answered with a closed channel.
+- The recovery of a durable placed lifecycle intent stops once the mob's
+  admission is closed. A Reset intent, which the Closing state refuses, was
+  retried every 2 s with a warning for the rest of the actor's life after a
+  stand-down or a failed Shutdown. The intent stays recorded, and the next
+  start drives it again.
+- `MobHandle::shutdown` closes the mob's admission, as its contract says
+  ("After this, no more commands are accepted"). The actor closes it on its
+  serialized admission path when it admits the Shutdown, before any teardown
+  step, with the new `MobAdmissionCloseReason::Shutdown` (appended to the
+  `#[non_exhaustive]` enum; it displays as "shutdown"); an earlier close keeps
+  its reason. Before, admission closed only through `close_if_idle`, the last
+  owner's release or `close_admission`: after a Shutdown, `acquire_owner`
+  handed out an owner lease on an actor that would take no further command,
+  and `admission_closed()` stayed `None`, so an embedding host that treats a
+  closed mob as gone kept treating the shut-down mob as live. A Shutdown that
+  fails after its admission leaves admission closed; Stop, Shutdown and
+  Destroy stay available. A Stop, the resumable pause, leaves admission open.
+- `MobHandle::destroy` closes the mob's admission once the destroy is
+  admitted (its durable destroy marker is written, by this attempt or an
+  earlier one), before any destroy cleanup, with the new
+  `MobAdmissionCloseReason::Destroyed` (it displays as "destroyed"); an
+  earlier close keeps its reason. Before, a destroyed mob's actor exited with
+  admission open, so `acquire_owner` still handed out owner leases and
+  `admission_closed()` stayed `None`. A destroy left incomplete after its
+  admission keeps admission closed; retrying the destroy stays available. A
+  mob restored with the durable marker starts with admission closed, before
+  `MobBuilder::resume` returns its handle, so nothing is spawned into it, and
+  no owner lease is granted, while its destroy is unfinished.
+- A durability fail-stop (a durable mutation whose outcome stayed uncertain,
+  or a durable recovery that fails before the actor admits a command) closes
+  the mob's admission before the actor exits (a mutation's fail-stop before it
+  quiesces), with the new `MobAdmissionCloseReason::DurabilityFailStop` (it
+  displays as "durability fail-stop"); an earlier close keeps its reason.
+- A lost mob actor task (one that ends without its loop returning, as on a
+  panic or an abort) closes the mob's admission from its spawn wrapper,
+  before the task is reported lost, with the new
+  `MobAdmissionCloseReason::ActorLost` (it displays as "actor lost"); an
+  earlier close keeps its reason. Before, a lost actor left admission open,
+  so `acquire_owner` still handed out owner leases and `admission_closed()`
+  stayed `None`.
+- A composition dispatch failure at a loop boundary (a structural routing
+  failure, which stops the mob's actor) closes the mob's admission before the
+  actor stops, with the new `MobAdmissionCloseReason::DispatchFailed` (it
+  displays as "dispatch failure"); an earlier close keeps its reason. Before,
+  the actor stopped with admission open, so `acquire_owner` still handed out
+  owner leases and `admission_closed()` stayed `None`. With the closes above,
+  no mob actor exit leaves admission open.
+- `meerkat-runtime`: in-memory runtime store execution custody no longer
+  refuses with `RuntimeStoreExecutionCustodyError::Busy` because its counter
+  lock was briefly held, for example while a claim released on another
+  thread (a dropped machine's ops worker) updated the counters. An acquire or
+  upgrade now waits for that update, so `Busy` means only a real governed or
+  shared conflict; a poisoned owner is still `Unavailable` (#1736).
+- `meerkat-runtime`: live channel custody and playback-readiness reads
+  (`MeerkatMachine::validate_live_channel_custody_by_pending_receipt`,
+  `validate_live_channel_custody_by_activation_receipt`,
+  `validate_live_playback_owner_readiness` and
+  `validate_live_active_playback_owner_readiness`, and the facade's
+  `validate_experimental_live_channel_custody*`) answer from one machine
+  snapshot. An activation, revocation or close that commits during the read
+  no longer fails it with `ValidationFailed` ("receipt is not current"): the
+  read answers the phase its snapshot holds, and the next read answers the
+  committed one. Four generated machine invariants pin the stage and
+  activation records every custody answer reads (#1606).
+- `make check-rust-release-packaging` no longer checks an archive left by an
+  earlier run. With a persistent `CARGO_TARGET_DIR`, each crate's
+  `package/` directory kept the `.crate` files of earlier runs, so a crate
+  whose `cargo package` wrote no archive at the workspace version was
+  checked (license texts, internal requirements, the facade link smoke)
+  against an earlier run's archive. Each package job now removes its
+  crate's earlier archives first, and such a crate fails as a missing
+  archive. `scripts/test-release-packaging-isolation.sh` reruns the check
+  over a persistent target with one crate writing no archive. Release
+  tooling only.
 - A mob that was reset and then re-spawned a member under an identity it had
   before the reset resumes after a restart. Resume replays the events after
   the last `MobReset`, and that replay required each identity's first
@@ -490,6 +1610,451 @@ them.
   audits-c). It also reaches both replay histories above, refuses three
   seeded defects, and checks that restoring the exact-successor replay rule
   makes those histories unreachable.
+- Work that names an original whose admission its source owner has not
+  settled yet is no longer refused as malformed or denied
+  (`meerkat-runtime`). Native admission of input that names such a
+  contributor, `require_source_original_live` and a retained resume report
+  `ControllerReadinessUnavailable` with `OriginalAdmissionPending`; operation
+  authorization of work that names it, the further originals of a helper
+  admission or child issuance, and the controller-grant mutation check report
+  it unavailable, and none of them waits. A retained resume therefore stays
+  retryable until the owner settles the original, instead of being refused
+  for good. A cancelled original is still refused, and the controller-grant
+  mutation check no longer counts such a contributor as unreferenced.
+- The `web_search` tool's native search call now reads its stop reason
+  (#1887). A search the provider refused or filtered, one whose context window
+  filled and a cancelled one come back `failed`, naming the stop reason, with
+  no answer, evidence or native events: the refusal text is no longer reported
+  as a `completed` (or `unavailable`) answer.
+- A Gemini prompt blocked before any candidate (`promptFeedback.blockReason`
+  and so no `finishReason`) now ends the response as a content filter
+  (#1888). The run fails as `content_filtered` after one provider call,
+  instead of being retried as an incomplete response and failing as
+  `ProviderError(IncompleteResponse)`. Every block reason reads this way,
+  `OTHER` and one the adapter does not know included: a blocked prompt is
+  blocked again on every retry. The raw block reason and the blocked safety
+  categories now reach the caller as the typed reason's provider detail, so a
+  `SAFETY` block and a `BLOCKLIST` block can be told apart, of the prompt or
+  of a candidate.
+- An OpenAI refusal is no longer committed as the answer. A Responses
+  `refusal` output part, streamed (`response.refusal.delta`/`.done`) or in the
+  terminal response, and a Chat Completions `delta.refusal` end the response
+  as a refusal: the run fails `content_filtered` with stop `refusal`, and the
+  refusal text travels as the provider detail, never as answer text. The
+  refusal wins over text and tool calls in the same response. A refused
+  OpenAI native search now comes back from the `web_search` tool `failed`
+  (#1887), as the Anthropic and Gemini ones do.
+- An Anthropic refusal now carries its `stop_details` (policy category and
+  explanation) as the provider detail. Its terminal waits for `message_stop`,
+  so `stop_details` is read wherever the stream puts it: inside the
+  `message_delta` delta, beside that delta, or on `message_stop`. When more
+  than one carries it, the `message_delta` wins (inside its delta, then
+  beside it), and `message_stop` only fills in a detail it lacked. A refusal
+  whose stream is cut after its stop still ends as a refusal, with whatever
+  detail was seen.
+- A native web search cut at its output cap (`max_tokens`) or paused by the
+  provider's server-tool loop (`pause_turn`) keeps its status and answer and
+  now says, in its `error`, that the answer may be incomplete (#1887).
+- `meerkat-session`: the last-resort compaction source (user requests only)
+  no longer claims to keep every user request. Its note says it carries the
+  newest N of the M requests, and the completion reports the same counts.
+- A model request of the agent loop no longer returns to the controller with
+  an `operation_refused` notice, or fails the turn, because an owner change
+  was still in progress on its work's own publication. An owner that holds a
+  change across its storage commit outlasted both built-in rebuilds, the
+  preparation's and the request's own. On such a `ReprepareRequired` refusal
+  the request now waits for the change to complete, then rebuilds under the
+  same operation without spending its own rebuild. The wait is bounded: one
+  wall-clock deadline per model call, set at its first wait to 2 s or to the
+  remaining run budget if that is less, so the rebuilds in between count
+  against it; at most 3 such free rebuilds per call; and a free rebuild only
+  once no change is in progress. Past those bounds the refusal takes its
+  ordinary path (one rebuild, then the controller feedback request), as does
+  any other refusal kind and a refusal while the work's own publication has
+  no change in progress. The run budget is checked after every wait, so a
+  turn whose budget runs out during one ends with the time-budget terminal,
+  not a refusal. Each refused attempt keeps its own audit record, and a
+  `debug` event `meerkat::authz::owner_change_wait` (operation id,
+  `waited_ms`, `settled`) marks each wait.
+- The same bounded wait covers the other operations that rebuild after a
+  `ReprepareRequired` refusal. A governed tool dispatch waits at its prepared
+  entry and again at its body entry, and when the call-level execution
+  policy gate stages the call again after its own awaits (dispatch admission,
+  consequence policy), inside the tool's timeout. At the body entry the review
+  check point runs on the decision checked after the wait; a reviewed tool whose
+  decision changed meanwhile is reviewed once more (see below) and no review
+  is reused. The `web_search` tool's helper model request waits within the
+  call's remaining tool time and asks again under the same delegate
+  operation. A compaction summary waits within the same
+  bounds, and past them the refusal still fails its compaction. When the
+  body entry or the gate's staging waits out a change after recording its
+  `Entry` record, it records another for the decision checked after the
+  wait. The gate's check point also runs on the decision checked after its
+  wait, but the gate's own code already ran: a reviewed tool whose decision
+  changed while the gate waited settles as `review_unsatisfied`
+  (`context_changed`) and is not reviewed again. A streaming tool's gate
+  wait also counts against its inactivity window, and past that window the
+  call ends as the tool's inactivity timeout. The debug event names the
+  site (`model_request`, `compaction_summary`, `tool_dispatch`,
+  `tool_entry`, `tool_policy_entry`, `web_search_delegate`).
+- A governed helper admission fence and a helper child issuance answer
+  `Unavailable` instead of `Denied` when their check refuses to rebuild
+  (`ReprepareRequired`), on the prepared path and on the dispatch path alike:
+  under the owner-change exclusion they cannot wait, and a refusal to rebuild
+  is no verdict on the operation, so a later attempt may succeed. A denial
+  and malformed facts stay `Denied`.
+- A model-reviewed (R2) tool call no longer fails with `review_unsatisfied`
+  (`context_changed`) when one owner publication change lands during its
+  review, at its verdict's commit, or at the dispatch's own entry staging
+  before the tool's dispatcher runs. When the operation is still permitted at
+  R2 with the same review material, the fenced dispatch re-prepares it and
+  reviews it once more from the start, as a second review attempt for the
+  same `tool_call_id`; the earlier verdict is never used. Deciding to review
+  once more reads the successor's review material once
+  (`review_operation_context`), so an owner sees one more read per
+  superseded call; when the material is unchanged, that read is the one the
+  second attempt is shown. A review observer can therefore see a
+  `ContextChanged` retirement followed by that second attempt: a host must
+  not treat the retirement as the call's final outcome.
+  At most one re-review runs per call, only after an allow or a reviewer
+  failure, and only with enough tool time left for a whole review deadline.
+  A second change, a denial or escalation, an expired review, a changed tier
+  (human consent included), changed or unreadable review material, and a
+  change once the tool's dispatcher is running still settle as before. An
+  owner change still in progress when the verdict is checked is now waited
+  out (within the attempt's own review deadline, 2 s at most) instead of
+  settling at once as changed authority; past that bound it settles as
+  before. The re-review adds no record type: the audit shows a second
+  `ReviewAttemptStarted` after the successor's `Prepared` record, and a
+  change at the entry staging also leaves that staging's `Entry` record
+  twice. Per tool call the waits stay bounded: at most 3 wait states (the
+  dispatch's preparation, and each review attempt's, which every staging of
+  that attempt shares), 9 free rebuilds and 6 s of waiting, inside the
+  tool's timeout.
+- `meerkat-contracts`: the `tool_config_changed` entry of
+  `WireEvent.known_payloads` in `artifacts/schemas/events.json` is generated
+  from the typed payload. The hand-written entry required a `status` field
+  that the event has never carried (its status is `status_info`), so every
+  real `tool_config_changed` event failed validation against it. It now
+  accepts the events the runtime serializes, including those stored by
+  0.9.3 and earlier and served with their `persisted` bit.
+- Creating a persistent `MeerkatMachine` over one store no longer waits for
+  another store's OAuth flow rehydration (`meerkat-runtime`). The
+  process-wide provider-auth authority cache held one lock while it built a
+  store's authority, which rehydrates that store's OAuth flows (a store read,
+  and a write back when flows were persisted), so every machine creation in
+  the process queued behind the slowest store. Each store key now has its own
+  slot: the cache lock covers only the slot lookup, and machines over one
+  store still wait for and share one authority, rehydrated once.
+- `@rkat/sdk`: a Node process that calls `MeerkatClient.close()` now exits
+  as soon as it has nothing else to do, instead of about 5 seconds later.
+  `close()` waits up to 5 seconds for the `rkat-rpc` child to exit before
+  it kills the child with SIGKILL, and the timer for that wait kept running
+  when the child exited first. It is now cancelled; a child that does not
+  exit within 5 seconds is still killed as before. `close()` also settles on
+  the child's exit instead of on its output pipes closing: a process the
+  child started that still held those pipes made `close()` wait the full
+  5 seconds after the child had exited, or wait forever after the SIGKILL.
+  Requests waiting on a child that exits by itself, a crash for instance,
+  likewise fail with `PROCESS_EXITED` at most about a second after the
+  exit, even when such a process still holds the pipes; before, they and
+  every request sent after the exit waited for the pipes to close, possibly
+  forever. After a protocol error (a reply line that is not JSON), the client
+  now stops the child the way `close()` does, and a later `close()` returns
+  once that child has exited: a child that ignores SIGTERM is killed after 5
+  seconds instead of being left running, and a process the child started can
+  no longer keep the caller's process alive through the child's pipes.
+  Pre-existing since 0.6.0; the protocol-error case since 0.7.0.
+- Python SDK: requests waiting on an `rkat-rpc` child that exits by
+  itself, a crash for instance, now fail with `CONNECTION_CLOSED` and the
+  child's stderr tail at most about a second after the exit, even when a
+  process the child started still holds the child's output pipes; before,
+  they and every request sent after the exit waited for those pipes to
+  close, possibly forever. `MeerkatClient.close()` likewise returns once
+  the child has exited, and lets go of such pipes: on Python 3.11 and
+  3.12, and on 3.13 and 3.14 before the fix for CPython issue 119710,
+  `asyncio`'s `Process.wait()` returns only once the child's pipes have
+  closed, so `close()` waited 5 seconds for a child that had already
+  exited. Pre-existing since 0.3.0.
+- `meerkat-openai`: on public GPT Live, a delegation result held behind the
+  user's unanswered question no longer leaves the voice model believing the
+  work is still in progress (#1820). Meerkat holds a result while the user's
+  latest utterance is unanswered, so the model answers that first; the
+  model's only fact about the delegation was then its in-progress
+  instruction, so "is it done yet?" got "Not yet" while the finished result
+  waited behind that very question. A held result now sends a notice at
+  once, always ahead of the result itself, on the instructions lane and
+  bound to its delegation: the work has
+  finished, its result has not reached the model yet, and the model may say
+  it has just finished but must not state, guess or imply the outcome until
+  the result arrives. The notice carries no result content and promises no
+  timing, the result is still released only by the existing triggers, later
+  "still running" lines stop naming that delegation, and the result's cue
+  no longer tells the model that anything it said earlier was said before
+  the work was done. A finished delegation whose result the runtime cannot
+  deliver yet (while another result holds the channel's one result slot, or
+  while results wait for the provider to acknowledge a concurrent
+  historical summary) gets the same notice: the machine authorizes it
+  once, as the narration kind `FinishedPending`, until the result is handed
+  to delivery, and the broker sends it
+  (`PublicLiveBrokerSession::append_delegation_finished_notice`) unless a
+  result of that delegation has already reached the session. While the
+  model is speaking, that notice waits until its response ends or the user
+  takes the floor (an instructions append mid-answer can cut the answer
+  off), and it is withdrawn, never sent, if the result reaches the session
+  first.
+- A session forked with RPC `session/fork_at` or `session/fork_replace` can
+  now run a turn (`meerkat-session`). The fork committed the child with its
+  source's session metadata but without the build state a cold resume
+  requires, so the child's first `turn/start` failed with `INTERNAL_ERROR`
+  "turn abandoned: persisted session <id> is missing session build state".
+  Every durable fork (`fork_at`, `fork_replace`, and the mob member,
+  turn-boundary and planned-identity forks) now commits a child build state
+  derived from the source's. The session configuration is carried: output
+  schema, hook overrides, budget limits, callback tool definitions, comms
+  settings, application context, additional instructions, and the shell and
+  tool call timeouts. The source's shell environment (`shell_env`), its MCP
+  attachment requests and its mob operator authority are not: the source
+  keeps its `shell_env` when it resumes, and MCP servers are attached to the
+  child itself. A source with session metadata but no build state cannot
+  give a child that runs, so every fork entry point now refuses it before
+  committing anything (`INVALID_PARAMS`, data kind
+  `fork_source_build_state_missing` with the `source_session_id`). A child
+  forked by 0.9.3 or earlier that never ran a turn still fails `turn/start`
+  with the error above, because it has no build state to derive one from:
+  fork its source again instead.
+- `meerkat-openai`, `meerkat-live`, `meerkat` and `meerkat-rpc`: an OpenAI
+  realtime response that ends without completing is now a typed failure, not
+  a finished turn (#1883). A `response.done` with status `failed`,
+  `in_progress`, or `incomplete` for a reason other than `max_output_tokens`
+  or `content_filter` used to surface as a completed turn with stop reason
+  `end_turn`, so the session committed the failed response's partial text as
+  an ordinary assistant reply, and a failed response without usage closed the
+  whole live channel. It now surfaces as the `turn_failed` observation with
+  the typed status; the provider's reason, code and message are diagnostics
+  only. The observation is not terminal: the channel stays open, the next
+  turn proceeds, and Meerkat sends no cancel. Both projection sinks commit
+  nothing of the failed response: they record `AssistantTurnFailed`, which
+  discards everything the response staged on every lane, and drop its
+  display-text buffer, so a barge-in after the failure never targets it. A
+  WebRTC peer stops playing the audio still queued for the failed response,
+  as it does for an interrupted one. A playback terminal waiting on the failed
+  response settles at the failure.
+  The response's usage is charged to the session and the budget when the
+  provider reported it; when it did not, the session event stream carries
+  `turn_usage_accounting_unmeasured` and no counter advances. A failed
+  response is not retried automatically: the client receives the typed
+  failure and decides whether to ask again. The `max_output_tokens`,
+  `content_filter` and cancellation mappings are unchanged. SDKs older than
+  this release do not know the `turn_failed` observation or the
+  `assistant_turn_failed` transcript event, and a decoder that validates the
+  observation type rejects them; upgrade the SDK with the server.
+- `rkat` builds without its default features
+  (`cargo check -p rkat --no-default-features`). Five helpers named types
+  and methods that exist only with `session-store` and failed to compile
+  without it: the ungoverned `bind_stock_prompt`, the governed-realm MCP
+  server lookup (`persistence_is_governed`, `GovernedMcpServers`,
+  `governed_configured_mcp_servers`) and the runtime-backed service builder
+  that waits for MCP servers. They are now gated on `session-store`, and a
+  build without it no longer warns about the session code it leaves out.
+  Pre-existing in 0.9.3.
+- A mob Shutdown's runtime teardown, and the settlement it reports,
+  unregister a member whose runtime registration is durability-degraded
+  (`meerkat-mob`). A failed boundary commit leaves the session
+  `ReloadRequired`, and its exited runtime loop can keep the session's
+  mutation fence, which only the runtime's reload-required discard releases.
+  The teardown's exact unregister admission waited on that fence, so the
+  member was reported `UnregisterPending` and stayed registered until the
+  process exited. The teardown and the settlement now run the discard first,
+  as retire and destroy do, and unregister the cold successor it publishes.
+  An unregister coordinator admitted before the session degraded still waits
+  on the fence; its settlement stays pending, bounded by each call's
+  deadline.
+- A pending member unregister that a mob Shutdown reported no longer
+  unregisters a registration that a later owner took over (`meerkat-mob`,
+  `meerkat-runtime`). When Shutdown's deadline passed before a member's
+  exact unregister was admitted, its settlement admitted that unregister
+  later through the member's exact registration witness. A later owner can
+  take a registration over in place under the same witness: a mob
+  reconstructed in-process over the same stores prepares its members'
+  bindings on the registrations the old incarnation left, a
+  `register_session` reuses a registration as it is, an executor
+  registration takes over a registration's live runtime loop as it is, and
+  an executor attachment or actor materialization adopts a registration
+  without a runtime loop. The settlement then unregistered the later
+  owner's live registration, or ran the reload-required discard on it once
+  it degraded.
+  It also followed whatever registration of the session was current once
+  its discard returned, which a later owner could already have replaced.
+  The runtime now stamps a registration's use at every adoption, Shutdown
+  reads it when it hands the member's registration back, and the settlement
+  starts the discard or the unregister only while that use is unchanged,
+  reporting `MemberUnregisterState::HandedOver` otherwise. It follows only
+  the successor its discard returns as published.
+- The runtime's reload-required discard disposes of a durability-degraded
+  registration that no runtime loop holds (`meerkat-runtime`). It required
+  the exact teardown handoff of the registration's runtime loop, so a
+  registration that never had a loop, or whose loop's teardown had already
+  completed, was refused until a repair nothing could perform: the exact
+  unregister is refused too while the session is degraded (the durability
+  gate refuses its first durable write), so a mob Shutdown reported that
+  member `UnregisterPending` for good, and a later owner's executor
+  registration on the session was refused. When no runtime loop can hold
+  the registration's mutation fence (no pending or committed attachment and
+  no runtime-loop teardown slot), the discard now takes the fence itself and
+  publishes the durability-ready cold successor, which the exact unregister
+  then settles, and a later owner's executor registration cold-reloads such
+  a registration as it does one whose loop handed its executor back. A
+  registration whose runtime loop is still attached keeps its fence until
+  that loop hands it back, and the discard waits for that handoff, as
+  before.
+- A peer message or request steered into a running turn was shown to the
+  model for one request and then lost (`meerkat-runtime`,
+  `meerkat-machine-schema`):
+  the machine classified it request-only, so it was consumed when it was
+  injected, never written to the transcript, missing from every later request
+  of the run and from history, and no `peer_content_ingested` event was
+  published for it. Text-only prompt steers, external-event steers and local
+  flow-step steers lost the same way. They now take the durable in-turn path
+  (see Breaking): one transcript row, committed with the run, recovered by
+  exactly one follow-up turn when its image is discarded or the process stops
+  mid-run. Pre-existing in 0.9.2 and 0.9.3.
+- `reply_to_peer` can answer a peer message that joined the running turn
+  (`meerkat-core`, `meerkat-runtime`, `meerkat-comms`). The turn's reply
+  capabilities came only from the deliveries that started it, so a message
+  delivered into the running turn was refused with `no_reply_capability`, or
+  with `unknown_reply_to` for its id. The durable in-turn delivery now adds
+  the message's reply capability to the running turn, and the message's
+  notice shows the `Delivery ID` that `reply_to` takes. When the selected id
+  matches deliveries of two different senders in one turn, the tool refuses
+  with `ambiguous_reply`, names each sender and sends nothing; before, it
+  answered the first. Pre-existing in 0.9.3.
+- A mob destroy whose member's boundary commit fails while the destroy
+  waits on that member's ingress detach now reloads the member, retries its
+  retirement once, and names it in `reloaded_members`. It answered
+  `MobDestroyError::Incomplete`; 0.9.3 listed this as a known limitation.
+- A wait for a session's durability-ready mutation gate now ends with the
+  typed `RuntimeDriverError::RecoveryRepairBlocked` as soon as the session's
+  durability degrades, even while another holder keeps the gate. The exited
+  runtime loop of a member whose boundary commit failed keeps the gate until
+  a reload, so such a wait lasted until the member was reloaded. This
+  includes the run-start hold a mob Shutdown takes on each member. An
+  unregister that waits for the gate before it stages its final unregister
+  also ends typed and releases its teardown coordinator, so the
+  reload-required discard can run.
+- The other waits for a session's mutation gate that serve live work now end
+  the same way instead of waiting for a holder of the gate once the session's
+  durability degrades: an exact-run interrupt and its reconciliation, the
+  recover and destroy control commands (`RuntimeControlPlaneError::StoreError`
+  carrying the refusal, as their durability-ready wait answers), a comms abort
+  (an abort of every session aborts the others, then answers the typed
+  refusal naming the sessions it skipped),
+  unregistering or retiring an executor attachment, an explicit stop and its
+  post-stop fence, installing an unregister coordinator, closing an idle
+  registration, input admission, the return to the gate after a boundary
+  callback, a member effect, the admitted-original read
+  (`AdmittedOriginalRefusal::Unavailable`), registering an executor over an
+  existing entry, and the runless terminal publication task. A session that
+  has already degraded refuses such a wait whenever another holder keeps the
+  gate. Waits that run only once the degraded holder has released the gate
+  (the reload-required discard) or before any runtime loop exists keep
+  waiting.
+- Reads of a session's runtime state that take no mutation gate (whether it
+  has active inputs, which a mob's close-if-idle and last-owner release ask;
+  a runtime wake; whether a run input awaits its boundary; a stopped run's
+  contributor terminal; an input's terminal completion) and a member's
+  tracked-input cancel waited behind a boundary commit or run
+  terminalization that holds the session's driver. Past its deadline such a
+  commit holds the driver until the store answers, so once the session
+  degrades they answer without it: the active-input read answers busy, the
+  contributor terminal is unknown, and the others refuse with the typed,
+  retryable `RecoveryRepairBlocked`.
+- A boundary commit whose store never answered (a stalled disk or a hung
+  network filesystem, for example) kept the session's mutation gate for
+  good, so every later wait for the gate waited for it, a mob destroy's
+  retirement of the member and a force cancel of it included. The commit's
+  declared deadline now degrades the session (see Changed), those waits end
+  typed, and a reload replaces the registration once the store has answered.
+- A fork child of a member or session with activated host instructions no
+  longer commits only to fail its first turn ("forked session must explicitly
+  activate inherited instruction keys"). `fork_off`, council participants, the
+  other self-starting forks and the RPC forks now either carry the source's
+  effective activations into the child (`reactivate_inherited`) or are refused,
+  typed, before commit. Council crash recovery verifies a planned child's
+  re-activation rows exactly and measures its prefix without them.
+- Generated TLA+ models now evaluate ordering comparisons between optional
+  values. The renderer wrote MobMachine's member progress guards
+  (`get_copied(id) <= Some(observed_at_ms)` and its `>` twin) as a plain `<=`
+  or `>` between option records, which TLC cannot evaluate, so any MobMachine
+  run with members stopped at the first state where a member progress
+  observation could fire: the deep profile stopped after nine states, before
+  any member transition was checked. Such comparisons now render with Rust's
+  `Option` order (`None` below every `Some`, two `Some`s by their values)
+  through `OptionLt` / `OptionLe`, which a model defines only when it uses
+  them, with ASSUMEs that re-check the order on every TLC run. The operators
+  branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
+  action-level `\/`. The Rust kernel already applied this order; only the
+  models of MobMachine and the two compositions that embed it change.
+  A TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`, lane
+  shard audits-b) now model-checks the member lifecycle around those guards,
+  over the whole reachable space of its domains, which no generated profile
+  checks to the end: roster recovery and
+  reset, session binding (fresh, replacing, already current), progress
+  observations, the local retire arms and the RetireMember signal, the
+  runtime retirement and archive observations, the resume path's replay
+  arms, stop and resume, and the recovery of an archived identity's next
+  incarnation. Every one of those arms must fire, a member's recorded
+  observation time never decreases, and the audit fails when a progress arm
+  loses its guard or the guard is rendered as a plain `<=` again.
+- MobMachine closes two latent gaps in its roster replay arms
+  (`meerkat-machine-schema`, `meerkat-mob`); no shell path feeds either
+  sequence.
+  - A replayed peer-only retirement start is refused for a runtime whose
+    retirement already records a session. Replayed over a releasing
+    retirement in flight, whose binding is already gone, the start removed
+    the recorded session while that session's ingress detach was still
+    pending, which broke the generated invariant that every pending detach
+    keeps its session. The resume path replays at most one start per
+    incarnation into freshly recovered state.
+  - A replayed Retired record that names the identity's current runtime
+    with another generation now matches no arm. The stale-incarnation arm
+    took it and pruned that runtime's state while the identity still mapped
+    to it, which broke the generated invariant that an identity held for a
+    respawn maps to no runtime or to a Retiring one. A consistent record
+    cannot carry that pairing: a runtime id names its generation. The arm
+    now takes only an identity that maps to no runtime and whose recorded
+    generation differs, so it no longer overlaps the current-runtime and
+    remapped-identity arms, which keep taking every record they took
+    before.
+  The member lifecycle audit, which now drives every replay arm, fails on
+  either gap.
+- A respawned member no longer starts from its predecessor's execution-health
+  record (`meerkat-machine-schema`, `meerkat-mob`). MobMachine kept each
+  identity's run state, in-flight work, progress token, last observation,
+  last progress time and event, and health class across incarnations, because
+  no arm removed them: until the new incarnation's session answered an
+  execution snapshot, its status reported the predecessor's in-flight work and
+  last progress time, and a first snapshot equal to the predecessor's last one
+  read as unchanged at the predecessor's progress time. Every arm that mints an
+  incarnation (spawn commit, placed and roster recovery, roster reset) now
+  clears that record, so a new incarnation's progress clock starts at its
+  first observation.
+- An idle close no longer counts a retired member's last observed work
+  (`meerkat-mob`). `close_if_idle` and the latched close after the last owner
+  releases summed the in-flight work of every identity's last execution
+  observation, retired ones included, so a member whose last status read saw
+  work in flight and that then retired kept the mob busy for its life:
+  admission never closed idle, and `MobBusy` reported runs that did not exist.
+  Only identities with a current incarnation count now. Pre-existing in 0.9.3.
+- After a restart, a placed member no longer shows its predecessor's kickoff
+  (`meerkat-mob`). The startup replay applies kickoff updates per identity and
+  installs the current placed incarnation from its committed carrier only after
+  the whole event pass, so the kickoff phase and error of an earlier
+  incarnation of the same identity (a failed kickoff, for example) carried
+  over to a placed incarnation that had no kickoff of its own, although the
+  live spawn commit had cleared them. The replay now clears the identity's
+  kickoff where that incarnation's spawn event sits; the incarnation's own
+  kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

@@ -245,6 +245,7 @@ fn installation(probe: &Arc<Probe>, bounds: McpAttemptGuardBounds) -> McpAttempt
     McpAttemptGuards::new(Arc::new(ProbeFactory(Arc::clone(probe))), bounds)
 }
 
+#[cfg(feature = "workspace-tests")]
 fn surface_router() -> McpRouter {
     McpRouter::new_with_surface_handle_and_stdio_profile(
         Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
@@ -252,6 +253,7 @@ fn surface_router() -> McpRouter {
     )
 }
 
+#[cfg(feature = "workspace-tests")]
 fn guarded(guards: &McpAttemptGuards, owner: McpConstructionOwner) -> Arc<McpRouterAdapter> {
     Arc::new(McpRouterAdapter::new(
         surface_router().with_attempt_guards(guards.clone(), owner),
@@ -330,6 +332,7 @@ fn closed_receipt(process: &McpAttemptProcessEnd) -> Arc<crate::McpStdioCloseRec
 
 /// r1 1: a begin refusal spawns nothing and finishes nothing; the begin is
 /// recorded as completed.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_begin_refusal_spawns_nothing_and_finishes_nothing() {
     let probe = Probe::new();
@@ -377,6 +380,7 @@ async fn a_begin_refusal_spawns_nothing_and_finishes_nothing() {
 
 /// Ok(None): the attempt proceeds unguarded; no finish, and the begin is
 /// recorded.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_unguarded_begin_lets_the_attempt_proceed_without_a_finish() {
     let probe = Probe::new();
@@ -399,6 +403,7 @@ async fn an_unguarded_begin_lets_the_attempt_proceed_without_a_finish() {
 /// r1 2 and r1 12: begin runs before the attachment control's physical
 /// entry, on the staged descriptor (no resolved secret); a later control
 /// refusal cancels the guard once, with nothing spawned.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn begin_precedes_the_physical_entry_and_a_control_refusal_cancels_once() {
     let probe = Probe::new();
@@ -461,6 +466,7 @@ async fn begin_precedes_the_physical_entry_and_a_control_refusal_cancels_once() 
 
 /// The service-secret refusal after begin cancels the guard as
 /// `Refused{ServiceSecret}`, nothing spawned.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_service_secret_refusal_cancels_as_refused() {
     let probe = Probe::new();
@@ -489,6 +495,7 @@ async fn a_service_secret_refusal_cancels_as_refused() {
 
 /// r1 12: a confinement refusal after begin cancels as
 /// `Refused{Confinement}`, nothing spawned.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_confinement_refusal_cancels_as_refused() {
     let probe = Probe::new();
@@ -537,6 +544,7 @@ async fn a_confinement_refusal_cancels_as_refused() {
 
 /// A spawn failure cancels as `SetupFailed{SpawnFailed}` in the launch
 /// phase, nothing spawned.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_spawn_failure_cancels_as_setup_failed_not_spawned() {
     let probe = Probe::new();
@@ -572,6 +580,7 @@ async fn a_spawn_failure_cancels_as_setup_failed_not_spawned() {
 
 /// r1 4 and r2 8: an initialize crash cancels with the attempt's own #230
 /// failure (same attempt number, no tail) and its close receipt.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_initialize_crash_cancels_with_its_setup_failure_and_close() {
     let probe = Probe::new();
@@ -613,6 +622,7 @@ async fn an_initialize_crash_cancels_with_its_setup_failure_and_close() {
 
 /// r1 3: an installed attempt settles only once its process was reaped by
 /// a later remove, with the remove's own receipt.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_installed_attempt_settles_after_its_remove_closes_it() {
     let probe = Probe::new();
@@ -646,6 +656,7 @@ async fn an_installed_attempt_settles_after_its_remove_closes_it() {
 
 /// r1 6 (process held): shutdown settles an installed attempt with the very
 /// receipt the shutdown report holds.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn shutdown_settles_an_installed_attempt_with_the_reported_receipt() {
     let probe = Probe::new();
@@ -681,6 +692,7 @@ async fn shutdown_settles_an_installed_attempt_with_the_reported_receipt() {
 /// A success the router refuses to install (its lifecycle mirror rejects
 /// the connected transition) cancels as `NotInstalled{InstallRefused}` with
 /// its close.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_install_refusal_cancels_as_not_installed() {
     struct RejectsConnected;
@@ -729,6 +741,7 @@ async fn an_install_refusal_cancels_as_not_installed() {
 /// r1 6 and r2 1: a shutdown while begin is pending does not drop it: the
 /// attempt is cancelled as `RouterClosed`, nothing spawns, and the guard
 /// the begin returns later gets exactly one cancel.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn shutdown_during_begin_cancels_the_late_guard_once() {
     let probe = Probe::new();
@@ -763,6 +776,7 @@ async fn shutdown_during_begin_cancels_the_late_guard_once() {
 
 /// r1 10 and r2 1: past its bound the attempt stops (`BeginBound`), nothing
 /// spawns, and the late guard gets exactly one cancel.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_begin_past_its_bound_is_cancelled_and_its_late_guard_cancelled_once() {
     let probe = Probe::new();
@@ -800,6 +814,7 @@ async fn a_begin_past_its_bound_is_cancelled_and_its_late_guard_cancelled_once()
 /// r2 1: the close index stopping an attempt mid-begin cancels it; and an
 /// adapter dropped mid-begin cancels it as `RouterDropped`. The late guards
 /// are cancelled once, and `close_and_join` reports them.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_dropped_adapter_mid_begin_cancels_and_close_and_join_reports_it() {
     let probe = Probe::new();
@@ -834,6 +849,7 @@ async fn a_dropped_adapter_mid_begin_cancels_and_close_and_join_reports_it() {
 /// r1 7: dropping the adapter without shutdown abandons an installed
 /// process (its group killed by the drop) and settles its guard with
 /// `Abandoned`.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_dropped_adapter_settles_an_installed_guard_as_abandoned() {
     let probe = Probe::new();
@@ -856,6 +872,7 @@ async fn a_dropped_adapter_settles_an_installed_guard_as_abandoned() {
 /// r2 2: the next begin for the same owner and server waits for the prior
 /// finish; past the settle bound it is refused (`PriorGuardUnsettled`, no
 /// begin); the prior finish is recorded completed once released.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_prior_unsettled_finish_refuses_the_next_begin() {
     let probe = Probe::new();
@@ -909,6 +926,7 @@ async fn a_prior_unsettled_finish_refuses_the_next_begin() {
 /// guard); the host refuses it, the reload fails, and the installed
 /// attempt settles after its later close. A wait on the live guard would
 /// last the whole settle bound and then refuse the reload unbegun.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_reload_never_waits_for_a_live_guard() {
     let probe = Probe::new();
@@ -943,6 +961,7 @@ async fn a_reload_never_waits_for_a_live_guard() {
 
 /// r2 4: a rebuilt construction for the same owner awaits its
 /// predecessor's running finish before beginning.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_rebuild_awaits_the_predecessor_finish() {
     let probe = Probe::new();
@@ -975,6 +994,7 @@ async fn a_rebuild_awaits_the_predecessor_finish() {
 /// r2 5: a shutdown awaits finishes by the settle bound; a slow one is
 /// reported `TimedOut` (settled closes unchanged), and `close_and_join`
 /// later reports it completed.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_slow_finish_times_out_at_shutdown_and_completes_at_join() {
     let probe = Probe::new();
@@ -1008,6 +1028,7 @@ async fn a_slow_finish_times_out_at_shutdown_and_completes_at_join() {
 
 /// r2 7: a finish that returns `Err` is `Failed`, one that panics is
 /// `Panicked`.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn failed_and_panicked_finishes_are_recorded() {
     for (finish, expected) in [
@@ -1034,6 +1055,7 @@ async fn failed_and_panicked_finishes_are_recorded() {
 
 /// r1 9 and r2 7: a shutdown racing a remove finishes the guard exactly
 /// once.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shutdown_racing_a_remove_finishes_exactly_once() {
     let probe = Probe::new();
@@ -1057,6 +1079,7 @@ async fn a_shutdown_racing_a_remove_finishes_exactly_once() {
 
 /// r1 13: attempt numbers are the #230 ones, and a guard refusal leaves no
 /// #230 failure.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn attempt_numbers_match_the_setup_diagnostics() {
     let probe = Probe::new();
@@ -1071,6 +1094,7 @@ async fn attempt_numbers_match_the_setup_diagnostics() {
 
 /// The guard scope is stdio: an HTTP attempt on a guarded router never
 /// begins a guard, and is neither guarded nor refused by it.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_http_attempt_never_begins_a_guard() {
     let probe = Probe::new();
@@ -1087,6 +1111,7 @@ async fn an_http_attempt_never_begins_a_guard() {
 }
 
 /// r1 14: without installed guards nothing is begun or reported.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn without_guards_nothing_is_reported() {
     let adapter = Arc::new(McpRouterAdapter::new(surface_router()));
@@ -1130,6 +1155,7 @@ fn bounds_over_the_maximum_are_refused() {
 /// M1: a close of the installation while an attempt still awaits its prior
 /// guard's finish refuses that attempt's begin: the factory is never asked,
 /// and the close reports the begin `Cancelled{InstallationClosed}`.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn close_and_join_refuses_a_begin_still_awaiting_its_prior_finish() {
     let probe = Probe::new();
@@ -1188,6 +1214,7 @@ async fn close_and_join_refuses_a_begin_still_awaiting_its_prior_finish() {
 
 /// M1: a finish that starts while `close_and_join` waits for another one is
 /// reported too, and no shutdown reports the guards completed while it runs.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn close_and_join_reports_a_finish_that_starts_while_it_waits() {
     let probe = Probe::new();
@@ -1254,6 +1281,7 @@ async fn close_and_join_reports_a_finish_that_starts_while_it_waits() {
 }
 
 /// L1: the immediate add path keeps a guard refusal typed.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn add_server_keeps_a_guard_refusal_typed() {
     let probe = Probe::new();
@@ -1276,6 +1304,7 @@ async fn add_server_keeps_a_guard_refusal_typed() {
 
 /// L3: an attempt dropped while it waits for its begin cancels the guard the
 /// begin returns later as `AttemptDropped`, nothing spawned.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_dropped_attempt_cancels_its_late_guard_as_attempt_dropped() {
     let probe = Probe::new();
@@ -1306,6 +1335,7 @@ async fn a_dropped_attempt_cancels_its_late_guard_as_attempt_dropped() {
 
 /// L3: a result the router had not processed when its shutdown began is
 /// cancelled `RouterClosed`, with its process's close.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn shutdown_cancels_an_unprocessed_result_as_router_closed() {
     let probe = Probe::new();
@@ -1347,6 +1377,7 @@ async fn shutdown_cancels_an_unprocessed_result_as_router_closed() {
 }
 
 /// N3: a second installation on one router is refused: the first stands.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_second_guard_installation_is_refused() {
     let first = Probe::new();
@@ -1377,6 +1408,7 @@ async fn a_second_guard_installation_is_refused() {
 /// R1: a guard its begin already handed over is still awaited and reported
 /// by a concurrent `close_and_join`: it is registered before the begin
 /// completes, not after the attempt picks it up.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn close_and_join_sees_a_guard_still_being_handed_over() {
     let probe = Probe::new();
@@ -1455,6 +1487,7 @@ fn killed_or_gone(pid: u32) -> bool {
 /// An abandoned attempt's process is killed before its guard learns it was
 /// abandoned: the custody drops its process (killing its group) before the
 /// guard's holder. A host may release a resource when it sees `Abandoned`.
+#[cfg(feature = "workspace-tests")]
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_abandoned_process_is_killed_before_its_guard_learns_it() {

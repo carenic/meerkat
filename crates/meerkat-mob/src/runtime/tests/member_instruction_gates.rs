@@ -110,9 +110,7 @@ impl meerkat_client::LlmClient for ScriptedClient {
                 ),
             };
             yield meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             };
         })
     }
@@ -169,13 +167,22 @@ impl Fixture {
     /// A turn-driven member restored onto a durable session that existed
     /// before the member: the case build-time instructions cannot reach.
     async fn restored_member() -> Self {
-        Self::restored_member_through(false).await
+        Self::restored_member_through(false, None).await
+    }
+
+    /// [`Self::restored_member`] in a mob whose host set `policy` as its fork
+    /// instruction policy.
+    async fn restored_member_with_policy(policy: meerkat_core::ForkInstructionPolicy) -> Self {
+        Self::restored_member_through(false, Some(policy)).await
     }
 
     /// [`Self::restored_member`], with the mob's session service optionally
     /// behind a decorator that forwards everything except the activation
     /// seam (the regression the typed default guards against).
-    async fn restored_member_through(non_forwarding_decorator: bool) -> Self {
+    async fn restored_member_through(
+        non_forwarding_decorator: bool,
+        fork_instruction_policy: Option<meerkat_core::ForkInstructionPolicy>,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("meerkat-member-instruction-")
             .tempdir()
@@ -234,12 +241,13 @@ impl Fixture {
         } else {
             service.clone()
         };
-        let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        let mut builder = MobBuilder::new(definition, MobStorage::in_memory())
             .with_session_service(Arc::clone(&mob_service))
-            .with_default_llm_client(Arc::new(client.clone()))
-            .create()
-            .await
-            .expect("create real turn-driven mob");
+            .with_default_llm_client(Arc::new(client.clone()));
+        if let Some(policy) = fork_instruction_policy {
+            builder = builder.with_fork_instruction_policy(policy);
+        }
+        let handle = builder.create().await.expect("create real turn-driven mob");
 
         // The durable session exists before the member: created, persisted
         // and its creating actor discarded, so the member adopts it through
@@ -327,9 +335,14 @@ impl Fixture {
 
     /// Start one turn and return its handle unawaited.
     async fn start_turn(&self, text: &str) -> WorkTurnHandle {
+        self.start_turn_for(&self.identity, text).await
+    }
+
+    /// Start one turn on `identity` and return its handle unawaited.
+    async fn start_turn_for(&self, identity: &AgentIdentity, text: &str) -> WorkTurnHandle {
         let entry = self
             .handle
-            .get_member(&self.identity)
+            .get_member(identity)
             .await
             .expect("roster read")
             .expect("member binding");
@@ -387,6 +400,1131 @@ async fn an_activation_on_a_restored_member_reaches_its_next_turn() {
         system_rows_with_body(next),
         1,
         "the next turn carries the activation exactly once"
+    );
+    fixture.finish().await;
+}
+
+fn standing_key() -> (InstructionNamespace, InstructionKey) {
+    (
+        InstructionNamespace::new("host.standing").expect("namespace"),
+        InstructionKey::new("member").expect("key"),
+    )
+}
+
+/// An activation request for `key` under the standing namespace.
+fn keyed_request(
+    key: &str,
+    activation: &str,
+    body: &str,
+    expectation: InstructionActivationExpectation,
+    supersedes: Option<&str>,
+) -> InstructionActivationRequest {
+    InstructionActivationRequest {
+        revision: InstructionRevisionRef {
+            namespace: InstructionNamespace::new("host.standing").expect("namespace"),
+            key: InstructionKey::new(key).expect("key"),
+            revision_id: InstructionRevisionId::new(format!("rev-{activation}")).expect("revision"),
+            content_sha256: InstructionContentDigest::for_body(body),
+        },
+        activation_id: InstructionActivationId::new(activation).expect("activation id"),
+        expectation,
+        supersedes: supersedes.map(|id| InstructionActivationId::new(id).expect("supersedes")),
+        body: body.to_string(),
+    }
+}
+
+/// The activation rows of `session` whose origin is `session` itself, in
+/// transcript order.
+fn origin_local_rows(
+    session: &meerkat_core::Session,
+) -> Vec<meerkat_core::InstructionActivationIdentity> {
+    session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system) => system.instruction_activation.clone(),
+            _ => None,
+        })
+        .filter(|identity| identity.origin_session_id == *session.id())
+        .collect()
+}
+
+impl Fixture {
+    async fn activate_standing(&self) {
+        self.activate(request(
+            "standing-1",
+            InstructionActivationExpectation::Absent,
+        ))
+        .await
+        .expect("activation applies at a safe boundary");
+    }
+
+    async fn source_session(&self) -> SessionId {
+        self.handle
+            .resolve_bridge_session_id(&self.identity)
+            .await
+            .expect("the restored member's session")
+    }
+
+    async fn durable(&self, id: &SessionId) -> Option<meerkat_core::Session> {
+        self.service
+            .load_durable_session_body(id)
+            .await
+            .expect("durable session read")
+    }
+
+    async fn session_count(&self) -> usize {
+        meerkat_core::service::SessionService::list(
+            &*self.service,
+            meerkat_core::service::SessionQuery::default(),
+        )
+        .await
+        .expect("session list")
+        .len()
+    }
+
+    async fn member_session(&self, identity: &AgentIdentity) -> Option<SessionId> {
+        self.handle.resolve_bridge_session_id(identity).await
+    }
+
+    async fn fork_at(
+        &self,
+        source: &SessionId,
+        message_index: usize,
+        inherited_instructions: Option<meerkat_core::ForkInstructionPolicy>,
+    ) -> Result<meerkat_core::SessionForkResult, SessionError> {
+        meerkat_core::service::SessionServiceTranscriptEditExt::fork_session_at(
+            &*self.service,
+            source,
+            meerkat_core::SessionForkAtRequest {
+                message_index,
+                running_behavior: meerkat_core::TranscriptEditRunningBehavior::Reject,
+                tool_access_policy: None,
+                inherited_instructions,
+            },
+        )
+        .await
+    }
+}
+
+/// Assert `refusal` is the policy refusal for exactly the standing key.
+fn assert_policy_refusal(refusal: &meerkat_core::ForkInstructionRefusal) {
+    assert_eq!(
+        refusal.cause,
+        meerkat_core::ForkInstructionRefusalCause::PolicyRefuses,
+        "the fork instruction policy refused the inherited key"
+    );
+    assert_eq!(
+        refusal.keys,
+        vec![standing_key()],
+        "the refusal names the key"
+    );
+}
+
+/// fork_off's composition (`fork_member_then_run_bounded`) starts the child's
+/// first turn itself, so the host has no window to activate the inherited
+/// key. Under the default policy the fork is refused, typed, before anything
+/// is committed: no child session, no roster entry, no model request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_self_starting_fork_of_an_activated_member_is_refused_before_commit_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let sessions_before = fixture.session_count().await;
+    let requests_before = fixture.client.requests().len();
+
+    let outcome = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member_then_run_bounded(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from("fork-child"))
+                .with_initial_message("the forked task"),
+            None,
+            "result",
+            4_096,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the fork answers");
+    match outcome {
+        Err(BoundedMemberRunError::Admission(MobError::ForkInstructionRefused {
+            source_member_id,
+            refusal,
+        })) => {
+            assert_eq!(source_member_id, fixture.identity);
+            assert_policy_refusal(&refusal);
+        }
+        other => panic!("expected a typed fork instruction refusal before commit, got {other:?}"),
+    }
+    assert!(
+        fixture
+            .handle
+            .get_member(&AgentIdentity::from("fork-child"))
+            .await
+            .expect("roster read")
+            .is_none(),
+        "no child is seated"
+    );
+    assert_eq!(
+        fixture.session_count().await,
+        sessions_before,
+        "no child session is committed"
+    );
+    assert_eq!(
+        fixture.client.requests().len(),
+        requests_before,
+        "no model request is made"
+    );
+    fixture.finish().await;
+}
+
+/// With `ReactivateInherited` the same self-starting fork commits a child
+/// that carries exactly one child-origin re-activation of the inherited key,
+/// and the child's first turn reaches the model with the instruction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_self_starting_fork_reactivates_inherited_instructions_when_the_host_opts_in() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activate_standing().await;
+    let requests_before = fixture.client.requests().len();
+
+    let outcome = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member_then_run_bounded(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from("fork-child"))
+                .with_initial_message("the forked task"),
+            None,
+            "result",
+            4_096,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the fork answers");
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("the fork child runs its first turn: {error:?}"),
+    };
+    let requests = fixture.client.requests();
+    let child_request = requests
+        .get(requests_before)
+        .expect("the child's first turn reached the model");
+    assert_eq!(
+        system_rows_with_body(child_request),
+        2,
+        "the child's request carries the inherited history row and its own activation"
+    );
+    let child = fixture
+        .durable(&outcome.fork.session_id)
+        .await
+        .expect("the child is committed");
+    let local = origin_local_rows(&child);
+    assert_eq!(local.len(), 1, "exactly one child-origin row: {local:?}");
+    assert_eq!(
+        local[0]
+            .supersedes
+            .as_ref()
+            .map(InstructionActivationId::as_str),
+        Some("standing-1"),
+        "the re-activation supersedes the inherited head"
+    );
+    assert_eq!(local[0].revision.revision_id.as_str(), "rev-standing-1");
+    assert!(
+        local[0]
+            .activation_id
+            .as_str()
+            .starts_with("fork-reactivation:"),
+        "fork-written rows are recognizable to an operator: {}",
+        local[0].activation_id
+    );
+    fixture.finish().await;
+}
+
+/// `Refuse` refuses even the host-driven fork whose host could activate the
+/// child: typed, before commit, nothing seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refuse_policy_refuses_a_host_driven_fork_before_commit() {
+    let fixture =
+        Fixture::restored_member_with_policy(meerkat_core::ForkInstructionPolicy::Refuse).await;
+    fixture.activate_standing().await;
+    let sessions_before = fixture.session_count().await;
+    let child = AgentIdentity::from("fork-child");
+
+    let outcome = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers");
+    match outcome {
+        Err(MobError::ForkInstructionRefused { refusal, .. }) => assert_policy_refusal(&refusal),
+        other => panic!("expected a typed fork instruction refusal before commit, got {other:?}"),
+    }
+    assert!(
+        fixture
+            .handle
+            .get_member(&child)
+            .await
+            .expect("roster read")
+            .is_none(),
+        "no child is seated"
+    );
+    assert_eq!(fixture.session_count().await, sessions_before);
+    fixture.finish().await;
+}
+
+/// The host-driven fork under `ReactivateInherited` seats a child whose first
+/// turn runs without any host activation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_driven_fork_reactivates_when_the_host_opts_in() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activate_standing().await;
+    let child = AgentIdentity::from("fork-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits and seats the child");
+
+    let before = fixture.client.requests().len();
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    if let Err(error) = tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+    {
+        panic!("the child's first turn runs without a host activation: {error:?}");
+    }
+    assert!(
+        fixture.client.requests().len() > before,
+        "the child reached the model"
+    );
+    fixture.finish().await;
+}
+
+/// The live delegation's durable fork admits the child's bounded turn itself:
+/// under the default policy the delegation is refused, typed, before commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_delegation_is_refused_before_commit_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let sessions_before = fixture.session_count().await;
+    let requests_before = fixture.client.requests().len();
+    let child = AgentIdentity::from("delegated-child");
+    let request = crate::runtime::delegation::DelegationExecutionRequest::new(
+        child.clone(),
+        "the delegated task",
+        BoundedResultSpec::new("delegation-result", 4_096).expect("result spec"),
+    )
+    .with_durable_fork(fixture.identity.clone(), None);
+    let started = tokio::time::timeout(
+        WAIT,
+        crate::runtime::delegation::DelegationExecutionService::new(fixture.handle.clone())
+            .start(request),
+    )
+    .await
+    .expect("the delegation answers");
+    match started {
+        Err(crate::runtime::delegation::DelegationExecutionError::Spawn(
+            MobError::ForkInstructionRefused { refusal, .. },
+        )) => assert_policy_refusal(&refusal),
+        Err(other) => panic!("expected a typed fork instruction refusal, got {other:?}"),
+        Ok(_) => {
+            panic!("expected a typed fork instruction refusal before commit, got a started child")
+        }
+    }
+    assert!(
+        fixture
+            .handle
+            .get_member(&child)
+            .await
+            .expect("roster read")
+            .is_none(),
+        "no child is seated"
+    );
+    assert_eq!(fixture.session_count().await, sessions_before);
+    assert_eq!(fixture.client.requests().len(), requests_before);
+    fixture.finish().await;
+}
+
+/// With `ReactivateInherited` the delegated durable fork's bounded turn
+/// completes and reaches the model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_fork_delegation_runs_when_the_host_opts_in() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activate_standing().await;
+    let requests_before = fixture.client.requests().len();
+    let child = AgentIdentity::from("delegated-child");
+    let request = crate::runtime::delegation::DelegationExecutionRequest::new(
+        child.clone(),
+        "the delegated task",
+        BoundedResultSpec::new("delegation-result", 4_096).expect("result spec"),
+    )
+    .with_durable_fork(fixture.identity.clone(), None);
+    let service =
+        crate::runtime::delegation::DelegationExecutionService::new(fixture.handle.clone());
+    let execution = tokio::time::timeout(WAIT, service.start(request))
+        .await
+        .expect("the delegation answers")
+        .expect("the delegation starts");
+    let terminalized = tokio::time::timeout(WAIT, execution.await_terminal())
+        .await
+        .expect("the delegated turn ends");
+    match terminalized.terminal() {
+        crate::runtime::delegation::DelegationTurnTerminal::Completed(_) => {}
+        terminal => panic!("the delegated child completes its bounded turn: {terminal:?}"),
+    }
+    assert!(
+        fixture.client.requests().len() > requests_before,
+        "the child reached the model"
+    );
+    fixture.finish().await;
+}
+
+/// RPC `session/fork_at` commits a child the host cannot activate (it is not
+/// materialized), so the default refuses a source whose prefix carries
+/// activation rows, typed, before commit, naming the field that clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_fork_at_of_an_activated_session_is_refused_before_commit_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+    let sessions_before = fixture.session_count().await;
+
+    match fixture.fork_at(&source, prefix, None).await {
+        Err(SessionError::ForkInstructionRefused(refusal)) => {
+            assert_policy_refusal(&refusal);
+            assert!(
+                refusal.to_string().contains("reactivate_inherited"),
+                "the refusal names the option that clears it: {refusal}"
+            );
+        }
+        other => panic!("expected a typed fork instruction refusal before commit, got {other:?}"),
+    }
+    assert_eq!(fixture.session_count().await, sessions_before);
+    fixture.finish().await;
+}
+
+/// RPC `session/fork_replace` (its own code path) refuses the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_fork_replace_of_an_activated_session_is_refused_before_commit_by_default() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    fixture.run_turn("a turn the replacement can address").await;
+    let source = fixture.source_session().await;
+    let source_body = fixture.durable(&source).await.expect("source");
+    let user_index = source_body
+        .messages()
+        .iter()
+        .rposition(|message| matches!(message, Message::User(_)))
+        .expect("a user message");
+    let sessions_before = fixture.session_count().await;
+
+    let replaced = meerkat_core::service::SessionServiceTranscriptEditExt::fork_session_replace(
+        &*fixture.service,
+        &source,
+        meerkat_core::SessionForkReplaceRequest {
+            message_index: user_index,
+            replacement: meerkat_core::TranscriptReplacement::Message {
+                message: Message::User(meerkat_core::UserMessage::text("a replaced question")),
+            },
+            running_behavior: meerkat_core::TranscriptEditRunningBehavior::Reject,
+            tool_access_policy: None,
+            inherited_instructions: None,
+        },
+    )
+    .await;
+    match replaced {
+        Err(SessionError::ForkInstructionRefused(refusal)) => assert_policy_refusal(&refusal),
+        other => panic!("expected a typed fork instruction refusal before commit, got {other:?}"),
+    }
+    assert_eq!(fixture.session_count().await, sessions_before);
+    fixture.finish().await;
+}
+
+/// `reactivate_inherited` on a generic fork appends one child-origin row per
+/// effective key, in (namespace, key) order whatever the activation order,
+/// and the result keeps the prefix meaning apart from the appended rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_fork_reactivates_every_effective_key_in_key_order() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    fixture
+        .activate(keyed_request(
+            "alpha",
+            "alpha-1",
+            "Prefer short answers.",
+            InstructionActivationExpectation::Absent,
+            None,
+        ))
+        .await
+        .expect("a second key activates");
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+
+    let forked = fixture
+        .fork_at(
+            &source,
+            prefix,
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+        .expect("the fork commits");
+    assert_eq!(forked.reactivated_instruction_count, 2);
+    assert_eq!(forked.prefix_message_count(), prefix);
+    assert_eq!(forked.message_count, prefix + 2);
+    let child = fixture
+        .durable(&forked.session_id)
+        .await
+        .expect("the child is committed");
+    let keys = origin_local_rows(&child)
+        .into_iter()
+        .map(|identity| identity.revision.key.as_str().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec!["alpha".to_string(), "member".to_string()]);
+    child
+        .validate_instruction_activation_turn_readiness()
+        .expect("the child can run a turn");
+    fixture.finish().await;
+}
+
+/// `reactivate_inherited` on `fork_replace` re-activates the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_fork_replace_reactivates_when_asked() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    fixture.run_turn("a turn the replacement can address").await;
+    let source = fixture.source_session().await;
+    let source_body = fixture.durable(&source).await.expect("source");
+    let user_index = source_body
+        .messages()
+        .iter()
+        .rposition(|message| matches!(message, Message::User(_)))
+        .expect("a user message");
+
+    let forked = meerkat_core::service::SessionServiceTranscriptEditExt::fork_session_replace(
+        &*fixture.service,
+        &source,
+        meerkat_core::SessionForkReplaceRequest {
+            message_index: user_index,
+            replacement: meerkat_core::TranscriptReplacement::Message {
+                message: Message::User(meerkat_core::UserMessage::text("a replaced question")),
+            },
+            running_behavior: meerkat_core::TranscriptEditRunningBehavior::Reject,
+            tool_access_policy: None,
+            inherited_instructions: Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        },
+    )
+    .await
+    .expect("the fork commits");
+    assert_eq!(forked.reactivated_instruction_count, 1);
+    let child = fixture
+        .durable(&forked.session_id)
+        .await
+        .expect("the child is committed");
+    assert_eq!(origin_local_rows(&child).len(), 1);
+    child
+        .validate_instruction_activation_turn_readiness()
+        .expect("the child can run a turn");
+    fixture.finish().await;
+}
+
+/// Re-activation carries only what was effective in the source. A source that
+/// itself only inherited a key (an unactivated fork child) has nothing
+/// effective to carry: the fork is refused, typed, and nothing is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reactivation_refuses_a_key_the_source_never_activated() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let unactivated = AgentIdentity::from("unactivated-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), unactivated.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the host-driven fork seats an unactivated child");
+    let source = fixture
+        .member_session(&unactivated)
+        .await
+        .expect("the unactivated child's session");
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("the unactivated child is committed")
+        .messages()
+        .len();
+    let sessions_before = fixture.session_count().await;
+
+    match fixture
+        .fork_at(
+            &source,
+            prefix,
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+    {
+        Err(SessionError::ForkInstructionRefused(refusal)) => {
+            assert_eq!(
+                refusal.cause,
+                meerkat_core::ForkInstructionRefusalCause::NotEffectiveInSource
+            );
+            assert_eq!(refusal.keys, vec![standing_key()]);
+        }
+        other => panic!("expected a NotEffectiveInSource refusal, got {other:?}"),
+    }
+    assert_eq!(fixture.session_count().await, sessions_before);
+    fixture.finish().await;
+}
+
+/// Re-activation that would cross the lineage's retained-body budget is
+/// refused with the budget cause, and nothing is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reactivation_refuses_past_the_lineage_body_budget() {
+    let fixture = Fixture::restored_member().await;
+    let body = "b".repeat(250 * 1024);
+    for (key, activation) in [("k1", "k1-1"), ("k2", "k2-1"), ("k3", "k3-1")] {
+        fixture
+            .activate(keyed_request(
+                key,
+                activation,
+                &body,
+                InstructionActivationExpectation::Absent,
+                None,
+            ))
+            .await
+            .expect("a large activation fits the source budget");
+    }
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+    let sessions_before = fixture.session_count().await;
+
+    match fixture
+        .fork_at(
+            &source,
+            prefix,
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+    {
+        Err(SessionError::ForkInstructionRefused(refusal)) => assert_eq!(
+            refusal.cause,
+            meerkat_core::ForkInstructionRefusalCause::LineageBodyBudgetExceeded {
+                max_bytes: 1024 * 1024
+            }
+        ),
+        other => panic!("expected a lineage budget refusal, got {other:?}"),
+    }
+    assert_eq!(fixture.session_count().await, sessions_before);
+    fixture.finish().await;
+}
+
+/// A prefix fork re-activates the key's head at the fork boundary, not a
+/// later activation the source made after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prefix_fork_reactivates_the_boundary_head() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    fixture.run_turn("a turn between the activations").await;
+    fixture
+        .activate(keyed_request(
+            "member",
+            "standing-2",
+            BODY,
+            InstructionActivationExpectation::Effective(
+                InstructionActivationId::new("standing-1").expect("id"),
+            ),
+            Some("standing-1"),
+        ))
+        .await
+        .expect("the later activation applies");
+    let source = fixture.source_session().await;
+    let body = fixture.durable(&source).await.expect("source");
+    let boundary = body
+        .messages()
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                Message::System(system)
+                    if system
+                        .instruction_activation
+                        .as_ref()
+                        .is_some_and(|identity| identity.activation_id.as_str() == "standing-2")
+            )
+        })
+        .expect("the later activation row");
+
+    let forked = fixture
+        .fork_at(
+            &source,
+            boundary,
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+        .expect("the prefix fork commits");
+    let child = fixture
+        .durable(&forked.session_id)
+        .await
+        .expect("the child is committed");
+    let local = origin_local_rows(&child);
+    assert_eq!(local.len(), 1, "one re-activation: {local:?}");
+    assert_eq!(
+        local[0]
+            .supersedes
+            .as_ref()
+            .map(InstructionActivationId::as_str),
+        Some("standing-1"),
+        "the boundary head, not the later activation"
+    );
+    assert_eq!(local[0].revision.revision_id.as_str(), "rev-standing-1");
+
+    // A fork whose prefix holds both rows re-activates the later one, the
+    // head at that boundary.
+    let full = fixture
+        .fork_at(
+            &source,
+            body.messages().len(),
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+        .expect("the full fork commits");
+    let full_child = fixture
+        .durable(&full.session_id)
+        .await
+        .expect("the child is committed");
+    let local = origin_local_rows(&full_child);
+    assert_eq!(local.len(), 1, "one re-activation: {local:?}");
+    assert_eq!(
+        local[0]
+            .supersedes
+            .as_ref()
+            .map(InstructionActivationId::as_str),
+        Some("standing-2")
+    );
+    fixture.finish().await;
+}
+
+/// An explicit `refuse` refuses a generic fork whose child would inherit rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_refuse_refuses_a_generic_fork() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+    match fixture
+        .fork_at(
+            &source,
+            prefix,
+            Some(meerkat_core::ForkInstructionPolicy::Refuse),
+        )
+        .await
+    {
+        Err(SessionError::ForkInstructionRefused(refusal)) => assert_policy_refusal(&refusal),
+        other => panic!("expected a typed fork instruction refusal, got {other:?}"),
+    }
+    fixture.finish().await;
+}
+
+/// Council crash recovery measures a planned child's prefix without the
+/// fork's re-activation rows, so the evidence of a re-activated child agrees
+/// with the provenance the fork reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planned_child_evidence_measures_the_prefix_without_the_reactivation_rows() {
+    let fixture = Fixture::restored_member().await;
+    fixture.activate_standing().await;
+    let source = fixture.source_session().await;
+    let evidence =
+        crate::forked_participant::ForkedParticipantSourceRuntime::session_execution_evidence(
+            &*fixture.service,
+            &source,
+        )
+        .await
+        .expect("source evidence read")
+        .expect("source evidence");
+    let planned = SessionId::new();
+    let outcome = crate::forked_participant::ForkedParticipantSourceRuntime::fork_planned_child(
+        &*fixture.service,
+        crate::forked_participant::PlannedForkRequest {
+            source_identity: evidence.agent_identity.clone().expect("the source member"),
+            owner_realm: evidence.realm_id.clone().expect("the source realm"),
+            source_session_id: source.clone(),
+            planned_child_session_id: planned.clone(),
+            prefix_message_count: None,
+            inherited_instructions: meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+        },
+    )
+    .await
+    .expect("the planned fork commits");
+    let child = crate::forked_participant::ForkedParticipantSourceRuntime::planned_child_evidence(
+        &*fixture.service,
+        &planned,
+    )
+    .await
+    .expect("evidence read")
+    .expect("the planned child exists");
+    assert_eq!(child.prefix_message_count, outcome.prefix_message_count);
+    assert_eq!(child.prefix_digest, outcome.prefix_digest);
+    let body = fixture.durable(&planned).await.expect("the child");
+    assert_eq!(
+        body.messages().len(),
+        outcome.prefix_message_count + 1,
+        "one re-activation row follows the prefix"
+    );
+    fixture.finish().await;
+}
+
+/// The fork_off job record keeps the source prefix length: the re-activation
+/// rows the fork appends belong to the child, not to the prefix it was forked
+/// with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fork_job_record_keeps_the_source_prefix_length() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activate_standing().await;
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+    let child = AgentIdentity::from("job-child");
+    let started = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member_then_run_detached(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone())
+                .with_initial_message("the job task"),
+            None,
+            "result",
+            4_096,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            Some(ForkJobBinding {
+                job_id: "job-1".to_string(),
+                owner_session_id: source.clone(),
+                retained_work: None,
+            }),
+        ),
+    )
+    .await
+    .expect("the fork answers");
+    let (fork, _run) = match started {
+        Ok(started) => started,
+        Err(error) => panic!("the detached fork starts: {error:?}"),
+    };
+    let entry = fixture
+        .handle
+        .get_member(&child)
+        .await
+        .expect("roster read")
+        .expect("the child is seated");
+    let job = entry.fork_job.expect("the child carries its job record");
+    assert_eq!(
+        job.prefix_message_count, prefix,
+        "the record counts the source prefix, not the re-activation rows"
+    );
+    let body = fixture
+        .durable(&fork.session_id)
+        .await
+        .expect("the child is committed");
+    assert!(
+        matches!(
+            body.messages().get(prefix),
+            Some(Message::System(system))
+                if system
+                    .instruction_activation
+                    .as_ref()
+                    .is_some_and(|identity| identity.origin_session_id == fork.session_id)
+        ),
+        "the child's own re-activation follows the prefix"
+    );
+    fixture.finish().await;
+}
+
+/// A child's own fork re-activation rows, with the child's id and each row's
+/// derived id replaced by placeholders, so rows of two children compare.
+fn normalized_reactivation_rows(
+    session: &meerkat_core::Session,
+) -> Vec<(
+    meerkat_core::InstructionRevisionRef,
+    Option<String>,
+    String,
+    String,
+)> {
+    let child = session.id().to_string();
+    session
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::System(system) => system
+                .instruction_activation
+                .as_ref()
+                .filter(|identity| identity.origin_session_id == *session.id())
+                .map(|identity| {
+                    (
+                        identity.revision.clone(),
+                        identity
+                            .supersedes
+                            .as_ref()
+                            .map(|id| id.as_str().to_string()),
+                        system
+                            .content
+                            .replace(identity.activation_id.as_str(), "<activation>")
+                            .replace(&child, "<child>"),
+                        system.created_at.to_rfc3339(),
+                    )
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The rows a generic (RPC) fork appends are the rows a mob fork appends,
+/// whose child then runs its first turn on them: one function writes both at
+/// the one fork commit. Compared row by row, each child's id standing for
+/// itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generic_fork_writes_the_rows_a_running_mob_fork_writes() {
+    let fixture = Fixture::restored_member_with_policy(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    )
+    .await;
+    fixture.activate_standing().await;
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+
+    let generic = fixture
+        .fork_at(
+            &source,
+            prefix,
+            Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+        )
+        .await
+        .expect("the generic fork commits");
+    let mob = tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member_then_run_bounded(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), AgentIdentity::from("fork-child"))
+                .with_initial_message("the forked task"),
+            None,
+            "result",
+            4_096,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+        ),
+    )
+    .await
+    .expect("the fork answers");
+    let mob = match mob {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("the mob fork child runs its first turn: {error:?}"),
+    };
+
+    let generic_rows = normalized_reactivation_rows(
+        &fixture
+            .durable(&generic.session_id)
+            .await
+            .expect("the generic child"),
+    );
+    let mob_rows = normalized_reactivation_rows(
+        &fixture
+            .durable(&mob.fork.session_id)
+            .await
+            .expect("the mob child"),
+    );
+    assert_eq!(generic_rows.len(), 1, "one re-activation row");
+    assert_eq!(
+        generic_rows, mob_rows,
+        "the generic fork writes the rows the running mob fork wrote"
+    );
+    fixture.finish().await;
+}
+
+/// Control: a source without activation rows forks exactly as before under
+/// every policy, and the child carries no activation rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_without_activation_rows_forks_as_before() {
+    let fixture = Fixture::restored_member().await;
+    fixture.run_turn("a turn to fork after").await;
+    let source = fixture.source_session().await;
+    let prefix = fixture
+        .durable(&source)
+        .await
+        .expect("source")
+        .messages()
+        .len();
+    for policy in [
+        None,
+        Some(meerkat_core::ForkInstructionPolicy::Refuse),
+        Some(meerkat_core::ForkInstructionPolicy::ReactivateInherited),
+    ] {
+        let forked = fixture
+            .fork_at(&source, prefix, policy)
+            .await
+            .expect("a source without activation rows forks");
+        assert_eq!(forked.reactivated_instruction_count, 0);
+        assert_eq!(forked.message_count, prefix);
+        let child = fixture
+            .durable(&forked.session_id)
+            .await
+            .expect("the child is committed");
+        assert!(origin_local_rows(&child).is_empty());
+    }
+    fixture.finish().await;
+}
+
+/// The host-driven fork (`MobHandle::fork_member`, the path a console or RPC
+/// fork wraps) seats a child whose first turn is refused for the inherited
+/// key before any model request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_fork_of_an_activated_member_refuses_its_first_turn() {
+    let fixture = Fixture::restored_member().await;
+    fixture
+        .activate(request(
+            "standing-1",
+            InstructionActivationExpectation::Absent,
+        ))
+        .await
+        .expect("activation applies at a safe boundary");
+    let child = AgentIdentity::from("fork-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits and seats the child");
+    let before = fixture.client.requests().len();
+
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    let Err(error) = tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+    else {
+        panic!("the child's turn is refused");
+    };
+    assert!(
+        format!("{error:?}")
+            .contains("forked session must explicitly activate inherited instruction keys"),
+        "the child's turn is refused for the inherited key: {error:?}"
+    );
+    assert_eq!(
+        fixture.client.requests().len(),
+        before,
+        "the child never reached the model"
+    );
+    fixture.finish().await;
+}
+
+/// On the host-driven fork the host can still activate the inherited key on
+/// the child before its first turn (the explicit flow the activation design
+/// names), and the child then runs with the activation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_fork_runs_after_the_host_activates_the_inherited_key() {
+    let fixture = Fixture::restored_member().await;
+    fixture
+        .activate(request(
+            "standing-1",
+            InstructionActivationExpectation::Absent,
+        ))
+        .await
+        .expect("activation applies at a safe boundary");
+    let child = AgentIdentity::from("fork-child");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.fork_member(
+            &fixture.identity,
+            SpawnMemberSpec::new(ProfileName::from("lead"), child.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("the fork answers")
+    .expect("the fork commits and seats the child");
+
+    let mut reactivation = request("standing-1", InstructionActivationExpectation::Absent);
+    reactivation.activation_id = InstructionActivationId::new("child-standing-1").expect("id");
+    reactivation.supersedes =
+        Some(InstructionActivationId::new("standing-1").expect("inherited head"));
+    let receipt = tokio::time::timeout(
+        WAIT,
+        fixture
+            .handle
+            .activate_member_instruction(&child, reactivation),
+    )
+    .await
+    .expect("activation answers")
+    .expect("the host activates the inherited key on the child");
+    assert_eq!(
+        receipt.disposition,
+        InstructionActivationDisposition::Applied
+    );
+
+    let before = fixture.client.requests().len();
+    let turn = fixture.start_turn_for(&child, "the child's task").await;
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the child's turn finishes")
+        .expect("the child's turn runs");
+    assert!(
+        fixture.client.requests().len() > before,
+        "the child reached the model"
     );
     fixture.finish().await;
 }
@@ -493,7 +1631,7 @@ async fn an_activation_mid_turn_waits_for_the_safe_boundary_and_never_interleave
 /// `DurabilityUnavailable` and nothing is appended, never a silent success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_decorator_that_does_not_forward_the_seam_is_refused_typed() {
-    let fixture = Fixture::restored_member_through(true).await;
+    let fixture = Fixture::restored_member_through(true, None).await;
     let error = fixture
         .activate(request(
             "standing-1",
@@ -521,7 +1659,7 @@ async fn a_decorator_that_does_not_forward_the_seam_is_refused_typed() {
 /// though it forwards the boundary itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_decorator_that_does_not_forward_the_controller_pin_is_refused_unsupported() {
-    let fixture = Fixture::restored_member_through(true).await;
+    let fixture = Fixture::restored_member_through(true, None).await;
     let session_id = fixture
         .handle
         .resolve_bridge_session_id(&fixture.identity)

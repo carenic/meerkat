@@ -150,6 +150,19 @@ binding and review attempt, verify the new owner facts in the reviewer request,
 and require one target entry under the new selection.
 Keep request arguments unchanged where the operation's account is owner-selected.
 
+Add a pure-authority variant: hold the reviewer response, then publish an owner
+change that keeps the permission result, the R2 tier and the review material
+unchanged, and release an `allow`. The stale allow never enters and its attempt
+retires `ContextChanged`; the fenced dispatch then reviews the same operation
+once more from the start, as a second attempt for the same tool call that reads
+the material once, and only that attempt's `allow` enters, once. A second such
+change during the re-review settles `ReviewUnsatisfied::ContextChanged` with no
+entry and no third review. The same single re-review follows a change that
+lands after the `allow` but at the dispatch's own entry staging; one that lands
+once the tool's own staging or effect runs settles as before. A material or
+applicability change never takes this path: its stale `allow` still settles as
+above.
+
 Include an applicability-change variant: begin with an owner-confirmed
 inapplicable fact, hold the review, then have the same native publication owner
 make that fact required but unavailable without changing permission or R2 tier.

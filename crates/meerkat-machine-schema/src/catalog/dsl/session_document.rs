@@ -121,12 +121,17 @@ pub enum RealtimeTranscriptLaneKind {
 }
 
 /// Terminal-boundary stop-reason class observed for a realtime assistant turn.
+///
+/// `Failed` is a provider response that ended without completing (#1883). It
+/// is never a `StopReason`: the shell resolves it only from
+/// `AssistantTurnFailed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RealtimeTranscriptStopReasonKind {
     Cancelled,
     ToolUse,
     #[default]
     Other,
+    Failed,
 }
 
 /// Per-item materialization verdict.
@@ -1381,10 +1386,18 @@ machine! {
             response_completed && text_after_write_present
         }
 
+        // A failed response (#1883) is discarded whole, display and spoken
+        // lanes alike, and records no completion: Failed takes the Discard
+        // transition only. It is deliberately absent from the
+        // removes-completion helper: that would enable the ToolUse
+        // transition beside Discard, and a completion entry an earlier
+        // playback snapshot recorded must outlive the failure, because the
+        // row that snapshot materialized needs it when the state restores.
         helper realtime_stop_reason_discards(
             stop_reason: Enum<RealtimeTranscriptStopReasonKind>
         ) -> bool {
             stop_reason == RealtimeTranscriptStopReasonKind::Cancelled
+                || stop_reason == RealtimeTranscriptStopReasonKind::Failed
         }
 
         helper realtime_stop_reason_removes_completion(

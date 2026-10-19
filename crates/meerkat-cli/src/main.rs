@@ -6,6 +6,13 @@
     clippy::needless_borrows_for_generic_args,
     clippy::redundant_closure_for_method_calls
 )]
+// Without `session-store` rkat has no session runtime: the run, resume,
+// session and mob commands compile out, and the helpers only they reach are
+// dead in that build.
+#![cfg_attr(
+    not(feature = "session-store"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 
 mod cli_parse;
 mod exit_status;
@@ -11081,7 +11088,7 @@ async fn bind_stock_prompt(
     Ok((input, Some(pending), route_hint))
 }
 
-#[cfg(not(feature = "local-authorization"))]
+#[cfg(all(feature = "session-store", not(feature = "local-authorization")))]
 async fn bind_stock_prompt(
     _persistence: &PersistenceBundle,
     _service: &meerkat::PersistentSessionService<FactoryAgentBuilder>,
@@ -11913,6 +11920,7 @@ fn cli_mcp_stdio_profile(_factory: &AgentFactory) -> CliMcpStdioProfile {}
 /// governed host installed, with or without available stock owners. Without
 /// owners the host's configured-attachment authority refuses every server,
 /// so the governed route never falls back to the ordinary preload.
+#[cfg(feature = "session-store")]
 fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
     persistence
         .runtime_adapter()
@@ -11922,6 +11930,7 @@ fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
 /// The configured MCP servers of a governed realm's session build: the
 /// declarative servers the factory connects through the governed host, and
 /// the servers refused before setup, which the session reports to the model.
+#[cfg(feature = "session-store")]
 #[derive(Debug, Default)]
 struct GovernedMcpServers {
     servers: Vec<meerkat_core::McpServerConfig>,
@@ -11936,6 +11945,7 @@ struct GovernedMcpServers {
 /// confined process could write) goes into the build with its typed
 /// refusal, so the model sees it as that server's failed setup. `None`
 /// keeps the ordinary CLI loader.
+#[cfg(feature = "session-store")]
 async fn governed_configured_mcp_servers(
     persistence: &PersistenceBundle,
     scope: &RuntimeScope,
@@ -13795,6 +13805,7 @@ fn build_cli_runtime_backed_service_with_defaults(
 /// is refused as ownerless; with it, that realm's own config documents serve
 /// them ([`meerkat::surface::install_default_mcp_auth_resolver_for_realm`]).
 /// `None` only for compositions over stores without realm documents.
+#[cfg(feature = "session-store")]
 #[allow(clippy::too_many_arguments)]
 fn build_cli_runtime_backed_service_waiting_for_mcp(
     factory: AgentFactory,
@@ -22442,9 +22453,16 @@ mod tests {
         );
     }
 
-    fn hooks_override_fixture_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/hooks/run_override.json")
+    /// The hook run-override fixture written to a file of its own, for the
+    /// `--hooks-override-file` parse path.
+    fn hooks_override_fixture_file() -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("fixture file");
+        std::io::Write::write_all(
+            &mut file,
+            meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON.as_bytes(),
+        )
+        .expect("fixture file must be written");
+        file
     }
 
     fn fixture_skill_key(name: &str) -> meerkat_core::skills::SkillKey {
@@ -22730,6 +22748,8 @@ mod tests {
             summary: Some("Peer terminal response".to_string()),
             payload: None,
             content: Vec::new(),
+            delivery_id: None,
+            in_reply_to: None,
         }];
         let content = meerkat_core::lifecycle::run_primitive::CoreRenderable::SystemNotice {
             kind: meerkat_core::types::SystemNoticeKind::Comms,
@@ -23848,7 +23868,7 @@ mod tests {
         let store: Arc<dyn TokenStore> = Arc::new(EphemeralTokenStore::new());
         let auth_lease = new_cli_auth_handles().0;
         let auth_binding = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").expect("realm id parses"),
+            realm: meerkat_core::RealmId::parse("cli-save-boundary").expect("realm id parses"),
             binding: meerkat_core::BindingId::parse("default_openai").expect("binding id parses"),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -23942,7 +23962,7 @@ mod tests {
         let store: Arc<dyn TokenStore> = Arc::new(SaveFailingTokenStore);
         let auth_lease = new_cli_auth_handles().0;
         let auth_binding = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").expect("realm id parses"),
+            realm: meerkat_core::RealmId::parse("cli-save-failure").expect("realm id parses"),
             binding: meerkat_core::BindingId::parse("default_openai").expect("binding id parses"),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -24479,6 +24499,21 @@ mod tests {
         }
     }
 
+    /// The login lifecycle guard is process-wide per lease key. A test that
+    /// takes it (a login, a token commit, a rollback) or reads status with
+    /// no live lease uses a realm of its own: under `cargo test`, another
+    /// test on the same key would block it, or make its status read find the
+    /// owner busy.
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    fn openai_auth_binding_in(realm: &str) -> AuthBindingRef {
+        AuthBindingRef {
+            realm: meerkat_core::RealmId::parse(realm).expect("realm id parses"),
+            binding: meerkat_core::BindingId::parse("openai_oauth").expect("binding id parses"),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        }
+    }
+
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     fn openai_oauth_tokens() -> meerkat_providers::auth_store::PersistedTokens {
         meerkat_providers::auth_store::PersistedTokens {
@@ -24496,15 +24531,15 @@ mod tests {
 
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     fn mark_tokens_lifecycle_published_for_test(
+        auth_binding: &AuthBindingRef,
         tokens: &meerkat_providers::auth_store::PersistedTokens,
         generation: u64,
         credential_published_at_millis: Option<u64>,
     ) -> meerkat_providers::auth_store::PersistedTokens {
         let _ = (generation, credential_published_at_millis);
         let handle = meerkat_runtime::RuntimeAuthLeaseHandle::new();
-        let key =
-            meerkat_providers::auth_store::TokenKey::from_auth_binding(&openai_auth_binding());
-        let lease_key = meerkat_core::handles::LeaseKey::from_auth_binding(&openai_auth_binding());
+        let key = meerkat_providers::auth_store::TokenKey::from_auth_binding(auth_binding);
+        let lease_key = meerkat_core::handles::LeaseKey::from_auth_binding(auth_binding);
         let transition = meerkat_core::handles::AuthLeaseHandle::acquire_lease(
             &handle,
             &lease_key,
@@ -25063,12 +25098,12 @@ mod tests {
 
         let store = EphemeralTokenStore::new();
         let auth_lease = new_cli_auth_handles().0;
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-status-rehydrate");
         let tokens = openai_oauth_tokens();
         store
             .save(
                 &TokenKey::from_auth_binding(&auth_binding),
-                &mark_tokens_lifecycle_published_for_test(&tokens, 1, None),
+                &mark_tokens_lifecycle_published_for_test(&auth_binding, &tokens, 1, None),
             )
             .await
             .expect("token save succeeds");
@@ -25093,6 +25128,10 @@ mod tests {
         .await
         .expect("AuthMachine freshness observation succeeds");
 
+        assert_eq!(
+            projection.credential_observation, None,
+            "the status read was answered, not refused with the owner busy"
+        );
         assert_eq!(projection.phase, AuthStatusPhase::Valid);
         assert!(projection.expires_at.is_some());
         let snapshot = auth_lease.snapshot(&LeaseKey::from_auth_binding(&auth_binding));
@@ -25211,7 +25250,7 @@ mod tests {
             ),
         );
         let store: Arc<dyn TokenStore> = Arc::new(EphemeralTokenStore::new());
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-oauth-login-consume");
         let credential_identity =
             meerkat_core::AuthCredentialIdentity::from_auth_binding(&auth_binding);
         let redirect_uri = "http://127.0.0.1:12345/callback";
@@ -25442,7 +25481,7 @@ mod tests {
         let auth_lease = new_cli_auth_handles().0;
         let store = Arc::new(SaveCountingCliTokenStore::new());
         let mutation_store: Arc<dyn meerkat_providers::auth_store::TokenStore> = store.clone();
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-oauth-consume-failure");
         let provider = meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt;
 
         let err = save_cli_oauth_tokens_and_consume_browser_flow(
@@ -26080,9 +26119,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     }),
                 ],
                 1 => vec![
@@ -26103,9 +26140,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     }),
                 ],
                 _ => vec![
@@ -26115,9 +26150,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     }),
                 ],
             };
@@ -26185,9 +26218,7 @@ default_model = "gemma"
                 }),
                 Ok(normalized_cli_fixture_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -35075,7 +35106,8 @@ default_model = "gpt-5.4"
 
     #[test]
     fn test_parse_hook_overrides_from_file_matches_fixture() {
-        let overrides = parse_hook_run_overrides(Some(hooks_override_fixture_path()), None)
+        let fixture_file = hooks_override_fixture_file();
+        let overrides = parse_hook_run_overrides(Some(fixture_file.path().to_path_buf()), None)
             .expect("fixture hook override must parse");
         assert_eq!(
             overrides.disable,
@@ -35094,12 +35126,14 @@ default_model = "gpt-5.4"
 
     #[test]
     fn test_parse_hook_overrides_from_inline_json_matches_file() {
-        let fixture_path = hooks_override_fixture_path();
-        let fixture = std::fs::read_to_string(&fixture_path).expect("fixture must exist");
-        let from_file = parse_hook_run_overrides(Some(fixture_path), None)
+        let fixture_file = hooks_override_fixture_file();
+        let from_file = parse_hook_run_overrides(Some(fixture_file.path().to_path_buf()), None)
             .expect("fixture hook override must parse from file");
-        let from_json = parse_hook_run_overrides(None, Some(fixture))
-            .expect("fixture hook override must parse from inline json");
+        let from_json = parse_hook_run_overrides(
+            None,
+            Some(meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON.to_string()),
+        )
+        .expect("fixture hook override must parse from inline json");
         assert_eq!(from_json, from_file);
     }
 
@@ -36698,14 +36732,17 @@ supports_reasoning = true
 /// `docs/**.mdx` must parse against the real clap definition
 /// (`Cli::try_parse_from`), so a documented invocation the binary would
 /// reject (e.g. `--sign` without `--signer-id`) turns this test red instead
-/// of shipping as teaching material.
+/// of shipping as teaching material. The published package carries no
+/// `docs/`: `tests/doc_examples_fixture.rs` (repository only) extracts the
+/// invocations into `tests/fixtures/doc_examples.txt`, which this module
+/// parses.
 #[cfg(test)]
 mod docs_cli_examples {
     use clap::Parser;
 
-    /// Minimal quote-aware shell-ish splitter for doc examples. Doc commands
-    /// that need real shell features (pipes, substitution, placeholders) are
-    /// skipped by [`skippable`], so this only needs words and quotes.
+    /// Minimal quote-aware shell-ish splitter for doc examples. The fixture
+    /// holds no doc command that needs real shell features (pipes,
+    /// substitution, placeholders), so this only needs words and quotes.
     fn split_tokens(line: &str) -> Option<Vec<String>> {
         let mut tokens = Vec::new();
         let mut current = String::new();
@@ -36883,48 +36920,6 @@ mod docs_cli_examples {
         }
     }
 
-    /// Doc lines that are illustrative shapes rather than literal
-    /// invocations: placeholders, shell composition, or output elision.
-    fn skippable(line: &str) -> bool {
-        line.contains('<')
-            || line.contains('[')
-            || line.contains("...")
-            || line.contains('|')
-            || line.contains('>')
-            || line.contains("$(")
-            || line.contains('`')
-            || line.contains('$')
-            || line.contains('#')
-    }
-
-    fn fenced_command_lines(text: &str) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut in_fence = false;
-        let mut pending = String::new();
-        for raw in text.lines() {
-            let trimmed = raw.trim();
-            if trimmed.starts_with("```") {
-                in_fence = !in_fence;
-                pending.clear();
-                continue;
-            }
-            if !in_fence {
-                continue;
-            }
-            let mut line = trimmed.to_string();
-            if !pending.is_empty() {
-                line = format!("{pending} {line}");
-                pending.clear();
-            }
-            if let Some(stripped) = line.strip_suffix('\\') {
-                pending = stripped.trim_end().to_string();
-                continue;
-            }
-            lines.push(line);
-        }
-        lines
-    }
-
     /// The `rkat` examples of every command's after-help text, a piped
     /// example reduced to its `rkat` stage.
     fn after_help_examples() -> Vec<String> {
@@ -37002,50 +36997,28 @@ mod docs_cli_examples {
 
     #[test]
     fn fenced_rkat_doc_examples_parse_against_clap() {
-        let docs_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("workspace root")
-            .join("docs");
+        let fixture = include_str!("../tests/fixtures/doc_examples.txt");
         let mut checked = 0usize;
         let mut failures = Vec::new();
-        let mut stack = vec![docs_root];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(_) => continue,
+        for (index, entry) in fixture.lines().enumerate() {
+            if entry.starts_with('#') {
+                continue;
+            }
+            let at = format!("tests/fixtures/doc_examples.txt:{}", index + 1);
+            let Some((doc, line)) = entry.split_once('\t') else {
+                failures.push(format!("{at}: not `<docs path><TAB><invocation>`"));
+                continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("mdx") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for line in fenced_command_lines(&text) {
-                    let line = line.strip_prefix("$ ").unwrap_or(&line).to_string();
-                    if !(line.starts_with("rkat ") || line == "rkat") {
-                        continue;
-                    }
-                    if skippable(&line) {
-                        continue;
-                    }
-                    let Some(tokens) = split_tokens(&line) else {
-                        continue;
-                    };
-                    match validate_example(&tokens, CliFeature::compiled) {
-                        ExampleValidation::Accepted => checked += 1,
-                        ExampleValidation::UnsupportedFeature => {}
-                        ExampleValidation::Rejected(err) => {
-                            checked += 1;
-                            failures.push(format!("{}: `{line}`: {err}", path.display()));
-                        }
-                    }
+            let Some(tokens) = split_tokens(line) else {
+                failures.push(format!("{at}: {doc}: `{line}`: unbalanced quotes"));
+                continue;
+            };
+            match validate_example(&tokens, CliFeature::compiled) {
+                ExampleValidation::Accepted => checked += 1,
+                ExampleValidation::UnsupportedFeature => {}
+                ExampleValidation::Rejected(err) => {
+                    checked += 1;
+                    failures.push(format!("{at}: {doc}: `{line}`: {err}"));
                 }
             }
         }

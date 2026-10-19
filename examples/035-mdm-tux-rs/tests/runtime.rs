@@ -375,9 +375,7 @@ impl meerkat::LlmClient for GatedClient {
             })
             .chain(futures::stream::once(async {
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 })
             })),
         )
@@ -611,9 +609,7 @@ fn cold_no_turn_resume_preserves_durable_build_state_without_resupply() {
                 meta: None,
             },
             meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             },
         ])));
         let id = runtime
@@ -865,6 +861,7 @@ fn managed_peer_ingress_and_schedule_use_the_rpc_session_owner() {
                 content_taint: None,
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 objective_id: None,
+                in_reply_to: None,
             })
             .await
             .unwrap();

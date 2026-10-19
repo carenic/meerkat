@@ -1204,6 +1204,9 @@ pub struct MobMcpState {
     /// this surface. Absent is honest fail-closed degradation for mixed-host
     /// edges; surfaces must supply an explicit dialable composition.
     controlling_acceptor: Option<meerkat_mob::ControllingAcceptorConfig>,
+    /// The host's fork instruction policy for every mob this state creates
+    /// or resumes ([`Self::with_fork_instruction_policy`]).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// The console principal this state serves (phase 5, chokepoint (b) —
     /// DEC-P5E-8). Injected at construction, never ambient (gotcha #19):
     /// every v1 local surface (RPC/REST/stdio/public-MCP/CLI/embedder)
@@ -1337,7 +1340,20 @@ impl MobMcpState {
             realm_skill_sources: BTreeMap::new(),
             member_live_host: std::sync::RwLock::new(None),
             controlling_acceptor: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
         }
+    }
+
+    /// Set the host's fork instruction policy for every mob this state
+    /// creates or resumes ([`meerkat_mob::MobBuilder::with_fork_instruction_policy`]).
+    /// The default refuses a self-starting fork (`fork_off`, a council
+    /// participant) of a member with activated host instructions.
+    pub fn with_fork_instruction_policy(
+        mut self,
+        policy: meerkat_core::ForkInstructionPolicy,
+    ) -> Self {
+        self.fork_instruction_policy = policy;
+        self
     }
 
     /// Install the process-scoped reverse-lane acceptor used by every mob
@@ -3105,6 +3121,50 @@ impl MobMcpState {
         }
     }
 
+    /// The tool bundles this host offers to child mobs: what a child mob's
+    /// inline profile may name in its `tools.bundles` opt-in.
+    fn offered_child_tool_bundles(&self) -> Vec<String> {
+        let mut offered: BTreeSet<String> = self.child_tool_bundles.offered().cloned().collect();
+        if let Some(bundles) = self.additional_child_tool_bundles.get() {
+            offered.extend(bundles.offered().cloned());
+        }
+        offered.into_iter().collect()
+    }
+
+    /// Refuse a definition whose inline profile opts into a tool bundle this
+    /// create does not offer: a child create offers what the host offers to
+    /// child mobs, any other create offers none. Realm-referenced profiles
+    /// are host-stored and keep what the host named.
+    fn refuse_unoffered_tool_bundles(
+        &self,
+        definition: &MobDefinition,
+        child: bool,
+    ) -> Result<(), MobError> {
+        let offered = if child {
+            self.offered_child_tool_bundles()
+        } else {
+            Vec::new()
+        };
+        for (profile_name, binding) in &definition.profiles {
+            let Some(profile) = binding.as_inline() else {
+                continue;
+            };
+            if let Some(bundle) = profile
+                .tools
+                .bundles
+                .iter()
+                .find(|bundle| !offered.contains(bundle))
+            {
+                return Err(MobError::ToolBundleNotOffered {
+                    profile: profile_name.clone(),
+                    bundle: bundle.clone(),
+                    offered,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn configure_builder(
         &self,
         mut builder: MobBuilder,
@@ -3149,7 +3209,7 @@ impl MobMcpState {
         if let Some(acceptor) = &self.controlling_acceptor {
             builder = builder.with_controlling_acceptor(acceptor.clone());
         }
-        builder
+        builder.with_fork_instruction_policy(self.fork_instruction_policy)
     }
 
     fn bind_realm_profile_store(&self, storage: MobStorage) -> MobStorage {
@@ -3515,8 +3575,13 @@ impl MobMcpState {
                         tracing::debug!(mob_id = %mob_id, ?busy, "mob closed its admission with work still in flight");
                     }
                 }
-                // A stopped actor admits nothing.
-                Err(MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed) => {}
+                // A stopped actor admits nothing, and a shutting-down one
+                // closed its admission before it began to drain.
+                Err(
+                    MobError::ActorCommandChannelClosed
+                    | MobError::ActorReplyChannelClosed
+                    | MobError::ShutdownInProgress { .. },
+                ) => {}
                 Err(error) => {
                     unsettled.push(format!("mob {mob_id}: admission not closed: {error}"));
                 }
@@ -4304,6 +4369,8 @@ impl MobMcpState {
     ) -> Result<MobId, MobError> {
         // (b) gate, ADJ-P5-11 (same class as mob_create_definition).
         self.require_console_owner(ControlScope::SendCommand)?;
+        // A mobpack create is not a child mob's: it offers no tool bundle.
+        self.refuse_unoffered_tool_bundles(&definition, false)?;
         let admission = self.admit("mobpack create")?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
@@ -4464,6 +4531,14 @@ impl MobMcpState {
         // (b) gate, ADJ-P5-11: no per-mob grant can authorize creating a
         // mob that does not exist yet.
         self.require_console_owner(ControlScope::SendCommand)?;
+        // Before anything of the mob exists: an opt-in names only what this
+        // create offers.
+        let child = owner_bridge_session_authority.as_ref().is_some_and(
+            |(_, destroy_on_owner_archive, _)| {
+                child_tool_policy::is_child_mob(*destroy_on_owner_archive)
+            },
+        );
+        self.refuse_unoffered_tool_bundles(&definition, child)?;
         let admission = self.admit("mob create")?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
@@ -14268,6 +14343,71 @@ mod tests {
         );
     }
 
+    /// A definition whose inline profile opts into a tool bundle.
+    fn opting_definition(mob_id: &str) -> MobDefinition {
+        let mut definition = explicit_definition(mob_id);
+        for binding in definition.profiles.values_mut() {
+            if let Some(profile) = binding.as_inline_mut() {
+                profile.tools.bundles = vec!["announcements".to_string()];
+            }
+        }
+        definition
+    }
+
+    /// A create that is not a child mob's offers no tool bundle: a host create
+    /// and a mobpack create naming one are refused typed before anything of
+    /// the mob exists.
+    #[tokio::test]
+    async fn test_host_and_mobpack_creates_offer_no_tool_bundle() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority"),
+        );
+        let refusal = |error: MobError| match error {
+            MobError::ToolBundleNotOffered {
+                profile,
+                bundle,
+                offered,
+            } => (profile.to_string(), bundle, offered),
+            other => panic!("a typed bundle refusal, got {other:?}"),
+        };
+        let error = state
+            .mob_create_definition(opting_definition("opting-host-mob"))
+            .await
+            .expect_err("a host create offers no bundle");
+        assert_eq!(
+            refusal(error),
+            (
+                "worker".to_string(),
+                "announcements".to_string(),
+                Vec::new()
+            )
+        );
+        let error = state
+            .mob_create_from_mobpack(
+                opting_definition("opting-pack-mob"),
+                BTreeMap::new(),
+                meerkat_mob::MobDefinitionSourceIdentity::mobpack("c".repeat(64), Vec::new()),
+            )
+            .await
+            .expect_err("a mobpack create offers no bundle");
+        assert_eq!(
+            refusal(error),
+            (
+                "worker".to_string(),
+                "announcements".to_string(),
+                Vec::new()
+            )
+        );
+        for mob_id in ["opting-host-mob", "opting-pack-mob"] {
+            assert!(
+                state.handle_for(&MobId::from(mob_id)).await.is_err(),
+                "no mob is created"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_mob_create_rejects_missing_definition() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -15280,6 +15420,47 @@ mod tests {
 
     fn far_deadline() -> std::time::Instant {
         std::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    /// A mob whose Shutdown is draining closed its admission when the
+    /// Shutdown was admitted: the close counts it closed, although its actor
+    /// answers the close `ShutdownInProgress` instead of running it.
+    #[tokio::test]
+    async fn close_admission_counts_a_shutting_down_mob_as_closed() {
+        let state = standing_state();
+        let mob_id = state
+            .mob_create_definition(explicit_definition("draining-mob-close"))
+            .await
+            .expect("create the mob");
+        let handle = state.handle_for(&mob_id).await.expect("mob handle");
+        let release = handle
+            .hold_shutdown_drain_for_test()
+            .await
+            .expect("hold the next Shutdown's drain");
+        let mut closed = handle.admission_closed();
+        let shutdown_handle = handle.clone();
+        let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(10), closed.wait_for(Option::is_some))
+            .await
+            .expect("the Shutdown is admitted")
+            .expect("admission watch");
+
+        assert_eq!(
+            state.close_admission(far_deadline()).await,
+            MobStateStandDown::Clean,
+            "a draining mob's admission is already closed"
+        );
+        assert!(
+            !shutdown.is_finished(),
+            "the Shutdown still joins the held task"
+        );
+
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("the Shutdown returns")
+            .expect("join")
+            .expect("the Shutdown finishes");
     }
 
     /// Owned work is joined, never aborted: a stand-down that cannot wait
@@ -18083,9 +18264,12 @@ mod tests {
     }
 
     /// A holder that still observes the destroyed mob's database when the
-    /// cleanup first drains it, and lets go shortly after, does not leave the
-    /// cleanup outstanding: the refused drain is retried a bounded number of
-    /// times, each after the host's release hook ran again.
+    /// cleanup first drains it, and lets go before the retry, does not leave
+    /// the cleanup outstanding: the refused drain is retried a bounded number
+    /// of times, each after the host's release hook ran again. The holder
+    /// lets go when the hook runs again, not after a fixed delay: a delay
+    /// races the first drain when all of the binary's tests run at once
+    /// (plain `cargo test`), and that drain then has nothing to refuse.
     #[tokio::test]
     async fn a_short_lived_holder_does_not_leave_the_destroy_cleanup_outstanding() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -18093,21 +18277,25 @@ mod tests {
         let state = persistent_destroy_state(&svc, root.path());
         let bound = bind_activated_mobs(&state);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (releaser, counted) = (Arc::clone(&bound), Arc::clone(&calls));
+        let holder = Arc::new(std::sync::Mutex::new(None));
+        let (releaser, counted, slot) =
+            (Arc::clone(&bound), Arc::clone(&calls), Arc::clone(&holder));
         let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
-            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
-                return;
-            }
-            // The first call hands the binding to a short-lived holder, as
-            // an observer that cloned it just before the destroy would be.
-            let held = releaser
+            let mut held = slot
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(mob_id);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                drop(held);
-            });
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // The first call hands the binding to a short-lived holder,
+                // as an observer that cloned it just before the destroy would
+                // be.
+                *held = releaser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(mob_id);
+            } else {
+                // The holder lets go before the retried drain.
+                drop(held.take());
+            }
         });
         state
             .set_after_destroy(hook)

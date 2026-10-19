@@ -8341,6 +8341,13 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
 
     fn session_boundary_authority_read_cost(&self) -> RuntimeSessionAuthorityReadCost;
 
+    /// The longest one boundary commit through this backend may take before
+    /// it reports its durable outcome, or `None` for a backend whose commits
+    /// cannot stall. See [`RuntimeStore::commit_outcome_deadline`].
+    fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+        Some(DEFAULT_COMMIT_OUTCOME_DEADLINE)
+    }
+
     /// Bounded transcript facts of the committed WholeBlob document that
     /// `authority` identifies, when this store already knows them without
     /// reading the body.
@@ -8566,6 +8573,18 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
     ) -> Result<Option<CommittedRecoveryBoundary>, RuntimeStoreError>;
 }
 
+/// The busy window of one lock-acquiring transaction in a SQLite-backed store:
+/// the shared busy timeout of the production connection profiles
+/// (`meerkat_sqlite::SHARED_BUSY_TIMEOUT`). A transaction that cannot take its
+/// lock within it fails with `SQLITE_BUSY` instead of waiting longer.
+pub const COMMIT_BUSY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The default [`RuntimeStore::commit_outcome_deadline`]: one lock-acquiring
+/// transaction per boundary commit, plus one busy window of margin for the
+/// write-ahead log sync and checkpoint.
+pub const DEFAULT_COMMIT_OUTCOME_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(2 * COMMIT_BUSY_WINDOW.as_secs());
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait RuntimeStore: Send + Sync {
@@ -8625,6 +8644,26 @@ pub trait RuntimeStore: Send + Sync {
     fn session_boundary_authority_read_cost(&self) -> RuntimeSessionAuthorityReadCost {
         self.session_authority_ops()
             .session_boundary_authority_read_cost()
+    }
+
+    /// The longest a boundary commit or run terminalization through this
+    /// store may legitimately take before it reports its durable outcome, or
+    /// `None` for a store whose commits cannot stall.
+    ///
+    /// A runtime loop that waits longer than this for a persistent session's
+    /// commit stops waiting: it marks the session reload-required and leaves
+    /// the commit running, so the session's other work ends typed instead of
+    /// waiting behind a store that never answers. A declaration that is too
+    /// short costs a healthy session a reload; one that is too long only
+    /// delays the typed end.
+    ///
+    /// The backend declares it through [`RuntimeSessionAuthorityOps`], so a
+    /// pure decorator forwards it. A composed store whose commit runs
+    /// lock-acquiring transactions of its own declares its inner store's
+    /// declaration plus the busy timeout of each such transaction. The
+    /// default is [`DEFAULT_COMMIT_OUTCOME_DEADLINE`].
+    fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+        self.session_authority_ops().commit_outcome_deadline()
     }
 
     /// Consume one exact physical HeadCanonical activation proof at the
@@ -9986,7 +10025,10 @@ pub trait RuntimeStore: Send + Sync {
 
 pub use memory::InMemoryRuntimeStore;
 #[cfg(feature = "sqlite-store")]
-pub use sqlite::SqliteRuntimeStore;
+pub use sqlite::{
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    StandaloneWholeBlobSessionSource,
+};
 
 #[cfg(test)]
 mod runtime_store_write_fence_tests {

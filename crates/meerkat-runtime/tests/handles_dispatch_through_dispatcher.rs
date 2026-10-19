@@ -27,22 +27,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    loop {
-        let toml = p.join("Cargo.toml");
-        if toml.exists() {
-            let text = fs::read_to_string(&toml).unwrap_or_default();
-            if text.contains("[workspace]") {
-                return p;
-            }
-        }
-        if !p.pop() {
-            panic!("could not locate workspace root");
-        }
-    }
-}
-
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -124,11 +108,13 @@ fn find_fn_end(lines: &[&str], fn_start: usize) -> usize {
 
 #[test]
 fn every_apply_input_in_handles_traverses_dispatcher() {
-    let root = workspace_root();
-    let handles_dir = root.join("crates/meerkat-runtime/src/handles");
+    // The crate's own sources, so the scan also runs from the published
+    // package.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let handles_dir = root.join("src/handles");
     assert!(
         handles_dir.is_dir(),
-        "expected crates/meerkat-runtime/src/handles to exist at {}",
+        "expected src/handles to exist at {}",
         handles_dir.display()
     );
 

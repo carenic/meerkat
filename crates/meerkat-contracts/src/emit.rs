@@ -191,6 +191,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "WireMemberProgressEvent": schema_for!(crate::wire::WireMemberProgressEvent),
         "WireMemberProgressSnapshot": schema_for!(crate::wire::WireMemberProgressSnapshot),
         "WireMemberPreviewUnavailable": schema_for!(crate::wire::WireMemberPreviewUnavailable),
+        "WireMemberRegistrationHookCall": schema_for!(crate::wire::WireMemberRegistrationHookCall),
         "MobSnapshotResult": schema_for!(crate::wire::MobSnapshotResult),
         "MobDestroyResult": schema_for!(crate::wire::MobDestroyResult),
         "MobRotateSupervisorResult": schema_for!(crate::wire::MobRotateSupervisorResult),
@@ -492,6 +493,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "BridgeTurnDirective": schema_for!(crate::wire::BridgeTurnDirective),
         "BridgeTurnOutcomeRecord": schema_for!(crate::wire::BridgeTurnOutcomeRecord),
         "ConnectionTargetErrorKind": schema_for!(crate::wire::ConnectionTargetErrorKind),
+        "ForkInstructionRefusal": schema_for!(meerkat_core::ForkInstructionRefusal),
+        "ForkInstructionRefusalCause": schema_for!(meerkat_core::ForkInstructionRefusalCause),
         "MaterializeLaunchMode": schema_for!(crate::wire::MaterializeLaunchMode),
         "MaterializeLaunchOutcome": schema_for!(crate::wire::MaterializeLaunchOutcome),
         "MemberBuildRejection": schema_for!(crate::wire::MemberBuildRejection),
@@ -808,7 +811,15 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
     write_pretty_json(output_dir.join("models.json"), &models)?;
 
     // Events — includes canonical event type inventory plus schema-ready
-    // payload definitions where available.
+    // payload definitions where available. A `known_payloads` entry is
+    // generated from the typed payload, so it describes what the event
+    // serializes.
+    /// A `tool_config_changed` event's payload, as `AgentEvent` serializes it.
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ToolConfigChangedEvent {
+        payload: meerkat_core::ToolConfigChangedPayload,
+    }
     let events = serde_json::json!({
         "AgentEvent": schema_for!(meerkat_core::AgentEvent),
         "ScopedAgentEvent": schema_for!(meerkat_core::ScopedAgentEvent),
@@ -816,23 +827,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
             "description": "Event envelope: session_id, sequence, event (AgentEvent), contract_version",
             "known_event_types": crate::KNOWN_AGENT_EVENT_TYPES,
             "known_payloads": {
-                "tool_config_changed": {
-                    "type": "object",
-                    "required": ["payload"],
-                    "properties": {
-                        "payload": {
-                            "type": "object",
-                            "required": ["operation", "target", "status", "persisted"],
-                            "properties": {
-                                "operation": {"type": "string", "enum": ["add", "remove", "reload"]},
-                                "target": {"type": "string"},
-                                "status": {"type": "string"},
-                                "persisted": {"type": "boolean"},
-                                "applied_at_turn": {"type": ["integer", "null"], "minimum": 0},
-                            }
-                        }
-                    }
-                }
+                "tool_config_changed": schema_for!(ToolConfigChangedEvent),
             },
             "note": "AgentEvent schema is emitted above. known_event_types stays as a lightweight canonical inventory for surface drift checks."
         }
@@ -2944,6 +2939,60 @@ mod tests {
                 .is_some_and(|target| target.to_string().contains("GoalAttentionTarget")),
             "goal create must use the narrow host target contract"
         );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    /// `WireEvent.known_payloads.tool_config_changed` describes the event as
+    /// it is serialized: one built now and one stored by 0.9.3 (served back
+    /// with its `persisted` bit) both validate against it.
+    #[test]
+    fn emitted_known_tool_config_changed_payload_accepts_serialized_events() {
+        let output_dir = temp_output_dir("known-tool-config-changed");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+        let events: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("events.json")).unwrap()).unwrap();
+        let known = &events["WireEvent"]["known_payloads"]["tool_config_changed"];
+
+        let built = serde_json::to_value(meerkat_core::AgentEvent::ToolConfigChanged {
+            payload: meerkat_core::ToolConfigChangedPayload::new(
+                meerkat_core::ToolConfigChangeOperation::Reload,
+                "tool_scope",
+                meerkat_core::ToolConfigChangeStatus::boundary_applied(true, false, 3),
+            )
+            .with_applied_at_turn(Some(2))
+            .with_domain(Some(meerkat_core::event::ToolConfigChangeDomain::ToolScope)),
+        })
+        .unwrap();
+        assert_schema_accepts(known, &built);
+
+        let stored_093 = serde_json::json!({
+            "type": "tool_config_changed",
+            "payload": {
+                "operation": "reload",
+                "target": "tool_scope",
+                "status_info": {
+                    "kind": "boundary_applied",
+                    "base_changed": true,
+                    "visible_changed": false,
+                    "revision": 3
+                },
+                "persisted": false,
+                "applied_at_turn": 2,
+                "domain": "tool_scope"
+            }
+        });
+        let decoded: meerkat_core::AgentEvent = serde_json::from_value(stored_093.clone()).unwrap();
+        let served = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(served, stored_093, "a 0.9.3 event is served as stored");
+        assert_schema_accepts(known, &served);
+
+        let mut without_status = built;
+        without_status["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status_info");
+        assert_schema_rejects(known, &without_status);
 
         fs::remove_dir_all(&output_dir).unwrap();
     }

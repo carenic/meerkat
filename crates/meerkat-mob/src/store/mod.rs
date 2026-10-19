@@ -17,6 +17,8 @@ pub use in_memory::{
 };
 pub use realm_profile::{RealmProfileStore, StoredRealmProfile};
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) use sqlite::{MemberBindingStoreRead, read_member_binding_store_at};
+#[cfg(not(target_arch = "wasm32"))]
 pub use sqlite::{
     SqliteForkedParticipantStore, SqliteMobEventStore, SqliteMobIdentityStatusStore,
     SqliteMobIdentityStore, SqliteMobObserverDrain, SqliteMobObserverDrainRefused,
@@ -5800,6 +5802,44 @@ pub(crate) trait MobIdentityMemberStore: Send + Sync {
         permit: &IdentityActuationPermit,
         event: &NewMobEvent,
     ) -> Result<IdentityWiringEventCommitOutcome, MobStoreError>;
+
+    /// Read the store's whole structural event journal, in cursor order,
+    /// and the identities `mob_id` holds an identity intent row for, in one
+    /// store transaction. Never writes.
+    async fn read_member_binding_journal(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<MemberBindingJournalRead, MobStoreError>;
+}
+
+/// One store-transaction read of a mob store's structural event journal and
+/// of the identities its mob holds an identity intent row for: the input of a
+/// [`crate::MemberBindingHistory`] fold.
+#[derive(Debug)]
+pub(crate) struct MemberBindingJournalRead {
+    /// Every journal event, in cursor order.
+    pub(crate) events: Vec<MobEvent>,
+    /// How each identity intent row (Present or Absent) of the read mob
+    /// reads: [`intent_row_management`] of its stored observation.
+    pub(crate) intent_rows: BTreeMap<AgentIdentity, crate::runtime::MemberIdentityManagement>,
+}
+
+/// How a member binding history reads one stored identity intent row: a row
+/// this build validates is intent-managed; an unsupported or malformed row is
+/// unreadable; no row is no entry.
+pub(crate) fn intent_row_management<T>(
+    observation: &IdentityStoredObservation<T>,
+) -> Option<crate::runtime::MemberIdentityManagement> {
+    match observation {
+        IdentityStoredObservation::Missing => None,
+        IdentityStoredObservation::Valid(_) => {
+            Some(crate::runtime::MemberIdentityManagement::IntentManaged)
+        }
+        IdentityStoredObservation::Unsupported { .. }
+        | IdentityStoredObservation::Malformed { .. } => {
+            Some(crate::runtime::MemberIdentityManagement::IntentUnreadable)
+        }
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]

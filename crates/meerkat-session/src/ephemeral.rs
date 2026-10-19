@@ -2292,6 +2292,10 @@ enum SessionCommand {
         dropped: u64,
         reply_tx: oneshot::Sender<()>,
     },
+    RecordLiveTurnAccounting {
+        accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+        reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
+    },
     AppendExternalUserContent {
         content: ContentInput,
         reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
@@ -3670,8 +3674,10 @@ pub trait SessionAgent: Send {
         Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Unsupported)
     }
 
-    /// Replace the LLM client for subsequent turns after proving that its
-    /// concrete wire can represent the existing canonical transcript.
+    /// Replace the LLM client for subsequent turns with another client for
+    /// the session's current model. A client for another provider or model
+    /// is refused with `AgentError::ClientModelChangeRequiresHotSwap`; a model
+    /// change goes through `hot_swap_llm_identity`.
     fn replace_client(
         &mut self,
         _client: std::sync::Arc<dyn meerkat_core::AgentLlmClient>,
@@ -3992,6 +3998,18 @@ pub trait SessionAgent: Send {
     {
         Err(meerkat_core::error::AgentError::ConfigError(
             "external assistant output append is not supported by this session agent".to_string(),
+        ))
+    }
+
+    /// Record the usage of an externally-produced turn that committed no
+    /// output (#1883: a failed live response). It advances session usage and
+    /// the budget; it commits no row and publishes no turn terminal.
+    fn record_external_turn_usage(
+        &mut self,
+        _usage: meerkat_core::TurnUsage,
+    ) -> Result<(), meerkat_core::error::AgentError> {
+        Err(meerkat_core::error::AgentError::ConfigError(
+            "external turn usage recording is not supported by this session agent".to_string(),
         ))
     }
 
@@ -6451,6 +6469,40 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 "Session task dropped reply".to_string(),
             ))
         })
+    }
+
+    /// Record the accounting of a live response that ended without
+    /// completing (#1883).
+    ///
+    /// Measured usage advances session usage and the budget; an unmeasured
+    /// response publishes `TurnUsageAccountingUnmeasured`. Nothing is
+    /// committed to the transcript and no turn terminal is published.
+    pub async fn record_live_turn_accounting(
+        &self,
+        id: &SessionId,
+        accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+    ) -> Result<(), SessionError> {
+        let command_tx = self.session_command_tx(id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::RecordLiveTurnAccounting {
+                accounting,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task dropped the reply channel".to_string(),
+                ))
+            })?
+            .map_err(SessionError::Agent)
     }
 
     /// Append externally-produced user content into the canonical transcript.
@@ -9994,6 +10046,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::AppendExternalAssistantOutput { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
+            SessionCommand::RecordLiveTurnAccounting { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
+            }
             SessionCommand::AppendRealtimeTranscriptEvent { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
@@ -11141,6 +11196,46 @@ async fn session_task<A: SessionAgent>(
                 control.publish_session_event(truncated).await;
                 let _ = reply_tx.send(());
             }
+            SessionCommand::RecordLiveTurnAccounting {
+                accounting,
+                reply_tx,
+            } => {
+                // #1883: a failed live response commits nothing and
+                // publishes no turn terminal; only its accounting is
+                // recorded. Measured usage advances session usage and the
+                // budget; an absent one is the routed unmeasured fact.
+                let result = match accounting {
+                    meerkat_core::live_adapter::LiveResponseAccounting::Measured { usage } => {
+                        let result = agent.record_external_turn_usage(usage);
+                        if result.is_ok() {
+                            let snap = agent.snapshot();
+                            control.publish_summary(SessionSummaryCache {
+                                updated_at: snap.updated_at,
+                                message_count: snap.message_count,
+                                total_tokens: snap.total_tokens,
+                                usage: snap.usage,
+                                last_assistant_text: snap.last_assistant_text,
+                            });
+                        }
+                        result
+                    }
+                    meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                        unmeasured,
+                    } => {
+                        let envelope = stamp_event_envelope(
+                            &next_seq,
+                            &source,
+                            AgentEvent::TurnUsageAccountingUnmeasured {
+                                session_id: session_id.clone(),
+                                unmeasured,
+                            },
+                        );
+                        control.publish_session_event(envelope).await;
+                        Ok(())
+                    }
+                };
+                let _ = reply_tx.send(result);
+            }
             SessionCommand::AppendExternalUserContent { content, reply_tx } => {
                 let result = agent.append_external_user_content(content);
                 if result.is_ok() {
@@ -12242,6 +12337,8 @@ mod runtime_turn_metadata_tests {
             summary_tokens: 1,
             messages_before: 2,
             messages_after: 1,
+            summary_source: None,
+            estimated_history_tokens_after: None,
         };
         let error = service
             .reconcile_runtime_compaction_projections(&missing_session_id, vec![intent])

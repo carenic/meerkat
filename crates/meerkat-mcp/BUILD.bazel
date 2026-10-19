@@ -49,7 +49,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-mcp"),
     crate_name = "meerkat_mcp",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "workspace-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -87,6 +92,7 @@ rust_library(
     crate_root = "src/lib.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -132,7 +138,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-mcp"),
     crate_name = "meerkat_mcp",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "workspace-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -172,6 +183,7 @@ rust_library(
     crate_root = "src/lib.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -218,6 +230,7 @@ rust_test(
     crate_root = "src/lib.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -256,6 +269,7 @@ rust_test(
         "//crates/meerkat-capabilities:meerkat_capabilities",
         "//crates/meerkat-contracts:meerkat_contracts",
         "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-mcp:meerkat_mcp_test_support",
         "//crates/meerkat-runtime:meerkat_runtime_test_support",
         "//crates/meerkat-sandbox:meerkat_sandbox",
         "//crates/meerkat-skills:meerkat_skills",
@@ -280,6 +294,7 @@ rust_test(
     crate_root = "tests/account_selection.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -344,6 +359,7 @@ rust_test(
     crate_root = "tests/external_tool_integration.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -407,6 +423,7 @@ rust_test(
     crate_root = "tests/form_elicitation.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -472,6 +489,7 @@ rust_test(
     crate_root = "tests/lifecycle_contract.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -535,6 +553,7 @@ rust_test(
     crate_root = "tests/m6_composition.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -601,6 +620,7 @@ rust_test(
     crate_root = "tests/m6_staged_boundary.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
@@ -665,6 +685,7 @@ rust_test(
     crate_root = "tests/session_expiry_replay.rs",
     crate_features = [
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,

@@ -4007,6 +4007,181 @@ enum IdentityStructuralEventLog {
     },
 }
 
+/// One read-only snapshot of a persistent mob store for
+/// [`crate::MobStorage::read_member_binding_history`]: every journal event,
+/// in cursor order, and how each identity intent row reads, per mob.
+#[derive(Debug)]
+pub(crate) struct MemberBindingStoreRead {
+    pub(crate) events: Vec<MobEvent>,
+    pub(crate) intent_rows:
+        BTreeMap<MobId, BTreeMap<AgentIdentity, crate::runtime::MemberIdentityManagement>>,
+}
+
+/// Read the persistent mob store at `path` for a member binding history with
+/// no running mob: open it read-only (a missing file is never created),
+/// check its schema without migrating it, and read the journal and the
+/// identity intent rows in one read transaction.
+pub(crate) async fn read_member_binding_store_at(
+    path: PathBuf,
+) -> Result<MemberBindingStoreRead, crate::runtime::MemberBindingHistoryReadError> {
+    tokio::task::spawn_blocking(move || read_member_binding_store_at_sync(&path))
+        .await
+        .map_err(|error| MobStoreError::Internal(format!("sqlite task join failed: {error}")))?
+}
+
+fn read_member_binding_store_at_sync(
+    path: &Path,
+) -> Result<MemberBindingStoreRead, crate::runtime::MemberBindingHistoryReadError> {
+    use crate::runtime::MemberBindingHistoryReadError as ReadError;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ReadError::StoreMissing {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) => {
+            return Err(ReadError::Read(MobStoreError::ReadFailed(format!(
+                "mob store {} is unavailable: {error}",
+                path.display()
+            ))));
+        }
+    }
+    let conn = meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly)
+        .map_err(|error| member_binding_store_refusal(path, error))?;
+    let snapshot = conn.unchecked_transaction().map_err(se)?;
+    // The schema check runs inside the read transaction, so the reads below
+    // see the schema it verified. It refuses and never migrates.
+    match meerkat_sqlite::preflight_domain_version(&snapshot, &MOB_DOMAIN) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ReadError::ForeignSchema {
+                path: path.to_path_buf(),
+                detail: "the file carries no mob schema".to_string(),
+            });
+        }
+        Err(error) => return Err(member_binding_store_refusal(path, error)),
+    }
+    let events = query_member_binding_events(&snapshot)?;
+    let mob_ids = {
+        let mut statement = snapshot
+            .prepare("SELECT DISTINCT mob_id FROM mob_identity_intents")
+            .map_err(se)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(se)?;
+        rows.map(|row| row.map(MobId::from).map_err(se))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut intent_rows = BTreeMap::new();
+    for mob_id in mob_ids {
+        let rows = query_member_binding_intent_rows(&snapshot, &mob_id)?;
+        intent_rows.insert(mob_id, rows);
+    }
+    snapshot.commit().map_err(se)?;
+    Ok(MemberBindingStoreRead {
+        events,
+        intent_rows,
+    })
+}
+
+/// A store this build does not read is a typed refusal; any other failure is
+/// a read failure.
+fn member_binding_store_refusal(
+    path: &Path,
+    error: meerkat_sqlite::SqliteStoreError,
+) -> crate::runtime::MemberBindingHistoryReadError {
+    use meerkat_sqlite::SqliteStoreError as Sqlite;
+    match error {
+        Sqlite::SchemaFromTheFuture { .. }
+        | Sqlite::UnsupportedSchemaPredecessor { .. }
+        | Sqlite::SchemaFingerprintMismatch { .. }
+        | Sqlite::CurrentSchemaMismatch { .. }
+        | Sqlite::UnledgeredDomainObjects { .. }
+        | Sqlite::LedgerMalformed { .. }
+        | Sqlite::UnsupportedDatabaseFile { .. } => {
+            crate::runtime::MemberBindingHistoryReadError::ForeignSchema {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        }
+        Sqlite::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::NotADatabase =>
+        {
+            crate::runtime::MemberBindingHistoryReadError::ForeignSchema {
+                path: path.to_path_buf(),
+                detail: "the file is not a SQLite database".to_string(),
+            }
+        }
+        other => crate::runtime::MemberBindingHistoryReadError::Read(MobStoreError::ReadFailed(
+            format!("mob store {} could not be read: {other}", path.display()),
+        )),
+    }
+}
+
+/// Every journal event, in cursor order; every row must decode.
+fn query_member_binding_events(conn: &Connection) -> Result<Vec<MobEvent>, MobStoreError> {
+    let mut statement = conn
+        .prepare("SELECT event_json FROM mob_events ORDER BY cursor")
+        .map_err(se)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(se)?;
+    let mut events = Vec::new();
+    for row in rows {
+        let bytes = row.map_err(se)?;
+        events.push(
+            decode_stored_mob_event(&bytes)
+                .map_err(|error| MobStoreError::Serialization(error.to_string()))?,
+        );
+    }
+    Ok(events)
+}
+
+/// Read the structural event journal and `mob_id`'s identity intent rows in
+/// one read transaction, so a member binding history and its intent-row fact
+/// come from one snapshot. Reads only; every event row must decode.
+fn read_member_binding_journal_snapshot(
+    conn: &Connection,
+    mob_id: &MobId,
+) -> Result<super::MemberBindingJournalRead, MobStoreError> {
+    let snapshot = conn.unchecked_transaction().map_err(se)?;
+    let events = query_member_binding_events(&snapshot)?;
+    let intent_rows = query_member_binding_intent_rows(&snapshot, mob_id)?;
+    snapshot.commit().map_err(se)?;
+    Ok(super::MemberBindingJournalRead {
+        events,
+        intent_rows,
+    })
+}
+
+/// How each of `mob_id`'s identity intent rows reads, each classified as
+/// `observe_identity_intent` classifies it, inside the caller's read
+/// transaction.
+fn query_member_binding_intent_rows(
+    conn: &Connection,
+    mob_id: &MobId,
+) -> Result<BTreeMap<AgentIdentity, crate::runtime::MemberIdentityManagement>, MobStoreError> {
+    let identities = {
+        let mut statement = conn
+            .prepare("SELECT agent_identity FROM mob_identity_intents WHERE mob_id = ?1")
+            .map_err(se)?;
+        let rows = statement
+            .query_map(params![mob_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(se)?;
+        rows.map(|row| row.map(AgentIdentity::from).map_err(se))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut intent_rows = BTreeMap::new();
+    for identity in identities {
+        let observation = query_identity_intent_observation(conn, mob_id, &identity)?;
+        if let Some(management) = super::intent_row_management(&observation) {
+            intent_rows.insert(identity, management);
+        }
+    }
+    Ok(intent_rows)
+}
+
 fn query_identity_structural_event_log(
     conn: &Connection,
     mob_id: &MobId,
@@ -5530,6 +5705,23 @@ impl MobIdentityStore for SqliteMobIdentityStore {
 
 #[async_trait]
 impl MobIdentityMemberStore for SqliteMobIdentityStore {
+    async fn read_member_binding_journal(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<super::MemberBindingJournalRead, MobStoreError> {
+        if self.event_bus.is_none() {
+            return Err(MobStoreError::IdentityMemberAtomicPersistenceUnavailable);
+        }
+        let path = self.path.clone();
+        let store_instance_id = self.store_instance_id.clone();
+        let mob_id = mob_id.clone();
+        run_sqlite_task(move || {
+            let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
+            read_member_binding_journal_snapshot(&conn, &mob_id)
+        })
+        .await
+    }
+
     async fn observe_identity_member_target(
         &self,
         mob_id: &MobId,
@@ -12016,6 +12208,62 @@ mod tests {
         assert!(
             table_exists(&path, "mob_runtime_callback_claim_verifiers"),
             "migration 11 must run when a released-v10 file is opened"
+        );
+    }
+
+    /// The member binding history reader reads a released 0.9.2 store, a
+    /// predecessor that opening the store would migrate, as it is: it
+    /// neither migrates nor otherwise writes the file.
+    #[tokio::test]
+    async fn the_member_binding_reader_reads_a_released_v10_store_without_migrating_it() {
+        let (_dir, path) = temp_db_path();
+        seed_released_predecessor(&path, 10, build_released_0_9_2_mob_schema);
+        let before = std::fs::read(&path).unwrap();
+
+        let read = read_member_binding_store_at(path.clone())
+            .await
+            .expect("read a released v10 store");
+
+        assert!(read.events.is_empty());
+        assert!(read.intent_rows.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(ledger_version(&path), 10);
+        assert!(!table_exists(&path, "mob_runtime_callback_claim_verifiers"));
+    }
+
+    /// An identity intent row this build cannot read (malformed bytes, or a
+    /// record from another schema version) reads as unreadable: neither as
+    /// a host-adopted identity nor as a command-driven one.
+    #[tokio::test]
+    async fn the_member_binding_reader_reads_unreadable_intent_rows_as_unreadable() {
+        let (_dir, path) = temp_db_path();
+        drop(SqliteMobStores::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            for (identity, record) in [
+                ("malformed", b"not a json record".to_vec()),
+                ("future", br#"{"schema_version": 9999}"#.to_vec()),
+            ] {
+                conn.execute(
+                    "INSERT INTO mob_identity_intents (mob_id, agent_identity, record_json)
+                     VALUES (?1, ?2, ?3)",
+                    params!["history-mob", identity, record],
+                )
+                .unwrap();
+            }
+        }
+
+        let read = read_member_binding_store_at(path.clone())
+            .await
+            .expect("read the store");
+
+        let unreadable = crate::runtime::MemberIdentityManagement::IntentUnreadable;
+        assert_eq!(
+            read.intent_rows.get(&MobId::from("history-mob")),
+            Some(&BTreeMap::from([
+                (AgentIdentity::from("future"), unreadable),
+                (AgentIdentity::from("malformed"), unreadable),
+            ]))
         );
     }
 

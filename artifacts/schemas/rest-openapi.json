@@ -398,6 +398,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/components/schemas/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -1160,6 +1189,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -1171,6 +1209,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -1544,8 +1593,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/components/schemas/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -4212,6 +4272,17 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "inherited_instructions": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ForkInstructionPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The controller host's fork instruction policy for the participant's\nfork. Sent only for `reactivate_inherited`: a member host that sees\nno field applies the default, which refuses a participant that would\ninherit activation rows (the council admits the participant's turns\nitself, so nothing else can activate them). A member host older than\nthis field rejects a payload that carries it."
+              },
               "prefix_message_count": {
                 "format": "uint64",
                 "minimum": 0,
@@ -5907,6 +5978,27 @@
             },
             "required": [
               "session_ownership_conflict"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/components/schemas/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
             ],
             "type": "object"
           }
@@ -8349,6 +8441,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/components/schemas/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfigContractSchema": {
         "description": "Schema-only projection for config write payloads.\n\nThe runtime [`meerkat_core::Config`] type owns defaults, loading, and\nplatform-dependent behavior. Public config-set contracts need only the\nstable section layout, so schema emission points here while serde continues\nto deserialize into the real runtime type.",
         "properties": {
@@ -8750,6 +8891,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -9608,6 +9764,11 @@
             "const": "STALE_DELIVERY_SCOPE",
             "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
             "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
+            "type": "string"
           }
         ]
       },
@@ -9894,6 +10055,137 @@
           }
         ]
       },
+      "ForkInstructionPolicy": {
+        "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
+        "oneOf": [
+          {
+            "const": "require_explicit_activation",
+            "description": "The host activates each inherited key on the child before its first\nturn. A fork that leaves no window for that is refused instead (see\n[`ForkInstructionPolicy::effective`]).",
+            "type": "string"
+          },
+          {
+            "const": "reactivate_inherited",
+            "description": "The fork owner re-activates, in the child and before the child is\ncommitted, every key that was effective in the source at the fork\nboundary.",
+            "type": "string"
+          },
+          {
+            "const": "refuse",
+            "description": "A fork whose child would inherit any activation row is refused before\nanything is committed.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/components/schemas/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/components/schemas/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/components/schemas/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/components/schemas/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "GeminiImageMetadata": {
         "properties": {
           "continuity_ref": {
@@ -9916,6 +10208,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -10604,6 +10911,20 @@
             "type": "string"
           }
         ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
       },
       "InstructionActivationId": {
         "description": "Caller-stable identity for one activation or rollback event.",
@@ -14828,6 +15149,93 @@
         },
         "type": "object"
       },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/components/schemas/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
         "oneOf": [
@@ -18763,6 +19171,89 @@
         ],
         "type": "object"
       },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/components/schemas/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
+      },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
         "type": "string"
@@ -18778,8 +19269,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/components/schemas/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -18933,7 +19446,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -18951,6 +19464,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -19860,7 +20378,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -19894,6 +20412,11 @@
             "$ref": "#/components/schemas/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -19906,8 +20429,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },

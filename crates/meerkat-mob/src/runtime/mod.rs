@@ -424,8 +424,10 @@ pub use delegation::{
     DelegationTurnTerminal, LiveDelegationTerminalEvidence, render_bounded_delegation_task,
 };
 pub use delivery_scope::{
-    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope, ScopeIncarnation,
-    ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberBinding, MemberBindingHistory,
+    MemberBindingHistoryReadError, MemberBindingState, MemberDeliveryScope,
+    MemberIdentityManagement, ScopeIncarnation, ScopedRecoveryUnresolved, ScopedWorkRecovery,
+    ScopedWorkState,
 };
 #[cfg(all(feature = "runtime-adapter", any(test, feature = "test-support")))]
 #[doc(hidden)]
@@ -474,8 +476,9 @@ pub use handle::{
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
     SpawnMemberSpec, SpawnResult, SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission,
-    SupervisorRotationReport, WorkAdmissionStage, WorkBoundedTurnResult, WorkDeliveryReceipt,
-    WorkTurnHandle, mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
+    SupervisorRotationReport, WithheldToolBundle, WorkAdmissionStage, WorkBoundedTurnResult,
+    WorkDeliveryReceipt, WorkTurnHandle, mob_error_wire_code, profile_to_wire,
+    stored_realm_profile_to_wire,
 };
 pub(crate) use handle::{
     CanonicalOpsOwnerContext, ExactTurnCompletionSender, FlowOperationCustody, MemberSpawnReceipt,
@@ -510,10 +513,12 @@ pub use reconcile::{
     ReconcileStage,
 };
 pub use recovery::RestoreIncompatible;
-pub(crate) use retirement_settlement::{ActorTaskEnd, MemberLifecycleObservations};
+pub(crate) use retirement_settlement::{
+    ActorTaskEnd, MemberLifecycleObservations, unregister_refused_until_repair,
+};
 pub use retirement_settlement::{
-    MemberShutdownOutcome, MobShutdownReport, RetirementSettlement, RetirementSettlementWatch,
-    RetirementStage, ShutdownOptions,
+    MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, MobShutdownReport,
+    RetirementSettlement, RetirementSettlementWatch, RetirementStage, ShutdownOptions,
 };
 use roster_authority::{RosterAuthority, RosterMutator};
 #[cfg(not(target_arch = "wasm32"))]

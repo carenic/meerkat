@@ -27,6 +27,8 @@ mod resume_topology_control;
 mod retirement_io;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(in crate::runtime) use shutdown_teardown::teardown_session;
 pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
@@ -478,6 +480,7 @@ fn identity_session_load_error_class(
         | SessionError::ExternalWriteFenceBackoff { .. }
         | SessionError::ServedElsewhere { .. }
         | SessionError::HostingUnavailable { .. }
+        | SessionError::ForkInstructionRefused(_)
         | SessionError::FailedWithData { .. } => IdentitySessionLoadErrorClass::Unavailable,
     }
 }
@@ -4190,8 +4193,176 @@ pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
     std::sync::Mutex::new(None);
+/// The mobs a one-shot per-mob test seam is armed for. A set, so arming the
+/// seam for one mob never disarms another's arm: tests in one process
+/// (in-process `cargo test`) can arm the same seam concurrently.
+#[cfg(test)]
+type MobSeamForTest = std::sync::Mutex<std::collections::BTreeSet<MobId>>;
+
+/// Arm a one-shot per-mob test seam: it fires once, for this mob only.
+#[cfg(test)]
+fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
+    if let Ok(mut armed) = seam.lock() {
+        armed.insert(mob_id.clone());
+    }
+}
+
+/// Whether the seam is armed for this mob, disarming it if so.
+#[cfg(test)]
+fn take_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) -> bool {
+    seam.lock().is_ok_and(|mut armed| armed.remove(mob_id))
+}
+
+#[cfg(test)]
+mod mob_seam_for_test_tests {
+    use super::*;
+
+    #[test]
+    fn arming_a_mob_seam_keeps_every_other_armed_mob() {
+        let seam: MobSeamForTest = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let first = MobId::from("seam-first");
+        let second = MobId::from("seam-second");
+        arm_mob_seam_for_test(&seam, &first);
+        arm_mob_seam_for_test(&seam, &second);
+        assert!(take_mob_seam_for_test(&seam, &first));
+        assert!(
+            !take_mob_seam_for_test(&seam, &first),
+            "a seam fires once per arm"
+        );
+        assert!(
+            take_mob_seam_for_test(&seam, &second),
+            "arming the first mob left the second mob armed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_answer_tests {
+    use super::*;
+
+    const DRAINING: &str = "draining-mob";
+
+    /// Answer one caller request the way a Shutdown's drain does, after the
+    /// Shutdown closed admission.
+    fn answer(routed: RoutedMobCommand) {
+        let mob_id = MobId::from(DRAINING);
+        let closed = (mob_id.clone(), MobAdmissionCloseReason::Shutdown);
+        let mut joined = Vec::new();
+        let mut retained = VecDeque::new();
+        MobActor::answer_while_shutting_down(
+            routed,
+            &mut joined,
+            &mut retained,
+            Some(&closed),
+            &mob_id,
+        );
+        assert!(joined.is_empty(), "a caller request joins no Shutdown");
+        assert!(retained.is_empty(), "a caller request is not retained");
+    }
+
+    fn lanes() -> [CommandAuthority; 3] {
+        [
+            CommandAuthority::principal(MobControlPrincipal::Owner),
+            CommandAuthority::agent_lane(),
+            CommandAuthority::internal(),
+        ]
+    }
+
+    /// Outside the Closing set, principal and agent requests get
+    /// `ShutdownInProgress` at once; internal requests, sent by the tasks the
+    /// drain joins, get the terminal closed channel.
+    #[test]
+    fn a_draining_shutdown_answers_each_lane_at_once() {
+        for authority in lanes() {
+            let lane = authority.kind();
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            answer(RoutedMobCommand {
+                authority,
+                cmd: MobCommand::QueryPhase { reply_tx },
+            });
+            let error = match reply_rx.try_recv() {
+                Ok(Err(error)) => error,
+                other => panic!("{lane:?}: expected an error answered at once, got {other:?}"),
+            };
+            match (lane, error) {
+                (CommandAuthorityKind::Internal, MobError::ActorCommandChannelClosed) => {}
+                (
+                    CommandAuthorityKind::Principal | CommandAuthorityKind::AgentLane,
+                    MobError::ShutdownInProgress { mob_id },
+                ) => assert_eq!(mob_id.as_str(), DRAINING),
+                (lane, error) => panic!("{lane:?}: unexpected drain answer: {error}"),
+            }
+        }
+    }
+
+    /// A command the Closing state refuses gets the close reason, on every
+    /// lane.
+    #[test]
+    fn a_draining_shutdown_refuses_a_closing_set_command_with_the_close_reason() {
+        for authority in lanes() {
+            let lane = authority.kind();
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            answer(RoutedMobCommand {
+                authority,
+                cmd: MobCommand::Reset { reply_tx },
+            });
+            match reply_rx.try_recv() {
+                Ok(Err(MobError::AdmissionClosed { mob_id, reason })) => {
+                    assert_eq!(mob_id.as_str(), DRAINING);
+                    assert_eq!(reason, MobAdmissionCloseReason::Shutdown);
+                }
+                other => panic!("{lane:?}: expected AdmissionClosed, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// Test seam: the actor loop of this mob panics at the top of its next turn.
+#[cfg(test)]
+static PANIC_ACTOR_LOOP_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(test)]
+pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&PANIC_ACTOR_LOOP_FOR_MOB, mob_id);
+}
+
+/// Test seam: the next loop-boundary flush of this mob fails structurally.
+#[cfg(test)]
+static FAIL_BOUNDARY_FLUSH_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(test)]
+pub(super) fn fail_next_boundary_flush_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_BOUNDARY_FLUSH_FOR_MOB, mob_id);
+}
+
+/// Test seam: this mob's next admitted Shutdown fails in its lifecycle drain,
+/// after its admission.
+#[cfg(test)]
+static FAIL_SHUTDOWN_DRAIN_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(test)]
+pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_SHUTDOWN_DRAIN_FOR_MOB, mob_id);
+}
+
+/// Test seam: this mob's next actor start fail-stops in its durable recovery,
+/// before command admission.
+#[cfg(test)]
+static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(test)]
+pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, mob_id);
+}
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static FAIL_RETIREMENT_PROJECTION_CLEANUP_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_REMOTE_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
@@ -4204,6 +4375,15 @@ static FAIL_AFTER_REMOTE_SUPERVISOR_REVOKED_FOR_IDENTITY: std::sync::Mutex<Optio
 pub(super) fn fail_session_ingress_detach_for_test(session_id: &SessionId) {
     if let Ok(mut target) = FAIL_SESSION_INGRESS_DETACH_FOR_SESSION.lock() {
         *target = Some(session_id.clone());
+    }
+}
+
+/// Fail `agent_identity`'s next retirement projection-cleanup stage, after
+/// its archive observation, so the retirement settles stuck there.
+#[cfg(test)]
+pub(super) fn fail_retirement_projection_cleanup_for_test(agent_identity: &AgentIdentity) {
+    if let Ok(mut target) = FAIL_RETIREMENT_PROJECTION_CLEANUP_FOR_IDENTITY.lock() {
+        *target = Some(agent_identity.clone());
     }
 }
 
@@ -5575,9 +5755,10 @@ struct DeferredResumeProvision {
     agent_identity: AgentIdentity,
     profile: crate::profile::Profile,
     external_tools: Option<Arc<dyn AgentToolDispatcher>>,
-    /// Tool names of the bundles the profile resolved when `external_tools`
-    /// was composed, for the declared tool restriction.
-    bundle_tools: std::collections::BTreeMap<String, meerkat_core::ToolNameSet>,
+    /// The deny vocabularies of the bundles the profile resolved when
+    /// `external_tools` was composed, for the declared tool restriction.
+    bundle_tools:
+        std::collections::BTreeMap<meerkat_core::ToolVocabularySource, meerkat_core::ToolNameSet>,
     compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     context: Option<serde_json::Value>,
     labels: Option<std::collections::BTreeMap<String, String>>,
@@ -6023,7 +6204,10 @@ fn observe_spawn_exec_facts(
     });
     SpawnExecObservations {
         workgraph_required: explicit_workgraph,
-        rust_bundles_present: !profile.tools.rust_bundles.is_empty(),
+        // An opted-in bundle is a Rust bundle too: a placed member cannot
+        // carry either.
+        rust_bundles_present: !profile.tools.rust_bundles.is_empty()
+            || !profile.tools.bundles.is_empty(),
         per_spawn_external_tools_present,
         host_surface_mcp_allowlist_present: !profile.tools.mcp.is_empty(),
         inherited_tool_filter_present,
@@ -6033,6 +6217,26 @@ fn observe_spawn_exec_facts(
         memory_required: profile.tools.memory,
         mcp_required: !profile.tools.mcp_servers.is_empty(),
         resume_session_id,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spawn_observation_tests {
+    use super::*;
+
+    /// A bundle a profile opts into is a Rust bundle too: a placed member
+    /// cannot carry it, so the spawn observes it like a strictly named one.
+    #[test]
+    fn an_opted_in_bundle_is_observed_as_a_rust_bundle() {
+        let mut profile: crate::profile::Profile =
+            serde_json::from_value(serde_json::json!({ "model": "claude-sonnet-4-6" })).unwrap();
+        let observe = |profile: &crate::profile::Profile| {
+            observe_spawn_exec_facts(profile, false, false, None, false, None).rust_bundles_present
+        };
+        assert!(!observe(&profile));
+        profile.tools.bundles = vec!["announcements".to_string()];
+        assert!(observe(&profile));
     }
 }
 
@@ -7752,6 +7956,9 @@ pub(super) struct MobActor {
     /// sole writer) so a durable fork can hand its child the source's overlay
     /// (see `ForkBuildInheritance`).
     pub(super) per_spawn_external_tools: super::handle::PerSpawnExternalTools,
+    /// The host's fork instruction policy
+    /// ([`super::MobBuilder::with_fork_instruction_policy`]).
+    pub(super) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// R3 case-3 base-prompt seam for placed spawns (ADJ-2). `None` ⇒
     /// case-3 remote spawns fail typed at spec compile.
     pub(super) spawn_base_prompt_source:
@@ -7853,9 +8060,10 @@ pub(super) enum MemberLiveMutationTarget {
 }
 
 pub(super) enum MemberLiveMutationCompletion {
-    /// Test-only task that awaited this actor's reply (see
-    /// `MobCommand::SpawnLiveMutationAwaitingActorForTest`); it owns no effect.
-    #[cfg(test)]
+    /// Test-only task that awaited this actor's reply or a test's release
+    /// (see `MobCommand::SpawnLiveMutationAwaitingActorForTest` and
+    /// `MobCommand::SpawnHeldLiveMutationForTest`); it owns no effect.
+    #[cfg(any(test, feature = "test-support"))]
     AwaitedActorForTest,
     Open {
         agent_identity: AgentIdentity,
@@ -10879,9 +11087,10 @@ impl MobActor {
 
     /// #1102 fast rejection: a local runtime-backed member whose persistent
     /// runtime shell is `ReloadRequired` refuses every input at admission
-    /// (`RecoveryRepairBlocked`), so deliveries to it must not be dispatched.
-    /// Reads the same per-session gate the runtime ingress path consults and
-    /// returns the typed `MemberReloadRequired` before any dispatch work.
+    /// (`RecoveryRepairBlocked`), so deliveries to it must not be dispatched,
+    /// and a force cancel must not wait on its gates. Reads the same
+    /// per-session gate the runtime ingress path consults and returns the
+    /// typed `MemberReloadRequired` before any dispatch work.
     async fn ensure_member_runtime_durability_ready(
         &self,
         entry: &RosterEntry,
@@ -10900,7 +11109,7 @@ impl MobActor {
                 agent_identity = %entry.agent_identity,
                 session_id = %bridge_session_id,
                 operation = %required.operation,
-                "rejecting delivery: member runtime registration requires a cold reload"
+                "refusing member work: member runtime registration requires a cold reload"
             );
             return Err(MobError::MemberReloadRequired {
                 member_id: entry.agent_identity.clone(),
@@ -10910,6 +11119,76 @@ impl MobActor {
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = entry;
         Ok(())
+    }
+
+    /// The signal that records a failed revival of `agent_identity`'s
+    /// session `session_id`, with the reason it records. A host refusal of
+    /// the member's registration keeps its typed code and the host's own
+    /// reason, so every later answer repeats the first: the member stays
+    /// Broken with it until an explicit repair.
+    pub(super) fn member_revival_failure_signal(
+        agent_identity: mob_dsl::AgentIdentity,
+        session_id: &SessionId,
+        error: &MobError,
+    ) -> (mob_dsl::MobMachineSignal, String) {
+        match error {
+            MobError::MemberRegistrationRefused { call, reason, .. } => (
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
+                    agent_identity,
+                    refusal_code: call.as_code().to_string(),
+                    reason: reason.clone(),
+                },
+                reason.clone(),
+            ),
+            _ => {
+                let reason = format!(
+                    "machine-authorized revival of bridge session '{session_id}' failed: {error}"
+                );
+                (
+                    mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
+                        agent_identity,
+                        reason: reason.clone(),
+                    },
+                    reason,
+                )
+            }
+        }
+    }
+
+    /// Whether MobMachine records that `agent_identity`'s host refused its
+    /// registration, read through the one parser of the recorded
+    /// restore-failure code. Such a member keeps no registration and no
+    /// owner context until a host-approved materialization.
+    pub(super) fn member_registration_refused(&self, agent_identity: &AgentIdentity) -> bool {
+        self.dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                agent_identity,
+            ))
+            .is_some()
+    }
+
+    /// The typed host refusal `agent_identity` is Broken with, read from
+    /// MobMachine's recorded restore-failure code, so asking again answers
+    /// the same refusal without asking the host.
+    pub(super) fn recorded_registration_refusal(
+        &self,
+        agent_identity: &AgentIdentity,
+        session_id: Option<meerkat_core::types::SessionId>,
+        reason: String,
+    ) -> Option<MobError> {
+        let call = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                &crate::ids::AgentIdentity::from(agent_identity.as_str()),
+            ))?;
+        Some(MobError::MemberRegistrationRefused {
+            member_id: agent_identity.clone(),
+            session_id,
+            call,
+            reason,
+        })
     }
 
     async fn ensure_member_not_broken(
@@ -10931,8 +11210,16 @@ impl MobActor {
                         .error
                         .unwrap_or_else(|| "member restore failed".to_string()),
                     hold: None,
+                    registration_refusal: None,
                 },
             );
+            if let Some(refusal) = self.recorded_registration_refusal(
+                agent_identity,
+                diag.bridge_session_id.clone(),
+                diag.reason.clone(),
+            ) {
+                return Err(refusal);
+            }
             return Err(MobError::MemberRestoreFailed {
                 member_id: agent_identity.clone(),
                 session_id: diag.bridge_session_id,
@@ -12387,6 +12674,7 @@ impl MobActor {
                                 bridge_session_id: Some(closed.session_id.clone()),
                                 reason: format!("{} [{}]", closed.reason, closed.refusal_code),
                                 hold: None,
+                                registration_refusal: None,
                             },
                         )
                         .await;
@@ -12814,6 +13102,10 @@ impl MobActor {
             .dsl_authority
             .state()
             .member_lifecycle_for_identity(&dsl_identity);
+        let registration_refusal = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&dsl_identity);
         let kickoff = kickoff_snapshot_from_machine_state(
             agent_identity.as_str(),
             self.dsl_authority.state(),
@@ -12955,6 +13247,7 @@ impl MobActor {
                 peer_connectivity: None,
                 kickoff,
                 progress,
+                registration_refusal,
             },
         ))
     }
@@ -13111,6 +13404,7 @@ impl MobActor {
                 bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
                 reason,
                 hold: None,
+                registration_refusal: None,
             },
         )
         .await;
@@ -13175,6 +13469,7 @@ impl MobActor {
                 bridge_session_id: Some(bridge_session_id.clone()),
                 reason: reason.clone(),
                 hold: None,
+                registration_refusal: None,
             },
         )
         .await;
@@ -13310,6 +13605,7 @@ impl MobActor {
                         bridge_session_id: Some(bridge_session_id.clone()),
                         reason: classify_reason.clone(),
                         hold: None,
+                        registration_refusal: None,
                     },
                 )
                 .await;
@@ -13368,6 +13664,7 @@ impl MobActor {
                                 bridge_session_id: Some(bridge_session_id.clone()),
                                 reason: failure_reason.clone(),
                                 hold,
+                                registration_refusal: None,
                             },
                         )
                         .await;
@@ -14038,6 +14335,7 @@ impl MobActor {
             roster: self.roster.clone(),
             definition: self.definition.clone(),
             events: self.events.clone(),
+            identity_member: self.identity_member.clone(),
             run_store: self.run_store.clone(),
             runtime_metadata: self.runtime_metadata.clone(),
             flow_streams: self.flow_streams.clone(),
@@ -14054,6 +14352,7 @@ impl MobActor {
             // `MobHandle` returned from `MobBuilder`. Tools built from the
             // actor do not dial realtime endpoints.
             realtime_session_factory: None,
+            fork_instruction_policy: self.fork_instruction_policy,
             flow_target_provisioner: Arc::clone(&self.flow_target_provisioner),
             explicit_resume_operations: Arc::clone(&self.explicit_resume_operations),
             member_admission_backlog: Arc::clone(&self.member_admission_backlog),
@@ -14065,6 +14364,8 @@ impl MobActor {
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
             incarnation: self.incarnation.incarnation(),
+            registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
+            realm_profile_store: self.realm_profile_store.clone(),
         }
     }
 
@@ -16184,16 +16485,19 @@ impl MobActor {
         }
     }
 
+    #[cfg(feature = "runtime-adapter")]
     pub(super) fn record_shutdown_unregister_pending(
         &mut self,
         member: Option<&AgentIdentity>,
         stage: &'static str,
+        settlement: super::MemberUnregisterSettlement,
     ) {
         if let Some(member) = member {
             self.record_shutdown_outcome(
                 member.clone(),
                 super::MemberShutdownOutcome::UnregisterPending {
                     stage: stage.to_string(),
+                    settlement,
                 },
             );
         }
@@ -16586,6 +16890,10 @@ impl MobActor {
                 work_ref: payload.work_ref.clone(),
                 pump,
             });
+            #[cfg(test)]
+            self.lifecycle_observations
+                .submit_work_pump_dispatches
+                .send_modify(|dispatches| *dispatches += 1);
             return Some(RoutedMobCommand {
                 authority,
                 cmd: MobCommand::SubmitWork { payload, reply_tx },
@@ -18177,8 +18485,9 @@ impl MobActor {
         Ok(())
     }
 
-    /// Hold every roster member's run starts for a Stop (#1500), the holds
-    /// running concurrently. Each hold waits on its own member's runtime (its
+    /// Hold every roster member's run starts for a Stop (#1500), each through
+    /// [`Self::stage_and_hold_member_run_starts`], the holds running
+    /// concurrently. Each hold waits on its own member's runtime (its
     /// session's mutation gate, which a running turn's commit holds, or its
     /// host for a placed member), so one busy member does not delay the
     /// others, and the inline Stop lasts about one hold rather than all of
@@ -18224,12 +18533,7 @@ impl MobActor {
                 let provisioner = Arc::clone(&provisioner);
                 async move {
                     let result = converge_autonomous_stop_member_result(
-                        provisioner
-                            .stop_member_runtime(
-                                &incarnation.member_ref,
-                                incarnation.expected_member.as_ref(),
-                                false,
-                            )
+                        Self::stage_and_hold_member_run_starts(provisioner.as_ref(), &incarnation)
                             .await,
                     );
                     (position, identity, result)
@@ -18257,6 +18561,34 @@ impl MobActor {
             Some((_, error)) => Err(error),
             None => Ok(outcomes),
         }
+    }
+
+    /// Hold one member's run starts for a Stop (#1500): stage `MobStop` for
+    /// its next runtime registration, then hold the current one. The stage
+    /// comes first and outlives the registration it was taken for, so a
+    /// registration that replaces the held one while the mob is Stopped (a
+    /// reload) is held too; Resume releases both. A Shutdown never stages:
+    /// it discards its members. A placed member's runtime registers on its
+    /// host, not here, so only the hold reaches it.
+    async fn stage_and_hold_member_run_starts(
+        provisioner: &dyn MobProvisioner,
+        incarnation: &AutonomousStopInterruptIncarnation,
+    ) -> Result<super::stop_report::MemberStopOutcome, MobError> {
+        if incarnation.expected_member.is_none() {
+            provisioner
+                .stage_member_registration_run_start_hold_only(
+                    &incarnation.member_ref,
+                    meerkat_runtime::RunStartHoldReason::MobStop,
+                )
+                .await?;
+        }
+        provisioner
+            .stop_member_runtime(
+                &incarnation.member_ref,
+                incarnation.expected_member.as_ref(),
+                false,
+            )
+            .await
     }
 
     async fn prepare_all_autonomous_member_stops(
@@ -18384,10 +18716,14 @@ impl MobActor {
             .saturating_add(usize::from(self.pending_shutdown_teardown.is_some()))
             .saturating_add(usize::from(self.shutdown_exit.is_some()))
             .saturating_add(self.identity_reconcile_queue.len());
+        // Only a current incarnation holds work. An identity whose member
+        // retired keeps its last execution observation until its next
+        // incarnation is minted, and that observation is not work in flight.
         let member_work = state
             .member_in_flight_work
-            .values()
-            .fold(0_u64, |total, work| total.saturating_add(*work));
+            .iter()
+            .filter(|(identity, _)| state.identity_to_runtime.contains_key(*identity))
+            .fold(0_u64, |total, (_, work)| total.saturating_add(*work));
         let runs = self
             .run_tasks
             .len()
@@ -18508,6 +18844,41 @@ impl MobActor {
         }
     }
 
+    /// Close admission because the actor is about to take no more commands:
+    /// - an admitted Shutdown, before its teardown;
+    /// - an admitted Destroy, once its durable marker is written, and a
+    ///   restored actor that carries that marker, before its handle escapes
+    ///   ([`Self::close_admission_if_destroy_admitted`]);
+    /// - a durability fail-stop, before the actor quiesces and exits, and a
+    ///   durable recovery that fail-stops before command admission;
+    /// - a structural dispatch failure at a loop boundary, before the actor
+    ///   stops.
+    ///
+    /// Nothing is then handed an owner lease on an actor that will take no
+    /// further command. Unconditional, keeping the first reason (D67); it
+    /// answers nobody, so it takes no busy snapshot. A Stop, the resumable
+    /// pause, never calls this.
+    #[inline(never)]
+    fn close_admission_for_exit(&mut self, reason: MobAdmissionCloseReason) {
+        use super::admission_close::{CloseDecision, CloseRequest};
+        if let CloseDecision::Closed { reason, .. } = self
+            .ownership
+            .decide(CloseRequest::Unconditional(reason), MobBusy::default)
+        {
+            self.enter_admission_closed(reason);
+        }
+    }
+
+    /// A restored mob whose destroy was already admitted (its durable
+    /// `MobDestroying` marker) admits nothing new: the destroy's retry is its
+    /// only way on. The builder calls this before it returns the handle, so
+    /// no owner lease or command is admitted first.
+    pub(super) fn close_admission_if_destroy_admitted(&mut self) {
+        if self.destroy_admitted() {
+            self.close_admission_for_exit(MobAdmissionCloseReason::Destroyed);
+        }
+    }
+
     /// The latched last-owner release: close once no owner is present and
     /// the mob is idle. An owner present again clears the latch; its own
     /// release signals anew.
@@ -18561,6 +18932,13 @@ impl MobActor {
             %reason,
             "mob admission closed"
         );
+    }
+
+    /// Once admission has closed, what a refused command's
+    /// `MobError::AdmissionClosed` carries: the mob id and the close reason.
+    fn admission_closed_refusal(&self) -> Option<(MobId, MobAdmissionCloseReason)> {
+        self.admission_closed
+            .map(|reason| (self.definition.id.clone(), reason))
     }
 
     fn shutdown_in_progress(&self) -> bool {
@@ -18962,9 +19340,19 @@ impl MobActor {
         if result.is_ok() {
             let mut retained = std::mem::take(&mut self.retained_actor_completions);
             let mut received = 0;
+            let closed = self.admission_closed_refusal();
+            let mob_id = self.definition.id.clone();
             let tail = Box::pin(self.shutdown_actor_owned_background_work());
-            Self::serve_refusals_while(command_rx, &mut joined, &mut retained, &mut received, tail)
-                .await;
+            Self::serve_refusals_while(
+                command_rx,
+                &mut joined,
+                &mut retained,
+                &mut received,
+                closed.as_ref(),
+                &mob_id,
+                tail,
+            )
+            .await;
             self.retained_actor_completions = retained;
             self.public_owner_release_backlog =
                 self.public_owner_release_backlog.saturating_sub(received);
@@ -19977,12 +20365,15 @@ impl MobActor {
     }
 
     /// Realize MobMachine's `HoldMemberRunStarts` on a member provisioned by
-    /// a spawn that completed into a Stopped mob (#1500).
+    /// a spawn that completed into a Stopped mob (#1500): it stages and holds
+    /// like every member the Stop held.
     async fn hold_spawned_member_run_starts(&self, member_ref: &MemberRef) {
-        if let Err(error) = self
-            .provisioner
-            .stop_member_runtime(member_ref, None, false)
-            .await
+        let incarnation = AutonomousStopInterruptIncarnation {
+            member_ref: member_ref.clone(),
+            expected_member: None,
+        };
+        if let Err(error) =
+            Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
         {
             tracing::warn!(
                 error = %error,
@@ -19994,6 +20385,7 @@ impl MobActor {
     /// Hold every member of a Stopped mob again (#1500): after a resume that
     /// released the holds and then failed, so queued input still waits for a
     /// resume that succeeds, and after a spawn completed into the Stopped mob.
+    /// Each member stages and holds as the Stop did.
     async fn hold_member_run_starts_while_stopped(&mut self) {
         if self.state() != MobState::Stopped {
             return;
@@ -20007,15 +20399,11 @@ impl MobActor {
                 continue;
             }
             let held = match self.autonomous_stop_interrupt_incarnation(entry) {
-                Ok(incarnation) => self
-                    .provisioner
-                    .stop_member_runtime(
-                        &incarnation.member_ref,
-                        incarnation.expected_member.as_ref(),
-                        false,
-                    )
-                    .await
-                    .map(|_| ()),
+                Ok(incarnation) => {
+                    Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation)
+                        .await
+                        .map(|_| ())
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = held {
@@ -22599,22 +22987,25 @@ impl MobActor {
         }
     }
 
-    /// Join barrier for every background task/listener owned directly by the
-    /// actor (as opposed to keyed pending-spawn/flow/autonomous tables).
-    /// Safe to call repeatedly; all task sets and optional handles are drained.
     /// Run `work` (a Shutdown step that joins actor-owned tasks) while still
     /// answering every command that reaches the actor: a Shutdown joins this
-    /// one, a caller request is refused typed as `ActorCommandChannelClosed`
-    /// (the answer it gets a moment later anyway), and an actor completion is
-    /// retained in `retained` for the actor to process after the step. A joined task may have sent this
-    /// actor a command and await its reply; served this way, it can never wait
-    /// on the actor that is joining it (in production the actor otherwise wedged in an
-    /// inline Shutdown join until SIGKILL).
+    /// one, a caller request is refused typed at once, and an actor
+    /// completion is retained in `retained` for the actor to process after
+    /// the step. A command the Closing state refuses gets `AdmissionClosed`
+    /// with the `closed` reason (the Shutdown closed admission before this
+    /// step), the answer it gets once the Shutdown parks. Any other caller
+    /// request gets `ShutdownInProgress` for `mob_id`: the actor is alive,
+    /// and the Shutdown can still fail and leave it serving. A joined task
+    /// may have sent this actor a command and await its reply; served this
+    /// way, it can never wait on the actor that is joining it (in production
+    /// the actor otherwise wedged in an inline Shutdown join until SIGKILL).
     async fn serve_refusals_while<F>(
         command_rx: &mut mpsc::Receiver<RoutedMobCommand>,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
         received: &mut usize,
+        closed: Option<&(MobId, MobAdmissionCloseReason)>,
+        mob_id: &MobId,
         work: F,
     ) -> F::Output
     where
@@ -22630,14 +23021,14 @@ impl MobActor {
                     // before the step ended is retained, not left behind.
                     while let Ok(routed) = command_rx.try_recv() {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed, mob_id);
                     }
                     return output;
                 }
                 routed = command_rx.recv(), if channel_open => match routed {
                     Some(routed) => {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed, mob_id);
                     }
                     None => channel_open = false,
                 },
@@ -22646,18 +23037,42 @@ impl MobActor {
     }
 
     /// One command reaching the actor while a Shutdown step joins its work:
-    /// a Shutdown joins it, a caller request is refused typed, an actor
+    /// a Shutdown joins it, a caller request is refused typed at once (with
+    /// the close reason when the Closing state refuses it), an actor
     /// completion is retained for processing (never refused).
+    ///
+    /// A caller request outside the Closing set gets `ShutdownInProgress`,
+    /// except on the internal lane. Internal requests come from the actor's
+    /// own tasks, which this step may be joining: they get the terminal
+    /// `ActorCommandChannelClosed`, so a joined task finishes instead of
+    /// retrying against the actor that waits for it.
     fn answer_while_shutting_down(
         routed: RoutedMobCommand,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
+        closed: Option<&(MobId, MobAdmissionCloseReason)>,
+        mob_id: &MobId,
     ) {
+        let lane = routed.authority.kind();
         match routed.cmd {
             MobCommand::Shutdown { reply_tx, .. } => joined.push(LifecycleReplyTx::Unit(reply_tx)),
             cmd => match cmd.shutdown_answer_class() {
                 super::state::ShutdownAnswerClass::CallerRequest => {
-                    cmd.reject_with_error(MobError::ActorCommandChannelClosed);
+                    let error = match closed {
+                        Some((closed_mob, reason)) if cmd.refused_while_admission_closed() => {
+                            MobError::AdmissionClosed {
+                                mob_id: closed_mob.clone(),
+                                reason: *reason,
+                            }
+                        }
+                        _ if lane == CommandAuthorityKind::Internal => {
+                            MobError::ActorCommandChannelClosed
+                        }
+                        _ => MobError::ShutdownInProgress {
+                            mob_id: mob_id.clone(),
+                        },
+                    };
+                    cmd.reject_with_error(error);
                 }
                 super::state::ShutdownAnswerClass::ActorCompletion => {
                     retained.push_back(RoutedMobCommand {
@@ -22669,6 +23084,9 @@ impl MobActor {
         }
     }
 
+    /// Join barrier for every background task/listener owned directly by the
+    /// actor (as opposed to keyed pending-spawn/flow/autonomous tables).
+    /// Safe to call repeatedly; all task sets and optional handles are drained.
     async fn shutdown_actor_owned_background_work(&mut self) {
         // #1105: settle owned wiring ledgers first. Aborting them before
         // reconciliation would strand real trust rows with no compensation
@@ -26045,21 +26463,32 @@ impl MobActor {
                 }
                 MobCommand::Retire {
                     agent_identity,
-                    expected_incarnation,
+                    target,
                     redrive,
                     deadline,
                     admission_tx,
                     reply_tx,
                 } => {
-                    let result = self.validate_retire_member_incarnation(&expected_incarnation).await;
-                    if !self.respawn_topology_reply_withheld {
-                        match result {
-                            Ok(()) => self.start_retirement(
-                                agent_identity, deadline, Some(admission_tx),
-                                retirement_io::RetirementReply::Retire(reply_tx),
-                                redrive,
-                            ).await,
-                            Err(error) => { let _ = reply_tx.send(Err(error)); }
+                    match target {
+                        super::state::RetireTarget::Exact(expected_incarnation) => {
+                            let result = self.validate_retire_member_incarnation(&expected_incarnation).await;
+                            if !self.respawn_topology_reply_withheld {
+                                match result {
+                                    Ok(()) => self.start_retirement(
+                                        agent_identity, deadline, Some(admission_tx),
+                                        retirement_io::RetirementReply::Retire(reply_tx),
+                                        redrive,
+                                    ).await,
+                                    Err(error) => { let _ = reply_tx.send(Err(error)); }
+                                }
+                            }
+                        }
+                        super::state::RetireTarget::Scoped(step) => {
+                            if !self.respawn_topology_reply_withheld {
+                                self.retire_scoped_step(
+                                    agent_identity, step, deadline, admission_tx, reply_tx,
+                                ).await;
+                            }
                         }
                     }
                 }
@@ -27413,6 +27842,17 @@ impl MobActor {
                     });
                     let _ = reply_tx.send(Ok(()));
                 }
+                #[cfg(any(test, feature = "test-support"))]
+                MobCommand::SpawnHeldLiveMutationForTest {
+                    release_rx,
+                    reply_tx,
+                } => {
+                    self.member_live_mutation_tasks.spawn(async move {
+                        let _ = release_rx.await;
+                        MemberLiveMutationCompletion::AwaitedActorForTest
+                    });
+                    let _ = reply_tx.send(Ok(()));
+                }
                 #[cfg(test)]
                 MobCommand::ParkActorForObservationTest {
                     entered_tx,
@@ -28376,6 +28816,10 @@ impl MobActor {
                         let _ = reply_tx.send(Err(error));
                         return ActorLoopControl::SkipBoundary;
                     }
+                    // The admitted Shutdown closes admission before any
+                    // teardown step: from here on no owner lease is handed
+                    // out and no new work is admitted.
+                    self.close_admission_for_exit(MobAdmissionCloseReason::Shutdown);
                     self.log_shutdown_admitted();
                     #[cfg(test)]
                     self.lifecycle_observations
@@ -28387,11 +28831,15 @@ impl MobActor {
                     let mut joined = Vec::new();
                     let mut retained = std::mem::take(&mut self.retained_actor_completions);
                     let mut received = 0;
+                    let closed = self.admission_closed_refusal();
+                    let mob_id = self.definition.id.clone();
                     let drained = Self::serve_refusals_while(
                         command_rx,
                         &mut joined,
                         &mut retained,
                         &mut received,
+                        closed.as_ref(),
+                        &mob_id,
                         Box::pin(async {
                             self.drain_wiring_io_for_lifecycle().await;
                             self.drain_member_effects_for_lifecycle().await?;
@@ -28399,6 +28847,15 @@ impl MobActor {
                         }),
                     )
                     .await;
+                    #[cfg(test)]
+                    let drained =
+                        if take_mob_seam_for_test(&FAIL_SHUTDOWN_DRAIN_FOR_MOB, &self.definition.id) {
+                            Err(MobError::Internal(
+                                "test seam: the Shutdown's lifecycle drain fails".to_string(),
+                            ))
+                        } else {
+                            drained
+                        };
                     self.retained_actor_completions = retained;
                     self.public_owner_release_backlog =
                         self.public_owner_release_backlog.saturating_sub(received);
@@ -28752,6 +29209,15 @@ impl MobActor {
     /// phase drops the recovery frame before a deeply nested command handler
     /// is polled, without moving actor authority out of the serialized task.
     async fn prepare_actor_run(&mut self) -> bool {
+        #[cfg(test)]
+        if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
+            tracing::error!(
+                mob_id = %self.definition.id,
+                "test seam: durable recovery fail-stops before command admission"
+            );
+            self.quiesce_volatile_producers_after_fail_stop().await;
+            return false;
+        }
         if let Err(error) = self.restore_local_cleanup_composition_delivery().await {
             tracing::error!(
                 mob_id = %self.definition.id,
@@ -28863,6 +29329,8 @@ impl MobActor {
         self.supervisor_bridge
             .set_member_run_start_posture(self.member_run_start_posture());
         if !boxed_arm_future(|| self.prepare_actor_run()).await {
+            // Durable recovery fail-stopped before command admission.
+            self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
             self.inline_step_watchdog.stop();
             drop(self);
             Self::close_and_drain_commands(command_rx).await;
@@ -28896,11 +29364,17 @@ impl MobActor {
         // their first tick. Awaiting a startup tick on wasm would therefore
         // park the actor for the five-minute identity safety cadence.
         'actor: loop {
+            #[cfg(test)]
+            assert!(
+                !take_mob_seam_for_test(&PANIC_ACTOR_LOOP_FOR_MOB, &self.definition.id),
+                "test seam: the mob actor loop panics"
+            );
             // Detached completion paths can re-enter through `continue` or
             // `SkipBoundary`, bypassing the ordinary post-command boundary.
             // Honor fail-stop before polling any new work so a confirmed
             // durable panic quarantine transfers ownership to cold recovery.
             if self.durable_uncertainty_fail_stop {
+                self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
                     "durable mutation outcome remained uncertain; crash-quiescing and terminating mob actor for cold replay"
@@ -29039,9 +29513,32 @@ impl MobActor {
                 }
                 // A Shutdown in progress (parked on its members' stops or on
                 // its runtime teardown) admits no new member and no member
-                // work it would then neither stop nor report.
+                // work it would then neither stop nor report. The actor is
+                // alive and the Shutdown can still fail, so the answer is
+                // ShutdownInProgress, never a closed channel. No sender
+                // reaches this today. The Closing state refused every start
+                // above except a member lane's revival, and no revival can be
+                // in flight: a Shutdown passes the deferral gate only while
+                // no lane holds submit-work pump state
+                // (`submit_work_pump_control_is_pending`), and after its
+                // admission the Closing state refuses every new submission.
+                // That lane-pump guard alone keeps this refusal dead. The
+                // member-effect guard (`resume_member_control_is_pending`)
+                // also defers a Shutdown behind a held pump preflight, but
+                // not behind a parked submission, which holds pump state with
+                // no member effect running.
+                // `shutdown_waits_for_a_parked_submit_work_pump_without_a_member_effect`
+                // pins the lane-pump guard: if it is narrowed, this refusal
+                // becomes live and the no-spin argument for the lane's pump
+                // must be re-examined.
                 if self.shutdown_in_progress() && cmd.starts_member_work() {
-                    cmd.reject_with_error(MobError::ActorCommandChannelClosed);
+                    #[cfg(test)]
+                    self.lifecycle_observations
+                        .parked_shutdown_member_work_refusals
+                        .send_modify(|refusals| *refusals += 1);
+                    cmd.reject_with_error(MobError::ShutdownInProgress {
+                        mob_id: self.definition.id.clone(),
+                    });
                     continue;
                 }
                 if matches!(
@@ -29143,6 +29640,7 @@ impl MobActor {
                 ActorLoopControl::BreakActor => break,
             }
             if self.durable_uncertainty_fail_stop {
+                self.close_admission_for_exit(MobAdmissionCloseReason::DurabilityFailStop);
                 tracing::error!(
                     mob_id = %self.definition.id,
                     "durable mutation outcome remained uncertain; crash-quiescing and terminating mob actor for cold replay"
@@ -29175,6 +29673,15 @@ impl MobActor {
             }
             loop {
                 let result = boxed_arm_future(|| self.flush_routed_effects()).await;
+                #[cfg(test)]
+                let result =
+                    if take_mob_seam_for_test(&FAIL_BOUNDARY_FLUSH_FOR_MOB, &self.definition.id) {
+                        Err(MobError::WiringError(
+                            "test seam: the boundary flush fails".to_string(),
+                        ))
+                    } else {
+                        result
+                    };
                 match Self::classify_actor_boundary_flush(result) {
                     ActorBoundaryFlushDisposition::Drained => break,
                     ActorBoundaryFlushDisposition::RetryAfterMachineClosure(error) => {
@@ -29186,6 +29693,9 @@ impl MobActor {
                         );
                     }
                     ActorBoundaryFlushDisposition::Fatal(error) => {
+                        // The actor takes no further command: admission
+                        // closes first, so no owner lease is granted on it.
+                        self.close_admission_for_exit(MobAdmissionCloseReason::DispatchFailed);
                         tracing::error!(
                             mob_id = %self.definition.id,
                             error = %error,
@@ -30071,6 +30581,14 @@ impl MobActor {
         };
         let entries = self.roster.read().await.list().cloned().collect::<Vec<_>>();
         for entry in entries {
+            // A member whose host refused its registration at this boot keeps
+            // no registration and no owner context until a host-approved
+            // materialization: the refusal removed the registration it was
+            // asked about. Any other restore failure is retryable and keeps
+            // this restore, which its repair reuses.
+            if self.member_registration_refused(&entry.agent_identity) {
+                continue;
+            }
             if let Some(plan) = self.prepare_restored_member_operation_binding(entry)? {
                 Self::realize_restored_member_operation_binding(
                     io.clone(),
@@ -35785,12 +36303,21 @@ impl MobActor {
                 roster.get(&agent_identity).cloned()
             };
             if let Some(entry) = entry {
+                // A member whose runtime needs a durability reload answers
+                // typed before the cancel takes its session's gates. The
+                // cancel point's own typed refusal stays the authority for a
+                // runtime that degrades after this read.
+                self.ensure_member_runtime_durability_ready(&entry).await?;
                 let member_ref = self.machine_member_ref_for_behavior(&entry, "force cancel")?;
                 let expected_member = placed
                     .then(|| self.placed_member_incarnation(&entry))
                     .transpose()?;
                 self.provisioner
-                    .cancel_member_admitted_work(&member_ref, expected_member.as_ref())
+                    .cancel_member_admitted_work(
+                        &member_ref,
+                        &entry.agent_identity,
+                        expected_member.as_ref(),
+                    )
                     .await?;
             } else {
                 tracing::warn!(
@@ -36306,6 +36833,7 @@ impl MobActor {
             binding_generation,
             source_member.clone(),
             request,
+            self.fork_instruction_policy,
         )
         .ok_or_else(|| {
             Self::forked_participant_refused(
@@ -36406,7 +36934,7 @@ impl MobActor {
             .member_placement
             .get(&dsl_identity)
             .cloned();
-        match placement {
+        let created = match placement {
             Some(host_id) => {
                 self.create_placed_forked_participant(&entry, host_id, &request)
                     .await
@@ -36417,10 +36945,10 @@ impl MobActor {
                 let service =
                     self.local_forked_participant_service(&source_identity, realm_id.clone())?;
                 service
-                    .create(
+                    .create_with_fork_instruction_policy(
                         &ForkedParticipantRequest {
                             request_id: request.request_id.clone(),
-                            source_identity,
+                            source_identity: source_identity.clone(),
                             source_session_id,
                             owner_route: ForkedParticipantOwnerRoute::Local { realm_id },
                             prefix_message_count: request.prefix_message_count,
@@ -36428,11 +36956,65 @@ impl MobActor {
                             reuse: request.reuse,
                             ttl: request.ttl,
                         },
+                        self.fork_instruction_policy,
                         chrono::Utc::now(),
                     )
                     .await
                     .map_err(Self::forked_participant_refused)
             }
+        };
+        let policy_carried = super::forked_participant_routing::carried_fork_instruction_policy(
+            self.fork_instruction_policy,
+        )
+        .is_some();
+        created.map_err(|error| {
+            Self::forked_participant_create_error(&source_identity, policy_carried, error)
+        })
+    }
+
+    /// Type one capability creation failure. A participant fork that the fork
+    /// instruction policy refused is the same [`MobError::ForkInstructionRefused`]
+    /// whether its source is local (the source runtime's typed session error)
+    /// or placed (the member host's typed bridge rejection).
+    ///
+    /// A member host that predates the policy refuses a create payload that
+    /// carries it (its payload type denies unknown fields) as an unsupported
+    /// command. When `policy_carried`, that rejection is the typed version
+    /// skew [`meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported`].
+    fn forked_participant_create_error(
+        source_identity: &AgentIdentity,
+        policy_carried: bool,
+        error: MobError,
+    ) -> MobError {
+        match error {
+            MobError::ForkedParticipantRefused(refused) => match *refused {
+                crate::forked_participant::ForkedParticipantError::Session(
+                    meerkat_core::SessionError::ForkInstructionRefused(refusal),
+                ) => MobError::ForkInstructionRefused {
+                    source_member_id: source_identity.clone(),
+                    refusal,
+                },
+                refused => MobError::ForkedParticipantRefused(Box::new(refused)),
+            },
+            MobError::BridgeCommandRejected {
+                cause:
+                    super::bridge_protocol::BridgeRejectionCause::ForkInstructionRefused { refusal },
+                ..
+            } => MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal,
+            },
+            MobError::BridgeCommandRejected {
+                cause: super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                ..
+            } if policy_carried => MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal: meerkat_core::ForkInstructionRefusal::new(
+                    meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported,
+                    Vec::new(),
+                ),
+            },
+            error => error,
         }
     }
 
@@ -38577,7 +39159,7 @@ impl MobActor {
         mode: MemberLiveReconcileMode,
     ) -> Result<(), MobError> {
         match completion {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             MemberLiveMutationCompletion::AwaitedActorForTest => Ok(()),
             MemberLiveMutationCompletion::Open {
                 agent_identity,
@@ -42118,6 +42700,7 @@ impl MobActor {
                 content_taint: None,
                 handling_mode,
                 objective_id: None,
+                in_reply_to: None,
             },
         };
         Ok(PeerMessageDeliveryPlan {
@@ -44206,6 +44789,8 @@ impl MobActor {
                 "destroy_retry_runtime_retire_after_detach_ack",
             )
             .await?;
+            #[cfg(feature = "runtime-adapter")]
+            self.drop_released_refused_member_retire_route(entry).await;
             return self.flush_routed_effects().await;
         }
 
@@ -44314,6 +44899,8 @@ impl MobActor {
                 )));
             }
         }
+        #[cfg(feature = "runtime-adapter")]
+        self.drop_released_refused_member_retire_route(entry).await;
         self.flush_routed_effects().await
     }
 
@@ -45419,6 +46006,7 @@ impl MobActor {
             historical_trust_unwire_authorities_by_peer: trust_cleanup_plan
                 .historical_trust_unwire_authorities_by_peer,
             retirement_deadline: None,
+            registration_refused: false,
         }
     }
 
@@ -46677,13 +47265,27 @@ impl MobActor {
             member_ref = ?ctx.entry.member_ref,
             "MobActor::dispose_archive_session retiring member via provisioner"
         );
-        let disposal_result = match ctx.retirement_deadline {
-            Some(deadline) => {
-                self.provisioner
-                    .retire_member_until(&ctx.entry.member_ref, &ctx.entry.agent_identity, deadline)
-                    .await
+        let disposal_result = if ctx.registration_refused {
+            self.provisioner
+                .retire_refused_member(
+                    &ctx.entry.member_ref,
+                    &ctx.entry.agent_identity,
+                    ctx.retirement_deadline,
+                )
+                .await
+        } else {
+            match ctx.retirement_deadline {
+                Some(deadline) => {
+                    self.provisioner
+                        .retire_member_until(
+                            &ctx.entry.member_ref,
+                            &ctx.entry.agent_identity,
+                            deadline,
+                        )
+                        .await
+                }
+                None => self.provisioner.retire_member(&ctx.entry.member_ref).await,
             }
-            None => self.provisioner.retire_member(&ctx.entry.member_ref).await,
         };
         let disposal = match disposal_result {
             Ok(disposal) => disposal,
@@ -46789,6 +47391,29 @@ impl MobActor {
     /// Prune edge locks for the member. Infallible.
     async fn dispose_prune_edge_locks(&self, ctx: &DisposalContext) {
         self.edge_locks.prune(ctx.agent_identity.as_str()).await;
+    }
+
+    /// Drop the `MobStop` a Stop staged for a member whose session is
+    /// disposed for good, by a retire or a destroy (#1500), so a later
+    /// registration of the same session is not held for it. The runtime's
+    /// unregister keeps staged reasons on purpose: a reload unregisters and
+    /// registers the same session again while the mob is Stopped. A failure
+    /// is logged only: the member is gone either way.
+    async fn unstage_departed_member_mob_stop(&self, entry: &RosterEntry) {
+        if let Err(error) = self
+            .provisioner
+            .unstage_member_registration_run_start_hold(
+                &entry.member_ref,
+                meerkat_runtime::RunStartHoldReason::MobStop,
+            )
+            .await
+        {
+            tracing::warn!(
+                agent_identity = %entry.agent_identity,
+                error = %error,
+                "dropping the staged MobStop of a departed member failed"
+            );
+        }
     }
 
     /// Remove only the exact retired incarnation from the roster.
@@ -48091,12 +48716,13 @@ impl MobActor {
         trust_cleanup_plan: RetireTrustCleanupPlan,
         report: &mut super::handle::MobDestroyReport,
     ) -> Result<(), super::handle::MobDestroyError> {
-        let ctx = Self::disposal_context_from_entry(
+        let mut ctx = Self::disposal_context_from_entry(
             &entry.agent_identity,
             &entry,
             trust_cleanup_plan,
             false,
         );
+        ctx.registration_refused = self.member_registration_refused(&entry.agent_identity);
         // Every step below is built in its own frame: at opt-level 0 each
         // awaited future reserved twice its size in this poll frame, beneath
         // the member's whole disposal.
@@ -48125,6 +48751,7 @@ impl MobActor {
                 });
             }
         }
+        self.unstage_departed_member_mob_stop(&entry).await;
         if let Err(error) = boxed_arm_future(|| {
             self.release_forked_participant_attachments_for_member(&entry.agent_identity)
         })
@@ -48533,6 +49160,9 @@ impl MobActor {
             report.push_error(format!("destroy marker append failed: {error}"));
             return Err(MobDestroyError::Incomplete { report });
         }
+        // The destroy is admitted (its durable marker is written, now or by
+        // an earlier attempt): admission closes before any destroy cleanup.
+        self.close_admission_for_exit(MobAdmissionCloseReason::Destroyed);
         Ok(DestroyAdmission {
             report,
             destroy_input_needed,
@@ -48620,6 +49250,42 @@ impl MobActor {
                 if let Err(error) =
                     boxed_arm_future(|| self.admit_member_retire_for_destroy(entry)).await
                 {
+                    // A boundary commit that fails while the ingress detach
+                    // waits for the session's mutation gate makes this
+                    // admission refuse typed for the degraded durability.
+                    // Reload the degraded member and retry its admission
+                    // once: the retry takes the pending detach the failed
+                    // attempt recorded.
+                    #[cfg(feature = "runtime-adapter")]
+                    match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry))
+                        .await
+                    {
+                        Ok(true) => {
+                            if !report.reloaded_members.contains(&entry.agent_identity) {
+                                report.reloaded_members.push(entry.agent_identity.clone());
+                            }
+                            if let Err(error) =
+                                boxed_arm_future(|| self.admit_member_retire_for_destroy(entry))
+                                    .await
+                            {
+                                report.push_error(format!(
+                                    "{}: destroy retire admission failed after the member's durability reload: {error}",
+                                    entry.agent_identity
+                                ));
+                                return Err(MobDestroyError::Incomplete { report });
+                            }
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(reload_error) => {
+                            report.push_error(format!(
+                                "{}: destroy retire admission failed: {error}",
+                                entry.agent_identity
+                            ));
+                            report.push_error(reload_error);
+                            return Err(MobDestroyError::Incomplete { report });
+                        }
+                    }
                     report.push_error(format!(
                         "{}: destroy retire admission failed: {error}",
                         entry.agent_identity
@@ -54749,7 +55415,11 @@ impl MobActor {
         let machine_member_ref =
             self.machine_member_ref_for_behavior(&entry, "cancel all work interrupt")?;
         self.provisioner
-            .cancel_member_admitted_work(&machine_member_ref, expected_member.as_ref())
+            .cancel_member_admitted_work(
+                &machine_member_ref,
+                &entry.agent_identity,
+                expected_member.as_ref(),
+            )
             .await
     }
 

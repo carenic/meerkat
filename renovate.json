@@ -58,6 +58,13 @@
       "automerge": false
     },
     {
+      "description": "The YAML parser reads SKILL.md frontmatter that arrives from HTTP and git sources: serde-saphyr is pinned exactly in Cargo.toml, and a new version of it or of its parser granit-parser is proposed a week after its release and never automerged.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["serde-saphyr", "granit-parser"],
+      "minimumReleaseAge": "7 days",
+      "automerge": false
+    },
+    {
       "description": "GitHub Actions run with the workflow token, OIDC and release secrets: pinned to commit SHAs (helpers:pinGitHubActionDigests, checked by scripts/ci-action-pins.mjs), new versions proposed a week after their release, in a group of their own, and never automerged. Keep this rule last.",
       "matchManagers": ["github-actions"],
       "groupName": "github actions",

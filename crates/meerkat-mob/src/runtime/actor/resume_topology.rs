@@ -1462,6 +1462,7 @@ where
             bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
             reason,
             hold: None,
+            registration_refusal: None,
         },
     ));
     Ok(())

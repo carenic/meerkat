@@ -10,7 +10,8 @@ use futures::StreamExt;
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
     AssistantBlock, ContentBlock, HttpAuthorizationRequest, HttpAuthorizer, ImageData, Message,
-    OutputSchema, Provider, StopReason, SystemNoticeBlock, SystemNoticeMessage, Usage,
+    OutputSchema, Provider, ProviderStopDetail, StopReason, SystemNoticeBlock, SystemNoticeMessage,
+    Usage,
 };
 use meerkat_llm_core::LlmError;
 use meerkat_llm_core::{
@@ -959,6 +960,11 @@ impl OpenAiCompatibleClient {
                     // request asked for. The latch is spent exactly once, by
                     // the terminal emission below.
                     let mut latched_stop: Option<StopReason> = None;
+                    // The provider's account of a latched refusal or filter.
+                    let mut latched_detail: Option<ProviderStopDetail> = None;
+                    // A refusal the model streams in `delta.refusal`: never
+                    // answer text, it ends the response as a refusal.
+                    let mut refusal_text = String::new();
                     // The instant the latch was taken, which is where the
                     // post-finish trailer window starts. `time_compat::Instant`
                     // is the browser-safe monotonic clock; this path is compiled
@@ -1169,6 +1175,9 @@ impl OpenAiCompatibleClient {
                                             meta: None,
                                         };
                                     }
+                                    if let Some(Value::String(refusal)) = delta.refusal {
+                                        refusal_text.push_str(&refusal);
+                                    }
                                     if let Some(tool_calls) = delta.tool_calls {
                                         for tool_call in tool_calls {
                                             let index = tool_call.index.unwrap_or(0);
@@ -1206,8 +1215,10 @@ impl OpenAiCompatibleClient {
                                 }
 
                                 if let Some(finish_reason) = choice.finish_reason {
-                                    let stop_reason =
-                                        chat_finish_reason_stop(finish_reason.as_str())?;
+                                    let (stop_reason, stop_detail) = chat_finish_stop(
+                                        finish_reason.as_str(),
+                                        std::mem::take(&mut refusal_text),
+                                    )?;
                                     if matches!(stop_reason, StopReason::ToolUse) {
                                         for buffer in tool_buffers.values() {
                                             if let Some(tool_call) = buffer.try_complete()? {
@@ -1235,6 +1246,7 @@ impl OpenAiCompatibleClient {
                                     // follows this finish event is still
                                     // read. The trailer window starts here.
                                     latched_stop = Some(stop_reason);
+                                    latched_detail = stop_detail;
                                     latched_at =
                                         Some(meerkat_core::time_compat::Instant::now());
                                 }
@@ -1271,10 +1283,20 @@ impl OpenAiCompatibleClient {
                         };
                     }
                     // The single terminal emission, after every usage event the
-                    // server chose to send.
+                    // server chose to send. A refusal streamed without a
+                    // finish reason still ends the response as a refusal.
+                    if latched_stop.is_none() && !refusal_text.is_empty() {
+                        latched_stop = Some(StopReason::Refusal);
+                        latched_detail = Some(ProviderStopDetail::openai(
+                            "refusal",
+                            Some(std::mem::take(&mut refusal_text)),
+                        ));
+                    }
+                    let stop_reason = latched_stop.unwrap_or(StopReason::EndTurn);
                     yield LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: latched_stop.unwrap_or(StopReason::EndTurn),
+                        outcome: match latched_detail {
+                            Some(detail) => LlmDoneOutcome::success_with_detail(stop_reason, detail),
+                            None => LlmDoneOutcome::success(stop_reason),
                         },
                     };
                 });
@@ -1503,6 +1525,10 @@ struct ChatChoice {
 struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
+    /// The model's refusal, streamed instead of content, as raw evidence: a
+    /// value that is not a string reads as no text.
+    #[serde(default)]
+    refusal: Option<Value>,
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
@@ -1543,6 +1569,31 @@ struct ChatUsage {
     prompt_tokens_details: Option<ChatPromptTokensDetails>,
     #[serde(default)]
     completion_tokens_details: Option<ChatCompletionTokensDetails>,
+}
+
+/// The stop of one Chat Completions response and the provider's account of
+/// it. A refusal the model streamed in `delta.refusal` wins over the finish
+/// reason, as an Anthropic refusal does: nothing of a refused response is
+/// committed, and the refusal text travels as the stop's provider detail. A
+/// `content_filter` finish carries its raw reason.
+fn chat_finish_stop(
+    finish_reason: &str,
+    refusal_text: String,
+) -> Result<(StopReason, Option<ProviderStopDetail>), LlmError> {
+    let stop_reason = chat_finish_reason_stop(finish_reason)?;
+    if !refusal_text.is_empty() {
+        return Ok((
+            StopReason::Refusal,
+            Some(ProviderStopDetail::openai("refusal", Some(refusal_text))),
+        ));
+    }
+    Ok(match stop_reason {
+        StopReason::ContentFilter => (
+            StopReason::ContentFilter,
+            Some(ProviderStopDetail::openai(finish_reason, None)),
+        ),
+        stop_reason => (stop_reason, None),
+    })
 }
 
 /// Map one Chat Completions `finish_reason`.
@@ -2361,6 +2412,8 @@ mod tests {
                         ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
                             .expect("structured response block"),
                     ],
+                    delivery_id: None,
+                    in_reply_to: None,
                 },
             ))])
             .expect("project chat messages");
@@ -2573,7 +2626,7 @@ mod tests {
         // `panic!` arm (which `-D clippy::panic` rejects).
         let rendered = match outcome {
             LlmDoneOutcome::Error { error } => error.to_string(),
-            LlmDoneOutcome::Success { stop_reason } => {
+            LlmDoneOutcome::Success { stop_reason, .. } => {
                 format!("SUCCESS({stop_reason:?}) - the turn was not failed at all")
             }
         };
@@ -2665,7 +2718,8 @@ mod tests {
         assert!(matches!(
             observed_done_outcome(&events),
             Some(LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn
+                stop_reason: StopReason::EndTurn,
+                ..
             })
         ));
     }
@@ -2697,7 +2751,8 @@ mod tests {
             matches!(
                 observed_done_outcome(&events),
                 Some(LlmDoneOutcome::Success {
-                    stop_reason: StopReason::MaxTokens
+                    stop_reason: StopReason::MaxTokens,
+                    ..
                 })
             ),
             "the deferred Done must carry the remembered finish reason, got {events:?}"
@@ -2740,6 +2795,116 @@ mod tests {
         }
     }
 
+    /// A refusal the model streams in `delta.refusal` is never
+    /// answer text. It wins over the finish reason and ends the response as a
+    /// refusal, its text the stop's provider detail.
+    #[tokio::test]
+    async fn chat_completions_refusal_ends_as_a_refusal_with_its_text() {
+        for (label, stream) in [
+            (
+                "finish stop",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"I can't \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"help with that.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            ),
+            (
+                "no finish reason",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"refusal\":\"I can't help with that.\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            ),
+        ] {
+            let events = collect_chat_stream_events(stream).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::TextDelta { .. })),
+                "{label}: a refusal is never answer text: {events:?}"
+            );
+            assert_eq!(done_count(&events), 1, "{label}: {events:?}");
+            match observed_done_outcome(&events) {
+                Some(LlmDoneOutcome::Success {
+                    stop_reason: StopReason::Refusal,
+                    stop_detail,
+                    ..
+                }) => assert_eq!(
+                    stop_detail.as_deref(),
+                    Some(&ProviderStopDetail::openai(
+                        "refusal",
+                        Some("I can't help with that.".to_string())
+                    )),
+                    "{label}"
+                ),
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// #1888: a `delta.refusal` that is not a string never fails the chunk
+    /// that carries it: it reads as no text, and the rest of the refusal
+    /// still ends the response as a refusal.
+    #[tokio::test]
+    async fn chat_completions_malformed_refusal_piece_never_fails_the_stream() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"refusal\":7}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"I can't help with that.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        assert_eq!(done_count(&events), 1, "{events:?}");
+        match observed_done_outcome(&events) {
+            Some(LlmDoneOutcome::Success {
+                stop_reason: StopReason::Refusal,
+                stop_detail,
+                ..
+            }) => assert_eq!(
+                stop_detail.as_deref(),
+                Some(&ProviderStopDetail::openai(
+                    "refusal",
+                    Some("I can't help with that.".to_string())
+                ))
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A `content_filter` finish carries its raw reason as provider detail; a
+    /// natural stop carries none.
+    #[tokio::test]
+    async fn chat_completions_content_filter_carries_its_reason() {
+        for (finish_reason, expected_stop, expected_detail) in [
+            (
+                "content_filter",
+                StopReason::ContentFilter,
+                Some(ProviderStopDetail::openai("content_filter", None)),
+            ),
+            ("stop", StopReason::EndTurn, None),
+        ] {
+            let stream = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}},\"finish_reason\":\"{finish_reason}\"}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let events = collect_chat_stream_events(&stream).await;
+            match observed_done_outcome(&events) {
+                Some(LlmDoneOutcome::Success {
+                    stop_reason,
+                    stop_detail,
+                    ..
+                }) => {
+                    assert_eq!(*stop_reason, expected_stop, "{finish_reason}");
+                    assert_eq!(
+                        stop_detail.as_deref(),
+                        expected_detail.as_ref(),
+                        "{finish_reason}"
+                    );
+                }
+                other => panic!("{finish_reason}: {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn chat_completions_separate_usage_event_terminates_without_done_sentinel() {
         // Same split chunking, but the server closes the body instead of
@@ -2775,7 +2940,8 @@ mod tests {
         assert!(matches!(
             observed_done_outcome(&events),
             Some(LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn
+                stop_reason: StopReason::EndTurn,
+                ..
             })
         ));
     }
@@ -2793,7 +2959,8 @@ mod tests {
         assert!(matches!(
             observed_done_outcome(&events),
             Some(LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn
+                stop_reason: StopReason::EndTurn,
+                ..
             })
         ));
     }
@@ -2861,7 +3028,8 @@ mod tests {
             matches!(
                 observed_done_outcome(events),
                 Some(LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn
+                    stop_reason: StopReason::EndTurn,
+                    ..
                 })
             ),
             "an unclosed body after the latch is END OF STREAM carrying the latched stop \
@@ -2910,7 +3078,8 @@ mod tests {
             matches!(
                 observed_done_outcome(events),
                 Some(LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn
+                    stop_reason: StopReason::EndTurn,
+                    ..
                 })
             ),
             "endless keepalive comments after the latch must end the stream successfully; \
@@ -2960,7 +3129,8 @@ mod tests {
             matches!(
                 observed_done_outcome(events),
                 Some(LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn
+                    stop_reason: StopReason::EndTurn,
+                    ..
                 })
             ),
             "an unclosed body with no trailer at all is still END OF STREAM; got {events:?}"
@@ -3020,7 +3190,8 @@ mod tests {
                     assert!(matches!(
                         outcome,
                         LlmDoneOutcome::Success {
-                            stop_reason: StopReason::ToolUse
+                            stop_reason: StopReason::ToolUse,
+                            ..
                         }
                     ));
                 }
@@ -3265,6 +3436,108 @@ mod tests {
             "a combined delta must emit its reasoning before its content"
         );
         handle.abort();
+    }
+
+    /// The transcript a durable in-turn steer leaves when it joins a running
+    /// turn at the boundary after a tool call: the call, its result, the row
+    /// the steer wrote, then the model's next answer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
+        vec![
+            Message::User(UserMessage::text("start the job")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "call_1".to_string(),
+                "lookup result".to_string(),
+                false,
+            )]),
+            steer_row,
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "noted".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+        ]
+    }
+
+    /// Encodes `steer_row` after the tool results: the assistant tool call,
+    /// then its tool message with nothing between them, then the steer as
+    /// a user message of its own, never merged into the tool output.
+    fn assert_durable_in_turn_chat_order(steer_row: Message, steer_text: &str) {
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            "http://localhost:11434/v1".to_string(),
+            None,
+            options(true, true, true, false),
+        );
+        let request = LlmRequest::new("gemma-4-31b", durable_in_turn_transcript_with(steer_row));
+        let body = client
+            .build_chat_completions_body(&request)
+            .expect("body should build");
+        let messages = body["messages"].as_array().expect("chat messages array");
+        let call_index = messages
+            .iter()
+            .position(|message| {
+                message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty())
+            })
+            .expect("assistant tool call message");
+        assert_eq!(messages[call_index]["role"], "assistant");
+        assert_eq!(messages[call_index]["tool_calls"][0]["id"], "call_1");
+        let output_index = messages
+            .iter()
+            .position(|message| message["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(messages[output_index]["tool_call_id"], "call_1");
+        assert_eq!(
+            output_index,
+            call_index + 1,
+            "nothing sits between the call and its output"
+        );
+        assert!(
+            !messages[output_index].to_string().contains(steer_text),
+            "the steer is never merged into the tool output"
+        );
+        let steer_index = messages
+            .iter()
+            .position(|message| message.to_string().contains(steer_text))
+            .expect("steer message");
+        assert_eq!(
+            steer_index,
+            output_index + 1,
+            "the steer's row directly follows the tool output"
+        );
+        assert_eq!(messages[steer_index]["role"], "user");
+    }
+
+    #[test]
+    fn durable_in_turn_notice_after_tool_results_builds_a_valid_chat_body() {
+        assert_durable_in_turn_chat_order(
+            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            )),
+            "background job finished",
+        );
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_chat_body() {
+        assert_durable_in_turn_chat_order(
+            Message::User(UserMessage::text("also check the second file")),
+            "also check the second file",
+        );
     }
 
     #[test]

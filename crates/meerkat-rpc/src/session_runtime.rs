@@ -6692,6 +6692,18 @@ impl SessionRuntime {
             .await
     }
 
+    /// Record the accounting of a live response that ended without
+    /// completing (#1883): its usage, or the routed unmeasured fact.
+    pub async fn record_live_turn_accounting(
+        &self,
+        session_id: &SessionId,
+        accounting: meerkat_core::live_adapter::LiveResponseAccounting,
+    ) -> Result<(), SessionError> {
+        self.service
+            .record_live_turn_accounting(session_id, accounting)
+            .await
+    }
+
     /// Record a live transport output-audio delivery degradation, routing
     /// the typed fact onto the session's owned event stream via the canonical
     /// [`SessionService::record_live_output_audio_degraded`] seam (K16).
@@ -12596,7 +12608,10 @@ impl SessionRuntime {
                 None => return Ok(()),
             }
         };
-        retirement
+        // A notification registration the retirement left with the process
+        // never reads or writes the store, so the retirement is complete;
+        // the join traced its directory.
+        let _retired = retirement
             .join(bound)
             .await
             .map_err(|incomplete| meerkat_core::SessionError::Store(Box::new(incomplete)))?;
@@ -13642,17 +13657,14 @@ impl SessionRuntime {
                 ?restore,
                 "did not restore the session's MCP attachment"
             );
-            let _ = lifecycle_tx.send(McpLifecycleAction {
-                target: outcome.server_name,
-                operation: ToolConfigChangeOperation::Add,
-                phase: meerkat_core::ExternalToolDeltaPhase::Failed,
-                persisted: false,
-                applied_at_turn: None,
-                tool_count: None,
-                detail: None,
-                confinement_refusal: None,
-                restore: Some(restore),
-            });
+            let _ = lifecycle_tx.send(
+                McpLifecycleAction::new(
+                    outcome.server_name,
+                    ToolConfigChangeOperation::Add,
+                    meerkat_core::ExternalToolDeltaPhase::Failed,
+                )
+                .with_restore(Some(restore)),
+            );
         }
     }
 
@@ -15594,9 +15606,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -15656,9 +15666,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -15815,9 +15823,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -16898,9 +16904,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -16952,9 +16956,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -17010,9 +17012,7 @@ mod tests {
                         ),
                     }),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ]))
             } else {
@@ -20565,9 +20565,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -20750,9 +20748,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -20884,9 +20880,7 @@ mod tests {
                 meta: None,
             },
             meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
             },
         ])));
         build.output_schema = Some(meerkat_core::OutputSchema::from_json_value(
@@ -21100,9 +21094,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::ToolUse,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::ToolUse),
                     }),
                 ],
                 None => vec![
@@ -21112,9 +21104,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             };
@@ -22825,6 +22815,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -22946,6 +22937,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -23123,6 +23115,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -23246,6 +23239,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -25271,6 +25265,7 @@ mod tests {
         assert_eq!(identity.model, "gpt-5.4");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     fn mcp_server_config(server_name: &str) -> McpServerConfig {
         McpServerConfig::stdio(
@@ -27608,6 +27603,7 @@ mod tests {
             content: "working".to_string().into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+            in_reply_to: None,
         });
 
         let rejected = runtime
@@ -33786,6 +33782,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn start_turn_applies_staged_mcp_remove_and_reload_at_turn_boundary() {
@@ -33862,6 +33859,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn async_mcp_removal_timeout_is_emitted_on_next_boundary() {
@@ -33970,6 +33968,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn staged_ops_remain_boundary_gated_while_background_drain_runs() {
@@ -34132,6 +34131,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn queued_lifecycle_actions_survive_boundary_apply_failure() {

@@ -1272,7 +1272,12 @@ impl AgentMobToolSurface {
             self.owner_bridge_session_id.clone(),
         )
         .await
-        .map_err(|e| Self::map_mob_error(call, e))?;
+        .map_err(|e| match e {
+            MobError::ToolBundleNotOffered { .. } => {
+                ToolError::invalid_arguments(call.name, e.to_string())
+            }
+            e => Self::map_mob_error(call, e),
+        })?;
         let authority_context = meerkat_runtime::mob_operator_authority::grant_manage_mob(
             &authority_context,
             created.mob_id.as_str(),
@@ -4234,6 +4239,7 @@ mod tests {
                 lifecycle_capabilities: None,
                 non_portable_disabled: None,
                 preview_unavailable,
+                registration_refusal: None,
             }
         };
         let note = |marker: Option<Marker>, run_state: Option<WireMemberRunState>| {

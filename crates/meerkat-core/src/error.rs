@@ -218,6 +218,10 @@ pub enum ToolError {
 
     /// The affected operation was refused by its governed authorization owner.
     /// This is an ordinary tool result, never a run or session disposition.
+    /// Its model payload's `data` is exactly the closed refusal kind and
+    /// whether the guarded tool code ran (`tool_invoked`: `false` when a
+    /// core certifier met the refusal before invoking it, `"unknown"`
+    /// otherwise); see [`crate::authorization::RefusalDispatch`].
     #[error("{refusal}")]
     AuthorizationRefused {
         refusal: crate::authorization::OperationRefused,
@@ -498,7 +502,40 @@ impl ToolError {
                 approval_id: Some(approval_id),
             } => Some(serde_json::json!({ "kind": kind, "approval_id": approval_id })),
             Self::ReviewUnavailable { kind } => Some(serde_json::json!({ "kind": kind })),
+            // The closed refusal kind and whether the guarded tool code ran,
+            // nothing else: no policy detail, owner data or audit content,
+            // and neither is a permission. `tool_invoked` is always present,
+            // so its absence can never read as "not invoked".
+            Self::AuthorizationRefused { refusal } => Some(serde_json::json!({
+                "kind": refusal.kind(),
+                "tool_invoked": match refusal.dispatch() {
+                    crate::authorization::RefusalDispatch::NotDispatched => {
+                        serde_json::Value::Bool(false)
+                    }
+                    crate::authorization::RefusalDispatch::Unknown => {
+                        serde_json::Value::from("unknown")
+                    }
+                },
+            })),
             _ => None,
+        }
+    }
+
+    /// This error, met before the tool code its certifier guards ran: an
+    /// operation refusal (also beneath settlement failures) is certified
+    /// [`crate::authorization::RefusalDispatch::NotDispatched`]; every other
+    /// error is unchanged.
+    #[must_use]
+    pub(crate) fn not_dispatched(self) -> Self {
+        match self {
+            Self::AuthorizationRefused { refusal } => Self::AuthorizationRefused {
+                refusal: refusal.not_dispatched(),
+            },
+            Self::WithSettlementFailures { error, failures } => Self::WithSettlementFailures {
+                error: Box::new(error.not_dispatched()),
+                failures,
+            },
+            other => other,
         }
     }
     pub fn outcome_uncertain(name: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -637,7 +674,14 @@ pub enum AgentError {
     #[error("Max tokens reached on turn {turn}, partial output: {partial}")]
     MaxTokensReached { turn: u32, partial: String },
     #[error("Content filtered on turn {turn}")]
-    ContentFiltered { turn: u32 },
+    ContentFiltered {
+        turn: u32,
+        /// Which refusing stop the provider ended the response with.
+        stop: crate::types::ContentFilteredStop,
+        /// The provider's own account of the refusal or filter, carried as
+        /// tagged provider data. Nothing in core reads it.
+        detail: Option<Box<crate::types::ProviderStopDetail>>,
+    },
     #[error("Max turns reached: {turns}")]
     MaxTurnsReached { turns: u32 },
     #[error("Run was cancelled")]
@@ -796,6 +840,28 @@ pub enum AgentError {
         hook_id: HookId,
         reason: crate::hooks::HookFailureReason,
     },
+
+    /// A live client replacement named a model other than the session's
+    /// durable identity. A model change goes through
+    /// `Agent::hot_swap_llm_identity`, which publishes the client, the
+    /// durable identity and the active model profile together.
+    #[error(
+        "replacing the client cannot change the session's model from {}:{durable_model} to {}:{requested_model}; change it with hot_swap_llm_identity",
+        .durable_provider.as_str(),
+        .requested_provider.as_str()
+    )]
+    ClientModelChangeRequiresHotSwap {
+        durable_provider: crate::Provider,
+        durable_model: String,
+        requested_provider: crate::Provider,
+        requested_model: String,
+    },
+
+    /// The session's instruction activation history refused a model turn,
+    /// typically a fork child whose inherited keys were never activated in
+    /// the child. No model request was made.
+    #[error("instruction activation refused the turn: {0}")]
+    InstructionActivation(crate::InstructionActivationError),
 }
 
 impl From<crate::OperationAuthorizationError> for AgentError {
@@ -1572,6 +1638,58 @@ mod tests {
             AgentError::callback_pending_with_settlement(call),
             AgentError::CallbackPending { .. }
         ));
+    }
+
+    /// The model payload of an operation refusal carries exactly the closed
+    /// kind and whether the guarded tool code ran, for every kind and both
+    /// facts, also beneath settlement failures: an uncertified refusal
+    /// renders an explicit "unknown", never an absent key. The message and
+    /// the code stay uniform.
+    #[test]
+    fn an_operation_refusal_payload_carries_exactly_its_kind_and_dispatch_fact() {
+        use crate::authorization::{OperationRefusalKind, OperationRefused};
+        let marker = crate::ToolDispatchSettlementFailure {
+            admission_source: crate::ToolDispatchAdmissionSource::ConfiguredGate,
+            effect_kind: crate::LiveBridgeEffectKind::ToolDispatch,
+            physical_outcome: crate::LiveBridgeEffectOutcome::Failed,
+            failure_kind: crate::ToolDispatchTerminalErrorKind::Unavailable,
+        };
+        for kind in [
+            OperationRefusalKind::ReprepareRequired,
+            OperationRefusalKind::Denied,
+            OperationRefusalKind::MalformedFacts,
+        ] {
+            let unknown = ToolError::AuthorizationRefused {
+                refusal: OperationRefused::new(kind),
+            };
+            for (error, tool_invoked) in [
+                (unknown.clone(), serde_json::json!("unknown")),
+                (unknown.clone().not_dispatched(), serde_json::json!(false)),
+                (
+                    unknown
+                        .clone()
+                        .with_settlement_failures(vec![marker.clone()])
+                        .not_dispatched(),
+                    serde_json::json!(false),
+                ),
+            ] {
+                let payload = error.to_error_payload();
+                assert_eq!(
+                    payload["data"],
+                    serde_json::json!({"kind": kind, "tool_invoked": tool_invoked}),
+                    "{kind:?}"
+                );
+                let keys = payload["data"]
+                    .as_object()
+                    .map(|data| data.keys().map(String::as_str).collect::<Vec<_>>());
+                assert_eq!(keys, Some(vec!["kind", "tool_invoked"]), "{kind:?}");
+                assert_eq!(payload["error"], "operation_refused");
+                assert_eq!(
+                    payload["message"],
+                    "operation unavailable under current authorization"
+                );
+            }
+        }
     }
 
     #[test]

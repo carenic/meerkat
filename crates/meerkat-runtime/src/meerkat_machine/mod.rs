@@ -957,9 +957,21 @@ enum PersistentAuthAuthorityKey {
     Process(usize),
 }
 
+/// One store key's provider-auth authority bundle. Creating the bundle
+/// rehydrates the store's OAuth flows (a store read, and a write back when
+/// flows were persisted), so it runs under this slot's own lock: callers for
+/// one key wait for that key's bundle, callers for other keys never do.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct PersistentAuthAuthoritySlot {
+    bundle: StdMutex<Option<Arc<PersistentAuthAuthorityBundle>>>,
+}
+
+/// Every store key's slot. The map's lock covers only the slot lookup, and
+/// nothing takes it while holding a slot's lock.
 #[cfg(not(target_arch = "wasm32"))]
 static PERSISTENT_AUTH_AUTHORITIES: OnceLock<
-    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthorityBundle>>>,
+    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthoritySlot>>>,
 > = OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1016,19 +1028,43 @@ impl ProviderAuthRuntimeAuthority {
 fn persistent_auth_authorities(
     store: &Arc<dyn RuntimeStore>,
 ) -> Arc<PersistentAuthAuthorityBundle> {
-    let key = runtime_store_identity(store);
+    persistent_auth_authorities_for_key(runtime_store_identity(store), store)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authority_slot(
+    key: PersistentAuthAuthorityKey,
+) -> Arc<PersistentAuthAuthoritySlot> {
     let authorities = PERSISTENT_AUTH_AUTHORITIES.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut authorities = authorities
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = authorities.get(&key) {
+    Arc::clone(authorities.entry(key).or_default())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authorities_for_key(
+    key: PersistentAuthAuthorityKey,
+    store: &Arc<dyn RuntimeStore>,
+) -> Arc<PersistentAuthAuthorityBundle> {
+    let durable = matches!(key, PersistentAuthAuthorityKey::Durable(_));
+    let slot = persistent_auth_authority_slot(key);
+    let mut bundle = slot
+        .bundle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = bundle.as_ref() {
         let stored_store_alive = existing
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upgrade()
             .is_some();
-        if matches!(key, PersistentAuthAuthorityKey::Durable(_)) || stored_store_alive {
+        // A process key whose store is gone gets a fresh bundle. That case is
+        // defensive: the bundle's weak reference keeps the store's allocation,
+        // so no other store takes its address while the entry exists. Only a
+        // test reaches it, with a key of its own.
+        if durable || stored_store_alive {
             existing.oauth_flows.bind_persistent_store(store);
             *existing
                 .store
@@ -1045,22 +1081,27 @@ fn persistent_auth_authorities(
             store,
         ),
     );
-    let bundle = Arc::new(PersistentAuthAuthorityBundle {
+    let created = Arc::new(PersistentAuthAuthorityBundle {
         store: StdMutex::new(Arc::downgrade(store)),
         auth_lease,
         oauth_flows,
     });
-    authorities.insert(key, Arc::clone(&bundle));
-    bundle
+    *bundle = Some(Arc::clone(&created));
+    created
 }
 
+/// Forget the authority bundle cached for `store`'s key, as a process
+/// restart would: the next machine over a store with that key rehydrates
+/// from the store. Only that key is forgotten, so tests running beside the
+/// caller keep theirs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn clear_persistent_auth_authorities_for_test() {
+pub(crate) fn forget_persistent_auth_authorities_for_test(store: &Arc<dyn RuntimeStore>) {
+    let key = runtime_store_identity(store);
     if let Some(authorities) = PERSISTENT_AUTH_AUTHORITIES.get() {
         authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .remove(&key);
     }
 }
 
@@ -1133,7 +1174,7 @@ mod scoped_original;
 pub use mcp_attachment::scoped_destination_target;
 #[cfg(feature = "local-authorization")]
 pub use scoped_original::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition, RetainedCustody,
     ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner, ScopedOriginalIngress,
     SourceOriginalBasis, bind_scoped_original, original_operation_grant, require_active_original,
     require_source_original_live, review_bounds_text,
@@ -1174,11 +1215,15 @@ pub use agent_mandate::{
 };
 pub(crate) mod scoped_context;
 mod session_management;
+mod session_mutation_gate;
 mod terminal_receipt;
 mod traits;
 mod visibility;
 
 pub(crate) use durability_health::{DurabilityHealthHandle, DurabilityReloadRequired};
+pub(crate) use session_mutation_gate::{
+    SessionMutationGate, SessionMutationGateWait, SettledGateWait, WeakSessionMutationGate,
+};
 
 pub(crate) use session_management::{
     DeleteOpsFinalizationAuthority, RetainOpsFinalizationAuthority,
@@ -1245,7 +1290,8 @@ enum CommittedEffectDispatchFailure {
 
 type UnregisterTeardownResult = Result<(), RuntimeDriverError>;
 type RuntimeStopCleanupResult = Result<(), RuntimeDriverError>;
-type ReloadRequiredDiscardResult = Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError>;
+type ReloadRequiredDiscardResult =
+    Result<ReloadRequiredRegistrationUseSettlement, RuntimeDriverError>;
 
 /// Joinable result channel for the one owned unregister saga of an epoch.
 #[derive(Clone)]
@@ -1342,6 +1388,20 @@ pub enum RuntimeSessionUnregisterAdmission {
     /// The exact coordinator remains process-owned; poll this observer on a
     /// later caller retry.
     Pending(RuntimeSessionUnregisterObserver),
+}
+
+/// Answer of
+/// [`MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RuntimeSessionUnregisterUseAdmission {
+    /// The registration's use was the expected one when the unregister was
+    /// started or joined, or the registration is no longer current: the
+    /// exact admission's answer.
+    Admitted(RuntimeSessionUnregisterAdmission),
+    /// The registration is current but was handed to another user after the
+    /// expected use was read. Nothing was started or joined.
+    Changed,
 }
 
 /// Typed answer of the same-registration quiescent close admission
@@ -1512,6 +1572,12 @@ impl UnregisterTeardownMechanicalObservations {
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
     runtime_id: LogicalRuntimeId,
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]):
+    /// stamped from the machine-wide sequence when the entry is built, and
+    /// stamped again by every adoption that hands the registration to a new
+    /// user. Adoptions stamp it under the session map lock, which every
+    /// reader of it holds too.
+    registration_use: std::sync::atomic::AtomicU64,
     /// The agent this registration's session acts as, bound by the trusted
     /// governed host. Every registration owns a fresh, unbound slot.
     agent_binding: agent_mandate::SessionAgentBinding,
@@ -1540,18 +1606,10 @@ struct RuntimeSessionEntry {
     /// This is a public-result fact only and never substitutes for cleanup
     /// ownership.
     archive_recovered_from_quiescent: bool,
-    /// Per-session mutation gate.
-    ///
-    /// Serializes same-session mutating commands across the full
-    /// DSL-stage → driver-mutate → DSL-sync span. Without this gate,
-    /// two concurrent commands on the same session can interleave between
-    /// the DSL projection sync (which releases `sessions` lock) and the
-    /// driver mutation (which acquires `driver` lock independently).
-    ///
-    /// This is NOT a replacement for `sessions` RwLock or `driver` Mutex —
-    /// it is an additional serialization point that spans the entire
-    /// multi-step mutation window.
-    mutation_gate: Arc<Mutex<()>>,
+    /// Per-session mutation gate (M). It carries this entry's
+    /// `durability_health`, so every copy of it can end a live wait on the
+    /// session's degradation (see [`SessionMutationGate`]).
+    mutation_gate: SessionMutationGate,
     /// Shared fail-closed durability gate for persistent sessions.
     ///
     /// The persistent driver degrades this exact handle when its live shell can
@@ -1747,7 +1805,7 @@ struct PreparedArchiveSessionRegistration {
 #[derive(Clone)]
 struct MemberIncarnationRegistration {
     incarnation: meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
     tracked_turn_journal: Option<Arc<dyn crate::member_observation::TrackedTurnJournal>>,
 }
 
@@ -1755,7 +1813,7 @@ struct MemberIncarnationRegistration {
 struct DirectMemberIncarnationRegistration {
     fence: meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
     runtime_epoch_id: meerkat_core::RuntimeEpochId,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
 }
 
 enum MemberResidencyState {
@@ -1781,7 +1839,7 @@ struct MemberResidencySlot {
 struct MemberEffectAuthorityLease {
     slot: Arc<MemberResidencySlot>,
     slot_guard: crate::tokio::sync::OwnedMutexGuard<()>,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
 }
 
 /// Exact effect interval for a host-member residency. The stable residency
@@ -1899,6 +1957,7 @@ pub struct PreparedSessionMaterialization {
     bindings: meerkat_core::SessionRuntimeBindings,
     claim_id: uuid::Uuid,
     claim_state: Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
+    inserted_registration: bool,
     cleanup_spawner: MachineCleanupTaskSpawner,
     archived_resume_authorization_issued: bool,
     armed: bool,
@@ -2174,7 +2233,7 @@ pub struct RuntimeSessionRegistrationWitness {
     machine: std::sync::Weak<MeerkatMachineShared>,
     session_id: SessionId,
     epoch_id: meerkat_core::RuntimeEpochId,
-    registration_gate: std::sync::Weak<Mutex<()>>,
+    registration_gate: WeakSessionMutationGate,
 }
 
 impl RuntimeSessionRegistrationWitness {
@@ -2182,7 +2241,7 @@ impl RuntimeSessionRegistrationWitness {
         machine: std::sync::Weak<MeerkatMachineShared>,
         session_id: SessionId,
         epoch_id: meerkat_core::RuntimeEpochId,
-        registration_gate: std::sync::Weak<Mutex<()>>,
+        registration_gate: WeakSessionMutationGate,
     ) -> Self {
         Self {
             machine,
@@ -2200,6 +2259,21 @@ impl RuntimeSessionRegistrationWitness {
         &self.epoch_id
     }
 
+    /// Whether this exact registration has ended for good: its runtime entry
+    /// is gone and nothing holds the entry's private incarnation identity,
+    /// so no machine can have it current, now or later. Read-only and
+    /// one-directional: `false` does not mean the registration is current
+    /// (an ended entry's identity can still be held while a task finishes
+    /// with it). Grants nothing and starts nothing.
+    #[must_use]
+    pub fn has_ended(&self) -> bool {
+        // A live entry holds its mutation gate strongly for its whole
+        // lifetime, and a rebuilt entry gets a gate of its own, so no strong
+        // reference left means this incarnation's entry exists nowhere. A
+        // dropped allocation can never gain a strong reference again.
+        self.registration_gate.upgrade().is_none()
+    }
+
     fn belongs_to(&self, machine: &MeerkatMachine) -> bool {
         std::ptr::eq(self.machine.as_ptr(), Arc::as_ptr(&machine.shared))
     }
@@ -2207,10 +2281,10 @@ impl RuntimeSessionRegistrationWitness {
     fn matches_entry(&self, entry: &RuntimeSessionEntry) -> bool {
         self.registration_gate
             .upgrade()
-            .is_some_and(|gate| Arc::ptr_eq(&gate, &entry.mutation_gate))
+            .is_some_and(|gate| gate.same_gate(&entry.mutation_gate))
     }
 
-    fn registration_gate(&self) -> Option<Arc<Mutex<()>>> {
+    fn registration_gate(&self) -> Option<SessionMutationGate> {
         self.registration_gate.upgrade()
     }
 }
@@ -2230,11 +2304,25 @@ impl PartialEq for RuntimeSessionRegistrationWitness {
         self.session_id == other.session_id
             && self.epoch_id == other.epoch_id
             && std::sync::Weak::ptr_eq(&self.machine, &other.machine)
-            && std::sync::Weak::ptr_eq(&self.registration_gate, &other.registration_gate)
+            && self.registration_gate.same_gate(&other.registration_gate)
     }
 }
 
 impl Eq for RuntimeSessionRegistrationWitness {}
+
+/// Which use of one exact runtime-session registration a caller saw.
+///
+/// A registration can be handed to a new user without being replaced: a
+/// later `register_session` reuses it as it is, and an executor attachment
+/// or an actor materialization adopts it in place, so its
+/// [`RuntimeSessionRegistrationWitness`] stays the same. Every such adoption
+/// stamps the registration with a fresh value of one machine-wide sequence.
+/// A use read earlier therefore differs from the current one once anyone
+/// has taken the registration since, and a successor registration never
+/// carries its predecessor's use. Opaque: compare it for equality only. Read
+/// it with [`MeerkatMachine::session_registration_use`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSessionRegistrationUse(u64);
 
 /// Result of exact cleanup for one durability-degraded runtime registration.
 ///
@@ -2290,6 +2378,47 @@ impl ReloadRequiredRegistrationSettlement {
             Self::NotCurrent => ReloadRequiredRegistrationDisposition::NotCurrent,
             Self::NotDegraded => ReloadRequiredRegistrationDisposition::NotDegraded,
             Self::Discarded { .. } => ReloadRequiredRegistrationDisposition::Discarded,
+        }
+    }
+}
+
+/// Answer of
+/// [`MeerkatMachine::reload_required_registration_settlement_if_current`]:
+/// the registration reload's terminal result, with the use the published
+/// successor starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReloadRequiredRegistrationUseSettlement {
+    /// The witness no longer names this machine's exact current registration.
+    NotCurrent,
+    /// The exact registration remains durability-ready and was left untouched.
+    NotDegraded,
+    /// The exact ReloadRequired process shell was replaced by `successor`,
+    /// the registration this reload published, whose use starts at
+    /// `successor_use`.
+    Discarded {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after the expected use
+    /// was read: nothing was discarded and no running discard was joined.
+    Changed,
+}
+
+impl ReloadRequiredRegistrationUseSettlement {
+    /// The settlement of a reload that was not gated on a use.
+    fn into_ungated_settlement(
+        self,
+    ) -> Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError> {
+        match self {
+            Self::NotCurrent => Ok(ReloadRequiredRegistrationSettlement::NotCurrent),
+            Self::NotDegraded => Ok(ReloadRequiredRegistrationSettlement::NotDegraded),
+            Self::Discarded { successor, .. } => {
+                Ok(ReloadRequiredRegistrationSettlement::Discarded { successor })
+            }
+            Self::Changed => Err(RuntimeDriverError::Internal(
+                "a use-gated reload result reached a caller that gave no expected use".to_string(),
+            )),
         }
     }
 }
@@ -2547,7 +2676,7 @@ struct MachineCleanupTaskSpawner {
 struct PendingRunlessTerminalPublicationDispatch {
     dispatch_id: uuid::Uuid,
     driver: SharedDriver,
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     requested_generation: u64,
     result_rx: crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>,
 }
@@ -2607,6 +2736,247 @@ impl RuntimeCleanupTaskSpawner {
         F: Future<Output = ()> + 'static,
     {
         self.inner.spawn(future);
+    }
+}
+
+/// What a ready-gated caller found once it held the session mutation gate.
+enum DurabilityGateSettlement {
+    /// The exact entry is durability-ready: the gate is the caller's.
+    Ready(crate::tokio::sync::OwnedMutexGuard<()>),
+    /// The entry was replaced while the caller waited: look it up again.
+    Replaced,
+    /// The entry is gone or degraded (its degraded settlement has run).
+    Refused(RuntimeDriverError),
+}
+
+/// The typed refusal of a live wait for a session mutation gate that ended
+/// on the session's degradation.
+fn degraded_gate_wait_refusal(required: DurabilityReloadRequired) -> RuntimeDriverError {
+    RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: required.to_string(),
+    }
+}
+
+/// Take a session's driver without M, or end once the session degrades. A
+/// boundary commit or run terminalization holds the driver together with M,
+/// and one past its commit deadline keeps both until the store answers, so a
+/// wait for the driver alone would wait for the store. The driver is polled
+/// first: a free driver is taken even on a degraded session, and a session
+/// without durable state waits as before.
+async fn lock_driver_live<'a, T>(
+    driver: &'a crate::tokio::sync::Mutex<T>,
+    durability_health: Option<&DurabilityHealthHandle>,
+) -> Result<crate::tokio::sync::MutexGuard<'a, T>, DurabilityReloadRequired> {
+    let Some(health) = durability_health else {
+        return Ok(driver.lock().await);
+    };
+    let degradation = health.subscribe_degradation();
+    let mut lock = std::pin::pin!(driver.lock());
+    let mut fired = std::pin::pin!(degradation.fired());
+    crate::tokio::select! {
+        biased;
+        guard = &mut lock => Ok(guard),
+        required = &mut fired => Err(required),
+    }
+}
+
+/// Settle a held session mutation gate: hand it back for a durability-ready
+/// entry, or detach the degraded entry and hard-cancel its exact run before
+/// refusing. Shared by the ready-gated caller and the process-owned task a
+/// waiter hands the settlement to when it leaves on the degradation signal.
+async fn settle_durability_gate(
+    shared: &MeerkatMachineShared,
+    session_id: &SessionId,
+    gate: &SessionMutationGate,
+    gate_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+) -> DurabilityGateSettlement {
+    let (reload_required, interrupt_handle, expected_run_id, detached_attachment, cleanup_spawner) = {
+        let mut sessions = shared.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return DurabilityGateSettlement::Refused(RuntimeDriverError::NotReady {
+                state: RuntimeState::Destroyed,
+            });
+        };
+        if !entry.mutation_gate.same_gate(gate) {
+            return DurabilityGateSettlement::Replaced;
+        }
+        match entry.require_durability_ready() {
+            Ok(()) => return DurabilityGateSettlement::Ready(gate_guard),
+            Err(reload_required) => {
+                let interrupt_handle = entry.interrupt_handle();
+                let expected_run_id = entry
+                    .dsl_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state()
+                    .current_run_id
+                    .as_ref()
+                    .and_then(crate::meerkat_machine::dsl_authority::current_run_id_from_dsl);
+                // Acquire process-owned execution before consuming the
+                // entry-local handle/attachment authority. A runtime
+                // setup failure leaves that authority installed for a
+                // later degraded retry instead of orphaning it.
+                let cleanup_spawner = match (&interrupt_handle, &expected_run_id) {
+                    (Some(_), Some(_)) => match MachineCleanupTaskSpawner::acquire() {
+                        Ok(cleanup_spawner) => Some(cleanup_spawner),
+                        Err(error) => {
+                            tracing::warn!(
+                                %session_id,
+                                operation = reload_required.operation(),
+                                reason = reload_required.reason(),
+                                %error,
+                                "could not acquire process-owned durability-degradation interrupt dispatcher; exact attachment retained for retry"
+                            );
+                            return DurabilityGateSettlement::Refused(
+                                RuntimeDriverError::RecoveryRepairBlocked {
+                                    evidence_digest: None,
+                                    reason: reload_required.to_string(),
+                                },
+                            );
+                        }
+                    },
+                    _ => None,
+                };
+                let detached_attachment = entry.take_runtime_loop_attachment();
+                // Consume every entry-local interrupt source under M.
+                // This is the dedup handoff: later degraded callers
+                // see no handle and cannot spawn a second callback for
+                // the same exact attachment/run.
+                entry.provisional_interrupt_handle = None;
+                (
+                    reload_required,
+                    interrupt_handle,
+                    expected_run_id,
+                    detached_attachment,
+                    cleanup_spawner,
+                )
+            }
+        }
+    };
+
+    // Dropping the exact attachment closes its wake/effect senders and
+    // detaches it from the entry before the async interrupt callback.
+    drop(detached_attachment);
+    // The entry is already detached and every ready-gated successor
+    // will observe ReloadRequired. Do not retain M across the external
+    // interrupt callback: actor cancellation may itself need to finish
+    // a machine-owned terminal callback.
+    drop(gate_guard);
+    if let (Some(interrupt_handle), Some(expected_run_id), Some(cleanup_spawner)) =
+        (interrupt_handle, expected_run_id, cleanup_spawner)
+    {
+        let reason = format!(
+            "durability reload required after `{}`: {}",
+            reload_required.operation(),
+            reload_required.reason()
+        );
+        let (ack_tx, ack_rx) = crate::tokio::sync::oneshot::channel();
+        cleanup_spawner.spawn(async move {
+            let mut first_ack = Some(ack_tx);
+            let mut retry_delay = std::time::Duration::from_millis(100);
+            loop {
+                let result = match std::panic::AssertUnwindSafe(
+                    interrupt_handle.hard_cancel_run_if_current(&expected_run_id, reason.clone()),
+                )
+                .catch_unwind()
+                .await
+                {
+                    Ok(Ok(delivered)) => Ok(delivered),
+                    Ok(Err(error)) => Err(format!(
+                        "exact durability-degradation interrupt failed: {error}"
+                    )),
+                    Err(payload) => Err(format!(
+                        "exact durability-degradation interrupt panicked: {}",
+                        meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                    )),
+                };
+                if let Some(ack_tx) = first_ack.take() {
+                    let _ = ack_tx.send(result.clone());
+                }
+                if result.is_ok() {
+                    break;
+                }
+                // ReloadRequired remains the durable shell authority
+                // while this exact handle/run pair retries
+                // process-owned. No successor can be admitted through
+                // the degraded entry.
+                crate::tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+            }
+        });
+        match crate::tokio::time::timeout(DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT, ack_rx)
+            .await
+        {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    %error,
+                    "exact durability-degradation interrupt failed; process-owned retry retained"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    %error,
+                    "exact durability-degradation interrupt task ended before acknowledgement"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    "exact durability-degradation interrupt exceeded acknowledgement budget; process-owned attempt retained"
+                );
+            }
+        }
+    }
+    DurabilityGateSettlement::Refused(RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: reload_required.to_string(),
+    })
+}
+
+/// A degraded settlement task's entry for its gate in
+/// `MeerkatMachineShared::pending_degraded_gate_settlements`. The task owns it
+/// and removes it when it ends on any outcome, or when it is dropped before it
+/// runs.
+struct PendingDegradedGateSettlement {
+    shared: Arc<MeerkatMachineShared>,
+    gate_address: usize,
+}
+
+impl PendingDegradedGateSettlement {
+    /// List `gate`, or `None` when a settlement task already waits for it.
+    fn claim(shared: &Arc<MeerkatMachineShared>, gate: &SessionMutationGate) -> Option<Self> {
+        let gate_address = gate.address();
+        shared
+            .pending_degraded_gate_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gate_address)
+            .then(|| Self {
+                shared: Arc::clone(shared),
+                gate_address,
+            })
+    }
+}
+
+impl Drop for PendingDegradedGateSettlement {
+    fn drop(&mut self) {
+        self.shared
+            .pending_degraded_gate_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.gate_address);
     }
 }
 
@@ -4591,6 +4961,7 @@ impl PreparedSessionMaterialization {
         machine: Arc<MeerkatMachine>,
         bindings: meerkat_core::SessionRuntimeBindings,
         claim_id: uuid::Uuid,
+        inserted_registration: bool,
         cleanup_spawner: MachineCleanupTaskSpawner,
     ) -> Result<Self, RuntimeDriverError> {
         let authority = bindings
@@ -4610,6 +4981,7 @@ impl PreparedSessionMaterialization {
             bindings,
             claim_id,
             claim_state,
+            inserted_registration,
             cleanup_spawner,
             archived_resume_authorization_issued: false,
             armed: true,
@@ -4618,6 +4990,15 @@ impl PreparedSessionMaterialization {
 
     pub fn bindings(&self) -> &meerkat_core::SessionRuntimeBindings {
         &self.bindings
+    }
+
+    /// Whether this materialization's own prepare inserted the session's
+    /// registration. `false` when it found a registration already current,
+    /// such as one a restore prepared before this revival: rolling this
+    /// materialization back leaves that registration in place. Fixed at the
+    /// prepare; an executor attaching later does not change it.
+    pub fn inserted_registration(&self) -> bool {
+        self.inserted_registration
     }
 
     pub fn bindings_clone(&self) -> meerkat_core::SessionRuntimeBindings {
@@ -4821,7 +5202,7 @@ impl PreparedSessionMaterialization {
                     Arc::downgrade(&self.machine.shared),
                     self.session_id().clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 )
             })
     }
@@ -5446,7 +5827,7 @@ impl RuntimeLoopAttachmentId {
 /// dispatch. A callback may release M, but only this exact attachment may
 /// receive the resulting effect after revalidation.
 struct RuntimeEffectDispatchAttachmentWitness {
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     driver: SharedDriver,
     dsl_authority: Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
     attachment_id: RuntimeLoopAttachmentId,
@@ -5457,7 +5838,7 @@ struct RuntimeEffectDispatchAttachmentWitness {
 /// callback. Publication resumes only after every attachment-local component
 /// is revalidated.
 struct RuntimeLiveBoundaryAttachmentWitness {
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     driver: SharedDriver,
     dsl_authority: Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
     attachment_id: RuntimeLoopAttachmentId,
@@ -6075,6 +6456,45 @@ impl RuntimeSessionEntry {
         )
     }
 
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]).
+    /// The caller holds the session map lock.
+    fn registration_use(&self) -> RuntimeSessionRegistrationUse {
+        RuntimeSessionRegistrationUse(
+            self.registration_use
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Hand this registration to a new user: stamp it with `stamp`, a fresh
+    /// value of the machine-wide sequence. The caller holds the session map
+    /// lock.
+    fn stamp_adoption(&self, stamp: u64) {
+        self.registration_use
+            .store(stamp, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether no runtime loop can hold this registration's mutation fence:
+    /// no attachment is pending or committed and no runtime-loop teardown
+    /// slot exists (no loop was ever attached, or its teardown completed).
+    fn no_runtime_loop_holds_mutation_fence(&self) -> bool {
+        matches!(self.attachment_slot, RuntimeLoopAttachmentSlot::Empty)
+            && self.runtime_loop_teardown.is_none()
+    }
+
+    /// Whether this registration's runtime-loop teardown is still the one a
+    /// reload-required discard was admitted with: the exact teardown handoff
+    /// slot, or, for a registration no runtime loop held, still none.
+    fn runtime_loop_teardown_is_as_admitted(
+        &self,
+        admitted: Option<&Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>>,
+    ) -> bool {
+        match (self.runtime_loop_teardown.as_ref(), admitted) {
+            (Some(current), Some(admitted)) => Arc::ptr_eq(current, admitted),
+            (None, None) => self.no_runtime_loop_holds_mutation_fence(),
+            _ => false,
+        }
+    }
+
     fn live_attachment_id(&self) -> Option<RuntimeLoopAttachmentId> {
         match &self.attachment_slot {
             RuntimeLoopAttachmentSlot::Pending(attachment)
@@ -6453,30 +6873,94 @@ impl MeerkatMachine {
         ))
     }
 
-    /// Acquire the per-session mutation gate.
-    ///
-    /// Returns an `Arc<Mutex<()>>` that the caller must `.lock().await` and
-    /// hold across the full DSL-stage → driver-mutate → DSL-sync span.
-    /// Returns `None` if the session is not registered.
-    async fn session_mutation_gate(&self, session_id: &SessionId) -> Option<Arc<Mutex<()>>> {
+    /// A copy of the current entry's mutation gate (M), which the caller
+    /// takes through one of its accessors and holds across the full DSL-stage
+    /// -> driver-mutate -> DSL-sync span. `None` if the session is not
+    /// registered.
+    async fn session_mutation_gate(&self, session_id: &SessionId) -> Option<SessionMutationGate> {
         let sessions = self.sessions.read().await;
         sessions
             .get(session_id)
-            .map(|entry| Arc::clone(&entry.mutation_gate))
+            .map(|entry| entry.mutation_gate.clone())
     }
 
-    async fn lock_current_session_mutation_gate(
+    /// Take the current entry's mutation gate for live work, following a
+    /// replaced entry to its new gate; `Ok(None)` once the session is not
+    /// registered. Once the session degrades while another holder keeps the
+    /// gate, the wait ends with the degradation's cause (see
+    /// [`Self::lock_live_session_mutation_gate`]). Unlike the ready-gated
+    /// wait, a free gate of a degraded entry is returned without settling it.
+    async fn lock_current_live_session_mutation_gate(
         &self,
         session_id: &SessionId,
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, DurabilityReloadRequired> {
+        loop {
+            let Some(gate) = self.session_mutation_gate(session_id).await else {
+                return Ok(None);
+            };
+            let gate_guard = self
+                .lock_live_session_mutation_gate(session_id, &gate)
+                .await?;
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
+            if entry.mutation_gate.same_gate(&gate) {
+                return Ok(Some(gate_guard));
+            }
+        }
+    }
+
+    /// Take the current entry's mutation gate however long its holder keeps
+    /// it, following a replaced entry to its new gate; `None` once the session
+    /// is not registered. `reason` says why no holder the session's
+    /// degradation can strand stands in the way.
+    async fn lock_current_settled_session_mutation_gate(
+        &self,
+        session_id: &SessionId,
+        reason: SettledGateWait,
     ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
         loop {
             let gate = self.session_mutation_gate(session_id).await?;
-            let gate_guard = Arc::clone(&gate).lock_owned().await;
+            let gate_guard = gate.lock_settled(reason).await;
             let sessions = self.sessions.read().await;
             let entry = sessions.get(session_id)?;
-            if Arc::ptr_eq(&entry.mutation_gate, &gate) {
+            if entry.mutation_gate.same_gate(&gate) {
                 return Some(gate_guard);
             }
+        }
+    }
+
+    /// Take `gate`, a copy of `session_id`'s mutation gate, for live work
+    /// (see [`SessionMutationGate::lock_live`]).
+    async fn lock_live_session_mutation_gate(
+        &self,
+        session_id: &SessionId,
+        gate: &SessionMutationGate,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, DurabilityReloadRequired> {
+        #[cfg(any(test, feature = "test-support"))]
+        if gate.ends_on_degradation() {
+            self.note_mutation_gate_wait_for_test(session_id, gate);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = session_id;
+        gate.lock_live().await
+    }
+
+    /// Take `gate`, a copy of `session_id`'s mutation gate, as `wait` says:
+    /// live (see [`Self::lock_live_session_mutation_gate`]) or settled for its
+    /// reason, which always takes it.
+    async fn lock_session_mutation_gate_as(
+        &self,
+        session_id: &SessionId,
+        gate: &SessionMutationGate,
+        wait: SessionMutationGateWait,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, DurabilityReloadRequired> {
+        match wait {
+            SessionMutationGateWait::Live => {
+                self.lock_live_session_mutation_gate(session_id, gate).await
+            }
+            SessionMutationGateWait::Settled(reason) => Ok(gate.lock_settled(reason).await),
         }
     }
 
@@ -6488,6 +6972,14 @@ impl MeerkatMachine {
     /// callback runs only after the session-map lock is released. Recovery and
     /// unregister paths that replace or tear down the entry intentionally use
     /// the lower-level gate above.
+    ///
+    /// A waiter parked behind a holder of the gate (for example a post-stop
+    /// fence the exited runtime loop retains after a failed boundary commit)
+    /// does not wait for it once the session degrades: it returns the typed
+    /// `RecoveryRepairBlocked` and hands the degraded settlement (detach and
+    /// exact hard-cancel) to a process-owned task that takes the gate when it
+    /// frees. The gate is polled first, so a free gate settles inline as
+    /// before.
     async fn lock_current_durability_ready_session_mutation_gate(
         &self,
         session_id: &SessionId,
@@ -6498,170 +6990,61 @@ impl MeerkatMachine {
                     state: RuntimeState::Destroyed,
                 },
             )?;
-            let gate_guard = Arc::clone(&gate).lock_owned().await;
-            let (
-                reload_required,
-                interrupt_handle,
-                expected_run_id,
-                detached_attachment,
-                cleanup_spawner,
-            ) = {
-                let mut sessions = self.sessions.write().await;
-                let entry = sessions
-                    .get_mut(session_id)
-                    .ok_or(RuntimeDriverError::NotReady {
-                        state: RuntimeState::Destroyed,
-                    })?;
-                if !Arc::ptr_eq(&entry.mutation_gate, &gate) {
-                    continue;
-                }
-                match entry.require_durability_ready() {
-                    Ok(()) => return Ok(gate_guard),
-                    Err(reload_required) => {
-                        let interrupt_handle = entry.interrupt_handle();
-                        let expected_run_id = entry
-                            .dsl_authority
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .state()
-                            .current_run_id
-                            .as_ref()
-                            .and_then(
-                                crate::meerkat_machine::dsl_authority::current_run_id_from_dsl,
-                            );
-                        // Acquire process-owned execution before consuming the
-                        // entry-local handle/attachment authority. A runtime
-                        // setup failure leaves that authority installed for a
-                        // later degraded retry instead of orphaning it.
-                        let cleanup_spawner = match (&interrupt_handle, &expected_run_id) {
-                            (Some(_), Some(_)) => match MachineCleanupTaskSpawner::acquire() {
-                                Ok(cleanup_spawner) => Some(cleanup_spawner),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %session_id,
-                                        operation = reload_required.operation(),
-                                        reason = reload_required.reason(),
-                                        %error,
-                                        "could not acquire process-owned durability-degradation interrupt dispatcher; exact attachment retained for retry"
-                                    );
-                                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                                        evidence_digest: None,
-                                        reason: reload_required.to_string(),
-                                    });
-                                }
-                            },
-                            _ => None,
-                        };
-                        let detached_attachment = entry.take_runtime_loop_attachment();
-                        // Consume every entry-local interrupt source under M.
-                        // This is the dedup handoff: later degraded callers
-                        // see no handle and cannot spawn a second callback for
-                        // the same exact attachment/run.
-                        entry.provisional_interrupt_handle = None;
-                        (
-                            reload_required,
-                            interrupt_handle,
-                            expected_run_id,
-                            detached_attachment,
-                            cleanup_spawner,
-                        )
-                    }
+            let gate_guard = match self
+                .lock_live_session_mutation_gate(session_id, &gate)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(required) => {
+                    // Had it taken the gate, this waiter would have settled
+                    // the degraded entry itself.
+                    self.hand_off_degraded_gate_settlement(session_id, gate);
+                    return Err(degraded_gate_wait_refusal(required));
                 }
             };
-
-            // Dropping the exact attachment closes its wake/effect senders and
-            // detaches it from the entry before the async interrupt callback.
-            drop(detached_attachment);
-            // The entry is already detached and every ready-gated successor
-            // will observe ReloadRequired. Do not retain M across the external
-            // interrupt callback: actor cancellation may itself need to finish
-            // a machine-owned terminal callback.
-            drop(gate_guard);
-            if let (Some(interrupt_handle), Some(expected_run_id), Some(cleanup_spawner)) =
-                (interrupt_handle, expected_run_id, cleanup_spawner)
-            {
-                let reason = format!(
-                    "durability reload required after `{}`: {}",
-                    reload_required.operation(),
-                    reload_required.reason()
-                );
-                let (ack_tx, ack_rx) = crate::tokio::sync::oneshot::channel();
-                cleanup_spawner.spawn(async move {
-                    let mut first_ack = Some(ack_tx);
-                    let mut retry_delay = std::time::Duration::from_millis(100);
-                    loop {
-                        let result = match std::panic::AssertUnwindSafe(
-                            interrupt_handle
-                                .hard_cancel_run_if_current(&expected_run_id, reason.clone()),
-                        )
-                        .catch_unwind()
-                        .await
-                        {
-                            Ok(Ok(delivered)) => Ok(delivered),
-                            Ok(Err(error)) => Err(format!(
-                                "exact durability-degradation interrupt failed: {error}"
-                            )),
-                            Err(payload) => Err(format!(
-                                "exact durability-degradation interrupt panicked: {}",
-                                meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
-                            )),
-                        };
-                        if let Some(ack_tx) = first_ack.take() {
-                            let _ = ack_tx.send(result.clone());
-                        }
-                        if result.is_ok() {
-                            break;
-                        }
-                        // ReloadRequired remains the durable shell authority
-                        // while this exact handle/run pair retries
-                        // process-owned. No successor can be admitted through
-                        // the degraded entry.
-                        crate::tokio::time::sleep(retry_delay).await;
-                        retry_delay = retry_delay
-                            .saturating_mul(2)
-                            .min(std::time::Duration::from_secs(5));
-                    }
-                });
-                match crate::tokio::time::timeout(
-                    DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT,
-                    ack_rx,
-                )
-                .await
-                {
-                    Ok(Ok(Ok(_))) => {}
-                    Ok(Ok(Err(error))) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            %error,
-                            "exact durability-degradation interrupt failed; process-owned retry retained"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            %error,
-                            "exact durability-degradation interrupt task ended before acknowledgement"
-                        );
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            "exact durability-degradation interrupt exceeded acknowledgement budget; process-owned attempt retained"
-                        );
-                    }
-                }
+            match settle_durability_gate(&self.shared, session_id, &gate, gate_guard).await {
+                DurabilityGateSettlement::Ready(guard) => return Ok(guard),
+                DurabilityGateSettlement::Replaced => continue,
+                DurabilityGateSettlement::Refused(error) => return Err(error),
             }
-            return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                evidence_digest: None,
-                reason: reload_required.to_string(),
-            });
         }
+    }
+
+    /// Run the degraded settlement for a waiter that left on the degradation
+    /// signal: a process-owned task takes the gate once its holder releases it
+    /// and settles exactly as a ready-gated caller would, with the same
+    /// detach and hard-cancel dedup. One task per gate: while one waits, the
+    /// waiters that leave after it spawn nothing, since its settlement is
+    /// theirs too. Without a cleanup runtime the next ready-gated caller
+    /// settles inline instead.
+    fn hand_off_degraded_gate_settlement(&self, session_id: &SessionId, gate: SessionMutationGate) {
+        #[cfg(test)]
+        self.test_degraded_gate_settlement_hand_offs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let spawner = match MachineCleanupTaskSpawner::acquire() {
+            Ok(spawner) => spawner,
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "could not hand off the durability-degraded gate settlement; the next ready-gated caller settles it"
+                );
+                return;
+            }
+        };
+        let Some(pending) = PendingDegradedGateSettlement::claim(&self.shared, &gate) else {
+            return;
+        };
+        #[cfg(test)]
+        self.test_degraded_gate_settlement_spawns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let shared = Arc::clone(&self.shared);
+        let session_id = session_id.clone();
+        drop(spawner.spawn(async move {
+            let _pending = pending;
+            let gate_guard = gate.lock_settled(SettledGateWait::DegradedSettlement).await;
+            let _ = settle_durability_gate(&shared, &session_id, &gate, gate_guard).await;
+        }));
     }
 
     /// Deterministically pause the runtime loop's next terminal run commit
@@ -7218,6 +7601,59 @@ impl MeerkatMachine {
         (entered_rx, release_tx)
     }
 
+    /// Pause one ReloadRequired discard worker of `session_id` after it
+    /// released the registration transaction and claimed any teardown
+    /// handoff, before it takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_reload_required_discard_before_mutation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "ReloadRequired before-mutation-gate test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Install a fresh runtime-loop teardown slot on the current registration
+    /// of `session_id`, as a runtime loop attached to it would, when it has
+    /// none. A real loop can reach a durability-degraded registration this
+    /// way: an executor registration checks durability when it claims the
+    /// session, releases the registration transaction while it still holds
+    /// the mutation gate, and attaches its loop without checking again, so a
+    /// session that degrades in between gets a loop after a discard was
+    /// admitted. Tests use this to place that attach inside a discard's
+    /// window deterministically. `false` when the session is not registered
+    /// or already has one.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn install_runtime_loop_teardown_slot_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(session_id) {
+            Some(entry) if entry.runtime_loop_teardown.is_none() => {
+                entry.runtime_loop_teardown =
+                    Some(crate::runtime_loop::RuntimeLoopTeardownSlot::pending());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Force one persistent session's shared durability gate into
     /// ReloadRequired without fabricating a store outcome. Test-only callers
     /// use this to exercise cancellation around the real disposal coordinator.
@@ -7237,6 +7673,83 @@ impl MeerkatMachine {
                     "deterministic test fault",
                 )
             })
+    }
+
+    /// Report the next degradation-aware wait for `session_id`'s mutation
+    /// gate that finds the gate held: the receiver resolves once that waiter
+    /// has subscribed to the session's degradation and is about to park
+    /// behind the holder, so a test can degrade the session during the wait
+    /// instead of before it. Test support.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_mutation_gate_wait_observer_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> crate::tokio::sync::oneshot::Receiver<()> {
+        let (parked_tx, parked_rx) = crate::tokio::sync::oneshot::channel();
+        let replaced = self
+            .test_mutation_gate_wait_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((session_id, parked_tx));
+        assert!(
+            replaced.is_none(),
+            "mutation gate wait observer already armed"
+        );
+        parked_rx
+    }
+
+    /// Measure the commit outcome declarations of the runtime loops this
+    /// machine starts from now on in busy windows of `window` (test support).
+    /// A store declares its deadline as a sum of busy windows, so this
+    /// shortens each window and keeps the declaration; it does not override
+    /// the deadline.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_runtime_commit_busy_window_for_test(&self, window: std::time::Duration) {
+        *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn runtime_commit_deadline_for_test(
+        &self,
+        commit_deadline: crate::runtime_loop::RuntimeLoopCommitDeadline,
+    ) -> crate::runtime_loop::RuntimeLoopCommitDeadline {
+        let window = *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match window {
+            Some(window) => commit_deadline.with_busy_window(window),
+            None => commit_deadline,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn note_mutation_gate_wait_for_test(&self, session_id: &SessionId, gate: &SessionMutationGate) {
+        if gate.try_lock().is_ok() {
+            return;
+        }
+        let parked_tx = {
+            let mut observer = self
+                .test_mutation_gate_wait_observer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if observer
+                .as_ref()
+                .is_some_and(|(armed_session_id, _)| armed_session_id == session_id)
+            {
+                observer.take().map(|(_, parked_tx)| parked_tx)
+            } else {
+                None
+            }
+        };
+        if let Some(parked_tx) = parked_tx {
+            let _ = parked_tx.send(());
+        }
     }
 
     /// Persist the exact current operation registry using the registration's
@@ -7268,6 +7781,31 @@ impl MeerkatMachine {
             .persist_ops_lifecycle(&runtime_id, &snapshot)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn run_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_reload_required_discard_before_mutation_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7392,29 +7930,38 @@ impl MeerkatMachine {
         }
     }
 
+    /// The mutation gate tied to `lease`'s exact live lifecycle gate, taken as
+    /// `wait` says; `Ok(None)` once the entry is gone or no longer `lease`'s.
     #[cfg(feature = "live")]
     async fn lock_session_mutation_gate_for_live_lifecycle_lease(
         &self,
         session_id: &SessionId,
         lease: &crate::member_live::MemberLiveLifecycleLease,
-    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+        wait: SessionMutationGateWait,
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, DurabilityReloadRequired> {
         let mutation_gate = {
             let sessions = self.sessions.read().await;
-            let entry = sessions.get(session_id)?;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
             if !lease.matches_gate(&entry.live_lifecycle_gate) {
-                return None;
+                return Ok(None);
             }
-            Arc::clone(&entry.mutation_gate)
+            entry.mutation_gate.clone()
         };
-        let guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let guard = self
+            .lock_session_mutation_gate_as(session_id, &mutation_gate, wait)
+            .await?;
         let sessions = self.sessions.read().await;
-        let entry = sessions.get(session_id)?;
+        let Some(entry) = sessions.get(session_id) else {
+            return Ok(None);
+        };
         if lease.matches_gate(&entry.live_lifecycle_gate)
-            && Arc::ptr_eq(&entry.mutation_gate, &mutation_gate)
+            && entry.mutation_gate.same_gate(&mutation_gate)
         {
-            Some(guard)
+            Ok(Some(guard))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -7928,7 +8475,10 @@ impl MeerkatMachine {
             None
         };
 
-        let gate_guard = Arc::clone(&witness.mutation_gate).lock_owned().await;
+        let gate_guard = self
+            .lock_live_session_mutation_gate(session_id, &witness.mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         let current_effect_tx = {
             let sessions = self.sessions.read().await;
             match sessions.get(session_id) {
@@ -7938,7 +8488,7 @@ impl MeerkatMachine {
                     ),
                 }),
                 Some(entry)
-                    if !Arc::ptr_eq(&entry.mutation_gate, &witness.mutation_gate)
+                    if !entry.mutation_gate.same_gate(&witness.mutation_gate)
                         || !Arc::ptr_eq(&entry.driver, &witness.driver)
                         || !Arc::ptr_eq(&entry.dsl_authority, &witness.dsl_authority)
                         || !entry.owns_runtime_loop_attachment(witness.attachment_id) =>
@@ -8077,6 +8627,10 @@ impl MeerkatMachine {
                     let _ = release.await;
                 }
             }
+            #[cfg(test)]
+            let outcome_input_id = live_boundary_plan
+                .as_ref()
+                .map(|plan| plan.input_id.clone());
             let dispatched = machine
                 .dispatch_accepted_ingress_boundary_work_owned(
                     &work_session_id,
@@ -8090,6 +8644,18 @@ impl MeerkatMachine {
                 )
                 .await;
             drop(runless_terminal);
+            #[cfg(test)]
+            if let Some(outcomes) = machine
+                .test_accepted_boundary_work_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                let _ = outcomes.send((
+                    outcome_input_id,
+                    dispatched.as_ref().copied().map_err(ToString::to_string),
+                ));
+            }
             if let Err(error) = dispatched {
                 tracing::error!(
                     session_id = %work_session_id,
@@ -9778,6 +10344,9 @@ impl Drop for RunStartHoldInFlightForTest<'_> {
 #[doc(hidden)]
 pub struct MeerkatMachineShared {
     native_work_authorization_host: crate::input_authority::NativeWorkAuthorizationSlot,
+    /// Source of [`RuntimeSessionRegistrationUse`] stamps: one machine-wide
+    /// sequence, so no two stamps this machine hands out are equal.
+    registration_use_sequence: std::sync::atomic::AtomicU64,
     /// The issuing consent owner's owner-loss settlement, installed by the
     /// composition before any session is registered. Empty: nothing is
     /// settled and nothing is recorded as settled.
@@ -9989,6 +10558,16 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot hold armed by a test: the next live channel custody or
+    /// playback-readiness read waits here (entered, release) right after it
+    /// takes its machine snapshot.
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    test_live_custody_read_hold: StdMutex<
+        Option<(
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// One-shot witness armed by a test: the next caller that waits on an
     /// unregister teardown saga reports the wait it dispatched on.
     #[cfg(feature = "test-support")]
@@ -10022,6 +10601,22 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Sender<()>,
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
+    >,
+    /// Deterministic test gate in a durable steer's live-boundary work after
+    /// its wait for an earlier durable steer ended, before it retakes the
+    /// session mutation gate. One-shot: the first waiter to get there takes it.
+    #[cfg(test)]
+    test_durable_steer_relock_hold: StdMutex<
+        Option<(
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// Receives each accepted-ingress boundary work's input and outcome, when
+    /// a test installs a sender.
+    #[cfg(test)]
+    test_accepted_boundary_work_outcomes: StdMutex<
+        Option<crate::tokio::sync::mpsc::UnboundedSender<(Option<InputId>, Result<(), String>)>>,
     >,
     /// Deterministic test gate after an executor attachment's runtime loop
     /// has released the registration gate it held through startup recovery,
@@ -10062,7 +10657,7 @@ pub struct MeerkatMachineShared {
     test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
     /// Fail the next record of a deferred close-time playback settlement
     /// after its machine transition, as a failed recovery-state persist does.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
     test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
@@ -10183,6 +10778,41 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate in a ReloadRequired discard worker, after
+    /// the registration transaction was released and any teardown handoff
+    /// claimed, before the worker takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    test_reload_required_discard_before_mutation_gate: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot report of a degradation-aware wait for one session's mutation
+    /// gate that found the gate held: the waiter has subscribed to the
+    /// session's degradation and is about to park behind the holder.
+    #[cfg(any(test, feature = "test-support"))]
+    test_mutation_gate_wait_observer:
+        StdMutex<Option<(SessionId, crate::tokio::sync::oneshot::Sender<()>)>>,
+    /// Test seam: the busy window this machine's runtime loops measure their
+    /// stores' commit outcome declarations in.
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_commit_busy_window: StdMutex<Option<std::time::Duration>>,
+    /// Test probe: how many ready-gated waiters left on the degradation
+    /// signal and handed the degraded settlement to a process-owned task.
+    #[cfg(test)]
+    test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize,
+    /// The mutation gates, by address, with a degraded settlement task
+    /// waiting to run. A ready-gated waiter that leaves on the degradation
+    /// signal spawns that task only for a gate that has none, so callers that
+    /// keep arriving behind one holder add no tasks. The task keeps its gate
+    /// alive while the gate is listed, so a listed address is never another
+    /// gate's.
+    pending_degraded_gate_settlements: StdMutex<HashSet<usize>>,
+    /// Test probe: how many degraded settlement tasks were spawned.
+    #[cfg(test)]
+    test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize,
     /// One-shot deterministic gate after a logical control command resolves
     /// its SessionId but before it acquires the current entry's mutation gate.
     /// Tests replace A with B in this window to prove the command captures no
@@ -10316,7 +10946,7 @@ impl MemberResidencyUpdate {
         mut self,
         incarnation: meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
         tracked_turn_journal: Option<Arc<dyn crate::member_observation::TrackedTurnJournal>>,
-        session_mutation_gate: Arc<crate::tokio::sync::Mutex<()>>,
+        session_mutation_gate: SessionMutationGate,
     ) -> Result<StagedMemberResidencyPublication, RuntimeDriverError> {
         let slot_guard = self.slot_guard.take().ok_or_else(|| {
             RuntimeDriverError::Internal(
@@ -10355,14 +10985,13 @@ impl MemberResidencyUpdate {
             .await?;
         let gate = {
             let sessions = self.adapter.sessions.read().await;
-            Arc::clone(
-                &sessions
-                    .get(&self.session_id)
-                    .ok_or(RuntimeDriverError::NotReady {
-                        state: RuntimeState::Destroyed,
-                    })?
-                    .mutation_gate,
-            )
+            sessions
+                .get(&self.session_id)
+                .ok_or(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                })?
+                .mutation_gate
+                .clone()
         };
         let publication = self
             .stage_under_retained_mutation_gate(incarnation, tracked_turn_journal, gate)
@@ -11322,7 +11951,7 @@ impl MeerkatMachine {
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+            (entry.epoch_id.clone(), entry.mutation_gate.clone())
         };
 
         let local_semantic_high_water = {
@@ -11395,10 +12024,10 @@ impl MeerkatMachine {
                     reason: "direct member runtime disappeared during durable admission"
                         .to_string(),
                 })?;
-            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+            (entry.epoch_id.clone(), entry.mutation_gate.clone())
         };
         if runtime_epoch_id != captured_runtime_epoch_id
-            || !Arc::ptr_eq(&session_mutation_gate, &captured_session_mutation_gate)
+            || !session_mutation_gate.same_gate(&captured_session_mutation_gate)
         {
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: "direct member runtime was replaced during durable admission".to_string(),
@@ -11429,7 +12058,9 @@ impl MeerkatMachine {
 
         if let Some(current) = direct_member.as_ref() {
             let current_runtime_is_exact = current.runtime_epoch_id == runtime_epoch_id
-                && Arc::ptr_eq(&current.session_mutation_gate, &session_mutation_gate);
+                && current
+                    .session_mutation_gate
+                    .same_gate(&session_mutation_gate);
             let current_semantic = current.fence.incarnation();
             if &current_semantic == requested {
                 if current_runtime_is_exact {
@@ -11538,7 +12169,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member live/open expected incarnation {expected:?}; runtime session was replaced"
@@ -11581,7 +12212,10 @@ impl MeerkatMachine {
             session_mutation_gate,
             ..
         } = lease;
-        let session_guard = Arc::clone(&session_mutation_gate).lock_owned().await;
+        let session_guard = self
+            .lock_live_session_mutation_gate(session_id, &session_mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
@@ -11591,7 +12225,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member effect expected incarnation {expected:?}; runtime session was replaced"
@@ -11633,7 +12267,7 @@ impl MeerkatMachine {
                 (Some(expected), MemberResidencyState::Placed(registration))
                     if &registration.incarnation == expected =>
                 {
-                    Some(Arc::clone(&registration.session_mutation_gate))
+                    Some(registration.session_mutation_gate.clone())
                 }
                 (Some(expected), MemberResidencyState::Placed(registration)) => {
                     return Err(RuntimeDriverError::StaleAuthority {
@@ -11687,7 +12321,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &registered_gate) {
+            if !entry.mutation_gate.same_gate(&registered_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member effect expected incarnation {expected:?}; runtime session was replaced"
@@ -11731,10 +12365,9 @@ impl MeerkatMachine {
         match (expected, &*state) {
             (Some(expected), MemberResidencyState::Placed(registration))
                 if &registration.incarnation == expected
-                    && Arc::ptr_eq(
-                        &registration.session_mutation_gate,
-                        &lease.session_mutation_gate,
-                    ) =>
+                    && registration
+                        .session_mutation_gate
+                        .same_gate(&lease.session_mutation_gate) =>
             {
                 Ok(())
             }
@@ -11844,6 +12477,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -11907,6 +12541,8 @@ impl MeerkatMachine {
                 test_executor_after_ensure_pause_release: crate::tokio::sync::Notify::new(),
                 #[cfg(feature = "test-support")]
                 test_unregister_saga_hold: StdMutex::new(None),
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+                test_live_custody_read_hold: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
@@ -11919,6 +12555,10 @@ impl MeerkatMachine {
                 test_fenced_accept_after_lease: StdMutex::new(None),
                 #[cfg(test)]
                 test_accepted_boundary_work_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_durable_steer_relock_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_accepted_boundary_work_outcomes: StdMutex::new(None),
                 #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]
@@ -11936,7 +12576,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
@@ -11967,6 +12607,17 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
+                #[cfg(test)]
+                test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
+                pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
+                #[cfg(test)]
+                test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12078,6 +12729,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -12141,6 +12793,8 @@ impl MeerkatMachine {
                 test_executor_after_ensure_pause_release: crate::tokio::sync::Notify::new(),
                 #[cfg(feature = "test-support")]
                 test_unregister_saga_hold: StdMutex::new(None),
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+                test_live_custody_read_hold: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
@@ -12153,6 +12807,10 @@ impl MeerkatMachine {
                 test_fenced_accept_after_lease: StdMutex::new(None),
                 #[cfg(test)]
                 test_accepted_boundary_work_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_durable_steer_relock_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_accepted_boundary_work_outcomes: StdMutex::new(None),
                 #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]
@@ -12170,7 +12828,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
@@ -12201,6 +12859,17 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
+                #[cfg(test)]
+                test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
+                pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
+                #[cfg(test)]
+                test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12428,7 +13097,7 @@ impl MeerkatMachine {
         dispatcher: composition::MeerkatCompositionSignalDispatcher,
     ) {
         let _gate = self
-            .lock_current_session_mutation_gate(session_id)
+            .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::TestFixture)
             .await
             .expect("test signal endpoint requires an existing registration");
         self.sessions
@@ -12963,6 +13632,21 @@ mod durable_steer_tests;
 #[cfg(test)]
 mod terminal_receipt_tests;
 
+#[cfg(test)]
+mod input_transition_wait_tests;
+
+#[cfg(all(test, feature = "live"))]
+mod live_custody_read_tests;
+
+#[cfg(test)]
+mod registration_use_tests;
+
+#[cfg(test)]
+mod durability_gate_wait_tests;
+
+#[cfg(test)]
+mod commit_deadline_tests;
+
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;
 
@@ -12983,6 +13667,14 @@ impl Drop for MeerkatMachineShared {
 }
 
 impl MeerkatMachineShared {
+    /// A fresh [`RuntimeSessionRegistrationUse`] stamp value: the next value
+    /// of the machine-wide sequence.
+    fn next_registration_use(&self) -> u64 {
+        self.registration_use_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
     fn require_governed_execution_custody(&self) -> Result<(), RuntimeDriverError> {
         if self.store.is_none()
             || self

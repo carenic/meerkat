@@ -647,6 +647,19 @@ impl PersistentRuntimeDriver {
         self.durability_health.clone()
     }
 
+    /// The store's declared commit outcome deadline with this shell's
+    /// durability health, for the runtime loop that commits through it.
+    pub(crate) fn runtime_loop_commit_deadline(
+        &self,
+    ) -> Option<crate::runtime_loop::RuntimeLoopCommitDeadline> {
+        let durability_health = self.durability_health.clone()?;
+        let deadline = self.store.commit_outcome_deadline()?;
+        Some(crate::runtime_loop::RuntimeLoopCommitDeadline::new(
+            deadline,
+            durability_health,
+        ))
+    }
+
     /// Degrade this production persistent shell after a transition or durable
     /// commit can no longer be reconciled in place. The shared session gate
     /// retains the first failure and refuses every later ordinary mutation

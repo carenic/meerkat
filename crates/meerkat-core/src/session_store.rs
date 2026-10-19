@@ -1356,6 +1356,14 @@ pub trait SessionStore: Send + Sync {
 
     /// Save an authoritative projection only if the persisted row is still the
     /// revision that the caller already validated.
+    ///
+    /// Besides runtime-backed services, one offline caller is legitimate: a
+    /// storage migration that runs while no other process uses the store. It
+    /// validates the session's transcript history itself, as `save` would,
+    /// and passes `None` to create the row of a session that only the
+    /// pre-migration store holds (`None` never replaces an existing row). It
+    /// activates the session's runtime authority only afterwards, from the
+    /// `HeadCanonicalAuthorityCrossing` this store issues.
     async fn save_authoritative_projection_if_current_revision(
         &self,
         session: &Session,
@@ -6042,7 +6050,77 @@ pub struct StrandLayout {
 /// still materialize their recorded exact splice, but current live-tail
 /// divergence fails closed. Pure — shared by read-only head synthesis and the
 /// in-transaction migration write.
+///
+/// The layout starts at the graph's pre-rewrite anchor, so a graph that
+/// retired its oldest occurrences refuses typed here. Lay a re-anchored graph
+/// out with [`strand_layout_for_retained_history`].
 pub fn strand_layout_for_history(
+    session: &Session,
+    history: Option<&ValidatedTranscriptHistory>,
+) -> Result<StrandLayout, SessionStoreError> {
+    if let Some(state) = history.map(ValidatedTranscriptHistory::state) {
+        // A whole-graph layout replays from the pre-rewrite anchor through
+        // every occurrence. A re-anchored graph no longer holds the retired
+        // bodies, so it has no faithful whole-graph layout.
+        if state.retired_count() != 0 {
+            return Err(SessionStoreError::InvalidTranscriptRewrite {
+                id: session.id().clone(),
+                reason: format!(
+                    "transcript graph retired its first {} rewrite occurrence(s) (oldest retained revision {}); a head-canonical strand layout needs the whole graph",
+                    state.retired_count(),
+                    state.oldest_retained_revision()
+                ),
+            });
+        }
+    }
+    lay_out_retained_history(session, history)
+}
+
+/// The strand layout of a transcript graph's retained part, with the base
+/// its retired occurrences left behind.
+///
+/// [`StrandLayout::rewrites`] holds only the retained occurrences: entry `i`
+/// is rewrite generation `retired_count() + i + 1`. The anchor strand holds
+/// the graph's own anchor, which a re-anchored graph moved to the child of
+/// its last retired occurrence. A store persists [`Self::retired_base`]
+/// beside these rows so that its cold replay starts from the same base.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RetainedStrandLayout {
+    /// The layout of the retained occurrences and the live tail.
+    pub layout: StrandLayout,
+    /// The retired prefix and anchor of a re-anchored graph; `None` for a
+    /// whole graph.
+    pub retired_base: Option<crate::RetiredTranscriptGraphBase>,
+}
+
+impl RetainedStrandLayout {
+    /// Occurrences retired before the anchor (zero for a whole graph).
+    #[must_use]
+    pub fn retired_count(&self) -> usize {
+        self.retired_base
+            .as_ref()
+            .map_or(0, crate::RetiredTranscriptGraphBase::retired_count)
+    }
+}
+
+/// Lay out the retained part of a session's transcript history.
+///
+/// For a whole graph this is [`strand_layout_for_history`]'s layout. A graph
+/// that retired its oldest occurrences lays out from its re-anchored anchor
+/// through its retained occurrences, and the result carries the retired base
+/// a store persists beside the rows.
+pub fn strand_layout_for_retained_history(
+    session: &Session,
+    history: Option<&ValidatedTranscriptHistory>,
+) -> Result<RetainedStrandLayout, SessionStoreError> {
+    Ok(RetainedStrandLayout {
+        layout: lay_out_retained_history(session, history)?,
+        retired_base: history.and_then(|history| history.state().retired_base()),
+    })
+}
+
+fn lay_out_retained_history(
     session: &Session,
     history: Option<&ValidatedTranscriptHistory>,
 ) -> Result<StrandLayout, SessionStoreError> {
@@ -6067,19 +6145,8 @@ pub fn strand_layout_for_history(
         });
     };
     let state = history.state();
-    // Head-canonical rows replay a graph from its pre-rewrite anchor through
-    // every occurrence. A re-anchored graph no longer holds the retired
-    // bodies, so it has no faithful strand layout.
-    if state.retired_count() != 0 {
-        return Err(SessionStoreError::InvalidTranscriptRewrite {
-            id: id.clone(),
-            reason: format!(
-                "transcript graph retired its first {} rewrite occurrence(s) (oldest retained revision {}); a head-canonical strand layout needs the whole graph",
-                state.retired_count(),
-                state.oldest_retained_revision()
-            ),
-        });
-    }
+    // A re-anchored graph lays out from its own anchor, the child of its last
+    // retired occurrence, and its retained edges chain from there.
     let serialized_anchor = state
         .anchor()
         .messages()
@@ -7495,7 +7562,7 @@ mod tests {
                 server_id: Some("server".to_string()),
                 operation: None,
                 phase: None,
-                persisted: true,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(true),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),
@@ -7848,7 +7915,7 @@ mod tests {
                 server_id: None,
                 operation: None,
                 phase: None,
-                persisted: false,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(false),
                 detail: Some("connecting".to_string()),
                 confinement_refusal: None,
                 pending_sources: vec!["test-server".to_string()],
@@ -8391,7 +8458,7 @@ mod tests {
                 server_id: None,
                 operation: None,
                 phase: Some(crate::event::ExternalToolDeltaPhase::Pending),
-                persisted: false,
+                lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(false),
                 detail: Some(body.to_string()),
                 confinement_refusal: None,
                 pending_sources: vec!["king-search".to_string()],
@@ -9108,6 +9175,119 @@ mod tests {
         // Wrong count.
         assert!(matches!(
             head.into_session(Vec::new()),
+            Err(SessionStoreError::Corrupted(_))
+        ));
+    }
+
+    fn peer_message_notice_with_delivery_id() -> Message {
+        Message::SystemNotice(SystemNoticeMessage::with_block(
+            SystemNoticeKind::Comms,
+            Some("Peer message".to_string()),
+            SystemNoticeBlock::Comms {
+                kind: crate::types::CommsNoticeKind::Message,
+                direction: crate::types::SystemNoticeDirection::Incoming,
+                peer: Some(crate::types::SystemNoticePeer {
+                    id: crate::comms::PeerId::new(),
+                    display_name: Some("sender".to_string()),
+                }),
+                sender_taint: None,
+                request_id: None,
+                intent: None,
+                status: None,
+                summary: Some("Peer message".to_string()),
+                payload: None,
+                content: vec![crate::types::ContentBlock::Text {
+                    text: "please look at this".to_string(),
+                }],
+                delivery_id: Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(77))),
+                in_reply_to: None,
+            },
+        ))
+    }
+
+    /// A stored row as a reader that does not know `delivery_id` decodes it:
+    /// the key is dropped from every notice block.
+    fn decoded_without_delivery_id(row: &[u8]) -> Message {
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("delivery_id");
+                    map.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(row).expect("row is JSON");
+        strip(&mut value);
+        serde_json::from_value(value).expect("row decodes without the key")
+    }
+
+    /// A peer message notice's delivery id is correlation, erased from the
+    /// transcript content digest. A reader that drops the key when it decodes
+    /// the stored row (0.9.3 does not know the field) recomputes the head
+    /// revision this version stored, so it loads the session instead of
+    /// failing `Corrupted`. The stored bytes are untouched, as they are for
+    /// such a reader.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn session_head_loads_rows_decoded_without_the_peer_notice_delivery_id() {
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("hello".to_string())));
+        session.push(peer_message_notice_with_delivery_id());
+        let head = SessionHead::from_session(&session, TranscriptStrandId::root(), 0)
+            .expect("head projection");
+        let rows = session
+            .messages()
+            .iter()
+            .map(|message| serde_json::to_vec(message).expect("serialize durable row"))
+            .collect::<Vec<_>>();
+        head.clone()
+            .into_session_from_serialized_rows(rows.clone())
+            .expect("rows as written load");
+
+        let decoded = rows
+            .iter()
+            .map(|row| decoded_without_delivery_id(row))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            decoded.as_slice(),
+            session.messages(),
+            "the notice row carries a delivery id"
+        );
+        let loaded = head
+            .into_session_with_serialized_rows(decoded, &rows, None, None)
+            .expect("a reader without the field computes the same revision");
+        assert!(matches!(
+            &loaded.messages()[1],
+            Message::SystemNotice(notice) if matches!(
+                notice.blocks.as_slice(),
+                [SystemNoticeBlock::Comms { delivery_id: None, .. }]
+            )
+        ));
+    }
+
+    /// The erasure is scoped to the delivery id: the rest of the notice block
+    /// stays in the digest, so decoded notice content that differs from what
+    /// the head revision covers still fails closed (over unchanged bytes).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn session_head_still_digests_the_rest_of_a_peer_notice() {
+        let mut session = Session::new();
+        session.push(peer_message_notice_with_delivery_id());
+        let head = SessionHead::from_session(&session, TranscriptStrandId::root(), 0)
+            .expect("head projection");
+        let rows = vec![serde_json::to_vec(&session.messages()[0]).expect("serialize durable row")];
+        let mut decoded = session.messages().to_vec();
+        if let Message::SystemNotice(notice) = &mut decoded[0]
+            && let [SystemNoticeBlock::Comms { content, .. }] = notice.blocks.as_mut_slice()
+        {
+            *content = vec![crate::types::ContentBlock::Text {
+                text: "please look at that".to_string(),
+            }];
+        }
+        assert!(matches!(
+            head.into_session_with_serialized_rows(decoded, &rows, None, None),
             Err(SessionStoreError::Corrupted(_))
         ));
     }

@@ -1194,6 +1194,7 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
         body: "before removal".to_string(),
         blocks: None,
         handling_mode: meerkat_core::types::HandlingMode::Queue,
+        in_reply_to: None,
     };
     let (receipt, _message_candidate): PeerSendAndCandidate = tokio::join!(
         CoreCommsRuntime::send(&sender, cmd),
@@ -1235,6 +1236,7 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
         body: "after removal".to_string(),
         blocks: None,
         handling_mode: meerkat_core::types::HandlingMode::Queue,
+        in_reply_to: None,
     };
     let result = CoreCommsRuntime::send(&sender, cmd_after).await;
     assert!(

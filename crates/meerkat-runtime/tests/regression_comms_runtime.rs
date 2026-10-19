@@ -53,6 +53,7 @@ fn make_message(from: &str, body: &str) -> InboxInteraction {
         content: InteractionContent::Message {
             body: body.into(),
             blocks: None,
+            in_reply_to: None,
         },
         rendered_text: format!("[{from}]: {body}"),
         handling_mode: meerkat_core::types::HandlingMode::Queue,
@@ -76,6 +77,7 @@ fn make_message_with_blocks(from: &str, body: &str) -> InboxInteraction {
                     data: "abc123".into(),
                 },
             ]),
+            in_reply_to: None,
         },
         rendered_text: format!("[{from}]: {body}"),
         handling_mode: meerkat_core::types::HandlingMode::Queue,

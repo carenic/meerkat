@@ -170,10 +170,6 @@ rust_test(
     ],
     size = "large",
     data = [
-        "//:test_fixtures",
-        "//tests/fixtures/machine-dsl-tests:package_runfiles",
-        "//tests/fixtures/mcp-test-server:package_runfiles",
-        "//tests/fixtures/surface-build-fixtures:package_runfiles",
         ":package_runfiles",
     ],
     env = {
@@ -362,9 +358,6 @@ rust_test(
         "e2e",
     ],
     data = [
-        ":package_runfiles",
-        "//:workspace_cargo_manifests",
-        "//:workspace_metadata",
         "//crates/meerkat-mcp-server:rkat_mcp_bin",
     ],
     env = {
@@ -438,7 +431,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
         "//crates/meerkat-mcp-server:rkat_mcp_bin",
     ],
     env = {

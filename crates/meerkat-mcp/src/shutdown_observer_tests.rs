@@ -5,6 +5,7 @@
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(feature = "workspace-tests")]
 fn surface_router() -> McpRouter {
     McpRouter::new_with_surface_handle_and_stdio_profile(
         Arc::new(meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral()),
@@ -23,6 +24,7 @@ fn the_observer_is_clone_send_sync_static() {
 /// C2: an adapter dropped without shutting its router down leaves its
 /// observer reading Abandoned. (Fails at base: nothing outside the adapter
 /// could observe its router's shutdown.)
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn an_observer_reads_abandoned_when_the_adapter_is_dropped_unshut() {
     let adapter = McpRouterAdapter::new(surface_router());
@@ -39,6 +41,7 @@ async fn an_observer_reads_abandoned_when_the_adapter_is_dropped_unshut() {
 
 /// C2: reading without waiting gives nothing until the shutdown reports or
 /// is abandoned, then the same observation a wait gives.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn current_reads_nothing_until_the_shutdown_reports() {
     let adapter = McpRouterAdapter::new(surface_router());
@@ -77,6 +80,7 @@ mod stdio {
 
     /// C2: every shutdown call and every observer, taken before the shutdown
     /// or after it and read after the adapter is gone, reads the one report.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn every_shutdown_and_observer_reads_the_one_report() {
         let mut router = surface_router();
@@ -126,6 +130,7 @@ mod stdio {
     /// while the server was in its EOF grace) leaves the observer reading
     /// Abandoned, never a report. (Fails at base: no observer existed; the
     /// adapter only logged that the task ended without finishing.)
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn an_observer_reads_abandoned_when_the_shutdown_task_is_dropped() {
         let host = tokio::runtime::Builder::new_multi_thread()

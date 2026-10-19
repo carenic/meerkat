@@ -103,6 +103,29 @@ pub struct ToolConfig {
     /// re-registered on resume.
     #[serde(default)]
     pub rust_bundles: Vec<String>,
+    /// Tool bundles this profile opted into: the lenient twin of the strict
+    /// [`Self::rust_bundles`].
+    ///
+    /// Each build mounts every named bundle the mob's builder registered and
+    /// withholds the rest, so an opted bundle never fails a member build;
+    /// [`crate::MobHandle::withheld_tool_bundles`] reports what is withheld.
+    /// The registrations are the ceiling, and they are read again at every
+    /// build, a resume included. The names persist with the definition. The
+    /// deny list may name the tools of each mounted opted bundle; while any
+    /// opted bundle is withheld, every deny name in no vocabulary is checked
+    /// only at call time, so a typo shows at build only once the bundle is
+    /// mounted again.
+    ///
+    /// The public profile input (`tools.bundles`) accepts this list only on
+    /// an inline profile of a child mob, and only for bundles the host offers
+    /// to child mobs; that offer is the host's, the same for every child mob,
+    /// whatever the creating member itself mounts. A host sets it where it
+    /// names `rust_bundles` itself: on a realm profile it stores, or on a
+    /// definition it builds with [`crate::MobBuilder`]. A `MobMcpState`
+    /// create that is not a child mob's refuses it, a TOML definition
+    /// included when it goes through one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
 }
 
 impl ToolConfig {
@@ -130,6 +153,7 @@ impl ToolConfig {
         "mcp",
         "mcp_servers",
         "rust_bundles",
+        "bundles",
     ];
 }
 
@@ -643,6 +667,7 @@ mod tests {
             mcp: vec!["server-a".to_string(), "server-b".to_string()],
             mcp_servers: vec![],
             rust_bundles: vec!["custom-tools".to_string()],
+            bundles: Vec::new(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ToolConfig = serde_json::from_str(&json).unwrap();
@@ -665,6 +690,7 @@ mod tests {
             mcp: vec!["mcp-server".to_string()],
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
+            bundles: Vec::new(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         let parsed: ToolConfig = toml::from_str(&toml_str).unwrap();
@@ -696,6 +722,7 @@ mod tests {
                 mcp: vec![],
                 mcp_servers: vec![],
                 rust_bundles: vec![],
+                bundles: Vec::new(),
             },
             peer_description: "Orchestrates worker agents".to_string(),
             external_addressable: true,
@@ -735,6 +762,7 @@ mod tests {
                 mcp: vec!["code-server".to_string()],
                 mcp_servers: vec![],
                 rust_bundles: vec!["custom".to_string()],
+                bundles: Vec::new(),
             },
             peer_description: "Writes code".to_string(),
             external_addressable: false,

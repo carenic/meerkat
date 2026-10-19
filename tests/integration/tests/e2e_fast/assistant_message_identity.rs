@@ -56,9 +56,7 @@ fn done(model: &str) -> Vec<LlmEvent> {
             ),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(StopReason::EndTurn),
         },
     ]
 }

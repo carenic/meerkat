@@ -256,7 +256,7 @@ fn assert_stock_turn_audit_with_models(
         .iter()
         .filter(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == denied_call && tool_name == "delete_record"))
         })
@@ -919,7 +919,10 @@ async fn exercise_stock_persistent(
     assert!(refusal.is_error);
     assert_eq!(
         serde_json::from_str::<Value>(&refusal.text_content()).unwrap(),
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     let allowed = tool_feedback(saved.messages(), PERMITTED_CALL).unwrap();
     assert!(!allowed.is_error);
@@ -1694,7 +1697,10 @@ async fn exercise_stock_persistent(
         assert!(refusal.is_error);
         assert_eq!(
             serde_json::from_str::<Value>(&refusal.text_content()).unwrap(),
-            ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+            ToolError::AuthorizationRefused {
+                refusal: denied_before_dispatch(),
+            }
+            .to_error_payload()
         );
         let allowed = tool_feedback(fresh_saved.messages(), REOPEN_PERMITTED_CALL).unwrap();
         assert!(!allowed.is_error);

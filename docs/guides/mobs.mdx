@@ -102,6 +102,23 @@ call blocks for it instead. There is no default deadline; `max_run_secs` is an
 opt-in autokill. See [Mob tools](/reference/builtin-tools#fork_off-and-council-delivery)
 for the result shapes and the ownership rules.
 
+A fork child holds the instruction activations it copied from its source as
+history only, and runs no model turn until each inherited key is activated in
+the child. The host decides who does that with its fork instruction policy
+(`MobBuilder::with_fork_instruction_policy`, or
+`MobMcpState::with_fork_instruction_policy`); it is never a tool argument or
+part of a mob definition:
+
+- `require_explicit_activation` (the default): the host activates the child
+  after `fork_member`. The forks that start the child's turn themselves
+  (`fork_off`, the bounded and detached member forks, the live delegation's
+  durable fork, and council participants) leave no window for that, so a fork
+  of a member with activated host instructions is refused before anything is
+  committed, with the typed `fork_instruction_refused` error.
+- `reactivate_inherited`: the fork appends the child's own activation of every
+  key that was effective in the source, and the child runs at once.
+- `refuse`: every fork whose child would inherit an activation is refused.
+
 ## Define A Mob
 
 A small mob definition has profiles and optional wiring:
@@ -226,8 +243,44 @@ the member's tool catalog (the tool list sent to the model) on every build, a
 resume included. A call to a denied name is still refused with an ordinary
 `access_denied` tool error, and a spawn cannot widen the list. An unknown name,
 such as a typo, fails the member's build with `DeclaredToolUnknown`, unless the
-profile declares an MCP server that maps no `tool_names`; then the name is
-checked only at call time.
+profile declares an MCP server that maps no `tool_names` or opts into a bundle
+the build withholds; then the name is checked only at call time.
+
+### Opting into host tool bundles
+
+`tools.bundles` names host tool bundles a profile opts into. It is the lenient
+twin of the host-named `rust_bundles`: a member build refuses with
+`ToolBundleUnavailable` while a `rust_bundles` entry is not registered, but it
+mounts each `bundles` entry the mob's builder registered and withholds the
+rest. `MobHandle::withheld_tool_bundles()` reports what is withheld. The
+registrations are the ceiling and are read again at every build, a resume
+included, so a host that stops offering a bundle withdraws it from every
+member that opted into it. While any opted bundle is withheld, every deny name
+in no vocabulary is checked only at call time, so a typo is reported at build
+only once the bundle is mounted again.
+
+Through the public profile input (the agent `mob_create` tool, `mob/create`),
+only an inline profile of a child mob, a mob a member creates with
+`mob_create`, may opt in, and only to a bundle the host registered as
+`ChildToolBundleAvailability::ChildOffered`. Any other name is refused with
+`ToolBundleNotOffered`, which lists the bundles the host offers; an empty or
+repeated name is an argument error. Realm profile writes and spawn-time
+profiles given as public profile input (the agent mob tools) cannot opt in. The
+offer is the host's, the same for every child mob, whatever tools the creating
+member itself mounts. A bundle the host registered as `ChildAvailable` still
+reaches every inline child profile without an opt-in.
+
+```json
+{
+  "id": "research",
+  "profiles": {
+    "announcer": {
+      "model": "claude-sonnet-4-6",
+      "tools": { "comms": true, "bundles": ["announcements"] }
+    }
+  }
+}
+```
 
 ### Profile model and provider fields
 
@@ -545,6 +598,17 @@ behavior, not durable configuration: re-supply it from a
 `SpawnMemberCustomizer` after restart. Remote placement rejects it before
 materialization instead of dropping the override.
 
+A trusted host that decides each member's destination or agent mandate
+installs a `MemberRuntimeRegistrationHook` with
+`MobBuilder::with_member_runtime_registration_hook` (`runtime-adapter`). Since
+0.9.4 each call carries the member's exact registration
+(`MemberRuntimeBuildIdentity::registration()`): the one prepared for a new
+member, or the current one of a member whose actor is recovered. Bind what the
+host decides to that registration, not to an identity derived from the
+member's session id or labels; a later registration of the same session is a
+different one. The identity is no longer `UnwindSafe`, so wrap it in
+`std::panic::AssertUnwindSafe` to move it into `catch_unwind`.
+
 ## Identity And Respawn
 
 Mobs separate stable member identity from runtime binding details:
@@ -558,6 +622,15 @@ Mobs separate stable member identity from runtime binding details:
 
 Use `AgentIdentity` for facts that survive respawn, such as wiring and durable
 configuration. Runtime IDs and fence tokens protect the lower-level binding.
+
+Since 0.9.4 a spawn never reuses a generation, across mob resets and restarts
+too: resume recovers each identity's highest generation from the whole event
+log, so a member re-spawned after a reset and a restart never reuses its
+pre-reset runtime id or member address, and a mob that was reset and then
+re-spawned a member under a pre-reset identity resumes after a restart (0.9.3
+and earlier failed that resume with an internal error). A store written
+before 0.9.4 whose last epoch already reused a generation still resumes, and
+that identity's next spawn goes above the recovered high-water.
 
 ### Durable role migration
 
@@ -1028,8 +1101,10 @@ cooperatively cancels a member's in-flight turn without retiring it — the
 member stays in the roster and can take new turns. As the operator remedy for
 a wedged member it is legal whenever the mob is running and idempotent:
 cancelling a member whose runtime is no longer live, or one already retiring,
-converges as a no-op success rather than an admission error. Only an identity
-the roster has never seen is refused, with a typed `MemberNotFound`.
+converges as a no-op success rather than an admission error. An identity the
+roster has never seen is refused with a typed `MemberNotFound`. A member whose
+runtime registration needs a durability reload is refused with a typed
+`MemberReloadRequired` (`-32029`) until its registration is reloaded.
 
 ## Persistence
 
@@ -1057,6 +1132,74 @@ Retirement, respawn, and registration reload wait behind the affected member's
 in-flight resume work. Cleanup failures retain exact retry authority; an
 unproven cleanup is not a successful cancellation. Compensation preserves
 durable session documents and refuses to remove a successor attachment.
+
+### Member binding history (Rust hosts)
+
+Since 0.9.4 a Rust host can ask which incarnation of a member held which
+session, as a store read that never waits behind the mob actor:
+`MobHandle::member_binding_history()` (also on `read_handle()`) and its
+single-read forms `member_binding_for_session`, `last_member_binding`,
+`durable_identity_members` and `identity_management`. For a stopped mob,
+`MobStorage::read_member_binding_history(path)` reads the same history from
+the persistent store, read-only. See
+[Member binding history](/reference/mob-architecture#member-binding-history)
+for what each read answers.
+
+### Shutdown, destroy and admission (Rust hosts)
+
+Every exported `MobHandle` clone shares one owner token. A mob whose admission
+is closed refuses new work with `MobError::AdmissionClosed` and a
+`MobAdmissionCloseReason`, while stop, shutdown, destroy, retirement,
+cancellation and reads keep working. Since 0.9.4 no mob actor exit leaves
+admission open:
+
+| Event | Close reason |
+|-------|--------------|
+| `MobHandle::shutdown` or `shutdown_with_report` is admitted | `Shutdown` |
+| A destroy is admitted (its durable destroy marker is written) | `Destroyed` |
+| A durable write's outcome stays uncertain, or a durable recovery fails | `DurabilityFailStop` |
+| The actor task ends without its loop returning (a panic or an abort) | `ActorLost` |
+| A composition dispatch failure stops the actor | `DispatchFailed` |
+
+An earlier close (`IdleClose`, `LastOwnerReleased`, `StandDown` or one of the
+above) keeps its reason. After any of them `acquire_owner()` is refused and
+`admission_closed()` reports the reason; 0.9.3 and earlier could still hand out
+an owner lease on a shut-down, destroyed or lost actor.
+
+While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
+flow run, wiring, a host bind, a live commit, resume, reset or reload) fails
+with `AdmissionClosed`, and every other request the actor answers (stop,
+destroy, complete, retirement, reads, `MobHandle::status`) fails with
+`MobError::ShutdownInProgress`: retryable, authority retained, wire code
+`SESSION_BUSY`. `MobHandle::stop` returns it at once. Retry once the Shutdown
+has finished, after which requests get `ActorCommandChannelClosed` (the actor
+has exited or is exiting), or has failed: a failed Shutdown keeps the actor
+serving with admission closed for its life, and Stop, Shutdown and Destroy stay
+available. 0.9.3 and earlier answered all of these with
+`ActorCommandChannelClosed`. A command sent while the actor exits after a
+Shutdown now fails instead of waiting forever.
+
+`shutdown_with_report(ShutdownOptions)` returns a `MobShutdownReport` with one
+`MemberShutdownOutcome` per member; `is_clean()` is true when every member was
+unregistered. Since 0.9.4 a member reported `UnregisterPending { stage,
+settlement, .. }` carries a `MemberUnregisterSettlement` that keeps following
+the member's exact runtime registration after Shutdown returns, also after the
+mob's actor exited: `try_state()` reads `Settled`, `Pending`, `Failed` or
+`HandedOver` without waiting, and `settle_within(deadline)` waits, admitting
+the unregister itself when Shutdown's deadline passed first. `HandedOver`
+means a later owner (a resumed mob, or any caller that reused or attached to
+the registration) took it over; the settlement then touches nothing. A member
+whose registration is durability-degraded is now unregistered after the
+runtime's reload-required discard (reported at stage
+`durability_reload_discard` while the runtime refuses the unregister until
+then); 0.9.3 and earlier left it registered until the process exited.
+
+A mob restored with an unfinished destroy starts with admission closed before
+`MobBuilder::resume` returns its handle, so nothing is spawned into it while the
+destroy is retried. A recorded placed lifecycle intent, such as a Reset, is not
+retried while admission is closed; it stays recorded and the next start drives
+it. `MobError` is `#[non_exhaustive]` since 0.9.4: an exhaustive `match` needs a
+wildcard arm.
 
 ### Admission in custom Rust session services
 
@@ -1184,7 +1327,7 @@ request; it never silently strips the field and launches a weaker member.
 
 The typed non-portable causes cover:
 
-- Rust tool bundles, per-spawn external tools, mob-default external tools, and a default LLM client override
+- Rust tool bundles (`rust_bundles`, and since 0.9.4 bundles a profile opts into with `tools.bundles`), per-spawn external tools, mob-default external tools, and a default LLM client override
 - an in-process compaction curator override
 - a host-surface MCP allow-list, an inherited tool filter, and WorkGraph tools
 - non-empty shell environment, MCP stdio environment, or MCP HTTP headers
