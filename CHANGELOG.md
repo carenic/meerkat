@@ -139,6 +139,25 @@ them.
   check that `preflight_schema_eligibility` runs and returns the ledger
   version it verified (`None` for a fresh domain), read in the same snapshot
   as the check.
+- `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`
+  converts a standalone WholeBlob runtime database in place to the
+  HeadCanonical profile, co-located with the SQLite session store in the same
+  file. A standalone database is one a host composed with
+  `SqliteRuntimeStore::new` on a file of its own, such as a Meta 0.9.3
+  persistent gateway's `runtime.sqlite`; it holds no physical session, so
+  `new_head_canonical` refuses it. The conversion requires the session store's
+  schema in the file (open `SqliteSessionStore` on it first; without it the
+  conversion refuses typed and writes nothing), pins the file, and seeds each
+  runtime's session that the co-located store holds no row for from its
+  digest-verified WholeBlob body, in the transaction that installs the
+  runtime's authority and completes its activation receipt. A stopped
+  conversion finishes on the next call. It returns
+  `StandaloneWholeBlobConversionReport`: per converted runtime, its session,
+  `StandaloneWholeBlobSessionSource` and boundary message count, with
+  `seeded_count` and `derived_count`. The caller
+  asserts that the file is standalone; a SQLite realm never uses it.
+  `new_head_canonical` is unchanged and never seeds a session, so a session
+  deleted from a realm's session store does not come back.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
   member's exact runtime registration, so every
   `MemberRuntimeRegistrationHook` call names the registration it is made

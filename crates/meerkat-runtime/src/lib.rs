@@ -1112,8 +1112,6 @@ pub use runtime_event::{
 };
 pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
 pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_handle};
-#[cfg(feature = "sqlite-store")]
-pub use store::SqliteRuntimeStore;
 pub use store::{
     CommittedRecoveryBoundary, CommittedWholeBlobMetadata, CommittedWholeBlobProvisionalTail,
     CommittedWholeBlobSnapshot, CommittingWholeBlobSession, ContinuationAdmission,
@@ -1133,6 +1131,11 @@ pub use store::{
     RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, VerifiedCommittedWholeBlobPayload,
     WholeBlobCommittedTranscriptFacts, WholeBlobProvisionalTailAuthority, WholeBlobStoreAuthority,
     reuse_or_load_committed_whole_blob_snapshot,
+};
+#[cfg(feature = "sqlite-store")]
+pub use store::{
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    StandaloneWholeBlobSessionSource,
 };
 pub use traits::{
     DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlPlane,

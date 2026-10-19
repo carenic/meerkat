@@ -653,6 +653,25 @@ without scheduling or replaying them. A later session activation follows normal
 recovery, which applies this binary's ordinary terminal-payload retirement to
 rows it writes itself.
 
+A SQLite realm activates the HeadCanonical profile when it opens:
+`SqliteRuntimeStore::new_head_canonical` converts each WholeBlob runtime from
+the co-located session store's own row for its session, and refuses typed when
+that store holds no row, because in a realm a missing row can be a deleted
+session that activation must not bring back. A standalone WholeBlob runtime
+database - one a host composed with `SqliteRuntimeStore::new` on a file of its
+own while its session store lived elsewhere, such as a Meta 0.9.3 persistent
+gateway's `runtime.sqlite` - holds no physical session, so it converts once,
+offline, through `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`.
+The host first opens `SqliteSessionStore` on the same file (the conversion
+refuses typed, and writes nothing, without the co-located session schema).
+The conversion pins the file and seeds each runtime's session that the
+co-located store holds no row for from its digest-verified WholeBlob body, in
+the transaction that installs the runtime's authority and completes its
+activation receipt, so the co-located transcript, rewrite history and metadata
+are that body's. A conversion stopped part way finishes on the next call, and
+a converted file opens with `new_head_canonical`. The caller asserts that the
+file is standalone: the conversion is never used on a realm database.
+
 ### Durable-tail recovery
 
 The intra-turn persistence hook writes a provisional physical successor

@@ -6271,6 +6271,27 @@ END";
         }
     }
 
+    /// Where activation takes a runtime's physical session from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HeadCanonicalActivationSource {
+        /// Only the co-tenant session store's own row, as in a SQLite realm.
+        /// A missing row refuses: there it can mean the session was deleted,
+        /// and activation must not bring it back.
+        CoTenantSession,
+        /// The explicit standalone conversion: a session the co-tenant store
+        /// holds no row for is seeded from the store-owned WholeBlob body.
+        StandaloneWholeBlob,
+    }
+
+    /// One runtime an activation pass converted.
+    #[derive(Debug)]
+    struct HeadCanonicalActivationOutcome {
+        runtime_id: LogicalRuntimeId,
+        session_id: meerkat_core::types::SessionId,
+        seeded_from_whole_blob: bool,
+        boundary_message_count: u64,
+    }
+
     #[derive(Debug)]
     struct StoreOwnedHeadCanonicalActivationSource {
         session: meerkat_core::Session,
@@ -6626,7 +6647,8 @@ ORDER BY runtime_id";
     fn activate_one_head_canonical_runtime(
         conn: &mut Connection,
         runtime_id: &LogicalRuntimeId,
-    ) -> Result<(), RuntimeStoreError> {
+        source: HeadCanonicalActivationSource,
+    ) -> Result<HeadCanonicalActivationOutcome, RuntimeStoreError> {
         let session_label = runtime_id
             .session_id()
             .map(|session_id| session_id.to_string())
@@ -6796,18 +6818,37 @@ ORDER BY runtime_id";
                 2,
                 source_message_count,
             );
-            let Some((physical_head, physical_head_token)) =
+            let co_tenant_physical =
                 meerkat_store::sqlite_store::ensure_head_canonical_for_runtime_in_txn(
                     &tx,
                     &current_source.session_id,
                 )
-                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?
-            else {
-                return Err(session_authority_conflict(
-                    runtime_id,
-                    "the co-tenant session store has no physical session to canonicalize",
-                ));
-            };
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+            let (physical_head, physical_head_token, seeded_from_whole_blob) =
+                match (co_tenant_physical, source) {
+                    (Some((head, token)), _) => (head, token, false),
+                    // The caller asserted a standalone WholeBlob database:
+                    // its co-tenant store never held this session, so the
+                    // verified body seeds it here, in the transaction that
+                    // installs the authority and completes the receipt.
+                    (None, HeadCanonicalActivationSource::StandaloneWholeBlob) => {
+                        let (head, token) =
+                            meerkat_store::sqlite_store::seed_head_canonical_for_runtime_in_txn(
+                                &tx,
+                                &current_source.session,
+                            )
+                            .map_err(|error| {
+                                map_head_canonical_session_store_error(runtime_id, error)
+                            })?;
+                        (head, token, true)
+                    }
+                    (None, HeadCanonicalActivationSource::CoTenantSession) => {
+                        return Err(session_authority_conflict(
+                            runtime_id,
+                            "the co-tenant session store has no physical session to canonicalize",
+                        ));
+                    }
+                };
             observed_physical_message_count = i64::try_from(physical_head.message_count).ok();
 
             heartbeat.set_phase(
@@ -6947,6 +6988,8 @@ ORDER BY runtime_id";
                 boundary_message_count,
                 physical_message_count,
                 elapsed_ms,
+                seeded_from_whole_blob,
+                successor_boundary_head.message_count,
             ))
         })();
 
@@ -6958,6 +7001,8 @@ ORDER BY runtime_id";
                 boundary_message_count,
                 physical_message_count,
                 elapsed_ms,
+                seeded_from_whole_blob,
+                boundary_head_message_count,
             )) => {
                 tracing::info!(
                     runtime_id = %runtime_id,
@@ -6966,9 +7011,15 @@ ORDER BY runtime_id";
                     boundary_message_count,
                     physical_message_count,
                     elapsed_ms,
+                    seeded_from_whole_blob,
                     "committed synchronous head-canonical profile activation"
                 );
-                Ok(())
+                Ok(HeadCanonicalActivationOutcome {
+                    runtime_id: runtime_id.clone(),
+                    session_id,
+                    seeded_from_whole_blob,
+                    boundary_message_count: boundary_head_message_count,
+                })
             }
             Err(error) => {
                 tracing::error!(
@@ -6988,7 +7039,11 @@ ORDER BY runtime_id";
         }
     }
 
-    fn activate_head_canonical_profiles(conn: &mut Connection) -> Result<(), RuntimeStoreError> {
+    fn activate_head_canonical_profiles(
+        conn: &mut Connection,
+        source: HeadCanonicalActivationSource,
+    ) -> Result<Vec<HeadCanonicalActivationOutcome>, RuntimeStoreError> {
+        let mut outcomes = Vec::new();
         for runtime_id in head_canonical_activation_candidate_ids(conn)? {
             let session_label = runtime_id
                 .session_id()
@@ -7034,11 +7089,15 @@ ORDER BY runtime_id";
                     ));
                 }
                 (Some(_), Some(HeadCanonicalActivationState::InProgress)) | (None, _) => {
-                    activate_one_head_canonical_runtime(conn, &runtime_id)?;
+                    outcomes.push(activate_one_head_canonical_runtime(
+                        conn,
+                        &runtime_id,
+                        source,
+                    )?);
                 }
             }
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     fn load_boundary_receipt(
@@ -10404,6 +10463,60 @@ ORDER BY runtime_id";
         release: std::sync::mpsc::Receiver<()>,
     }
 
+    /// What one [`SqliteRuntimeStore::convert_standalone_whole_blob_in_place`]
+    /// call converted.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct StandaloneWholeBlobConversionReport {
+        /// The runtimes this call converted, in runtime id order. Runtimes an
+        /// earlier, stopped call converted are not repeated, and a converted
+        /// database reports none.
+        pub converted: Vec<StandaloneWholeBlobRuntimeConversion>,
+    }
+
+    impl StandaloneWholeBlobConversionReport {
+        /// Runtimes this call seeded from their WholeBlob bodies.
+        pub fn seeded_count(&self) -> usize {
+            self.count(StandaloneWholeBlobSessionSource::SeededFromWholeBlobBody)
+        }
+
+        /// Runtimes this call converted from the co-located session store's
+        /// own rows, as a realm activation derives them.
+        pub fn derived_count(&self) -> usize {
+            self.count(StandaloneWholeBlobSessionSource::CoLocatedSessionStore)
+        }
+
+        fn count(&self, source: StandaloneWholeBlobSessionSource) -> usize {
+            self.converted
+                .iter()
+                .filter(|conversion| conversion.session_source == source)
+                .count()
+        }
+    }
+
+    /// One runtime a standalone WholeBlob conversion converted.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct StandaloneWholeBlobRuntimeConversion {
+        pub runtime_id: LogicalRuntimeId,
+        pub session_id: meerkat_core::types::SessionId,
+        /// Where the session's co-located physical row came from.
+        pub session_source: StandaloneWholeBlobSessionSource,
+        /// Messages in the runtime's installed boundary transcript.
+        pub boundary_message_count: u64,
+    }
+
+    /// Where a standalone conversion took a runtime's co-located session from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum StandaloneWholeBlobSessionSource {
+        /// The co-located session store held no row for the session; the
+        /// conversion seeded it from the runtime's verified WholeBlob body.
+        SeededFromWholeBlobBody,
+        /// The co-located session store's own row, converted as in a realm.
+        CoLocatedSessionStore,
+    }
+
     /// SQLite-backed runtime store sharing the same sqlite file as `SqliteSessionStore`.
     pub struct SqliteRuntimeStore {
         path: PathBuf,
@@ -10675,12 +10788,24 @@ ORDER BY runtime_id";
         /// returning; an `in_progress` activation is retried, and any
         /// unverifiable source refuses construction rather than leaking an
         /// O(document) migration into the first ordinary service boundary.
+        ///
+        /// Each predecessor converts from the co-located session store's own
+        /// row for its session. A predecessor whose session that store does
+        /// not hold refuses construction typed: in a SQLite realm that can be
+        /// a session deleted from the session store, which activation must
+        /// not bring back. A standalone WholeBlob database (one composed with
+        /// [`Self::new`] on a file of its own, its session store elsewhere)
+        /// converts through [`Self::convert_standalone_whole_blob_in_place`]
+        /// first.
         pub fn new_head_canonical(path: impl Into<PathBuf>) -> Result<Self, RuntimeStoreError> {
             let path = path.into();
             validate_runtime_database_file(&path)?;
             let mut conn = open_head_canonical_runtime_connection(&path)?;
             pin_head_canonical_profile(&mut conn)?;
-            activate_head_canonical_profiles(&mut conn)?;
+            activate_head_canonical_profiles(
+                &mut conn,
+                HeadCanonicalActivationSource::CoTenantSession,
+            )?;
             drop(conn);
             let (path, execution_custody) = bind_runtime_execution_custody(path)?;
             Ok(Self {
@@ -10702,6 +10827,102 @@ ORDER BY runtime_id";
                 #[cfg(test)]
                 machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
             })
+        }
+
+        /// Convert a standalone WholeBlob runtime database in place to the
+        /// head-canonical profile, co-located with the SQLite session store
+        /// in the same file.
+        ///
+        /// A standalone WholeBlob database is one a host composed with
+        /// [`Self::new`] on a file of its own while its session store lived
+        /// elsewhere: it holds WholeBlob runtime authority and bodies and no
+        /// physical session, so [`Self::new_head_canonical`] refuses it. The
+        /// caller asserts that `path` is such a database. Never call this on
+        /// a SQLite realm database: there a WholeBlob runtime whose session
+        /// was deleted from the session store would get that session back.
+        /// A realm activates through [`Self::new_head_canonical`], which
+        /// never seeds a session.
+        ///
+        /// The file must already carry the co-located session store's schema
+        /// (open the SQLite session store on it first). Without it this
+        /// refuses typed ([`RuntimeStoreError::Unsupported`]) and writes
+        /// nothing. It then pins the file to the head-canonical profile and
+        /// activates every queued runtime as [`Self::new_head_canonical`]
+        /// does, with one difference: a runtime whose session the co-located
+        /// store holds no row for is seeded from its store-owned WholeBlob
+        /// body, verified against the store-issued digest, in the
+        /// transaction that installs its authority and completes its
+        /// activation receipt. A runtime whose session has a row converts
+        /// exactly as in a realm. A WholeBlob body that is missing or differs
+        /// from its digest refuses typed. A conversion stopped part way
+        /// finishes when this is called again, and on a converted database
+        /// it converts nothing. Open the converted file with
+        /// [`Self::new_head_canonical`]; the WholeBlob constructors refuse it.
+        pub fn convert_standalone_whole_blob_in_place(
+            path: impl Into<PathBuf>,
+        ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
+            let path = path.into();
+            validate_runtime_database_file(&path)?;
+            if !path.is_file() {
+                return Err(RuntimeStoreError::NotFound(format!(
+                    "no runtime database to convert at {}",
+                    path.display()
+                )));
+            }
+            Self::require_co_located_session_schema_read_only(&path)?;
+            let mut conn = open_head_canonical_runtime_connection(&path)?;
+            pin_head_canonical_profile(&mut conn)?;
+            let converted = activate_head_canonical_profiles(
+                &mut conn,
+                HeadCanonicalActivationSource::StandaloneWholeBlob,
+            )?
+            .into_iter()
+            .map(|outcome| StandaloneWholeBlobRuntimeConversion {
+                runtime_id: outcome.runtime_id,
+                session_id: outcome.session_id,
+                session_source: if outcome.seeded_from_whole_blob {
+                    StandaloneWholeBlobSessionSource::SeededFromWholeBlobBody
+                } else {
+                    StandaloneWholeBlobSessionSource::CoLocatedSessionStore
+                },
+                boundary_message_count: outcome.boundary_message_count,
+            })
+            .collect();
+            Ok(StandaloneWholeBlobConversionReport { converted })
+        }
+
+        /// Refuse a standalone conversion, over a read-only connection and
+        /// before any write, when the file carries no co-located session
+        /// store schema.
+        fn require_co_located_session_schema_read_only(
+            path: &Path,
+        ) -> Result<(), RuntimeStoreError> {
+            // #1551: even a read-only connection names sidecars after this
+            // path; refuse an unsafe database file before opening it.
+            meerkat_sqlite::validate_database_file(path).map_err(map_shared_sqlite_error)?;
+            let conn = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|error| {
+                RuntimeStoreError::ReadFailed(format!(
+                    "read-only preflight of {} failed: {error}",
+                    path.display()
+                ))
+            })?;
+            let session_schema = meerkat_sqlite::domain_version(
+                &conn,
+                meerkat_store::sqlite_store::SESSION_STORE_DOMAIN.name,
+            )
+            .map_err(map_shared_sqlite_error)?;
+            if session_schema.is_none() {
+                return Err(RuntimeStoreError::Unsupported(format!(
+                    "standalone WholeBlob conversion of {} requires the co-located session store schema; open the SQLite session store on this file first",
+                    path.display()
+                )));
+            }
+            Ok(())
         }
 
         pub fn path(&self) -> &Path {
@@ -20222,7 +20443,10 @@ ORDER BY runtime_id";
             tx.commit().unwrap();
 
             assert!(matches!(
-                activate_head_canonical_profiles(&mut conn),
+                activate_head_canonical_profiles(
+                    &mut conn,
+                    HeadCanonicalActivationSource::CoTenantSession
+                ),
                 Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { detail, .. })
                     if detail.contains("has no exact message-row prefix authority")
             ));
@@ -20349,7 +20573,11 @@ ORDER BY runtime_id";
                     .is_empty(),
                 "completed migration receipts and current authorities are historical, not startup work"
             );
-            activate_head_canonical_profiles(&mut conn).unwrap();
+            activate_head_canonical_profiles(
+                &mut conn,
+                HeadCanonicalActivationSource::CoTenantSession,
+            )
+            .unwrap();
         }
 
         #[tokio::test]
@@ -20444,6 +20672,892 @@ ORDER BY runtime_id";
                     .unwrap()
                     .is_empty(),
                 "completed activation plus valid append must leave no startup work"
+            );
+        }
+
+        /// The runtime database a published Meta 0.9.3 persistent gateway
+        /// left behind: WholeBlob runtime authority and bodies, every runtime
+        /// queued for activation, and no session-store tables (the gateway
+        /// keeps its session store in another file). See the fixture README.
+        const META_093_GATEWAY_FIXTURE: &str = "tests/fixtures/v0_9_3_meta_gateway_runtime";
+
+        /// One WholeBlob runtime of the 0.9.3 gateway database, read raw.
+        struct Meta093GatewayRuntime {
+            runtime_id: LogicalRuntimeId,
+            session_id: meerkat_core::types::SessionId,
+            blob_sha256: String,
+            body: Vec<u8>,
+            message_count: usize,
+            rewrite_occurrences: u64,
+        }
+
+        /// Copy the released gateway database into a fresh directory after
+        /// binding every byte of it to the fixture manifest, and read its
+        /// WholeBlob runtimes without opening it as a store.
+        fn meta_093_gateway_fixture_copy() -> (TempDir, PathBuf, Vec<Meta093GatewayRuntime>) {
+            use sha2::Digest as _;
+
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(META_093_GATEWAY_FIXTURE);
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture.join("fixture-manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["schema_version"], 1);
+            assert_eq!(manifest["data_classification"], "synthetic_non_production");
+            assert_eq!(manifest["producer"]["artifact_origin"], "published_release");
+            assert_eq!(manifest["producer"]["version"], "0.9.3");
+            let bytes = std::fs::read(fixture.join("runtime.sqlite")).unwrap();
+            assert_eq!(
+                manifest["file"]["bytes"],
+                bytes.len(),
+                "the released gateway database changed size"
+            );
+            assert_eq!(
+                manifest["file"]["sha256"],
+                format!("{:x}", sha2::Sha256::digest(&bytes)),
+                "the released gateway database bytes changed"
+            );
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            std::fs::write(&path, &bytes).unwrap();
+
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let ledgers = conn
+                .prepare("SELECT domain, version FROM meerkat_schema ORDER BY domain")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "domain": row.get::<_, String>(0)?,
+                        "version": row.get::<_, i64>(1)?,
+                    }))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                manifest["expected"]["ledgers"],
+                serde_json::Value::Array(ledgers),
+                "the released gateway database holds exactly the runtime-store ledger"
+            );
+            let rows = conn
+                .prepare(
+                    r"
+                    SELECT authority.runtime_id, authority.session_id,
+                           authority.store_revision, authority.blob_sha256,
+                           body.session_snapshot
+                    FROM runtime_whole_blob_authority AS authority
+                    JOIN runtime_whole_blob_bodies AS body
+                      ON body.blob_sha256 = authority.blob_sha256
+                    ORDER BY authority.runtime_id
+                    ",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, JsonColumnBytes>(4)?.into_bytes(),
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let expected = manifest["expected"]["runtimes"].as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                expected.len(),
+                "the manifest binds the exact WholeBlob runtime set"
+            );
+            let runtimes = rows
+                .into_iter()
+                .zip(expected)
+                .map(
+                    |((runtime_id, session_id, store_revision, blob_sha256, body), expected)| {
+                        assert_eq!(expected["runtime_id"], runtime_id.as_str());
+                        assert_eq!(expected["session_id"], session_id.as_str());
+                        assert_eq!(expected["store_revision"], store_revision);
+                        assert_eq!(expected["body_bytes"], body.len());
+                        assert_eq!(
+                            expected["body_sha256"],
+                            format!("{:x}", sha2::Sha256::digest(&body))
+                        );
+                        let session = deserialize_persisted_session(&body).unwrap();
+                        let rewrite_occurrences = session
+                            .transcript_rewrite_prefix_authority()
+                            .map_or(0, |prefix| prefix.occurrence_count());
+                        assert_eq!(expected["message_count"], session.messages().len());
+                        assert_eq!(expected["rewrite_occurrences"], rewrite_occurrences);
+                        Meta093GatewayRuntime {
+                            runtime_id: LogicalRuntimeId::new(runtime_id),
+                            session_id: session.id().clone(),
+                            blob_sha256,
+                            body,
+                            message_count: session.messages().len(),
+                            rewrite_occurrences,
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+            assert!(
+                runtimes
+                    .iter()
+                    .any(|runtime| runtime.rewrite_occurrences > 0)
+                    && runtimes
+                        .iter()
+                        .any(|runtime| runtime.rewrite_occurrences == 0),
+                "the fixture carries a rewritten transcript and a plain one"
+            );
+            (dir, path, runtimes)
+        }
+
+        fn meta_093_session_table_count(path: &Path) -> i64 {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
+                .query_row(
+                    r"
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name IN ('sessions', 'session_heads')
+                    ",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        /// The co-located store's transcript is the WholeBlob body's
+        /// transcript byte for byte, with the same rewrite history.
+        fn assert_session_matches_whole_blob_body(
+            runtime: &Meta093GatewayRuntime,
+            loaded: &meerkat_core::Session,
+        ) {
+            #[derive(serde::Deserialize)]
+            struct RawTranscript<'a> {
+                #[serde(borrow)]
+                messages: Vec<&'a serde_json::value::RawValue>,
+            }
+
+            let raw: RawTranscript<'_> = serde_json::from_slice(&runtime.body).unwrap();
+            assert_eq!(
+                loaded.messages().len(),
+                raw.messages.len(),
+                "{}: message count",
+                runtime.runtime_id
+            );
+            for (index, (message, raw_message)) in
+                loaded.messages().iter().zip(&raw.messages).enumerate()
+            {
+                assert_eq!(
+                    serde_json::to_string(message).unwrap(),
+                    raw_message.get(),
+                    "{}: message {index} is not the WholeBlob body's bytes",
+                    runtime.runtime_id
+                );
+            }
+            let original = deserialize_persisted_session(&runtime.body).unwrap();
+            assert_eq!(loaded.id(), original.id());
+            assert_eq!(loaded.version(), original.version());
+            assert_eq!(loaded.created_at(), original.created_at());
+            assert_eq!(
+                loaded.transcript_rewrite_prefix_authority(),
+                original.transcript_rewrite_prefix_authority(),
+                "{}: rewrite authority",
+                runtime.runtime_id
+            );
+            assert_eq!(
+                loaded
+                    .transcript_history_state_shared()
+                    .unwrap()
+                    .map(|state| serde_json::to_value(&*state).unwrap()),
+                original
+                    .transcript_history_state_shared()
+                    .unwrap()
+                    .map(|state| serde_json::to_value(&*state).unwrap()),
+                "{}: rewrite history",
+                runtime.runtime_id
+            );
+            assert_eq!(
+                serde_json::to_value(loaded).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&runtime.body).unwrap(),
+                "{}: whole session document",
+                runtime.runtime_id
+            );
+        }
+
+        /// The session store a host opens on the gateway database before it
+        /// converts it. Opening it creates the co-located session schema.
+        fn meta_093_co_located_session_store(path: &Path) -> SqliteSessionStore {
+            SqliteSessionStore::open(path.to_path_buf()).unwrap()
+        }
+
+        /// Hosting paths beside `database`, laid out as a realm's path
+        /// authority lays them out.
+        fn hosting_paths_beside(database: &Path) -> crate::session_hosting::HostingPaths {
+            let root = database.parent().unwrap();
+            let paths = crate::session_hosting::HostingPaths {
+                hosting_lock_dir: root.join("hosting"),
+                cold_delivery_lock: root.join("delivery").join("cold-delivery.lock"),
+                database: None,
+            };
+            std::fs::create_dir_all(&paths.hosting_lock_dir).unwrap();
+            std::fs::create_dir_all(paths.cold_delivery_lock.parent().unwrap()).unwrap();
+            paths
+        }
+
+        /// The report names exactly `runtimes`, in order, each seeded from its
+        /// WholeBlob body at the body's boundary.
+        fn assert_meta_093_seeded_report(
+            report: &StandaloneWholeBlobConversionReport,
+            runtimes: &[&Meta093GatewayRuntime],
+        ) {
+            assert_eq!(
+                (report.seeded_count(), report.derived_count()),
+                (runtimes.len(), 0)
+            );
+            assert_eq!(
+                report
+                    .converted
+                    .iter()
+                    .map(|conversion| (
+                        conversion.runtime_id.clone(),
+                        conversion.session_id.clone(),
+                        conversion.session_source,
+                        conversion.boundary_message_count,
+                    ))
+                    .collect::<Vec<_>>(),
+                runtimes
+                    .iter()
+                    .map(|runtime| (
+                        runtime.runtime_id.clone(),
+                        runtime.session_id.clone(),
+                        StandaloneWholeBlobSessionSource::SeededFromWholeBlobBody,
+                        runtime.message_count as u64,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        /// The converted gateway database composed as a SQLite realm composes
+        /// its pair, and as the gateway composes it once converted: the
+        /// session store and `new_head_canonical` on the one file, with
+        /// hosting paths. Every session the co-located store loads is its
+        /// WholeBlob body, every runtime's authority sits at the body's
+        /// boundary, every receipt is complete, and no startup work is left.
+        async fn assert_meta_093_gateway_converted(
+            path: &Path,
+            runtimes: &[Meta093GatewayRuntime],
+        ) {
+            let session_store = SqliteSessionStore::open(path.to_path_buf()).unwrap();
+            let store = SqliteRuntimeStore::new_head_canonical(path)
+                .expect("a converted gateway database opens with no startup work")
+                .with_hosting_paths(hosting_paths_beside(path));
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            assert!(head_canonical_profile_is_pinned(&conn).unwrap());
+            assert!(
+                head_canonical_activation_candidate_ids(&conn)
+                    .unwrap()
+                    .is_empty(),
+                "a converted database leaves no startup work"
+            );
+            for runtime in runtimes {
+                let loaded = session_store
+                    .load(&runtime.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{}: the co-located store has no session",
+                            runtime.runtime_id
+                        )
+                    });
+                assert_session_matches_whole_blob_body(runtime, &loaded);
+
+                let Some(RuntimeSessionAuthority::HeadCanonical(authority)) = store
+                    .load_session_boundary_authority(&runtime.runtime_id)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("{}: no HeadCanonical authority", runtime.runtime_id);
+                };
+                assert_eq!(authority.session_id(), &runtime.session_id);
+                assert_eq!(
+                    authority.boundary_head().message_count,
+                    runtime.message_count as u64,
+                    "{}: the runtime boundary is the WholeBlob body",
+                    runtime.runtime_id
+                );
+                let receipt = load_head_canonical_activation_marker(&conn, &runtime.runtime_id)
+                    .unwrap()
+                    .expect("activation receipt");
+                assert_eq!(receipt.state, HeadCanonicalActivationState::Complete);
+                assert_eq!(
+                    receipt.source_snapshot_token.as_deref(),
+                    Some(activation_source_snapshot_token(&runtime.body).as_str())
+                );
+                assert_eq!(
+                    receipt.source_message_count,
+                    Some(runtime.message_count as i64)
+                );
+            }
+        }
+
+        /// Every table's rows, without the columns that record wall-clock
+        /// time, in a fixed order: what two conversions of the same bytes
+        /// must agree on.
+        fn rows_without_wall_clock(
+            path: &Path,
+        ) -> Vec<(String, Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let tables = conn
+                .prepare(
+                    r"
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table' AND substr(name, 1, 7) != 'sqlite_'
+                    ORDER BY name
+                    ",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            tables
+                .into_iter()
+                .map(|table| {
+                    let columns = conn
+                        .prepare(&format!(
+                            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+                        ))
+                        .unwrap()
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|column| !column.ends_with("_at_ms") && column != "elapsed_ms")
+                        .collect::<Vec<_>>();
+                    let selected = columns
+                        .iter()
+                        .map(|column| format!("\"{column}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let order = (1..=columns.len())
+                        .map(|position| position.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let rows = conn
+                        .prepare(&format!(
+                            "SELECT {selected} FROM \"{table}\" ORDER BY {order}"
+                        ))
+                        .unwrap()
+                        .query_map([], |row| {
+                            (0..columns.len())
+                                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    (table, columns, rows)
+                })
+                .collect()
+        }
+
+        /// The two databases hold the same rows, wall-clock columns aside. A
+        /// difference names its table, row and columns.
+        fn assert_same_rows(expected: &Path, actual: &Path) {
+            let expected = rows_without_wall_clock(expected);
+            let actual = rows_without_wall_clock(actual);
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|(table, columns, _)| (table, columns))
+                    .collect::<Vec<_>>(),
+                actual
+                    .iter()
+                    .map(|(table, columns, _)| (table, columns))
+                    .collect::<Vec<_>>(),
+                "the databases differ in tables or columns"
+            );
+            for ((table, columns, expected_rows), (_, _, actual_rows)) in
+                expected.iter().zip(&actual)
+            {
+                assert_eq!(expected_rows.len(), actual_rows.len(), "{table}: row count");
+                for (index, (expected_row, actual_row)) in
+                    expected_rows.iter().zip(actual_rows).enumerate()
+                {
+                    let differing = columns
+                        .iter()
+                        .zip(expected_row.iter().zip(actual_row))
+                        .filter(|(_, (left, right))| left != right)
+                        .map(|(column, _)| column.as_str())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        differing.is_empty(),
+                        "{table}: row {index} differs in {differing:?}"
+                    );
+                }
+            }
+        }
+
+        /// #306 K1: the published Meta 0.9.3 gateway runtime database converts
+        /// in place once the session store is opened on the same file. Every
+        /// session the co-located store loads afterwards is its WholeBlob
+        /// body, transcript and rewrite history byte for byte; each runtime's
+        /// authority sits at the body's boundary; a second call converts
+        /// nothing; and a 0.9.3 WholeBlob open of the file refuses it.
+        #[tokio::test]
+        async fn meta_093_gateway_runtime_converts_in_place_with_identical_transcripts() {
+            let (_dir, path, runtimes) = meta_093_gateway_fixture_copy();
+            assert_eq!(
+                meta_093_session_table_count(&path),
+                0,
+                "the gateway database has no co-located session store"
+            );
+            let session_store = meta_093_co_located_session_store(&path);
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the 0.9.3 gateway runtime database converts in place");
+            assert_meta_093_seeded_report(&report, &runtimes.iter().collect::<Vec<_>>());
+            for runtime in &runtimes {
+                let loaded = session_store
+                    .load(&runtime.session_id)
+                    .await
+                    .unwrap()
+                    .expect("the open session store sees the seeded session");
+                assert_session_matches_whole_blob_body(runtime, &loaded);
+            }
+            drop(session_store);
+            assert_meta_093_gateway_converted(&path, &runtimes).await;
+
+            let rerun = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("a converted database converts again without work");
+            assert!(rerun.converted.is_empty(), "{rerun:?}");
+            assert_eq!((rerun.seeded_count(), rerun.derived_count()), (0, 0));
+            assert_meta_093_gateway_converted(&path, &runtimes).await;
+
+            // A 0.9.3 binary opens runtime.sqlite with the WholeBlob
+            // constructor. The converted file is pinned, so that open refuses
+            // typed instead of serving it.
+            match SqliteRuntimeStore::new(&path) {
+                Err(RuntimeStoreError::Unsupported(detail)) => {
+                    assert!(detail.contains("irreversibly pinned"), "{detail}");
+                }
+                Err(other) => panic!("unexpected WholeBlob refusal: {other:?}"),
+                Ok(_) => panic!("a WholeBlob open must refuse the converted database"),
+            }
+        }
+
+        /// #306 K1: realm activation stays as it was on the gateway database.
+        /// `new_head_canonical` refuses it typed on every attempt and seeds
+        /// no session; the refusal leaves the file pinned with its first
+        /// runtime's activation in progress, and the standalone conversion
+        /// then converts every runtime.
+        #[tokio::test]
+        async fn meta_093_gateway_runtime_refuses_realm_activation_then_converts() {
+            let (_dir, path, runtimes) = meta_093_gateway_fixture_copy();
+            let session_store = meta_093_co_located_session_store(&path);
+            for attempt in 0..2 {
+                match SqliteRuntimeStore::new_head_canonical(&path) {
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                        runtime_id,
+                        detail,
+                    }) => {
+                        assert_eq!(
+                            runtime_id,
+                            runtime_id_text(&runtimes[0].runtime_id),
+                            "attempt {attempt}"
+                        );
+                        assert!(
+                            detail.contains("no physical session to canonicalize"),
+                            "attempt {attempt}: {detail}"
+                        );
+                    }
+                    Err(other) => panic!("attempt {attempt}: unexpected refusal {other:?}"),
+                    Ok(_) => panic!("attempt {attempt}: realm activation seeded a session"),
+                }
+                for runtime in &runtimes {
+                    assert!(
+                        session_store
+                            .load(&runtime.session_id)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "attempt {attempt}: {} was seeded by realm activation",
+                        runtime.runtime_id
+                    );
+                }
+            }
+            let conn = Connection::open(&path).unwrap();
+            assert!(head_canonical_profile_is_pinned(&conn).unwrap());
+            assert_eq!(
+                load_head_canonical_activation_marker(&conn, &runtimes[0].runtime_id)
+                    .unwrap()
+                    .expect("the refused activation's marker")
+                    .state,
+                HeadCanonicalActivationState::InProgress
+            );
+            drop(conn);
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the standalone conversion finishes a refused realm activation");
+            assert_meta_093_seeded_report(&report, &runtimes.iter().collect::<Vec<_>>());
+            drop(session_store);
+            assert_meta_093_gateway_converted(&path, &runtimes).await;
+        }
+
+        /// #306 K1: the conversion needs the co-located session store's
+        /// schema. Without it the conversion refuses typed and leaves every
+        /// byte of the database as it was; once the session store has been
+        /// opened on the file, the same bytes convert.
+        #[tokio::test]
+        async fn meta_093_gateway_conversion_requires_the_co_located_session_schema() {
+            let (_dir, path, runtimes) = meta_093_gateway_fixture_copy();
+            let before = std::fs::read(&path).unwrap();
+            match SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path) {
+                Err(RuntimeStoreError::Unsupported(detail)) => {
+                    assert!(
+                        detail.contains("requires the co-located session store schema"),
+                        "{detail}"
+                    );
+                }
+                other => panic!("conversion without the session schema: {other:?}"),
+            }
+            assert!(
+                std::fs::read(&path).unwrap() == before,
+                "the refused conversion wrote the database"
+            );
+
+            drop(meta_093_co_located_session_store(&path));
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the gateway database converts once its session store is open");
+            assert_meta_093_seeded_report(&report, &runtimes.iter().collect::<Vec<_>>());
+            assert_meta_093_gateway_converted(&path, &runtimes).await;
+        }
+
+        /// #306 K1 (mid-activation retry): a conversion stopped after its
+        /// first runtime committed, with the second runtime's conversion
+        /// rolled back at its authority write, keeps the first runtime and
+        /// none of the second's seeded rows; the next call finishes it, and
+        /// the result equals an uninterrupted conversion row for row.
+        #[tokio::test]
+        async fn meta_093_gateway_conversion_stopped_mid_way_reruns_to_the_uninterrupted_result() {
+            let (_uninterrupted_dir, uninterrupted, runtimes) = meta_093_gateway_fixture_copy();
+            let (_stopped_dir, stopped, _) = meta_093_gateway_fixture_copy();
+            let [first, second, third] = runtimes.as_slice() else {
+                panic!("the fixture holds three runtimes");
+            };
+            drop(meta_093_co_located_session_store(&uninterrupted));
+            SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&uninterrupted).unwrap();
+
+            drop(meta_093_co_located_session_store(&stopped));
+            Connection::open(&stopped)
+                .unwrap()
+                .execute_batch(&format!(
+                    r"
+                    CREATE TRIGGER stop_before_second_runtime_authority
+                    BEFORE INSERT ON runtime_session_authority
+                    WHEN NEW.runtime_id = '{}'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic stop before the second runtime commits');
+                    END;
+                    ",
+                    runtime_id_text(&second.runtime_id)
+                ))
+                .unwrap();
+            match SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&stopped) {
+                Err(RuntimeStoreError::WriteFailed(detail)) => {
+                    assert!(detail.contains("synthetic stop"), "{detail}");
+                }
+                other => panic!("the stop did not end the conversion: {other:?}"),
+            }
+
+            let conn = Connection::open(&stopped).unwrap();
+            assert!(head_canonical_profile_is_pinned(&conn).unwrap());
+            let state = |runtime: &Meta093GatewayRuntime| {
+                load_head_canonical_activation_marker(&conn, &runtime.runtime_id)
+                    .unwrap()
+                    .map(|marker| marker.state)
+            };
+            assert_eq!(state(first), Some(HeadCanonicalActivationState::Complete));
+            assert_eq!(
+                state(second),
+                Some(HeadCanonicalActivationState::InProgress)
+            );
+            assert_eq!(state(third), None);
+            assert!(
+                load_head_canonical_authority(&conn, &second.runtime_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let session_store = meta_093_co_located_session_store(&stopped);
+            assert!(
+                session_store
+                    .load(&first.session_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                session_store
+                    .load(&second.session_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the stopped transaction left its seeded session behind"
+            );
+            assert!(
+                session_store
+                    .load(&third.session_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(session_store);
+            conn.execute_batch("DROP TRIGGER stop_before_second_runtime_authority;")
+                .unwrap();
+            drop(conn);
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&stopped)
+                .expect("the stopped conversion finishes");
+            assert_meta_093_seeded_report(&report, &[second, third]);
+            assert_same_rows(&uninterrupted, &stopped);
+            assert_meta_093_gateway_converted(&stopped, &runtimes).await;
+        }
+
+        /// #306 K1: a WholeBlob body that differs from its store-issued digest,
+        /// or is missing, refuses the conversion typed at that runtime. It
+        /// keeps no authority and no seeded session there, and the runtimes
+        /// before it stay converted.
+        #[tokio::test]
+        async fn meta_093_gateway_conversion_refuses_a_corrupted_or_missing_body_typed() {
+            let (_corrupted_dir, corrupted, runtimes) = meta_093_gateway_fixture_copy();
+            let mut altered = runtimes[1].body.clone();
+            altered.push(b' ');
+            Connection::open(&corrupted)
+                .unwrap()
+                .execute(
+                    "UPDATE runtime_whole_blob_bodies SET session_snapshot = ?1 WHERE blob_sha256 = ?2",
+                    params![altered, runtimes[1].blob_sha256],
+                )
+                .unwrap();
+            let (_missing_dir, missing, _) = meta_093_gateway_fixture_copy();
+            Connection::open(&missing)
+                .unwrap()
+                .execute(
+                    "DELETE FROM runtime_whole_blob_bodies WHERE blob_sha256 = ?1",
+                    params![runtimes[2].blob_sha256],
+                )
+                .unwrap();
+
+            for (path, refused, expected_detail) in [
+                (&corrupted, 1, "differs from store-issued authority"),
+                (&missing, 2, "references a missing body"),
+            ] {
+                let session_store = meta_093_co_located_session_store(path);
+                match SqliteRuntimeStore::convert_standalone_whole_blob_in_place(path) {
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                        runtime_id,
+                        detail,
+                    }) => {
+                        assert_eq!(runtime_id, runtime_id_text(&runtimes[refused].runtime_id));
+                        assert!(detail.contains(expected_detail), "{detail}");
+                    }
+                    other => panic!("an unverifiable body converted: {other:?}"),
+                }
+                let conn = Connection::open(path).unwrap();
+                for (index, runtime) in runtimes.iter().enumerate() {
+                    let converted = index < refused;
+                    assert_eq!(
+                        load_head_canonical_authority(&conn, &runtime.runtime_id)
+                            .unwrap()
+                            .is_some(),
+                        converted,
+                        "{}: authority",
+                        runtime.runtime_id
+                    );
+                    assert_eq!(
+                        session_store
+                            .load(&runtime.session_id)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        converted,
+                        "{}: co-located session",
+                        runtime.runtime_id
+                    );
+                }
+            }
+        }
+
+        const RELEASED_0_8_10_REALM_FIXTURE: &str = "tests/fixtures/v0_8_10_released_realm/corpus";
+
+        /// A copy of the SQLite realm directory the published 0.8.10 `rkat`
+        /// wrote, every file bound to the corpus manifest, and the one session
+        /// it holds.
+        fn released_0_8_10_realm_copy() -> (
+            TempDir,
+            meerkat_store::RealmPaths,
+            meerkat_core::types::SessionId,
+        ) {
+            use sha2::Digest as _;
+
+            let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join(RELEASED_0_8_10_REALM_FIXTURE);
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(corpus.join("fixture-manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["producer"]["artifact_origin"], "published_release");
+            assert_eq!(manifest["producer"]["meerkat_version"], "0.8.10");
+            assert_eq!(
+                manifest["realm"]["sqlite_database"],
+                "realm/sessions.sqlite3"
+            );
+            let dir = TempDir::new().unwrap();
+            for file in manifest["files"].as_array().unwrap() {
+                let relative = file["path"].as_str().unwrap();
+                let Some(realm_relative) = relative.strip_prefix("realm/") else {
+                    continue;
+                };
+                let bytes = std::fs::read(corpus.join(relative)).unwrap();
+                assert_eq!(
+                    file["sha256"],
+                    format!("{:x}", sha2::Sha256::digest(&bytes)),
+                    "{relative}: the released realm bytes changed"
+                );
+                let target = dir.path().join("realm").join(realm_relative);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, bytes).unwrap();
+            }
+            let paths = meerkat_store::realm_paths_in(dir.path(), "realm");
+            assert!(paths.sessions_sqlite_path.is_file());
+            let sessions = manifest["expected"]["sessions"].as_array().unwrap();
+            assert_eq!(sessions.len(), 1, "the released realm holds one session");
+            let session_id =
+                meerkat_core::types::SessionId::parse(sessions[0]["session_id"].as_str().unwrap())
+                    .unwrap();
+            (dir, paths, session_id)
+        }
+
+        /// The runtime store as a SQLite realm composes it today.
+        fn realm_runtime_store(
+            paths: &meerkat_store::RealmPaths,
+        ) -> Result<SqliteRuntimeStore, RuntimeStoreError> {
+            SqliteRuntimeStore::new_head_canonical(paths.sessions_sqlite_path.clone()).map(
+                |store| {
+                    store.with_hosting_paths(crate::session_hosting::HostingPaths {
+                        hosting_lock_dir: paths.session_hosting_lock_dir(),
+                        cold_delivery_lock: paths.cold_delivery_lock_path(),
+                        database: None,
+                    })
+                },
+            )
+        }
+
+        /// #306 K1 (no resurrection): a published 0.8.10 SQLite realm whose
+        /// session was deleted from the session store while its runtime entry
+        /// lingered does not get the session back. Composed as a realm
+        /// composes its stores today, `new_head_canonical` refuses typed on
+        /// every open and seeds nothing.
+        #[tokio::test]
+        async fn released_0_8_10_realm_with_a_deleted_session_does_not_get_it_back() {
+            let (_dir, paths, session_id) = released_0_8_10_realm_copy();
+            let runtime_id = LogicalRuntimeId::for_session(&session_id);
+            let session_store =
+                SqliteSessionStore::open(paths.sessions_sqlite_path.clone()).unwrap();
+            assert!(session_store.load(&session_id).await.unwrap().is_some());
+            session_store.delete(&session_id).await.unwrap();
+            assert!(session_store.load(&session_id).await.unwrap().is_none());
+
+            for attempt in 0..2 {
+                match realm_runtime_store(&paths) {
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                        runtime_id: refused,
+                        detail,
+                    }) => {
+                        assert_eq!(refused, runtime_id_text(&runtime_id), "attempt {attempt}");
+                        assert!(
+                            detail.contains("no physical session to canonicalize"),
+                            "attempt {attempt}: {detail}"
+                        );
+                    }
+                    Err(other) => panic!("attempt {attempt}: unexpected refusal {other:?}"),
+                    Ok(_) => panic!("attempt {attempt}: the realm opened past its deleted session"),
+                }
+                assert!(
+                    session_store.load(&session_id).await.unwrap().is_none(),
+                    "attempt {attempt}: the deleted session came back"
+                );
+            }
+            let conn = Connection::open_with_flags(
+                &paths.sessions_sqlite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert!(
+                load_head_canonical_authority(&conn, &runtime_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// #306 K1: on a published 0.8.10 realm whose session is present, the
+        /// standalone conversion takes today's derivation for the runtime: its
+        /// result is the realm's own `new_head_canonical` activation, row for
+        /// row, and its report names the co-located session store as the
+        /// source.
+        #[tokio::test]
+        async fn released_0_8_10_realm_rows_convert_by_todays_derivation() {
+            let (_activated_dir, activated, session_id) = released_0_8_10_realm_copy();
+            let (_converted_dir, converted, _) = released_0_8_10_realm_copy();
+            drop(SqliteSessionStore::open(activated.sessions_sqlite_path.clone()).unwrap());
+            drop(realm_runtime_store(&activated).expect("the released realm activates"));
+            drop(SqliteSessionStore::open(converted.sessions_sqlite_path.clone()).unwrap());
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(
+                converted.sessions_sqlite_path.clone(),
+            )
+            .unwrap();
+            assert_eq!((report.seeded_count(), report.derived_count()), (0, 1));
+
+            let boundary_message_count: i64 = Connection::open_with_flags(
+                &activated.sessions_sqlite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT boundary_message_count FROM runtime_head_canonical_activations WHERE runtime_id = ?1",
+                params![runtime_id_text(&LogicalRuntimeId::for_session(&session_id))],
+                |row| row.get(0),
+            )
+            .unwrap();
+            assert_eq!(
+                report
+                    .converted
+                    .iter()
+                    .map(|conversion| (
+                        conversion.runtime_id.clone(),
+                        conversion.session_id.clone(),
+                        conversion.session_source,
+                        conversion.boundary_message_count as i64,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    LogicalRuntimeId::for_session(&session_id),
+                    session_id.clone(),
+                    StandaloneWholeBlobSessionSource::CoLocatedSessionStore,
+                    boundary_message_count,
+                )]
+            );
+            assert_same_rows(
+                &activated.sessions_sqlite_path,
+                &converted.sessions_sqlite_path,
             );
         }
 
@@ -26122,5 +27236,7 @@ ORDER BY runtime_id";
 
 #[cfg(feature = "sqlite-store")]
 pub use inner::{
-    RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, prepare_pre_0_8_10_runtime_input_states,
+    RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, StandaloneWholeBlobConversionReport,
+    StandaloneWholeBlobRuntimeConversion, StandaloneWholeBlobSessionSource,
+    prepare_pre_0_8_10_runtime_input_states,
 };

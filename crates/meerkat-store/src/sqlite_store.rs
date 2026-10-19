@@ -5601,7 +5601,18 @@ fn migrate_legacy_blob_in_txn(
     else {
         return Ok(None);
     };
-    let (layout, head) = layout_for_blob_session(&session)?;
+    lay_out_blob_session_in_txn(tx, id, &session).map(Some)
+}
+
+/// Lay out one whole-blob session document as this store's physical session:
+/// its strands, settled rows and canonical head, inside the caller's
+/// transaction.
+fn lay_out_blob_session_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+    session: &Session,
+) -> Result<(SessionHead, String), SessionStoreError> {
+    let (layout, head) = layout_for_blob_session(session)?;
     persist_blob_strand_layout_in_txn(tx, id, &layout)?;
     // Blob activation is the explicit one-time full-history path. Settle its
     // current store-issued anchor before publishing the canonical head so all
@@ -5620,7 +5631,7 @@ fn migrate_legacy_blob_in_txn(
         return Err(SessionStoreError::Corrupted(id.clone()));
     }
     let token = write_head_row_only_in_txn(tx, &head)?;
-    Ok(Some((head, token)))
+    Ok((head, token))
 }
 
 /// Head row if present; otherwise migrate a legacy blob in this transaction
@@ -6840,6 +6851,41 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
     )?;
     let upgraded_token = write_head_row_only_in_txn(tx, &upgraded)?;
     Ok(Some((upgraded, upgraded_token)))
+}
+
+/// One-time seeding seam for a standalone WholeBlob runtime database.
+///
+/// A runtime database that never shared its file with a session store holds
+/// WholeBlob bodies and no physical session. The runtime's explicit
+/// standalone conversion calls this, for a session this store holds no row
+/// for, inside the transaction that installs the session's HeadCanonical
+/// authority and completes its activation receipt, after it verified
+/// `session` as the exact store-issued WholeBlob body. The body is laid out
+/// as this store's physical session through the same one-time full-history
+/// layout as a released blob, and the head comes back exactly as
+/// [`ensure_head_canonical_for_runtime_in_txn`] returns it. The seam refuses
+/// when this store already holds a head or blob row for the session, and it
+/// neither opens nor commits a transaction.
+#[doc(hidden)]
+pub fn seed_head_canonical_for_runtime_in_txn(
+    tx: &Transaction<'_>,
+    session: &Session,
+) -> Result<(SessionHead, String), SessionStoreError> {
+    let id = session.id();
+    if head_row_in_txn(tx, id)?.is_some()
+        || load_session_snapshot_in_txn(tx, id)
+            .map_err(into_session_store_error)?
+            .is_some()
+    {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: "seeding requires a co-tenant session store that holds no row for this session"
+                .to_string(),
+        });
+    }
+    lay_out_blob_session_in_txn(tx, id, session)?;
+    ensure_head_canonical_for_runtime_in_txn(tx, id)?
+        .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))
 }
 
 /// Cross one persisted SQLite HeadCanonical representation and return the
