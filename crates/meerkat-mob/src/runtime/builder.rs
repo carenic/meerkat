@@ -9583,7 +9583,7 @@ impl MobBuilder {
                             additional_instructions: restore_spec.additional_instructions.clone(),
                             shell_env: restore_spec.shell_env.clone(),
                             mob_tool_authority_context: None,
-                            mob_incarnation: Some(tool_handle.incarnation()),
+                            mob_incarnation: Some(tool_handle.live_incarnation()),
                             inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                             tool_access_policy: restore_spec.tool_access_policy.clone(),
                             system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -9840,7 +9840,7 @@ impl MobBuilder {
                 additional_instructions: restore_spec.additional_instructions.clone(),
                 shell_env: restore_spec.shell_env.clone(),
                 mob_tool_authority_context: None,
-                mob_incarnation: Some(tool_handle.incarnation()),
+                mob_incarnation: Some(tool_handle.live_incarnation()),
                 inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                 tool_access_policy: restore_spec.tool_access_policy.clone(),
                 system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -10630,7 +10630,7 @@ impl MobBuilder {
 
             let mut actor = MobActor {
                 definition,
-                incarnation,
+                incarnation: handle.live_incarnation(),
                 roster,
                 events,
                 placed_completion_durable_index,

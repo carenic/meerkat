@@ -941,7 +941,7 @@ impl UpcallServeSeams for MobUpcallSeams {
         let context = mint_mob_operator_authority_from_facts(
             &facts,
             fenced.handle.mob_id().as_str(),
-            fenced.handle.incarnation(),
+            fenced.handle.live_incarnation(),
             provenance,
             request_id,
         )
@@ -2130,15 +2130,11 @@ mod tests {
         let provenance = MobToolCallerProvenance::default()
             .with_mob_id("mob-a")
             .with_member_id("b2");
-        let incarnation = meerkat_core::service::MobIncarnationId::mint();
-        let context = mint_mob_operator_authority_from_facts(
-            &facts,
-            "mob-a",
-            incarnation,
-            provenance,
-            "req-1",
-        )
-        .expect("facts re-mint through the generated ladder");
+        let live = crate::tests::fresh_live_incarnation();
+        let incarnation = live.incarnation();
+        let context =
+            mint_mob_operator_authority_from_facts(&facts, "mob-a", live, provenance, "req-1")
+                .expect("facts re-mint through the generated ladder");
         assert!(
             context.is_generated_authority_context(),
             "sealed generated context"

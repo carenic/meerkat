@@ -380,11 +380,12 @@ impl OwedStorageCleanup {
     }
 }
 
-/// A mob a create built: its id and the incarnation its runtime minted.
+/// A mob a create built: its id and the incarnation its runtime minted, as
+/// the witness its handle hands out.
 #[derive(Debug, Clone)]
 pub(crate) struct CreatedMob {
     pub(crate) mob_id: MobId,
-    pub(crate) incarnation: meerkat_core::service::MobIncarnationId,
+    pub(crate) incarnation: meerkat_core::service::LiveMobIncarnation,
 }
 
 /// How a destroy request meets this state's record of the mobs it
@@ -4301,7 +4302,7 @@ impl MobMcpState {
             builder = builder.with_callback_claim_verifier(claim_verifier);
         }
         let handle = builder.create().await?;
-        let incarnation = handle.incarnation();
+        let incarnation = handle.live_incarnation();
         #[cfg(test)]
         {
             let hold = self
@@ -16808,7 +16809,7 @@ mod tests {
     /// `incarnation`, with a fresh principal token.
     fn managing_authority(
         mob_id: &MobId,
-        incarnation: meerkat_core::service::MobIncarnationId,
+        incarnation: meerkat_core::service::LiveMobIncarnation,
     ) -> meerkat_core::service::MobToolAuthorityContext {
         let authority =
             meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
@@ -16821,16 +16822,17 @@ mod tests {
         .expect("generated managed mob scope")
     }
 
-    /// The incarnation the live mob `mob_id` runs at.
+    /// The incarnation the live mob `mob_id` runs at, as its handle's
+    /// witness.
     async fn live_incarnation(
         state: &MobMcpState,
         mob_id: &MobId,
-    ) -> meerkat_core::service::MobIncarnationId {
+    ) -> meerkat_core::service::LiveMobIncarnation {
         state
             .handle_for(mob_id)
             .await
             .expect("live mob handle")
-            .incarnation()
+            .live_incarnation()
     }
 
     fn destroy_surface(
@@ -17847,7 +17849,7 @@ mod tests {
             .handle_for(&mob_id)
             .await
             .expect("implicit mob handle");
-        let before_incarnation = before.incarnation();
+        let before_incarnation = before.live_incarnation();
         before
             .shutdown()
             .await
@@ -17864,7 +17866,7 @@ mod tests {
             .handle_for(&mob_id)
             .await
             .expect("restored implicit mob");
-        assert!(restored.incarnation() != before_incarnation);
+        assert!(restored.incarnation() != before_incarnation.incarnation());
         assert!(AgentMobToolSurface::is_implicit_mob_of(&restored, &owner));
         assert!(
             !managing_authority(&mob_id, before_incarnation)
@@ -18326,6 +18328,7 @@ mod tests {
             .mob_create_definition(explicit_definition("replaced-during-destroy"))
             .await
             .expect("create explicit mob");
+        let destroyed_incarnation = live_incarnation(&state, &mob_id).await;
         let storage_path = destroy_test_storage_path(root.path(), &mob_id);
         let (archive, _actor_task) = spawn_worker_with_held_archive(&svc, &state, &mob_id).await;
         let elsewhere = Arc::new(
@@ -18432,10 +18435,11 @@ mod tests {
             Some(storage_path.as_path())
         );
         assert!(retained.cleanup_owed());
+        assert_eq!(retained.incarnation, destroyed_incarnation.incarnation());
         let agent = destroy_surface(
             &state,
             SessionId::new(),
-            managing_authority(&mob_id, retained.incarnation),
+            managing_authority(&mob_id, destroyed_incarnation),
         );
         let refused = dispatch_destroy(&agent, &mob_id)
             .await

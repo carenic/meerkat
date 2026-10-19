@@ -202,7 +202,7 @@ fn creator_authority() -> meerkat_core::service::MobToolAuthorityContext {
 /// scope.
 fn forker_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority =
         meerkat_runtime::mob_operator_authority::set_create_authority(&creator_authority(), false)
@@ -220,7 +220,7 @@ fn forker_authority(
 /// `incarnation`, as a council convener holds.
 fn convener_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     meerkat_runtime::mob_operator_authority::grant_manage_mob(
         &creator_authority(),
@@ -508,7 +508,7 @@ async fn a_managed_host_without_a_child_policy_leaves_same_mob_spawns_forks_and_
     let convener = agent_surface(
         &fixture.state,
         session_of("convener").await,
-        convener_authority(mob_id.as_str(), handle.incarnation()),
+        convener_authority(mob_id.as_str(), handle.live_incarnation()),
     );
     dispatch(
         &convener,
@@ -527,7 +527,7 @@ async fn a_managed_host_without_a_child_policy_leaves_same_mob_spawns_forks_and_
     let forker = agent_surface(
         &fixture.state,
         session_of("alice").await,
-        forker_authority(mob_id.as_str(), handle.incarnation()),
+        forker_authority(mob_id.as_str(), handle.live_incarnation()),
     );
     let forked = dispatch(
         &forker,

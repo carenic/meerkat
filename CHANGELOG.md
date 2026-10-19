@@ -57,6 +57,42 @@ them.
   `SealIdentityGenerationHighwaterDestroyed`, also appended last, so no
   existing variant's discriminant moves. Exhaustive matches must add the
   arms.
+- The mob operator grant functions take a
+  `meerkat_core::service::LiveMobIncarnation`, the witness a mob runtime's
+  own handle hands out (`meerkat_mob::MobHandle::live_incarnation`),
+  instead of a `meerkat_core::service::MobIncarnationId`, so no grant binds
+  an id decoded from input:
+  - `meerkat_runtime::mob_operator_authority::grant_manage_mob`
+  - `meerkat_runtime::mob_operator_authority::grant_spawn_profile_in_mob`
+  - `meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob`
+  - `meerkat_runtime::mob_operator_authority::mint_mob_operator_authority_from_facts`
+    (its `holder_incarnation`)
+
+  Pass `handle.live_incarnation()` where `handle.incarnation()` was passed.
+  The scope readers (`MobToolAuthorityContext::can_manage_mob`,
+  `spawn_profile_scope_present` and `spawn_profile_scope_contains`) still
+  take a `MobIncarnationId`. The witness's constructor is public but hidden
+  and disallowed by the workspace `clippy.toml`; a downstream workspace that
+  wants the same fence adds the entry
+  `meerkat_core::service::LiveMobIncarnation::witnessed` to its own
+  `disallowed-methods`.
+- Behaviour-only (not measured by the gate):
+  `meerkat_core::service::MobIncarnationId` is a plain identity. It
+  serializes as its canonical form, a lowercase hyphenated UUID, where it
+  serialized a fixed redacted string; it deserializes from exactly that
+  form, where it always refused; and `Debug` renders
+  `MobIncarnationId(<uuid>)`. 0.9.3 never wrote a decodable value, so no
+  stored data breaks. Grants stay unpersisted:
+  `MobToolAuthorityContext` still leaves its incarnation bindings out when
+  it serializes.
+
+### Added
+
+- `meerkat_core::service::LiveMobIncarnation` (with `incarnation()`) and
+  `meerkat_mob::MobHandle::live_incarnation`: the witness the mob operator
+  grant functions take (see Breaking).
+- `meerkat_core::service::MobIncarnationId` implements `Display`,
+  `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 
 ### Fixed
 

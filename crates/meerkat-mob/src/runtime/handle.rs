@@ -8273,6 +8273,21 @@ impl MobHandle {
         self.incarnation
     }
 
+    /// The witness that this mob's runtime runs at [`Self::incarnation`], for
+    /// the mob operator grants
+    /// (`meerkat_runtime::mob_operator_authority::grant_manage_mob` and the
+    /// spawn-profile grants), which take nothing else. The only way to get
+    /// one: a grant therefore binds an incarnation a mob runtime of this
+    /// process runs or ran at, never a value decoded from input. A handle
+    /// kept after its mob's destroy still hands it out; a grant naming it
+    /// reaches nothing, since no mob runs at it again.
+    // The one shipped witness site: the facade's host_launch_sites test
+    // lists it (`WITNESS_SITES`).
+    #[allow(clippy::disallowed_methods)]
+    pub fn live_incarnation(&self) -> meerkat_core::service::LiveMobIncarnation {
+        meerkat_core::service::LiveMobIncarnation::witnessed(self.incarnation)
+    }
+
     /// Change-notification seam over the actor-published machine state.
     ///
     /// Interval observers that only need to know WHEN membership/binding

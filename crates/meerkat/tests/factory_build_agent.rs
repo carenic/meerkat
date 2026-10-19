@@ -861,13 +861,17 @@ async fn restricted_without_enable_offers_no_web_search() {
     }
 }
 
+// A test helper listed in host_launch_sites.rs: no mob runtime runs here.
+#[allow(clippy::disallowed_methods)]
 fn create_test_authority() -> MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated create-only mob authority should be accepted");
     meerkat_runtime::mob_operator_authority::grant_manage_mob(
         &authority,
         "mob-a",
-        meerkat_core::service::MobIncarnationId::mint(),
+        meerkat_core::service::LiveMobIncarnation::witnessed(
+            meerkat_core::service::MobIncarnationId::mint(),
+        ),
     )
     .expect("generated mob authority should grant managed mob scope")
 }

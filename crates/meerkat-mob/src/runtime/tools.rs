@@ -764,7 +764,7 @@ pub(super) fn compose_external_tools_for_profile(
                 meerkat_runtime::mob_operator_authority::grant_spawn_profiles_in_mob(
                     &authority_context,
                     mob_id,
-                    mob_handle.incarnation(),
+                    mob_handle.live_incarnation(),
                     profiles,
                 )
                 .map_err(|error| {

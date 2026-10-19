@@ -7599,7 +7599,7 @@ fn sample_definition_with_mob_tools() -> MobDefinition {
 
 fn generated_mob_operator_authority_with_scope(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated create-only mob authority should be accepted");
@@ -7612,7 +7612,7 @@ fn generated_mob_operator_authority_with_scope(
 
 fn generated_mob_operator_authority_with_spawn_profile(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
     profile: &str,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     // Create-only authority with NO manage scope on the target mob, granted a
@@ -7648,7 +7648,8 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
         .create()
         .await
         .expect("create mob");
-    let incarnation = created.incarnation();
+    let live = created.live_incarnation();
+    let incarnation = live.incarnation();
     assert_eq!(created.clone().incarnation(), incarnation);
     assert_eq!(created.observer().incarnation(), incarnation);
     let mob_id = created.mob_id().clone();
@@ -7659,7 +7660,7 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
     let (recreated, _recreated_service) = create_test_mob(sample_definition()).await;
     assert_eq!(recreated.mob_id(), &mob_id);
     assert_ne!(recreated.incarnation(), incarnation);
-    let authority = generated_mob_operator_authority_with_scope(mob_id.as_str(), incarnation);
+    let authority = generated_mob_operator_authority_with_scope(mob_id.as_str(), live);
     assert!(authority.can_manage_mob(mob_id.as_str(), incarnation));
     assert!(!authority.can_manage_mob(mob_id.as_str(), recreated.incarnation()));
     recreated
@@ -25359,7 +25360,7 @@ async fn profile_tools_mob_true_rejects_deserialized_operator_authority_projecti
         serde_json::from_value(
             serde_json::to_value(generated_mob_operator_authority_with_scope(
                 handle.definition().id.as_str(),
-                handle.incarnation(),
+                handle.live_incarnation(),
             ))
             .unwrap(),
         )
@@ -25402,7 +25403,7 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25448,7 +25449,7 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25496,7 +25497,7 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25545,7 +25546,7 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             mob_id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -25623,7 +25624,7 @@ async fn forker_without_manage_scope_observes_and_retires_only_its_own_children(
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -25741,7 +25742,7 @@ async fn forker_force_cancels_only_running_members_it_owns() {
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -26003,7 +26004,7 @@ async fn owned_member_tools_report_absent_targets_as_typed_not_found() {
         &forker,
         generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         ),
     )
@@ -26011,7 +26012,7 @@ async fn owned_member_tools_report_absent_targets_as_typed_not_found() {
     let manager_tools = owned_member_tool_dispatcher(
         &handle,
         &bystander,
-        generated_mob_operator_authority_with_scope(&mob_id, handle.incarnation()),
+        generated_mob_operator_authority_with_scope(&mob_id, handle.live_incarnation()),
     )
     .await;
 
@@ -26744,7 +26745,7 @@ async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() 
         None,
         Some(generated_mob_operator_authority_with_scope(
             mob_id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -36332,7 +36333,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
-                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
+                mob_incarnation: Some(crate::tests::fresh_live_incarnation()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -87195,7 +87196,7 @@ async fn dispatch_handles_bind_their_authority_lanes() {
         false,
         generated_mob_operator_authority_with_scope(
             handle.definition().id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         ),
     );
     assert!(
@@ -87222,7 +87223,7 @@ async fn dispatch_handles_bind_their_authority_lanes() {
         false,
         generated_mob_operator_authority_with_scope(
             handle.definition().id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         ),
     );
     assert!(
