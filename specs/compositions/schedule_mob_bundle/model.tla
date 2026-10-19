@@ -3653,19 +3653,18 @@ occurrence_DispatchDeduplicatedFromDispatching(arg_admission_outcome, arg_at_utc
        /\ occurrence_phase = "Dispatching"
        /\ (occurrence_delivery_correlation_id # None)
        /\ (packet.payload.admission_outcome = "Deduplicated")
-       /\ occurrence_phase' = "Completed"
+       /\ occurrence_phase' = "Dispatching"
        /\ occurrence_receipt_recorded_at_utc_ms' = Some(packet.payload.at_utc_ms)
-       /\ occurrence_receipt_stage' = Some("Completed")
+       /\ occurrence_receipt_stage' = Some("DispatchAccepted")
        /\ occurrence_receipt_failure_class' = None
        /\ occurrence_receipt_detail' = None
-       /\ occurrence_completed_at_utc_ms' = Some(packet.payload.at_utc_ms)
-       /\ UnchangedFrame_96ed67b95cd03572
+       /\ UnchangedFrame_097c0123c8ffece5
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
        /\ observed_inputs' = observed_inputs
        /\ pending_routes' = pending_routes
        /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects \cup { [machine |-> "occurrence", variant |-> "DispatchAccepted", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DispatchDeduplicatedFromDispatching"], [machine |-> "occurrence", variant |-> "Completed", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DispatchDeduplicatedFromDispatching"] }
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "DispatchDeduplicatedFromDispatching", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "Completed"]}
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "occurrence", variant |-> "DispatchAccepted", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "DispatchDeduplicatedFromDispatching"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "occurrence", transition |-> "DispatchDeduplicatedFromDispatching", actor |-> "occurrence_authority", step |-> (model_step_count + 1), from_phase |-> occurrence_phase, to_phase |-> "Dispatching"]}
        /\ model_step_count' = model_step_count + 1
 
 

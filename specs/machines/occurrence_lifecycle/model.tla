@@ -1574,14 +1574,13 @@ DispatchDeduplicatedFromDispatching(admission_outcome, at_utc_ms) ==
     /\ phase = "Dispatching"
     /\ (delivery_correlation_id # None)
     /\ (admission_outcome = "Deduplicated")
-    /\ phase' = "Completed"
+    /\ phase' = "Dispatching"
     /\ model_step_count' = model_step_count + 1
     /\ receipt_recorded_at_utc_ms' = Some(at_utc_ms)
-    /\ receipt_stage' = Some("Completed")
+    /\ receipt_stage' = Some("DispatchAccepted")
     /\ receipt_failure_class' = None
     /\ receipt_detail' = None
-    /\ completed_at_utc_ms' = Some(at_utc_ms)
-    /\ UnchangedFrame_95e30a42bf11dec6
+    /\ UnchangedFrame_f04d76cc9194d8c9
 
 
 AwaitCompletionFromDispatching(at_utc_ms) ==

@@ -250,9 +250,9 @@ async fn commit_past_its_deadline(
 
 /// Reads of the session's driver that take no gate answer while a commit
 /// past its deadline holds the driver: the active-input read answers busy,
-/// and the wake, the uncommitted-run-input read and the input's terminal
-/// completion refuse typed. Before, each waited for the driver, and so for
-/// the store.
+/// the wake and the uncommitted-run-input read refuse typed, and the input's
+/// terminal completion answers not yet. Before, each waited for the driver,
+/// and so for the store.
 #[tokio::test]
 async fn driver_reads_without_the_gate_answer_while_a_commit_past_its_deadline_holds_the_driver() {
     let store = declaring_store();
@@ -301,11 +301,8 @@ async fn driver_reads_without_the_gate_answer_while_a_commit_past_its_deadline_h
     .await
     .expect("the terminal read answers");
     assert!(
-        matches!(
-            terminal,
-            Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
-        ),
-        "the terminal read refuses typed: {terminal:?}"
+        matches!(terminal, Ok(None)),
+        "the terminal read answers not yet: {terminal:?}"
     );
     hold.release(HeldStoreCommitRelease::Commit);
 }

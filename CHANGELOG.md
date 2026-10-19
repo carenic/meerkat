@@ -267,6 +267,30 @@ them.
   replaces the registration from durable truth. A mob member's tracked turn
   stays pending on either failure, as on `AuthorityUnavailable`, and a
   scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+- `meerkat-schedule`, `meerkat`: a scheduled occurrence's terminal now comes
+  only from its delivered input's own terminal outcome. A reclaim whose
+  redelivery the target deduplicated (it had admitted the same stable
+  delivery identity before) recorded the occurrence `completed` at admission
+  without reading that input. The occurrence now stays `dispatching` and
+  waits as for an accepted delivery; its receipt still records the admission
+  as deduplicated. After such a reclaim:
+  - the existing input is still live: the occurrence waits for it and ends
+    with its outcome;
+  - it failed: `delivery_failed` with its failure class;
+  - its receipt is not finalized yet, or the store cannot be read: the
+    occurrence keeps its lease and re-reads the outcome for up to 5 lease
+    periods (5 minutes at the default 60 s lease), then ends
+    `delivery_failed` with `runtime_completion_authority_unavailable`;
+  - it ended without a public completion, its receipt cannot be read, or it
+    has left the runtime (a row that recovery discarded, a store-less
+    runtime's archived input): `delivery_failed` with
+    `runtime_completion_authority_unavailable`, at the bound above where the
+    read only says not yet. Such an input is not admitted a second time;
+  - the same read serves an accepted input that is already terminal at
+    admission: when its outcome read answered that no receipt was finalized
+    yet, the occurrence ended `delivery_failed` at once; it now waits under
+    the same bound. Nothing reclaims an occurrence while it waits, so the
+    wait does not depend on the misfire policy.
 
 ### Fixed
 
@@ -407,15 +431,19 @@ them.
   tracked-input cancel waited behind a boundary commit or run
   terminalization that holds the session's driver. Past its deadline such a
   commit holds the driver until the store answers, so once the session
-  degrades they answer without it: the active-input read answers busy, the
-  contributor terminal is unknown, and the others refuse with the typed,
-  retryable `RecoveryRepairBlocked`.
+  degrades they answer without it: the active-input read answers busy, an
+  input's terminal completion answers not yet (`Ok(None)`), the contributor
+  terminal is unknown, and the others refuse with the typed, retryable
+  `RecoveryRepairBlocked`.
 - A boundary commit whose store never answered (a stalled disk or a hung
   network filesystem, for example) kept the session's mutation gate for
   good, so every later wait for the gate waited for it, a mob destroy's
   retirement of the member and a force cancel of it included. The commit's
   declared deadline now degrades the session (see Changed), those waits end
   typed, and a reload replaces the registration once the store has answered.
+- A scheduled mob delivery whose redelivery found the delivery already failed
+  (`meerkat-mob-mcp`) recorded the occurrence `completed`. It now records
+  `delivery_failed` with the delivery's failure class.
 
 ## [0.9.3] - 2026-10-18
 
