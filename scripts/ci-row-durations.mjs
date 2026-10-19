@@ -5,12 +5,16 @@
 //
 // usage: ci-row-durations.mjs --repository OWNER/REPO [--output FILE] RUN_ID...
 //   Reads each run's jobs through `gh api` and keeps, per row, the longest
-//   successful job. A row is `<lane>:<row name>`, the lane read from the job
-//   name (LANE_PREFIXES). Without --output the table goes to stdout.
+//   successful job. A row is `<lane>:<rowKey>`, the lane read from the job
+//   name (LANE_PREFIXES) and the key from the row's name without the member
+//   count of a packed row (rowKey in scripts/ci-cargo-lanes.mjs), so jobs of
+//   one anchor in different packings share their row. Without --output the
+//   table goes to stdout.
 
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { checkRowDurations, rowKey } from "./ci-cargo-lanes.mjs";
 
 export const LANE_PREFIXES = [
   ["Clippy (", "clippy"],
@@ -23,7 +27,7 @@ export const LANE_PREFIXES = [
 // The table key of a job, or null for a job of no measured lane.
 export function rowOf(jobName) {
   for (const [prefix, lane] of LANE_PREFIXES) {
-    if (jobName.startsWith(prefix) && jobName.endsWith(")")) return `${lane}:${jobName.slice(prefix.length, -1)}`;
+    if (jobName.startsWith(prefix) && jobName.endsWith(")")) return `${lane}:${rowKey(jobName.slice(prefix.length, -1))}`;
   }
   return null;
 }
@@ -65,14 +69,17 @@ function main(argv) {
       .map((line) => JSON.parse(line)),
   );
   const table = {
-    schema_version: 1,
+    schema_version: 2,
     description:
       "Longest successful hosted-runner job time per lane row, in seconds, from the runs below " +
-      "(scripts/ci-row-durations.mjs). scripts/ci-cargo-lanes.mjs starts the rows at or over " +
-      "WAVE_FIRST_SECONDS, and rows missing here, before the others.",
+      "(scripts/ci-row-durations.mjs). A row is keyed by its name without the member count of a packed " +
+      "row (rowKey), so a repack keeps its measurement while its anchor stays the same. " +
+      "scripts/ci-cargo-lanes.mjs starts the rows at or over WAVE_FIRST_SECONDS, and rows missing here, " +
+      "before the others.",
     runs: runs.map(Number),
     rows: durationsOf(jobs),
   };
+  checkRowDurations(table, "the generated table");
   const text = `${JSON.stringify(table, null, 2)}\n`;
   if (output) writeFileSync(output, text);
   else process.stdout.write(text);

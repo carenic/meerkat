@@ -286,7 +286,11 @@ long row picked late set the wall time. The measurements are
 `scripts/ci-row-durations.json`, regenerated from green runs with
 `scripts/ci-row-durations.mjs --repository OWNER/REPO --output
 scripts/ci-row-durations.json RUN_ID...`; a stale entry only moves a row
-between waves. The `CI gate` counts a two-wave lane as run when every wave
+between waves. A row is keyed by its name without the member count of a
+packed row (`core+12` is `core`, `openai+8 bazel set` is `openai bazel set`),
+so a merge that moves line counts and repacks the rows keeps a row's
+measurement while the bin's heaviest member, which names it, stays the
+same. The `CI gate` counts a two-wave lane as run when every wave
 that holds rows succeeded. Other runs on the account (pull-request CI,
 nightly, dispatches) take runners from the same pool: keep them off while a
 release commit's main run is in progress.
