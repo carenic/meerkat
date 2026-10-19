@@ -560,6 +560,22 @@ and returns its effects with the phase the authority holds after it, and
 The defaults derive the answers from `snapshot` and `apply_turn_input`, so
 existing implementors keep working unchanged.
 
+### Retiring a runtime delivery owner
+
+Since 0.9.4 `RuntimeDeliveryOwnerRetirement::join` returns
+`RuntimeDeliveryOwnerRetired` instead of `()`. Its
+`notification_registration_retained` names the directory
+(`meerkat_runtime::RetainedNotificationRegistration`) whose file notification
+registration the operating system still held when the owner stopped its store
+watch. Nothing can interrupt that platform call (macOS FSEvents can hold it for
+tens of seconds), so the retirement cancels the registration without waiting;
+its thread stays with the process until the call returns and never touches the
+store. The join logs the retained directory once, as an info event. The report
+is `#[must_use]`: code that used `?` or matched `Ok(())` binds it, matches
+`Ok(_)` or reads it. `DeliveryStoreWatch::stop` returns the same registration,
+and `SqliteChangeWatch::pending_registration` describes the one a watch would
+leave.
+
 ---
 
 ## Complete example

@@ -555,6 +555,15 @@ interface ContentFilteredAgentErrorReason {
 }
 ```
 
+`ToolConfigChangedPayload.settled` replaces `persisted` in 0.9.4 (see
+[Tool config events](#tool-config-events)): the parser derives it from
+`status_info` and uses a stored bit (`settled`, or `persisted` from
+`rkat-rpc` 0.9.3 and earlier) only for a status it does not know. A 0.9.3 SDK
+requires `persisted` and fails on every `tool_config_changed` event from a
+0.9.4 `rkat-rpc`. The binary the SDK downloads always matches it, so this
+happens only with a binary you supply (`MEERKAT_BIN_PATH`, an explicit path,
+or `rkat-rpc` on `PATH`); upgrade the SDK with the binary.
+
 `CompactionCompletedEvent.summarySource` and
 `CompactionCompletedEvent.estimatedHistoryTokensAfter` (see
 [Compaction events](#compaction-events)) are new in 0.9.4. Both are absent on

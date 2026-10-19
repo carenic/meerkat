@@ -453,6 +453,19 @@ dictionary reads as `None`, and a `stop` the SDK does not know reads as an
 unknown reason with the wire object in `raw`. SDKs before 0.9.4 read every such
 reason as unknown and keep it raw.
 
+`ToolConfigChanged.payload` is a `ToolConfigChangedPayload` whose `settled`
+field replaces `persisted` in 0.9.4. It says whether the change is a settled
+lifecycle fact rather than a pending or draining step, derived from
+`status_info` the way `rkat-rpc` derives it; the stored bit (`settled`, or
+`persisted` from `rkat-rpc` 0.9.3 and earlier) is used only for a status the
+SDK does not know. It says nothing about configuration: whether a change was
+written there is the `persisted` of the `mcp_add` / `mcp_remove` response.
+Stored notices in session history stay raw and can carry either key. A 0.9.3
+SDK requires `persisted` and fails on every `tool_config_changed` event from a
+0.9.4 `rkat-rpc`. The binary the SDK downloads always matches it, so this
+happens only with a binary you supply (`MEERKAT_BIN_PATH`, an explicit
+`rkat_path`, or `rkat-rpc` on `PATH`); upgrade the SDK with the binary.
+
 `CompactionCompleted` carries two fields new in 0.9.4:
 
 - `summary_source` (`CompactionSummarySource`): who wrote the summary.

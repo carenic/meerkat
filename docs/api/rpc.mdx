@@ -3017,6 +3017,12 @@ Event types match the `AgentEvent` enum in `crates/meerkat-core/src/event.rs`
 projection in `artifacts/schemas/events.json`. New variants must appear in
 both that enum and this table. The decodable vocabulary includes the
 explicitly marked legacy row; not every variant is emitted by current writers.
+Since 0.9.4 the `tool_config_changed` entry of `WireEvent.known_payloads` in
+that file is generated from the typed payload. The hand-written entry before it
+required a `status` field the event never carried (its status is
+`status_info`), so every real `tool_config_changed` event failed validation
+against it; the generated entry accepts the events the runtime serializes,
+including those stored by 0.9.3 and earlier with their `persisted` bit.
 
 Message-scoped events (`turn_started`, `reasoning_delta`,
 `reasoning_complete`, `text_delta`, `text_complete`, `server_tool_content`,
@@ -3069,7 +3075,7 @@ live transport's realtime observations. See
 | `hook_denied` | Hook blocked operation |
 | `skills_resolved` | Skills loaded for turn |
 | `skill_resolution_failed` | Skill resolution failed |
-| `tool_config_changed` | Tool visibility or MCP config changed |
+| `tool_config_changed` | Tool visibility or MCP config changed. Since 0.9.4 the payload's lifecycle bit is `settled` (a settled lifecycle fact rather than a pending or draining step, derived from `status_info`), not `persisted`; it never said whether configuration was written, which is the `persisted` of `mcp/add`, `mcp/remove` and `mcp/reload`. Events stored by 0.9.3 and earlier are served with their stored `persisted` key, so accept either. A 0.9.3 Python or TypeScript SDK requires `persisted` and fails on these events: upgrade the SDK with `rkat-rpc` |
 | `background_job_completed` | Background shell job reached a typed terminal status; `terminal_status` is semantic and `status` is only an optional display mirror |
 | `transcript_rewrite_committed` | Legacy 0.8.10 compatibility/read-only full-body rewrite row; current writers must not emit it |
 | `transcript_rewrite_audit_receipt_committed` | Current receipt-only evidence for a committed ordered transcript rewrite suffix |

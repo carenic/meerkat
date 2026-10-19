@@ -782,6 +782,16 @@ present, is consumed only by the one-time activation importer and is never a
 fallback authority for a current head. Sessions created in HeadCanonical mode
 may have no meaningful `sessions` blob row at all.
 
+Since 0.9.4 the store also lays out a whole-blob session whose transcript graph
+retired its oldest occurrences, which every session compacted more often than
+`history_retained_rewrites` (default 4) has. The realm's one-time migration of
+such a blob row, the standalone WholeBlob conversion's seeding and read-only
+head synthesis write or derive the rows the store keeps after retiring the same
+occurrences incrementally: the retired base as a
+`session_transcript_retirements` row and rewrite rows for the retained
+generations only, and the synthesized head is the head the migration writes.
+0.9.3 and earlier refused such a session typed; the in-memory store still does.
+
 <Warning>
 Downstream tooling that reads `sessions.session_json` via direct SQL sees
 empty or stale content for sessions written by 0.7.25+ binaries — silently,
