@@ -1,9 +1,9 @@
 //! A live channel custody or playback-readiness read answers from one
 //! machine snapshot (#1606). Each test holds a read right after it takes its
-//! snapshot, commits a transition (activation, owner revocation, close), then
-//! releases it: the read answers the phase its snapshot holds, never the
-//! "not current" error a second snapshot would give, and the next read
-//! answers the committed phase.
+//! snapshot, commits a transition (an activation or a close), then releases
+//! it: the read answers the phase its snapshot holds, never the "not
+//! current" error a second snapshot would give, and the next read answers
+//! the committed phase.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use super::*;
@@ -186,19 +186,6 @@ impl Fixture {
         .await;
     }
 
-    async fn revoke_playback_owner(&self) {
-        self.apply(
-            dsl::MeerkatMachineInput::RevokeLivePlaybackOwner {
-                session_id: self.session_id.to_string(),
-                channel_id: CHANNEL.to_string(),
-                owner_id: OWNER.to_string(),
-                readiness_id: READINESS.to_string(),
-            },
-            "revoke the playback owner",
-        )
-        .await;
-    }
-
     async fn custody_by_pending(&self) -> Result<LiveChannelCustodyProjection, RuntimeDriverError> {
         self.machine
             .validate_live_channel_custody_by_pending_receipt(&self.session_id, &channel(), PENDING)
@@ -213,6 +200,31 @@ impl Fixture {
                 &self.session_id,
                 &channel(),
                 ACTIVATION,
+            )
+            .await
+    }
+
+    async fn readiness(&self) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
+        self.machine
+            .validate_live_playback_owner_readiness(
+                &self.session_id,
+                &channel(),
+                PENDING,
+                READINESS,
+            )
+            .await
+    }
+
+    async fn active_readiness(
+        &self,
+    ) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
+        self.machine
+            .validate_live_active_playback_owner_readiness(
+                &self.session_id,
+                &channel(),
+                ACTIVATION,
+                PENDING,
+                READINESS,
             )
             .await
     }
@@ -327,31 +339,22 @@ async fn an_activation_under_a_pending_receipt_read_reads_the_snapshot_phase() {
     );
 }
 
-/// A playback-readiness read answers from the one snapshot it holds, so
-/// an owner revocation committed under it does not fail it half way; the
-/// next read, whose snapshot holds the revocation, fails on the stage.
+/// A playback-readiness read answers from the one snapshot it holds, so a
+/// close committed under it, which clears the owner and the readiness, does
+/// not fail it half way; the next read, whose snapshot holds the close,
+/// fails on the stage.
 #[tokio::test]
-async fn an_owner_revocation_under_a_readiness_read_reads_the_snapshot() {
+async fn a_close_under_a_readiness_read_reads_the_snapshot() {
     let fixture = Arc::new(Fixture::open().await);
     fixture.stage().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
     let read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
-        async move {
-            fixture
-                .machine
-                .validate_live_playback_owner_readiness(
-                    &fixture.session_id,
-                    &channel(),
-                    PENDING,
-                    READINESS,
-                )
-                .await
-        }
+        async move { fixture.readiness().await }
     });
     entered.await.expect("the read reaches its hold");
-    fixture.revoke_playback_owner().await;
+    fixture.close(Some(PENDING), None).await;
     release.send(()).expect("release the held read");
 
     let readiness = read
@@ -360,17 +363,43 @@ async fn an_owner_revocation_under_a_readiness_read_reads_the_snapshot() {
         .expect("the readiness the snapshot holds answers whole");
     assert_eq!(readiness.owner_id(), OWNER);
     assert_eq!(readiness.readiness_id(), READINESS);
-    assert!(
-        fixture
-            .machine
-            .validate_live_playback_owner_readiness(
-                &fixture.session_id,
-                &channel(),
-                PENDING,
-                READINESS,
-            )
-            .await
-            .is_err(),
-        "a snapshot that holds the revocation has no readiness"
-    );
+    match fixture.readiness().await {
+        Err(RuntimeDriverError::ValidationFailed { reason }) => {
+            assert_eq!(reason, "opaque live pending receipt is not current");
+        }
+        other => panic!("a snapshot that holds the close fails on the stage, got {other:?}"),
+    }
+}
+
+/// An active playback-readiness read answers from the one snapshot it
+/// holds, so a close committed under it, which clears the owner and the
+/// readiness, does not fail it half way; the next read, whose snapshot
+/// holds the close, fails on the activation.
+#[tokio::test]
+async fn a_close_under_an_active_readiness_read_reads_the_snapshot() {
+    let fixture = Arc::new(Fixture::open().await);
+    fixture.stage().await;
+    fixture.activate().await;
+
+    let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
+    let read = tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { fixture.active_readiness().await }
+    });
+    entered.await.expect("the read reaches its hold");
+    fixture.close(None, Some(ACTIVATION)).await;
+    release.send(()).expect("release the held read");
+
+    let readiness = read
+        .await
+        .expect("read task")
+        .expect("the readiness the snapshot holds answers whole");
+    assert_eq!(readiness.owner_id(), OWNER);
+    assert_eq!(readiness.readiness_id(), READINESS);
+    match fixture.active_readiness().await {
+        Err(RuntimeDriverError::ValidationFailed { reason }) => {
+            assert_eq!(reason, "opaque live activation receipt is not current");
+        }
+        other => panic!("a snapshot that holds the close fails on the activation, got {other:?}"),
+    }
 }
