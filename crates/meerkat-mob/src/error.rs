@@ -1346,10 +1346,11 @@ pub enum MobError {
         interaction_id: String,
     },
 
-    /// The mob is shutting down: its Shutdown is draining the mob's own work,
-    /// or is parked on its members' stops or on its runtime teardown, and it
-    /// answers this request without running it. Retry once the Shutdown has
-    /// finished (the actor then exits, and requests get
+    /// The mob is shutting down: its Shutdown is draining the mob's own work
+    /// and answers this request without running it. (A Shutdown parked on its
+    /// members' stops or on its runtime teardown refuses member work this way
+    /// too, but no request reaches that refusal today.) Retry once the
+    /// Shutdown has finished (the actor then exits, and requests get
     /// [`Self::ActorCommandChannelClosed`]) or failed (the actor stays and
     /// serves the retry). It never means the actor is gone.
     #[error("mob {mob_id} is shutting down; retry once the shutdown has finished or failed")]

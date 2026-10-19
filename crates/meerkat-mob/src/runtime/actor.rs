@@ -29329,10 +29329,15 @@ impl MobActor {
                 // above except a member lane's revival, and no revival can be
                 // in flight: a Shutdown passes the deferral gate only while
                 // no lane holds submit-work pump state
-                // (`submit_work_pump_control_is_pending`) and no member
-                // effect runs (`resume_member_control_is_pending`), and after
-                // its admission the Closing state refuses every new
-                // submission. If either guard is narrowed, this refusal
+                // (`submit_work_pump_control_is_pending`), and after its
+                // admission the Closing state refuses every new submission.
+                // That lane-pump guard alone keeps this refusal dead. The
+                // member-effect guard (`resume_member_control_is_pending`)
+                // also defers a Shutdown behind a held pump preflight, but
+                // not behind a parked submission, which holds pump state with
+                // no member effect running.
+                // `shutdown_waits_for_a_parked_submit_work_pump_without_a_member_effect`
+                // pins the lane-pump guard: if it is narrowed, this refusal
                 // becomes live and the no-spin argument for the lane's pump
                 // must be re-examined.
                 if self.shutdown_in_progress() && cmd.starts_member_work() {

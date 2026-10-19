@@ -53,12 +53,10 @@ them.
   it was parked. `MobHandle::acquire_owner` after the Shutdown's admission is
   refused the same way where it granted an owner lease. Every other request
   the actor answers while the Shutdown drains (a Stop, Destroy, Complete or
-  retirement, a read, a status probe) gets the new
-  `MobError::ShutdownInProgress`, where v0.9.3 answered
+  retirement, a read, a status probe, `MobHandle::status` included) gets the
+  new `MobError::ShutdownInProgress`, where v0.9.3 answered
   `MobError::ActorCommandChannelClosed`: retryable with the authority
   retained (wire code `SessionBusy`), returned by `MobHandle::stop` at once.
-  `MobHandle::status` returns it there too, where it returned
-  `MobError::Internal` ("not terminal lifecycle authority").
   Requests on the actor's internal lane, sent by the tasks the drain joins,
   keep `ActorCommandChannelClosed`, which otherwise now means the actor has
   exited or is exiting.
