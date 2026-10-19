@@ -531,6 +531,13 @@ if (args[0] === "api") {
   assert.equal(result.status, 1, "verify refuses the bump plus one source edit");
 
   // --- The CI gate's own shell, read from ci.yml. ---
+  // The step reader on a known input: a comment at the step's indent or at
+  // column 0, between "- name:" and "run: |", does not end the step.
+  assert.equal(
+    extractStepRun("      - name: Probe\n      # at the step's indent\n# at column 0\n        shell: bash\n        run: |\n          echo ok\n", "Probe"),
+    "echo ok\n",
+    "a comment before a step's run block does not end the step",
+  );
   const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
   const gateCheck = extractStepRun(workflow, "Check lane results");
   const gateEnv = {
@@ -962,7 +969,8 @@ function workflowEvents(text) {
   return events;
 }
 
-// The `run: |` body of the named step: the indented block under it.
+// The `run: |` body of the named step: the indented block under it. A
+// comment line does not end the step before its run block.
 function extractStepRun(text, name) {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
@@ -970,6 +978,7 @@ function extractStepRun(text, name) {
   const stepIndent = lines[at].indexOf("-");
   let runAt = -1;
   for (let index = at + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (/^\s+run: \|\s*$/.test(lines[index])) {
