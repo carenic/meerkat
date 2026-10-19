@@ -6,7 +6,9 @@ description: >-
   setting of the client, not of the identity. When that
   identity is unavailable (pull requests from forks have no id-token, or the
   variables are unset) run with a local disk cache only, with no remote cache,
-  instead of failing the lane.
+  instead of failing the lane. When the sccache release cannot be downloaded,
+  run without sccache (an empty RUSTC_WRAPPER) instead of failing the lane; a
+  download whose sha256 does not match the pin still fails it.
 
 inputs:
   bucket:
@@ -32,8 +34,8 @@ inputs:
 
 outputs:
   backend:
-    description: Selected backend, gcs or local.
-    value: ${{ steps.select.outputs.backend }}
+    description: Selected backend, gcs or local; none when the download failed and the job runs without sccache.
+    value: ${{ steps.select.outputs.backend || 'none' }}
 
 runs:
   using: composite
@@ -43,7 +45,15 @@ runs:
     # exports the job's Actions cache token, which neither backend below uses.
     # Renovate proposes a new SCCACHE_VERSION (renovate.json); SCCACHE_SHA256
     # changes with it, or this check fails. The backend is selected below.
+    # A download that fails leaves the lane without sccache instead of failing
+    # it (the release host answered one lane's nine tries with 403 while the
+    # run's other lanes downloaded it): an empty RUSTC_WRAPPER, which Cargo
+    # reads as no wrapper, replaces the job's sccache wrapper, and the steps
+    # below are skipped. A download that completes is used only once its
+    # sha256 matches; a mismatch still fails the lane, so no unverified binary
+    # ever reaches PATH or runs.
     - name: Install sccache
+      id: install
       shell: bash
       env:
         SCCACHE_VERSION: v0.18.0
@@ -58,17 +68,30 @@ runs:
         dir="${RUNNER_TEMP}/sccache-install"
         archive="${dir}/${name}.tar.gz"
         mkdir -p "${dir}/bin"
+        status=0
         curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors -o "${archive}" \
-          "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz"
+          "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz" \
+          2> "${dir}/curl.err" || status=$?
+        cat "${dir}/curl.err" >&2
+        if (( status != 0 )); then
+          rm -f "${archive}"
+          cause="$(tail -n 1 "${dir}/curl.err" | sed 's/^curl: ([0-9]*) //')"
+          cause="${cause//%/%25}"
+          echo "::warning::sccache ${SCCACHE_VERSION} download failed (curl exit ${status}: ${cause:-no message}); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
+          echo "installed=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
         echo "${SCCACHE_SHA256}  ${archive}" | sha256sum --check --strict
         tar -xzf "${archive}" -C "${dir}/bin" --strip-components=1 "${name}/sccache"
         echo "${dir}/bin" >> "${GITHUB_PATH}"
         echo "SCCACHE_PATH=${dir}/bin/sccache" >> "${GITHUB_ENV}"
         "${dir}/bin/sccache" --version
+        echo "installed=true" >> "${GITHUB_OUTPUT}"
 
     - name: Authenticate to GCP with workload identity
       id: gcp
-      if: ${{ inputs.bucket != '' && inputs.workload_identity_provider != '' && inputs.service_account != '' }}
+      if: ${{ steps.install.outputs.installed == 'true' && inputs.bucket != '' && inputs.workload_identity_provider != '' && inputs.service_account != '' }}
       # A fork's pull request has no id-token permission; a failed
       # authentication selects the local fallback below, it never fails the
       # lane (and the gate grants no budget exemption for it).
@@ -83,6 +106,7 @@ runs:
 
     - name: Select the sccache backend
       id: select
+      if: ${{ steps.install.outputs.installed == 'true' }}
       shell: bash
       env:
         BUCKET: ${{ inputs.bucket }}
@@ -115,6 +139,7 @@ runs:
         fi
 
     - name: Start the sccache server
+      if: ${{ steps.install.outputs.installed == 'true' }}
       shell: bash
       env:
         BACKEND: ${{ steps.select.outputs.backend }}
