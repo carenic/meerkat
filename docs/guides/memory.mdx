@@ -77,21 +77,46 @@ Controls when and how compaction runs.
 | `max_request_bytes` | `Option<u64>` | `None` | Optional host request-body cap. Byte compaction triggers at four-fifths of the stricter available cap: this value or an exact provider-reported cap. |
 | `recent_turn_budget` | `usize` | `4` | Maximum number of recent complete conversational turns to retain. A turn starts only at a conversational User message; typed injected context stays attached to that turn. Capacity recovery may retain fewer turns. |
 | `max_summary_tokens` | `u32` | `4096` | Maximum tokens the LLM may produce for the compaction summary. |
-| `min_turns_between_compactions` | `u32` | `3` | Minimum turns that must elapse between consecutive compactions (loop guard to prevent runaway compaction). |
+| `min_turns_between_compactions` | `u32` | `3` | Minimum pre-LLM boundaries between an ordinary compaction and the last compaction or failed attempt (loop guard to prevent runaway compaction). Every LLM call is a boundary, including each call of a tool loop, and the session keeps the count across runs. Capacity recovery bypasses it, except a history crossing that the last rewrite could not get under the threshold (see the cadence check below). |
 
 ## How compaction triggers
 
-Compaction is checked at every turn boundary, just before the next LLM call.
+Compaction is checked at every pre-LLM boundary: just before each LLM call,
+including each call of a tool loop.
 
 The decision flow:
 
 <Steps>
-  <Step title="Skip turn 0">
-    The first turn always skips compaction.
+  <Step title="Skip the first boundary">
+    The session's first LLM call never compacts.
   </Step>
   <Step title="Cadence check">
-    Ordinary compaction attempts respect `min_turns_between_compactions`.
+    Ordinary compaction attempts respect `min_turns_between_compactions`,
+    counted in pre-LLM boundaries since the last compaction or failed attempt.
     Current-history or request-byte capacity recovery bypasses this cost guard.
+
+    A history crossing counts as recovery only while compacting can still get
+    the history under the threshold. The session records the history estimate
+    each rewrite leaves (`last_rewrite_history_tokens` in its compaction
+    cadence). When that is still at or above the threshold, the rows a rewrite
+    keeps (the System rows, the in-flight request, the recent turns and the
+    summary) cross it on their own, so the crossing waits for the cadence
+    instead of paying for a summary at every boundary, and a warning names the
+    remedies: raise `auto_compact_threshold` above that floor, omit it so it
+    derives from the model window, or shrink the System rows. Such a crossing
+    bypasses the cadence again only when the request no longer fits the model
+    window and the history added since that rewrite is at least the overage.
+    A model that declares no context window has no overage, so there such a
+    crossing always waits for the cadence, however much the history grew, and
+    only a request-byte crossing still bypasses it.
+
+    A request-byte crossing keeps its bypass. With an exact provider cap the
+    rebuilt request must shrink and fit that cap, or the turn fails as
+    irreducible instead of compacting again. With the transcript estimate, a
+    rewrite keeps the System rows, the summary and at most two retention
+    budgets of verbatim rows, which stay under a byte threshold measured in
+    megabytes unless the System rows alone approach the provider's request
+    cap.
   </Step>
   <Step title="Threshold evaluation">
     Compaction triggers if ANY of:
@@ -125,8 +150,16 @@ When compaction triggers:
     Without a curator, a provider-safe projection of the current history plus
     the compaction prompt is sent to the LLM with no tools and
     `max_summary_tokens` as the response limit. Media and reasoning are
-    projected for summarization, and an oversized source projection is bounded
-    to a head/tail handoff excerpt. With a curator, this LLM call is skipped.
+    projected for summarization. The source may take two bytes per token of
+    the summarizing model's context window left after `max_summary_tokens`,
+    capped by the model's declared input ceiling, less the prompt, and never
+    less than 4 KiB. For a model that declares no window it may take a quarter
+    of `auto_compact_threshold`. A larger source is trimmed (large tool
+    results first, then the other context, user requests last), and every cut
+    text is marked for the summarizer. If even the fully trimmed source does
+    not fit, only the newest user requests that fit are sent, under a note
+    that says how many of them it carries. With a curator, this LLM call is
+    skipped.
   </Step>
   <Step title="Handle result">
     **On ordinary failure**: a CompactionFailed event is emitted and the session is not mutated (safe failure).
@@ -163,7 +196,15 @@ When compaction triggers:
     or runtime handoff refusal preserves the original history.
   </Step>
   <Step title="Record usage and emit completion event">
-    Compaction usage is recorded against the session and budget. A **CompactionCompleted** event is emitted with summary token count and before/after message counts.
+    Compaction usage is recorded against the session and budget. A
+    **CompactionCompleted** event is emitted with the summary token count, the
+    before/after message counts, and `summary_source`: who wrote the summary
+    (`provider_call`, `host_curator` or `mechanical_fallback`) and, for a
+    provider call, how much of the history its source carried (`whole`,
+    `trimmed` with the last kind of text cut, or `requests_only` with how many
+    of the user requests it kept), and `estimated_history_tokens_after`: the
+    history estimate the rewrite left, in the unit of
+    `estimated_history_tokens`.
   </Step>
 </Steps>
 

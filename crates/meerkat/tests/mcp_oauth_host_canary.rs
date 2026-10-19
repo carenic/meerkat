@@ -91,7 +91,7 @@ impl LlmClient for EchoCallingClient {
             ),
         });
         events.push(LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success { stop_reason },
+            outcome: LlmDoneOutcome::success(stop_reason),
         });
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }

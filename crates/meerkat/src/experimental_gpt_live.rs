@@ -22451,10 +22451,54 @@ mod tests {
                         transcript: "The final spoken reply survives close and reopen.".to_string(),
                     },
                 ));
+                // A custody read whose snapshot predates the close answers
+                // that snapshot's Active phase while the close commits under
+                // it, not "not current" (#1606).
+                let (held_read_entered, held_read_release) =
+                    runtime.test_hold_next_live_custody_read();
+                let held_read = tokio::spawn({
+                    let member_host = Arc::clone(&member_host);
+                    let channel_id = channel_id.clone();
+                    let pending_receipt = opened.pending_receipt().to_string();
+                    async move {
+                        member_host
+                            .validate_experimental_live_channel_custody(
+                                &channel_id,
+                                &pending_receipt,
+                            )
+                            .await
+                    }
+                });
+                held_read_entered
+                    .await
+                    .expect("the custody read reaches its hold");
                 member_host
                     .close_live_channel(Some(authority.as_ref()), &channel_id)
                     .await
                     .expect("graceful close drains queued final and exact playback evidence");
+                held_read_release
+                    .send(())
+                    .expect("release the held custody read");
+                let held_custody = held_read
+                    .await
+                    .expect("held custody read task")
+                    .expect("a close committed under the read reads as its snapshot phase");
+                assert_eq!(
+                    held_custody.phase().activation_receipt(),
+                    Some(activation_receipt.as_str()),
+                    "the held read answers the Active phase its snapshot holds"
+                );
+                let closed_custody = member_host
+                    .validate_experimental_live_channel_custody(
+                        &channel_id,
+                        opened.pending_receipt(),
+                    )
+                    .await
+                    .expect("the next read answers the committed close");
+                assert!(matches!(
+                    closed_custody.phase(),
+                    crate::surface::ExperimentalLiveChannelPhaseStatus::Closed
+                ));
                 assert_eq!(
                     rejected_appends.load(AtomicOrdering::SeqCst),
                     2,
@@ -26460,9 +26504,9 @@ mod tests {
                         meta: None,
                     },
                     meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::EndTurn,
+                        ),
                     },
                 ]),
                 entered: Notify::new(),

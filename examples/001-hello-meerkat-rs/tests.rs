@@ -34,9 +34,7 @@ impl LlmClient for CaptureClient {
                 ),
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
             }),
         ]))
     }

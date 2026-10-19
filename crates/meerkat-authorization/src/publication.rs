@@ -202,6 +202,26 @@ impl LocalAuthorizationPublication {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// The owner change in progress on this publication, if any: a token for
+    /// waiting until it completes, never a permission. `None` while no change
+    /// is in progress, and for a poisoned or exhausted publication, whose
+    /// observations stay unavailable.
+    #[must_use]
+    pub fn change_in_progress(&self) -> Option<meerkat_core::authorization::OwnerChangeInProgress> {
+        let sequence = self.inner.sequence.load(Ordering::Acquire);
+        (sequence != INVALID && !sequence.is_multiple_of(2)).then(|| {
+            meerkat_core::authorization::OwnerChangeInProgress::new(self.inner.instance, sequence)
+        })
+    }
+
+    /// The instance and live sequence, for an audit read of a refused
+    /// attempt. `None` once poisoned or exhausted. Not a permission and not
+    /// an observation: nothing may be decided from it.
+    pub(crate) fn current_read(&self) -> Option<(uuid::Uuid, u64)> {
+        let sequence = self.inner.sequence.load(Ordering::Acquire);
+        (sequence != INVALID).then_some((self.inner.instance, sequence))
+    }
+
     /// Observe the current owners and bind that disposable view to one coherent
     /// publication. The closure must read real owner data or their immutable
     /// snapshots, never a separately refreshed policy cache. It must not do I/O.
@@ -361,6 +381,12 @@ impl LocalPublicationStamp {
     /// durable policy epoch, or cross-process freshness proof.
     pub(crate) fn observation_sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// The instance this read belongs to; its sequences compare only with
+    /// that instance's.
+    pub(crate) fn instance(&self) -> uuid::Uuid {
+        self.inner.instance
     }
 
     /// One allocation-free local atomic read at the final operation boundary.
@@ -858,5 +884,43 @@ mod tests {
             publication.observe(|| ()),
             Err(PublicationError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn change_in_progress_names_only_a_published_change_of_this_instance() {
+        let publication = LocalAuthorizationPublication::new();
+        assert_eq!(publication.change_in_progress(), None);
+        // A reservation is no change in progress until it publishes.
+        drop(publication.reserve_owner_change().expect("reservation"));
+        assert_eq!(publication.change_in_progress(), None);
+        let change = publication.begin_owner_change().expect("owner change");
+        let first = publication
+            .change_in_progress()
+            .expect("a published change is in progress");
+        assert_eq!(publication.change_in_progress(), Some(first));
+        let other = LocalAuthorizationPublication::new();
+        let other_change = other.begin_owner_change().expect("other owner change");
+        assert_ne!(
+            other.change_in_progress(),
+            Some(first),
+            "another publication names its own change"
+        );
+        drop(other_change);
+        drop(change);
+        assert_eq!(publication.change_in_progress(), None);
+        let later = publication.begin_owner_change().expect("later change");
+        assert_ne!(
+            publication.change_in_progress(),
+            Some(first),
+            "a later change is another token"
+        );
+        publication.poison();
+        assert_eq!(
+            publication.change_in_progress(),
+            None,
+            "a poisoned publication has no change to wait for"
+        );
+        drop(later);
+        assert_eq!(publication.change_in_progress(), None);
     }
 }

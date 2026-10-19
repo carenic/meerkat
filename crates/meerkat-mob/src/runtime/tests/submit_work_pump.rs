@@ -252,3 +252,170 @@ async fn submit_work_pump_preflight_closed_manager_refuses_before_record_or_send
     responder.shutdown();
     host.shutdown();
 }
+
+/// Request a Shutdown behind everything already in the actor's mailbox, then
+/// round-trip a status read behind it: the actor serves the read after the
+/// Shutdown, so a deferred Shutdown leaves the read answered (and not
+/// admitted), while an admitted one answers it from its drain.
+async fn request_shutdown_then_read(
+    handle: &MobHandle,
+) -> (
+    tokio::sync::oneshot::Receiver<Result<(), MobError>>,
+    Result<MobState, MobError>,
+) {
+    let shutdown = handle
+        .enqueue_actor_command_for_test(|reply_tx| crate::runtime::state::MobCommand::Shutdown {
+            deadline: None,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue the Shutdown");
+    let read = tokio::time::timeout(Duration::from_secs(10), handle.status())
+        .await
+        .expect("the actor answers the read");
+    (shutdown, read)
+}
+
+/// A Shutdown is admitted only once no lane holds submit-work pump state and
+/// no member effect runs, so a lane's revival of its submission never meets a
+/// parked Shutdown. A held pump preflight is both pump state and a running
+/// member effect: either guard alone defers this Shutdown, and the two
+/// guarantee it together. The pump dispatches the submission once, before
+/// the Shutdown's admission, no member work reaches the parked-Shutdown
+/// refusal, and once the Shutdown commits a request finds the command channel
+/// closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_is_admitted_only_after_a_submit_work_pump_preflight_settles() {
+    let (controlling, host, responder, entry) = fixture("pump-preflight-shutdown").await;
+    let observations = Arc::clone(&controlling.handle.lifecycle_observations);
+    let held = MemberEventPumpManager::hold_completion_preparation_for_test(
+        controlling.mob_id.clone(),
+        entry.agent_identity.clone(),
+    );
+    let reply = submit(
+        &controlling.handle,
+        &entry,
+        meerkat_core::interaction::InteractionId(Uuid::new_v4()),
+        "submitted before the shutdown",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), held.entered())
+        .await
+        .expect("the pump preflight reached the hold");
+
+    let mut task = controlling.handle.actor_task_watch();
+    let (shutdown, read) = request_shutdown_then_read(&controlling.handle).await;
+    assert_eq!(
+        read.expect("a deferred Shutdown leaves the actor serving reads"),
+        MobState::Running
+    );
+    assert!(
+        !*observations.shutdown_admitted.borrow(),
+        "a Shutdown was admitted while a submit-work pump preflight was held"
+    );
+    assert_eq!(*observations.submit_work_pump_dispatches.borrow(), 0);
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(15), shutdown)
+        .await
+        .expect("the Shutdown answers")
+        .expect("shutdown reply")
+        .expect("the Shutdown finishes");
+    let _ = tokio::time::timeout(Duration::from_secs(15), reply)
+        .await
+        .expect("the submission is answered");
+    assert_eq!(
+        *observations.submit_work_pump_dispatches.borrow(),
+        1,
+        "the pump dispatched its submission once"
+    );
+    assert_eq!(
+        *observations.parked_shutdown_member_work_refusals.borrow(),
+        0,
+        "no member work reached a parked Shutdown"
+    );
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    match controlling.handle.stop().await {
+        Err(MobError::ActorCommandChannelClosed) => {}
+        other => panic!("expected a closed command channel after the commit, got {other:?}"),
+    }
+    responder.shutdown();
+    host.shutdown();
+}
+
+/// The lane-pump guard on its own: a submission parked behind the member's
+/// held turn admission is submit-work pump state while no member effect
+/// runs, and the Shutdown still waits for it. Narrowing that guard alone lets
+/// this Shutdown in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_waits_for_a_parked_submit_work_pump_without_a_member_effect() {
+    let (controlling, host, responder, entry) = fixture("pump-parked-shutdown").await;
+    let observations = Arc::clone(&controlling.handle.lifecycle_observations);
+    let (turn_entered, release_turn) = MobHandle::arm_member_turn_admission_test_gate(
+        entry.agent_identity.clone(),
+        crate::MemberTurnAdmissionTestStage::BeforeRuntimeAdmission,
+    );
+    let _first = submit(
+        &controlling.handle,
+        &entry,
+        meerkat_core::interaction::InteractionId(Uuid::new_v4()),
+        "held at its turn admission",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), turn_entered)
+        .await
+        .expect("the first submission reached its turn admission")
+        .expect("turn admission gate");
+    assert_eq!(*observations.submit_work_pump_dispatches.borrow(), 1);
+    let mut second = submit(
+        &controlling.handle,
+        &entry,
+        meerkat_core::interaction::InteractionId(Uuid::new_v4()),
+        "parked behind the held turn admission",
+    )
+    .await;
+
+    let (shutdown, read) = request_shutdown_then_read(&controlling.handle).await;
+    assert_eq!(
+        read.expect("a deferred Shutdown leaves the actor serving reads"),
+        MobState::Running
+    );
+    assert!(
+        !*observations.shutdown_admitted.borrow(),
+        "a Shutdown was admitted while a parked submission held pump state"
+    );
+    assert!(
+        matches!(
+            second.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the second submission is parked, not answered"
+    );
+    assert_eq!(
+        *observations.submit_work_pump_dispatches.borrow(),
+        1,
+        "the parked submission has not started its preflight"
+    );
+
+    drop(release_turn);
+    tokio::time::timeout(Duration::from_secs(30), shutdown)
+        .await
+        .expect("the Shutdown answers")
+        .expect("shutdown reply")
+        .expect("the Shutdown finishes");
+    assert_eq!(
+        *observations.submit_work_pump_dispatches.borrow(),
+        2,
+        "the parked submission dispatched once, before the Shutdown's admission"
+    );
+    assert_eq!(
+        *observations.parked_shutdown_member_work_refusals.borrow(),
+        0,
+        "no member work reached a parked Shutdown"
+    );
+    responder.shutdown();
+    host.shutdown();
+}

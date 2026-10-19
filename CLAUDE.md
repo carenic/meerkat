@@ -567,14 +567,24 @@ and its CI must be green before a release tag (`require_ci_green`):
   own inputs (`sdks/web/`, the runtime, the contracts, examples 031-033),
   and on a push also for every change whose closure reaches
   `meerkat-web-runtime`; `example-web` also runs the Web SDK's `npm test` (type
-  tests over the generated events, node unit suites).
+  tests over the generated events, node unit suites). A pull request that
+  changes a crate the web runtime builds on, or plans the whole workspace,
+  runs only that `npm test` and leaves the wasm build, the browser suites
+  and `wasm-timers` to the push (`example_web_wasm` false, named in
+  `deferred_to_push`): the cold wasm build of the runtime's closure alone
+  took about 20 minutes. On a push or dispatch `example-web` gets 35 minutes,
+  `integration` and `mcp-confinement-positive` 50 (a pull request keeps 25,
+  30 and 40), and `feature-check` 60: caps sized from cold runs after a
+  meerkat-core change.
 - `push: main` only (no budget): `main-unit` over the whole workspace (the
   unit lane's rows verbatim, then the rest of the workspace in packed
   shards), `sdk-host`, and the push-only lanes above.
 - Long rows first: `clippy`, `main-unit`, `closure-tests` and
   `feature-check` run in two waves (`<lane>` and `<lane>-rest`, a copy the
   lanes self-test checks); rows measured at 8 minutes or more
-  (`scripts/ci-row-durations.json`), or never measured, start first, and the
+  (`scripts/ci-row-durations.json`, keyed by a row's name without a packed
+  row's member count, so a repack keeps the measurement while the bin's
+  heaviest member stays the same), or never measured, start first, and the
   rest and the short lanes wait for the `stagger` job. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
@@ -588,7 +598,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   warning with a typed verdict, never a
   failure (the account's 40 concurrent hosted jobs are shared by every PR,
   main push and nightly); the lane table is reported on every non-cancelled
-  run, failed runs included; a failure to measure only warns on `main`;
+  run, failed runs included; a push or a dispatch is a full validation run
+  that only reports the budget (a failure to measure only warns there);
   schema-4 attestation (backend `github-hosted-cargo`) on successful `main`
   pushes. For a `release-projection` plan it re-verifies the reused parent
   attempt with the parent's copies of the scripts (`ci-release-evidence.mjs
@@ -599,6 +610,11 @@ and its CI must be green before a release tag (`require_ci_green`):
   and records the run and attempt in the attestation (`plan.mode:
   release-projection`, `reused_test_evidence`). It runs under
   `!cancelled()` so superseded runs surface as cancelled.
+  `scripts/ci-gate-consistency-selftest.mjs` (in `make ci-lanes-selftest`)
+  runs its shell on the planner's plans with each job's `if:` evaluated:
+  the gate must pass a run in which every selected lane passed and fail one
+  in which a lane that ran failed or did not run (an allowlist names the
+  dispatch's archived main-unit lanes).
 
 The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
 the feature-matrix test runs, audit, the SDK suites, and the whole

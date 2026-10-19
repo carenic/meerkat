@@ -4899,13 +4899,16 @@ pub(crate) fn identity_member_target_state(
                         "MemberSpawned overwrites a current member realization without terminal retirement",
                     );
                 }
+                // A spawn ascends from the retired history. It is the exact
+                // successor unless a store's earlier restart reused a
+                // generation; the mint then goes above the high-water.
                 if let Some(highwater) = generation_highwater {
-                    if highwater.next() != Some(spawned.generation) {
+                    if spawned.generation <= highwater {
                         return malformed_member_target(
                             mob_id,
                             identity,
                             event.cursor,
-                            "MemberSpawned generation is not the exact successor of retired history",
+                            "MemberSpawned generation does not ascend from retired history",
                         );
                     }
                 }
@@ -5062,7 +5065,7 @@ pub(crate) fn identity_member_target_state(
                     );
                 };
                 if current_generation != previous_generation
-                    || previous_generation.next() != Some(*new_generation)
+                    || *new_generation <= *previous_generation
                     || agent_runtime_id.identity != *identity
                     || agent_runtime_id.generation != *new_generation
                     || fence_token.get() == 0
@@ -5071,7 +5074,7 @@ pub(crate) fn identity_member_target_state(
                         mob_id,
                         identity,
                         event.cursor,
-                        "MemberReset does not name an exact successor runtime",
+                        "MemberReset does not name an ascending successor runtime",
                     );
                 }
                 current_head = Some((*new_generation, agent_runtime_id.clone(), *fence_token));
@@ -7892,6 +7895,94 @@ mod authority_validating_run_store_tests {
         assert!(
             Arc::ptr_eq(&rewrapped, &validated),
             "the validation boundary is not stacked"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_member_target_generation_tests {
+    use super::*;
+    use crate::event::MemberSpawnedEvent;
+    use crate::ids::{AgentRuntimeId, FenceToken, ProfileName};
+
+    fn event(mob_id: &MobId, cursor: u64, kind: MobEventKind) -> MobEvent {
+        MobEvent {
+            cursor,
+            timestamp: Utc::now(),
+            mob_id: mob_id.clone(),
+            kind,
+        }
+    }
+
+    fn spawned(identity: &AgentIdentity, generation: u64, fence: u64) -> MobEventKind {
+        let generation = Generation::new(generation);
+        MobEventKind::MemberSpawned(
+            MemberSpawnedEvent::new(
+                identity.clone(),
+                generation,
+                FenceToken::new(fence),
+                AgentRuntimeId::new(identity.clone(), generation),
+                ProfileName::from("worker"),
+            )
+            .with_bridge_member_ref(Some(MemberRef::from_bridge_session_id(
+                meerkat_core::SessionId::new(),
+            ))),
+        )
+    }
+
+    fn retired(identity: &AgentIdentity, generation: u64) -> MobEventKind {
+        MobEventKind::MemberRetired {
+            agent_identity: identity.clone(),
+            generation: Generation::new(generation),
+            role: ProfileName::from("worker"),
+        }
+    }
+
+    /// A store whose last reset epoch reused a generation mints the next one
+    /// above the high-water, so a spawn after retired history and a member
+    /// reset can skip generations. The target still resolves; a spawn or a
+    /// reset that does not ascend stays malformed.
+    #[test]
+    fn identity_member_target_accepts_ascending_generation_gaps() {
+        let mob_id = MobId::from("target-generation-gaps");
+        let identity = AgentIdentity::from("worker");
+        let mut events = vec![
+            event(&mob_id, 1, spawned(&identity, 0, 1)),
+            event(&mob_id, 2, retired(&identity, 0)),
+            event(&mob_id, 3, spawned(&identity, 3, 3)),
+            event(
+                &mob_id,
+                4,
+                MobEventKind::MemberReset {
+                    agent_identity: identity.clone(),
+                    previous_generation: Generation::new(3),
+                    new_generation: Generation::new(5),
+                    fence_token: FenceToken::new(4),
+                    agent_runtime_id: AgentRuntimeId::new(identity.clone(), Generation::new(5)),
+                },
+            ),
+        ];
+        let state = identity_member_target_state(&events, &mob_id, &identity);
+        assert!(
+            matches!(
+                state.observation,
+                IdentityMemberTargetObservation::Present { .. }
+            ),
+            "ascending gaps resolve: {:?}",
+            state.observation
+        );
+
+        events.push(event(&mob_id, 5, retired(&identity, 5)));
+        events.push(event(&mob_id, 6, spawned(&identity, 5, 6)));
+        let state = identity_member_target_state(&events, &mob_id, &identity);
+        assert!(
+            matches!(
+                &state.observation,
+                IdentityMemberTargetObservation::Malformed { detail, .. }
+                    if detail.contains("does not ascend")
+            ),
+            "a spawn that repeats a generation is malformed: {:?}",
+            state.observation
         );
     }
 }

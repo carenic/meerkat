@@ -489,6 +489,11 @@ impl LlmRequestAuthorization {
         self.usage
     }
 
+    /// The admitted work this model operation belongs to.
+    pub(crate) fn work_authorization(&self) -> &WorkAuthorizationContext {
+        &self.work
+    }
+
     /// The actual operation this request authorization belongs to.
     pub fn operation_id(&self) -> &OperationId {
         &self.operation_id

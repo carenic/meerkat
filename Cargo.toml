@@ -64,8 +64,9 @@ notify = "8"
 jsonschema = { version = "0.26", default-features = false }
 schemars = { version = "1", features = ["derive"] }
 
-# YAML
-serde_yaml = "0.9"
+# YAML: pure Rust, no `unsafe`; pinned exactly and never automerged
+# (renovate.json), since SKILL.md frontmatter arrives from HTTP and git.
+serde-saphyr = { version = "=2.0.0", default-features = false, features = ["deserialize", "serialize"] }
 
 # Enum utilities
 strum = { version = "0.28", features = ["derive"] }

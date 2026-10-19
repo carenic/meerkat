@@ -8,7 +8,7 @@ use meerkat_core::web_search::{
     WebSearchEvidence, WebSearchNativeEvent, WebSearchRequest, WebSearchResult, WebSearchStatus,
 };
 use meerkat_core::{AgentLlmClient, AssistantBlock, Message, Provider, SystemMessage, UserMessage};
-use meerkat_llm_core::{LlmError, WebSearchExecutor};
+use meerkat_llm_core::{LlmError, WebSearchExecutor, WebSearchStop, classify_web_search_stop};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -112,6 +112,33 @@ async fn execute_native_web_search(
         .await
         .map_err(map_agent_error_to_llm_error)?;
 
+    // A call that stopped on a refusal, a content filter, a filled context
+    // window or a cancellation produced no answer, even when a native search
+    // ran first: report it failed with the reason, never its text as the
+    // answer. One cut at its output cap or paused by the provider's
+    // server-tool loop keeps its answer and says it may be incomplete (#1887).
+    let cut_note = match classify_web_search_stop(result.stop_reason()) {
+        WebSearchStop::Unanswered(stop) => {
+            return Ok(WebSearchResult {
+                status: WebSearchStatus::Failed,
+                query: request.query,
+                provider: Some(provider),
+                model: Some(ModelId::new(model.to_string())),
+                answer: None,
+                evidence: Vec::new(),
+                native_events: Vec::new(),
+                error: Some(format!(
+                    "the native web-search call stopped with `{stop}` and produced no answer"
+                )),
+                checked_at: chrono::Utc::now(),
+            });
+        }
+        WebSearchStop::MaybeIncomplete(stop) => Some(format!(
+            "the native web-search call stopped with `{stop}`; the answer may be incomplete"
+        )),
+        WebSearchStop::Answered => None,
+    };
+
     let mut answer_parts = Vec::new();
     let mut native_events = Vec::new();
     let mut evidence = Vec::new();
@@ -148,11 +175,15 @@ async fn execute_native_web_search(
             answer: (!answer_parts.is_empty()).then(|| answer_parts.join("\n\n")),
             evidence,
             native_events,
-            error: Some(
-                "provider stream produced no native web-search event; \
-                 search execution is unverified"
+            error: Some(match cut_note {
+                Some(cut_note) => format!(
+                    "provider stream produced no native web-search event; \
+                     search execution is unverified; {cut_note}"
+                ),
+                None => "provider stream produced no native web-search event; \
+                         search execution is unverified"
                     .to_string(),
-            ),
+            }),
             checked_at: chrono::Utc::now(),
         });
     }
@@ -165,7 +196,7 @@ async fn execute_native_web_search(
         answer: (!answer_parts.is_empty()).then(|| answer_parts.join("\n\n")),
         evidence,
         native_events,
-        error: None,
+        error: cut_note,
         checked_at: chrono::Utc::now(),
     })
 }
@@ -497,6 +528,19 @@ mod tests {
             })
         }
 
+        fn stopped(
+            blocks: Vec<AssistantBlock>,
+            stop_reason: StopReason,
+        ) -> Arc<dyn AgentLlmClient> {
+            Arc::new(Self {
+                outcome: Mutex::new(Some(Ok(LlmStreamResult::new(
+                    blocks,
+                    stop_reason,
+                    Usage::default(),
+                )))),
+            })
+        }
+
         fn err(err: AgentError) -> Arc<dyn AgentLlmClient> {
             Arc::new(Self {
                 outcome: Mutex::new(Some(Err(err))),
@@ -598,6 +642,81 @@ mod tests {
             !result.native_events.is_empty(),
             "the native-search witness must be retained"
         );
+    }
+
+    /// #1887: a search call that stopped on a refusal, a content filter, a
+    /// filled context window or a cancellation produced no answer. It
+    /// reports `failed` naming the stop reason, with none of its text,
+    /// evidence or native events, even after a native search ran.
+    #[tokio::test]
+    async fn a_search_call_stopped_without_an_answer_fails_with_its_reason() {
+        for (stop_reason, wire) in [
+            (StopReason::Refusal, "refusal"),
+            (StopReason::ContentFilter, "content_filter"),
+            (StopReason::ContextWindowExceeded, "context_window_exceeded"),
+            (StopReason::Cancelled, "cancelled"),
+        ] {
+            let client = FakeClient::stopped(
+                vec![
+                    server_tool_block(),
+                    text_block("I can't help with that search."),
+                ],
+                stop_reason,
+            );
+            let executor = AnthropicWebSearchExecutor::new("claude-sonnet-4-6".to_string(), client);
+            let result = executor
+                .execute_web_search(request())
+                .await
+                .expect("a stopped search still resolves to a typed result");
+            assert_eq!(result.status, WebSearchStatus::Failed, "{wire}");
+            assert_eq!(result.answer, None, "{wire}");
+            assert!(result.evidence.is_empty(), "{wire}: {:?}", result.evidence);
+            assert!(
+                result.native_events.is_empty(),
+                "{wire}: {:?}",
+                result.native_events
+            );
+            let error = result.error.expect("a failed search names its reason");
+            assert!(error.contains(&format!("`{wire}`")), "{error}");
+        }
+    }
+
+    /// A search answer cut at the call's output cap or paused by the
+    /// provider's server-tool loop still answers: it keeps the rules of a
+    /// natural end, completed with its answer once a native search ran.
+    #[tokio::test]
+    async fn a_search_cut_at_its_output_cap_or_paused_keeps_its_answer() {
+        for stop_reason in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::PauseTurn,
+        ] {
+            let client = FakeClient::stopped(
+                vec![text_block("Meerkats are small."), server_tool_block()],
+                stop_reason,
+            );
+            let executor = AnthropicWebSearchExecutor::new("claude-sonnet-4-6".to_string(), client);
+            let result = executor
+                .execute_web_search(request())
+                .await
+                .expect("an answered search resolves to a typed result");
+            assert_eq!(result.status, WebSearchStatus::Completed, "{stop_reason:?}");
+            assert_eq!(
+                result.answer.as_deref(),
+                Some("Meerkats are small."),
+                "{stop_reason:?}"
+            );
+            let expected_error = match stop_reason {
+                StopReason::MaxTokens => Some(
+                    "the native web-search call stopped with `max_tokens`; the answer may be incomplete",
+                ),
+                StopReason::PauseTurn => Some(
+                    "the native web-search call stopped with `pause_turn`; the answer may be incomplete",
+                ),
+                _ => None,
+            };
+            assert_eq!(result.error.as_deref(), expected_error, "{stop_reason:?}");
+        }
     }
 
     // Row #355: a stream error must propagate the typed failure class, not be

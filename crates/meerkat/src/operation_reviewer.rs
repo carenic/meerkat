@@ -441,6 +441,7 @@ async fn collect_review_response(
             LlmEvent::Done { outcome } => match outcome {
                 LlmDoneOutcome::Success {
                     stop_reason: completed,
+                    ..
                 } => {
                     if stop_reason.replace(completed).is_some() {
                         return Err(ReviewResponseError::UnexpectedOutput);

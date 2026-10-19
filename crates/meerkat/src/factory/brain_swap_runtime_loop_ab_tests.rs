@@ -172,7 +172,7 @@ fn usage_event(provider: Provider, model: &str) -> LlmEvent {
 
 fn done_event(stop_reason: StopReason) -> LlmEvent {
     LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success { stop_reason },
+        outcome: LlmDoneOutcome::success(stop_reason),
     }
 }
 

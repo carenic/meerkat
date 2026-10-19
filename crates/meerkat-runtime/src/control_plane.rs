@@ -630,20 +630,30 @@ pub(crate) async fn has_committed_runless_recovery_carrier(
                 error,
             )
         })?;
-    Ok(stored_inputs.into_iter().any(|stored| {
-        stored
-            .state
-            .interaction_terminal_outbox
-            .is_some_and(|outbox| {
-                matches!(
-                    outbox.batch_key,
-                    crate::input_state::InteractionTerminalBatchKey::RuntimeTermination { .. }
-                ) && !matches!(
-                    outbox.phase,
-                    crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
-                )
-            })
-    }))
+    Ok(stored_inputs
+        .iter()
+        .any(carries_unpublished_runless_termination))
+}
+
+/// Whether this stored input carries a committed runless runtime-termination
+/// carrier that still waits for its publication. The one row predicate for
+/// every reader that asks whether a runless terminal is still owed.
+pub(crate) fn carries_unpublished_runless_termination(
+    stored: &crate::input_state::StoredInputState,
+) -> bool {
+    stored
+        .state
+        .interaction_terminal_outbox
+        .as_ref()
+        .is_some_and(|outbox| {
+            matches!(
+                outbox.batch_key,
+                crate::input_state::InteractionTerminalBatchKey::RuntimeTermination { .. }
+            ) && !matches!(
+                outbox.phase,
+                crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
+            )
+        })
 }
 
 /// Canonical terminalization for an async stop after the executor has accepted

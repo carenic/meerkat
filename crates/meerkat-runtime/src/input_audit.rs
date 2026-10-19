@@ -71,6 +71,29 @@ impl InputAuthorizationAudit {
         }
     }
 
+    /// Whether any record carries a refusal read or a policy read's
+    /// publication instance, which only stored input state v7 and later can
+    /// carry.
+    pub(crate) fn has_publication_read(&self) -> bool {
+        let carries_read =
+            |record: &StoredAuthorizationAuditObservation| match &record.observation.observation {
+                meerkat_authorization_contracts::audit::AuditObservation::Refused {
+                    read, ..
+                } => read.is_some(),
+                meerkat_authorization_contracts::audit::AuditObservation::Prepared {
+                    policy,
+                    ..
+                } => policy.publication_instance.is_some(),
+                _ => false,
+            };
+        match &self.0 {
+            AuditPayload::Pending(records) => records
+                .lock()
+                .is_ok_and(|records| records.iter().any(carries_read)),
+            AuditPayload::Frozen(records) => records.iter().any(carries_read),
+        }
+    }
+
     /// Freeze exactly the observed prefix for the existing row transaction.
     /// Concurrent appends remain on the live buffer for the next native row
     /// update. This method does not acknowledge or clear either prefix/suffix.

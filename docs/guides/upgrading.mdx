@@ -188,8 +188,11 @@ lost.
   per-member outcomes, and `ShutdownOptions::with_deadline` bounds every wait
   by your own deadline (for example below a Kubernetes termination grace
   period).
-- While a Shutdown runs, commands other than a second Shutdown get
-  `ActorCommandChannelClosed`. Treat it as "mob shutting down".
+- While a Shutdown runs, a command its closed admission refuses (a spawn,
+  work, a flow, wiring) gets `AdmissionClosed`, and while it drains its own
+  work, commands other than a second Shutdown get the retryable
+  `ShutdownInProgress`. Once the actor has exited, commands get
+  `ActorCommandChannelClosed`. Treat all three as "mob shutting down".
 - A retirement that started and failed answers `MemberRetirementStuck`.
   **Do:** call `MobHandle::redrive_retirement` or resume the mob.
 - A spawn that completes into a Stopped mob leaves it Stopped and holds the

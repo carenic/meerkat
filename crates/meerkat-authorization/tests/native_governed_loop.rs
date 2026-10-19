@@ -403,7 +403,7 @@ struct ScriptedProvider {
 
 fn done(stop_reason: StopReason) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success { stop_reason },
+        outcome: LlmDoneOutcome::success(stop_reason),
     })
 }
 
@@ -765,7 +765,7 @@ async fn generated_grant_denial_reaches_controller_and_permitted_tool_finishes_s
         .iter()
         .find(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == DENIED_CALL && tool_name == "delete_record"))
         })
@@ -854,6 +854,9 @@ mod s3_scoped_context;
 
 #[path = "native_governed_loop/s1_scoped_original.rs"]
 mod s1_scoped_original;
+
+#[path = "native_governed_loop/owner_change_wait.rs"]
+mod owner_change_wait;
 
 #[cfg(unix)]
 #[path = "native_governed_loop/connector_call_context.rs"]

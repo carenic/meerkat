@@ -1340,6 +1340,9 @@ impl GeneratedMachineKernel {
             "mob_machine_next_respawn_generation" => {
                 self.eval_mob_machine_next_respawn_generation(args, transition_name)
             }
+            "mob_machine_next_minted_generation" => {
+                self.eval_mob_machine_next_minted_generation(args, transition_name)
+            }
             "mob_machine_u64_is_exact_successor" => {
                 self.eval_mob_machine_u64_is_exact_successor(args, transition_name)
             }
@@ -1494,6 +1497,67 @@ impl GeneratedMachineKernel {
                     )
                 })?
                 .checked_add(1),
+            None => Some(0),
+        };
+        let Some(next_generation) = next_generation else {
+            return Ok(KernelValue::None);
+        };
+        let generation_type = NamedTypeId::parse("Generation").map_err(|error| {
+            self.eval_error(
+                transition_name,
+                format!("invalid Generation named type: {error}"),
+            )
+        })?;
+        Ok(option_some(KernelValue::Named {
+            type_name: generation_type,
+            value: Box::new(KernelValue::U64(next_generation)),
+        }))
+    }
+
+    fn eval_mob_machine_next_minted_generation(
+        &self,
+        args: Vec<KernelValue>,
+        transition_name: &TransitionId,
+    ) -> Result<KernelValue, TransitionRefusal> {
+        let [
+            identity_runtime_generations,
+            identity_generation_highwater,
+            agent_identity,
+        ]: [KernelValue; 3] = args.try_into().map_err(|_| {
+            self.eval_error(
+                transition_name,
+                "mob_machine_next_minted_generation expects three args",
+            )
+        })?;
+        let identity_runtime_generations = identity_runtime_generations
+            .into_map()
+            .map_err(|error| self.eval_error(transition_name, error))?;
+        let identity_generation_highwater = identity_generation_highwater
+            .into_map()
+            .map_err(|error| self.eval_error(transition_name, error))?;
+        if named_or_bare_string_leaf(&agent_identity, "AgentIdentity").is_none() {
+            return Err(self.eval_error(
+                transition_name,
+                "mob_machine_next_minted_generation expected AgentIdentity",
+            ));
+        }
+        let generation_in = |generations: &BTreeMap<KernelValue, KernelValue>| {
+            generations
+                .get(&agent_identity)
+                .map(|generation| {
+                    named_or_bare_u64_leaf(generation, "Generation").ok_or_else(|| {
+                        self.eval_error(
+                            transition_name,
+                            "mob_machine_next_minted_generation expected Generation map values",
+                        )
+                    })
+                })
+                .transpose()
+        };
+        let retained = generation_in(&identity_runtime_generations)?;
+        let highwater = generation_in(&identity_generation_highwater)?;
+        let next_generation = match retained.max(highwater) {
+            Some(generation) => generation.checked_add(1),
             None => Some(0),
         };
         let Some(next_generation) = next_generation else {
@@ -4691,6 +4755,45 @@ mod tests {
             ),
             Err(TransitionRefusal::EvaluationError { .. })
         ));
+    }
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn mob_next_minted_generation_reads_the_highwater() {
+        let kernel = GeneratedMachineKernel::new(mob_machine());
+        let transition = transition_id("BeginSpawnExecFresh");
+        let agent = named_string("AgentIdentity", "agent.a");
+        let generations = |value: Option<u64>| {
+            KernelValue::Map(
+                value
+                    .map(|value| (agent.clone(), named_u64("Generation", value)))
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        let mint = |retained: Option<u64>, highwater: Option<u64>| {
+            kernel
+                .eval_native_helper(
+                    "mob_machine_next_minted_generation",
+                    vec![generations(retained), generations(highwater), agent.clone()],
+                    &transition,
+                )
+                .expect("minted generation")
+        };
+        assert_eq!(mint(None, None), option_some(named_u64("Generation", 0)));
+        assert_eq!(mint(Some(7), None), option_some(named_u64("Generation", 8)));
+        assert_eq!(mint(None, Some(5)), option_some(named_u64("Generation", 6)));
+        // A store whose post-reset epoch reused generation 2 mints above the
+        // pre-reset high-water, not above the reused generation.
+        assert_eq!(
+            mint(Some(2), Some(5)),
+            option_some(named_u64("Generation", 6))
+        );
+        assert_eq!(
+            mint(Some(9), Some(5)),
+            option_some(named_u64("Generation", 10))
+        );
+        assert_eq!(mint(None, Some(u64::MAX)), KernelValue::None);
     }
 
     #[allow(clippy::expect_used)]

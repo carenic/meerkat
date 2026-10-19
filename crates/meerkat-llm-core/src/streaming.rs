@@ -102,9 +102,7 @@ mod tests {
                 meta: None,
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
             Ok(LlmEvent::TextDelta {
                 delta: "later".to_string(),

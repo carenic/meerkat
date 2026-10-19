@@ -42,8 +42,19 @@ fn runtime_actor_future(
 /// Publishes how the actor task ended: `Returned` once the actor future
 /// returned, `Lost` when the task ends any other way (a panic or an abort
 /// drops this guard without the future returning).
+///
+/// A lost task closes the mob's admission first (D67,
+/// `MobAdmissionCloseReason::ActorLost`): the actor closes it on its own
+/// exits, but a lost task never reaches them. The guard shares the mob's
+/// ownership state (the `Arc` every handle holds) and a clone of the
+/// actor's admission sender, so the close is decided under the same lock as
+/// owner acquisition and published on the same channel. The clone drops with
+/// the guard, so the channel still closes when the task ends.
 struct ActorTaskEndGuard {
     observations: Option<Arc<super::MemberLifecycleObservations>>,
+    ownership: Arc<super::admission_close::MobOwnership>,
+    admission_closed_tx:
+        tokio::sync::watch::Sender<Option<super::admission_close::MobAdmissionCloseReason>>,
 }
 
 impl ActorTaskEndGuard {
@@ -53,11 +64,28 @@ impl ActorTaskEndGuard {
             observations.record_actor_task_end(super::ActorTaskEnd::Returned);
         }
     }
+
+    /// Close admission for a task that ended without its future returning,
+    /// keeping an earlier close's reason.
+    fn close_admission_for_lost_task(&self) {
+        use super::admission_close::{
+            CloseDecision, CloseRequest, MobAdmissionCloseReason, MobBusy,
+        };
+        if let CloseDecision::Closed { reason, .. } = self.ownership.decide(
+            CloseRequest::Unconditional(MobAdmissionCloseReason::ActorLost),
+            MobBusy::default,
+        ) {
+            self.admission_closed_tx.send_replace(Some(reason));
+        }
+    }
 }
 
 impl Drop for ActorTaskEndGuard {
     fn drop(&mut self) {
         if let Some(observations) = self.observations.take() {
+            // Closed before `Lost` is published, so whoever observes the
+            // lost task also observes the close.
+            self.close_admission_for_lost_task();
             observations.record_actor_task_end(super::ActorTaskEnd::Lost);
         }
     }
@@ -362,7 +390,7 @@ impl OrchestratorResumeNotification {
 }
 
 #[cfg(feature = "runtime-adapter")]
-async fn drive_recovered_placed_lifecycle_intent(
+pub(super) async fn drive_recovered_placed_lifecycle_intent(
     handle: MobHandle,
     intent: mob_dsl::PlacedCompletionLifecycleIntentKind,
 ) {
@@ -384,7 +412,12 @@ async fn drive_recovered_placed_lifecycle_intent(
         };
         match result {
             Ok(()) => return,
-            Err(MobError::ActorCommandChannelClosed) => return,
+            // The actor has exited, or it refuses the intent for the rest of
+            // its life: a Reset is in the Closing set, so once admission is
+            // closed (a failed Shutdown, a stand-down) no retry can run it.
+            // The durable intent stays recorded, and the next start drives
+            // it again.
+            Err(MobError::ActorCommandChannelClosed | MobError::AdmissionClosed { .. }) => return,
             Err(error) => {
                 tracing::warn!(
                     mob_id = %handle.mob_id(),
@@ -3821,18 +3854,13 @@ fn seed_mob_authority_sync_from_events(
                         new_generation, agent_runtime_id.generation, agent_identity
                     )));
                 }
-                let expected_generation = previous_generation
-                    .get()
-                    .checked_add(1)
-                    .map(crate::ids::Generation::new)
-                    .ok_or_else(|| {
-                        MobError::Internal(format!(
-                            "stored MemberReset previous generation overflow for '{agent_identity}'"
-                        ))
-                    })?;
-                if *new_generation != expected_generation {
+                // A reset generation ascends from the previous one. It is the
+                // exact successor unless a store's earlier restart reused a
+                // generation; the mint then goes above the high-water, and
+                // the machine replay accepts that gap.
+                if *new_generation <= *previous_generation {
                     return Err(MobError::Internal(format!(
-                        "stored MemberReset generation '{new_generation}' is not the exact successor of '{previous_generation}' for '{agent_identity}'"
+                        "stored MemberReset generation '{new_generation}' does not ascend from '{previous_generation}' for '{agent_identity}'"
                     )));
                 }
                 let previous_agent_runtime_id =
@@ -4127,6 +4155,213 @@ struct RespawnTopologyLedger {
     effective_preservation: BTreeMap<(String, u64), bool>,
     active_abandonments: BTreeMap<(String, u64), (AgentRuntimeId, crate::ids::FenceToken, u64)>,
     spawned: BTreeMap<(String, u64), (AgentRuntimeId, crate::ids::FenceToken, u64)>,
+}
+
+/// The highest member generation each identity has had in this mob's whole
+/// history, every reset epoch included. Resume seeds the MobMachine from the
+/// events after the last `MobReset` only, so it recovers this high-water
+/// separately (see [`recover_identity_generation_highwaters`]): minting reads
+/// it, and an identity re-spawned after a reset and a restart never reuses a
+/// pre-reset generation.
+///
+/// The match names every [`MobEventKind`] and has no wildcard arm, so a new
+/// kind fails to compile until it is classified here. Host binding
+/// generations (`RemoteHost*`) are a different counter and contribute nothing.
+pub(crate) fn identity_generation_highwaters(
+    events: &[crate::event::MobEvent],
+) -> BTreeMap<crate::ids::AgentIdentity, crate::ids::Generation> {
+    let mut highwaters = BTreeMap::<crate::ids::AgentIdentity, crate::ids::Generation>::new();
+    let mut note = |identity: &crate::ids::AgentIdentity, generation: crate::ids::Generation| {
+        highwaters
+            .entry(identity.clone())
+            .and_modify(|current| *current = (*current).max(generation))
+            .or_insert(generation);
+    };
+    for event in events {
+        match &event.kind {
+            MobEventKind::MemberSpawned(spawned) => {
+                note(&spawned.agent_identity, spawned.generation);
+                note(
+                    &spawned.agent_runtime_id.identity,
+                    spawned.agent_runtime_id.generation,
+                );
+            }
+            MobEventKind::MemberSessionBindingRecovered(recovered) => {
+                note(
+                    &recovered.agent_runtime_id.identity,
+                    recovered.agent_runtime_id.generation,
+                );
+            }
+            MobEventKind::MemberRetirementStarted {
+                agent_identity,
+                agent_runtime_id,
+                generation,
+                ..
+            } => {
+                note(agent_identity, *generation);
+                note(&agent_runtime_id.identity, agent_runtime_id.generation);
+            }
+            MobEventKind::RemoteMemberRuntimeRetired {
+                agent_identity,
+                agent_runtime_id,
+                generation,
+                ..
+            }
+            | MobEventKind::RemoteMemberSupervisorRevoked {
+                agent_identity,
+                agent_runtime_id,
+                generation,
+                ..
+            } => {
+                note(agent_identity, *generation);
+                note(&agent_runtime_id.identity, agent_runtime_id.generation);
+            }
+            MobEventKind::MemberRetired {
+                agent_identity,
+                generation,
+                ..
+            }
+            | MobEventKind::RemoteMemberReleaseConfirmed {
+                agent_identity,
+                generation,
+                ..
+            } => note(agent_identity, *generation),
+            MobEventKind::RespawnTopologyAbandoned {
+                agent_identity,
+                generation,
+                agent_runtime_id,
+                ..
+            } => {
+                note(agent_identity, *generation);
+                if let Some(agent_runtime_id) = agent_runtime_id {
+                    note(&agent_runtime_id.identity, agent_runtime_id.generation);
+                }
+            }
+            MobEventKind::MemberReset {
+                agent_identity,
+                previous_generation,
+                new_generation,
+                agent_runtime_id,
+                ..
+            } => {
+                note(agent_identity, *previous_generation);
+                note(agent_identity, *new_generation);
+                note(&agent_runtime_id.identity, agent_runtime_id.generation);
+            }
+            MobEventKind::StepDispatched { target, .. } => {
+                note(&target.identity, target.generation);
+            }
+            MobEventKind::StepTargetCompleted {
+                target,
+                remote_turn_obligation,
+                ..
+            }
+            | MobEventKind::StepTargetFailed {
+                target,
+                remote_turn_obligation,
+                ..
+            } => {
+                note(&target.identity, target.generation);
+                if let Some(obligation) = remote_turn_obligation {
+                    note(&obligation.agent_identity, obligation.generation);
+                }
+            }
+            MobEventKind::RemoteTurnObligationRecorded { obligation }
+            | MobEventKind::RemoteTurnOutcomeResolved { obligation }
+            | MobEventKind::RemoteTurnOutcomeAcknowledged { obligation }
+            | MobEventKind::RemoteTurnOutcomeDisposed { obligation } => {
+                note(&obligation.agent_identity, obligation.generation);
+            }
+            MobEventKind::PlacedCompletionObligationRecorded { obligation }
+            | MobEventKind::PlacedCompletionCancellationRequested { obligation }
+            | MobEventKind::PlacedCompletionOutcomeResolved { obligation, .. }
+            | MobEventKind::PlacedCompletionOutcomeClosed { obligation, .. }
+            | MobEventKind::PlacedCompletionOutcomeAcknowledged { obligation }
+            | MobEventKind::PlacedCompletionOutcomeDisposed { obligation } => {
+                note(&obligation.agent_identity, obligation.generation);
+            }
+            MobEventKind::PlacedKickoffObligationRecorded { obligation }
+            | MobEventKind::PlacedKickoffOutcomeResolved { obligation, .. }
+            | MobEventKind::PlacedKickoffRejectedNoEffect { obligation, .. }
+            | MobEventKind::PlacedKickoffOutcomeAcknowledged { obligation }
+            | MobEventKind::PlacedKickoffOutcomeDisposed { obligation } => {
+                note(&obligation.agent_identity, obligation.generation);
+            }
+            MobEventKind::MobCreated { .. }
+            | MobEventKind::MobDefinitionUpdated { .. }
+            | MobEventKind::MobOwnerBridgeSessionBound { .. }
+            | MobEventKind::MobCompleted
+            | MobEventKind::MobDestroying
+            | MobEventKind::MobDestroyStorageFinalizing
+            | MobEventKind::MobReset
+            | MobEventKind::ForkJobTerminal(_)
+            | MobEventKind::MemberKickoffUpdated { .. }
+            | MobEventKind::ObjectiveOwnerBound { .. }
+            | MobEventKind::ObjectiveConcluded { .. }
+            | MobEventKind::MembersWired { .. }
+            | MobEventKind::MembersWiredBatch { .. }
+            | MobEventKind::MembersUnwired { .. }
+            | MobEventKind::ExternalPeerWired { .. }
+            | MobEventKind::ExternalPeerUnwired { .. }
+            | MobEventKind::FlowStarted { .. }
+            | MobEventKind::FlowCompleted { .. }
+            | MobEventKind::FlowFailed { .. }
+            | MobEventKind::FlowCanceled { .. }
+            | MobEventKind::PlacedCompletionLifecycleQuiesceStarted { .. }
+            | MobEventKind::MobStopped
+            | MobEventKind::PlacedCompletionLifecycleQuiesceEnded { .. }
+            | MobEventKind::RemoteHostBindStarted { .. }
+            | MobEventKind::RemoteHostBindConfirmed { .. }
+            | MobEventKind::RemoteHostBindCompleted { .. }
+            | MobEventKind::RemoteHostBindAbortedNoEffect { .. }
+            | MobEventKind::RemoteHostRevokeStarted { .. }
+            | MobEventKind::RemoteHostRevokeConfirmed { .. }
+            | MobEventKind::RemoteHostRevokeCompleted { .. }
+            | MobEventKind::StepCompleted { .. }
+            | MobEventKind::StepFailed { .. }
+            | MobEventKind::StepSkipped { .. }
+            | MobEventKind::TopologyViolation { .. }
+            | MobEventKind::SupervisorEscalation { .. }
+            | MobEventKind::SupervisorEscalationFailed { .. }
+            | MobEventKind::OrchestratorResumeNotificationFailed { .. }
+            | MobEventKind::OperatorActionRecorded { .. } => {}
+        }
+    }
+    highwaters
+}
+
+/// Recover every identity's generation high-water from `events`, one mob's
+/// whole history, then seal the recovery window. Resume runs it once, after
+/// every event repair and before it seeds the last reset epoch.
+fn recover_identity_generation_highwaters(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    events: &[crate::event::MobEvent],
+) -> Result<(), MobError> {
+    for (identity, generation) in identity_generation_highwaters(events) {
+        apply_seeded_mob_signal(
+            authority,
+            mob_dsl::MobMachineSignal::RecoverIdentityGenerationHighwater {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(&identity),
+                generation: mob_dsl::Generation::from_domain(generation),
+            },
+            "recover_identity_generation_highwater",
+        )?;
+    }
+    seal_identity_generation_highwater(authority, "resume_seal_generation_highwater")
+}
+
+/// Close the generation high-water recovery window: create seals a fresh
+/// machine, and resume seals once it has recovered the high-water. A sealed
+/// machine refuses the recovery signal.
+fn seal_identity_generation_highwater(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    context: &'static str,
+) -> Result<(), MobError> {
+    apply_seeded_mob_signal(
+        authority,
+        mob_dsl::MobMachineSignal::SealIdentityGenerationHighwater,
+        context,
+    )
 }
 
 fn respawn_topology_ledger(
@@ -7412,6 +7647,10 @@ impl MobBuilder {
                 "create_definition_spawn_policy",
             )?;
             finish_seeded_mob_authority_phase(&mut dsl_authority, MobState::Running)?;
+            seal_identity_generation_highwater(
+                &mut dsl_authority,
+                "create_seal_generation_highwater",
+            )?;
 
             // The creator's claim verifier before anything else durable: a
             // store that already holds one for the id (an earlier mob's,
@@ -7906,6 +8145,12 @@ impl MobBuilder {
                 Arc::clone(&supervisor_bridge),
             )
             .await?;
+
+            // The epoch replay below sees only the events after the last
+            // MobReset. Minting must still sort above every generation the
+            // whole history used, so the high-water comes from every epoch,
+            // before the epoch replay, and the window is sealed.
+            recover_identity_generation_highwaters(initial_dsl_authority.as_mut(), &mob_events)?;
 
             // Generic event replay remains authoritative for local members and
             // retired history. It skips only the exact current placed projection;
@@ -10284,6 +10529,9 @@ impl MobBuilder {
             // non-owning; the token is attached only to the returned handle.
             let ownership = super::admission_close::MobOwnership::new();
             let (admission_closed_tx, admission_closed_rx) = tokio::sync::watch::channel(None);
+            // The actor task's end guard closes admission if the task is lost.
+            let task_end_ownership = Arc::clone(&ownership);
+            let task_end_admission_closed_tx = admission_closed_tx.clone();
             let handle = MobHandle {
                 // Explicit launch-site mint (A16): the launching process IS the
                 // owning operator — not ambient inference (gotcha #19).
@@ -10649,6 +10897,11 @@ impl MobBuilder {
                     )),
                 });
             }
+            // A mob restored with an admitted destroy (its durable
+            // MobDestroying marker) starts with admission closed, before its
+            // handle escapes: nothing is spawned into it, and no owner lease
+            // is granted, before the destroy's retry runs.
+            actor.close_admission_if_destroy_admitted();
             // A17 recovery trigger (DEC-P6E-11): obligations survive via event
             // replay, subscriptions do not — re-derive pending remote-turn
             // obligations from recovered machine state and keep their members'
@@ -10936,6 +11189,8 @@ impl MobBuilder {
             }
             let actor_task_end = ActorTaskEndGuard {
                 observations: Some(Arc::clone(&handle.lifecycle_observations)),
+                ownership: task_end_ownership,
+                admission_closed_tx: task_end_admission_closed_tx,
             };
             tokio::spawn(async move {
                 runtime_actor_future(actor, command_rx).await;
@@ -14095,7 +14350,7 @@ mod tests {
                 Generation::INITIAL,
                 Generation::INITIAL,
                 AgentRuntimeId::initial(identity.clone()),
-                "is not the exact successor",
+                "does not ascend",
             ),
             (
                 "regressed generation",
@@ -14103,23 +14358,15 @@ mod tests {
                 Generation::new(1),
                 Generation::INITIAL,
                 AgentRuntimeId::initial(identity.clone()),
-                "is not the exact successor",
+                "does not ascend",
             ),
             (
-                "skipped generation",
-                identity.clone(),
-                Generation::INITIAL,
-                Generation::new(2),
-                AgentRuntimeId::new(identity.clone(), Generation::new(2)),
-                "is not the exact successor",
-            ),
-            (
-                "generation overflow",
+                "wrapped generation",
                 identity.clone(),
                 Generation::new(u64::MAX),
                 Generation::INITIAL,
                 AgentRuntimeId::initial(identity.clone()),
-                "previous generation overflow",
+                "does not ascend",
             ),
         ];
 
@@ -14334,6 +14581,270 @@ mod tests {
             )
             .await
             .expect("persist test mob events")
+    }
+
+    fn generation_test_spawned_event(
+        mob_id: &MobId,
+        cursor: u64,
+        identity: &AgentIdentity,
+        generation: u64,
+    ) -> MobEvent {
+        let generation = Generation::new(generation);
+        test_event(
+            mob_id,
+            cursor,
+            MobEventKind::MemberSpawned(MemberSpawnedEvent::new(
+                identity.clone(),
+                generation,
+                FenceToken::new(cursor),
+                AgentRuntimeId::new(identity.clone(), generation),
+                ProfileName::from("worker"),
+            )),
+        )
+    }
+
+    fn next_minted_generation(
+        authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+        identity: &AgentIdentity,
+    ) -> u64 {
+        let transition = apply_seeded_mob_input_transition(
+            authority,
+            mob_dsl::MobMachineInput::ComputeRespawnGeneration {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(identity),
+            },
+            "test_compute_respawn_generation",
+        )
+        .expect("compute the next generation");
+        transition
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::RespawnGenerationComputed {
+                    next_generation, ..
+                } => Some(next_generation.0),
+                _ => None,
+            })
+            .expect("the machine emits the next generation")
+    }
+
+    /// The generation high-water folds every reset epoch and every kind that
+    /// names a member generation, and no host binding generation.
+    #[test]
+    fn identity_generation_highwaters_fold_the_whole_history() {
+        let definition = MobDefinition::explicit("generation-highwater-fold");
+        let mob_id = &definition.id;
+        let alpha = AgentIdentity::from("alpha");
+        let events = vec![
+            generation_test_spawned_event(mob_id, 1, &alpha, 0),
+            generation_test_spawned_event(mob_id, 2, &alpha, 3),
+            retired_event(mob_id, 3, &alpha, Generation::new(3)),
+            test_event(mob_id, 4, MobEventKind::MobReset),
+            generation_test_spawned_event(mob_id, 5, &alpha, 0),
+            test_event(
+                mob_id,
+                6,
+                MobEventKind::RemoteTurnObligationRecorded {
+                    obligation: test_remote_turn_obligation(),
+                },
+            ),
+            test_event(
+                mob_id,
+                7,
+                MobEventKind::RemoteHostRevokeStarted {
+                    operation_id: "revoke-op".to_string(),
+                    host_id: "host-a".to_string(),
+                    epoch: 1,
+                    binding_generation: 9,
+                },
+            ),
+        ];
+        let highwaters = identity_generation_highwaters(&events);
+        assert_eq!(highwaters.get(&alpha), Some(&Generation::new(3)));
+        assert_eq!(
+            highwaters.get(&AgentIdentity::from("placed-worker")),
+            Some(&Generation::new(2)),
+            "a remote-turn obligation names its member generation"
+        );
+        assert_eq!(
+            highwaters.len(),
+            2,
+            "a host binding generation is another counter: {highwaters:?}"
+        );
+    }
+
+    /// A resumed machine mints above every generation the whole history used,
+    /// the same as the machine that never restarted, also when its last reset
+    /// epoch already reused a lower generation (a store a 0.9.3 restart left).
+    #[test]
+    fn resumed_machine_mints_above_every_pre_reset_generation() {
+        let definition = MobDefinition::explicit("generation-highwater-resume");
+        let mob_id = &definition.id;
+        let alpha = AgentIdentity::from("alpha");
+        let beta = AgentIdentity::from("beta");
+        let reset_history = vec![
+            generation_test_spawned_event(mob_id, 1, &alpha, 0),
+            retired_event(mob_id, 2, &alpha, Generation::INITIAL),
+            test_event(mob_id, 3, MobEventKind::MobReset),
+        ];
+
+        // The machine that never restarted keeps alpha's history through the
+        // reset (seeding treats MobReset as a no-op, as ResetToRunning does).
+        let mut never_restarted = seed_mob_authority();
+        seed_mob_authority_sync_from_events(
+            &mut never_restarted,
+            &reset_history,
+            &definition,
+            false,
+            &BTreeSet::new(),
+        )
+        .expect("seed the whole history");
+        assert_eq!(next_minted_generation(&mut never_restarted, &alpha), 1);
+
+        // Resume replays only the last reset epoch, which names no alpha.
+        let mut epoch_only = seed_mob_authority();
+        seed_mob_authority_sync_from_events(
+            &mut epoch_only,
+            &reset_history[3..],
+            &definition,
+            false,
+            &BTreeSet::new(),
+        )
+        .expect("seed the last reset epoch");
+        assert_eq!(
+            next_minted_generation(&mut epoch_only, &alpha),
+            0,
+            "without the high-water a restored machine reuses alpha's generation"
+        );
+
+        let mut resumed = seed_mob_authority();
+        recover_identity_generation_highwaters(&mut resumed, &reset_history)
+            .expect("recover the generation high-water");
+        seed_mob_authority_sync_from_events(
+            &mut resumed,
+            &reset_history[3..],
+            &definition,
+            false,
+            &BTreeSet::new(),
+        )
+        .expect("seed the last reset epoch after the high-water");
+        assert_eq!(
+            next_minted_generation(&mut resumed, &alpha),
+            1,
+            "the restored machine mints what the machine that never restarted mints"
+        );
+
+        // A 0.9.3 restart already re-spawned beta at its pre-reset generation
+        // in the last epoch. That store still resumes, and beta mints above
+        // its pre-reset high-water.
+        let mut reused_history = vec![
+            generation_test_spawned_event(mob_id, 1, &beta, 0),
+            generation_test_spawned_event(mob_id, 2, &beta, 1),
+            retired_event(mob_id, 3, &beta, Generation::new(1)),
+            test_event(mob_id, 4, MobEventKind::MobReset),
+        ];
+        reused_history.push(generation_test_spawned_event(mob_id, 5, &beta, 0));
+        let mut legacy = seed_mob_authority();
+        recover_identity_generation_highwaters(&mut legacy, &reused_history)
+            .expect("recover the generation high-water");
+        seed_mob_authority_sync_from_events(
+            &mut legacy,
+            &reused_history[4..],
+            &definition,
+            false,
+            &BTreeSet::new(),
+        )
+        .expect("a store whose last epoch reused a generation still resumes");
+        assert_eq!(next_minted_generation(&mut legacy, &beta), 2);
+        assert_eq!(
+            next_minted_generation(&mut legacy, &AgentIdentity::from("gamma")),
+            0
+        );
+    }
+
+    /// The replay sees only the events after the last reset, so it accepts any
+    /// ascending generation. alpha's first generation there continues its
+    /// pre-reset history; beta's store reused generation 0 after a restart,
+    /// and its next reset went above the high-water. The exact-successor rule
+    /// refused both, so such a mob could not resume.
+    #[test]
+    fn epoch_replay_accepts_every_ascending_generation() {
+        let definition = MobDefinition::explicit("generation-replay-ascends");
+        let mob_id = &definition.id;
+        let alpha = AgentIdentity::from("alpha");
+        let beta = AgentIdentity::from("beta");
+        let reset_beta = |cursor: u64, previous: u64, next: u64| {
+            test_event(
+                mob_id,
+                cursor,
+                MobEventKind::MemberReset {
+                    agent_identity: beta.clone(),
+                    previous_generation: Generation::new(previous),
+                    new_generation: Generation::new(next),
+                    fence_token: FenceToken::new(cursor),
+                    agent_runtime_id: AgentRuntimeId::new(beta.clone(), Generation::new(next)),
+                },
+            )
+        };
+        let history = vec![
+            generation_test_spawned_event(mob_id, 1, &alpha, 0),
+            generation_test_spawned_event(mob_id, 2, &beta, 0),
+            reset_beta(3, 0, 1),
+            retired_event(mob_id, 4, &beta, Generation::new(1)),
+            test_event(mob_id, 5, MobEventKind::MobReset),
+            generation_test_spawned_event(mob_id, 6, &alpha, 1),
+            generation_test_spawned_event(mob_id, 7, &beta, 0),
+            reset_beta(8, 0, 2),
+        ];
+        let mut resumed = seed_mob_authority();
+        recover_identity_generation_highwaters(&mut resumed, &history)
+            .expect("recover the generation high-water");
+        seed_mob_authority_sync_from_events(
+            &mut resumed,
+            &history[5..],
+            &definition,
+            false,
+            &BTreeSet::new(),
+        )
+        .expect("the last reset epoch replays every ascending generation");
+        assert_eq!(next_minted_generation(&mut resumed, &alpha), 2);
+        assert_eq!(next_minted_generation(&mut resumed, &beta), 3);
+    }
+
+    /// The recovery signal is accepted only before the seal, and it inserts or
+    /// raises, never lowers.
+    #[test]
+    fn generation_highwater_recovery_closes_at_the_seal_and_never_lowers() {
+        let alpha = mob_dsl::AgentIdentity::from_domain(&AgentIdentity::from("alpha"));
+        let recover = |authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+                       value: u64| {
+            authority.apply_signal(
+                mob_dsl::MobMachineSignal::RecoverIdentityGenerationHighwater {
+                    agent_identity: alpha.clone(),
+                    generation: mob_dsl::Generation(value),
+                },
+            )
+        };
+        let mut authority = seed_mob_authority();
+        recover(&mut authority, 5).expect("record a first high-water");
+        assert!(
+            recover(&mut authority, 3).is_err(),
+            "a lower value is refused"
+        );
+        recover(&mut authority, 7).expect("a higher value raises it");
+        seal_identity_generation_highwater(&mut authority, "test_seal")
+            .expect("seal the recovery window");
+        assert!(
+            recover(&mut authority, 9).is_err(),
+            "a sealed machine refuses recovery"
+        );
+        assert!(
+            seal_identity_generation_highwater(&mut authority, "test_seal_again").is_err(),
+            "the window closes once"
+        );
+        assert_eq!(
+            authority.state().identity_generation_highwater.get(&alpha),
+            Some(&mob_dsl::Generation(7))
+        );
     }
 
     #[test]

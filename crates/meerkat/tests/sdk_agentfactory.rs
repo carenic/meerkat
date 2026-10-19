@@ -76,9 +76,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::ToolUse),
                 }),
             ]))
         } else {
@@ -89,9 +87,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -222,6 +218,16 @@ impl meerkat_core::compact::Compactor for NoopCompactor {
         1
     }
 
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        _budget: Option<meerkat_core::compact::SummarizationSourceBudget>,
+    ) -> meerkat_core::compact::SummarizationSource {
+        meerkat_core::compact::SummarizationSource::whole(
+            meerkat_core::types::materialize_latest_system_prompt_versions(messages),
+        )
+    }
+
     fn rebuild_history(
         &self,
         messages: &[Message],
@@ -321,9 +327,7 @@ impl LlmClient for ParamsCaptureClient {
             }),
             Ok(normalized_anthropic_usage(request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
             }),
         ]))
     }

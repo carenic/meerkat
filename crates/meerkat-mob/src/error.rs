@@ -370,7 +370,11 @@ impl std::fmt::Display for MemberRegistrationHookCall {
 }
 
 /// Errors returned by mob operations.
+///
+/// Non-exhaustive: a later release can add a refusal without breaking a
+/// downstream match, which needs a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MobError {
     /// The requested mob does not exist in the runtime/store.
     #[error("mob not found: {0}")]
@@ -462,10 +466,11 @@ pub enum MobError {
         reason: String,
     },
 
-    /// The mob's admission is closed (D67): it was closed when idle, its last
-    /// public owner released it, or its embedder stood it down. Admitted work
-    /// is unaffected; Stop, Shutdown, Destroy, retirement, cancellation and
-    /// reads remain available.
+    /// The mob's admission is closed (D67), for any
+    /// [`MobAdmissionCloseReason`](crate::runtime::MobAdmissionCloseReason):
+    /// the refused command was not admitted. Admitted work is unaffected, and
+    /// the close itself refuses no Stop, Shutdown, Destroy, retirement,
+    /// cancellation or read.
     #[error("mob '{mob_id}' admission is closed ({reason})")]
     AdmissionClosed {
         mob_id: MobId,
@@ -1225,7 +1230,12 @@ pub enum MobError {
     #[error("per-unit work cancellation is unsupported for {0}: no work-tracking ledger is wired")]
     WorkCancellationUnsupported(WorkRef),
 
-    /// The mob actor command channel closed before accepting a command.
+    /// The mob actor command channel closed before accepting a command: the
+    /// actor has exited or is exiting. While a Shutdown drains its own work,
+    /// the actor also answers its internal requests this way, so the tasks
+    /// it joins can finish; other requests then get
+    /// [`Self::ShutdownInProgress`] (or [`Self::AdmissionClosed`] for a
+    /// command the close refuses).
     #[error("mob actor command channel closed")]
     ActorCommandChannelClosed,
 
@@ -1394,6 +1404,16 @@ pub enum MobError {
         correlation_id: String,
         interaction_id: String,
     },
+
+    /// The mob is shutting down: its Shutdown is draining the mob's own work
+    /// and answers this request without running it. (A Shutdown parked on its
+    /// members' stops or on its runtime teardown refuses member work this way
+    /// too, but no request reaches that refusal today.) Retry once the
+    /// Shutdown has finished (the actor then exits, and requests get
+    /// [`Self::ActorCommandChannelClosed`]) or failed (the actor stays and
+    /// serves the retry). It never means the actor is gone.
+    #[error("mob {mob_id} is shutting down; retry once the shutdown has finished or failed")]
+    ShutdownInProgress { mob_id: MobId },
 
     /// A restored member's host refused its registration at `call`. The
     /// refused registration is gone: removed exactly through the canonical
@@ -1789,6 +1809,14 @@ impl MobError {
                 "retryable": true,
                 "authority_retained": true,
             })),
+            // No deadline field: the refusal claims none. The Shutdown
+            // either finishes (the actor exits) or fails (the actor stays).
+            Self::ShutdownInProgress { mob_id } => Some(serde_json::json!({
+                "kind": "mob_shutdown_in_progress",
+                "mob_id": mob_id.as_str(),
+                "retryable": true,
+                "authority_retained": true,
+            })),
             Self::LifecycleOperationProgressStalled {
                 intent,
                 member_id,
@@ -1953,6 +1981,7 @@ impl MobError {
                 | Self::LifecycleOperationPending { .. }
                 | Self::LifecycleOperationProgressStalled { .. }
                 | Self::LifecycleOperationAdmissionPending { .. }
+                | Self::ShutdownInProgress { .. }
                 | Self::DirectMemberAdoptionPending { .. }
                 | Self::MemberAdmissionBacklogFull { .. }
                 | Self::ActorCommandTimedOut { .. }
@@ -2112,6 +2141,8 @@ impl MobError {
             | Self::MemberRetirementAdmissionPending { .. }
             | Self::LifecycleOperationProgressStalled { .. }
             | Self::LifecycleOperationAdmissionPending { .. }
+            // A Shutdown in progress holds the actor; the request ran nowhere.
+            | Self::ShutdownInProgress { .. }
             | Self::SupervisorProtocolUpgradeRequired { .. }
             // A degraded registration is not a temporal "busy" collision
             // (§ TargetBusy's own doc: "target exists but cannot accept

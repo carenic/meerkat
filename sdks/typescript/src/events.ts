@@ -269,8 +269,24 @@ export interface ProviderAgentErrorReason {
   readonly providerError: unknown;
 }
 
+/** The provider's own account of a refusal or filter, tagged by `provider`. */
+export type ContentFilteredStopDetail = Readonly<Record<string, unknown>> & {
+  readonly provider: string;
+};
+
+/**
+ * The provider refused or filtered the response. `stop` is the typed meaning;
+ * `detail` is the provider's tagged evidence, absent when it sent none.
+ */
+export interface ContentFilteredAgentErrorReason {
+  readonly reasonType: "content_filtered";
+  readonly stop: "refusal" | "content_filter";
+  readonly detail?: ContentFilteredStopDetail;
+}
+
 export type AgentErrorReason =
   | ProviderAgentErrorReason
+  | ContentFilteredAgentErrorReason
   | TurnTerminalCauseReason
   | UnknownAgentErrorReason
   | HookAgentErrorReason;
@@ -430,11 +446,44 @@ export interface CompactionStartedEvent {
   readonly messageCount: number;
 }
 
+/** The kinds of text a summarization source is trimmed through, in order. */
+export type SummarizationTrimStage = "tool_results" | "context" | "user_requests";
+
+/** How much of the history a compaction summary's source carried. */
+export type SummarizationSourceBound =
+  | { readonly kind: "whole" }
+  | { readonly kind: "trimmed"; readonly through: SummarizationTrimStage }
+  | { readonly kind: "requests_only"; readonly kept: number; readonly of: number }
+  | {
+      readonly kind: "unknown";
+      readonly rawKind: string;
+      readonly raw: Readonly<Record<string, unknown>>;
+    };
+
+/** Who wrote a compaction summary. */
+export type CompactionSummarySource =
+  | { readonly kind: "provider_call"; readonly sourceBound: SummarizationSourceBound }
+  | { readonly kind: "host_curator" }
+  | { readonly kind: "mechanical_fallback" }
+  | {
+      readonly kind: "unknown";
+      readonly rawKind: string;
+      readonly raw: Readonly<Record<string, unknown>>;
+    };
+
 export interface CompactionCompletedEvent {
   readonly type: "compaction_completed";
   readonly summaryTokens: number;
   readonly messagesBefore: number;
   readonly messagesAfter: number;
+  /** Absent only for a completion recorded before the source was reported. */
+  readonly summarySource?: CompactionSummarySource;
+  /**
+   * Estimated history tokens the rewrite left, in the unit of
+   * `CompactionStartedEvent.estimatedHistoryTokens`. Absent for a completion
+   * recorded before it was reported, or when the history was not measured.
+   */
+  readonly estimatedHistoryTokensAfter?: number;
 }
 
 export interface CompactionFailedEvent {
@@ -1105,6 +1154,20 @@ function parseAgentErrorReason(raw: unknown): AgentErrorReason | null | undefine
     };
   }
 
+  if (reasonType === "content_filtered") {
+    const stop = raw.stop;
+    if (stop !== "refusal" && stop !== "content_filter") {
+      return { reasonType: "unknown", rawReasonType: reasonType, raw };
+    }
+    // Provider evidence never fails the report: a detail that is not a
+    // provider-tagged object reads as absent, as Core decodes it.
+    const detail = raw.detail;
+    if (isPlainRecord(detail) && typeof detail.provider === "string") {
+      return { reasonType, stop, detail: detail as ContentFilteredStopDetail };
+    }
+    return { reasonType, stop };
+  }
+
   if (!["hook_denied", "hook_timeout", "hook_execution_failed"].includes(reasonType)) {
     return { reasonType: "unknown", rawReasonType: reasonType, raw };
   }
@@ -1501,6 +1564,55 @@ function parseInteractionFailureReason(raw: unknown): InteractionFailureReason {
   }
 }
 
+const SUMMARIZATION_TRIM_STAGES: readonly SummarizationTrimStage[] = [
+  "tool_results",
+  "context",
+  "user_requests",
+];
+
+function parseSummarizationSourceBound(raw: unknown): SummarizationSourceBound {
+  if (!isPlainRecord(raw)) {
+    throw new Error("summary_source.source_bound must be object");
+  }
+  const kind = requireStringField(raw, "kind");
+  switch (kind) {
+    case "whole":
+      return { kind };
+    case "trimmed": {
+      const through = requireStringField(raw, "through");
+      const stage = SUMMARIZATION_TRIM_STAGES.find((known) => known === through);
+      if (stage !== undefined) {
+        return { kind, through: stage };
+      }
+      return { kind: "unknown", rawKind: kind, raw };
+    }
+    case "requests_only":
+      return {
+        kind,
+        kept: requireNonNegativeIntegerField(raw, "kept"),
+        of: requireNonNegativeIntegerField(raw, "of"),
+      };
+    default:
+      return { kind: "unknown", rawKind: kind, raw };
+  }
+}
+
+function parseCompactionSummarySource(raw: unknown): CompactionSummarySource {
+  if (!isPlainRecord(raw)) {
+    throw new Error("compaction_completed.summary_source must be object");
+  }
+  const kind = requireStringField(raw, "kind");
+  switch (kind) {
+    case "provider_call":
+      return { kind, sourceBound: parseSummarizationSourceBound(raw.source_bound) };
+    case "host_curator":
+    case "mechanical_fallback":
+      return { kind };
+    default:
+      return { kind: "unknown", rawKind: kind, raw };
+  }
+}
+
 function parseStreamTruncationReason(raw: unknown): StreamTruncationReason {
   if (!isPlainRecord(raw)) {
     throw new Error("stream_truncated.reason must be object");
@@ -1792,7 +1904,24 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
     case "compaction_started":
       return { type, inputTokens: requireNumberField(raw, "input_tokens"), estimatedHistoryTokens: requireNumberField(raw, "estimated_history_tokens"), messageCount: requireNumberField(raw, "message_count") };
     case "compaction_completed":
-      return { type, summaryTokens: requireNumberField(raw, "summary_tokens"), messagesBefore: requireNumberField(raw, "messages_before"), messagesAfter: requireNumberField(raw, "messages_after") };
+      return {
+        type,
+        summaryTokens: requireNumberField(raw, "summary_tokens"),
+        messagesBefore: requireNumberField(raw, "messages_before"),
+        messagesAfter: requireNumberField(raw, "messages_after"),
+        ...(raw.summary_source === undefined || raw.summary_source === null
+          ? {}
+          : { summarySource: parseCompactionSummarySource(raw.summary_source) }),
+        ...(raw.estimated_history_tokens_after === undefined ||
+        raw.estimated_history_tokens_after === null
+          ? {}
+          : {
+              estimatedHistoryTokensAfter: requireNonNegativeIntegerField(
+                raw,
+                "estimated_history_tokens_after",
+              ),
+            }),
+      };
     case "compaction_failed":
       return { type, reason: requireRecordField(raw, "reason") };
 

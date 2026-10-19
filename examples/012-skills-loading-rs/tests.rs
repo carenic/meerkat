@@ -75,9 +75,7 @@ impl meerkat_client::LlmClient for CaptureClient {
                 ),
             }),
             Ok(meerkat::LlmEvent::Done {
-                outcome: meerkat::LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: meerkat::LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
     }

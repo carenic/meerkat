@@ -482,6 +482,12 @@ impl LocalWorkAuthorization {
 }
 
 impl WorkAuthorization for LocalWorkAuthorization {
+    fn owner_change_in_progress(
+        &self,
+    ) -> Option<meerkat_core::authorization::OwnerChangeInProgress> {
+        self.publication.change_in_progress()
+    }
+
     fn run_if_current_within(
         &self,
         binding: &PreparedAuthorizationBinding,

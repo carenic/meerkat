@@ -3276,12 +3276,12 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
-    /// Replace the LLM client on a live session.
-    ///
-    /// Enables mid-session model/provider hot-swap without rebuilding the
-    /// agent. The new client takes effect on the next turn. Returns
-    /// `Unsupported` by default; session services that support live agents
-    /// override this.
+    /// Replace the LLM client on a live session with another client for the
+    /// session's current model, without rebuilding the agent. The new client
+    /// takes effect on the next turn. A client for another provider or model
+    /// is refused with `AgentError::ClientModelChangeRequiresHotSwap`; change
+    /// the model with `hot_swap_session_llm_identity`. Returns `Unsupported`
+    /// by default; session services that support live agents override this.
     async fn set_session_client(
         &self,
         _id: &SessionId,

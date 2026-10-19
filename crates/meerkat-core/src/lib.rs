@@ -151,6 +151,7 @@ mod wasm_task;
 pub mod web_search;
 
 // Re-export main types at crate root
+pub use agent::compact::CompactionSummarySource;
 pub use agent::{
     Agent, AgentBuildPolicyError, AgentBuilder, AgentControlStateError, AgentExecutionSnapshot,
     AgentLlmClient, AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch,
@@ -220,6 +221,8 @@ pub use compact::{
     CompactionCuratorError, CompactionDiscard, CompactionResult, CompactionRetained,
     CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
     ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
+    SummarizationSource, SummarizationSourceBound, SummarizationSourceBudget,
+    SummarizationTrimStage,
 };
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,
@@ -656,12 +659,14 @@ pub use turn_execution_authority::{
 pub use turn_terminal::{ClassifiedTurnTerminal, TurnTerminalClassifier, TurnTerminalKind};
 pub use types::{
     ArtifactRef, AssistantBlock, AssistantMessageId, BlockAssistantMessage, CommsNoticeKind,
-    ContentBlock, ContentInput, CumulativeUsage, ExtractionError, HandlingMode, ImageData,
-    InstructionActivationId, InstructionActivationIdentity, InstructionContentDigest,
-    InstructionKey, InstructionNamespace, InstructionRevisionId, InstructionRevisionRef,
-    InvalidInstructionContentDigest, InvalidInstructionIdentifier, LiveContextObservationId,
-    MemoryIndexExclusion, MemoryIndexableContent, Message, OutputSchema, ProviderMeta, RunInput,
-    RunResult, SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
+    ContentBlock, ContentFilteredStop, ContentInput, CumulativeUsage, ExtractionError,
+    GeminiStopStage, HandlingMode, ImageData, InstructionActivationId,
+    InstructionActivationIdentity, InstructionContentDigest, InstructionKey, InstructionNamespace,
+    InstructionRevisionId, InstructionRevisionRef, InvalidInstructionContentDigest,
+    InvalidInstructionIdentifier, LiveContextObservationId, MemoryIndexExclusion,
+    MemoryIndexableContent, Message, OutputSchema, PROVIDER_STOP_DETAIL_TEXT_CAP,
+    PROVIDER_STOP_DETAIL_TRUNCATION_MARKER, ProviderMeta, ProviderStopDetail, RunInput, RunResult,
+    SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
     SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,
     SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, SystemNoticeRecord, SystemPromptKey,
     SystemPromptVersion, SystemPromptVersionIdentity, TOOL_ARTIFACT_REF_PART_MAX_BYTES,

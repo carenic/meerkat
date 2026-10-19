@@ -41,6 +41,7 @@ pub use types::{
     ImageGenerationExecutor, LlmClient, LlmDoneOutcome, LlmEvent, LlmReplayProjection, LlmRequest,
     LlmRequestRouteWitness, LlmResponse, LlmStream, PlainModelRoute, PreparedLlmRequest,
     ProviderGeneratedImage, ProviderImageGenerationOutput, ProviderImageGenerationRequest,
-    ToolCallBuffer, WebSearchExecutor, dimensions_from_size_preference,
-    media_type_from_format_preference, normalize_base64_image_data,
+    ToolCallBuffer, WebSearchExecutor, WebSearchStop, classify_web_search_stop,
+    dimensions_from_size_preference, media_type_from_format_preference,
+    normalize_base64_image_data,
 };

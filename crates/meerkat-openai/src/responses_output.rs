@@ -125,7 +125,11 @@ pub(crate) fn lower_items<'a>(
                                 annotations.extend(citations);
                             }
                         }
-                        "refusal" => text.push_str(required(part, "refusal")?),
+                        // A refusal is never answer text: it ends the response
+                        // as a refusal and travels as the stop's provider detail.
+                        "refusal" => {
+                            required(part, "refusal")?;
+                        }
                         kind => {
                             return Err(LlmError::InvalidRequest {
                                 message: format!(

@@ -174,8 +174,8 @@ try {
   );
   assert.ok(projectionPlan.unit_packages.includes("rkat"), "rkat's unit row runs its bin's fenced docs example test");
   assert.deepEqual(
-    Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web"].map((key) => [key, projectionPlan[key]])),
-    { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false },
+    Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web", "example_web_wasm"].map((key) => [key, projectionPlan[key]])),
+    { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false, example_web_wasm: false },
     "a release projection runs the generation ratchets and the Bazel graph check only",
   );
   assert.deepEqual(projectionPlan.release_projection, {
@@ -208,6 +208,7 @@ try {
     "generated_contract=true",
     "bazel_graph=true",
     "example_web=false",
+    "example_web_wasm=false",
   ]) {
     assert.ok(github.stdout.split("\n").includes(line), `github output carries ${line}`);
   }
@@ -530,6 +531,13 @@ if (args[0] === "api") {
   assert.equal(result.status, 1, "verify refuses the bump plus one source edit");
 
   // --- The CI gate's own shell, read from ci.yml. ---
+  // The step reader on a known input: a comment at the step's indent or at
+  // column 0, between "- name:" and "run: |", does not end the step.
+  assert.equal(
+    extractStepRun("      - name: Probe\n      # at the step's indent\n# at column 0\n        shell: bash\n        run: |\n          echo ok\n", "Probe"),
+    "echo ok\n",
+    "a comment before a step's run block does not end the step",
+  );
   const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
   const gateCheck = extractStepRun(workflow, "Check lane results");
   const gateEnv = {
@@ -546,7 +554,7 @@ if (args[0] === "api") {
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
     IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", GOVERNED_JSONL: "false",
     MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "", READER_NOT_RUN: "",
-    SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false",
+    SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false", EXAMPLE_WEB_WASM: "false",
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
     GENERATED_CONTRACT: "true", RELEASE_PROJECTION: "true",
@@ -602,6 +610,11 @@ if (args[0] === "api") {
   ]) {
     assert.equal(gate(change).status, 1, `the gate refuses ${label}`);
   }
+  // A projection reuses its parent's wasm build: a plan that builds it is
+  // inconsistent, even when its WASM timer lane ran and passed.
+  const wasmProjection = gate({ EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "success" });
+  assert.equal(wasmProjection.status, 1, "the gate refuses a projection plan that builds the web wasm");
+  assert.match(wasmProjection.stdout, /an inconsistent release-projection plan \(.*example_web_wasm=true/);
   // An ordinary plan: a pull request passes without the lanes it left to
   // the push and names them; the push must run them, and the gate refuses a
   // push plan that left any.
@@ -632,6 +645,22 @@ if (args[0] === "api") {
   assert.equal(notRunRun.status, 0, notRunRun.stdout);
   assert.match(notRunRun.stdout, /::notice::readers of changed files that need live-provider credentials run in no CI lane: integration-tests:test:gpt_live_public_e2e/);
   assert.equal(runGate(pushGate).status, 0, `the gate accepts a push that ran them: ${runGate(pushGate).stdout}`);
+  // The WASM timer lane runs with the example web suites' wasm build
+  // (example_web_wasm), which a pull request can leave to the push while the
+  // suites still run their Web SDK tests: the gate requires the lane exactly
+  // when its job runs (run 39233844462 refused the skipped lane).
+  const exampleWebGate = { ...pullRequestGate, EXAMPLE_WEB: "true", EXAMPLE_WEB_RESULT: "success" };
+  const deferredWasmRun = runGate({ ...exampleWebGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "skipped" });
+  assert.equal(deferredWasmRun.status, 0, `the gate accepts a pull request that left the wasm build to the push: ${deferredWasmRun.stdout}`);
+  const wasmRun = runGate({ ...exampleWebGate, EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "success" });
+  assert.equal(wasmRun.status, 0, `and one whose WASM timer lane ran: ${wasmRun.stdout}`);
+  for (const [label, env] of [
+    ["a pull request whose planned WASM timer lane did not run", { ...exampleWebGate, EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "skipped" }],
+    ["a pull request whose unplanned WASM timer lane failed", { ...exampleWebGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "failure" }],
+    ["a push whose WASM timer lane did not run", { ...pushGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "skipped" }],
+  ]) {
+    assert.equal(runGate(env).status, 1, `the gate refuses ${label}`);
+  }
   // A push runs its unit rows in the packed main unit lane, not in a unit
   // lane of its own: the gate requires that lane instead.
   const unitOnMainGate = {
@@ -788,10 +817,49 @@ process.stdout.write(JSON.stringify(fixture[path]));
   assert.equal(budget.status, 0, `a re-run rest-wave row: ${budget.stdout}${budget.stderr}`);
   assert.match(budget.stdout, /^\| Clippy \(core\+12\) \| 2 \| 3 \| 470 \| 500 \| 473 \| 470 \| success \|$/m, "a re-run row is not behind the stagger job");
   // The execution overrun still fails: the stagger job's run time counts.
-  budget = runBudget([0], [...busy.slice(0, 2), { ...stagger, completed_at: at(741) }, job("Clippy (core+12)", 741, 745, 1791)]);
+  const overBudget = [...busy.slice(0, 2), { ...stagger, completed_at: at(741) }, job("Clippy (core+12)", 741, 745, 1791)];
+  budget = runBudget([0], overBudget);
   assert.equal(budget.status, 1, `a rest-wave row over the execution budget fails: ${budget.stdout}`);
   assert.equal(budget.outputs.exec_path_seconds, "1081", "1046 s of the row, 30 s of classification, 5 s of stagger");
   assert.equal(budget.outputs.budget_verdict, "exec_over_budget");
+
+  // The readers of the pin below, on known inputs: a comment or blank line
+  // ends neither the on: map nor a step's env:.
+  assert.deepEqual(
+    workflowEvents("on:\n  push:\n    branches:\n      - main\n# merge queue\n\n  merge_group: {}\njobs:\n"),
+    ["push", "merge_group"],
+    "a trigger after a comment or blank line inside on: is read",
+  );
+  assert.throws(() => workflowEvents("on:\n  'merge_group': {}\njobs:\n"), /on: map has a line this selftest cannot read/);
+  assert.deepEqual(
+    extractStepEnv("      - name: Probe\n        env:\n          A: one\n        # B follows\n          B: two\n        run: |\n          true\n", "Probe"),
+    { A: "one", B: "two" },
+    "an env entry after a comment inside a step's env: is read",
+  );
+
+  // Which runs the budget binds is ci.yml's ENFORCE_BUDGET expression,
+  // evaluated here for each event: the budget keeps pull-request feedback
+  // fast, and a push or a dispatch is a full validation run that only
+  // reports it. The same over-budget run fails a pull request and passes a
+  // push and a dispatch, with the overrun reported.
+  assert.deepEqual(workflowEvents(workflow).sort(), ["pull_request", "push", "workflow_dispatch"], "every event ci.yml runs on has a budget case");
+  const enforceBudget = extractStepEnv(workflow, "Enforce lane execution budget").ENFORCE_BUDGET;
+  const enforcedOn = enforceBudget?.match(/^\$\{\{ github\.event_name (==|!=) '([a-z_]+)' \}\}$/);
+  assert.ok(enforcedOn, `this selftest reads ENFORCE_BUDGET as \${{ github.event_name == (or !=) '<event>' }}, not ${enforceBudget}`);
+  for (const [event, enforced] of [["pull_request", true], ["push", false], ["workflow_dispatch", false]]) {
+    const value = String((event === enforcedOn[2]) === (enforcedOn[1] === "=="));
+    budget = runBudget([0], overBudget, { ENFORCE_BUDGET: value });
+    const seen = `${event} (ENFORCE_BUDGET=${value}): ${budget.stdout}${budget.stderr}`;
+    assert.equal(budget.outputs.budget_verdict, "exec_over_budget", `the budget reports the overrun on a ${seen}`);
+    assert.match(budget.stdout, /^Lane execution: 1081\/\d+ s /m, `the budget prints the measurement on a ${seen}`);
+    if (enforced) {
+      assert.equal(budget.status, 1, `the budget refuses an over-budget ${seen}`);
+      assert.match(budget.stdout, /^::error::CI exceeded the \d+-second lane execution budget \(1081 s;/m, `the refusal names the overrun on a ${seen}`);
+    } else {
+      assert.equal(budget.status, 0, `the budget only reports on a ${seen}`);
+      assert.doesNotMatch(budget.stdout, /::error::/, `the budget reports no error on a ${seen}`);
+    }
+  }
 
   // A GitHub API server error (5xx) is retried after each API_RETRY_DELAYS
   // delay. It fails an enforced measurement only after the last retry, and
@@ -850,8 +918,9 @@ process.stdout.write(JSON.stringify(fixture[path]));
   rmSync(scratch, { recursive: true, force: true });
 }
 
-// The literal `env:` entries of the named step (no expressions).
-function extractStepLiteralEnv(text, name) {
+// The `env:` entries of the named step, as written. A comment line ends
+// neither the step nor its env:.
+function extractStepEnv(text, name) {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
   assert.ok(at >= 0, `ci.yml has a step named ${name}`);
@@ -859,6 +928,7 @@ function extractStepLiteralEnv(text, name) {
   const env = {};
   let envIndent = -1;
   for (let index = at + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (envIndent < 0) {
@@ -867,13 +937,40 @@ function extractStepLiteralEnv(text, name) {
     }
     if (indent >= 0 && indent <= envIndent) break;
     const entry = lines[index].match(/^\s+([A-Z_]+): (.+)$/);
-    if (entry && !entry[2].includes("${{")) env[entry[1]] = entry[2];
+    if (entry) env[entry[1]] = entry[2];
   }
+  return env;
+}
+
+// The literal `env:` entries of the named step (no expressions).
+function extractStepLiteralEnv(text, name) {
+  const env = Object.fromEntries(Object.entries(extractStepEnv(text, name)).filter(([, value]) => !value.includes("${{")));
   assert.ok(Object.keys(env).length > 0, `step ${name} has literal env entries`);
   return env;
 }
 
-// The `run: |` body of the named step: the indented block under it.
+// The events ci.yml runs on: the keys of its top-level on: map. A comment or
+// blank line does not end the map, and every other line at the keys' indent
+// must be a key.
+function workflowEvents(text) {
+  const lines = text.split("\n");
+  const at = lines.indexOf("on:");
+  assert.ok(at >= 0, "ci.yml has an on: map");
+  const events = [];
+  for (let index = at + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() === "" || /^\s*#/.test(line)) continue;
+    if (/^\S/.test(line)) break;
+    if (line.search(/\S/) !== 2) continue;
+    const key = line.match(/^ {2}([a-z_]+):(?:\s|$)/);
+    assert.ok(key, `ci.yml's on: map has a line this selftest cannot read: ${line.trim()} (line ${index + 1})`);
+    events.push(key[1]);
+  }
+  return events;
+}
+
+// The `run: |` body of the named step: the indented block under it. A
+// comment line does not end the step before its run block.
 function extractStepRun(text, name) {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
@@ -881,6 +978,7 @@ function extractStepRun(text, name) {
   const stepIndent = lines[at].indexOf("-");
   let runAt = -1;
   for (let index = at + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (/^\s+run: \|\s*$/.test(lines[index])) {

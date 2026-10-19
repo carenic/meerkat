@@ -124,6 +124,10 @@ name: CI
 # dispatch on main saves into the scope the next push to main restores
 # from, and that run writes the exact-tree attestation a release tag
 # trusts (scripts/check_release_workflow_contract.py, release-caches).
+# The sccache bucket is not such a cache: a dispatch on a release branch
+# writes it (.github/actions/setup-sccache-ci), and an object there serves
+# only a compile with the same inputs. The registry cache keeps the rule
+# on every dispatch; a save would spare a registry download at most.
 #
 # Everything else (integration-fast and e2e-fast over the whole workspace,
 # the dense Mob topology stress, the bounded TLC machine-verify sweep, the
@@ -301,6 +305,7 @@ jobs:
       bazel_graph: ${{ steps.plan.outputs.bazel_graph }}
       examples_browser: ${{ steps.plan.outputs.examples_browser }}
       example_web: ${{ steps.plan.outputs.example_web }}
+      example_web_wasm: ${{ steps.plan.outputs.example_web_wasm }}
       release_projection: ${{ steps.plan.outputs.release_projection }}
       release_projection_versions: ${{ steps.plan.outputs.release_projection_versions }}
       release_evidence_commit: ${{ steps.plan.outputs.release_evidence_commit }}
@@ -1256,9 +1261,13 @@ jobs:
     # feature: 863 s on run 38859112297) unless it touches the lane's own
     # inputs or changes its definition (GUARD_LANE_INPUTS,
     # GUARD_LANE_DEFINITIONS in scripts/ci-cargo-lanes.mjs).
+    # The push's build is cold after a change below the facade: 32.5 minutes
+    # on main push 39213218053 and 27.5 on dispatch 39211283488, against the
+    # 40 a pull request keeps. A push or dispatch gets 50, about 54% above
+    # the slower run.
     if: ${{ needs.changes.outputs.mcp_confinement_positive == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 40 || 50 }}
     env:
       RUSTC_WRAPPER: sccache
       CARGO_TERM_COLOR: never
@@ -1367,7 +1376,15 @@ jobs:
     # workflow pins, a docs edit).
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.integration_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A suite whose package compiles meerkat-mob runs on the push only, and
+    # the first build of a tree that changes meerkat-core compiles that chain
+    # cold. On dispatch 39211283488, whose cache is read-only so every lane
+    # compiled alone, the rpc-configured-turn-limit row was cancelled at 30
+    # minutes with meerkat-rpc still compiling (it started 22m44s in), and
+    # gpt-live-replay took 28m52s there and 29m29s on main push 39213218053.
+    # A push or dispatch gets 50 minutes; a pull request runs only the suites
+    # outside the chain and keeps 30.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 30 || 50 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}
@@ -2086,8 +2103,12 @@ jobs:
     runs-on: ubuntu-24.04
     # A row whose objects are not in sccache yet runs long: the rkat+6 matrix
     # row (402-1054 s warm) hit a 30-minute timeout on main push run
-    # 39186529346 and on release-branch dispatches.
-    timeout-minutes: 45
+    # 39186529346 and on release-branch dispatches. Cold after a change to
+    # meerkat-core it took 41m23s on dispatch 39211283488, and on main push
+    # 39213218053 its eight commands took 44m29s, so the 45-minute cap
+    # cancelled it after the last one finished. 60 minutes is about a third
+    # above that.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.feature_check_matrix) }}
@@ -2160,7 +2181,7 @@ jobs:
     # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
     if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_rest_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.feature_check_rest_matrix) }}
@@ -2376,6 +2397,12 @@ jobs:
     # contracts, or those examples change (the push also for every change
     # that reaches the runtime's crates).
     # Independent of the Rust lanes, so it stays off the critical path.
+    # A pull request that changes a crate the web runtime builds on, or plans
+    # the whole workspace, runs only the Web SDK's type and unit tests here
+    # (example_web_wasm is false): building the wasm then compiles the
+    # runtime's whole dependency closure cold, 1181 s of pull request
+    # 39209102985's 1329 s lane, over the 1080 s lane budget. The push runs
+    # the wasm build and the browser suites (deferred_to_push names them).
     if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web == 'true' }}
     runs-on: ubuntu-24.04
     # Sized from measurement (2026-09-29). Warm (sccache 100% hits, e.g. job
@@ -2389,8 +2416,11 @@ jobs:
     # about 25% above the slowest cold run, so a legitimate cold run is never
     # cancelled here. On a pull request the gate's CI_MAX_EXEC_SECONDS
     # (1080 s of execution, about 30 s of it the change classification)
-    # caps it first: run 38931641220's cold lane took 842 s.
-    timeout-minutes: 25
+    # caps it first: run 38931641220's cold lane took 842 s. A push or a
+    # dispatch builds the wasm cold after a change below the runtime: 22m15s
+    # on dispatch 39211283488 and 22m23s on main push 39213218053 (wasm build
+    # 19m21s), so they get 35 minutes, about 55% above those.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 25 || 35 }}
     env:
       RUSTC_WRAPPER: sccache
       # The suites need a working runtime, not a size-optimized one: skip
@@ -2400,18 +2430,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Setup Rust
-        uses: ./.github/actions/setup-rust-ci
-
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-
       - name: Setup Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22"
 
+      - name: Install the Web SDK
+        working-directory: sdks/web
+        # The SDK has no lockfile.
+        run: npm install --no-fund --no-audit --ignore-scripts
+
+      - name: Web SDK type and unit tests
+        working-directory: sdks/web
+        # tsc over tests/ (the exhaustive event switches over the generated
+        # events) and the node unit suites; #1469 failed only in nightly.
+        # They need no wasm, so a pull request that leaves the wasm to the
+        # push still runs them.
+        run: npm test
+
+      - name: Setup Rust
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Add wasm32 target
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
+        run: rustup target add wasm32-unknown-unknown
+
       - name: Install wasm-pack
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2425,6 +2471,7 @@ jobs:
           wasm-pack --version
 
       - name: Setup sccache
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         uses: ./.github/actions/setup-sccache-ci
         with:
           bucket: ${{ env.SCCACHE_GCS_BUCKET_NAME }}
@@ -2434,6 +2481,7 @@ jobs:
           key_prefix: sccache/${{ env.RUSTUP_TOOLCHAIN }}/linux-x64
 
       - name: Cache cargo registry
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.event_name != 'workflow_dispatch' }}
@@ -2443,37 +2491,33 @@ jobs:
           cache-targets: "false"
           cache-on-failure: true
 
-      - name: Build and test the Web SDK
+      - name: Build the Web SDK wasm
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: sdks/web
         # Built once; all three suites read sdks/web/wasm (033 through its
-        # sync:runtime copy). The SDK has no lockfile.
-        run: |
-          npm install --no-fund --no-audit --ignore-scripts
-          npm run build:wasm
-          npm test
+        # sync:runtime copy).
+        run: npm run build:wasm
 
       - name: Install example dependencies
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         run: |
           npm ci --no-fund --no-audit --prefix examples/031-wasm-mini-diplomacy-sh/web
           npm ci --no-fund --no-audit --prefix examples/032-wasm-webcm-agent/web
           npm ci --no-fund --no-audit --prefix examples/033-the-office-demo-sh/web
 
       - name: Install Playwright Chromium
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         # The three examples lock the same Playwright release.
         working-directory: examples/033-the-office-demo-sh/web
         run: npx playwright install --with-deps chromium
 
-      - name: Web SDK type and unit tests
-        working-directory: sdks/web
-        # tsc over tests/ (the exhaustive event switches over the generated
-        # events) and the node unit suites; #1469 failed only in nightly.
-        run: npm test
-
       - name: Direct WASM runtime browser contracts
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: sdks/web
         run: npm run test:browser
 
       - name: WASM package lifecycle and natural process shutdown
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: sdks/web
         timeout-minutes: 2
         run: |
@@ -2481,14 +2525,17 @@ jobs:
           npm run test:packed
 
       - name: 031 wasm mini diplomacy suite
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: examples/031-wasm-mini-diplomacy-sh/web
         run: npm test
 
       - name: 032 wasm WebCM agent suite
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: examples/032-wasm-webcm-agent/web
         run: npm test
 
       - name: 033 office demo suites
+        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}
         working-directory: examples/033-the-office-demo-sh/web
         # test runs the fixture groups; test:offline loads the built page
         # with the synced runtime.
@@ -2502,8 +2549,12 @@ jobs:
     needs: [changes, stagger]
     # Compile the Rust regression binaries independently of the example build
     # so both lanes retain the pull-request wall-clock budget. Selected with
-    # the example web suites.
-    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web == 'true' }}
+    # the example web suites' wasm build (example_web_wasm): a pull request
+    # that changes a crate the web runtime builds on, or plans the whole
+    # workspace, leaves both to the push,
+    # since this lane compiles the same closure for wasm32 (893 s cold at
+    # opt-level 0 on pull request 39209102985).
+    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web_wasm == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -2696,6 +2747,7 @@ jobs:
           BAZEL_GRAPH: ${{ needs.changes.outputs.bazel_graph }}
           EXAMPLES_BROWSER: ${{ needs.changes.outputs.examples_browser }}
           EXAMPLE_WEB: ${{ needs.changes.outputs.example_web }}
+          EXAMPLE_WEB_WASM: ${{ needs.changes.outputs.example_web_wasm }}
           MODE: ${{ needs.changes.outputs.mode }}
           REASON: ${{ needs.changes.outputs.reason }}
           SHARD_COUNT: ${{ needs.changes.outputs.shard_count }}
@@ -2822,8 +2874,8 @@ jobs:
           # so consistently, or nothing below can be trusted either.
           if [[ "${RELEASE_PROJECTION}" == "true" ]]; then
             echo "release projection: lanes reuse CI run ${RELEASE_EVIDENCE_RUN_ID} attempt ${RELEASE_EVIDENCE_RUN_ATTEMPT} of ${RELEASE_EVIDENCE_COMMIT} (verified next)"
-            if [[ "${MODE}" != "release-projection" || "${RUST_CHANGED}" != "false" || "${EXAMPLE_WEB}" != "false" || "${GENERATED_CONTRACT}" != "true" || "${BAZEL_GRAPH}" != "true" ]]; then
-              echo "::error::an inconsistent release-projection plan (mode=${MODE} rust_changed=${RUST_CHANGED} example_web=${EXAMPLE_WEB} generated_contract=${GENERATED_CONTRACT} bazel_graph=${BAZEL_GRAPH})."
+            if [[ "${MODE}" != "release-projection" || "${RUST_CHANGED}" != "false" || "${EXAMPLE_WEB}" != "false" || "${EXAMPLE_WEB_WASM}" != "false" || "${GENERATED_CONTRACT}" != "true" || "${BAZEL_GRAPH}" != "true" ]]; then
+              echo "::error::an inconsistent release-projection plan (mode=${MODE} rust_changed=${RUST_CHANGED} example_web=${EXAMPLE_WEB} example_web_wasm=${EXAMPLE_WEB_WASM} generated_contract=${GENERATED_CONTRACT} bazel_graph=${BAZEL_GRAPH})."
               failed=1
             fi
             if ! [[ "${RELEASE_EVIDENCE_COMMIT}" =~ ^[0-9a-f]{40}$ && "${RELEASE_EVIDENCE_RUN_ID}" =~ ^[1-9][0-9]*$ && "${RELEASE_EVIDENCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]; then
@@ -2975,9 +3027,16 @@ jobs:
           # runtime, its crates, or examples 031-033.
           if [[ ( "${IS_MAIN_PUSH}" == "true" && "${RELEASE_PROJECTION}" != "true" ) || "${EXAMPLE_WEB}" == "true" ]]; then
             require_ran "Example web suites" "${EXAMPLE_WEB_RESULT}"
-            require_ran "WASM timer ownership" "${WASM_TIMERS_RESULT}"
           else
             forbid_failure "Example web suites" "${EXAMPLE_WEB_RESULT}"
+          fi
+          # WASM timer ownership runs with the suites' wasm build
+          # (example_web_wasm), which a pull request that changes a crate the
+          # web runtime builds on, or plans the whole workspace, leaves to the
+          # push: it is required exactly when the job's condition selects it.
+          if [[ ( "${IS_MAIN_PUSH}" == "true" && "${RELEASE_PROJECTION}" != "true" ) || "${EXAMPLE_WEB_WASM}" == "true" ]]; then
+            require_ran "WASM timer ownership" "${WASM_TIMERS_RESULT}"
+          else
             forbid_failure "WASM timer ownership" "${WASM_TIMERS_RESULT}"
           fi
           # Bazel graph check: every main push, and pull requests with a
@@ -3046,9 +3105,11 @@ jobs:
       - name: Enforce lane execution budget
         # Runs on every run that was not cancelled, including runs whose lane
         # check above failed, so a failed run also names its slowest lanes.
-        # Enforced on pull requests only (the push-to-main run carries the
-        # deferred lanes and has no wall-clock budget; there it only reports,
-        # and a failure to measure is a warning).
+        # Enforced on pull requests only: the budget keeps pull-request
+        # feedback fast. A push (it carries the lanes a pull request left to
+        # it) and a dispatch (it plans the whole workspace) are full
+        # validation runs with no wall-clock budget: there the step only
+        # reports, and a failure to measure is a warning.
         #
         # Three numbers per lane, from the Actions jobs API:
         #   queued    created_at to started_at: waiting for a hosted runner
@@ -3075,7 +3136,7 @@ jobs:
           MAX_EXEC_SECONDS: ${{ env.CI_MAX_EXEC_SECONDS }}
           MAX_TERMINAL_SECONDS: ${{ env.CI_MAX_TERMINAL_SECONDS }}
           QUEUE_WARN_SECONDS: ${{ env.CI_QUEUE_WARN_SECONDS }}
-          ENFORCE_BUDGET: ${{ github.event_name != 'push' }}
+          ENFORCE_BUDGET: ${{ github.event_name == 'pull_request' }}
           GATE_JOB_NAME: CI gate
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
@@ -3182,8 +3243,8 @@ jobs:
 
           # Measurement needs the Actions API. A failure to measure fails a
           # pull request, whose budget is enforced, but only warns on a push
-          # to main, where the budget is a report: a transient API error must
-          # not turn main's CI gate red and block release readiness.
+          # or a dispatch, where the budget is a report: a transient API error
+          # must not turn main's CI gate red and block release readiness.
           try:
               lanes = collect_lanes()
           except (subprocess.CalledProcessError, KeyError, IndexError, TypeError, ValueError) as error:

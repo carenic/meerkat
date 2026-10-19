@@ -903,6 +903,7 @@ impl ContinuationOwnerService {
 
 /// Why a continuation was not admitted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum ContinuationAdmitError {
     /// A terminal policy outcome: the delivery is settled as refused, never
     /// admitted, and the deliveries after it proceed.
@@ -912,6 +913,12 @@ pub enum ContinuationAdmitError {
     /// failure); the delivery stays pending and is retried.
     #[error("continuation not admitted: {0}")]
     Failed(String),
+    /// Not admitted now because the runtime is not ready to admit it, for a
+    /// typed cause: for example an original whose admission its source owner
+    /// has not settled yet. The delivery stays pending and is retried, as for
+    /// [`Self::Failed`], and its drain reports the cause.
+    #[error("continuation not admitted yet: {0}")]
+    NotReady(meerkat_core::authorization::ControllerReadinessFailure),
 }
 
 impl From<String> for ContinuationAdmitError {
@@ -1148,10 +1155,12 @@ impl ContinuationHostBindings {
 
     /// Announce that the bound job owner's committed facts may have become
     /// readable, for example once its custody is restored or its pin
-    /// recorded: every delivery owner subscribed to these bindings retries
-    /// the rows it holds blocked, asking the source again. Call it after the
-    /// facts are readable through the source. It grants nothing and asserts
-    /// nothing; an announcement with nothing changed costs one retry.
+    /// recorded, or that a source owner settled an original that a retained
+    /// resume may wait on (it promoted or withdrew its candidate): every
+    /// delivery owner subscribed to these bindings retries the rows it holds
+    /// blocked, asking the source again. Call it after the facts are readable
+    /// through the source. It grants nothing and asserts nothing; an
+    /// announcement with nothing changed costs one retry.
     pub fn source_custody_changed(&self) {
         self.publish_source_change();
     }
@@ -1394,7 +1403,9 @@ impl ContinuationDeliverySink for MachineContinuationSink {
 }
 
 /// Classify a retained-resume admission: only a terminal policy refusal is
-/// [`ContinuationAdmitError::Refused`]; every other error is retryable.
+/// [`ContinuationAdmitError::Refused`]; every other error is retryable, and a
+/// runtime that is not ready for a typed cause keeps that cause
+/// ([`ContinuationAdmitError::NotReady`]).
 pub fn retained_admission_outcome(
     outcome: Result<meerkat_runtime::AcceptOutcome, meerkat_runtime::RuntimeDriverError>,
 ) -> Result<InputId, ContinuationAdmitError> {
@@ -1406,6 +1417,9 @@ pub fn retained_admission_outcome(
         ))),
         Err(meerkat_runtime::RuntimeDriverError::RetainedResumeRefused { reason }) => {
             Err(ContinuationAdmitError::Refused(reason.into()))
+        }
+        Err(meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable { reason }) => {
+            Err(ContinuationAdmitError::NotReady(reason))
         }
         Err(error) => Err(ContinuationAdmitError::Failed(error.to_string())),
     }
@@ -1492,6 +1506,12 @@ pub(crate) async fn admit_continuation_row(
             Err(crate::job_delivery::JobOutboxProjectionError::Apply(
                 crate::job_delivery::JobDeliveryApplyError::Infrastructure(error),
             ))
+        }
+        Err(ContinuationAdmitError::NotReady(reason)) => {
+            Err(crate::job_delivery::JobOutboxProjectionError::NotReady {
+                delivery_id: delivery_id.to_string(),
+                reason,
+            })
         }
     }
 }

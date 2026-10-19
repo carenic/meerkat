@@ -313,17 +313,15 @@ impl AuthenticatedOriginalSource for Custody {
     ) -> Result<Option<AuthenticatedOriginal>, ControllerReadinessFailure> {
         Ok(self.0.lock().expect("custody").get(&original.work).cloned())
     }
-    fn retained_original(
+    fn retained_custody(
         &self,
         _: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
-        Ok(self
-            .0
-            .lock()
-            .expect("custody")
-            .get(&original.work)
-            .map(|held| held.authority_basis.clone()))
+    ) -> Result<crate::meerkat_machine::RetainedCustody, ControllerReadinessFailure> {
+        Ok(self.0.lock().expect("custody").get(&original.work).map_or(
+            crate::meerkat_machine::RetainedCustody::NotRetained,
+            |held| crate::meerkat_machine::RetainedCustody::Retained(held.authority_basis.clone()),
+        ))
     }
 }
 

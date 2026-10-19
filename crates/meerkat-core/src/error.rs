@@ -637,7 +637,14 @@ pub enum AgentError {
     #[error("Max tokens reached on turn {turn}, partial output: {partial}")]
     MaxTokensReached { turn: u32, partial: String },
     #[error("Content filtered on turn {turn}")]
-    ContentFiltered { turn: u32 },
+    ContentFiltered {
+        turn: u32,
+        /// Which refusing stop the provider ended the response with.
+        stop: crate::types::ContentFilteredStop,
+        /// The provider's own account of the refusal or filter, carried as
+        /// tagged provider data. Nothing in core reads it.
+        detail: Option<Box<crate::types::ProviderStopDetail>>,
+    },
     #[error("Max turns reached: {turns}")]
     MaxTurnsReached { turns: u32 },
     #[error("Run was cancelled")]
@@ -795,6 +802,22 @@ pub enum AgentError {
     HookLaunchRefused {
         hook_id: HookId,
         reason: crate::hooks::HookFailureReason,
+    },
+
+    /// A live client replacement named a model other than the session's
+    /// durable identity. A model change goes through
+    /// `Agent::hot_swap_llm_identity`, which publishes the client, the
+    /// durable identity and the active model profile together.
+    #[error(
+        "replacing the client cannot change the session's model from {}:{durable_model} to {}:{requested_model}; change it with hot_swap_llm_identity",
+        .durable_provider.as_str(),
+        .requested_provider.as_str()
+    )]
+    ClientModelChangeRequiresHotSwap {
+        durable_provider: crate::Provider,
+        durable_model: String,
+        requested_provider: crate::Provider,
+        requested_model: String,
     },
 }
 
