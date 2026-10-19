@@ -706,6 +706,34 @@ pub enum LiveTranscriptIdentityError {
     MissingItemId,
 }
 
+/// A session's turn boundary held for one live channel's projections, from
+/// [`LiveProjectionSink::hold_channel_projection_boundary`] (#1821).
+///
+/// While it lives, the sink applies that channel's projections under the held
+/// boundary instead of queueing each one for it. Dropping it releases the
+/// boundary.
+#[doc(hidden)]
+#[must_use = "dropping the hold releases the boundary at once"]
+pub struct LiveProjectionBoundaryHold {
+    _hold: Box<dyn Send + Sync>,
+}
+
+impl LiveProjectionBoundaryHold {
+    /// Wrap the sink's own hold; dropping the wrapper drops it.
+    pub fn new(hold: impl Send + Sync + 'static) -> Self {
+        Self {
+            _hold: Box::new(hold),
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveProjectionBoundaryHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveProjectionBoundaryHold")
+            .finish_non_exhaustive()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[async_trait::async_trait]
 pub trait LiveProjectionSink: Send + Sync {
@@ -988,6 +1016,24 @@ pub trait LiveProjectionSink: Send + Sync {
         session_id: &SessionId,
         event: &RealtimeTranscriptEvent,
     ) -> Result<RealtimeTranscriptApplyOutcome, LiveProjectionError>;
+
+    /// Hold the session's turn boundary for `channel_id`'s projections, so a
+    /// transport applies the rows it already has under one acquisition
+    /// instead of queueing for the boundary once per row (#1821).
+    ///
+    /// Waits like a projection from that channel would: behind a running
+    /// turn, and refused once the channel's close has released the channel.
+    /// The caller must drop the hold before it waits for anything else.
+    /// `Ok(None)`, the default, means the sink takes the boundary for each
+    /// projection itself.
+    #[doc(hidden)]
+    async fn hold_channel_projection_boundary(
+        &self,
+        _session_id: &SessionId,
+        _channel_id: &LiveChannelId,
+    ) -> Result<Option<LiveProjectionBoundaryHold>, LiveProjectionError> {
+        Ok(None)
+    }
 }
 
 /// Errors returned by [`LiveProjectionSink`] implementations.
@@ -3534,6 +3580,22 @@ impl LiveAdapterHost {
             reason,
         )
         .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))
+    }
+
+    /// Hold `channel_id`'s session turn boundary for the channel's
+    /// projections through the projection sink (#1821); see
+    /// [`LiveProjectionSink::hold_channel_projection_boundary`]. `Ok(None)`
+    /// when the sink does not hold boundaries.
+    #[doc(hidden)]
+    pub async fn hold_projection_boundary(
+        &self,
+        channel_id: &LiveChannelId,
+    ) -> Result<Option<LiveProjectionBoundaryHold>, LiveAdapterHostError> {
+        let session_id = self.channel_session(channel_id).await?;
+        Ok(self
+            .projection_sink
+            .hold_channel_projection_boundary(&session_id, channel_id)
+            .await?)
     }
 
     /// Retain an adapter observation whose projection the session refused

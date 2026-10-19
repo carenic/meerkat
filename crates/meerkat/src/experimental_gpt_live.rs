@@ -7613,9 +7613,11 @@ async fn release_unmeasured_segments(
     activation: &PreparedExperimentalGptLiveActivation,
     binding: &ProviderWebrtcBinding,
     adapter: &ExperimentalGptLiveDeferredAdapter,
+    boundary_hold: &mut PumpBoundaryHold,
 ) -> Result<(), String> {
     while let Some(seal) = adapter.next_unmeasured_seal()? {
-        let release = release_unmeasured_segment(activation, binding, adapter, &seal).await?;
+        let release =
+            release_unmeasured_segment(activation, binding, adapter, &seal, boundary_hold).await?;
         adapter.complete_unmeasured_seal(&seal.item_id)?;
         if release == UnmeasuredSegmentRelease::Abandoned {
             adapter.retract_captions(&seal.item_id);
@@ -7663,6 +7665,7 @@ async fn release_unmeasured_segment(
     binding: &ProviderWebrtcBinding,
     adapter: &ExperimentalGptLiveDeferredAdapter,
     seal: &UnmeasuredSegmentSeal,
+    boundary_hold: &mut PumpBoundaryHold,
 ) -> Result<UnmeasuredSegmentRelease, String> {
     let runtime = &activation.runtime;
     // Read the generated output without reserving it: the reservation holds
@@ -7775,7 +7778,12 @@ async fn release_unmeasured_segment(
     meerkat_core::slow_await::warn_if_slow(
         binding.channel_id(),
         "pump: first-output media health request",
-        Box::pin(request_first_output_media_health(activation, binding, seal)),
+        Box::pin(request_first_output_media_health(
+            activation,
+            binding,
+            seal,
+            boundary_hold,
+        )),
     )
     .await;
     Ok(UnmeasuredSegmentRelease::Committed)
@@ -7793,6 +7801,7 @@ async fn request_first_output_media_health(
     activation: &PreparedExperimentalGptLiveActivation,
     binding: &ProviderWebrtcBinding,
     seal: &UnmeasuredSegmentSeal,
+    boundary_hold: &mut PumpBoundaryHold,
 ) {
     let Some(output_id) = seal.output_id.as_deref() else {
         return;
@@ -7818,6 +7827,8 @@ async fn request_first_output_media_health(
     if !requested {
         return;
     }
+    // A publication can wait on its consumer: never under the boundary.
+    boundary_hold.release();
     tracing::info!(
         channel = %binding.channel_id(),
         "requested the client's media health for the channel's first output"
@@ -7886,9 +7897,15 @@ async fn release_unmeasured_segments_before_terminal(
     binding: &ProviderWebrtcBinding,
     adapter: &ExperimentalGptLiveDeferredAdapter,
 ) {
+    // The pump holds no boundary at a terminal.
     let released = tokio::time::timeout(
         UNMEASURED_TERMINAL_RELEASE_BOUND,
-        release_unmeasured_segments(activation, binding, adapter),
+        release_unmeasured_segments(
+            activation,
+            binding,
+            adapter,
+            &mut PumpBoundaryHold::default(),
+        ),
     )
     .await;
     let failure = match released {
@@ -7966,6 +7983,86 @@ impl DelegationAcknowledgementWindow {
 
     const fn is_open(&self) -> bool {
         self.open
+    }
+}
+
+/// Rows the pump applies under one hold of its session's turn boundary.
+const PUMP_BOUNDARY_HOLD_ROWS: usize = 64;
+/// How long the pump keeps one hold of its session's turn boundary. With
+/// [`PUMP_BOUNDARY_HOLD_ROWS`] it bounds what a queued member turn waits for
+/// the rows ahead of it: this span plus the row in flight when it ends.
+const PUMP_BOUNDARY_HOLD_SPAN: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long the pump waits, holding the boundary, for a row the adapter
+/// already has queued to come out of lowering.
+const PUMP_BOUNDARY_HOLD_NEXT_ROW_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// The pump's hold on its session's turn boundary (#1821).
+///
+/// The boundary is a FIFO lock that a running member turn holds until it
+/// commits. A row parked behind that turn takes it when the turn ends, but
+/// the runtime loop's next acquire is already queued, so without a hold every
+/// other row the transport already has waits for the next queued turn too:
+/// one row per member turn. The pump takes the hold before it applies a row
+/// and keeps it only across rows the adapter already has, so they land
+/// together before a queued turn starts. It drops the hold before anything
+/// else it waits for, when nothing is queued, once a close is requested, and
+/// at the bounds above.
+#[derive(Default)]
+struct PumpBoundaryHold {
+    hold: Option<meerkat_live::LiveProjectionBoundaryHold>,
+    taken_at: Option<tokio::time::Instant>,
+    rows: usize,
+}
+
+impl PumpBoundaryHold {
+    fn is_held(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    fn release(&mut self) {
+        self.hold = None;
+        self.taken_at = None;
+        self.rows = 0;
+    }
+
+    /// Take the boundary for the next row unless it is already held. A
+    /// refused hold (the close released the channel, the session is gone, a
+    /// sink without holds) leaves the row to take the boundary itself, which
+    /// meets the same answer.
+    async fn take(
+        &mut self,
+        host: &meerkat_live::LiveAdapterHost,
+        channel: &meerkat_live::LiveChannelId,
+    ) {
+        if self.hold.is_some() {
+            return;
+        }
+        if let Ok(Some(hold)) = host.hold_projection_boundary(channel).await {
+            self.hold = Some(hold);
+            self.taken_at = Some(tokio::time::Instant::now());
+            self.rows = 0;
+        }
+    }
+
+    /// A row landed: keep the hold only within its bounds.
+    fn row_applied(&mut self, close_requested: bool) {
+        if self.hold.is_none() {
+            return;
+        }
+        self.rows += 1;
+        if close_requested
+            || self.rows >= PUMP_BOUNDARY_HOLD_ROWS
+            || self.next_row_grace().is_none()
+        {
+            self.release();
+        }
+    }
+
+    /// How long the pump may wait for its next row while it keeps the hold.
+    fn next_row_grace(&self) -> Option<std::time::Duration> {
+        let left = PUMP_BOUNDARY_HOLD_SPAN.checked_sub(self.taken_at?.elapsed())?;
+        (!left.is_zero()).then(|| left.min(PUMP_BOUNDARY_HOLD_NEXT_ROW_GRACE))
     }
 }
 
@@ -8388,22 +8485,50 @@ fn spawn_sideband_actors(
             LiveAdapterObservation,
             Option<meerkat_live::ObservationOutcome>,
         )> = None;
+        let mut boundary_hold = PumpBoundaryHold::default();
         loop {
             if pending_projection.is_none() && !pump_adapter.has_unmeasured_seals() {
                 let observation = {
-                    let next = tokio::select! {
-                        () = pump_gate.cancelled() => return,
-                        // Lowering sealed a segment without returning an
-                        // observation (a finished provider turn): release it
-                        // before pulling again.
-                        () = pump_adapter.unmeasured_seal_requested.notified() => continue,
-                        next = activation
-                            .live_adapter_host
-                            .next_observation_raw(pump_binding.channel_id()) => next,
+                    let next_observation = activation
+                        .live_adapter_host
+                        .next_observation_raw(pump_binding.channel_id());
+                    tokio::pin!(next_observation);
+                    // The boundary is kept only for a row the adapter already
+                    // has, and only briefly; otherwise it goes back before
+                    // the pump waits for the provider.
+                    let mut held_next = None;
+                    if boundary_hold.is_held() {
+                        let queued = matches!(
+                            pump_adapter.unapplied_backlog().1,
+                            Some(unread) if unread > 0
+                        );
+                        if let Some(grace) = boundary_hold.next_row_grace()
+                            && queued
+                            && !pump_drain.requested.load(Ordering::Acquire)
+                        {
+                            held_next = tokio::time::timeout(grace, &mut next_observation)
+                                .await
+                                .ok();
+                        }
+                        if held_next.is_none() {
+                            boundary_hold.release();
+                        }
+                    }
+                    let next = match held_next {
+                        Some(next) => next,
+                        None => tokio::select! {
+                            () = pump_gate.cancelled() => return,
+                            // Lowering sealed a segment without returning an
+                            // observation (a finished provider turn): release
+                            // it before pulling again.
+                            () = pump_adapter.unmeasured_seal_requested.notified() => continue,
+                            next = &mut next_observation => next,
+                        },
                     };
                     match next {
                         Ok(Some(observation)) => observation,
                         Ok(None) => {
+                            boundary_hold.release();
                             // Close and EOF release in-flight speech before the
                             // projection receipt settles. An owner close drives
                             // exact retry of a failed release; a remote EOF
@@ -8453,6 +8578,7 @@ fn spawn_sideband_actors(
                             break;
                         }
                         Err(_) => {
+                            boundary_hold.release();
                             tracing::warn!("experimental live adapter observation read failed");
                             break;
                         }
@@ -8464,6 +8590,7 @@ fn spawn_sideband_actors(
                         LiveAdapterObservation::StatusChanged { status } if status.is_terminal()
                     )
                 {
+                    boundary_hold.release();
                     // In-flight speech gets one bounded release; the
                     // terminal is retained whether or not it succeeds.
                     if pump_adapter.seal_open_unmeasured_segments() {
@@ -8495,10 +8622,15 @@ fn spawn_sideband_actors(
                         &activation,
                         &pump_binding,
                         &pump_adapter,
+                        &mut boundary_hold,
                     )),
                 )
                 .await
-                    && !pump_drain
+                {
+                    // The retry can wait for the close: never under the
+                    // boundary.
+                    boundary_hold.release();
+                    if !pump_drain
                         .retain_projection_for_retry(
                             &activation.live_adapter_host,
                             &pump_binding,
@@ -8507,8 +8639,9 @@ fn spawn_sideband_actors(
                             &error,
                         )
                         .await
-                {
-                    return;
+                    {
+                        return;
+                    }
                 }
                 continue;
             }
@@ -8516,6 +8649,18 @@ fn spawn_sideband_actors(
                 continue;
             };
             let retry_sequence = pump_drain.projection_retry.load(Ordering::Acquire);
+            if applied.is_none() && !pump_drain.requested.load(Ordering::Acquire) {
+                // Behind a running member turn this is where the pump waits.
+                meerkat_core::slow_await::warn_if_slow(
+                    pump_binding.channel_id(),
+                    "pump: hold the turn boundary",
+                    Box::pin(
+                        boundary_hold
+                            .take(&activation.live_adapter_host, pump_binding.channel_id()),
+                    ),
+                )
+                .await;
+            }
             // Set when the session refused the projection because the
             // member's turn boundary is held and the channel's close has
             // released this channel's projections from waiting behind it.
@@ -8613,6 +8758,9 @@ fn spawn_sideband_actors(
                         pump_binding.clone(),
                         output.clone(),
                     );
+                    // A publication can wait on its consumer: never under
+                    // the boundary.
+                    boundary_hold.release();
                     meerkat_core::slow_await::warn_if_slow(
                         pump_binding.channel_id(),
                         "pump: publish assistant output",
@@ -8628,6 +8776,7 @@ fn spawn_sideband_actors(
             }
             .await;
             if boundary_busy {
+                boundary_hold.release();
                 // The channel is closing while the member's own turn holds the
                 // session's turn boundary. The close does not wait for that
                 // turn: the observation is handed to the deferred close
@@ -8670,6 +8819,8 @@ fn spawn_sideband_actors(
                 continue;
             }
             if let Err(error) = apply_result {
+                // The retry can wait for the close: never under the boundary.
+                boundary_hold.release();
                 if !pump_drain
                     .retain_projection_for_retry(
                         &activation.live_adapter_host,
@@ -8684,6 +8835,7 @@ fn spawn_sideband_actors(
                 }
                 continue;
             }
+            boundary_hold.row_applied(pump_drain.requested.load(Ordering::Acquire));
             pending_projection = None;
             unapplied.pending_projection.store(false, Ordering::Release);
         }
@@ -15609,6 +15761,357 @@ mod tests {
         .unwrap_or_else(|_| {
             panic!("the deferred row {expected:?} never reached the persisted transcript")
         });
+    }
+
+    /// #1821: rows the transport already holds when a member turn ends land
+    /// together, before a turn that queued for the boundary behind them
+    /// starts. The row parked behind the running turn takes the boundary
+    /// when the turn ends, and the runtime loop's next acquire is already
+    /// queued behind it: without the pump's boundary hold the next row waited
+    /// for that whole queued turn, one row per member turn.
+    #[tokio::test]
+    async fn rows_parked_behind_a_member_turn_land_before_the_next_queued_turn() {
+        let (service, runtime, session_id, _temp) = materialized_member_session().await;
+        let channel_id = meerkat_live::LiveChannelId::new("rows-before-the-next-turn");
+        let admission = runtime
+            .resolve_live_open_admission(&session_id, &channel_id, &deferred_settlement_identity())
+            .await
+            .expect("channel admitted");
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            crate::surface::ServiceLiveProjection::new(Arc::clone(&service), Arc::clone(&runtime)),
+        )));
+        host.open_channel_with_authority(
+            admission
+                .channel_open_authority()
+                .expect("admission carries host open authority"),
+        )
+        .await
+        .expect("host channel opened");
+        let adapter = test_deferred_adapter();
+        host.attach_adapter(&channel_id, Arc::clone(&adapter) as Arc<dyn LiveAdapter>)
+            .await
+            .expect("attach the transport's adapter");
+        let binding = ProviderWebrtcBinding::new(
+            channel_id.clone(),
+            session_id.clone(),
+            meerkat_live::LiveRuntimeBindingGeneration::new(1),
+            meerkat_live::LiveRuntimeBindingFence::new(1),
+        );
+        let transport = Arc::new(ExperimentalGptLiveWebrtcTransport::new());
+        let (retirement_tx, _retirement_rx) = mpsc::channel(1);
+        let active = spawn_sideband_actors(
+            binding.clone(),
+            Arc::new(ControlledAmbiguousSideband::new()),
+            Arc::clone(&adapter),
+            1,
+            retirement_tx,
+            Arc::clone(&transport.pending_deliveries),
+        );
+        *active.activation_gate.prepared.lock().await =
+            Some(Arc::new(PreparedExperimentalGptLiveActivation {
+                runtime: Arc::clone(&runtime),
+                runtime_binding:
+                    meerkat_runtime::live_execution::LiveDelegationRuntimeBinding::__test_new(
+                        session_id.clone(),
+                        channel_id.clone(),
+                        meerkat_runtime::identifiers::LogicalRuntimeId::new("fixture-runtime"),
+                        1,
+                        1,
+                    ),
+                activator: Arc::new(NoopBoundChannelActivator),
+                control: Arc::clone(&transport) as Arc<dyn ExperimentalGptLiveControlPlane>,
+                live_adapter_host: Arc::clone(&host),
+                public_observation_publisher: Arc::new(NoopPublicObservationPublisher),
+            }));
+        active
+            .activation_gate
+            .committed
+            .store(true, Ordering::Release);
+        active.activation_gate.changed.notify_waiters();
+
+        // A member turn runs: it holds the session's turn boundary. The user
+        // speaks twice meanwhile.
+        let member_turn = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        const FIRST: &str = "First thing said while the member turn ran.";
+        const SECOND: &str = "Second thing said while the member turn ran.";
+        for (index, text) in [FIRST, SECOND].into_iter().enumerate() {
+            let turn = LiveSidebandTurnRef::__from_provider_observation(
+                &channel_id,
+                format!("queued-user-{index}"),
+                format!("private-queued-user-{index}"),
+            )
+            .expect("user turn");
+            adapter
+                .push_observation(LiveSidebandObservation::new(
+                    binding.clone(),
+                    LiveSidebandObservationKind::TurnFinished {
+                        turn,
+                        role: LiveSidebandTurnRole::User,
+                        transcript: text.to_string(),
+                    },
+                ))
+                .expect("queue the user's speech");
+        }
+        // The pump takes the first row and parks behind the member turn; the
+        // second stays queued in the adapter.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while adapter.unapplied_backlog().1 != Some(1) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pump takes the first row");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The member's next turn queues for the boundary behind the parked
+        // row, as the runtime loop's next lap does.
+        let (next_turn_started_tx, next_turn_started) = oneshot::channel();
+        let (end_next_turn, next_turn_ends) = oneshot::channel::<()>();
+        let next_turn_service = Arc::clone(&service);
+        let next_turn_session = session_id.clone();
+        let next_turn = tokio::spawn(async move {
+            let boundary = next_turn_service
+                .acquire_runtime_turn_finalization_guard(&next_turn_session)
+                .await;
+            let _ = next_turn_started_tx.send(());
+            let _ = next_turn_ends.await;
+            drop(boundary);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        drop(member_turn);
+        tokio::time::timeout(std::time::Duration::from_secs(10), next_turn_started)
+            .await
+            .expect("the queued turn starts")
+            .expect("queued turn task");
+        let persisted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.load_authoritative_session(&session_id),
+        )
+        .await
+        .expect("an ordinary read takes no boundary")
+        .expect("read the persisted transcript")
+        .expect("session");
+        let user_rows: Vec<String> = persisted
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![FIRST.to_string(), SECOND.to_string()],
+            "both rows the transport held when the member turn ended land before the queued turn starts"
+        );
+
+        let _ = end_next_turn.send(());
+        next_turn.await.expect("queued turn task");
+        retire_sideband_actors(active, SidebandActorRetirement::Immediate).await;
+    }
+
+    /// #1821: a channel's projection hold lets every row kind the GPT Live
+    /// pump applies through the real sink while it holds the session's turn
+    /// boundary, and keeps every other writer out until it ends. A row path
+    /// that took the boundary again would wedge the pump, so each row must
+    /// return within a short bound. A release revokes the hold and frees the
+    /// boundary at once, and a released channel gets no hold.
+    #[tokio::test]
+    async fn a_projection_hold_lets_its_channel_rows_through_and_holds_other_writers_out() {
+        use meerkat_live::LiveProjectionSink as _;
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+        const SPOKEN: &str = "Spoken while the channel held the boundary.";
+        let (service, runtime, session_id, _temp) = materialized_member_session().await;
+        let channel_id = meerkat_live::LiveChannelId::new("projection-hold-rows");
+        runtime
+            .resolve_live_open_admission(&session_id, &channel_id, &deferred_settlement_identity())
+            .await
+            .expect("channel admitted");
+        let sink =
+            crate::surface::ServiceLiveProjection::new(Arc::clone(&service), Arc::clone(&runtime));
+        let hold = tokio::time::timeout(
+            BOUND,
+            sink.hold_channel_projection_boundary(&session_id, &channel_id),
+        )
+        .await
+        .expect("a free boundary is held at once")
+        .expect("hold the boundary")
+        .expect("the session service's sink holds boundaries");
+
+        // Another writer (the member's next turn) waits for the hold.
+        let writer_service = Arc::clone(&service);
+        let writer_session = session_id.clone();
+        let writer = tokio::spawn(async move {
+            drop(
+                writer_service
+                    .acquire_runtime_turn_finalization_guard(&writer_session)
+                    .await,
+            );
+        });
+
+        // Every row kind the pump applies runs under the held boundary. Rows
+        // without a playback target are refused, but they return.
+        let usage = || {
+            TurnUsage::host_declared(
+                Provider::OpenAI,
+                "gpt-live-1-codex".to_string(),
+                Usage::default(),
+            )
+        };
+        tokio::time::timeout(
+            BOUND,
+            sink.append_user_transcript(
+                &session_id,
+                SPOKEN,
+                meerkat_live::LiveTranscriptIdentity::user(Some("item:held-user"), None, Some(0))
+                    .with_channel(&channel_id),
+            ),
+        )
+        .await
+        .expect("a user final under the hold returns")
+        .expect("the user final lands");
+        let _ = tokio::time::timeout(
+            BOUND,
+            service.admit_live_assistant_playback_target_with_context_observation(
+                &session_id,
+                channel_id.clone(),
+                meerkat_core::InteractionId::new(),
+                "response:held".to_string(),
+                "item:held-assistant".to_string(),
+                0,
+                None,
+            ),
+        )
+        .await
+        .expect("an output start under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            sink.append_assistant_transcript_final(
+                &session_id,
+                "An answer.",
+                meerkat_live::LiveTranscriptIdentity::assistant_final(
+                    "item:held-assistant",
+                    None,
+                    Some(0),
+                    Some("response:held"),
+                )
+                .with_channel(&channel_id),
+                StopReason::EndTurn,
+                Usage::default(),
+                Some("response:held"),
+            ),
+        )
+        .await
+        .expect("an assistant final under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            sink.resolve_assistant_playback_after_final(
+                &session_id,
+                &channel_id,
+                "response:held",
+                "item:held-assistant",
+                0,
+            ),
+        )
+        .await
+        .expect("the final's playback resolution under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            service.observe_live_assistant_playback_final(
+                &session_id,
+                channel_id.clone(),
+                meerkat_core::InteractionId::new(),
+                "response:held".to_string(),
+                "item:held-assistant".to_string(),
+                0,
+            ),
+        )
+        .await
+        .expect("a final's playback observation under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            sink.observe_assistant_playback_terminal(
+                &session_id,
+                &channel_id,
+                meerkat_core::InteractionId::new(),
+                "response:held",
+                "item:held-assistant",
+                0,
+                &meerkat_core::LiveAssistantPlaybackEvidence::Unmeasured,
+                StopReason::EndTurn,
+                usage(),
+            ),
+        )
+        .await
+        .expect("a playback terminal under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            sink.truncate_assistant_transcript(
+                &session_id,
+                &channel_id,
+                Some(meerkat_core::InteractionId::new()),
+                Some("item:held-assistant"),
+                None,
+                Some(0),
+                Some("response:held"),
+                Some("An"),
+            ),
+        )
+        .await
+        .expect("a truncation under the hold returns");
+        let _ = tokio::time::timeout(
+            BOUND,
+            sink.complete_assistant_playback(
+                &session_id,
+                &channel_id,
+                meerkat_core::InteractionId::new(),
+                "response:held",
+                "item:held-assistant",
+                0,
+                StopReason::EndTurn,
+                usage(),
+            ),
+        )
+        .await
+        .expect("a playback completion under the hold returns");
+        assert_eventually_user_row(&service, &session_id, SPOKEN).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !writer.is_finished(),
+            "another writer waits while the channel holds the boundary"
+        );
+
+        drop(hold);
+        tokio::time::timeout(BOUND, writer)
+            .await
+            .expect("the writer takes the boundary once the hold ends")
+            .expect("writer task");
+
+        // A release revokes a live hold and frees the boundary at once.
+        let revoked = service
+            .hold_live_channel_projection_boundary(&session_id, &channel_id)
+            .await
+            .expect("hold the boundary again");
+        service.release_live_projection_turn_boundary_waiters(&session_id, &channel_id);
+        drop(
+            tokio::time::timeout(
+                BOUND,
+                service.acquire_runtime_turn_finalization_guard(&session_id),
+            )
+            .await
+            .expect("a revoked hold no longer holds the boundary"),
+        );
+        // A released channel gets no hold.
+        assert!(matches!(
+            service
+                .hold_live_channel_projection_boundary(&session_id, &channel_id)
+                .await,
+            Err(meerkat_core::service::SessionError::Busy { .. })
+        ));
+        drop(revoked);
     }
 
     /// #1821 (R1): a member turn that ends with an error gives the close

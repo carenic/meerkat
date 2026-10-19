@@ -1956,6 +1956,22 @@ them.
   live spawn commit had cleared them. The replay now clears the identity's
   kickoff where that incarnation's spawn event sits; the incarnation's own
   kickoff updates follow it and still replay. Pre-existing in 0.9.3.
+- GPT Live: the transcript rows a channel's transport already holds when a
+  running member turn ends (the user's finalized speech, the assistant's
+  spoken segments) now all commit at that turn's boundary, before a member
+  turn queued behind them starts. Each row took the session's turn boundary
+  on its own, and the member's next queued turn was already waiting for it
+  behind the first row, so while member turns ran back to back (a typed
+  message, a second delegation) the backlog drained one row per turn: the
+  persisted transcript fell further behind the conversation with every turn,
+  and speech said before a typed message landed after that message's
+  answer, so the turn answering it did not see it. The transport now holds
+  the boundary across the rows it already has, for at most 64 rows or about
+  a second at a time, so a queued turn waits at most that long for them. A
+  WebSocket or WebRTC live channel still takes the boundary once per row, and
+  its transport forwards nothing behind a row that waits, so its voice goes
+  silent while a member turn runs and arrives in a burst when the turn ends
+  (see `docs/guides/realtime.mdx`). (#1821)
 
 ## [0.9.3] - 2026-10-18
 
