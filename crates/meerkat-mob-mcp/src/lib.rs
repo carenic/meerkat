@@ -3379,6 +3379,24 @@ impl MobMcpState {
 
                 let storage = self.bind_realm_profile_store(MobStorage::persistent(&path)?);
                 if storage.is_event_log_empty().await? {
+                    // A creation record that is not finalized names a mob
+                    // whose log lost its MobCreated: the store disagrees with
+                    // itself, so it is left unrestored as found, never
+                    // swept. With no record, or one a finished destroy
+                    // finalized, the store is empty.
+                    if let Some(mob_id) = storage.unfinalized_creation_mob().await? {
+                        self.keep_unrestored_mob(
+                            Some(mob_id.clone()),
+                            &path,
+                            MobError::IncarnationInconsistent {
+                                mob_id,
+                                inconsistency:
+                                    meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
                     if let Err(error) = Self::remove_storage_files(Some(path.as_path())).await {
                         tracing::error!(error = %error, "empty mob store sweep failed");
                     }
@@ -17722,6 +17740,62 @@ mod tests {
                 .await
                 .expect("provenance"),
             meerkat_mob::MobProvenance::Session { session_id: caller }
+        );
+    }
+
+    /// The restore's empty-store sweep keeps a store whose log is empty but
+    /// whose creation record is not finalized: its log lost the `MobCreated`
+    /// that record names, so the store is left unrestored under that mob,
+    /// typed, and never deleted. An empty store with no record is still
+    /// swept.
+    #[tokio::test]
+    async fn the_restore_sweep_keeps_an_empty_log_whose_creation_record_is_live() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let damaged = state
+            .mob_create_definition(explicit_definition("sweep-live-record"))
+            .await
+            .expect("create the mob whose log is lost");
+        // A restart: the predecessor gives up its supervisor route.
+        state
+            .handle_for(&damaged)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+        drop(state);
+        let mob_root = MobMcpState::persistent_mob_root(root.path());
+        let damaged_store = MobMcpState::persistent_storage_path(&mob_root, &damaged);
+        MobStorage::drop_event_log_for_test(&damaged_store)
+            .expect("drop the log, not through the destroy's clear");
+        let empty_store =
+            MobMcpState::persistent_storage_path(&mob_root, &MobId::from("sweep-empty"));
+        drop(MobStorage::persistent(&empty_store).expect("an empty store with no record"));
+
+        let restored = restored_state(&svc, root.path());
+        let unrestored = restored.unrestored_mobs().await;
+        assert_eq!(unrestored.len(), 1, "{unrestored:?}");
+        assert_eq!(unrestored[0].0, damaged);
+        assert!(
+            matches!(
+                &unrestored[0].1,
+                MobError::IncarnationInconsistent {
+                    mob_id,
+                    inconsistency: meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
+                } if mob_id == &damaged
+            ),
+            "{:?}",
+            unrestored[0].1
+        );
+        assert!(
+            tokio::fs::metadata(&damaged_store).await.is_ok(),
+            "the store whose record is not finalized is kept"
+        );
+        assert!(
+            tokio::fs::metadata(&empty_store).await.is_err(),
+            "the empty store with no record is swept"
         );
     }
 

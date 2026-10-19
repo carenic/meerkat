@@ -308,6 +308,9 @@ them.
 - `meerkat_mob_mcp::MobMcpState::unrestored_mobs`: the persisted mobs whose
   resume failed at restore, each with the typed error a lookup of its id
   answers. They are not in `mob_list`.
+- `meerkat_mob::MobStorage::unfinalized_creation_mob`: the mob a store's
+  creation record names while that record is not finalized, read without
+  building a runtime.
 
 ### Changed
 
@@ -496,10 +499,15 @@ them.
   records: a create by a session that roster names, or while it cannot be
   read, is refused with `MobError::ProvenanceUnavailable` naming that mob.
   A child mob that a member of that mob created still resumes while its
-  owner session is live, although its parent mob does not run. A
-  transport or persistence fault, and a store that names no mob, still fail
-  the restore, so the next mob verb tries it again. Pre-existing in 0.9.3
-  and earlier.
+  owner session is live, although its parent mob does not run. The sweep
+  of empty stores at restore keeps a store whose log is empty while its
+  creation record is not finalized (the log lost the `MobCreated` that
+  record names): it is left unrestored the same way, under the record's
+  mob, answering `IncarnationInconsistent` (`RecordWithoutCreation`). An
+  empty store with no creation record, or one a finished destroy
+  finalized, is still removed. A transport or persistence fault, and a
+  store that names no mob, still fail the restore, so the next mob verb
+  tries it again. Pre-existing in 0.9.3 and earlier.
 
 ## [0.9.3] - 2026-10-18
 
