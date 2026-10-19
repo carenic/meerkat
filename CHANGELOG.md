@@ -362,9 +362,11 @@ them.
     optional.
   - Version skew: the 0.9.3 Python and TypeScript SDKs require `persisted`,
     so a 0.9.3 SDK talking to a 0.9.4 rkat-rpc fails on every
-    `tool_config_changed` event that 0.9.4 builds. The SDKs fetch their own
-    matching rkat-rpc, so this happens only with an overridden binary path;
-    the remedy is to upgrade the SDK.
+    `tool_config_changed` event that 0.9.4 builds. An SDK downloads its own
+    matching rkat-rpc only when it is given none, so this happens with a
+    binary it is given: `MEERKAT_BIN_PATH`, an explicit path, or an rkat-rpc
+    on `PATH` (a Homebrew upgrade, for example); the remedy is to upgrade the
+    SDK.
   - Stored transcripts: 0.9.3 cannot read back a transcript that 0.9.4 wrote
     with a `tool_config` notice (a tool-scope, deferred-catalog or
     failed-closed notice), because 0.9.3 requires the payload's `persisted`.
