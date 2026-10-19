@@ -745,11 +745,13 @@ impl LiveSidebandNarrationAuthority {
 /// delegation's work has finished while its result has not been released
 /// (the channel's one result slot is held by another result, for example).
 /// It carries no text and is never spoken, and it is built only from the
-/// generated narration authority of that kind.
+/// generated narration authority of that kind, bound to the delegation that
+/// authority was checked against.
 #[derive(Clone)]
 pub struct LiveSidebandFinishedNoticeAuthority {
     binding: ProviderWebrtcBinding,
     attempt: LiveSidebandAppendAttempt,
+    delegation: LiveSidebandDelegationRef,
     consumed: Arc<AtomicBool>,
 }
 
@@ -759,6 +761,7 @@ impl fmt::Debug for LiveSidebandFinishedNoticeAuthority {
             .debug_struct("LiveSidebandFinishedNoticeAuthority")
             .field("binding", &self.binding)
             .field("attempt", &self.attempt)
+            .field("delegation", &self.delegation)
             .field("consumed", &self.consumed.load(Ordering::Relaxed))
             .finish()
     }
@@ -771,12 +774,14 @@ impl LiveSidebandFinishedNoticeAuthority {
     pub fn __from_generated_finished_notice_authority(
         binding: ProviderWebrtcBinding,
         narration_id: String,
+        delegation: LiveSidebandDelegationRef,
     ) -> Option<Self> {
         Some(Self {
             binding,
             attempt: LiveSidebandAppendAttempt::__from_generated_append_id(format!(
                 "narration:{narration_id}"
             ))?,
+            delegation,
             consumed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1160,18 +1165,18 @@ impl LiveSidebandCommand {
         })
     }
 
-    /// Tell the provider session that one exact delegation's work finished
-    /// while its result has not been released. Consumes the generated
-    /// finished-notice authority; the command carries no text, no result,
-    /// and is not spoken.
+    /// Tell the provider session that the delegation the authority was
+    /// checked against finished its work while its result has not been
+    /// released. Consumes the generated finished-notice authority; the
+    /// command carries no text, no result, and is not spoken.
     pub fn note_delegation_finished(
         authority: LiveSidebandFinishedNoticeAuthority,
-        delegation: LiveSidebandDelegationRef,
     ) -> Result<Self, LiveSidebandCommandError> {
         authority.consume_once()?;
         let LiveSidebandFinishedNoticeAuthority {
             binding,
             attempt,
+            delegation,
             consumed: _,
         } = authority;
         Ok(Self {
@@ -1976,13 +1981,13 @@ mod tests {
             attempt: LiveSidebandAppendAttempt(
                 "narration:operation-4:finished-pending".to_string(),
             ),
+            delegation: delegation(),
             consumed: Arc::new(AtomicBool::new(false)),
         };
-        let command =
-            LiveSidebandCommand::note_delegation_finished(authority.clone(), delegation())
-                .expect("one finished notice");
+        let command = LiveSidebandCommand::note_delegation_finished(authority.clone())
+            .expect("one finished notice");
         assert_eq!(
-            LiveSidebandCommand::note_delegation_finished(authority, delegation()).err(),
+            LiveSidebandCommand::note_delegation_finished(authority).err(),
             Some(LiveSidebandCommandError::AuthorityAlreadyConsumed),
             "the authority is one-shot across clones"
         );

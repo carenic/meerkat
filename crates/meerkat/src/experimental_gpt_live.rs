@@ -6651,7 +6651,7 @@ impl ExperimentalGptLiveWebrtcTransport {
         let sideband = authority
             .into_sideband_finished_notice_authority(binding, &delegation)
             .map_err(|_| ExperimentalGptLiveBridgeError::ContextAuthorityRejected)?;
-        let command = LiveSidebandCommand::note_delegation_finished(sideband, delegation)
+        let command = LiveSidebandCommand::note_delegation_finished(sideband)
             .map_err(|_| ExperimentalGptLiveBridgeError::ContextAuthorityRejected)?;
         let attempt = command.attempt();
         let (resolution_tx, resolution_rx) = oneshot::channel();
@@ -14353,11 +14353,11 @@ mod tests {
                 meerkat_live::LiveSidebandFinishedNoticeAuthority::__from_generated_finished_notice_authority(
                     binding.clone(),
                     "public-live-finished-pending".to_string(),
+                    delegation.clone(),
                 )
                 .expect("generated finished-notice authority");
-            let command =
-                LiveSidebandCommand::note_delegation_finished(authority, delegation.clone())
-                    .expect("finished notice command");
+            let command = LiveSidebandCommand::note_delegation_finished(authority)
+                .expect("finished notice command");
             let attempt = command.attempt();
             assert_eq!(
                 sideband

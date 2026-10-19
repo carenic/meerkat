@@ -3726,6 +3726,7 @@ impl LiveDelegationNarrationAuthority {
         LiveSidebandFinishedNoticeAuthority::__from_generated_finished_notice_authority(
             binding,
             narration_id,
+            delegation.clone(),
         )
         .ok_or(LiveExecutionAuthorityError::CorrelationMismatch)
     }
@@ -6374,7 +6375,7 @@ mod tests {
                 let sideband = authority
                     .into_sideband_finished_notice_authority(binding, &delegation)
                     .expect("the refused narration conversion spent nothing");
-                let command = LiveSidebandCommand::note_delegation_finished(sideband, delegation)
+                let command = LiveSidebandCommand::note_delegation_finished(sideband)
                     .expect("finished notice command");
                 assert!(!command.is_spoken(), "a finished notice is never spoken");
                 assert!(matches!(
