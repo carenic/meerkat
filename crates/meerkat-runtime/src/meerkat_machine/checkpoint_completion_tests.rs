@@ -475,6 +475,77 @@ async fn checkpoint_apply_with_run_result_uses_run_authority_live_and_after_rest
     }
 }
 
+/// A run result an earlier release committed but never finalized (its turn
+/// stopped before the completion receipt settled) is finalized from the
+/// durable row at the next cold start, so the session can accept work again.
+/// The row still carries the earlier release's `stored_input_state_version`
+/// stamp, which makes its bytes differ from this binary's image of the same
+/// typed row; the exact receipt CAS must still recognize it.
+#[tokio::test]
+async fn earlier_release_pending_run_result_finalizes_after_cold_restart() {
+    use meerkat_core::generated::session_persistence_version_authority as version_authority;
+    use meerkat_core::lifecycle::core_executor::CoreApplyTerminal;
+
+    let fixture = Fixture::with_initial_input(false).await;
+    let input_id = old_input_id();
+    let terminal = CoreApplyTerminal::RunResult(Box::new(meerkat_core::types::RunResult {
+        text: "an earlier release committed this result".to_string(),
+        session_id: fixture.session_id.clone(),
+        usage: Default::default(),
+        turns: 1,
+        tool_calls: 0,
+        terminal_cause_kind: None,
+        structured_output: None,
+        extraction_error: None,
+        schema_warnings: None,
+        skill_diagnostics: None,
+        run_usage: None,
+        request_usage: Vec::new(),
+    }));
+    fixture
+        .checkpoint_batch_with_terminal(std::slice::from_ref(&input_id), Some(&terminal))
+        .await;
+    let current = String::from_utf8(fixture.raw_row(&input_id)).unwrap();
+    let current_stamp = format!(
+        "\"stored_input_state_version\":{}",
+        version_authority::stored_input_state_version()
+    );
+    let earlier = current.replacen(&current_stamp, "\"stored_input_state_version\":6", 1);
+    assert_ne!(earlier, current, "the fixture must carry the earlier stamp");
+    fixture.replace_fixture_row(&input_id, earlier.as_bytes());
+
+    let driver = fixture.fresh_driver_from_durable().await.unwrap();
+    crate::runtime_loop::test_drain_recovered_input_terminal_completions(&driver, &mut NoExecution)
+        .await
+        .expect("the earlier release's pending receipt finalizes from its durable row");
+    let row = fixture
+        .store
+        .load_input_state(&fixture.runtime_id(), &input_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let completion = row.state.terminal_completion.unwrap();
+    assert!(matches!(
+        completion.phase,
+        InputTerminalCompletionPhase::Finalized { .. }
+    ));
+    let Some(crate::completion::CompletionOutcome::Completed(result)) = completion.outcome else {
+        panic!("the committed RunResult must survive finalization");
+    };
+    assert_eq!(result.text, "an earlier release committed this result");
+    let finalized = fixture.raw_row(&input_id);
+    assert!(
+        std::str::from_utf8(&finalized)
+            .unwrap()
+            .contains(&current_stamp),
+        "finalization writes the current encoding"
+    );
+    crate::runtime_loop::test_drain_recovered_input_terminal_completions(&driver, &mut NoExecution)
+        .await
+        .unwrap();
+    assert_eq!(finalized, fixture.raw_row(&input_id));
+}
+
 /// Stage `input_id` for the fixture run, end the turn with the generated
 /// budget terminal, and commit it through the real runtime-loop commit
 /// carrying `terminal`.

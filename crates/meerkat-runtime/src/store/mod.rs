@@ -9464,6 +9464,11 @@ pub trait RuntimeStore: Send + Sync {
     /// currently persisted row is byte-identical to its expected
     /// [`StoredInputState`] serialization.
     ///
+    /// A row an earlier release wrote under an older
+    /// `stored_input_state_version` is compared as this binary encodes the
+    /// typed row it decodes to, since its version stamp alone differs from
+    /// this binary's image of the same row.
+    ///
     /// Expected and replacement batches must contain the same unique keys and
     /// at most [`MAX_INPUT_STATE_BATCH_CAS`] rows. If every current row already
     /// equals its replacement, implementations return

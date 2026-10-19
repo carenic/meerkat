@@ -8464,6 +8464,37 @@ ORDER BY runtime_id";
         serde_json::from_slice(bytes).map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))
     }
 
+    /// The durable input row as this binary encodes it, for the exact batch
+    /// CAS.
+    ///
+    /// The batch CAS compares a stored row with this binary's encoding of the
+    /// expected and replacement rows. A row an earlier release wrote keeps that
+    /// release's older `stored_input_state_version` stamp, so its bytes never
+    /// equal this binary's image of the very same typed row, and every CAS on
+    /// it would report a stale row for good: a terminal completion an earlier
+    /// release left pending could never be finalized. Such a row is compared as
+    /// the current typed decoder reads it, re-encoded. A row at the current
+    /// version is compared exactly as stored, and a row that does not decode
+    /// stays as stored, so any other difference is still stale.
+    fn input_row_in_current_encoding(stored: Vec<u8>) -> Vec<u8> {
+        use meerkat_core::generated::session_persistence_version_authority as version_authority;
+
+        #[derive(serde::Deserialize)]
+        struct StoredVersion {
+            stored_input_state_version: u32,
+        }
+        let current_version = version_authority::stored_input_state_version();
+        let earlier_release = serde_json::from_slice::<StoredVersion>(&stored)
+            .is_ok_and(|row| row.stored_input_state_version < current_version);
+        if !earlier_release {
+            return stored;
+        }
+        deserialize_persisted_input_state(&stored)
+            .ok()
+            .and_then(|row| serde_json::to_vec(&row).ok())
+            .unwrap_or(stored)
+    }
+
     /// Encode a `u64` boundary-receipt sequence into the durable `INTEGER`
     /// column as the reinterpreted two's-complement `i64` bit pattern.
     ///
@@ -16088,6 +16119,7 @@ ORDER BY runtime_id";
                     let Some(current) = current else {
                         return Ok(InputStateBatchCasOutcome::Stale);
                     };
+                    let current = input_row_in_current_encoding(current);
                     if current != row.expected_json {
                         all_expected = false;
                     }
@@ -16167,6 +16199,7 @@ ORDER BY runtime_id";
                     let Some(current) = current else {
                         return Ok(FencedInputStateBatchCasOutcome::Stale);
                     };
+                    let current = input_row_in_current_encoding(current);
                     if current != row.expected_json {
                         all_expected = false;
                     }
@@ -24594,6 +24627,163 @@ ORDER BY runtime_id";
             let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
             assert_eq!(rows.len(), crate::store::MAX_INPUT_STATE_BATCH_CAS);
             assert!(rows.iter().all(|row| row.state.recovery_count == 7));
+        }
+
+        /// The pending terminal completion row a 0.9.2 binary wrote for a turn
+        /// that stopped at its completed-boundary commit, taken from a captured
+        /// directory with its prompt text and model name replaced by neutral
+        /// ones and its candidate digest recomputed. It carries stored input
+        /// state version 6, which 0.9.0 through 0.9.3 wrote.
+        const EARLIER_RELEASE_PENDING_RECEIPT_ROW: &str = concat!(
+            r#"{"stored_input_state_version":6,"input_id":"01a15641-4385-7710-aa5b-74ddbd9c"#,
+            r#"e3f1","current_state":"consumed","policy":{"version":1,"decision":{"apply_mo"#,
+            r#"de":"stage_run_start","wake_mode":"wake_if_idle","queue_mode":"fifo","consum"#,
+            r#"e_point":"on_run_complete","drain_policy":"queue_next_turn","routing_disposi"#,
+            r#"tion":"queue","record_transcript":true,"emit_operator_content":true,"policy_"#,
+            r#"version":1}},"runtime_semantics":{"boundary":"run_start","execution_kind":"c"#,
+            r#"ontent_turn","execution_handling_mode":null,"peer_response_terminal_apply_in"#,
+            r#"tent":null,"live_interrupt_required":false},"terminal_outcome":{"outcome_typ"#,
+            r#"e":"consumed"},"durability":"durable","attempt_count":1,"recovery_count":0,""#,
+            r#"history":[{"timestamp":"2026-10-19T22:21:20.134647734Z","from":"accepted","t"#,
+            r#"o":"queued","reason":"QueueAccepted"},{"timestamp":"2026-10-19T22:21:20.1434"#,
+            r#"25531Z","from":"queued","to":"staged","reason":"StageForRun(01a15641-438f-74"#,
+            r#"e0-b913-07c827a2fed6)"},{"timestamp":"2026-10-19T22:21:20.217337018Z","from""#,
+            r#":"staged","to":"applied","reason":"MarkApplied(01a15641-438f-74e0-b913-07c82"#,
+            r#"7a2fed6)"},{"timestamp":"2026-10-19T22:21:20.217337018Z","from":"applied","t"#,
+            r#"o":"applied_pending_consumption","reason":"MarkAppliedPendingConsumption(bou"#,
+            r#"ndary_sequence=1)"},{"timestamp":"2026-10-19T22:21:20.217374935Z","from":"ap"#,
+            r#"plied_pending_consumption","to":"consumed","reason":"Consume"}],"terminal_co"#,
+            r#"mpletion":{"input_id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","batch_ordinal""#,
+            r#":0,"batch_key":{"scope":"run","run_id":"01a15641-438f-74e0-b913-07c827a2fed6"#,
+            r#""},"owner_input_id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","candidate_digest"#,
+            r#"":"4baafa70ff40f5dd7d10a8989b10803f7025847a9bd6f47e141751009f6bb3e8","comple"#,
+            r#"tion_input_ids_digest":"aa375d8c846ea1970518c3025f79d40deea2b8c9bed7dac3d15e"#,
+            r#"75820828e813","requires_session_checkpoint":true,"candidate":{"candidate_typ"#,
+            r#"e":"run_result","result":{"text":"fixture reply 21","session_id":"01a15640-c"#,
+            r#"724-7302-9145-63c8ad263794","usage":{"input_tokens":300110,"output_tokens":1"#,
+            r#"6,"cache_creation_tokens":null,"cache_read_tokens":null},"run_usage":{"input"#,
+            r#"_tokens":20,"output_tokens":2,"cache_creation_tokens":null,"cache_read_token"#,
+            r#"s":null},"request_usage":[{"input_tokens":10,"output_tokens":1,"cache_creati"#,
+            r#"on_tokens":null,"cache_read_tokens":null,"accounting":{"provider":"self_host"#,
+            r#"ed","model":"fixture-model","presented_tokens":10,"convention":"open_ai_comp"#,
+            r#"atible_prompt_includes_cache_details","aggregation":"provider_inclusive_inpu"#,
+            r#"t_total"}},{"input_tokens":10,"output_tokens":1,"cache_creation_tokens":null"#,
+            r#","cache_read_tokens":null,"accounting":{"provider":"self_hosted","model":"fi"#,
+            r#"xture-model","presented_tokens":10,"convention":"open_ai_compatible_prompt_i"#,
+            r#"ncludes_cache_details","aggregation":"provider_inclusive_input_total"}}],"tu"#,
+            r#"rns":1,"tool_calls":0,"skill_diagnostics":{"source_health":{"state":"healthy"#,
+            r#"","invalid_ratio":0.0,"invalid_count":0,"total_count":14,"failure_streak":0,"#,
+            r#""handshake_failed":false},"quarantined":[]}}},"completion_input_ids":["01a15"#,
+            r#"641-4385-7710-aa5b-74ddbd9ce3f1"],"phase":{"phase":"pending"}},"scoped_desti"#,
+            r#"nation":{"kind":"never_scoped"},"persisted_input":{"input_type":"prompt","he"#,
+            r#"ader":{"id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","timestamp":"2026-10-19T2"#,
+            r#"2:21:20.133813573Z","source":{"type":"operator"},"durability":"durable","vis"#,
+            r#"ibility":{"transcript_eligible":true,"operator_eligible":true}},"content":"c"#,
+            r#"ycle 4 settle","turn_metadata":{"handling_mode":"queue","transcript_identity"#,
+            r#"":{"interaction_id":"3f21e967-fc11-4073-817e-ade10c232ab9"}}},"last_run_id":"#,
+            r#""01a15641-438f-74e0-b913-07c827a2fed6","last_boundary_sequence":1,"admission"#,
+            r#"_sequence":1000000010,"created_at":"2026-10-19T22:21:20.134580854Z","updated"#,
+            r#"_at":"2026-10-19T22:21:20.217374935Z"}"#,
+        );
+
+        /// A row an earlier release wrote differs from this binary's image of
+        /// the same typed row only by its older `stored_input_state_version`
+        /// stamp. The exact batch CAS reads such a row as that typed row, so a
+        /// receipt an earlier release left pending can be finalized, and still
+        /// refuses one whose content changed.
+        #[tokio::test]
+        async fn input_state_batch_cas_sqlite_reads_an_earlier_release_row_as_its_typed_row() {
+            use meerkat_core::generated::session_persistence_version_authority as version_authority;
+
+            let (_dir, store) = temp_store();
+            let runtime_id = LogicalRuntimeId::new("input-cas-earlier-release");
+            let input_id = InputId::from_uuid(
+                uuid::Uuid::parse_str("01a15641-4385-7710-aa5b-74ddbd9ce3f1").unwrap(),
+            );
+            let write_row = |bytes: &[u8]| {
+                open_runtime_connection(store.path())
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO runtime_input_states (runtime_id, input_id, state_json)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(runtime_id, input_id) DO UPDATE
+                         SET state_json = excluded.state_json",
+                        params![runtime_id_text(&runtime_id), input_id.0.to_string(), bytes],
+                    )
+                    .unwrap();
+            };
+            let read_row = || {
+                open_runtime_connection(store.path())
+                    .unwrap()
+                    .query_row(
+                        "SELECT state_json FROM runtime_input_states
+                         WHERE runtime_id = ?1 AND input_id = ?2",
+                        params![runtime_id_text(&runtime_id), input_id.0.to_string()],
+                        |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+                    )
+                    .unwrap()
+            };
+            let earlier = EARLIER_RELEASE_PENDING_RECEIPT_ROW;
+            write_row(earlier.as_bytes());
+            let expected = store
+                .load_input_state(&runtime_id, &input_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let completion = expected.state.terminal_completion.as_ref().unwrap();
+            assert!(completion.requires_session_checkpoint);
+            assert!(matches!(
+                completion.phase,
+                crate::input_state::InputTerminalCompletionPhase::Pending
+            ));
+            let current_stamp = format!(
+                "\"stored_input_state_version\":{}",
+                version_authority::stored_input_state_version()
+            );
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                earlier.replacen("\"stored_input_state_version\":6", &current_stamp, 1),
+                "only the version stamp differs from this binary's image of the row"
+            );
+            let mut replacement = expected.clone();
+            replacement.state.recovery_count = 1;
+            let replacement = persistable(replacement);
+
+            let changed = earlier.replacen("\"recovery_count\":0", "\"recovery_count\":3", 1);
+            assert_ne!(changed, earlier);
+            write_row(changed.as_bytes());
+            assert_eq!(
+                store
+                    .compare_and_swap_input_states_atomically(
+                        &runtime_id,
+                        std::slice::from_ref(&expected),
+                        std::slice::from_ref(&replacement),
+                    )
+                    .await
+                    .unwrap(),
+                InputStateBatchCasOutcome::Stale,
+                "an earlier-release row whose content changed is still stale"
+            );
+            assert_eq!(read_row(), changed.as_bytes());
+
+            write_row(earlier.as_bytes());
+            assert_eq!(
+                store
+                    .compare_and_swap_input_states_atomically(
+                        &runtime_id,
+                        std::slice::from_ref(&expected),
+                        std::slice::from_ref(&replacement),
+                    )
+                    .await
+                    .unwrap(),
+                InputStateBatchCasOutcome::Swapped,
+                "the earlier-release row holding the expected typed row must swap"
+            );
+            assert_eq!(
+                read_row(),
+                serde_json::to_vec(replacement.as_stored()).unwrap(),
+                "the swap writes the current encoding"
+            );
         }
 
         #[tokio::test]
