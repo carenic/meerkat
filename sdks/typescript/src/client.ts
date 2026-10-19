@@ -1280,33 +1280,41 @@ export class MeerkatClient {
     // new work while the original child is still being reaped.
     this.rejectPendingRequests(new MeerkatError("CLIENT_CLOSED", "Client closed"));
     this.closeQueues();
-    if (process) {
-      process.stdin?.end();
-      // Settle on the child's exit, not its "close": a descendant that
-      // inherited the child's stdio can hold those pipes open long after the
-      // child is gone. A child that has already exited settles at once.
-      const exited =
-        process.exitCode != null || process.signalCode != null
-          ? Promise.resolve()
-          : once(process, "exit").then(
-              () => undefined,
-              () => undefined,
-            );
-      process.kill();
-      // Cancel the 5 s cap once the child has exited: a pending timer keeps
-      // the caller's Node process alive until it fires.
-      const cap = new AbortController();
-      const timeout = delay(5000, "timeout" as const, { signal: cap.signal });
-      const outcome = await Promise.race([exited, timeout]);
-      cap.abort();
-      if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
-        process.kill("SIGKILL");
-        await exited;
-      }
-      process.stdin?.destroy();
-      process.stdout?.destroy();
-      process.stderr?.destroy();
+    if (process) await MeerkatClient.stopChild(process);
+  }
+
+  /**
+   * Stop a child this client has let go of: end its stdin, signal it, and
+   * wait for it to exit, killing it with SIGKILL after 5 s; then destroy its
+   * stdio, so nothing the child started can keep the caller's process alive
+   * through those pipes. Never rejects: a kill that fails settles the wait.
+   */
+  private static async stopChild(process: ChildProcess): Promise<void> {
+    process.stdin?.end();
+    // Settle on the child's exit, not its "close": a descendant that
+    // inherited the child's stdio can hold those pipes open long after the
+    // child is gone. A child that has already exited settles at once.
+    const exited =
+      process.exitCode != null || process.signalCode != null
+        ? Promise.resolve()
+        : once(process, "exit").then(
+            () => undefined,
+            () => undefined,
+          );
+    process.kill();
+    // Cancel the 5 s cap once the child has exited: a pending timer keeps
+    // the caller's Node process alive until it fires.
+    const cap = new AbortController();
+    const timeout = delay(5000, "timeout" as const, { signal: cap.signal });
+    const outcome = await Promise.race([exited, timeout]);
+    cap.abort();
+    if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
+      process.kill("SIGKILL");
+      await exited;
     }
+    process.stdin?.destroy();
+    process.stdout?.destroy();
+    process.stderr?.destroy();
   }
 
   private rejectPendingRequests(reason: unknown): void {
@@ -1342,7 +1350,9 @@ export class MeerkatClient {
     this.process = null;
     if (process) {
       process.stdin?.destroy();
-      process.kill();
+      // Stopped as close() stops it, without waiting for it here: a child
+      // that ignores SIGTERM is killed after 5 s, and its pipes are let go.
+      void MeerkatClient.stopChild(process);
     }
   }
 

@@ -49,10 +49,19 @@ const poll = setInterval(() => {
  * `exitOnRequest` writes two stderr lines and exits with code 7, without a
  * reply, on the first request after the handshake; `lateStderr` leaves a
  * descendant on its stderr that writes one more line just after that exit.
+ * `corruptOnRequest` answers that first request with a line that is not
+ * JSON and keeps running.
  */
 function writeFixture(
   root,
-  { stubborn = false, holder = false, exitAfterHandshake = false, exitOnRequest = false, lateStderr = false },
+  {
+    stubborn = false,
+    holder = false,
+    exitAfterHandshake = false,
+    exitOnRequest = false,
+    lateStderr = false,
+    corruptOnRequest = false,
+  },
 ) {
   const bin = path.join(root, "rkat-rpc.cjs");
   writeFileSync(bin, `#!/usr/bin/env node
@@ -61,6 +70,10 @@ rl.on("line", (line) => {
   const msg = JSON.parse(line);
   ${exitOnRequest ? `if (msg.method !== "initialize" && msg.method !== "capabilities/get") {
     process.stderr.write("fixture: first stderr line\\nfixture: last stderr line\\n", () => process.exit(7));
+    return;
+  }` : ""}
+  ${corruptOnRequest ? `if (msg.method !== "initialize" && msg.method !== "capabilities/get") {
+    process.stdout.write("not a JSON-RPC frame\\n");
     return;
   }` : ""}
   const result = msg.method === "initialize"
@@ -163,11 +176,57 @@ process.stdout.write(JSON.stringify(report) + "\\n");
 }
 
 /**
+ * Run a separate Node process that connects to `bin`, a fixture that answers
+ * the first request after the handshake with a line that is not JSON. It
+ * reports how that request and a later one failed and how long close() took
+ * after them, then has nothing left to do. With `closeAfterChildExit` it
+ * calls close() only once the stopped child has closed (or after 3 s), so the
+ * client sees the child's exit first. As it exits it writes a second line:
+ * how often the client closed its queues in all.
+ */
+function runFaultProbe(root, bin, { closeAfterChildExit = false } = {}) {
+  return runScript(root, "fault-probe.mjs", `
+import { writeSync } from "node:fs";
+import { MeerkatClient } from ${JSON.stringify(CLIENT_URL)};
+const client = new MeerkatClient(${JSON.stringify(bin)});
+await client.connect();
+const child = client.process;
+let queueCloses = 0;
+const closeQueues = client.closeQueues.bind(client);
+client.closeQueues = () => {
+  queueCloses += 1;
+  closeQueues();
+};
+process.on("exit", () => writeSync(1, JSON.stringify({ queueCloses }) + "\\n"));
+${
+  closeAfterChildExit
+    ? `const childClosed = new Promise((resolve) => {
+  const timer = setTimeout(resolve, 3_000, false);
+  child.once("close", () => {
+    clearTimeout(timer);
+    resolve(true);
+  });
+});`
+    : ""
+}
+const fault = await client.getConfig().then(() => "resolved", (error) => error.code);
+const later = await client.getConfig().then(() => "resolved", (error) => error.code);
+const report = { pid: child.pid, fault, later };
+${closeAfterChildExit ? "report.childClosed = await childClosed;" : ""}
+const started = performance.now();
+await client.close();
+report.closeMs = performance.now() - started;
+process.stdout.write(JSON.stringify(report) + "\\n");
+`);
+}
+
+/**
  * Run `source` as a separate Node process in a process group of its own; the
  * fixture joins it, so one kill takes both. The script writes one JSON line
- * when it is done and should then have nothing left to do. Resolves with that
- * report, how long the process lived after writing it, what it wrote to
- * stderr, and its process group.
+ * when it is done and should then have nothing left to do; it may write one
+ * more as it exits. Resolves with the first report, the second as `final`,
+ * how long the process lived after the first, what it wrote to stderr, and its
+ * process group.
  */
 function runScript(root, name, source) {
   const script = path.join(root, name);
@@ -216,7 +275,8 @@ function runScript(root, name, source) {
         reject(new Error(`${name} failed (code ${code}, signal ${signal}): ${stderr}`));
         return;
       }
-      resolve({ ...JSON.parse(stdout.trim()), lingerMs: exitedAt - reportedAt, stderr, group: child.pid });
+      const [report, final] = stdout.trim().split("\n").map((line) => JSON.parse(line));
+      resolve({ ...report, final, lingerMs: exitedAt - reportedAt, stderr, group: child.pid });
     });
   });
 }
@@ -454,6 +514,80 @@ describe("A child that exits by itself", () => {
       assert.equal(run.stderr, "");
     } finally {
       if (group !== undefined) killGroup(group);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("A protocol error from the child", () => {
+  it("lets the process exit as soon as the stopped child has exited", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    try {
+      const run = await runFaultProbe(root, writeFixture(root, { corruptOnRequest: true }), {
+        closeAfterChildExit: true,
+      });
+      assert.equal(run.fault, "PROTOCOL_ERROR");
+      assert.equal(run.later, "PROTOCOL_ERROR");
+      assert.equal(run.childClosed, true, "the stopped child must close before close() is called");
+      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      // Once for the fault, once more for close(): the child's exit, seen
+      // first, adds none.
+      assert.deepEqual(run.final, { queueCloses: 2 });
+      assert.equal(alive(run.pid), false, "the child must have been stopped");
+      assert.ok(
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
+      );
+      assert.equal(run.stderr, "");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets go of the child's pipes, even when a descendant holds them", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    let group;
+    try {
+      const run = await runFaultProbe(root, writeFixture(root, { holder: true, corruptOnRequest: true }), {
+        closeAfterChildExit: true,
+      });
+      group = run.group;
+      assert.equal(run.fault, "PROTOCOL_ERROR");
+      assert.equal(run.later, "PROTOCOL_ERROR");
+      assert.equal(run.childClosed, true, "the stopped child must close before close() is called");
+      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      // Once for the fault, once more for close(): the child's exit, seen
+      // first, adds none.
+      assert.deepEqual(run.final, { queueCloses: 2 });
+      assert.equal(alive(run.pid), false, "the child must have been stopped");
+      assert.ok(
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
+      );
+      assert.equal(run.stderr, "");
+    } finally {
+      if (group !== undefined) killGroup(group);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("kills a child that ignores SIGTERM 5 s later", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    try {
+      const run = await runFaultProbe(root, writeFixture(root, { stubborn: true, corruptOnRequest: true }));
+      assert.equal(run.fault, "PROTOCOL_ERROR");
+      assert.equal(run.later, "PROTOCOL_ERROR");
+      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      // Once for the fault, once more for close(): the child's exit adds none.
+      assert.deepEqual(run.final, { queueCloses: 2 });
+      // The process lives on until the stubborn child is killed, 5 s after the fault.
+      assert.ok(
+        run.lingerMs >= 4_500 && run.lingerMs < 9_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned, not until the 5 s kill`,
+      );
+      assert.equal(alive(run.pid), false, "the stubborn child must have been killed");
+      assert.equal(run.stderr, "");
+    } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });

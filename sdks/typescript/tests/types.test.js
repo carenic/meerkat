@@ -5,6 +5,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import packageJson from "../package.json" with { type: "json" };
 import {
@@ -5928,9 +5929,25 @@ describe("Capability status parse boundary (row 161)", () => {
 });
 
 describe("Transport corrupted-frame fault (row 246)", () => {
+  /** A stand-in child process that exits when it is signalled, as a real one does. */
+  function exitingChild(onKill = () => {}) {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: { write: () => {}, end: () => {}, destroy: () => {} },
+      exitCode: null,
+      signalCode: null,
+      kill(signal = "SIGTERM") {
+        onKill(signal);
+        child.signalCode = signal;
+        child.emit("exit", null, signal);
+        return true;
+      },
+    });
+    return child;
+  }
+
   it("surfaces a typed PROTOCOL_ERROR to pending callers instead of silently dropping a corrupted frame", async () => {
     const client = new MeerkatClient();
-    client.process = { stdin: { write: () => {}, destroy: () => {} }, kill: () => {} };
+    client.process = exitingChild();
 
     // Register a pending request through the real request bookkeeping.
     const pending = client.registerRequest(client.requestId + 1);
@@ -5947,12 +5964,9 @@ describe("Transport corrupted-frame fault (row 246)", () => {
   it("marks the client unusable after transport corruption: later calls reject with the recorded fault, process is torn down", async () => {
     let killed = false;
     const client = new MeerkatClient();
-    client.process = {
-      stdin: { write: () => {}, destroy: () => {} },
-      kill: () => {
-        killed = true;
-      },
-    };
+    client.process = exitingChild(() => {
+      killed = true;
+    });
 
     client.handleLine("this is not json{");
 

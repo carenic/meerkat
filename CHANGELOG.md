@@ -343,7 +343,12 @@ them.
   likewise fail with `PROCESS_EXITED` at most about a second after the
   exit, even when such a process still holds the pipes; before, they and
   every request sent after the exit waited for the pipes to close, possibly
-  forever. Pre-existing since 0.6.0.
+  forever. After a protocol error (a reply line that is not JSON), the client
+  now stops the child the way `close()` does: a child that ignores SIGTERM is
+  killed after 5 seconds instead of being left running, and a process the
+  child started can no longer keep the caller's process alive through the
+  child's pipes. Pre-existing since 0.6.0; the protocol-error case since
+  0.7.0.
 
 ## [0.9.3] - 2026-10-18
 
