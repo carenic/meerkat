@@ -32,6 +32,9 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
   A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
+  local member whose registration needs a durability reload is reported with
+  `run` and `starts` `reload_required` instead of failing the Stop; a remote
+  one still fails it (reload it on its host, then retry). Since 0.9.4 a
   member reloaded while the mob is stopped stays held until Resume, as does
   one spawned into a stopped mob or held again after a failed Resume;
   retire, Shutdown and destroy release the hold for the members they dispose
@@ -124,8 +127,9 @@ succeeds after it. `MobError` is `#[non_exhaustive]`. Details in
   identity (live or retired) since the latest reset, without the actor queue.
   `MobStorage::read_member_binding_history(path)` reads a stopped mob's store
   read-only. Details in `references/mobs.md`.
-- Since 0.9.4 a host refusal of a restored member's registration removes
-  that registration and leaves the member Broken with
+- Since 0.9.4 a host refusal of a restored member's registration (also one
+  the boot recreates on a fresh session) removes that registration and leaves
+  only that member Broken with
   `MemberRegistrationRefused` (member status `registration_refusal`) until
   repaired; retire, respawn and destroy still work. A destination the runtime
   did not install is `MemberDestinationNotInstalled` (failure class

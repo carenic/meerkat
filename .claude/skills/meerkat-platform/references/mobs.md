@@ -150,6 +150,21 @@ first (stage `durability_reload_discard` while the runtime refuses its
 unregister until then), so it no longer stays registered until the process
 exits.
 
+Reload-required stops (since 0.9.4): Stop and Shutdown report a local member
+whose registration is durability-degraded with run and run starts
+`ReloadRequired` (`MemberStopRun::ReloadRequired`,
+`MemberRunStarts::ReloadRequired`, both non-exhaustive; wire `stop_report`
+`run` and `starts` `reload_required`), where they failed or waited on it. That
+registration starts no run until a reload replaces it: Shutdown's teardown
+discards it, and the `MobStop` a Stop staged holds the reloaded registration
+until Resume. A Shutdown holds every member's run starts and reports the first
+failure in roster order instead of stopping at it. In a multi-host mob a
+remote member that needs a reload still makes a Stop fail with
+`MobError::BridgeCommandRejected` (cause `internal`), and a Shutdown too when
+that member is `AutonomousHost`: a failed Stop rolls back and the mob stays
+Running, a failed Shutdown keeps every member; reload the member on its host,
+then retry.
+
 Stop hold: Stop holds run starts for every local member until Resume. Since
 0.9.4 that includes a member reloaded while the mob is stopped, one spawned
 into a stopped mob and one held again after a failed Resume; retire, Shutdown
@@ -212,8 +227,11 @@ end `Stopped`) and releases its owner context. The member stays Broken with
 in member status as `registration_refusal`, until an explicit repair;
 `ensure_member_live` returns it without asking the host again, and retire,
 respawn and destroy still work. A member `MobBuilder::resume` restores at boot
-gets the same refusal (a member it recreates on a fresh session still fails the
-whole resume). A runtime that did not install the destination the host
+gets the same refusal, and so does one it recreates on a fresh session (for
+example when the session service keeps no durable sessions): only that member
+is Broken and the others resume, where the refusal failed the whole resume
+before. Any other failure to recreate a member still fails the resume. A
+runtime that did not install the destination the host
 selected answers `MobError::MemberDestinationNotInstalled { session_id, error }`
 (data kind `mob_member_destination_not_installed` with a snake_case `cause`;
 before, a `WiringError`). Its failure class is `RuntimeRejected`, so schedule
