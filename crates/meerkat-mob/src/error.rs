@@ -1406,6 +1406,35 @@ pub enum MobError {
     /// and the mob set is restored.
     #[error("{}", provenance_unavailable_message(mob_id.as_ref()))]
     ProvenanceUnavailable { mob_id: Option<MobId> },
+
+    /// A member delivery scope captured at another incarnation of this mob
+    /// reached a scoped verb (see `meerkat_mob::MemberDeliveryScope`).
+    /// `expected` is the incarnation the scope names, `None` for a version-1
+    /// scope, which names none and is honoured only by an incarnation
+    /// assigned to a store from before 0.9.4. `current` is the incarnation
+    /// this mob runs at. Nothing was read or changed.
+    #[error("{}", incarnation_mismatch_message(mob_id, expected.as_ref(), current.as_ref()))]
+    IncarnationMismatch {
+        mob_id: MobId,
+        expected: Option<meerkat_core::service::MobIncarnationId>,
+        current: Option<meerkat_core::service::MobIncarnationId>,
+    },
+}
+
+fn incarnation_mismatch_message(
+    mob_id: &MobId,
+    expected: Option<&meerkat_core::service::MobIncarnationId>,
+    current: Option<&meerkat_core::service::MobIncarnationId>,
+) -> String {
+    let expected = match expected {
+        Some(incarnation) => format!("incarnation {incarnation}"),
+        None => "no incarnation (a version-1 scope)".to_string(),
+    };
+    let current = match current {
+        Some(incarnation) => format!("runs at incarnation {incarnation}"),
+        None => "has no live incarnation here".to_string(),
+    };
+    format!("mob '{mob_id}' {current}; the delivery scope names {expected}")
 }
 
 fn provenance_unavailable_message(mob_id: Option<&MobId>) -> String {

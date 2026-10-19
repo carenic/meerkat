@@ -2370,6 +2370,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::IncarnationInconsistent { .. }
         | MobError::IncarnationDestroyed { .. }
         | MobError::ProvenanceUnavailable { .. }
+        // A scope's incarnation is checked by the scoped verbs only.
+        | MobError::IncarnationMismatch { .. }
         | MobError::PlacedCompletionDeliveryRejected
         | MobError::PlacedCompletionHostNoEffect
         | MobError::PlacedCompletionHostCancelled
@@ -8306,6 +8308,16 @@ impl MobHandle {
             ))
         })?;
         Ok(record.provenance()?)
+    }
+
+    /// Whether this mob's incarnation was assigned to a store from before
+    /// 0.9.4 at its first resume, rather than minted by its create.
+    pub(crate) async fn incarnation_is_migrated(&self) -> Result<bool, MobError> {
+        Ok(self
+            .events
+            .creation_record()
+            .await?
+            .is_some_and(|record| record.is_migrated()))
     }
 
     /// The member of this mob's current roster whose bridge session is

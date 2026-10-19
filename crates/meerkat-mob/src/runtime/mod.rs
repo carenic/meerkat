@@ -424,7 +424,7 @@ pub use delegation::{
     DelegationTurnTerminal, LiveDelegationTerminalEvidence, render_bounded_delegation_task,
 };
 pub use delivery_scope::{
-    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope,
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope, ScopeIncarnation,
     ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
 };
 #[cfg(all(feature = "runtime-adapter", any(test, feature = "test-support")))]

@@ -37,6 +37,17 @@ them.
 
 ### Breaking
 
+- `MemberDeliveryScope` now names the mob incarnation it was captured at
+  and is written as version 2 (`MEMBER_DELIVERY_SCOPE_VERSION`). A stored
+  version-1 scope still decodes, as `ScopeIncarnation::Legacy`, and only a
+  mob whose incarnation was assigned to a store from before 0.9.4 honours
+  it. `MobHandle::require_scope_incarnation` refuses a scope from another
+  incarnation of the mob with the new `MobError::IncarnationMismatch`
+  (appended last), and `MobHandle::recover_bounded_work_at_scope` answers
+  such a scope with the new `ScopedRecoveryUnresolved::IncarnationNotHosted`
+  without reading any session. Consumers that persist scopes keep their
+  version-1 scopes; a 0.9.3 build refuses a version-2 scope as an
+  unsupported version.
 - `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
   `retained_registrations: usize`: notification registrations of the
   drained observer's change watches that were still running when the drain

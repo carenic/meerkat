@@ -133,6 +133,12 @@ pub(crate) mod private {
             self.finalized_at_ms.is_some()
         }
 
+        /// Whether this incarnation was assigned to a store from before
+        /// 0.9.4 at its first resume, rather than minted by a create.
+        pub(crate) fn is_migrated(&self) -> bool {
+            matches!(self.origin, MobCreationOrigin::Migrated)
+        }
+
         pub(crate) fn provenance(&self) -> Result<crate::MobProvenance, MobStoreError> {
             serde_json::from_str(&self.provenance)
                 .map_err(|error| MobStoreError::Serialization(error.to_string()))
