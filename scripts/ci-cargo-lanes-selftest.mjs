@@ -1636,6 +1636,19 @@ for (const path of [
       assert.fail(`${job}: the rest wave differs from the job in ${JSON.stringify(line)} / ${JSON.stringify(twin)}`);
     });
   }
+  // The feature-check rows are compile-only, but a row whose objects are not
+  // in sccache yet runs long: the rkat+6 matrix row hit the 30-minute timeout
+  // on main push run 39186529346 and on release-branch dispatches (projected
+  // 35-38 minutes cold). Both waves allow exactly 45 minutes: room for a cold
+  // row, and no more, so a hung row still fails early.
+  for (const job of ["feature-check", "feature-check-rest"]) {
+    const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: \d+$/.test(line));
+    assert.equal(
+      timeout,
+      "    timeout-minutes: 45",
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 45 (a cold feature row needs more than 30 minutes, and a longer cap only delays a hung row)`,
+    );
+  }
   const stagger = jobLines(workflow, "stagger").join("\n");
   assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
   assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
@@ -1679,6 +1692,13 @@ for (const path of [
     "only the changed package's suites join the pull request",
   );
   assert.ok(unitOf(facade).suites.some((suite) => suite.features.includes("openai-live")), "the facade touch runs its GPT Live suite in the pull request");
+  // meerkat-openai's realtime adapter (live.rs, text_adapter.rs) is behind
+  // `realtime`, which neither its default features nor its `live` suite
+  // enable: its own suite runs those tests in the pull request and on main.
+  const openai = planFor(["crates/meerkat-openai/src/live.rs"], ["--event", "pull_request"]);
+  const realtime = (suites) => suites.filter((suite) => suite.packages[0] === "meerkat-openai" && suite.features.includes("realtime"));
+  assert.equal(realtime(unitOf(openai).suites).length, 1, "a pull request that changes meerkat-openai runs its realtime suite");
+  assert.equal(realtime(facade.main_feature_unit_shards).length, 1, "main runs meerkat-openai's realtime suite");
   for (const suite of unitOf(facade).suites) {
     assert.ok(suite.estimated_minutes <= facade.pr_unit_budget_minutes, `${suite.name} fits the pull-request budget`);
   }

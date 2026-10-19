@@ -294,9 +294,12 @@ async fn authorize_publishes_token_expiry_to_auth_lease_handle() {
 async fn released_and_reacquired_auth_lease_invalidates_private_token_cache() {
     let mock = start_mock("lease-reacquired-token", 3600).await;
     let handle = Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new());
+    // The binding is this test's own: `release_lease` below try-locks the
+    // process-wide lifecycle exclusion, which the other tests' authorizers
+    // hold for the shared `azure_foundry` binding while they run.
     let lease_key = LeaseKey::new(
         RealmId::parse("dev").unwrap(),
-        BindingId::parse("azure_foundry").unwrap(),
+        BindingId::parse("azure_foundry_released").unwrap(),
         Some(ProfileId::parse("foundry_azure_ad").unwrap()),
     );
     let lease_handle = generated_auth_lease_handle_for_test(Arc::clone(&handle));

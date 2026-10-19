@@ -16,6 +16,36 @@ const INVALID_UNKNOWN_FIELD: &[u8] =
 const INVALID_ABSENT_DEFAULT_DENY: &[u8] =
     include_bytes!("fixtures/compiled_application_tool_policy_absent_default_deny_v1.json");
 
+/// The v1 fixtures are frozen. meerkat-contracts embeds byte-identical copies
+/// of its own (`tests/fixtures/`) and pins the same digests.
+#[test]
+fn v1_fixtures_keep_their_pinned_bytes() {
+    use sha2::{Digest, Sha256};
+    for (name, bytes, sha256) in [
+        (
+            "valid",
+            VALID,
+            "e39de29b4673bb286441032932224ee0dc59a24d3179c63e9683be27df73e26b",
+        ),
+        (
+            "unknown_field",
+            INVALID_UNKNOWN_FIELD,
+            "0ff0066878c133de7e69a5c4efb863029c15572cf5cf51cac4603c3d9c6d53c7",
+        ),
+        (
+            "absent_default_deny",
+            INVALID_ABSENT_DEFAULT_DENY,
+            "38eab839b8d2fd72623a58a489f3113b82749b38fdd78009d02273837c813631",
+        ),
+    ] {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            sha256,
+            "the {name} v1 fixture changed"
+        );
+    }
+}
+
 #[test]
 fn canonical_compiled_policy_fixture_round_trips_exactly() {
     let policy = CompiledApplicationToolPolicy::parse_canonical_json(VALID).unwrap();

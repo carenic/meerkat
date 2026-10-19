@@ -193,9 +193,9 @@ else
 fi
 
 # Windows release binaries are cross-compiled from Linux with cargo-xwin and
-# then verified on a Windows runner; the binary gate requires both of those
-# jobs whichever lane builds Linux/macOS, and no hosted matrix entry builds
-# natively on windows-latest any more.
+# then verified on the pinned windows-2025-vs2026 runner; the binary gate
+# requires both of those jobs whichever lane builds Linux/macOS, and no
+# hosted matrix entry builds natively on windows-latest any more.
 if awk '
     /^  build_binaries_windows_cross:/ { in_job = 1; next }
     in_job && /^  [[:alnum:]_-]+:/ { in_job = 0 }
@@ -207,7 +207,7 @@ if awk '
   awk '
     /^  verify_windows_binaries:/ { in_job = 1; next }
     in_job && /^  [[:alnum:]_-]+:/ { in_job = 0 }
-    in_job && /runs-on: windows-latest/ { native = 1 }
+    in_job && /runs-on: windows-2025-vs2026$/ { native = 1 }
     in_job && /--version/ { version = 1 }
     END { exit (native && version) ? 0 : 1 }
   ' "${release_workflow}" &&
@@ -216,9 +216,9 @@ if awk '
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
   ! grep -Fq 'king.europe.buildbuddy.io' "${release_workflow}"; then
-  pass "Release workflow cross-compiles Windows binaries on Linux, verifies them on windows-latest, and gates on both"
+  pass "Release workflow cross-compiles Windows binaries on Linux, verifies them on the pinned windows-2025-vs2026 runner, and gates on both"
 else
-  bad "Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on windows-latest (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
+  bad "Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on the pinned windows-2025-vs2026 runner (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
 fi
 
 web_build_timeout="$(
