@@ -1,8 +1,8 @@
 {
   "generated": true,
   "source_repository": "https://github.com/lukacf/meerkat-recall",
-  "source_ref": "cbd51bdbd15315f4eacc94bb2f1d6922cac7c824",
-  "source_commit": "cbd51bdbd15315f4eacc94bb2f1d6922cac7c824",
+  "source_ref": "d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c",
+  "source_commit": "d0493b6e9ba6e61ecea24e50b5f8748e3ffe8f6c",
   "source_version": "0.9.1",
   "source_docs_dirty": false,
   "public_pages": 45,
@@ -12,7 +12,6 @@
     "Local routes namespaced under /recall.",
     "Existing immutable technical Markdown/source links retain their original public commit; linked target bytes are unchanged.",
     "Missing page icons supplied; Pipeline Work Queue and Pipeline Budget Control retain their stable punctuation-free fragments.",
-    "Canonical source uses neutral consuming-host wording and explicitly distinguishes current source defaults from published 0.9.1 binaries; no downstream product or branch name is added to the mirror.",
-    "Prose that used the legacy product name says Meerkat Recall or names the `elephant-db` backend; compatibility identifiers and example code are unchanged."
+    "Canonical source uses neutral consuming-host wording and explicitly distinguishes current source defaults from published 0.9.1 binaries; no downstream product or branch name is added to the mirror."
   ]
 }
