@@ -5575,9 +5575,10 @@ struct DeferredResumeProvision {
     agent_identity: AgentIdentity,
     profile: crate::profile::Profile,
     external_tools: Option<Arc<dyn AgentToolDispatcher>>,
-    /// Tool names of the bundles the profile resolved when `external_tools`
-    /// was composed, for the declared tool restriction.
-    bundle_tools: std::collections::BTreeMap<String, meerkat_core::ToolNameSet>,
+    /// The deny vocabularies of the bundles the profile resolved when
+    /// `external_tools` was composed, for the declared tool restriction.
+    bundle_tools:
+        std::collections::BTreeMap<meerkat_core::ToolVocabularySource, meerkat_core::ToolNameSet>,
     compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
     context: Option<serde_json::Value>,
     labels: Option<std::collections::BTreeMap<String, String>>,
@@ -6023,7 +6024,10 @@ fn observe_spawn_exec_facts(
     });
     SpawnExecObservations {
         workgraph_required: explicit_workgraph,
-        rust_bundles_present: !profile.tools.rust_bundles.is_empty(),
+        // An opted-in bundle is a Rust bundle too: a placed member cannot
+        // carry either.
+        rust_bundles_present: !profile.tools.rust_bundles.is_empty()
+            || !profile.tools.bundles.is_empty(),
         per_spawn_external_tools_present,
         host_surface_mcp_allowlist_present: !profile.tools.mcp.is_empty(),
         inherited_tool_filter_present,
@@ -6033,6 +6037,26 @@ fn observe_spawn_exec_facts(
         memory_required: profile.tools.memory,
         mcp_required: !profile.tools.mcp_servers.is_empty(),
         resume_session_id,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod spawn_observation_tests {
+    use super::*;
+
+    /// A bundle a profile opts into is a Rust bundle too: a placed member
+    /// cannot carry it, so the spawn observes it like a strictly named one.
+    #[test]
+    fn an_opted_in_bundle_is_observed_as_a_rust_bundle() {
+        let mut profile: crate::profile::Profile =
+            serde_json::from_value(serde_json::json!({ "model": "claude-sonnet-4-6" })).unwrap();
+        let observe = |profile: &crate::profile::Profile| {
+            observe_spawn_exec_facts(profile, false, false, None, false, None).rust_bundles_present
+        };
+        assert!(!observe(&profile));
+        profile.tools.bundles = vec!["announcements".to_string()];
+        assert!(observe(&profile));
     }
 }
 

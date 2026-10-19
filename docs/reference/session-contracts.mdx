@@ -525,6 +525,8 @@ mobs. `set_additional_child_tool_bundles` carries the matching optional tool
 factories, so children can use a configured host service. Each factory uses
 the actual executing caller's resolver; registration conveys no inherited
 parent authority and exposes no tools unless the host selects their bundle.
+A bundle registered `ChildOffered` reaches only a child profile that names it
+in `tools.bundles`, and only while the host offers it (see the mobs guide).
 
 `MobMcpState::set_after_destroy` is the release counterpart for the mobs that
 state destroys. Once a destroy completed natively and the mob left the

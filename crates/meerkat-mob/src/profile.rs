@@ -107,9 +107,12 @@ pub struct ToolConfig {
     /// [`Self::rust_bundles`].
     ///
     /// Each build mounts every named bundle the mob's builder registered and
-    /// withholds the rest, so an opted bundle never fails a member build.
+    /// withholds the rest, so an opted bundle never fails a member build;
+    /// [`crate::MobHandle::withheld_tool_bundles`] reports what is withheld.
     /// The registrations are the ceiling, and they are read again at every
-    /// build, a resume included. The names persist with the definition.
+    /// build, a resume included. The names persist with the definition. While
+    /// a bundle is withheld, a deny name it may own is checked only at call
+    /// time.
     ///
     /// The public profile input (`tools.bundles`) accepts this list only on
     /// an inline profile of a child mob, and only for bundles the host offers

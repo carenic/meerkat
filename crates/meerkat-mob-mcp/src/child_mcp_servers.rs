@@ -56,6 +56,11 @@ impl ChildMcpServers {
         config: McpServerConfig,
         availability: ChildToolBundleAvailability,
     ) -> Result<Self, ChildMcpServerRegistrationError> {
+        if availability == ChildToolBundleAvailability::ChildOffered {
+            return Err(ChildMcpServerRegistrationError::OfferNotSupported {
+                name: config.name.clone(),
+            });
+        }
         if self
             .servers
             .get(&config.name)

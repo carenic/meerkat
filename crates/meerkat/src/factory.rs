@@ -9308,6 +9308,27 @@ impl AgentFactory {
                     );
                 }
             }
+            let withheld = restriction
+                .vocabulary
+                .keys()
+                .filter_map(|source| match source {
+                    meerkat_core::ToolVocabularySource::WithheldBundle(bundle) => {
+                        Some(bundle.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !withheld.is_empty() {
+                // An opted-in bundle the host no longer offers names tools
+                // this build cannot know: the gate enforces these by name.
+                let bundles = withheld.join(", ");
+                for tool in unknown.drain(..) {
+                    tracing::info!(
+                        declared_by = %restriction.declared_by,
+                        "deny name {tool} deferred to runtime (tool bundle {bundles} is withheld)"
+                    );
+                }
+            }
             if let Some(tool) = unknown.first() {
                 return Err(BuildAgentError::DeclaredToolUnknown(Box::new(
                     meerkat_core::error::DeclaredToolUnknown {

@@ -3187,7 +3187,12 @@ fn collect_profile_tool_classes(
     for name in &profile.tools.mcp {
         out.insert(AdaptiveToolIdentity::mcp_server(name)?.into_canonical());
     }
-    for name in &profile.tools.rust_bundles {
+    for name in profile
+        .tools
+        .rust_bundles
+        .iter()
+        .chain(&profile.tools.bundles)
+    {
         out.insert(AdaptiveToolIdentity::rust_bundle(name)?.into_canonical());
     }
     Ok(())
@@ -5980,6 +5985,26 @@ mod tests {
         assert_eq!(
             runtime_limits.allowed_skill_identities,
             BTreeSet::from(["lint-review".to_string()])
+        );
+    }
+
+    /// A bundle a profile opts into is a Rust bundle the layer uses, like a
+    /// strictly named one: the adaptive policy sees it.
+    #[test]
+    fn adaptive_layer_evidence_counts_opted_in_bundles() {
+        let mut context = compile_context();
+        let verifier = context
+            .profile_templates
+            .get_mut(&ProfileName::from("verifier"))
+            .expect("verifier profile");
+        verifier.tools.bundles = vec!["announcements".to_string()];
+
+        let compiled = compile_layer(&layer_plan(), &context, &compile_policy()).unwrap();
+        assert!(
+            compiled
+                .policy_evidence
+                .used_tool_classes
+                .contains("rust_bundle:announcements")
         );
     }
 

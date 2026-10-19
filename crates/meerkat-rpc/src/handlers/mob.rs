@@ -4894,6 +4894,25 @@ mod tests {
     /// T-A5: the four multi-host codes render their JSON-RPC codes with
     /// typed BARE detail data; everything else stays byte-identical to the
     /// phase-5 `invalid_params` rendering.
+    /// A create that opts into a tool bundle not offered to it is an argument
+    /// error on the wire, and its message lists what the host offers.
+    #[test]
+    fn mob_call_error_renders_an_unoffered_bundle_as_invalid_params() {
+        let err = MobError::ToolBundleNotOffered {
+            profile: meerkat_mob::ProfileName::from("worker"),
+            bundle: "announcements".to_string(),
+            offered: vec!["offered-pair".to_string()],
+        };
+        let response = mob_call_error(Some(RpcId::Num(1)), &err);
+        let error = response.error.expect("an unoffered bundle is an error");
+        assert_eq!(error.code, error::INVALID_PARAMS);
+        assert!(
+            error.message.contains("'announcements'") && error.message.contains("offered-pair"),
+            "{}",
+            error.message
+        );
+    }
+
     #[test]
     fn mob_call_error_renders_classified_codes_with_typed_data() {
         use meerkat_mob::{AgentRuntimeId, FenceToken};

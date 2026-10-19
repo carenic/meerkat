@@ -2828,6 +2828,50 @@ impl MobMcpState {
         }
     }
 
+    /// The tool bundles this host offers to child mobs: what a child mob's
+    /// inline profile may name in its `tools.bundles` opt-in.
+    fn offered_child_tool_bundles(&self) -> Vec<String> {
+        let mut offered: BTreeSet<String> = self.child_tool_bundles.offered().cloned().collect();
+        if let Some(bundles) = self.additional_child_tool_bundles.get() {
+            offered.extend(bundles.offered().cloned());
+        }
+        offered.into_iter().collect()
+    }
+
+    /// Refuse a definition whose inline profile opts into a tool bundle this
+    /// create does not offer: a child create offers what the host offers to
+    /// child mobs, any other create offers none. Realm-referenced profiles
+    /// are host-stored and keep what the host named.
+    fn refuse_unoffered_tool_bundles(
+        &self,
+        definition: &MobDefinition,
+        child: bool,
+    ) -> Result<(), MobError> {
+        let offered = if child {
+            self.offered_child_tool_bundles()
+        } else {
+            Vec::new()
+        };
+        for (profile_name, binding) in &definition.profiles {
+            let Some(profile) = binding.as_inline() else {
+                continue;
+            };
+            if let Some(bundle) = profile
+                .tools
+                .bundles
+                .iter()
+                .find(|bundle| !offered.contains(bundle))
+            {
+                return Err(MobError::ToolBundleNotOffered {
+                    profile: profile_name.clone(),
+                    bundle: bundle.clone(),
+                    offered,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn configure_builder(
         &self,
         mut builder: MobBuilder,
@@ -4023,6 +4067,8 @@ impl MobMcpState {
     ) -> Result<MobId, MobError> {
         // (b) gate, ADJ-P5-11 (same class as mob_create_definition).
         self.require_console_owner(ControlScope::SendCommand)?;
+        // A mobpack create is not a child mob's: it offers no tool bundle.
+        self.refuse_unoffered_tool_bundles(&definition, false)?;
         let admission = self.admit("mobpack create")?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
@@ -4181,6 +4227,14 @@ impl MobMcpState {
         // (b) gate, ADJ-P5-11: no per-mob grant can authorize creating a
         // mob that does not exist yet.
         self.require_console_owner(ControlScope::SendCommand)?;
+        // Before anything of the mob exists: an opt-in names only what this
+        // create offers.
+        let child = owner_bridge_session_authority.as_ref().is_some_and(
+            |(_, destroy_on_owner_archive, _)| {
+                child_tool_policy::is_child_mob(*destroy_on_owner_archive)
+            },
+        );
+        self.refuse_unoffered_tool_bundles(&definition, child)?;
         let admission = self.admit("mob create")?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
@@ -13967,6 +14021,71 @@ mod tests {
             err.to_string().contains("verified pack identity"),
             "expected verified identity mismatch error, got {err}"
         );
+    }
+
+    /// A definition whose inline profile opts into a tool bundle.
+    fn opting_definition(mob_id: &str) -> MobDefinition {
+        let mut definition = explicit_definition(mob_id);
+        for binding in definition.profiles.values_mut() {
+            if let Some(profile) = binding.as_inline_mut() {
+                profile.tools.bundles = vec!["announcements".to_string()];
+            }
+        }
+        definition
+    }
+
+    /// A create that is not a child mob's offers no tool bundle: a host create
+    /// and a mobpack create naming one are refused typed before anything of
+    /// the mob exists.
+    #[tokio::test]
+    async fn test_host_and_mobpack_creates_offer_no_tool_bundle() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority"),
+        );
+        let refusal = |error: MobError| match error {
+            MobError::ToolBundleNotOffered {
+                profile,
+                bundle,
+                offered,
+            } => (profile.to_string(), bundle, offered),
+            other => panic!("a typed bundle refusal, got {other:?}"),
+        };
+        let error = state
+            .mob_create_definition(opting_definition("opting-host-mob"))
+            .await
+            .expect_err("a host create offers no bundle");
+        assert_eq!(
+            refusal(error),
+            (
+                "worker".to_string(),
+                "announcements".to_string(),
+                Vec::new()
+            )
+        );
+        let error = state
+            .mob_create_from_mobpack(
+                opting_definition("opting-pack-mob"),
+                BTreeMap::new(),
+                meerkat_mob::MobDefinitionSourceIdentity::mobpack("c".repeat(64), Vec::new()),
+            )
+            .await
+            .expect_err("a mobpack create offers no bundle");
+        assert_eq!(
+            refusal(error),
+            (
+                "worker".to_string(),
+                "announcements".to_string(),
+                Vec::new()
+            )
+        );
+        for mob_id in ["opting-host-mob", "opting-pack-mob"] {
+            assert!(
+                state.handle_for(&MobId::from(mob_id)).await.is_err(),
+                "no mob is created"
+            );
+        }
     }
 
     #[tokio::test]

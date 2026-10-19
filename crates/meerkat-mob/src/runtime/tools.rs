@@ -687,16 +687,20 @@ impl AgentToolDispatcher for McpProvenanceFilter {
 // Mob tool dispatcher
 // ---------------------------------------------------------------------------
 
-/// The tool names of each bundle `profile` resolves to, from the same
-/// registered bundles [`compose_external_tools_for_profile`] composes.
+/// The deny vocabularies of the bundles `profile` names, from the same
+/// registered bundles [`compose_external_tools_for_profile`] composes: the
+/// tool names of each registered bundle, strict (`rust_bundles`) or opted
+/// into (`bundles`), and a nameless withheld entry for each opted bundle
+/// `tool_bundles` does not register.
 pub(crate) fn resolve_profile_bundle_tools(
     profile: &crate::profile::Profile,
     tool_bundles: &BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
-) -> BTreeMap<String, meerkat_core::ToolNameSet> {
-    profile
+) -> BTreeMap<meerkat_core::ToolVocabularySource, meerkat_core::ToolNameSet> {
+    let mut vocabulary: BTreeMap<_, _> = profile
         .tools
         .rust_bundles
         .iter()
+        .chain(&profile.tools.bundles)
         .filter_map(|name| {
             tool_bundles.get(name).map(|dispatcher| {
                 // Deferred catalog tools are composed like visible ones, so
@@ -712,10 +716,24 @@ pub(crate) fn resolve_profile_bundle_tools(
                             .map(|entry| entry.tool.name.clone()),
                     )
                     .collect();
-                (name.clone(), names)
+                (
+                    meerkat_core::ToolVocabularySource::Bundle(name.clone()),
+                    names,
+                )
             })
         })
-        .collect()
+        .collect();
+    vocabulary.extend(
+        withheld_profile_bundles(profile, |bundle| tool_bundles.contains_key(bundle)).map(
+            |bundle| {
+                (
+                    meerkat_core::ToolVocabularySource::WithheldBundle(bundle.clone()),
+                    meerkat_core::ToolNameSet::new(),
+                )
+            },
+        ),
+    );
+    vocabulary
 }
 
 /// The bundles `profile` opted into (`tools.bundles`) that `is_registered`
@@ -731,18 +749,16 @@ pub(crate) fn withheld_profile_bundles<'a>(
     })
 }
 
-/// Record a build's resolved bundle tools as bundle vocabularies on its
-/// declared tool restriction, so the profile's deny list may name them.
+/// Record a build's resolved bundle vocabularies (see
+/// [`resolve_profile_bundle_tools`]) on its declared tool restriction, so the
+/// profile's deny list may name the bundles' tools, and a deny name a
+/// withheld bundle may own is deferred to the execution gate.
 pub(crate) fn attach_declared_bundle_tools(
     config: &mut meerkat::AgentBuildConfig,
-    bundle_tools: BTreeMap<String, meerkat_core::ToolNameSet>,
+    bundle_tools: BTreeMap<meerkat_core::ToolVocabularySource, meerkat_core::ToolNameSet>,
 ) {
     if let Some(restriction) = config.declared_tool_restriction.as_mut() {
-        restriction.vocabulary.extend(
-            bundle_tools
-                .into_iter()
-                .map(|(bundle, names)| (meerkat_core::ToolVocabularySource::Bundle(bundle), names)),
-        );
+        restriction.vocabulary.extend(bundle_tools);
     }
 }
 
@@ -755,6 +771,7 @@ pub(super) fn compose_external_tools_for_profile(
     persisted_mob_tool_authority_context: Option<MobToolAuthorityContext>,
 ) -> Result<Option<Arc<dyn AgentToolDispatcher>>, MobError> {
     let mut dispatchers: Vec<Arc<dyn AgentToolDispatcher>> = Vec::new();
+    let mob_id = mob_handle.definition().id.clone();
 
     // Mount mob operator tools iff the canonical resolver yields an authority.
     // The resolver is the single source of truth shared with build_agent_config.
@@ -804,6 +821,35 @@ pub(super) fn compose_external_tools_for_profile(
         dispatchers.push(Arc::new(BundleProvenanceDispatcher::mount(
             dispatcher, name,
         )));
+    }
+
+    // Opted-in bundles: each the mob registers is mounted once (a name the
+    // strict list already mounted is skipped), and each it does not register
+    // is withheld. The registrations are the ceiling, read at every build.
+    let mut mounted: std::collections::BTreeSet<&str> = profile
+        .tools
+        .rust_bundles
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for name in &profile.tools.bundles {
+        if let Some(dispatcher) = tool_bundles.get(name)
+            && mounted.insert(name.as_str())
+        {
+            dispatchers.push(Arc::new(BundleProvenanceDispatcher::mount(
+                Arc::clone(dispatcher),
+                name,
+            )));
+        }
+    }
+    let withheld: Vec<&String> =
+        withheld_profile_bundles(profile, |bundle| tool_bundles.contains_key(bundle)).collect();
+    if !withheld.is_empty() {
+        tracing::warn!(
+            mob_id = %mob_id,
+            bundles = ?withheld,
+            "opted-in tool bundles withheld: this mob does not register them"
+        );
     }
 
     // Compose per-spawn and default external tools with deterministic
