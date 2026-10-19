@@ -3025,8 +3025,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/v0_8_10_recovery_migration_session.json",
+        "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
         "tests/turn_projection_cost.rs",
