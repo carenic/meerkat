@@ -544,6 +544,14 @@ jobs:
       - name: MODULE.bazel.lock recorded inputs
         run: make verify-bazel-module-lock-inputs
 
+      # The BUILD files are generated from Cargo metadata and the Rust
+      # sources' text. The bazel-graph job's query and --nobuild build accept
+      # a stale graph that is still valid (a missing data label, no target
+      # for a new test), and the commit hook that regenerates them is local
+      # and never sees a merge commit. About 5 seconds.
+      - name: Generated Bazel BUILD files are current
+        run: make buildbuddy-generate-check
+
       # Release binaries must compile no test-only code: the release builds
       # pass the release define, under which no target they link enables a
       # non-shipping feature; the packaged-binary marker scan is the backstop.

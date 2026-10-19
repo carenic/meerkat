@@ -412,7 +412,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   is planned as the whole workspace (without looking for evidence): the
   explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
-  parity, lock consistency, `make ci-lanes-selftest`,
+  parity, lock consistency, generated BUILD freshness
+  (`make buildbuddy-generate-check`), `make ci-lanes-selftest`,
   `make path-classifier-selftest`, and the ripgrep tombstone scans
   (`legacy-surface-gate`, `session-control-gate`, `deprecated-backend-gate`;
   ripgrep is installed first, and each scan refuses to run without it).

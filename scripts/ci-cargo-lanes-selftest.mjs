@@ -1649,6 +1649,20 @@ for (const path of [
       `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 45 (a cold feature row needs more than 30 minutes, and a longer cap only delays a hung row)`,
     );
   }
+  // Every run checks the generated BUILD files against their inputs: the
+  // bazel-graph job's query and --nobuild build accept a stale graph that is
+  // still valid, and the commit hook is local and never sees a merge commit.
+  // Format + governance runs on every event, and the step has no condition.
+  const governance = jobLines(workflow, "fmt-governance");
+  assert.ok(!governance.some((line) => /^    if: /.test(line)), "Format + governance runs on every event");
+  const freshness = governance.indexOf("      - name: Generated Bazel BUILD files are current");
+  assert.ok(freshness >= 0, "Format + governance checks that the generated Bazel BUILD files are current");
+  const nextStep = governance.findIndex((line, index) => index > freshness && /^      - /.test(line));
+  assert.deepEqual(
+    governance.slice(freshness + 1, nextStep === -1 ? governance.length : nextStep),
+    ["        run: make buildbuddy-generate-check"],
+    "the BUILD freshness step runs the generator's check and nothing else, on every run",
+  );
   const stagger = jobLines(workflow, "stagger").join("\n");
   assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
   assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
