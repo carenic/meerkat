@@ -660,6 +660,85 @@ async fn an_incomplete_admitted_destroy_keeps_admission_closed() {
     }
 }
 
+/// A mob restored with its durable destroy marker (a destroy admitted, then
+/// left incomplete, before the process stopped) starts with admission
+/// closed, before its handle escapes: nothing is spawned into it, and no
+/// owner lease is granted, while the destroy's retry has not finished, and
+/// that retry is still admitted. A current-thread runtime, so the restored
+/// actor task has not run when the handle is first read.
+#[tokio::test]
+async fn a_mob_restored_with_an_admitted_destroy_starts_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-destroy-restart");
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone()),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    handle
+        .spawn_spec(worker_spec("d67-destroy-restart-worker"))
+        .await
+        .expect("spawn worker");
+    events.fail_appends_for("MemberRetired").await;
+    match handle.destroy().await {
+        Err(crate::runtime::handle::MobDestroyError::Incomplete { .. }) => {}
+        other => panic!("expected an incomplete destroy, got {other:?}"),
+    }
+    crash_stop_and_release_routes(handle).await;
+
+    // The retirement append still fails, so the restored actor's automatic
+    // destroy retry stays incomplete and the actor stays up while the test
+    // reads it.
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events.clone(),
+        runtime_metadata,
+    ))
+    .with_session_service(service)
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("resume the destroying mob from its durable marker");
+    // Read before this test first yields: only what the builder did before
+    // it returned the handle.
+    let closed_at_return = *resumed.admission_closed().borrow();
+    let owner_at_return = resumed.acquire_owner().map(drop);
+    let late_spawn = resumed
+        .spawn_spec(worker_spec("d67-destroy-restart-late"))
+        .await;
+    match late_spawn {
+        Ok(_) => panic!("a restored destroying mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+    assert_eq!(
+        closed_at_return,
+        Some(MobAdmissionCloseReason::Destroyed),
+        "admission is closed before the restored handle escapes"
+    );
+    match owner_at_return {
+        Ok(()) => panic!("a restored destroying mob grants no owner, even before its actor runs"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+    assert_eq!(
+        *resumed.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+
+    // The destroy's own retry is still admitted: once the retirement append
+    // succeeds, it finishes the destroy and the actor exits.
+    let mut task = resumed.actor_task_watch();
+    events.allow_appends_for("MemberRetired").await;
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+}
+
 /// A durability fail-stop exits the actor, so the mob grants no owner lease
 /// either: admission closes with the fail-stop's own reason before the actor
 /// quiesces and closes its mailbox.

@@ -18540,7 +18540,9 @@ impl MobActor {
 
     /// Close admission because the actor is about to take no more commands:
     /// - an admitted Shutdown, before its teardown;
-    /// - an admitted Destroy, once its durable marker is written;
+    /// - an admitted Destroy, once its durable marker is written, and a
+    ///   restored actor that carries that marker, before its handle escapes
+    ///   ([`Self::close_admission_if_destroy_admitted`]);
     /// - a durability fail-stop, before the actor quiesces and exits, and a
     ///   durable recovery that fail-stops before command admission.
     ///
@@ -18556,6 +18558,16 @@ impl MobActor {
             .decide(CloseRequest::Unconditional(reason), MobBusy::default)
         {
             self.enter_admission_closed(reason);
+        }
+    }
+
+    /// A restored mob whose destroy was already admitted (its durable
+    /// `MobDestroying` marker) admits nothing new: the destroy's retry is its
+    /// only way on. The builder calls this before it returns the handle, so
+    /// no owner lease or command is admitted first.
+    pub(super) fn close_admission_if_destroy_admitted(&mut self) {
+        if self.destroy_admitted() {
+            self.close_admission_for_exit(MobAdmissionCloseReason::Destroyed);
         }
     }
 

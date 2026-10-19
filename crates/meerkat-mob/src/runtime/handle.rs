@@ -14324,7 +14324,9 @@ impl MobHandle {
     /// unless admission had already closed): [`Self::acquire_owner`] and every
     /// command the Closing state refuses then fail with
     /// [`MobError::AdmissionClosed`]. A destroy left incomplete after its
-    /// admission keeps admission closed; retry the destroy.
+    /// admission keeps admission closed; retry the destroy. A mob restored
+    /// with that marker starts with admission closed: `MobBuilder::resume`
+    /// returns its handle already closed.
     pub async fn destroy(&self) -> Result<MobDestroyReport, MobDestroyError> {
         match self
             .execute_destroy_machine_command(MobMachineCommand::Destroy)

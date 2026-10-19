@@ -10657,6 +10657,11 @@ impl MobBuilder {
                     )),
                 });
             }
+            // A mob restored with an admitted destroy (its durable
+            // MobDestroying marker) starts with admission closed, before its
+            // handle escapes: nothing is spawned into it, and no owner lease
+            // is granted, before the destroy's retry runs.
+            actor.close_admission_if_destroy_admitted();
             // A17 recovery trigger (DEC-P6E-11): obligations survive via event
             // replay, subscriptions do not — re-derive pending remote-turn
             // obligations from recovered machine state and keep their members'
