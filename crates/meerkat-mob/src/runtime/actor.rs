@@ -4362,6 +4362,9 @@ pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
+static FAIL_RETIREMENT_PROJECTION_CLEANUP_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
 static FAIL_AFTER_DESTROY_REMOTE_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -4372,6 +4375,15 @@ static FAIL_AFTER_REMOTE_SUPERVISOR_REVOKED_FOR_IDENTITY: std::sync::Mutex<Optio
 pub(super) fn fail_session_ingress_detach_for_test(session_id: &SessionId) {
     if let Ok(mut target) = FAIL_SESSION_INGRESS_DETACH_FOR_SESSION.lock() {
         *target = Some(session_id.clone());
+    }
+}
+
+/// Fail `agent_identity`'s next retirement projection-cleanup stage, after
+/// its archive observation, so the retirement settles stuck there.
+#[cfg(test)]
+pub(super) fn fail_retirement_projection_cleanup_for_test(agent_identity: &AgentIdentity) {
+    if let Ok(mut target) = FAIL_RETIREMENT_PROJECTION_CLEANUP_FOR_IDENTITY.lock() {
+        *target = Some(agent_identity.clone());
     }
 }
 
@@ -18616,10 +18628,14 @@ impl MobActor {
             .saturating_add(usize::from(self.pending_shutdown_teardown.is_some()))
             .saturating_add(usize::from(self.shutdown_exit.is_some()))
             .saturating_add(self.identity_reconcile_queue.len());
+        // Only a current incarnation holds work. An identity whose member
+        // retired keeps its last execution observation until its next
+        // incarnation is minted, and that observation is not work in flight.
         let member_work = state
             .member_in_flight_work
-            .values()
-            .fold(0_u64, |total, work| total.saturating_add(*work));
+            .iter()
+            .filter(|(identity, _)| state.identity_to_runtime.contains_key(*identity))
+            .fold(0_u64, |total, (_, work)| total.saturating_add(*work));
         let runs = self
             .run_tasks
             .len()
@@ -26359,21 +26375,32 @@ impl MobActor {
                 }
                 MobCommand::Retire {
                     agent_identity,
-                    expected_incarnation,
+                    target,
                     redrive,
                     deadline,
                     admission_tx,
                     reply_tx,
                 } => {
-                    let result = self.validate_retire_member_incarnation(&expected_incarnation).await;
-                    if !self.respawn_topology_reply_withheld {
-                        match result {
-                            Ok(()) => self.start_retirement(
-                                agent_identity, deadline, Some(admission_tx),
-                                retirement_io::RetirementReply::Retire(reply_tx),
-                                redrive,
-                            ).await,
-                            Err(error) => { let _ = reply_tx.send(Err(error)); }
+                    match target {
+                        super::state::RetireTarget::Exact(expected_incarnation) => {
+                            let result = self.validate_retire_member_incarnation(&expected_incarnation).await;
+                            if !self.respawn_topology_reply_withheld {
+                                match result {
+                                    Ok(()) => self.start_retirement(
+                                        agent_identity, deadline, Some(admission_tx),
+                                        retirement_io::RetirementReply::Retire(reply_tx),
+                                        redrive,
+                                    ).await,
+                                    Err(error) => { let _ = reply_tx.send(Err(error)); }
+                                }
+                            }
+                        }
+                        super::state::RetireTarget::Scoped(step) => {
+                            if !self.respawn_topology_reply_withheld {
+                                self.retire_scoped_step(
+                                    agent_identity, step, deadline, admission_tx, reply_tx,
+                                ).await;
+                            }
                         }
                     }
                 }

@@ -221,6 +221,7 @@ pub enum MobMachineCatalogInput {
     BeginExplicitResumeCleanup,
     SettleExplicitResumeCleanup,
     FinishExplicitResume,
+    RetireAtScope,
 }
 
 impl MobMachineCatalogInput {
@@ -442,6 +443,7 @@ impl MobMachineCatalogInput {
         Self::BeginExplicitResumeCleanup,
         Self::SettleExplicitResumeCleanup,
         Self::FinishExplicitResume,
+        Self::RetireAtScope,
     ];
 
     #[must_use]
@@ -666,6 +668,7 @@ impl MobMachineCatalogInput {
             Self::BeginExplicitResumeCleanup => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::BeginExplicitResumeCleanup,
             Self::SettleExplicitResumeCleanup => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::SettleExplicitResumeCleanup,
             Self::FinishExplicitResume => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::FinishExplicitResume,
+            Self::RetireAtScope => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::RetireAtScope,
         }
     }
 
@@ -915,6 +918,7 @@ impl MobMachineCatalogInput {
             Self::BeginExplicitResumeCleanup => "BeginExplicitResumeCleanup",
             Self::SettleExplicitResumeCleanup => "SettleExplicitResumeCleanup",
             Self::FinishExplicitResume => "FinishExplicitResume",
+            Self::RetireAtScope => "RetireAtScope",
         }
     }
 }

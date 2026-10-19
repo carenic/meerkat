@@ -529,6 +529,23 @@ them.
   0.9.3 member host forks participants, council participants included, without
   the policy, and a participant whose source has activated host instructions
   fails its first turn.
+- MobMachine classifies a member delivery scope: `MobMachineInput`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineInputVariant` (meerkat-machine-schema), and the kernel `Input`
+  and `InputKind` gain the variant `RetireAtScope`; `MobMachineEffect`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineEffectVariant` (meerkat-machine-schema), and the kernel `Effect`
+  and `EffectKind` gain `RetireAtScopeResolved`. The kernel
+  `generated::mob::TransitionId` gains `RetireAtScopeCurrentRunning`,
+  `RetireAtScopeCurrentStopped`, `RetireAtScopeNoCurrentIncarnationRunning`,
+  `RetireAtScopeNoCurrentIncarnationStopped`,
+  `RetireAtScopeStaleFenceTokenRunning`, `RetireAtScopeStaleFenceTokenStopped`,
+  `RetireAtScopeStaleSessionBindingRunning`,
+  `RetireAtScopeStaleSessionBindingStopped`,
+  `RetireAtScopeMobNotRunningCompleted` and
+  `RetireAtScopeMobNotRunningDestroyed`. Every new variant is appended last,
+  so no existing variant's discriminant moves. Exhaustive matches must add
+  the arms.
 
 ### Security
 
@@ -949,6 +966,36 @@ them.
   `session/fork_at` and `session/fork_replace` take `inherited_instructions`
   and report `reactivated_instruction_count`. The Python and TypeScript SDKs
   take the option on their fork calls and read the count.
+- `meerkat-machine-schema`: MobMachine decides whether a member delivery
+  scope still names its member's current incarnation. The runtime-internal
+  input `RetireAtScope` names an identity, a runtime id, the identity's fence
+  and a session, and answers without a state change through the effect
+  `RetireAtScopeResolved` and its `RetireAtScopeVerdictKind`: `Current` when
+  the identity maps to that runtime id, its fence is the scope's, and the
+  session is the member's binding or the session its retirement is
+  releasing; `NoCurrentIncarnation` when the identity maps to no
+  incarnation; `StaleFenceToken` when another incarnation is current;
+  `StaleSessionBinding` when the incarnation is current but the session is
+  not one it holds; and `MobNotRunning` in a completed or destroyed mob. The
+  verdicts are total and mutually exclusive. The member lifecycle TLC audit
+  checks both in every state its domains reach and for every scope they can
+  name, and that a Current verdict admits a Retire of that incarnation; five
+  `meerkat_mob_seam` witnesses reach each verdict.
+- `meerkat-mob`: `MobHandle::retire_at_scope` retires exactly the member
+  incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
+  semantics. Each step, every descendant and the member itself, is admitted
+  by MobMachine's `RetireAtScope` verdict on the scope in the same actor
+  command that retires it, so a successor minted while the call runs is
+  never retired through an older scope. A scope whose incarnation was
+  replaced answers `StaleFenceToken`, a moved session binding
+  `StaleDeliveryScope`, and a completed or destroyed mob
+  `InvalidTransition`; a refusal stops the call. After the member's own
+  step, descendants are retired only while no incarnation of the identity
+  is current. `Ok(())` is `retire`'s barrier:
+  with no incarnation current, the call waits out a retirement the mob still
+  owns for the identity, answers `Ok(())` only once the identity has no
+  roster entry and no stuck retirement, and answers a stuck retirement with
+  `MemberRetirementStuck`.
 
 ### Changed
 
@@ -1748,6 +1795,79 @@ them.
   effective activations into the child (`reactivate_inherited`) or are refused,
   typed, before commit. Council crash recovery verifies a planned child's
   re-activation rows exactly and measures its prefix without them.
+- Generated TLA+ models now evaluate ordering comparisons between optional
+  values. The renderer wrote MobMachine's member progress guards
+  (`get_copied(id) <= Some(observed_at_ms)` and its `>` twin) as a plain `<=`
+  or `>` between option records, which TLC cannot evaluate, so any MobMachine
+  run with members stopped at the first state where a member progress
+  observation could fire: the deep profile stopped after nine states, before
+  any member transition was checked. Such comparisons now render with Rust's
+  `Option` order (`None` below every `Some`, two `Some`s by their values)
+  through `OptionLt` / `OptionLe`, which a model defines only when it uses
+  them, with ASSUMEs that re-check the order on every TLC run. The operators
+  branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
+  action-level `\/`. The Rust kernel already applied this order; only the
+  models of MobMachine and the two compositions that embed it change.
+  A TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`, lane
+  shard audits-b) now model-checks the member lifecycle around those guards,
+  over the whole reachable space of its domains, which no generated profile
+  checks to the end: roster recovery and
+  reset, session binding (fresh, replacing, already current), progress
+  observations, the local retire arms and the RetireMember signal, the
+  runtime retirement and archive observations, the resume path's replay
+  arms, stop and resume, and the recovery of an archived identity's next
+  incarnation. Every one of those arms must fire, a member's recorded
+  observation time never decreases, and the audit fails when a progress arm
+  loses its guard or the guard is rendered as a plain `<=` again.
+- MobMachine closes two latent gaps in its roster replay arms
+  (`meerkat-machine-schema`, `meerkat-mob`); no shell path feeds either
+  sequence.
+  - A replayed peer-only retirement start is refused for a runtime whose
+    retirement already records a session. Replayed over a releasing
+    retirement in flight, whose binding is already gone, the start removed
+    the recorded session while that session's ingress detach was still
+    pending, which broke the generated invariant that every pending detach
+    keeps its session. The resume path replays at most one start per
+    incarnation into freshly recovered state.
+  - A replayed Retired record that names the identity's current runtime
+    with another generation now matches no arm. The stale-incarnation arm
+    took it and pruned that runtime's state while the identity still mapped
+    to it, which broke the generated invariant that an identity held for a
+    respawn maps to no runtime or to a Retiring one. A consistent record
+    cannot carry that pairing: a runtime id names its generation. The arm
+    now takes only an identity that maps to no runtime and whose recorded
+    generation differs, so it no longer overlaps the current-runtime and
+    remapped-identity arms, which keep taking every record they took
+    before.
+  The member lifecycle audit, which now drives every replay arm, fails on
+  either gap.
+- A respawned member no longer starts from its predecessor's execution-health
+  record (`meerkat-machine-schema`, `meerkat-mob`). MobMachine kept each
+  identity's run state, in-flight work, progress token, last observation,
+  last progress time and event, and health class across incarnations, because
+  no arm removed them: until the new incarnation's session answered an
+  execution snapshot, its status reported the predecessor's in-flight work and
+  last progress time, and a first snapshot equal to the predecessor's last one
+  read as unchanged at the predecessor's progress time. Every arm that mints an
+  incarnation (spawn commit, placed and roster recovery, roster reset) now
+  clears that record, so a new incarnation's progress clock starts at its
+  first observation.
+- An idle close no longer counts a retired member's last observed work
+  (`meerkat-mob`). `close_if_idle` and the latched close after the last owner
+  releases summed the in-flight work of every identity's last execution
+  observation, retired ones included, so a member whose last status read saw
+  work in flight and that then retired kept the mob busy for its life:
+  admission never closed idle, and `MobBusy` reported runs that did not exist.
+  Only identities with a current incarnation count now. Pre-existing in 0.9.3.
+- After a restart, a placed member no longer shows its predecessor's kickoff
+  (`meerkat-mob`). The startup replay applies kickoff updates per identity and
+  installs the current placed incarnation from its committed carrier only after
+  the whole event pass, so the kickoff phase and error of an earlier
+  incarnation of the same identity (a failed kickoff, for example) carried
+  over to a placed incarnation that had no kickoff of its own, although the
+  live spawn commit had cleared them. The replay now clears the identity's
+  kickoff where that incarnation's spawn event sits; the incarnation's own
+  kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

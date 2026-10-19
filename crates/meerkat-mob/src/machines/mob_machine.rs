@@ -21,7 +21,7 @@ pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
     FlowRunReducerCommandKind, LoopIterationReducerCommandKind, MemberAdmissionVerdictKind,
     MemberHealthClass, MemberProgressEventKind, MobLifecycleJournalKind,
     PlacedCompletionLifecycleIntentKind, PolicyDecision, ResumeMemberOutcomeDisposition,
-    SpawnExecPhase, StepFaultDispositionKind, StepOutputFaultKind,
+    RetireAtScopeVerdictKind, SpawnExecPhase, StepFaultDispositionKind, StepOutputFaultKind,
     SupervisorEscalationFailureCause, TurnTimeoutDisposition, WorkContentAttribution,
 };
 
@@ -6579,6 +6579,343 @@ mod tests {
     }
 
     #[test]
+    fn retired_replay_for_another_generation_never_prunes_the_current_runtime() {
+        let mut seeded = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("retired-replay-current-runtime");
+        let runtime = AgentRuntimeId::from("retired-replay-current-runtime:0");
+        seed_live_member(&mut seeded, &identity, &runtime);
+
+        // The identity still maps to its generation-zero runtime, which is no
+        // longer live. A Retired record naming that runtime with another
+        // generation is inconsistent (a runtime id names its generation) and
+        // matches no arm.
+        let mut current = seeded.state().clone();
+        current.live_runtime_ids.remove(&runtime);
+        let mut authority = MobMachineAuthority::recover_from_state(current)
+            .expect("recover a current incarnation whose runtime is gone");
+        let before = authority.state().clone();
+        assert!(
+            authority
+                .apply_signal(MobMachineSignal::RecoverRosterMemberRetired {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime.clone(),
+                    generation: Generation(1),
+                    preserve_machine_topology: false,
+                    preservation_started: false,
+                })
+                .is_err(),
+            "a Retired record with another generation must not settle the current runtime"
+        );
+        assert_eq!(authority.state(), &before);
+
+        // Control: a delayed final of an older generation, for an identity
+        // that maps to no runtime, still takes the stale-incarnation arm. It
+        // prunes the stale runtime's bookkeeping and keeps the identity's
+        // history.
+        let mut retired = seeded.state().clone();
+        retired.identity_to_runtime.remove(&identity);
+        retired.member_session_bindings.remove(&identity);
+        retired
+            .identity_runtime_generations
+            .insert(identity.clone(), Generation(1));
+        let mut authority = MobMachineAuthority::recover_from_state(retired)
+            .expect("recover an identity whose later incarnation retired");
+        assert!(authority.state().live_runtime_ids.contains(&runtime));
+        assert!(
+            authority
+                .state()
+                .runtime_fence_tokens
+                .contains_key(&runtime)
+        );
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMemberRetired {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime.clone(),
+                generation: Generation(0),
+                preserve_machine_topology: false,
+                preservation_started: false,
+            })
+            .expect("a delayed final of an older generation prunes its runtime");
+        assert!(!authority.state().live_runtime_ids.contains(&runtime));
+        assert!(
+            !authority
+                .state()
+                .runtime_fence_tokens
+                .contains_key(&runtime)
+        );
+        assert_eq!(
+            authority
+                .state()
+                .identity_runtime_generations
+                .get(&identity),
+            Some(&Generation(1))
+        );
+    }
+
+    fn retire_at_scope_verdict(
+        authority: &mut MobMachineAuthority,
+        identity: &AgentIdentity,
+        runtime_id: &AgentRuntimeId,
+        fence_token: FenceToken,
+        session_id: &SessionId,
+    ) -> RetireAtScopeVerdictKind {
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::RetireAtScope {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                fence_token,
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("RetireAtScope classifies every scope in every phase")
+        .into_effects()
+        .into_iter()
+        .find_map(|effect| match effect {
+            MobMachineEffect::RetireAtScopeResolved { verdict, .. } => Some(verdict),
+            _ => None,
+        })
+        .expect("RetireAtScope resolves exactly one verdict")
+    }
+
+    #[test]
+    fn retire_at_scope_names_the_current_incarnation_and_nothing_else() {
+        let mut authority = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("scoped-retire-live");
+        let runtime_id = AgentRuntimeId::from("scoped-retire-live:0");
+        let session_id = seed_live_member(&mut authority, &identity, &runtime_id);
+        let fence = *authority
+            .state()
+            .identity_runtime_fence_tokens
+            .get(&identity)
+            .expect("seeded fence");
+        let before = authority.state().clone();
+        for (runtime, fence, session, expected) in [
+            (
+                runtime_id.clone(),
+                fence,
+                session_id.clone(),
+                RetireAtScopeVerdictKind::Current,
+            ),
+            (
+                runtime_id.clone(),
+                FenceToken(fence.0 + 1),
+                session_id.clone(),
+                RetireAtScopeVerdictKind::StaleFenceToken,
+            ),
+            (
+                AgentRuntimeId::from("scoped-retire-live:1"),
+                fence,
+                session_id.clone(),
+                RetireAtScopeVerdictKind::StaleFenceToken,
+            ),
+            (
+                runtime_id.clone(),
+                fence,
+                SessionId::from("scoped-retire-other-session"),
+                RetireAtScopeVerdictKind::StaleSessionBinding,
+            ),
+        ] {
+            assert_eq!(
+                retire_at_scope_verdict(&mut authority, &identity, &runtime, fence, &session),
+                expected,
+                "scope ({runtime:?}, {fence:?}, {session:?})"
+            );
+        }
+        let never = AgentIdentity::from("scoped-retire-never-a-member");
+        assert_eq!(
+            retire_at_scope_verdict(
+                &mut authority,
+                &never,
+                &AgentRuntimeId::from("scoped-retire-never-a-member:0"),
+                fence,
+                &session_id,
+            ),
+            RetireAtScopeVerdictKind::NoCurrentIncarnation
+        );
+        assert_eq!(
+            authority.state(),
+            &before,
+            "the classifier changes no state"
+        );
+
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Stop,
+        );
+        MobMachineMutator::apply(&mut authority, MobMachineInput::Stop).expect("stop");
+        assert_eq!(
+            retire_at_scope_verdict(&mut authority, &identity, &runtime_id, fence, &session_id),
+            RetireAtScopeVerdictKind::Current,
+            "a stopped mob still names its current incarnation"
+        );
+    }
+
+    #[test]
+    fn retire_at_scope_keeps_a_releasing_retirement_current_for_its_own_session() {
+        let mut authority = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("scoped-retire-releasing");
+        let runtime_id = AgentRuntimeId::from("scoped-retire-releasing:0");
+        let session_id = seed_live_member(&mut authority, &identity, &runtime_id);
+        let fence = *authority
+            .state()
+            .identity_runtime_fence_tokens
+            .get(&identity)
+            .expect("seeded fence");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::Retire {
+                mob_id: MobId::from("scoped-retire-releasing-mob"),
+                agent_runtime_id: runtime_id.clone(),
+                agent_identity: identity.clone(),
+                generation: Generation(0),
+                releasing: Some(session_id.clone()),
+                session_id: Some(session_id.clone()),
+            },
+        )
+        .expect("open a releasing retirement");
+        assert!(
+            !authority
+                .state()
+                .member_session_bindings
+                .contains_key(&identity),
+            "the releasing retirement moved the session binding"
+        );
+        assert_eq!(
+            retire_at_scope_verdict(&mut authority, &identity, &runtime_id, fence, &session_id),
+            RetireAtScopeVerdictKind::Current,
+            "the Retiring incarnation is current for the session its retirement releases"
+        );
+        assert_eq!(
+            retire_at_scope_verdict(
+                &mut authority,
+                &identity,
+                &runtime_id,
+                fence,
+                &SessionId::from("scoped-retire-releasing-other"),
+            ),
+            RetireAtScopeVerdictKind::StaleSessionBinding
+        );
+    }
+
+    #[test]
+    fn retire_at_scope_keeps_a_retiring_placed_member_current_through_its_binding() {
+        let identity = AgentIdentity::from("scoped-retire-placed");
+        let runtime_id = AgentRuntimeId("scoped-retire-placed:0".to_string());
+        let host_id = HostId("scoped-retire-placed-host".to_string());
+        let member_session_id = SessionId("scoped-retire-placed-session".to_string());
+        let owner_session_id = SessionId("scoped-retire-placed-owner".to_string());
+        let fence = FenceToken(51);
+        let mut authority = MobMachineAuthority::new();
+        authority
+            .apply_signal(MobMachineSignal::RecoverOwnerBridgeSession {
+                bridge_session_id: owner_session_id.clone(),
+                destroy_on_owner_archive: false,
+                implicit_delegation_mob: false,
+            })
+            .expect("recover the placed member's owner");
+        authority
+            .apply_signal(MobMachineSignal::RecoverHostBinding {
+                host_id: host_id.clone(),
+                pubkey: PeerSigningKey([8; 32]),
+                endpoint: PeerAddress("tcp://scoped-retire-placed-host.test:4100".to_string()),
+                epoch: 1,
+                binding_generation: 1,
+                protocol_min: 4,
+                protocol_max: 4,
+                engine_version: "scoped-retire-placed-engine".to_string(),
+                durable_sessions: true,
+                autonomous_members: true,
+                hard_cancel_member: true,
+                tracked_input_cancel: true,
+                memory_store: true,
+                mcp: true,
+                resolvable_providers: std::collections::BTreeSet::from(["anthropic".to_string()]),
+                approval_forwarding: false,
+                live_endpoint: None,
+            })
+            .expect("recover the placed member's host");
+        authority
+            .apply_signal(MobMachineSignal::RecoverCommittedPlacedSpawn {
+                spawn_id: PlacedSpawnId("scoped-retire-placed-spawn".to_string()),
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                generation: Generation(0),
+                fence_token: fence,
+                host_id,
+                host_binding_generation: 1,
+                member_session_id: member_session_id.clone(),
+                member_peer_endpoint: MemberPeerEndpoint {
+                    name: PeerName("mob/worker/scoped-retire-placed".to_string()),
+                    peer_id: PeerId("scoped-retire-placed-peer".to_string()),
+                    address: PeerAddress("tcp://scoped-retire-placed-member.test:4200".to_string()),
+                    signing_key: PeerSigningKey([3; 32]),
+                },
+                profile_name: "worker".to_string(),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: true,
+                provision_operation_id: "scoped-retire-placed-operation".to_string(),
+                operation_owner_session_id: owner_session_id,
+            })
+            .expect("recover the placed member");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::Retire {
+                mob_id: MobId::from("scoped-retire-placed-mob"),
+                agent_runtime_id: runtime_id.clone(),
+                agent_identity: identity.clone(),
+                generation: Generation(0),
+                releasing: Some(member_session_id.clone()),
+                session_id: Some(member_session_id.clone()),
+            },
+        )
+        .expect("open the placed member's releasing retirement");
+        assert_eq!(
+            authority.state().member_state_markers.get(&runtime_id),
+            Some(&MobMemberState::Retiring)
+        );
+        assert!(
+            !authority
+                .state()
+                .runtime_retire_pending_sessions
+                .contains_key(&runtime_id),
+            "a placed retirement keeps its binding and parks no session"
+        );
+        assert_eq!(
+            retire_at_scope_verdict(
+                &mut authority,
+                &identity,
+                &runtime_id,
+                fence,
+                &member_session_id,
+            ),
+            RetireAtScopeVerdictKind::Current,
+            "the retiring placed member is current through its kept binding"
+        );
+    }
+
+    #[test]
+    fn retire_at_scope_refuses_in_a_completed_mob() {
+        let mut authority = MobMachineAuthority::new();
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Complete,
+        );
+        MobMachineMutator::apply(&mut authority, MobMachineInput::Complete)
+            .expect("complete the mob");
+        assert_eq!(
+            retire_at_scope_verdict(
+                &mut authority,
+                &AgentIdentity::from("scoped-retire-completed"),
+                &AgentRuntimeId::from("scoped-retire-completed:0"),
+                FenceToken(1),
+                &SessionId::from("scoped-retire-completed-session"),
+            ),
+            RetireAtScopeVerdictKind::MobNotRunning
+        );
+    }
+
+    #[test]
     fn exhausted_generation_history_cannot_compute_or_recover_generation_zero() {
         let identity = AgentIdentity::from("generation-exhausted");
         let runtime = AgentRuntimeId::from("generation-exhausted:max");
@@ -6902,6 +7239,349 @@ mod tests {
             authority.state().member_health_class.get(&near_max),
             Some(&MemberHealthClass::Healthy)
         );
+    }
+
+    /// Records a wedged execution-health history for `identity`: an open run
+    /// whose progress token does not change for five minutes.
+    fn observe_wedged_member(authority: &mut MobMachineAuthority, identity: &AgentIdentity) {
+        for observed_at_ms in [1_000, 301_000] {
+            MobMachineMutator::apply(
+                authority,
+                MobMachineInput::ObserveMemberProgress {
+                    agent_identity: identity.clone(),
+                    run_open: true,
+                    in_flight_work: 2,
+                    progress_token: "previous-incarnation:open".into(),
+                    observed_at_ms,
+                },
+            )
+            .expect("observe the previous incarnation's execution");
+        }
+        assert_eq!(
+            authority.state().member_health_class.get(identity),
+            Some(&MemberHealthClass::Wedged),
+            "the previous incarnation is wedged"
+        );
+    }
+
+    /// The minted incarnation has no execution-health history, and its first
+    /// observation starts a fresh progress clock: the raw snapshot the
+    /// previous incarnation was wedged on reads as progress, not as a wait.
+    fn assert_fresh_execution_health(
+        authority: &mut MobMachineAuthority,
+        identity: &AgentIdentity,
+        label: &str,
+    ) {
+        let state = authority.state();
+        assert!(
+            !state.member_run_open.contains_key(identity),
+            "{label}: run state carried over"
+        );
+        assert!(
+            !state.member_in_flight_work.contains_key(identity),
+            "{label}: in-flight work carried over"
+        );
+        assert!(
+            !state.member_progress_tokens.contains_key(identity),
+            "{label}: progress token carried over"
+        );
+        assert!(
+            !state.member_last_observed_at_ms.contains_key(identity),
+            "{label}: last observation carried over"
+        );
+        assert!(
+            !state.member_last_progress_at_ms.contains_key(identity),
+            "{label}: progress clock carried over"
+        );
+        assert!(
+            !state.member_last_progress_event.contains_key(identity),
+            "{label}: progress event carried over"
+        );
+        assert!(
+            !state.member_health_class.contains_key(identity),
+            "{label}: health class carried over"
+        );
+
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::ObserveMemberProgress {
+                agent_identity: identity.clone(),
+                run_open: true,
+                in_flight_work: 2,
+                progress_token: "previous-incarnation:open".into(),
+                observed_at_ms: 302_000,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("{label}: first observation of the new incarnation: {error:?}")
+        });
+        let state = authority.state();
+        assert_eq!(
+            state.member_last_progress_event.get(identity),
+            Some(&MemberProgressEventKind::ExecutionAdvanced),
+            "{label}: the first observation is progress"
+        );
+        assert_eq!(
+            state.member_health_class.get(identity),
+            Some(&MemberHealthClass::Healthy),
+            "{label}: the new incarnation starts healthy"
+        );
+        assert_eq!(
+            state.member_last_progress_at_ms.get(identity),
+            Some(&302_000),
+            "{label}: the progress clock starts at the first observation"
+        );
+    }
+
+    #[test]
+    fn respawned_member_starts_without_the_previous_execution_health() {
+        let mut authority = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("respawn-health-history");
+        let runtime_v0 = AgentRuntimeId::from("respawn-health-history:0");
+        let runtime_v1 = AgentRuntimeId::from("respawn-health-history:1");
+        let digest = "respawn-health-profile-digest".to_string();
+
+        let spawn = |authority: &mut MobMachineAuthority,
+                     runtime_id: &AgentRuntimeId,
+                     fence_token: FenceToken,
+                     generation: Generation| {
+            MobMachineMutator::apply(
+                authority,
+                MobMachineInput::AuthorizeSpawnProfile {
+                    agent_identity: identity.clone(),
+                    profile_name: "worker".to_string(),
+                    model: "test-model".to_string(),
+                    profile_material_digest: digest.clone(),
+                    tool_config_digest: "test-tool-config-digest".to_string(),
+                    skills_digest: "test-skills-digest".to_string(),
+                    provider_params_digest: None,
+                    output_schema_digest: None,
+                    external_addressable: true,
+                    resolved_spec_digest: None,
+                },
+            )
+            .expect("authorize the spawn profile");
+            MobMachineMutator::apply(
+                authority,
+                MobMachineInput::BeginSpawnExec {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation,
+                    profile_material_digest: digest.clone(),
+                    external_addressable: true,
+                    runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                    bridge_session_id: None,
+                    replacing: None,
+                    placement: None,
+                    workgraph_required: false,
+                    rust_bundles_present: false,
+                    per_spawn_external_tools_present: false,
+                    mob_default_external_tools_present: false,
+                    default_llm_client_override_present: false,
+                    host_surface_mcp_allowlist_present: false,
+                    inherited_tool_filter_present: false,
+                    shell_env_present: false,
+                    mcp_stdio_env_present: false,
+                    mcp_http_headers_present: false,
+                    memory_required: false,
+                    mcp_required: false,
+                    resume_session_id: None,
+                    placed_spawn_id: None,
+                    placed_provision_operation_id: None,
+                    placed_operation_owner_session_id: None,
+                    effective_profile_override_present: false,
+                    effective_model_override_present: false,
+                },
+            )
+            .expect("open the spawn execution");
+            MobMachineMutator::apply(
+                authority,
+                MobMachineInput::CommitSpawnMembership {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation,
+                    profile_material_digest: digest.clone(),
+                    external_addressable: true,
+                    runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                    bridge_session_id: None,
+                    replacing: None,
+                    member_peer_endpoint: None,
+                    spec_digest_echo: None,
+                    ack_engine_version: None,
+                    placed_spawn_id: None,
+                    provision_operation_id: None,
+                },
+            )
+            .expect("commit the membership");
+        };
+
+        spawn(&mut authority, &runtime_v0, FenceToken(7), Generation(0));
+        observe_wedged_member(&mut authority, &identity);
+
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::Retire {
+                mob_id: MobId::from("respawn-health-history-mob"),
+                agent_runtime_id: runtime_v0.clone(),
+                agent_identity: identity.clone(),
+                generation: Generation(0),
+                releasing: None,
+                session_id: None,
+            },
+        )
+        .expect("admit the retirement");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::RecordRemoteMemberRuntimeRetired {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_v0.clone(),
+                fence_token: FenceToken(7),
+                generation: Generation(0),
+            },
+        )
+        .expect("record the runtime retirement");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::RecordRemoteMemberSupervisorRevoked {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_v0.clone(),
+                fence_token: FenceToken(7),
+                generation: Generation(0),
+            },
+        )
+        .expect("record the supervisor revocation");
+        authority
+            .apply_signal(
+                MobMachineSignal::ObserveRemoteMemberRetirementArchivedAndSupervisorRevoked {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_v0,
+                    fence_token: FenceToken(7),
+                    generation: Generation(0),
+                    preserve_machine_topology: false,
+                },
+            )
+            .expect("settle the retirement");
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&identity)
+        );
+
+        spawn(&mut authority, &runtime_v1, FenceToken(8), Generation(1));
+        assert_eq!(
+            authority.state().identity_to_runtime.get(&identity),
+            Some(&runtime_v1)
+        );
+        assert_fresh_execution_health(&mut authority, &identity, "respawn commit");
+    }
+
+    #[test]
+    fn recovered_roster_member_starts_without_the_previous_execution_health() {
+        let identity = AgentIdentity::from("recovered-health-history");
+        let mut authority = MobMachineAuthority::new();
+        observe_wedged_member(&mut authority, &identity);
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMember {
+                agent_identity: identity.clone(),
+                agent_runtime_id: AgentRuntimeId::from("recovered-health-history:0"),
+                fence_token: FenceToken(7),
+                generation: Generation(0),
+                profile_name: "worker".to_string(),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: true,
+            })
+            .expect("recover the roster member");
+        assert_fresh_execution_health(&mut authority, &identity, "roster recovery");
+    }
+
+    #[test]
+    fn recovered_reset_starts_without_the_previous_execution_health() {
+        let identity = AgentIdentity::from("reset-health-history");
+        let runtime_v0 = AgentRuntimeId::from("reset-health-history:0");
+        let runtime_v1 = AgentRuntimeId::from("reset-health-history:1");
+        let mut seeded = MobMachineAuthority::new();
+        seed_live_member(&mut seeded, &identity, &runtime_v0);
+        observe_wedged_member(&mut seeded, &identity);
+        let mut authority = MobMachineAuthority::recover_from_state(seeded.state().clone())
+            .expect("recover a member with an execution-health history");
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMemberReset {
+                agent_identity: identity.clone(),
+                previous_agent_runtime_id: runtime_v0,
+                previous_generation: Generation(0),
+                agent_runtime_id: runtime_v1.clone(),
+                fence_token: FenceToken(8),
+                generation: Generation(1),
+            })
+            .expect("an exact reset replay mints the next incarnation");
+        assert_eq!(
+            authority.state().identity_to_runtime.get(&identity),
+            Some(&runtime_v1)
+        );
+        assert_fresh_execution_health(&mut authority, &identity, "reset recovery");
+    }
+
+    #[test]
+    fn recovered_placed_member_starts_without_the_previous_execution_health() {
+        let identity = AgentIdentity::from("placed-health-history");
+        let host = HostId("placed-health-host".to_string());
+        let mut authority = MobMachineAuthority::new();
+        authority
+            .apply_signal(MobMachineSignal::RecoverOwnerBridgeSession {
+                bridge_session_id: SessionId("owner-session".to_string()),
+                destroy_on_owner_archive: false,
+                implicit_delegation_mob: false,
+            })
+            .expect("recover owner");
+        authority
+            .apply_signal(MobMachineSignal::RecoverHostBinding {
+                host_id: host.clone(),
+                pubkey: PeerSigningKey([8; 32]),
+                endpoint: PeerAddress("tcp://placed-health-host.test:4100".to_string()),
+                epoch: 1,
+                binding_generation: 1,
+                protocol_min: 4,
+                protocol_max: 4,
+                engine_version: "placed-test-engine".to_string(),
+                durable_sessions: true,
+                autonomous_members: true,
+                hard_cancel_member: true,
+                tracked_input_cancel: true,
+                memory_store: true,
+                mcp: true,
+                resolvable_providers: std::collections::BTreeSet::from(["anthropic".to_string()]),
+                approval_forwarding: false,
+                live_endpoint: None,
+            })
+            .expect("recover bound host");
+        observe_wedged_member(&mut authority, &identity);
+        authority
+            .apply_signal(MobMachineSignal::RecoverCommittedPlacedSpawn {
+                spawn_id: PlacedSpawnId("placed-health-spawn".to_string()),
+                agent_identity: identity.clone(),
+                agent_runtime_id: AgentRuntimeId("placed-health-history:0".to_string()),
+                generation: Generation(0),
+                fence_token: FenceToken(7),
+                host_id: host,
+                host_binding_generation: 1,
+                member_session_id: SessionId("placed-health-session".to_string()),
+                member_peer_endpoint: MemberPeerEndpoint {
+                    name: PeerName("mob/worker/placed-health-history".to_string()),
+                    peer_id: PeerId("placed-health-peer".to_string()),
+                    address: PeerAddress("tcp://placed-health-member.test:4200".to_string()),
+                    signing_key: PeerSigningKey([3; 32]),
+                },
+                profile_name: "worker".to_string(),
+                runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
+                external_addressable: true,
+                provision_operation_id: "placed-health-operation".to_string(),
+                operation_owner_session_id: SessionId("owner-session".to_string()),
+            })
+            .expect("recover the committed placed member");
+        assert_fresh_execution_health(&mut authority, &identity, "placed recovery");
     }
 
     #[test]
