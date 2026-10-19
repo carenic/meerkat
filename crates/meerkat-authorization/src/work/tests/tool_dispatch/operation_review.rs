@@ -1937,6 +1937,12 @@ async fn superseded_review_is_reviewed_once_more_and_enters() {
         "a second owner-issued attempt, never the first one reused"
     );
     assert_eq!(
+        work.review_context_calls(),
+        2,
+        "the first attempt's read and the supersession decision's, which the \
+         second attempt is shown"
+    );
+    assert_eq!(
         *world
             .observer
             .bodies_at_used

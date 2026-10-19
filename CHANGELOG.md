@@ -92,9 +92,13 @@ them.
   before the tool's dispatcher runs. When the operation is still permitted at
   R2 with the same review material, the fenced dispatch re-prepares it and
   reviews it once more from the start, as a second review attempt for the
-  same `tool_call_id`; the earlier verdict is never used. A review observer
-  can therefore see a `ContextChanged` retirement followed by that second
-  attempt: a host must not treat the retirement as the call's final outcome.
+  same `tool_call_id`; the earlier verdict is never used. Deciding to review
+  once more reads the successor's review material once
+  (`review_operation_context`), so an owner sees one more read per
+  superseded call; when the material is unchanged, that read is the one the
+  second attempt is shown. A review observer can therefore see a
+  `ContextChanged` retirement followed by that second attempt: a host must
+  not treat the retirement as the call's final outcome.
   At most one re-review runs per call, only after an allow or a reviewer
   failure, and only with enough tool time left for a whole review deadline.
   A second change, a denial or escalation, an expired review, a changed tier
