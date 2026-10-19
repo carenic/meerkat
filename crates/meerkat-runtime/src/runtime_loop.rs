@@ -9612,6 +9612,7 @@ mod tests {
             content: "peer message".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(input_to_prompt(&input), "peer message");
     }
@@ -9645,6 +9646,7 @@ mod tests {
             content: "plain body payload".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         assert_eq!(input_to_prompt(&input), "plain body payload");
@@ -9682,6 +9684,7 @@ mod tests {
             content: "stale helper-local comms prose".into(),
             payload: Some(serde_json::json!({"subject": "alpha beta gamma"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let prompt = input_to_prompt(&input);
@@ -9731,6 +9734,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -9789,6 +9793,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -9862,6 +9867,7 @@ mod tests {
                     payload: None,
                     content: Vec::new(),
                     delivery_id: None,
+                    in_reply_to: None,
                 }],
             },
             identity: None,
@@ -10017,6 +10023,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
         let input_id = input.id().clone();
 
@@ -10093,6 +10100,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
@@ -10149,6 +10157,7 @@ mod tests {
             content: String::new().into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
             .expect("single input metadata cannot conflict");
@@ -10209,6 +10218,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
             .expect("single input metadata cannot conflict");
@@ -10280,6 +10290,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let policy = crate::policy_table::DefaultPolicyTable::resolve(&input, true);
@@ -10349,6 +10360,7 @@ mod tests {
             content: body.into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -11239,6 +11251,7 @@ mod tests {
             content: String::new().into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -12719,6 +12732,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let input_id = input.id().clone();
         let primitive =
@@ -12786,6 +12800,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -12847,6 +12862,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -12907,6 +12923,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -13158,6 +13175,7 @@ mod tests {
                     content: InteractionContent::Message {
                         body: "build failed".into(),
                         blocks: None,
+                        in_reply_to: None,
                     },
                     rendered_text: "External event via webhook: build failed".into(),
                     handling_mode: meerkat_core::types::HandlingMode::Queue,
@@ -14533,6 +14551,7 @@ mod tests {
             content: "done".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let id = input.id().clone();
         let primitive =
@@ -14578,6 +14597,7 @@ mod tests {
             content: "msg".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let continuation =
             Input::Continuation(ContinuationInput::detached_background_op_completed());

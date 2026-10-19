@@ -53,6 +53,7 @@ fn fresh_input(template: &Input, label: &str, progress: bool) -> Input {
             .into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     } else {
         let Input::Prompt(mut prompt) = template.clone() else {

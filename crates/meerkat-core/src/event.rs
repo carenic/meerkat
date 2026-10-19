@@ -3615,6 +3615,7 @@ mod tests {
                 payload: None,
                 content: Vec::new(),
                 delivery_id: None,
+                in_reply_to: None,
             }
         }
 

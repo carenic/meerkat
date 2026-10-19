@@ -2708,6 +2708,7 @@ mod tests {
             content_taint: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         };
         let envelope_id = uuid::Uuid::new_v4();
         let receipt = SendReceipt::PeerMessageSent {

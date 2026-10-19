@@ -4297,6 +4297,17 @@
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
               },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
+              },
               "intent": {
                 "type": [
                   "string",
@@ -13115,6 +13126,17 @@
               },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [

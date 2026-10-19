@@ -7887,6 +7887,7 @@ class SystemNoticeBlockComms(TypedDict, total=False):
     content: NotRequired[list[ContentBlock]]
     delivery_id: NotRequired[Optional[InteractionId]]
     direction: Required[SystemNoticeDirection]
+    in_reply_to: NotRequired[Optional[InteractionId]]
     intent: NotRequired[Optional[str]]
     kind: Required[CommsNoticeKind]
     payload: NotRequired[Any]

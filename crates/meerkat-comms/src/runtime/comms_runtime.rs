@@ -603,7 +603,12 @@ fn classified_entry_to_interaction(
                     content_taint: _,
                     handling_mode: _,
                     objective_id: _,
-                } => meerkat_core::InteractionContent::Message { body, blocks },
+                    in_reply_to,
+                } => meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks,
+                    in_reply_to: in_reply_to.map(meerkat_core::InteractionId),
+                },
                 MessageKind::IncarnationFencedMessage {
                     body,
                     blocks,
@@ -697,7 +702,11 @@ fn classified_entry_to_interaction(
                 id: meerkat_core::InteractionId(interaction_id.unwrap_or(raw_item_id.0)),
                 from_route: None,
                 from: format!("event:{source}"),
-                content: meerkat_core::InteractionContent::Message { body, blocks },
+                content: meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks,
+                    in_reply_to: None,
+                },
                 rendered_text,
                 handling_mode,
                 render_metadata,
@@ -1212,6 +1221,7 @@ impl CoreCommsRuntime for CommsRuntime {
                 content_taint,
                 handling_mode,
                 objective_id,
+                in_reply_to,
             } => self
                 .send_peer_command(
                     &to,
@@ -1221,6 +1231,7 @@ impl CoreCommsRuntime for CommsRuntime {
                         content_taint: None,
                         handling_mode: Some(handling_mode),
                         objective_id,
+                        in_reply_to: in_reply_to.map(|delivery| delivery.0),
                     },
                     content_taint,
                 )
@@ -2531,6 +2542,7 @@ impl CommsRuntime {
                 content_taint,
                 handling_mode,
                 objective_id,
+                in_reply_to,
             } => {
                 self.hydrate_blocks_for_transport(&mut blocks, "comms message")
                     .await?;
@@ -2540,6 +2552,7 @@ impl CommsRuntime {
                     content_taint,
                     handling_mode,
                     objective_id,
+                    in_reply_to,
                 })
             }
             crate::types::MessageKind::IncarnationFencedMessage {
@@ -5826,6 +5839,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: meerkat_core::types::HandlingMode::Queue,
                     objective_id: None,
+                    in_reply_to: None,
                 },
             )
             .await
@@ -6610,6 +6624,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "must not pass local classifier".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -6750,6 +6765,91 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("prompt injection"));
     }
 
+    /// A message's signed `in_reply_to` reaches the classified interaction
+    /// as the delivery it answers; a message without one answers nothing.
+    #[tokio::test]
+    async fn hydrating_a_message_with_blocks_keeps_its_in_reply_to() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime = CommsRuntime::new(test_runtime_config("hydrate-reply", &tmp))
+            .await
+            .unwrap();
+        let answered = Uuid::new_v4();
+        let kind = runtime
+            .hydrate_message_kind_for_transport(MessageKind::Message {
+                objective_id: None,
+                content_taint: None,
+                blocks: Some(vec![meerkat_core::types::ContentBlock::Text {
+                    text: "see the attached".to_string(),
+                }]),
+                body: "reply".to_string(),
+                handling_mode: None,
+                in_reply_to: Some(answered),
+            })
+            .await
+            .expect("text blocks hydrate");
+        assert!(
+            matches!(kind, MessageKind::Message { in_reply_to: Some(id), .. } if id == answered),
+            "{kind:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn classified_snapshot_carries_a_messages_signed_in_reply_to() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_runtime_config("in-reply-to", &tmp);
+        let runtime = CommsRuntime::new(config).await.unwrap();
+        install_test_peer_comms_handle(&runtime);
+
+        let sender = Keypair::generate();
+        add_trusted_peer_with_generated_authority(
+            &runtime,
+            trusted_descriptor("sender", sender.public_key(), "tcp://127.0.0.1:4201"),
+        )
+        .await;
+
+        let answered = Uuid::new_v4();
+        let message = |body: &str, in_reply_to: Option<Uuid>| {
+            signed_envelope(
+                &sender,
+                runtime.public_key(),
+                MessageKind::Message {
+                    objective_id: None,
+                    content_taint: None,
+                    blocks: None,
+                    body: body.to_string(),
+                    handling_mode: None,
+                    in_reply_to,
+                },
+            )
+        };
+        for envelope in [message("reply", Some(answered)), message("fresh", None)] {
+            runtime
+                .router
+                .inbox_sender()
+                .send_classified(InboxItem::External { envelope })
+                .into_result()
+                .unwrap();
+        }
+
+        let interactions = snapshot_runtime_interactions(&runtime).await;
+        let in_reply_to_of = |wanted: &str| {
+            interactions
+                .iter()
+                .find_map(|interaction| match &interaction.content {
+                    meerkat_core::InteractionContent::Message {
+                        body, in_reply_to, ..
+                    } if body == wanted => Some(*in_reply_to),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted} message in {interactions:?}"))
+        };
+        assert_eq!(
+            in_reply_to_of("reply"),
+            Some(meerkat_core::InteractionId(answered))
+        );
+        assert_eq!(in_reply_to_of("fresh"), None);
+    }
+
     #[tokio::test]
     async fn classified_snapshot_converts_all_authenticated_content_variants() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6776,6 +6876,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let req = signed_envelope(
@@ -6888,6 +6989,7 @@ mod tests {
                 blocks: None,
                 content_taint: Some(SenderContentTaint::Tainted),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let clean = signed_envelope(
@@ -6912,6 +7014,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
 
@@ -7041,6 +7144,7 @@ mod tests {
                 blocks: Some(blocks.clone()),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
 
@@ -7062,6 +7166,7 @@ mod tests {
             meerkat_core::InteractionContent::Message {
                 body,
                 blocks: got_blocks,
+                in_reply_to: _,
             } => {
                 assert_eq!(body, "please inspect this");
                 assert_eq!(got_blocks.as_ref(), Some(&blocks));
@@ -7097,6 +7202,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         runtime
@@ -8763,6 +8869,7 @@ mod tests {
             to: missing_peer_route("missing-peer"),
             body: "hello".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let result = CoreCommsRuntime::send(&runtime, cmd).await;
@@ -8805,6 +8912,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "greeting".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
@@ -8878,6 +8986,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "blob-backed image".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
@@ -9200,6 +9309,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "inproc-only hello".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let receipt = CoreCommsRuntime::send(&sender, cmd).await;
@@ -9270,6 +9380,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "hello without trusted".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
 
         let expected_peer_id = receiver.public_key().to_peer_id().to_string();
@@ -9385,6 +9496,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "hello trusted peer".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, send_cmd).await;
@@ -10344,6 +10456,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await
@@ -10382,6 +10495,7 @@ mod tests {
                 to: peer_route(&peer_name, peer_pubkey),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10434,6 +10548,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "policy-rejected".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10470,6 +10585,7 @@ mod tests {
                 to: missing_peer_route(&missing_name),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10515,6 +10631,7 @@ mod tests {
                 to: peer_route(&missing_name, missing_pubkey),
                 body: "hello".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;
@@ -10572,6 +10689,7 @@ mod tests {
                         to: PeerRoute::with_display_name(entry.peer_id, entry.name.clone()),
                         body: "truthfulness test".to_string(),
                         handling_mode: meerkat_core::types::HandlingMode::Queue,
+                        in_reply_to: None,
                     },
                     PeerSendability::PeerRequest => CommsCommand::PeerRequest {
                         objective_id: None,
@@ -11026,6 +11144,7 @@ mod tests {
             to: peer_route(&peer_name, peer.public_key()),
             body: "not streamable".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let finalize = spawn_runtime_finalization(Arc::clone(&peer), finalizer);
         let result = CoreCommsRuntime::send_and_stream(&runtime, cmd).await;
@@ -11203,6 +11322,7 @@ mod tests {
             to: peer_route(&receiver_name, receiver.public_key()),
             body: "should fail".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
+            in_reply_to: None,
         };
         let result = CoreCommsRuntime::send(&sender, cmd).await;
         assert!(
@@ -11371,6 +11491,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: None,
                     objective_id: None,
+                    in_reply_to: None,
                 },
                 None,
             )

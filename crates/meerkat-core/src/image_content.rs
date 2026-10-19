@@ -1078,6 +1078,7 @@ mod tests {
                     },
                 }],
                 delivery_id: None,
+                in_reply_to: None,
             },
         ))];
 

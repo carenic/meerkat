@@ -129,6 +129,7 @@ impl Fixture {
                 content: body.into(),
                 payload: None,
                 handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+                in_reply_to: None,
             });
             inputs.push(input.id().clone());
             assert!(
@@ -501,6 +502,7 @@ async fn stage_refusal_terminal_remains_recoverable_after_a_prior_abandoned_fail
         content: "directed input after an abandoned failure".into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
     assert!(
         fixture

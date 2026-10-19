@@ -735,6 +735,7 @@ fn peer_steer_with(convention: crate::input::PeerConvention, body: &str) -> Inpu
         content: body.into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     })
 }
 

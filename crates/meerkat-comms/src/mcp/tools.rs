@@ -421,6 +421,9 @@ pub async fn handle_tools_call_typed(
                 content_taint: None,
                 handling_mode: input.handling_mode,
                 objective_id: None,
+                // The reply names the delivery it answers, signed in the
+                // envelope, so the receiver can link it.
+                in_reply_to: Some(capability.in_reply_to),
             }
             .with_objective_id(objective_id_from_dispatch_context(dispatch_context)?);
             dispatch(ctx, command).await
@@ -447,6 +450,8 @@ pub async fn handle_tools_call_typed(
                 content_taint: None,
                 handling_mode: input.handling_mode,
                 objective_id: None,
+                // A fresh message answers no delivery.
+                in_reply_to: None,
             }
             .with_objective_id(objective_id_from_dispatch_context(dispatch_context)?);
             dispatch(ctx, command).await
@@ -1026,6 +1031,7 @@ async fn dispatch_without_runtime(
             content_taint,
             handling_mode,
             objective_id,
+            in_reply_to,
             ..
         } => {
             reject_runtime_less_blob_blocks(blocks.as_deref())?;
@@ -1042,6 +1048,7 @@ async fn dispatch_without_runtime(
                         content_taint: None,
                         handling_mode: Some(handling_mode),
                         objective_id,
+                        in_reply_to: in_reply_to.map(|delivery| delivery.0),
                     },
                     content_taint,
                 )
@@ -1944,6 +1951,83 @@ mod tests {
         assert_eq!(body, "on it");
         assert!(blocks.is_none());
         assert_eq!(*handling_mode, HandlingMode::Queue);
+    }
+
+    /// A reply names the delivery it answers: `reply_to_peer` stamps the
+    /// selected capability's id as `in_reply_to`, which the comms runtime
+    /// signs into the envelope. `send_message` answers nothing and stamps
+    /// nothing.
+    #[tokio::test]
+    async fn test_runtime_less_reply_to_peer_names_the_delivery_it_answers() {
+        let (ctx, peer_id, _sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
+        let capability = reply_capability(peer_id, 7);
+        let dispatch_context = reply_dispatch_context(vec![capability.clone()]);
+
+        handle_tools_call_with_context(
+            &ctx,
+            "reply_to_peer",
+            &json!({"body": "on it", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("the runtime-less reply dispatches");
+
+        let candidate = finalize.await.expect("finalization task");
+        assert!(
+            matches!(
+                &candidate.interaction.content,
+                meerkat_core::InteractionContent::Message { in_reply_to: Some(id), .. }
+                    if *id == capability.in_reply_to
+            ),
+            "the receiver sees the delivery the reply answers: {:?}",
+            candidate.interaction.content
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_to_peer_names_the_delivery_it_answers_and_send_message_names_none() {
+        let peer_keypair = Keypair::generate();
+        let (mut ctx, peer_id) = make_trusted_runtime_less_context(&peer_keypair).await;
+        let runtime = Arc::new(RecordingRuntime::new());
+        ctx.runtime = Some(RuntimeCommsCommandHandle::new(runtime.clone()));
+        let capability = reply_capability(peer_id, 7);
+        let dispatch_context = reply_dispatch_context(vec![capability.clone()]);
+
+        handle_tools_call_with_context(
+            &ctx,
+            "reply_to_peer",
+            &json!({"body": "on it", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("single-delivery reply must dispatch without a selector");
+        handle_tools_call_with_context(
+            &ctx,
+            "send_message",
+            &json!({"peer_id": peer_id.to_string(), "body": "fresh", "handling_mode": "queue"}),
+            &dispatch_context,
+        )
+        .await
+        .expect("send_message dispatches");
+
+        let sent = runtime.sent.lock();
+        let [
+            CommsCommand::PeerMessage {
+                in_reply_to: reply_in_reply_to,
+                ..
+            },
+            CommsCommand::PeerMessage {
+                in_reply_to: send_in_reply_to,
+                ..
+            },
+        ] = sent.as_slice()
+        else {
+            panic!("expected two peer messages, got {sent:?}");
+        };
+        assert_eq!(*reply_in_reply_to, Some(capability.in_reply_to));
+        assert_eq!(*send_in_reply_to, None);
     }
 
     #[tokio::test]

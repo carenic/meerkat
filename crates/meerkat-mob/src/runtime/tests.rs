@@ -64727,6 +64727,7 @@ async fn test_peer_message_reaches_ready_autonomous_member_before_kickoff_settle
                 },
             ]),
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -64861,6 +64862,7 @@ async fn test_peer_messages_reach_all_ready_autonomous_members_before_kickoff_se
                     },
                 ]),
                 handling_mode: meerkat_core::types::HandlingMode::Steer,
+                in_reply_to: None,
             },
         )
         .await
@@ -65016,6 +65018,7 @@ async fn test_running_peer_message_to_autonomous_member_queues_when_exact_bounda
                 },
             ]),
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -65047,6 +65050,7 @@ async fn test_running_peer_message_to_autonomous_member_queues_when_exact_bounda
             body: "body: second peer message while running".to_string(),
             blocks: None,
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -66251,6 +66255,7 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
             body: "body: keep requester busy".to_string(),
             blocks: None,
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await

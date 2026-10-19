@@ -1994,6 +1994,7 @@ mod tests {
                     data: ImageData::Inline { data: huge_base64 },
                 }],
                 delivery_id: None,
+                in_reply_to: None,
             },
         ))];
 

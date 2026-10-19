@@ -4539,6 +4539,7 @@ mod tests {
             ]),
             payload: None,
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+            in_reply_to: None,
         });
         let mut stored =
             meerkat_runtime::input_state::StoredInputState::new_accepted(input.id().clone());

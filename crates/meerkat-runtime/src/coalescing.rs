@@ -159,6 +159,7 @@ mod tests {
             content: "progress".into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         assert!(is_coalescing_eligible(&input));
     }
@@ -188,6 +189,7 @@ mod tests {
             content: "hello".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         assert!(!is_coalescing_eligible(&input));
     }

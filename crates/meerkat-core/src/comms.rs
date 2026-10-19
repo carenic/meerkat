@@ -1598,6 +1598,9 @@ impl CommsCommandRequest {
                 content_taint,
                 handling_mode: handling_mode.unwrap_or_default(),
                 objective_id: None,
+                // Host sends never answer a delivery: only `reply_to_peer`
+                // labels a reply.
+                in_reply_to: None,
             },
             CommsCommandRequest::PeerLifecycle {
                 to,
@@ -1732,6 +1735,11 @@ pub enum CommsCommand {
         content_taint: Option<SendTaintOverride>,
         handling_mode: HandlingMode,
         objective_id: Option<crate::interaction::ObjectiveId>,
+        /// The delivery this message answers. `reply_to_peer` sets it to the
+        /// selected delivery id; `send_message` never does. It travels signed
+        /// in the envelope and only labels the reply for the receiver: it is
+        /// never routing or authority.
+        in_reply_to: Option<InteractionId>,
     },
     /// One-way peer message whose actual member sender is preserved while the
     /// receiver must match a mandatory exact residency before admission.

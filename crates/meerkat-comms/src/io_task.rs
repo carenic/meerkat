@@ -498,6 +498,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -538,6 +539,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -588,6 +590,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -629,6 +632,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -670,6 +674,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -716,6 +721,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -760,6 +766,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -811,6 +818,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -852,6 +860,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -900,6 +909,7 @@ mod tests {
                 }]),
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -1248,6 +1258,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid
         };
@@ -1296,6 +1307,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1341,6 +1353,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1389,6 +1402,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -1475,6 +1489,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -1575,6 +1590,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1643,6 +1659,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1683,6 +1700,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // unsigned
         };
@@ -1727,6 +1745,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;

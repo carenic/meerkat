@@ -22825,6 +22825,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -22946,6 +22947,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -23123,6 +23125,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -23246,6 +23249,7 @@ mod tests {
                         "token": "birch seventeen",
                     })),
                     handling_mode: None,
+                    in_reply_to: None,
                 }),
             )
             .await
@@ -27608,6 +27612,7 @@ mod tests {
             content: "working".to_string().into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+            in_reply_to: None,
         });
 
         let rejected = runtime

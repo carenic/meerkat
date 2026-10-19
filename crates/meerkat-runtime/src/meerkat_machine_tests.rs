@@ -5944,6 +5944,7 @@ async fn idle_explicit_steer_peer_request_runs_through_runtime_loop() {
         ]),
         payload: Some(serde_json::json!({"subject": "mdm-smoke"})),
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
 
     let (_outcome, completion_handle) = adapter
@@ -6235,6 +6236,7 @@ fn make_progress_input(label: &str) -> Input {
         content: format!("progress-{label}").into(),
         payload: Some(serde_json::json!({ "label": label })),
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 
@@ -24468,6 +24470,7 @@ async fn apply_input_intermediate_peer_input_during_running_turn_wakes_without_b
         content: "interrupt while running".into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     });
     let peer_input_id = peer_input.id().clone();
     let peer_outcome = adapter
@@ -24738,6 +24741,7 @@ async fn service_peer_admission_wakes_without_live_cancel_after_boundary() {
         content: "interrupt through service ext ingest".into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     });
 
     let peer_outcome = <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(
@@ -25200,6 +25204,7 @@ fn interrupt_yielding_peer_input(
         content: body.into(),
         payload: None,
         handling_mode,
+        in_reply_to: None,
     });
     let input_id = input.id().clone();
     (input, input_id)
@@ -25260,6 +25265,7 @@ fn directed_interrupt_yielding_peer_input(body: &str) -> (Input, InputId) {
         content: body.into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
     (input, input_id)
 }
@@ -37150,6 +37156,7 @@ async fn runtime_input_hooks_follow_committed_accept_dedup_and_reject_outcomes()
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
+        in_reply_to: None,
     });
     let (peer_accepted, _) = adapter
         .accept_input_with_completion(&session_id, valid_peer)
@@ -37190,6 +37197,7 @@ async fn runtime_input_hooks_follow_committed_accept_dedup_and_reject_outcomes()
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
+        in_reply_to: None,
     });
     adapter
         .accept_input_with_completion(&session_id, invalid_peer)
@@ -47799,6 +47807,7 @@ fn runtime_parity_peer_message(text: &str) -> Input {
         content: text.into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 
@@ -48093,6 +48102,7 @@ async fn wake_runtime_if_active_inputs_drains_existing_attached_queue() {
                 content: "done".into(),
                 payload: Some(serde_json::json!({ "token": "birch seventeen" })),
                 handling_mode: None,
+                in_reply_to: None,
             }))
             .await
             .expect("direct driver accept should queue terminal peer response");

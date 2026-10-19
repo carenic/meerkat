@@ -135,17 +135,31 @@ them.
   literals and exhaustive patterns of either variant name it. On the wire it
   is optional (`delivery_id` on the notice block and on
   `peer_content_ingested`) and omitted when absent.
+- `meerkat-core`: `CommsCommand::PeerMessage`, `InteractionContent::Message`
+  and `SystemNoticeBlock::Comms` gain `in_reply_to: Option<InteractionId>`;
+  `meerkat-comms`: `MessageKind::Message` gains `in_reply_to: Option<Uuid>`;
+  `meerkat-runtime`: `PeerInput` gains `in_reply_to`. It is the delivery a
+  `reply_to_peer` reply answers (see Added). Struct literals and exhaustive
+  patterns name it. On the wire it is optional (`in_reply_to` on the notice
+  block) and omitted when absent.
 - Behaviour (no type change): the text the model reads for an incoming peer
-  message notice now carries a `Delivery ID: <id>` line after its payload.
+  message notice now carries a `Delivery ID: <id>` line after its payload, and
+  an `In reply to: <id>` line when the message is a reply.
 - Compatibility (not measured by the gate): the transcript content digest
-  erases a comms notice's `delivery_id`, as it erases a notice's runtime
-  origin, so a row's revision is the same with or without the field. A 0.9.3
-  reader, which drops the key when it decodes the row, computes the revision
-  0.9.4 stored and loads the session. One residual: an append retried after a
-  crash over rows already stored compares the re-serialized rows byte for
-  byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote would refuse
-  the retry; the stored input state 7 entry above already keeps 0.9.3 off a
-  runtime store that 0.9.4 wrote.
+  erases a comms notice's `delivery_id` and `in_reply_to`, as it erases a
+  notice's runtime origin, so a row's revision is the same with or without
+  them. A 0.9.3 reader, which drops the keys when it decodes the row, computes
+  the revision 0.9.4 stored and loads the session. One residual: an append
+  retried after a crash over rows already stored compares the re-serialized
+  rows byte for byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote
+  would refuse the retry; the stored input state 7 entry above already keeps
+  0.9.3 off a runtime store that 0.9.4 wrote.
+- Compatibility (wire): a 0.9.3 receiver refuses a `reply_to_peer` reply from
+  0.9.4. Its message kind does not know `in_reply_to`, so it re-serializes the
+  signed envelope without the field, the signature check fails, and it drops
+  the envelope; the sender gets no acknowledgement and `reply_to_peer` reports
+  the send as undelivered. `send_message` and every other message kind are
+  unchanged, so a 0.9.3 peer still receives them.
 
 ### Added
 
@@ -162,6 +176,11 @@ them.
   refusals of reply selection (`NoReplyCapability`, `InvalidReplyContext`,
   `UnknownReplyTo`, `AmbiguousReply`); `reply_to_peer` reports each with its
   stable code prefix.
+- A reply sent with `reply_to_peer` names the delivery it answers: the
+  signed message carries that delivery id as `in_reply_to`, and the
+  receiver's message notice shows it as an `In reply to` line (`meerkat-comms`,
+  `meerkat-core`, `meerkat-runtime`). It is a label the sender declares:
+  routing and authorization never read it, and `send_message` never sets it.
 - `LocalGrantAuthority::resolve_lineage_observed`,
   `resolve_controller_lineage_observed` and
   `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside

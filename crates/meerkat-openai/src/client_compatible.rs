@@ -2362,6 +2362,7 @@ mod tests {
                             .expect("structured response block"),
                     ],
                     delivery_id: None,
+                    in_reply_to: None,
                 },
             ))])
             .expect("project chat messages");

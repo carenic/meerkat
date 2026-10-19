@@ -60,6 +60,7 @@ fn make_progress_input(label: &str) -> Input {
         content: format!("progress-{label}").into(),
         payload: Some(serde_json::json!({ "label": label })),
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 

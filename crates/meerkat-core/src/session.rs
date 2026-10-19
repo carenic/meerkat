@@ -657,7 +657,8 @@ fn digest_timestamp_sentinel() -> crate::types::MessageTimestamp {
 /// - per-construction bookkeeping is erased: [`TranscriptMessageIdentity`]
 ///   (run/interaction ids are runtime-binding atoms — a re-created authority
 ///   re-stamps them), `created_at` timestamps, and the correlation ids of
-///   notices (runtime origin, peer message delivery id). A resume that
+///   notices (runtime origin, a peer message's delivery id and the delivery
+///   it answers). A resume that
 ///   re-projects the same conversation through a new runtime authority must
 ///   digest to the same revision as the persisted row, or the append-only save
 ///   guard strands the session on restart (fails closed with
@@ -667,10 +668,11 @@ fn digest_timestamp_sentinel() -> crate::types::MessageTimestamp {
 /// `render_metadata`, notice kinds and blocks) because changing them changes
 /// the transcript's meaning. Inside a block, only correlation handles are
 /// erased: a comms notice's delivery id names the delivery a reply capability
-/// answers, and the routing authority lives in that capability, not in the
-/// transcript. Erasing it keeps the revision stable across versions: a row
-/// with the field digests like the same row without it, as a reader that does
-/// not know the field decodes it.
+/// answers, and its `in_reply_to` names the delivery the sender says it
+/// answers. Routing authority lives in the reply capability, not in the
+/// transcript. Erasing them keeps the revision stable across versions: a row
+/// with the fields digests like the same row without them, as a reader that
+/// does not know the fields decodes it.
 pub(crate) fn canonicalize_messages_for_digest(messages: &[Message]) -> Vec<Message> {
     let mut canonical = canonicalize_message_images_for_digest(messages);
     for message in &mut canonical {
@@ -714,14 +716,21 @@ fn erase_message_construction_bookkeeping(message: &mut Message) {
         Message::SystemNotice(notice) => {
             notice.created_at = digest_timestamp_sentinel();
             notice.runtime_origin = None;
-            // A peer message's delivery id is correlation, like the runtime
-            // origin: erasing it keeps the revision of a row that carries it
-            // equal to the revision a reader computes after dropping the
-            // field (0.9.3 drops unknown notice-block keys on decode), so
-            // such a reader still loads the session.
+            // A peer message's delivery id and the delivery it answers are
+            // correlation, like the runtime origin: erasing them keeps the
+            // revision of a row that carries them equal to the revision a
+            // reader computes after dropping the fields (0.9.3 drops unknown
+            // notice-block keys on decode), so such a reader still loads the
+            // session.
             for block in &mut notice.blocks {
-                if let crate::types::SystemNoticeBlock::Comms { delivery_id, .. } = block {
+                if let crate::types::SystemNoticeBlock::Comms {
+                    delivery_id,
+                    in_reply_to,
+                    ..
+                } = block
+                {
                     *delivery_id = None;
+                    *in_reply_to = None;
                 }
             }
         }
@@ -10319,45 +10328,51 @@ mod tests {
 
     /// Known answer for the revision of a transcript that holds an incoming
     /// peer message notice. The literal is the revision of the transcript
-    /// without a delivery id, computed before the field existed (the
+    /// without correlation ids, computed before the fields existed (the
     /// canonical form a 0.9.3 reader computes), and the same transcript with
-    /// a delivery id digests to it, so a reader that drops the field computes
-    /// the revision this version stores.
+    /// a delivery id, an `in_reply_to` or both digests to it, so a reader
+    /// that drops the fields computes the revision this version stores.
     #[test]
-    fn peer_message_notice_revision_matches_the_known_answer_with_or_without_a_delivery_id() {
+    fn peer_message_notice_revision_matches_the_known_answer_with_or_without_correlation_ids() {
         const REVISION_WITHOUT_DELIVERY_ID: &str =
             "sha256:30ab944fbe82dea6d5b0656daeb606271418d5ae97de750fef40f8f0f3ddfb94";
-        let transcript = |delivery_id: Option<crate::interaction::InteractionId>| {
-            vec![
-                Message::User(crate::types::UserMessage::text("hello".to_string())),
-                Message::SystemNotice(crate::types::SystemNoticeMessage::with_block(
-                    crate::types::SystemNoticeKind::Comms,
-                    Some("Peer message".to_string()),
-                    crate::types::SystemNoticeBlock::Comms {
-                        kind: crate::types::CommsNoticeKind::Message,
-                        direction: crate::types::SystemNoticeDirection::Incoming,
-                        peer: Some(crate::types::SystemNoticePeer {
-                            id: crate::comms::PeerId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
-                            display_name: Some("sender".to_string()),
-                        }),
-                        sender_taint: None,
-                        request_id: None,
-                        intent: None,
-                        status: None,
-                        summary: Some("Peer message".to_string()),
-                        payload: None,
-                        content: vec![crate::types::ContentBlock::Text {
-                            text: "please look at this".to_string(),
-                        }],
-                        delivery_id,
-                    },
-                )),
-            ]
-        };
+        let transcript =
+            |delivery_id: Option<crate::interaction::InteractionId>,
+             in_reply_to: Option<crate::interaction::InteractionId>| {
+                vec![
+                    Message::User(crate::types::UserMessage::text("hello".to_string())),
+                    Message::SystemNotice(crate::types::SystemNoticeMessage::with_block(
+                        crate::types::SystemNoticeKind::Comms,
+                        Some("Peer message".to_string()),
+                        crate::types::SystemNoticeBlock::Comms {
+                            kind: crate::types::CommsNoticeKind::Message,
+                            direction: crate::types::SystemNoticeDirection::Incoming,
+                            peer: Some(crate::types::SystemNoticePeer {
+                                id: crate::comms::PeerId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+                                display_name: Some("sender".to_string()),
+                            }),
+                            sender_taint: None,
+                            request_id: None,
+                            intent: None,
+                            status: None,
+                            summary: Some("Peer message".to_string()),
+                            payload: None,
+                            content: vec![crate::types::ContentBlock::Text {
+                                text: "please look at this".to_string(),
+                            }],
+                            delivery_id,
+                            in_reply_to,
+                        },
+                    )),
+                ]
+            };
         let delivery_id = Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(77)));
+        let in_reply_to = Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(78)));
         for (label, messages) in [
-            ("without a delivery id", transcript(None)),
-            ("with a delivery id", transcript(delivery_id)),
+            ("without correlation ids", transcript(None, None)),
+            ("with a delivery id", transcript(delivery_id, None)),
+            ("with an in_reply_to", transcript(None, in_reply_to)),
+            ("with both", transcript(delivery_id, in_reply_to)),
         ] {
             assert_eq!(
                 transcript_messages_digest(&messages).unwrap(),

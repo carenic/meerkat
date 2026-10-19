@@ -6882,6 +6882,7 @@ export interface SystemNoticeBlockComms {
   content?: ContentBlock[];
   delivery_id?: InteractionId | null;
   direction: SystemNoticeDirection;
+  in_reply_to?: InteractionId | null;
   intent?: string | null;
   kind: CommsNoticeKind;
   payload?: unknown;

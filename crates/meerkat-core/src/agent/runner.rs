@@ -3917,6 +3917,7 @@ mod skill_activation_effect_tests {
                         payload: None,
                         content: vec![image.clone()],
                         delivery_id: None,
+                        in_reply_to: None,
                     }],
                 },
             ),

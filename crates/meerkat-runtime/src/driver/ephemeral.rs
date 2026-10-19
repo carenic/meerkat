@@ -5964,6 +5964,7 @@ mod tests {
             content: "peer body".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -6060,6 +6061,7 @@ mod tests {
             content: format!("progress {label}").into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -7265,6 +7267,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Text(String::new()),
             payload: Some(serde_json::json!({"ok": false})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let outcome = driver.accept_input(input).await.unwrap();
@@ -7317,6 +7320,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Text(String::new()),
             payload: Some(serde_json::json!({"ok": false})),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 

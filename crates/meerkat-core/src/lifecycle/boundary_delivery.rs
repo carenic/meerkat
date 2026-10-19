@@ -566,6 +566,7 @@ mod tests {
                         text: "hello".to_string(),
                     }],
                     delivery_id: None,
+                    in_reply_to: None,
                 }],
             },
             identity: None,

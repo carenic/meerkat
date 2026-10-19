@@ -21,6 +21,13 @@
 //! `peer_content_ingested`. Three peer steers admitted inside one gated
 //! boundary each land exactly once, in arrival order.
 //!
+//! On a SQLite realm, a wired member's peer message that joins the running
+//! turn is answered with `reply_to_peer` naming the Delivery ID its notice
+//! shows; the sender receives the reply naming the delivery it answers, and
+//! after the stack restarts over the same realm both transcripts still hold
+//! their row once with its id, the steer is Consumed, and no model request
+//! runs.
+//!
 //! The scripted client is installed through BOTH
 //! `SessionRuntime::set_default_llm_client` and
 //! `MobMcpState::with_default_llm_client`.
@@ -48,6 +55,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const TARGET: &str = "durable-steer-target";
+const SENDER: &str = "durable-steer-sender";
 const TURN_PROMPT: &str = "DURABLE-STEER-TURN run several tools";
 const FINAL_TEXT: &str = "DURABLE-STEER-FINAL";
 const FOLLOW_UP_ACK: &str = "DURABLE-STEER-FOLLOW-UP";
@@ -59,6 +67,9 @@ const TEXT_PROMPT_TOKEN: &str = "DURABLE-TEXT-PROMPT-TOKEN-8Y";
 const EXTERNAL_EVENT_TOKEN: &str = "DURABLE-EXTERNAL-EVENT-TOKEN-9Z";
 const FLOW_STEP_TOKEN: &str = "DURABLE-FLOW-STEP-TOKEN-2A";
 const LATE_PEER_TOKEN: &str = "DURABLE-LATE-PEER-TOKEN-3B";
+const PEER_ASK_TOKEN: &str = "DURABLE-PEER-ASK-TOKEN-7F";
+const REPLY_TOKEN: &str = "DURABLE-PEER-REPLY-TOKEN-8G";
+const REPLY_REALM: &str = "durable-steer-reply-realm";
 const ORDERED_PEER_TOKENS: [&str; 3] = [
     "DURABLE-PEER-FIRST-4C",
     "DURABLE-PEER-SECOND-5D",
@@ -171,6 +182,8 @@ impl meerkat_core::service::MobToolsFactory for GateToolsFactory {
 
 #[derive(Clone, Debug)]
 struct RecordedRequest {
+    /// A request of the target's gated turn (it holds the turn prompt).
+    target: bool,
     in_turn: bool,
     messages: Vec<Message>,
 }
@@ -179,6 +192,10 @@ struct ScriptedProvider {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     hold: Arc<Hold>,
     gate: Gate,
+    /// When set, the first request after the gate answers the peer notice
+    /// carrying [`PEER_ASK_TOKEN`]: it records the `Delivery ID` the notice
+    /// shows the model and calls `reply_to_peer` with it.
+    reply_to_shown_delivery: Option<Arc<Mutex<Option<String>>>>,
 }
 
 fn usage(model: &str) -> LlmEvent {
@@ -207,11 +224,15 @@ fn text_events(model: &str, text: &str) -> Vec<LlmEvent> {
 }
 
 fn tool_events(model: &str, id: &str, name: &str) -> Vec<LlmEvent> {
+    tool_events_with_args(model, id, name, json!({}))
+}
+
+fn tool_events_with_args(model: &str, id: &str, name: &str, args: Value) -> Vec<LlmEvent> {
     vec![
         LlmEvent::ToolCallComplete {
             id: id.to_string(),
             name: name.to_string(),
-            args: json!({}),
+            args,
             meta: None,
         },
         usage(model),
@@ -252,9 +273,28 @@ impl LlmClient for ScriptedProvider {
             6
         };
         self.requests.lock().unwrap().push(RecordedRequest {
+            target: in_turn_prompt,
             in_turn: in_turn_prompt && !turn_ended,
             messages: request.messages.clone(),
         });
+        let reply = match (step, &self.reply_to_shown_delivery) {
+            (4, Some(shown)) => {
+                shown_delivery_id(&request.messages, PEER_ASK_TOKEN).map(|delivery| {
+                    *shown.lock().unwrap() = Some(delivery.clone());
+                    tool_events_with_args(
+                        &model,
+                        "toolu_p2",
+                        "reply_to_peer",
+                        json!({
+                            "reply_to": delivery,
+                            "body": REPLY_TOKEN,
+                            "handling_mode": "queue",
+                        }),
+                    )
+                })
+            }
+            _ => None,
+        };
         let hold = Arc::clone(&self.hold);
         let gate = self.gate;
         Box::pin(futures::StreamExt::flat_map(
@@ -264,7 +304,7 @@ impl LlmClient for ScriptedProvider {
                     1 => text_events(&model, FOLLOW_UP_ACK),
                     2 => text_events(&model, FINAL_TEXT),
                     3 => tool_events(&model, "toolu_p3", "probe_step"),
-                    4 => tool_events(&model, "toolu_p2", "probe_step"),
+                    4 => reply.unwrap_or_else(|| tool_events(&model, "toolu_p2", "probe_step")),
                     5 => match gate {
                         Gate::Tool => tool_events(&model, "toolu_p1", "probe_block"),
                         Gate::ModelThenTools => {
@@ -297,6 +337,28 @@ async fn make_stack(
     client: Arc<dyn LlmClient>,
     gate_tools: Arc<dyn meerkat_core::AgentToolDispatcher>,
 ) -> (MethodRouter, Arc<MobMcpState>) {
+    let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let persistence = meerkat::PersistenceBundle::new(
+        store,
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+        blob_store,
+    )
+    .expect("construct runtime authority");
+    let (router, mob_state, _runtime) =
+        make_stack_over(root, client, gate_tools, persistence).await;
+    (router, mob_state)
+}
+
+/// [`make_stack`] over a caller's persistence, so a test can restart the
+/// stack over the same realm.
+async fn make_stack_over(
+    root: &std::path::Path,
+    client: Arc<dyn LlmClient>,
+    gate_tools: Arc<dyn meerkat_core::AgentToolDispatcher>,
+    persistence: meerkat::PersistenceBundle,
+) -> (MethodRouter, Arc<MobMcpState>, Arc<SessionRuntime>) {
     let project_root = root.join("project-root");
     let context_root = root.join("context-root");
     for dir in [&project_root, &context_root] {
@@ -314,15 +376,6 @@ async fn make_stack(
         .comms(true)
         .mob(true);
     let config = Config::default();
-    let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
-    let blob_store: Arc<dyn meerkat_core::BlobStore> =
-        Arc::new(meerkat_store::MemoryBlobStore::new());
-    let persistence = meerkat::PersistenceBundle::new(
-        store,
-        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-        blob_store,
-    )
-    .expect("construct runtime authority");
     let runtime = SessionRuntime::new(
         factory,
         config.clone(),
@@ -362,7 +415,21 @@ async fn make_stack(
         )),
         gate_tools,
     }));
-    (router, mob_state)
+    (router, mob_state, runtime)
+}
+
+/// The reply scenario's SQLite realm under `root`; opening it again is the
+/// restart.
+async fn open_reply_realm(root: &std::path::Path) -> meerkat::PersistenceBundle {
+    let (_manifest, persistence) = meerkat::open_realm_persistence_in(
+        &root.join("realms"),
+        REPLY_REALM,
+        Some(meerkat_store::RealmBackend::Sqlite),
+        Some(meerkat_store::RealmOrigin::Explicit),
+    )
+    .await
+    .expect("open the SQLite realm");
+    persistence
 }
 
 fn mob_definition(mob_id: &str) -> MobDefinition {
@@ -381,27 +448,33 @@ fn mob_definition(mob_id: &str) -> MobDefinition {
     .expect("durable steer mob definition")
 }
 
-async fn session_history(router: &MethodRouter, session_id: &SessionId) -> Vec<Value> {
-    let params = serde_json::value::RawValue::from_string(
-        json!({ "session_id": session_id.to_string(), "limit": 200 }).to_string(),
-    )
-    .unwrap();
+/// Dispatch one RPC call and return its result; an error fails the test.
+async fn rpc(router: &MethodRouter, method: &str, params: Value) -> Value {
+    let params = serde_json::value::RawValue::from_string(params.to_string()).unwrap();
     let response = router
         .dispatch(RpcRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(RpcId::Num(1)),
-            method: "session/history".to_string(),
+            method: method.to_string(),
             params: Some(params),
         })
         .await
-        .expect("session/history dispatch");
+        .unwrap_or_else(|| panic!("{method} dispatch"));
     assert!(
         response.error.is_none(),
-        "session/history error: {:?}",
+        "{method} error: {:?}",
         response.error
     );
-    let history: Value = serde_json::from_str(response.result.as_ref().expect("result").get())
-        .expect("history JSON");
+    serde_json::from_str(response.result.as_ref().expect("result").get()).expect("result JSON")
+}
+
+async fn session_history(router: &MethodRouter, session_id: &SessionId) -> Vec<Value> {
+    let history = rpc(
+        router,
+        "session/history",
+        json!({ "session_id": session_id.to_string(), "limit": 200 }),
+    )
+    .await;
     history["messages"].as_array().cloned().unwrap_or_default()
 }
 
@@ -470,6 +543,7 @@ fn peer_steer(convention: meerkat_runtime::PeerConvention, token: &str) -> meerk
         content: ContentInput::Text(token.to_string()),
         payload: None,
         handling_mode: Some(HandlingMode::Steer),
+        in_reply_to: None,
     })
 }
 
@@ -545,6 +619,24 @@ fn token_rows(messages: &[Message], token: &str) -> usize {
         .count()
 }
 
+/// The `Delivery ID` that the notice carrying `token` shows the model.
+fn shown_delivery_id(messages: &[Message], token: &str) -> Option<String> {
+    messages.iter().find_map(|message| match message {
+        Message::SystemNotice(notice) => {
+            let text = notice.model_projection_text();
+            if !text.contains(token) {
+                return None;
+            }
+            text.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("Delivery ID: ")
+                    .map(|id| id.trim().to_string())
+            })
+        }
+        _ => None,
+    })
+}
+
 struct Outcome {
     requests: Vec<RecordedRequest>,
     /// Index of the first gated-turn request recorded after the steer.
@@ -570,6 +662,7 @@ async fn run_scenario_with(
         requests: Arc::clone(&requests),
         hold: Arc::clone(&hold),
         gate,
+        reply_to_shown_delivery: None,
     });
     let gate_tools = Arc::new(GateTools::new(Arc::clone(&hold), step_delay));
     let (router, mob_state) = make_stack(temp.path(), client, gate_tools).await;
@@ -611,6 +704,50 @@ async fn run_scenario_with(
         }
     });
 
+    let (turn, first_after_gate) = start_gated_turn(&handle, &hold, &requests).await;
+
+    for steer in steers {
+        let (outcome, _completion) = runtime
+            .accept_input_with_completion(&session, steer)
+            .await
+            .expect("steer admitted while the turn runs");
+        assert!(outcome.is_accepted());
+    }
+    // Let the ingress prepare its boundary delivery before releasing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hold.released.store(true, Ordering::SeqCst);
+
+    let result = turn.await.expect("turn task");
+    let text = result
+        .expect("turn completes in time")
+        .expect("turn succeeds");
+    assert_eq!(text, FINAL_TEXT);
+
+    // Let any follow-up turn settle.
+    settle(&requests).await;
+    let history = session_history(&router, &session).await;
+    let requests = requests.lock().unwrap().clone();
+    event_reader.abort();
+    let peer_ingested = peer_ingested.load(Ordering::SeqCst);
+    let _ = mob_state.mob_destroy(&mob_id).await;
+    Outcome {
+        requests,
+        first_after_gate,
+        history,
+        peer_ingested,
+    }
+}
+
+type GatedTurn =
+    tokio::task::JoinHandle<Result<Result<String, String>, tokio::time::error::Elapsed>>;
+
+/// Start the target's gated turn and wait until it holds the gate. Returns
+/// the turn and the index of the first request recorded after the gate.
+async fn start_gated_turn(
+    handle: &MobHandle,
+    hold: &Hold,
+    requests: &Mutex<Vec<RecordedRequest>>,
+) -> (GatedTurn, usize) {
     let spec = BoundedResultSpec::new("turn", 16 * 1024).expect("bounded result spec");
     let work = handle
         .start_work_for_identity_bounded(
@@ -647,25 +784,11 @@ async fn run_scenario_with(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let first_after_gate = requests.lock().unwrap().len();
+    (turn, first_after_gate)
+}
 
-    for steer in steers {
-        let (outcome, _completion) = runtime
-            .accept_input_with_completion(&session, steer)
-            .await
-            .expect("steer admitted while the turn runs");
-        assert!(outcome.is_accepted());
-    }
-    // Let the ingress prepare its boundary delivery before releasing.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    hold.released.store(true, Ordering::SeqCst);
-
-    let result = turn.await.expect("turn task");
-    let text = result
-        .expect("turn completes in time")
-        .expect("turn succeeds");
-    assert_eq!(text, FINAL_TEXT);
-
-    // Let any follow-up turn settle.
+/// Wait until no model request arrives for two seconds.
+async fn settle(requests: &Mutex<Vec<RecordedRequest>>) {
     let mut stable = 0;
     let mut last = requests.lock().unwrap().len();
     while stable < 20 {
@@ -677,17 +800,6 @@ async fn run_scenario_with(
             stable = 0;
             last = now;
         }
-    }
-    let history = session_history(&router, &session).await;
-    let requests = requests.lock().unwrap().clone();
-    event_reader.abort();
-    let peer_ingested = peer_ingested.load(Ordering::SeqCst);
-    let _ = mob_state.mob_destroy(&mob_id).await;
-    Outcome {
-        requests,
-        first_after_gate,
-        history,
-        peer_ingested,
     }
 }
 
@@ -953,4 +1065,236 @@ async fn e2e_fast_three_peer_steers_in_one_gated_boundary_land_once_each_in_arri
         "first delivery in arrival order: {first_requests:?}"
     );
     assert_eq!(outcome.peer_ingested, 3, "peer_content_ingested events");
+}
+
+/// The one history row that carries `token`, with its position.
+fn the_row_with(history: &[Value], token: &str) -> (usize, Value) {
+    let positions = history_token_positions(history, token);
+    assert_eq!(
+        positions.len(),
+        1,
+        "one transcript row carries {token}: {history:?}"
+    );
+    (positions[0], history[positions[0]].clone())
+}
+
+/// Every input of `session`'s runtime with its phase, read from the store.
+async fn input_phases(
+    store: &Arc<dyn meerkat_runtime::RuntimeStore>,
+    session: &SessionId,
+) -> Vec<(String, String)> {
+    store
+        .load_input_states_strict(&meerkat_runtime::LogicalRuntimeId::for_session(session))
+        .await
+        .expect("input rows decode")
+        .into_iter()
+        .map(|stored| {
+            (
+                stored.state.input_id.to_string(),
+                format!("{:?}", stored.seed.phase),
+            )
+        })
+        .collect()
+}
+
+/// A wired member's peer message joins the target's running turn; the model
+/// answers it with `reply_to_peer`, naming the Delivery ID the notice shows,
+/// and the sender receives the reply naming the delivery it answers. After
+/// the stack restarts over the same SQLite realm, each transcript still holds
+/// its row once with its id, the steer is Consumed, and no model request
+/// runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_reply_to_a_joined_peer_steer_reaches_its_sender_and_survives_restart() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let hold = Arc::new(Hold::default());
+    let shown = Arc::new(Mutex::new(None));
+    let client: Arc<dyn LlmClient> = Arc::new(ScriptedProvider {
+        requests: Arc::clone(&requests),
+        hold: Arc::clone(&hold),
+        gate: Gate::Tool,
+        reply_to_shown_delivery: Some(Arc::clone(&shown)),
+    });
+    let gate_tools: Arc<dyn meerkat_core::AgentToolDispatcher> =
+        Arc::new(GateTools::new(Arc::clone(&hold), Duration::ZERO));
+    let persistence = open_reply_realm(temp.path()).await;
+    let runtime_store = persistence.runtime_store();
+    let (router, mob_state, runtime) = make_stack_over(
+        temp.path(),
+        Arc::clone(&client),
+        Arc::clone(&gate_tools),
+        persistence,
+    )
+    .await;
+
+    let mob_id = format!("durable-steer-reply-{}", uuid::Uuid::new_v4().simple());
+    let mob_id = mob_state
+        .mob_create_definition(mob_definition(&mob_id))
+        .await
+        .expect("create mob");
+    let handle: MobHandle = mob_state.handle_for(&mob_id).await.expect("mob handle");
+    for member in [TARGET, SENDER] {
+        handle
+            .spawn_spec(SpawnMemberSpec::new("keeper", AgentIdentity::from(member)))
+            .await
+            .expect("spawn member");
+    }
+    handle
+        .wire(AgentIdentity::from(TARGET), AgentIdentity::from(SENDER))
+        .await
+        .expect("wire the target and the sender");
+    let target_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from(TARGET))
+        .await
+        .expect("target session");
+    let sender_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from(SENDER))
+        .await
+        .expect("sender session");
+    let target_peer = handle
+        .roster()
+        .await
+        .get(&AgentIdentity::from(TARGET))
+        .and_then(|entry| entry.peer_id())
+        .expect("target peer id");
+
+    let (turn, first_after_gate) = start_gated_turn(&handle, &hold, &requests).await;
+    let admitted_before = input_phases(&runtime_store, &target_session).await.len();
+    rpc(
+        &router,
+        "comms/send",
+        json!({
+            "session_id": sender_session.to_string(),
+            "kind": "peer_message",
+            "to": target_peer.to_string(),
+            "body": PEER_ASK_TOKEN,
+            "handling_mode": "steer",
+        }),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while input_phases(&runtime_store, &target_session).await.len() == admitted_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the target never admitted the peer message"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the ingress prepare its boundary delivery before releasing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hold.released.store(true, Ordering::SeqCst);
+    let text = turn
+        .await
+        .expect("turn task")
+        .expect("turn completes in time")
+        .expect("turn succeeds");
+    assert_eq!(text, FINAL_TEXT);
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut sender_history = session_history(&router, &sender_session).await;
+    while history_token_positions(&sender_history, REPLY_TOKEN).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reply never reached the sender: {sender_history:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sender_history = session_history(&router, &sender_session).await;
+    }
+    settle(&requests).await;
+    let target_history = session_history(&router, &target_session).await;
+    let sender_history = session_history(&router, &sender_session).await;
+    let delivery = shown
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the first request after the gate shows the joined notice's Delivery ID");
+
+    // A1: every request of the run after the gate carries the steer once and
+    // shows the same Delivery ID; none before; no follow-up turn.
+    let recorded = requests.lock().unwrap().clone();
+    assert!(
+        recorded
+            .iter()
+            .filter(|request| request.target)
+            .all(|request| request.in_turn),
+        "no follow-up turn runs for the target"
+    );
+    for request in &recorded[..first_after_gate] {
+        assert_eq!(token_rows(&request.messages, PEER_ASK_TOKEN), 0);
+    }
+    let after: Vec<_> = recorded[first_after_gate..]
+        .iter()
+        .filter(|request| request.target)
+        .collect();
+    assert_eq!(after.len(), 3, "three requests of the run follow the gate");
+    for request in after {
+        assert_eq!(token_rows(&request.messages, PEER_ASK_TOKEN), 1);
+        assert_eq!(
+            shown_delivery_id(&request.messages, PEER_ASK_TOKEN).as_deref(),
+            Some(delivery.as_str())
+        );
+    }
+
+    // A2: one row, between the boundary's tool results and the next
+    // assistant message, naming the delivery.
+    let (at, row) = the_row_with(&target_history, PEER_ASK_TOKEN);
+    assert_eq!(history_role(&row), "system_notice");
+    assert_eq!(row["blocks"][0]["delivery_id"], json!(delivery));
+    assert_eq!(history_role(&target_history[at - 1]), "tool_results");
+    assert_eq!(history_role(&target_history[at + 1]), "block_assistant");
+    let steer_input = row["runtime_origin"]["input_id"]
+        .as_str()
+        .expect("the row names the input it projects")
+        .to_string();
+
+    // A4: the reply succeeded and the sender's notice names the delivery it
+    // answers.
+    let reply_result = target_history
+        .iter()
+        .find(|row| history_role(row) == "tool_results" && row.to_string().contains("toolu_p2"))
+        .expect("the reply call has a result");
+    assert!(
+        !reply_result.to_string().contains("\"is_error\":true"),
+        "reply_to_peer succeeds: {reply_result}"
+    );
+    let (_, reply_row) = the_row_with(&sender_history, REPLY_TOKEN);
+    assert_eq!(history_role(&reply_row), "system_notice");
+    assert_eq!(reply_row["blocks"][0]["in_reply_to"], json!(delivery));
+
+    // A5: restart over the same realm.
+    runtime.shutdown().await;
+    drop(router);
+    drop(mob_state);
+    drop(runtime);
+    drop(runtime_store);
+    let before_restart = requests.lock().unwrap().len();
+    let persistence = open_reply_realm(temp.path()).await;
+    let runtime_store = persistence.runtime_store();
+    let (router, _mob_state, _runtime) =
+        make_stack_over(temp.path(), client, gate_tools, persistence).await;
+    let (_, row) = the_row_with(
+        &session_history(&router, &target_session).await,
+        PEER_ASK_TOKEN,
+    );
+    assert_eq!(row["blocks"][0]["delivery_id"], json!(delivery));
+    let (_, reply_row) = the_row_with(
+        &session_history(&router, &sender_session).await,
+        REPLY_TOKEN,
+    );
+    assert_eq!(reply_row["blocks"][0]["in_reply_to"], json!(delivery));
+    let phases = input_phases(&runtime_store, &target_session).await;
+    assert_eq!(
+        phases
+            .iter()
+            .find(|(input, _)| *input == steer_input)
+            .map(|(_, phase)| phase.as_str()),
+        Some("Consumed"),
+        "the steer stays Consumed: {phases:?}"
+    );
+    settle(&requests).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        before_restart,
+        "no model request runs after the restart"
+    );
 }

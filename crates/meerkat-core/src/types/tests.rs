@@ -368,6 +368,7 @@ fn peer_terminal_notice_projection_does_not_default_missing_status() {
         payload: Some(json!({"ok": true})),
         content: Vec::new(),
         delivery_id: None,
+        in_reply_to: None,
     };
 
     let projection = block.model_projection_text();
@@ -453,6 +454,7 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
             text: "hello".to_string(),
         }],
         delivery_id: None,
+        in_reply_to: None,
     };
 
     let undeclared = block(None);
@@ -488,6 +490,65 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
 }
 
 #[test]
+fn comms_message_notice_renders_in_reply_to_after_the_delivery_id() {
+    // A reply names the delivery it answers as an `In reply to` line after
+    // its own `Delivery ID`; the declared-taint marker stays the last line.
+    let delivery = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5e));
+    let answered = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5f));
+    let block = |in_reply_to, sender_taint| SystemNoticeBlock::Comms {
+        kind: CommsNoticeKind::Message,
+        direction: SystemNoticeDirection::Incoming,
+        peer: Some(SystemNoticePeer {
+            id: crate::comms::PeerId::new(),
+            display_name: Some("Peer A".to_string()),
+        }),
+        sender_taint,
+        request_id: None,
+        intent: None,
+        status: None,
+        summary: Some("Peer message".to_string()),
+        payload: None,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }],
+        delivery_id: Some(delivery),
+        in_reply_to,
+    };
+
+    let without = block(None, None).model_projection_text();
+    let with = block(Some(answered), None).model_projection_text();
+    assert!(!without.contains("In reply to"), "{without}");
+    assert_eq!(with, format!("{without}\nIn reply to: {answered}"));
+    let tainted = block(
+        Some(answered),
+        Some(crate::comms::SenderContentTaint::Tainted),
+    )
+    .model_projection_text();
+    assert_eq!(
+        tainted,
+        format!("{with}\n[sender declared this content tainted]")
+    );
+
+    // The field rides the wire only when present, and round-trips.
+    let wire = serde_json::to_value(block(Some(answered), None)).unwrap();
+    assert_eq!(wire["in_reply_to"], json!(answered.to_string()));
+    assert!(
+        serde_json::to_value(block(None, None))
+            .unwrap()
+            .get("in_reply_to")
+            .is_none()
+    );
+    let decoded: SystemNoticeBlock = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        decoded,
+        SystemNoticeBlock::Comms {
+            in_reply_to: Some(id),
+            ..
+        } if id == answered
+    ));
+}
+
+#[test]
 fn comms_message_notice_renders_its_delivery_id_before_the_taint_marker() {
     // The id `reply_to_peer` takes as `reply_to` is model-visible on the
     // message notice it names; a notice without one renders as before, and
@@ -510,6 +571,7 @@ fn comms_message_notice_renders_its_delivery_id_before_the_taint_marker() {
             text: "hello".to_string(),
         }],
         delivery_id,
+        in_reply_to: None,
     };
 
     let without = block(None, None).model_projection_text();
@@ -563,6 +625,7 @@ fn comms_block_round_trips_through_wire_with_typed_peer_id() {
         payload: None,
         content: Vec::new(),
         delivery_id: None,
+        in_reply_to: None,
     };
 
     let value = serde_json::to_value(&block).unwrap();
@@ -589,6 +652,7 @@ fn system_notice_explicit_null_payloads_round_trip_without_becoming_absent() {
             payload: Some(Value::Null),
             content: Vec::new(),
             delivery_id: None,
+            in_reply_to: None,
         },
         SystemNoticeBlock::ExternalEvent {
             source: "connector".to_string(),

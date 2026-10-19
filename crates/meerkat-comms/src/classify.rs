@@ -966,6 +966,7 @@ mod tests {
                 body: "hello".to_string(),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let item = InboxItem::External { envelope };
@@ -1006,6 +1007,7 @@ mod tests {
                 body: "hello".to_string(),
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let item = InboxItem::External { envelope };

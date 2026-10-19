@@ -1243,6 +1243,7 @@ mod tests {
             body: "hello".to_string(),
             handling_mode: None,
             objective_id: None,
+            in_reply_to: None,
         }
     }
 

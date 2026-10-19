@@ -408,6 +408,7 @@ async fn materialize_fresh_builds_session_registers_identity_and_acks() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await
         .expect("demuxed member-addressed send is acked by the member identity");

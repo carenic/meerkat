@@ -1099,6 +1099,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: crate::identity::Signature::new([0u8; 64]),
         };
@@ -1263,6 +1264,7 @@ mod tests {
                     blocks: None,
                     content_taint: None,
                     handling_mode: None,
+                    in_reply_to: None,
                 },
             )
             .await;
@@ -1342,6 +1344,7 @@ mod tests {
                     blocks: None,
                     content_taint: None,
                     handling_mode: None,
+                    in_reply_to: None,
                 },
             ),
         )
@@ -1437,6 +1440,7 @@ mod tests {
                     blocks: None,
                     content_taint: None,
                     handling_mode: None,
+                    in_reply_to: None,
                 },
             )
             .await;
@@ -1664,6 +1668,7 @@ mod tests {
             blocks: None,
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
         let received_taint = |candidate: meerkat_core::interaction::PeerInputCandidate,
                               expected_body: &str| {
@@ -2009,6 +2014,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: None,
                     objective_id: None,
+                    in_reply_to: None,
                 },
                 None,
             )
@@ -2200,6 +2206,7 @@ mod tests {
                     content_taint: None,
                     handling_mode: None,
                     objective_id: None,
+                    in_reply_to: None,
                 },
                 None,
             )

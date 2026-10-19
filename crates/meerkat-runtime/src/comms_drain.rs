@@ -1533,6 +1533,7 @@ fn peer_input_from_delivery_payload(
         // and lowers as InjectedContext-role transcript appends immediately
         // before this input's peer append.
         injected_context: payload.injected_context,
+        in_reply_to: None,
     }))
 }
 
@@ -9372,6 +9373,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: "build failed".to_string(),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 rendered_text: "External event via webhook: build failed".to_string(),
                 handling_mode: HandlingMode::Queue,
@@ -9403,6 +9405,7 @@ mod tests {
                 content: InteractionContent::Message {
                     body: format!("DONE {index}"),
                     blocks: None,
+                    in_reply_to: None,
                 },
                 rendered_text: format!("DONE {index}"),
                 handling_mode: HandlingMode::Steer,
@@ -12512,6 +12515,7 @@ mod tests {
             payload: None,
             handling_mode: None,
             sender_taint: None,
+            in_reply_to: None,
         });
         let semantics =
             crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(&input, true)
@@ -14933,7 +14937,11 @@ mod tests {
                 id,
                 from_route: None,
                 from: sender.to_string(),
-                content: InteractionContent::Message { body, blocks: None },
+                content: InteractionContent::Message {
+                    body,
+                    blocks: None,
+                    in_reply_to: None,
+                },
                 rendered_text: String::new(),
                 handling_mode: HandlingMode::Queue,
                 render_metadata: None,

@@ -560,6 +560,12 @@ pub struct PeerInput {
     /// on durable input persistence (absent on older persisted inputs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injected_context: Vec<ContentInput>,
+    /// The delivery a peer message says it answers: the sender's signed
+    /// `in_reply_to` (set by its `reply_to_peer`). Rendered on the message
+    /// notice as `In reply to`; never routing or authority. Additive on
+    /// durable input persistence (absent on older persisted inputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<meerkat_core::interaction::InteractionId>,
 }
 
 /// Peer communication conventions.
@@ -658,6 +664,7 @@ pub fn peer_response_terminal_input(
         // Bridge-projected terminal responses carry no comms envelope, so no
         // sender declaration exists.
         sender_taint: None,
+        in_reply_to: None,
     })
 }
 
@@ -1233,6 +1240,13 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
     } else {
         None
     };
+    // The delivery the sender says this message answers (its signed
+    // `in_reply_to`): shown on message notices only.
+    let in_reply_to = if matches!(kind, CommsNoticeKind::Message) {
+        peer.in_reply_to
+    } else {
+        None
+    };
     Some(CoreRenderable::SystemNotice {
         kind: SystemNoticeKind::Comms,
         body: Some(summary.clone()),
@@ -1251,6 +1265,7 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
             payload: peer.payload.clone(),
             content,
             delivery_id,
+            in_reply_to,
         }],
     })
 }
@@ -1807,6 +1822,7 @@ mod tests {
             content: "work content".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection(&input);
@@ -1894,6 +1910,7 @@ mod tests {
             content: "hi there".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["input_type"], "peer");
@@ -1924,6 +1941,7 @@ mod tests {
             content: "hi there".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -2162,6 +2180,7 @@ mod tests {
             ]),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let Input::Peer(peer) = &input else {
@@ -2224,6 +2243,7 @@ mod tests {
                 content: "hello from peer".into(),
                 payload: None,
                 handling_mode: None,
+                in_reply_to: None,
             });
             let projection = runtime_input_projection(&input);
             let append = projection.append.expect("conversation append");
@@ -2289,6 +2309,7 @@ mod tests {
             content: "response body".into(),
             payload: Some(serde_json::json!({"answer":"ok"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let Input::Peer(peer) = &input else {
@@ -2410,6 +2431,7 @@ mod tests {
             content: body.into(),
             payload: None,
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         })
     }
 
@@ -2548,6 +2570,64 @@ mod tests {
             None,
             "a request is answered with send_response, not reply_to_peer"
         );
+    }
+
+    /// A peer message that answers a delivery shows it: its notice block
+    /// carries the sender's `in_reply_to`, and the model reads it as an
+    /// `In reply to` line. A request shows none.
+    #[test]
+    fn peer_message_notice_shows_the_delivery_it_answers() {
+        let answered = meerkat_core::InteractionId(uuid::Uuid::from_u128(0xA1));
+        let notice_block = |convention: PeerConvention| {
+            let mut input = steer_peer_input(convention, "on it");
+            if let Input::Peer(peer) = &mut input {
+                peer.header.source = InputOrigin::Peer {
+                    peer_id: uuid::Uuid::from_u128(0xC1).to_string(),
+                    display_identity: Some("Peer A".into()),
+                    runtime_id: None,
+                };
+                peer.in_reply_to = Some(answered);
+            }
+            let appends = projection_durable_boundary_appends(&runtime_input_projection(&input));
+            match appends.as_slice() {
+                [append] => match &append.content {
+                    CoreRenderable::SystemNotice { blocks, .. } => match blocks.as_slice() {
+                        [block] => block.clone(),
+                        other => panic!("one comms block: {other:?}"),
+                    },
+                    other => panic!("a system notice: {other:?}"),
+                },
+                other => panic!("one notice row: {other:?}"),
+            }
+        };
+
+        let message = notice_block(PeerConvention::Message);
+        assert!(matches!(
+            &message,
+            meerkat_core::types::SystemNoticeBlock::Comms {
+                in_reply_to: Some(id),
+                ..
+            } if *id == answered
+        ));
+        let line = format!("In reply to: {answered}");
+        assert!(
+            message.model_projection_text().contains(&line),
+            "{}",
+            message.model_projection_text()
+        );
+
+        let request = notice_block(PeerConvention::Request {
+            request_id: "request-1".into(),
+            intent: "review".into(),
+        });
+        assert!(matches!(
+            &request,
+            meerkat_core::types::SystemNoticeBlock::Comms {
+                in_reply_to: None,
+                ..
+            }
+        ));
+        assert!(!request.model_projection_text().contains("In reply to"));
     }
 
     #[test]
@@ -2965,6 +3045,7 @@ mod tests {
             }]),
             payload: Some(serde_json::json!({"answer":"ok"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -3004,6 +3085,7 @@ mod tests {
             content: "Agent joined".into(),
             payload: Some(serde_json::json!({"name": "agent-1"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -3030,6 +3112,7 @@ mod tests {
             content: "Done".into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -3052,6 +3135,7 @@ mod tests {
             content: "Working...".into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -3181,6 +3265,7 @@ mod tests {
             ]),
             payload: None,
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection(&input);
@@ -3432,6 +3517,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(peer_msg.kind(), InputKind::PeerMessage);
 
@@ -3449,6 +3535,7 @@ mod tests {
             content: "hi".into(),
             payload: Some(serde_json::json!({"subject": "x"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(peer_req.kind(), InputKind::PeerRequest);
 
@@ -3540,6 +3627,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["handling_mode"], "queue");
@@ -3667,6 +3755,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["handling_mode"], "steer");
@@ -3690,6 +3779,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert!(json.get("handling_mode").is_none());

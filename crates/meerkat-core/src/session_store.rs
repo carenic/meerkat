@@ -9133,6 +9133,7 @@ mod tests {
                     text: "please look at this".to_string(),
                 }],
                 delivery_id: Some(crate::interaction::InteractionId(uuid::Uuid::from_u128(77))),
+                in_reply_to: None,
             },
         ))
     }
