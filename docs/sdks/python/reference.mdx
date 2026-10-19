@@ -443,6 +443,31 @@ the continuation variant does not fabricate a prompt. `RunFailed` accepts
 the current `error_report` and derives its `error_class` and `error` display
 fields from that report.
 
+Since 0.9.4 a run that failed because the provider refused or filtered the
+response (`error_class` `content_filtered`) carries `error_report.reason` as an
+`AgentErrorReason` with `reason_type == "content_filtered"`, `stop`
+(`"refusal"` or `"content_filter"`) and `detail`, the provider's own account as
+a dictionary tagged by `"provider"` (`anthropic`, `open_ai` or `gemini`), or
+`None` when the provider gave none. A `detail` that is not a provider-tagged
+dictionary reads as `None`, and a `stop` the SDK does not know reads as an
+unknown reason with the wire object in `raw`. SDKs before 0.9.4 read every such
+reason as unknown and keep it raw.
+
+`CompactionCompleted` carries two fields new in 0.9.4:
+
+- `summary_source` (`CompactionSummarySource`): who wrote the summary.
+  `kind` is `provider_call` (with `source_bound`, a
+  `SummarizationSourceBound` whose `kind` is `whole`, `trimmed` with
+  `through` = `tool_results`, `context` or `user_requests`, or
+  `requests_only` with `kept` and `of`), `host_curator` or
+  `mechanical_fallback`. A kind this SDK does not know is `unknown`, with the
+  wire kind in `raw_kind` and the wire object in `raw`. `None` for a
+  completion recorded before 0.9.4.
+- `estimated_history_tokens_after`: the estimated history tokens the rewrite
+  left, in the unit of `CompactionStarted.estimated_history_tokens`; `None` for
+  a completion recorded before 0.9.4 or when the history could not be
+  measured.
+
 `Retrying` parses the current wire shape, which carries one typed `retry`
 schedule: `attempt`, `max_attempts`, `error` and `delay_ms` are projections of
 `retry.plan.attempt`, `retry.plan.max_retries`, `retry.failure.message` and

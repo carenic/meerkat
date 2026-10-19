@@ -3038,7 +3038,7 @@ live transport's realtime observations. See
 | `run_completed` | Agent run finished |
 | `extraction_succeeded` | Structured-output extraction succeeded after a completed run; `request_usage` has one usage row per extraction request |
 | `extraction_failed` | Structured-output extraction failed after a completed run; `request_usage` has one usage row per answered extraction request |
-| `run_failed` | Agent run failed |
+| `run_failed` | Agent run failed; `error_report` carries `class`, `message` and a typed `reason`. Since 0.9.4 a `content_filtered` failure (the provider refused or filtered the response) carries `reason` `{"reason_type": "content_filtered", "stop": "refusal" \| "content_filter", "detail": {...}}` instead of `null`; `detail` is the provider's own account, tagged by `provider` (`anthropic`, `open_ai` or `gemini`), and is omitted when the provider gave none |
 | `turn_started` | New LLM call within the turn; `assistant_message_id` names the assistant message it will commit |
 | `reasoning_delta` | Streaming reasoning/thinking chunk from the model |
 | `reasoning_complete` | Reasoning/thinking complete for this block |
@@ -3055,7 +3055,7 @@ live transport's realtime observations. See
 | `tool_execution_completed` | Tool returned a result |
 | `tool_execution_timed_out` | Tool exceeded timeout |
 | `compaction_started` | Context compaction began |
-| `compaction_completed` | Compaction finished |
+| `compaction_completed` | Compaction finished. Since 0.9.4 it carries `summary_source` (who wrote the summary: `{"kind": "provider_call", "source_bound": ...}` with bound `whole`, `trimmed` (`through`) or `requests_only` (`kept`, `of`), `{"kind": "host_curator"}` or `{"kind": "mechanical_fallback"}`) and optional `estimated_history_tokens_after`, in the unit of `compaction_started`'s `estimated_history_tokens` |
 | `compaction_failed` | Compaction failed |
 | `budget_warning` | Approaching resource limits |
 | `retrying` | Retrying after transient error; the retry reuses `assistant_message_id`, so discard that id's live buffer |
@@ -3253,7 +3253,7 @@ and `data`, never on the message text.
 | -32028 | Stale fence | Command carried a superseded generation and fence |
 | -32029 | Member reload required | Member registration is durability-degraded; only an explicit registration reload repairs it |
 | -32030 | Input refused | The native owner declined an unaccepted input |
-| -32031 | Input not ready | Native input readiness is currently unavailable |
+| -32031 | Input not ready | Native input readiness is currently unavailable; `data` is `{"type": "not_ready", "reason": {"kind": ...}}`. Since 0.9.4 the kind `original_admission_pending` means an original the input names is still waiting on its source owner's admission: retry later |
 | -32032 | Session runtime unavailable | Runtime authority is unavailable before a session operation starts |
 | -32033 | Approval store unavailable | The approval store committed nothing; a fresh retry is valid |
 | -32034 | Approval conflict | Another owner changed the approval first; reconcile it before reuse |

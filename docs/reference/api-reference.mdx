@@ -442,6 +442,16 @@ Every `ErrorCode` maps to a stable string, JSON-RPC code, HTTP status, and CLI e
 | Invalid params | `INVALID_PARAMS` | -32602 | 400 | 2 |
 | Internal error | `INTERNAL_ERROR` | -32603 | 500 | 1 |
 
+`INPUT_REFUSED` and `INPUT_NOT_READY` carry the native owner's typed detail
+(`WireInputAdmissionErrorDetail`): `{"type": "refused", "kind": "denied" | "malformed_facts"}`
+or `{"type": "not_ready", "reason": {"kind": ...}}`, where `reason` is a
+`WireControllerReadinessFailure`. Since 0.9.4 its kinds include
+`original_admission_pending`: an original the input or operation relies on is
+still its source owner's submission candidate, whose admission the owner has
+not settled yet. Treat it as unavailable and retry later. A Rust decoder of
+`WireControllerReadinessFailure` built before 0.9.4 rejects the new kind; the
+Python, TypeScript and Web SDKs keep error details as untyped data.
+
 For session-service transport behavior specifically, see the [Capability matrix](/reference/capability-matrix#error-codes).
 
 ## Provider clients

@@ -503,6 +503,65 @@ mismatched source role fails closed. Ordinary resume should leave it as
 
 ---
 
+## Source owners and retained continuations
+
+A host that owns governed originals implements `AuthenticatedOriginalSource`.
+Since 0.9.4 it answers `retained_custody`, which replaces `retained_original`
+and returns `RetainedCustody` (non-exhaustive):
+
+| Answer | Meaning |
+|--------|---------|
+| `Retained(basis)` | Admitted and held, with the original's own mandate (the earlier `Some(basis)`) |
+| `AdmissionPending` | The original is still the owner's submission candidate. Answer it only for a candidate you will promote or withdraw yourself, within your own bound, and withdraw any candidate you cannot settle |
+| `NotRetained` | Not retained: the earlier `None`, a withdrawn candidate from then on, and a candidate you have not enrolled in such a settlement |
+
+Work that names a pending original is unavailable, not refused, and nothing
+waits for it. Native admission of input that names such a contributor,
+`require_source_original_live` and a retained resume report
+`ControllerReadinessUnavailable` with
+`ControllerReadinessFailure::OriginalAdmissionPending` (wire kind
+`original_admission_pending`, `INPUT_NOT_READY` on JSON-RPC). Operation
+authorization of work that names it, the further originals of a helper
+admission or child issuance, and the controller-grant mutation check report it
+unavailable as well. A retained resume therefore stays retryable until the
+owner settles the original. A cancelled original is still refused, and the
+controller-grant mutation check no longer counts a pending contributor as
+unreferenced. 0.9.3 and earlier refused such work as malformed or denied.
+
+The job delivery drain treats a continuation the runtime is not ready to admit
+the same way. `retained_admission_outcome` maps it to
+`ContinuationAdmitError::NotReady(cause)` (the enum is now
+`#[non_exhaustive]`, so a `match` needs a wildcard arm),
+`JobOutboxProjectionError::NotReady` carries the cause, and the drain blocks
+the row with `BlockedDeliveryReason::NotReady(cause)`. That is the enum's first
+variant with data, so its variants no longer have defined discriminants. The
+continuation stays pending and is retried, as for `Failed`; nothing is stored
+for the cause, which is read again on every retry.
+
+`MeerkatMachine::durable_admitted_original` (new in 0.9.4) reads the historical
+admission of a keyed governed original from the session's durable runtime
+store alone, so a source owner can resolve it after the session retired. It
+needs no registration, attachment or actor, consults no live state, and
+revives, submits, replays or releases nothing. It returns
+`DurableAdmittedOriginal` (the actual input id, the retained association, the
+durable phase, terminal outcome, last run and attempt count) only for the exact
+admission: one own contributor with that association and the exact replay of
+the expected original. Otherwise it returns `DurableAdmittedOriginalRefusal`
+(non-exhaustive): `Conflict` for a mismatch, `NotAdmitted` for nothing under
+the key, `UnknownRuntime` for an unknown session, and `Unavailable` for
+unreadable evidence. `SessionServiceRuntimeExt::durable_admitted_original`
+forwards it; its default answers `Unavailable`.
+
+`TurnStateHandle` gains three provided methods in 0.9.4: `turn_phase` reads the
+turn phase alone, `apply_turn_input_observing_phase` applies a typed turn input
+and returns its effects with the phase the authority holds after it, and
+`scalars` returns `TurnStateScalars`, the scalar fields of a
+`TurnStateSnapshot` without its collections or terminality classification.
+The defaults derive the answers from `snapshot` and `apply_turn_input`, so
+existing implementors keep working unchanged.
+
+---
+
 ## Complete example
 
 ```rust
