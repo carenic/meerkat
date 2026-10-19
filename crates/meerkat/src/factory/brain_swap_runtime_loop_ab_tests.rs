@@ -721,7 +721,7 @@ impl AbHarness {
             .unregister_session_registration_until_terminal_if_current(&registration)
             .await
             .expect("tear down the original runtime attachment");
-        assert!(torn_down, "the original registration was still current");
+        assert!(torn_down, "the original registration was no longer current");
         drop(self);
         attach_harness(environment, Some(session_id)).await
     }
