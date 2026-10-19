@@ -9964,15 +9964,16 @@ mod tests {
         assert_eq!(loaded.messages(), session.messages());
 
         let again = session.clone();
-        match store
+        let refusal = store
             .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &again))
-            .await
-        {
-            Err(SessionStoreError::Internal(detail)) => {
-                assert!(detail.contains("holds no row"), "{detail}");
-            }
-            other => panic!("seeding over a head row: {other:?}"),
-        }
+            .await;
+        assert!(
+            matches!(
+                &refusal,
+                Err(SessionStoreError::Internal(detail)) if detail.contains("holds no row")
+            ),
+            "seeding over a head row: {refusal:?}"
+        );
 
         let (_blob_dir, blob_store) = temp_store();
         let mut released = Session::new();
@@ -9996,15 +9997,16 @@ mod tests {
             )
             .unwrap();
         let blob = released.clone();
-        match blob_store
+        let refusal = blob_store
             .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &blob))
-            .await
-        {
-            Err(SessionStoreError::Internal(detail)) => {
-                assert!(detail.contains("holds no row"), "{detail}");
-            }
-            other => panic!("seeding over a released blob row: {other:?}"),
-        }
+            .await;
+        assert!(
+            matches!(
+                &refusal,
+                Err(SessionStoreError::Internal(detail)) if detail.contains("holds no row")
+            ),
+            "seeding over a released blob row: {refusal:?}"
+        );
     }
 
     /// The durable-writer invariant for the session store, asserted through
