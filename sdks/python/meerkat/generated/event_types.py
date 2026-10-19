@@ -2091,6 +2091,7 @@ class AgentEventCompactionStarted(TypedDict, total=False):
 class AgentEventCompactionCompleted(TypedDict, total=False):
     """Context compaction completed successfully.
     """
+    estimated_history_tokens_after: NotRequired[Optional[int]]
     messages_after: Required[int]
     messages_before: Required[int]
     summary_source: NotRequired[Optional[CompactionSummarySource]]

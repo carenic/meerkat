@@ -464,6 +464,10 @@ class CompactionCompleted(Event):
     messages_after: int = 0
     # None only for a completion recorded before the source was reported.
     summary_source: CompactionSummarySource | None = None
+    # Estimated history tokens the rewrite left, in the unit of
+    # CompactionStarted.estimated_history_tokens. None for a completion
+    # recorded before it was reported, or when the history was not measured.
+    estimated_history_tokens_after: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1802,6 +1806,12 @@ def parse_event(raw: dict[str, Any]) -> Event:
             elif f == "summary_source" and cls is CompactionCompleted:
                 kwargs["summary_source"] = _parse_compaction_summary_source(
                     raw.get("summary_source"),
+                )
+            elif f == "estimated_history_tokens_after" and cls is CompactionCompleted:
+                kwargs[f] = (
+                    None
+                    if raw.get(f) is None
+                    else _require_non_negative_int(raw, f)
                 )
             elif f == "payload" and cls is ToolConfigChanged:
                 payload_raw = raw["payload"]

@@ -1806,6 +1806,7 @@ mod tests {
                     messages_before: 40,
                     messages_after: 3,
                     summary_source: None,
+                    estimated_history_tokens_after: None,
                 },
                 AgentEvent::TurnStarted {
                     turn_number: 0,

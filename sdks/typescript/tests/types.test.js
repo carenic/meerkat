@@ -6553,4 +6553,21 @@ describe("Compaction summary source", () => {
     const malformed = parseEvent({ ...base, summary_source: "provider_call" });
     assert.equal(malformed.type, "malformed_event");
   });
+
+  it("reads the history the rewrite left and keeps events without it", () => {
+    const legacy = parseEvent(base);
+    assert.equal("estimatedHistoryTokensAfter" in legacy, false);
+    const explicitNull = parseEvent({ ...base, estimated_history_tokens_after: null });
+    assert.equal("estimatedHistoryTokensAfter" in explicitNull, false);
+
+    const reported = parseEvent({ ...base, estimated_history_tokens_after: 9800 });
+    assert.equal(reported.estimatedHistoryTokensAfter, 9800);
+
+    for (const malformed of ["9800", -1, true, 1.5]) {
+      assert.equal(
+        parseEvent({ ...base, estimated_history_tokens_after: malformed }).type,
+        "malformed_event",
+      );
+    }
+  });
 });

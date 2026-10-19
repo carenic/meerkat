@@ -515,8 +515,8 @@ impl Compactor for DefaultCompactor {
         // Cadence is a cost policy, not recovery authority. It may suppress a
         // provider-reported high-water mark while the current transcript is
         // still below both live pressure thresholds, but it must never veto a
-        // history or exact-byte crossing. One large tool result can make the
-        // very next request impossible, including when the previous
+        // crossing that compacting can recover. One large tool result can make
+        // the very next request impossible, including when the previous
         // compaction happened fewer than `min_turns_between_compactions`
         // boundaries ago.
         //
@@ -525,7 +525,57 @@ impl Compactor for DefaultCompactor {
         // survives compaction untouched, so a forecast crossing that cadence
         // could not veto would compact on every boundary forever without
         // reducing the crossing.
-        let requires_capacity_recovery = history_trigger || byte_trigger;
+        //
+        // A history crossing is recoverable only while the last rewrite got
+        // the history under the threshold. A rewrite keeps the System rows,
+        // the in-flight request and the recent turns, and adds a summary; when
+        // what it left is still at or above the threshold, that floor crosses
+        // on its own, and compacting again pays for a summary that recovers
+        // nothing. Such a crossing waits for the cadence like the forecast,
+        // unless the request no longer fits the model window and what arrived
+        // since that rewrite is at least the overage: that growth is the only
+        // content a rewrite can still remove.
+        //
+        // The byte crossing keeps its bypass. On the exact path the rebuilt
+        // request must shrink and fit its cap, or the turn fails as
+        // irreducible. On the estimated path a rewrite keeps the System rows,
+        // the summary and at most two retention budgets of verbatim rows, so
+        // its bytes stay under a request-byte threshold measured in megabytes
+        // unless the System rows alone approach the provider's request cap,
+        // which also puts the history far over the token threshold and the
+        // request over the model window.
+        let history_floor_crosses = ctx
+            .last_rewrite_history_tokens
+            .is_some_and(|left| left >= self.config.auto_compact_threshold);
+        let removable_growth_covers_overage = ctx
+            .request_context_budget
+            .as_ref()
+            .filter(|budget| budget.state != meerkat_core::ContextBudgetState::Within)
+            .zip(ctx.last_rewrite_history_tokens)
+            .is_some_and(|(budget, left)| {
+                ctx.estimated_history_tokens.saturating_sub(left) >= budget.overage_tokens
+            });
+        let history_recovers =
+            history_trigger && (!history_floor_crosses || removable_growth_covers_overage);
+        if history_trigger
+            && !history_recovers
+            && ctx
+                .last_compaction_boundary_index
+                .is_some_and(|last| ctx.session_boundary_index == last.saturating_add(1))
+        {
+            tracing::warn!(
+                last_rewrite_history_tokens = ctx.last_rewrite_history_tokens,
+                estimated_history_tokens = ctx.estimated_history_tokens,
+                threshold = self.config.auto_compact_threshold,
+                min_turns_between_compactions = self.config.min_turns_between_compactions,
+                "compaction cannot bring the history under its threshold: the last rewrite left \
+                 the history at or above it, so the System rows, the kept request, the recent \
+                 turns and the summary cross it on their own; history crossings now wait for the \
+                 compaction cadence. Raise auto_compact_threshold above that floor, omit it so it \
+                 derives from the model window, or shrink the System rows"
+            );
+        }
+        let requires_capacity_recovery = history_recovers || byte_trigger;
         if !requires_capacity_recovery
             && let Some(last) = ctx.last_compaction_boundary_index
             && ctx.session_boundary_index.saturating_sub(last)
@@ -874,6 +924,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 0,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -890,6 +941,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 7, // Only 2 boundaries since last compaction, threshold is 3
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -906,11 +958,148 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 6,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
             "an already-oversized history must recover even immediately after a prior compaction"
         );
+    }
+
+    /// A history crossing is capacity recovery only while compacting can get
+    /// under the threshold. When the last rewrite already left the history at
+    /// or above it, the floor crosses on its own: the crossing waits for the
+    /// cadence like an ordinary trigger instead of paying for a summary at
+    /// every boundary, and compaction still runs once the cadence allows it.
+    #[test]
+    fn history_crossing_waits_for_the_cadence_when_the_last_rewrite_left_it_over() {
+        let c = DefaultCompactor::new(make_config());
+        let just_after = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 0,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(101_000),
+        };
+        assert!(
+            !c.should_compact(&just_after),
+            "a rewrite that left the history over the threshold cannot recover it at the next boundary"
+        );
+        let after_cadence = CompactionContext {
+            session_boundary_index: 8,
+            ..just_after
+        };
+        assert!(
+            c.should_compact(&after_cadence),
+            "the crossing still compacts once the cadence allows it"
+        );
+    }
+
+    /// Control: a rewrite that got the history under the threshold keeps the
+    /// bypass, so new content that crosses again is recovered at once.
+    #[test]
+    fn history_crossing_bypasses_the_cadence_when_the_last_rewrite_got_under() {
+        let c = DefaultCompactor::new(make_config());
+        let ctx = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 0,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(40_000),
+        };
+        assert!(c.should_compact(&ctx));
+    }
+
+    /// With the floor over the threshold, the bypass returns only when the
+    /// request no longer fits the model window and what arrived since the
+    /// last rewrite covers the overage: that growth is the only content a
+    /// rewrite can still remove. Without such growth the cadence holds.
+    #[test]
+    fn floor_over_threshold_bypasses_only_for_growth_that_covers_the_window_overage() {
+        let threshold = 6_000;
+        let compactor = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: threshold,
+            ..make_config()
+        });
+        let profile = windowed_profile_witness(10_000);
+        let messages = vec![Message::User(UserMessage::text("t".repeat(80_000)))];
+        let budget =
+            meerkat_core::context_budget_fact_for_messages(&messages, &[], 2_048, &profile)
+                .expect("declared window must classify");
+        assert_ne!(
+            budget.state,
+            meerkat_core::ContextBudgetState::Within,
+            "the request must be projected beyond the window"
+        );
+        let overage = budget.overage_tokens;
+        assert!(overage > 0);
+        let ctx = meerkat_core::agent::compact::build_compaction_context(
+            &messages,
+            0,
+            Some(budget),
+            None,
+            Some(5),
+            6,
+        );
+        let history = ctx.estimated_history_tokens;
+        assert!(
+            history.saturating_sub(overage) >= threshold,
+            "every case below must keep the floor over the threshold"
+        );
+
+        let no_growth = CompactionContext {
+            last_rewrite_history_tokens: Some(history),
+            ..ctx.clone()
+        };
+        assert!(
+            !compactor.should_compact(&no_growth),
+            "nothing removable arrived since the last rewrite: the cadence holds"
+        );
+        let short_of_overage = CompactionContext {
+            last_rewrite_history_tokens: Some(history - overage + 1),
+            ..ctx.clone()
+        };
+        assert!(
+            !compactor.should_compact(&short_of_overage),
+            "growth below the overage cannot make the request fit"
+        );
+        let covers_overage = CompactionContext {
+            last_rewrite_history_tokens: Some(history - overage),
+            ..ctx
+        };
+        assert!(
+            compactor.should_compact(&covers_overage),
+            "growth that covers the overage is removable: the bypass fires"
+        );
+    }
+
+    /// The byte crossing keeps its bypass whatever the last rewrite left.
+    #[test]
+    fn byte_crossing_keeps_its_bypass_after_a_rewrite_that_left_the_history_over() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            max_request_bytes: Some(9_000_000),
+            ..make_config()
+        });
+        let ctx = CompactionContext {
+            last_input_tokens: 0,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 8_000_000,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(101_000),
+        };
+        assert!(c.should_compact(&ctx));
     }
 
     #[test]
@@ -925,6 +1114,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 1,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx));
     }
@@ -943,6 +1133,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx));
 
@@ -956,6 +1147,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx2));
     }
@@ -977,6 +1169,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 42,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -1001,6 +1194,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -1023,6 +1217,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -1051,6 +1246,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             !c.should_compact(&ctx),
@@ -1081,6 +1277,7 @@ mod tests {
             )),
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 6,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -1292,6 +1489,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&neither));
 

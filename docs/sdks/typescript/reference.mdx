@@ -656,7 +656,7 @@ interface ToolExecutionTimedOutEvent  { type: "tool_execution_timed_out";   id: 
 
 ```typescript
 interface CompactionStartedEvent   { type: "compaction_started";   inputTokens: number; estimatedHistoryTokens: number; messageCount: number }
-interface CompactionCompletedEvent { type: "compaction_completed";  summaryTokens: number; messagesBefore: number; messagesAfter: number; summarySource?: CompactionSummarySource }
+interface CompactionCompletedEvent { type: "compaction_completed";  summaryTokens: number; messagesBefore: number; messagesAfter: number; summarySource?: CompactionSummarySource; estimatedHistoryTokensAfter?: number }
 // Who wrote the summary; a provider call says how much of the history its source carried.
 type CompactionSummarySource =
   | { kind: "provider_call"; sourceBound: SummarizationSourceBound }

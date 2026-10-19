@@ -1,9 +1,10 @@
-//! The compaction summary's source is sized for the model that writes it.
+//! The compaction summary's source is sized for the model that writes it, and
+//! a history no rewrite can get under the threshold compacts at the cadence.
 //!
-//! A factory-built agent compacts with the `DefaultCompactor`. Each test runs
-//! two turns of one session against a scripted client and reads the source
-//! the summary request carries: the second turn's first boundary compacts the
-//! first turn.
+//! A factory-built agent compacts with the `DefaultCompactor`. The source
+//! tests run two turns of one session against a scripted client and read the
+//! source the summary request carries: the second turn's first boundary
+//! compacts the first turn.
 
 use super::*;
 use async_trait::async_trait;
@@ -194,5 +195,71 @@ async fn summary_source_without_a_declared_window_keeps_the_threshold_bound() {
     assert!(
         !serde_json::to_string(&source).unwrap().contains(MARKER),
         "the bounded source trims the middle of the first turn"
+    );
+}
+
+/// A System prompt alone over the compaction threshold leaves every rewrite
+/// over it: every boundary crosses. After the first rewrite proves that,
+/// the crossings wait for the compaction cadence instead of paying for a
+/// summary call before every model call.
+#[tokio::test]
+async fn a_floor_over_the_threshold_compacts_at_the_cadence_not_at_every_boundary() {
+    const TURNS: usize = 8;
+    let temp = tempfile::tempdir().expect("temp session store");
+    let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+    let mut config = Config::default();
+    config.models.custom.insert(
+        MODEL.to_string(),
+        CustomModelConfig {
+            provider: Provider::OpenAI,
+            display_name: None,
+            context_window: Some(200_000),
+            max_input_tokens: None,
+            max_output_tokens: Some(4_096),
+            vision: Some(false),
+            web_search: Some(false),
+            call_timeout_secs: None,
+        },
+    );
+    let session = Session::new();
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let bindings = runtime
+        .prepare_bindings(session.id().clone())
+        .await
+        .expect("session runtime bindings");
+    let client = Arc::new(SummarySourceRecordingClient {
+        input_tokens: 0,
+        summary_requests: Mutex::new(Vec::new()),
+    });
+    let mut build = AgentBuildConfig::new(MODEL);
+    build.provider = Some(Provider::OpenAI);
+    build.llm_client_override = Some(client.clone());
+    build.resume_session = Some(session);
+    build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+    build.override_builtins = ToolCategoryOverride::Disable;
+    // About 4,000 estimated tokens of System prompt against a 2,000-token
+    // threshold: no rewrite can get the history under it.
+    build.system_prompt = meerkat_core::SystemPromptOverride::Set("s".repeat(16_000));
+    build.auto_compact_threshold_override = std::num::NonZeroU64::new(2_000);
+    let mut agent = factory
+        .build_agent(build, &config)
+        .await
+        .expect("agent on the custom model");
+
+    for turn in 0..TURNS {
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        agent
+            .run(meerkat_core::ContentInput::Text(format!("turn {turn}")))
+            .await
+            .expect("every turn completes");
+    }
+
+    let summary_calls = client.summary_requests.lock().unwrap().len();
+    assert_eq!(
+        summary_calls, 3,
+        "{TURNS} turns cross at every boundary after the first; with the default cadence of 3 \
+         the summary runs at boundaries 1, 4 and 7, not at all seven"
     );
 }

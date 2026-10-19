@@ -8790,6 +8790,30 @@ def test_parse_compaction_completed_summary_source():
     assert curator.summary_source == CompactionSummarySource(kind="host_curator")
 
 
+def test_parse_compaction_completed_estimated_history_tokens_after():
+    from meerkat.events import CompactionCompleted
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.estimated_history_tokens_after is None
+    assert parse_event({**base, "estimated_history_tokens_after": None}) == legacy
+
+    reported = parse_event({**base, "estimated_history_tokens_after": 9_800})
+    assert isinstance(reported, CompactionCompleted)
+    assert reported.estimated_history_tokens_after == 9_800
+
+    for malformed in ("9800", -1, True, 1.5):
+        event = parse_event({**base, "estimated_history_tokens_after": malformed})
+        assert isinstance(event, UnknownEvent)
+        assert event.type == "malformed_event"
+
+
 def test_parse_compaction_completed_unknown_summary_source_kinds():
     from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
 

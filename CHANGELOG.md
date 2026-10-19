@@ -68,6 +68,23 @@ them.
   the durable identity and the profile together. A replacement client for the
   same model, or any client on a session without a durable identity, is
   accepted as before.
+- `meerkat-core`: a compaction rewrite records the history it left.
+  `SessionCompactionCadence` and `CompactionContext` gain
+  `last_rewrite_history_tokens`, the estimated history tokens the last rewrite
+  left (`None` before the first), which `Compactor::should_compact` reads; the
+  session persists it with its compaction cadence.
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `estimated_history_tokens_after`, the same estimate in the unit of
+  `estimated_history_tokens`, `None` for one recorded before this release or
+  when the history could not be measured (on the wire the field is optional;
+  the Python SDK reads it as `CompactionCompleted.estimated_history_tokens_after`
+  and the TypeScript SDK as
+  `CompactionCompletedEvent.estimatedHistoryTokensAfter`). A
+  `CompactionContext` built by hand keeps the previous decisions with
+  `last_rewrite_history_tokens: None`. A 0.9.3 binary ignores the persisted
+  field and drops it when it next writes the cadence; back on this release,
+  that session compacts as before until its next rewrite records the field
+  again, so a downgrade and upgrade cost at most one extra summary call.
 
 ### Added
 
@@ -103,6 +120,19 @@ them.
   the threshold; only a window too small for the 4 KiB minimum still
   overflows, and the capacity fallback then writes a mechanical summary. A
   model that declares no context window keeps the threshold rule.
+- Compaction no longer pays for a summary at every boundary when no rewrite
+  can get the history under the threshold. A history crossing bypassed
+  `min_turns_between_compactions` as capacity recovery even when the last
+  rewrite had left the history over the threshold, for example when the
+  System rows alone exceed an explicit `auto_compact_threshold`: every
+  boundary compacted again and paid for a summary call that recovered
+  nothing. Such a crossing now waits for the cadence, and a warning names the
+  remedies (raise `auto_compact_threshold` above that floor, omit it so it
+  derives from the model window, or shrink the System rows). A history
+  crossing still bypasses the cadence while the last rewrite got the history
+  under the threshold, and when the request no longer fits the model window
+  and the history added since that rewrite covers the overage. The
+  request-byte crossing keeps its bypass.
 
 ### Fixed
 

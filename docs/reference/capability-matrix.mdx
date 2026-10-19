@@ -458,6 +458,11 @@ When `session-compaction` is enabled:
   can fall in one turn, and the session keeps the count across runs. A live
   history-token or exact provider-byte capacity crossing bypasses that cost
   guard so an already-oversized request can recover immediately. A
+  history-token crossing bypasses it only while the last rewrite got the
+  history under the threshold, or when the request no longer fits the model
+  window and the history added since that rewrite covers the overage: when
+  the rows a rewrite keeps cross the threshold on their own, compacting again
+  cannot recover it, and it waits for the cadence. A
   request-budget crossing does not bypass it: tool definitions and the output
   reserve survive compaction, so a crossing they cause is a cost decision, not a
   recovery one.

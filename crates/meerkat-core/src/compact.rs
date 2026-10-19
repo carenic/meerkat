@@ -23,6 +23,15 @@ pub struct SessionCompactionCadence {
     /// Boundary index where compaction was last attempted, successful or not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_attempt_boundary_index: Option<u64>,
+    /// Estimated history tokens the last compaction rewrite left: the
+    /// committed rewrite's transcript, or the unchanged transcript of a
+    /// rewrite rejected as a no-op. A failed attempt leaves it as it was.
+    ///
+    /// The evidence for [`CompactionContext::last_rewrite_history_tokens`].
+    /// `None` before the first rewrite, and for a session last written by a
+    /// binary before 0.9.4, which neither writes nor reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rewrite_history_tokens: Option<u64>,
 }
 
 /// Context provided to `Compactor::should_compact` for trigger decisions.
@@ -82,6 +91,14 @@ pub struct CompactionContext {
     pub last_compaction_boundary_index: Option<u64>,
     /// Current session-scoped pre-LLM boundary index.
     pub session_boundary_index: u64,
+    /// Estimated history tokens, in the unit of `estimated_history_tokens`,
+    /// that the last compaction rewrite left, or `None` before the first.
+    ///
+    /// A rewrite always keeps the System rows, the in-flight request and the
+    /// recent turns, and adds a summary. When what it left is still at or
+    /// above the threshold, that floor alone crosses it, and compacting again
+    /// cannot bring the history under it.
+    pub last_rewrite_history_tokens: Option<u64>,
 }
 
 /// Provider-authored witness for the exact JSON body an invocation may send.

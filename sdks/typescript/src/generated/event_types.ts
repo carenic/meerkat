@@ -1471,6 +1471,7 @@ export type AgentEvent = {
   message_count: number;
   type: "compaction_started";
 } | {
+  estimated_history_tokens_after?: number | null;
   messages_after: number;
   messages_before: number;
   summary_source?: CompactionSummarySource | null;

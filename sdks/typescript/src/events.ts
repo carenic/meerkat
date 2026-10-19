@@ -462,6 +462,12 @@ export interface CompactionCompletedEvent {
   readonly messagesAfter: number;
   /** Absent only for a completion recorded before the source was reported. */
   readonly summarySource?: CompactionSummarySource;
+  /**
+   * Estimated history tokens the rewrite left, in the unit of
+   * `CompactionStartedEvent.estimatedHistoryTokens`. Absent for a completion
+   * recorded before it was reported, or when the history was not measured.
+   */
+  readonly estimatedHistoryTokensAfter?: number;
 }
 
 export interface CompactionFailedEvent {
@@ -1876,6 +1882,15 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
         ...(raw.summary_source === undefined || raw.summary_source === null
           ? {}
           : { summarySource: parseCompactionSummarySource(raw.summary_source) }),
+        ...(raw.estimated_history_tokens_after === undefined ||
+        raw.estimated_history_tokens_after === null
+          ? {}
+          : {
+              estimatedHistoryTokensAfter: requireNonNegativeIntegerField(
+                raw,
+                "estimated_history_tokens_after",
+              ),
+            }),
       };
     case "compaction_failed":
       return { type, reason: requireRecordField(raw, "reason") };

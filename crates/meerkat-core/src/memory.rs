@@ -63,6 +63,11 @@ pub struct CompactionProjectionIntent {
     /// recorded the source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_source: Option<crate::agent::compact::CompactionSummarySource>,
+    /// Estimated history tokens the rewrite left, carried to the completion
+    /// event the commit emits. `None` for an intent staged before 0.9.4, or
+    /// when the rewritten history could not be measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_history_tokens_after: Option<u64>,
 }
 
 impl CompactionProjectionId {
@@ -1111,7 +1116,19 @@ mod tests {
         });
         let intent: CompactionProjectionIntent = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(intent.summary_source, None);
+        assert_eq!(intent.estimated_history_tokens_after, None);
         assert_eq!(serde_json::to_value(&intent).unwrap(), legacy);
+
+        let current = CompactionProjectionIntent {
+            estimated_history_tokens_after: Some(61_234),
+            ..intent
+        };
+        let encoded = serde_json::to_value(&current).unwrap();
+        assert_eq!(encoded["estimated_history_tokens_after"], 61_234);
+        assert_eq!(
+            serde_json::from_value::<CompactionProjectionIntent>(encoded).unwrap(),
+            current
+        );
     }
 
     fn range(start: u64, end: u64) -> MessageRange {

@@ -1300,6 +1300,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -26168,6 +26177,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -39533,6 +39551,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -54605,6 +54632,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -77461,6 +77497,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -93145,6 +93190,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -154820,6 +154874,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",

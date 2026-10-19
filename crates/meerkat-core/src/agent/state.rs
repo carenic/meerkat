@@ -3491,7 +3491,7 @@ where
                     .into_iter()
                     .flatten()
                     .max();
-                    let ctx = crate::agent::compact::build_compaction_context(
+                    let mut ctx = crate::agent::compact::build_compaction_context(
                         &model_messages,
                         self.last_input_tokens,
                         request_context_budget,
@@ -3499,6 +3499,8 @@ where
                         last_guarded_boundary,
                         current_boundary_index,
                     );
+                    ctx.last_rewrite_history_tokens =
+                        self.compaction_cadence.last_rewrite_history_tokens;
                     if compactor.should_compact(&ctx) {
                         self.tool_application_observations.invalidate();
                         let rollback_state = crate::agent::CompactionRollbackState {
@@ -3750,9 +3752,24 @@ where
                                     }
                                     Ok(commit)
                                 });
+                            // What the rewrite leaves, in the unit of the
+                            // history trigger: the evidence the next boundary
+                            // judges a crossing by, and what the completion
+                            // reports.
+                            let mut history_tokens_after = None;
                             let compacted_session = match prepared_rewrite {
-                                Ok(Some(commit)) => Some((compacted_session, commit)),
+                                Ok(Some(commit)) => {
+                                    history_tokens_after =
+                                        crate::agent::compact::estimated_history_tokens(
+                                            &compacted_session.messages_for_model_boundary(),
+                                        );
+                                    Some((compacted_session, commit))
+                                }
                                 Ok(None) => {
+                                    // The transcript is unchanged: it is
+                                    // what this rewrite left.
+                                    self.compaction_cadence.last_rewrite_history_tokens =
+                                        Some(ctx.estimated_history_tokens);
                                     let error =
                                         crate::agent::compact::CompactionError::InvalidRebuild(
                                             "compactor produced a no-op transcript rewrite"
@@ -3880,6 +3897,7 @@ where
                                                             messages_before: outcome.messages_before,
                                                             messages_after: outcome.messages_after,
                                                             summary_source: Some(outcome.summary_source),
+                                                            estimated_history_tokens_after: history_tokens_after,
                                                         };
                                                         match compacted_session
                                                             .add_compaction_projection_intent(intent)
@@ -4073,6 +4091,8 @@ where
                                     });
                                 self.compaction_cadence.last_compaction_boundary_index =
                                     Some(outcome.session_boundary_index);
+                                self.compaction_cadence.last_rewrite_history_tokens =
+                                    history_tokens_after;
                                 if emit_completed_now
                                     && !crate::event_tap::tap_emit(
                                         &self.event_tap,
@@ -4082,6 +4102,7 @@ where
                                             messages_before: outcome.messages_before,
                                             messages_after: outcome.messages_after,
                                             summary_source: Some(outcome.summary_source),
+                                            estimated_history_tokens_after: history_tokens_after,
                                         },
                                     )
                                     .await
@@ -4489,6 +4510,7 @@ where
                     messages_before: intent.messages_before,
                     messages_after: intent.messages_after,
                     summary_source: intent.summary_source,
+                    estimated_history_tokens_after: intent.estimated_history_tokens_after,
                 },
             )
             .await
@@ -10898,6 +10920,68 @@ mod tests {
         }
     }
 
+    /// Compacts at every boundary after the first. A rewrite whose summary
+    /// matches, word for word, the summary the history starts with replays
+    /// that summary row unchanged: the rewrite is then a no-op.
+    struct ReplayingSummaryCompactor;
+
+    impl Compactor for ReplayingSummaryCompactor {
+        fn should_compact(&self, ctx: &CompactionContext) -> bool {
+            ctx.session_boundary_index >= 1
+        }
+
+        fn compaction_prompt(&self) -> &'static str {
+            "COMPACT NOW"
+        }
+
+        fn max_summary_tokens(&self) -> u32 {
+            32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
+        }
+
+        fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
+            let replayed = messages
+                .first()
+                .filter(|first| {
+                    matches!(
+                        first,
+                        Message::User(user)
+                            if user.transcript_role.is_compaction_summary()
+                                && user.text_content()
+                                    == format!("{COMPACTION_SUMMARY_PREFIX}{summary}")
+                    )
+                })
+                .cloned();
+            let Some(previous) = replayed else {
+                return DiscardingCompactor::new(0).rebuild_history(messages, summary);
+            };
+            CompactionResult {
+                messages: messages.to_vec(),
+                summary: CompactionSummary::new(0, previous.clone()),
+                retained: messages
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(offset, message)| {
+                        let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+                        CompactionRetained::new(offset, offset, message)
+                    })
+                    .collect(),
+                discarded: vec![CompactionDiscard::new(0, previous)],
+            }
+        }
+    }
+
     /// Test compactor whose trigger is the BYTE threshold only, evaluated
     /// through the production-owned `request_byte_trigger_threshold`
     /// arithmetic (4/5 of the cap) — the same expression `DefaultCompactor`
@@ -11985,8 +12069,15 @@ mod tests {
         let session = crate::Session::new();
         let session_id = session.id().clone();
         let (event_tx, mut event_rx) = mpsc::channel(4096);
+        // A bound other than the default `Whole`, so only a faithful copy of
+        // the staged source passes, not a constant fill.
+        let staged_source = crate::agent::compact::CompactionSummarySource::ProviderCall {
+            source_bound: crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 },
+        };
         let mut agent = with_test_turn_state_handle_for_session(AgentBuilder::new(), session)
-            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .compactor(Arc::new(DiscardingCompactor::new(1).reporting(
+                crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 },
+            )))
             .memory_store(memory_store.clone())
             .with_compaction_commit_coordinator(Arc::new(AllowCompactionCoordinator { session_id }))
             .with_default_event_tx(event_tx)
@@ -12003,9 +12094,11 @@ mod tests {
         let completions = |event_rx: &mut mpsc::Receiver<crate::event::AgentEvent>| {
             std::iter::from_fn(|| event_rx.try_recv().ok())
                 .filter_map(|event| match event {
-                    crate::event::AgentEvent::CompactionCompleted { summary_source, .. } => {
-                        Some(summary_source)
-                    }
+                    crate::event::AgentEvent::CompactionCompleted {
+                        summary_source,
+                        estimated_history_tokens_after,
+                        ..
+                    } => Some((summary_source, estimated_history_tokens_after)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -12020,6 +12113,16 @@ mod tests {
             .validated_compaction_projection_intents()
             .unwrap();
         assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].summary_source, Some(staged_source));
+        let staged_left = intents[0].estimated_history_tokens_after;
+        assert!(
+            staged_left.is_some(),
+            "the staged intent carries what the rewrite left"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens, staged_left,
+            "the staged rewrite records the same evidence"
+        );
         agent
             .reconcile_runtime_compaction_projections(&intents)
             .await
@@ -12027,12 +12130,9 @@ mod tests {
 
         assert_eq!(
             completions(&mut event_rx),
-            vec![Some(
-                crate::agent::compact::CompactionSummarySource::ProviderCall {
-                    source_bound: crate::compact::SummarizationSourceBound::Whole,
-                }
-            )],
-            "the completion the runtime commit emits carries the staged summary source"
+            vec![(Some(staged_source), staged_left)],
+            "the completion the runtime commit emits carries the staged summary source and \
+             what the rewrite left"
         );
     }
 
@@ -12082,6 +12182,7 @@ mod tests {
                 messages_before,
                 messages_after: 1,
                 summary_source: None,
+                estimated_history_tokens_after: None,
             })
             .unwrap();
         projection
@@ -12233,6 +12334,7 @@ mod tests {
             serde_json::to_value(rollback_session.transcript_history_state().unwrap()).unwrap();
         let rollback_usage = rollback_session.total_usage();
         let rollback_last_input_tokens = agent.last_input_tokens;
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(111);
         let rollback_compaction_cadence = agent.compaction_cadence.clone();
         let attempted_boundary = rollback_compaction_cadence.session_boundary_index + 1;
         let projection = append_abort_test_projection(agent.session_mut(), "atomic-apply-failure");
@@ -12253,6 +12355,7 @@ mod tests {
             .compaction_cadence
             .last_compaction_attempt_boundary_index = Some(attempted_boundary);
         agent.compaction_cadence.last_compaction_boundary_index = Some(attempted_boundary);
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(999);
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
@@ -12308,6 +12411,11 @@ mod tests {
             agent.compaction_cadence.last_compaction_boundary_index,
             rollback_compaction_cadence.last_compaction_boundary_index,
             "a rolled-back compaction must retain the attempt but not claim successful completion"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(111),
+            "an aborted rewrite left nothing: the previous rewrite's evidence stays"
         );
         assert!(
             agent
@@ -14700,6 +14808,142 @@ mod tests {
                     source_bound: bound
                 }
             )]
+        );
+    }
+
+    /// A committed rewrite records the history estimate it left as the
+    /// session's cadence evidence, persisted with the cadence, and the
+    /// completion reports the same number.
+    #[tokio::test]
+    async fn compaction_records_and_reports_the_history_its_rewrite_left() {
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        assert_eq!(agent.compaction_cadence.last_rewrite_history_tokens, None);
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the compaction commits and the turn continues");
+
+        let mut started = Vec::new();
+        let mut left = Vec::new();
+        for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+            match event {
+                crate::event::AgentEvent::CompactionStarted {
+                    estimated_history_tokens,
+                    ..
+                } => started.push(estimated_history_tokens),
+                crate::event::AgentEvent::CompactionCompleted {
+                    estimated_history_tokens_after,
+                    ..
+                } => left.push(estimated_history_tokens_after),
+                _ => {}
+            }
+        }
+        let [before] = started.as_slice() else {
+            panic!("expected one compaction, got {started:?}");
+        };
+        let [Some(after)] = left.as_slice() else {
+            panic!("the completion must report what the rewrite left: {left:?}");
+        };
+        assert!(
+            after < before,
+            "the rewrite shrank the history: {after} vs {before}"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(*after),
+            "the evidence is the number the completion reports"
+        );
+        let mut persisted = agent.session().clone();
+        assert_eq!(
+            crate::agent::compact::load_compaction_cadence(&mut persisted)
+                .unwrap()
+                .last_rewrite_history_tokens,
+            Some(*after),
+            "the evidence is persisted with the session's compaction cadence"
+        );
+    }
+
+    /// A rewrite rejected as a no-op left the transcript as it was, so the
+    /// evidence is the estimate the attempt started from.
+    #[tokio::test]
+    async fn rejected_noop_rewrite_records_the_unchanged_history() {
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(ReplayingSummaryCompactor))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent
+            .run("second".into())
+            .await
+            .expect("the first compaction commits");
+        let committed = agent.compaction_cadence.last_rewrite_history_tokens;
+        assert!(committed.is_some(), "the committed rewrite left evidence");
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("third".into(), tx)
+            .await
+            .expect("a rejected no-op rewrite keeps the history and the turn continues");
+        let mut started = Vec::new();
+        let mut rejected = false;
+        for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+            match event {
+                crate::event::AgentEvent::CompactionStarted {
+                    estimated_history_tokens,
+                    ..
+                } => started.push(estimated_history_tokens),
+                crate::event::AgentEvent::CompactionFailed {
+                    reason:
+                        crate::event::CompactionFailureReason::TranscriptRewriteFailed { message },
+                } if message.contains("no-op") => rejected = true,
+                _ => {}
+            }
+        }
+        assert!(rejected, "the replayed summary must be rejected as a no-op");
+        let [before] = started.as_slice() else {
+            panic!("expected one compaction attempt, got {started:?}");
+        };
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(*before),
+            "a no-op rewrite left exactly the history it started from"
+        );
+    }
+
+    /// A summary call that fails proves nothing about what a rewrite would
+    /// leave: the evidence of the last rewrite stays.
+    #[tokio::test]
+    async fn failed_summary_call_keeps_the_previous_rewrite_evidence() {
+        let client = Arc::new(FailingCompactionLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(12_345);
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("a failed summary call keeps the history and the turn continues");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, crate::event::AgentEvent::CompactionFailed { .. })),
+            "the summary call must have failed"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(12_345)
         );
     }
 

@@ -12245,6 +12245,7 @@ mod runtime_turn_metadata_tests {
             messages_before: 2,
             messages_after: 1,
             summary_source: None,
+            estimated_history_tokens_after: None,
         };
         let error = service
             .reconcile_runtime_compaction_projections(&missing_session_id, vec![intent])

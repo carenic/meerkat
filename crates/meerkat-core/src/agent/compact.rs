@@ -546,7 +546,16 @@ pub fn build_compaction_context(
         provider_request_pressure,
         last_compaction_boundary_index,
         session_boundary_index,
+        last_rewrite_history_tokens: None,
     }
+}
+
+/// The history estimate `build_compaction_context` reports for `messages`,
+/// or `None` when it cannot be measured.
+pub(crate) fn estimated_history_tokens(messages: &[Message]) -> Option<u64> {
+    estimate_transcript_pressure(messages)
+        .ok()
+        .map(|pressure| pressure.tokens)
 }
 
 /// Best-effort count of prior LLM boundaries for older sessions that do not
@@ -592,6 +601,7 @@ pub fn load_compaction_cadence(
                 session_boundary_index: infer_session_boundary_index(session.messages()),
                 last_compaction_boundary_index: None,
                 last_compaction_attempt_boundary_index: None,
+                last_rewrite_history_tokens: None,
             };
             persist_compaction_cadence(session, &cadence)
                 .map_err(CompactionCadenceError::PersistFailed)?;
@@ -1940,10 +1950,27 @@ mod tests {
             session_boundary_index: 7,
             last_compaction_boundary_index: Some(4),
             last_compaction_attempt_boundary_index: Some(6),
+            last_rewrite_history_tokens: Some(61_234),
         };
         persist_compaction_cadence(&mut session, &cadence).unwrap();
 
         assert_eq!(load_compaction_cadence(&mut session).unwrap(), cadence);
+    }
+
+    /// Cadence metadata written before 0.9.4 has no rewrite evidence: it reads
+    /// as `None` (no evidence, so a history crossing still bypasses the
+    /// cadence), and a cadence without evidence writes no field for an older
+    /// binary to meet.
+    #[test]
+    fn compaction_cadence_without_rewrite_evidence_reads_and_writes_as_before() {
+        let legacy = serde_json::json!({
+            "session_boundary_index": 7,
+            "last_compaction_boundary_index": 4,
+            "last_compaction_attempt_boundary_index": 6
+        });
+        let cadence: SessionCompactionCadence = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(cadence.last_rewrite_history_tokens, None);
+        assert_eq!(serde_json::to_value(&cadence).unwrap(), legacy);
     }
 
     #[test]
