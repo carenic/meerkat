@@ -2533,6 +2533,28 @@ mod tests {
         }
     }
 
+    /// The login lifecycle guard is process-wide per lease key. A test that
+    /// takes it (a login, a token commit, a rollback) or reads status with
+    /// no live lease uses a realm of its own: under `cargo test`, another
+    /// test on the same key would block it, or make its status read find the
+    /// owner busy.
+    fn openai_auth_binding_in(realm: &str) -> AuthBindingRef {
+        AuthBindingRef {
+            realm: meerkat_core::RealmId::parse(realm).unwrap(),
+            binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        }
+    }
+
+    /// `config` with its `dev` realm moved to `realm` (see
+    /// [`openai_auth_binding_in`]).
+    fn in_own_realm(mut config: meerkat_core::Config, realm: &str) -> meerkat_core::Config {
+        let section = config.realm.remove("dev").unwrap();
+        config.realm.insert(realm.into(), section);
+        config
+    }
+
     fn generated_auth_transition_for_test(
         lease_key: &LeaseKey,
         expires_at: u64,
@@ -4307,17 +4329,20 @@ mod tests {
 
     #[tokio::test]
     async fn login_start_records_flow_on_runtime_authority() {
-        let runtime = test_runtime_with_config(config_with_openai_oauth_binding(
-            CredentialSourceSpec::ManagedStore,
+        let realm = "rpc-login-records-flow";
+        let runtime = test_runtime_with_config(in_own_realm(
+            config_with_openai_oauth_binding(CredentialSourceSpec::ManagedStore),
+            realm,
         ));
-        let unrelated_runtime = test_runtime_with_config(config_with_openai_oauth_binding(
-            CredentialSourceSpec::ManagedStore,
+        let unrelated_runtime = test_runtime_with_config(in_own_realm(
+            config_with_openai_oauth_binding(CredentialSourceSpec::ManagedStore),
+            realm,
         ));
         let redirect_uri = "http://127.0.0.1:0/callback";
         let params = raw_params(serde_json::json!({
             "provider": "openai",
             "redirect_uri": redirect_uri,
-            "realm_id": "dev",
+            "realm_id": realm,
             "binding_id": "default_openai"
         }));
 
@@ -4334,7 +4359,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 state,
-                &credential_identity(&openai_auth_binding()),
+                &credential_identity(&openai_auth_binding_in(realm)),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
                     meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
@@ -4357,7 +4382,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 state,
-                &credential_identity(&openai_auth_binding()),
+                &credential_identity(&openai_auth_binding_in(realm)),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
                     meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
@@ -4369,14 +4394,16 @@ mod tests {
 
     #[tokio::test]
     async fn login_start_records_flow_on_runtime_adapter_authority() {
-        let runtime = test_runtime_with_config(config_with_openai_oauth_binding(
-            CredentialSourceSpec::ManagedStore,
+        let realm = "rpc-login-adapter-flow";
+        let runtime = test_runtime_with_config(in_own_realm(
+            config_with_openai_oauth_binding(CredentialSourceSpec::ManagedStore),
+            realm,
         ));
         let redirect_uri = "http://127.0.0.1:0/callback";
         let params = raw_params(serde_json::json!({
             "provider": "openai",
             "redirect_uri": redirect_uri,
-            "realm_id": "dev",
+            "realm_id": realm,
             "binding_id": "default_openai"
         }));
 
@@ -4392,7 +4419,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 state,
-                &credential_identity(&openai_auth_binding()),
+                &credential_identity(&openai_auth_binding_in(realm)),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
                     meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
@@ -4973,13 +5000,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_status_ignores_stale_token_without_auth_machine_lifecycle() {
-        let runtime = test_runtime_with_config(config_with_openai_managed_store_binding());
-        let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
-            binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
-            profile: None,
-            origin: meerkat_core::connection::BindingOrigin::Configured,
-        };
+        let realm = "rpc-status-stale-token";
+        let runtime = test_runtime_with_config(in_own_realm(
+            config_with_openai_managed_store_binding(),
+            realm,
+        ));
+        let auth_binding = openai_auth_binding_in(realm);
         let store = runtime
             .token_store()
             .expect("token store open")
@@ -5002,7 +5028,7 @@ mod tests {
             .await
             .unwrap();
         let params = raw_params(serde_json::json!({
-            "realm_id": "dev",
+            "realm_id": realm,
             "binding_id": "default_openai"
         }));
 
@@ -5010,6 +5036,11 @@ mod tests {
             handle_auth_status_get(Some(RpcId::Num(1)), Some(params.as_ref()), &runtime).await;
 
         let status = auth_status_value(resp);
+        assert_eq!(
+            status.get("credential_observation"),
+            None,
+            "the status read was answered, not refused with the owner busy: {status}"
+        );
         assert_eq!(status["state"], "missing_credential");
         assert!(status.get("expires_at").is_none());
         assert!(status.get("last_refresh_at").is_none());
@@ -5055,6 +5086,11 @@ mod tests {
             handle_auth_status_get(Some(RpcId::Num(1)), Some(params.as_ref()), &runtime).await;
 
         let status = auth_status_value(resp);
+        assert_eq!(
+            status.get("credential_observation"),
+            None,
+            "the status read was answered, not refused with the owner busy: {status}"
+        );
         assert_eq!(status["state"], "valid", "{status}");
         assert!(status.get("expires_at").is_some(), "{status}");
         assert_eq!(status["account_id"], "acct-1", "{status}");
@@ -5434,9 +5470,13 @@ mod tests {
 
     #[tokio::test]
     async fn auth_profile_create_publishes_auth_machine_lifecycle() {
-        let runtime = test_runtime_with_config(config_with_openai_managed_store_binding());
+        let realm = "rpc-profile-create";
+        let runtime = test_runtime_with_config(in_own_realm(
+            config_with_openai_managed_store_binding(),
+            realm,
+        ));
         let params = raw_params(serde_json::json!({
-            "realm_id": "dev",
+            "realm_id": realm,
             "binding_id": "default_openai",
             "auth_method": "api_key",
             "secret": "sk-test"
@@ -5460,7 +5500,7 @@ mod tests {
             .expect("test token store");
         let auth_lease = runtime.generated_auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-ready-device-consume").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5519,7 +5559,7 @@ mod tests {
             .expect("test token store");
         let auth_lease = runtime.auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-browser-consume-commit").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5561,7 +5601,7 @@ mod tests {
         );
         let auth_lease = runtime.auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-browser-consume-claim").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5606,7 +5646,7 @@ mod tests {
             store.clone(),
         );
         let auth_lease = runtime.generated_auth_lease_handle();
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("rpc-token-single-save");
         let key = TokenKey::from_auth_binding(&auth_binding);
 
         save_tokens_and_publish_lifecycle(
@@ -5643,7 +5683,7 @@ mod tests {
             store.clone(),
         );
         let auth_lease = runtime.generated_auth_lease_handle();
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("rpc-save-failure-release");
 
         let resp = save_tokens_and_publish_lifecycle(
             Some(RpcId::Num(1)),
@@ -5683,7 +5723,7 @@ mod tests {
             .expect("test token store");
         let auth_lease = runtime.auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-raw-registry-browser").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5754,7 +5794,7 @@ mod tests {
             .expect("test token store");
         let auth_lease = runtime.auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-raw-registry-device").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5821,7 +5861,7 @@ mod tests {
             .expect("test token store");
         let auth_lease = runtime.auth_lease_handle();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-browser-stale-previous").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5876,7 +5916,7 @@ mod tests {
         let auth_lease = runtime.generated_auth_lease_handle();
         let authority = runtime.oauth_flow_authority();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-stale-previous-rollback").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -5956,7 +5996,7 @@ mod tests {
         let auth_lease = runtime.generated_auth_lease_handle();
         let authority = runtime.oauth_flow_authority();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-oauth-only-rollback").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -6049,7 +6089,7 @@ mod tests {
             .expect("token store open")
             .expect("test token store");
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-real-device-consume").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -6111,7 +6151,7 @@ mod tests {
             .expect("token store open")
             .expect("test token store");
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-real-browser-missing").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -6188,7 +6228,7 @@ mod tests {
         let auth_lease = runtime.auth_lease_handle();
         let authority = runtime.oauth_flow_authority();
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-oauth-to-api-key-consume").unwrap(),
             binding: meerkat_core::BindingId::parse("default_anthropic").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -6257,7 +6297,7 @@ mod tests {
             .expect("token store open")
             .expect("test token store");
         let auth_binding = AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").unwrap(),
+            realm: meerkat_core::RealmId::parse("rpc-terminal-consume").unwrap(),
             binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
