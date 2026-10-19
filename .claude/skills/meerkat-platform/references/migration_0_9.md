@@ -275,8 +275,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   and `LiveProjectionSink` gains the required `signal_turn_failed`.
 - Rust: `LlmDoneOutcome::Success` is non-exhaustive (build it with
   `LlmDoneOutcome::success(..)` / `success_with_detail(..)`);
-  `AgentError::ContentFiltered` gains `stop` and `detail`; `AgentErrorReason`
-  gains `ContentFiltered`.
+  `AgentError::ContentFiltered` gains `stop` and `detail`; the exhaustive
+  `AgentErrorReason` gains `ContentFiltered { stop, detail }`, so every
+  `match` on it needs the arm.
 - `Agent::replace_client` (and `replace_client_with_request_policy`) and
   `SessionService::set_session_client` refuse a client, or a request-policy
   model, whose provider or model differs from the session's durable identity

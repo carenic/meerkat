@@ -203,8 +203,10 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   its `error` now says the answer may be incomplete.
 - **Do (Rust):** build `LlmDoneOutcome::Success` with
   `LlmDoneOutcome::success(stop_reason)` or `success_with_detail(..)` and match
-  it with `Success { stop_reason, .. }`; `AgentError::ContentFiltered` gains
-  `stop` and `detail`, and `AgentErrorReason` gains `ContentFiltered`.
+  it with `Success { stop_reason, .. }`. `AgentError::ContentFiltered` gains
+  `stop` and `detail` (a pattern that names `turn` without `..` needs them),
+  and `AgentErrorReason`, an exhaustive enum, gains
+  `ContentFiltered { stop, detail }`: add the arm to every `match` on it.
 
 #### Realtime responses that fail
 
