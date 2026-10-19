@@ -810,10 +810,35 @@ process.stdout.write(JSON.stringify(fixture[path]));
   assert.equal(budget.status, 0, `a re-run rest-wave row: ${budget.stdout}${budget.stderr}`);
   assert.match(budget.stdout, /^\| Clippy \(core\+12\) \| 2 \| 3 \| 470 \| 500 \| 473 \| 470 \| success \|$/m, "a re-run row is not behind the stagger job");
   // The execution overrun still fails: the stagger job's run time counts.
-  budget = runBudget([0], [...busy.slice(0, 2), { ...stagger, completed_at: at(741) }, job("Clippy (core+12)", 741, 745, 1791)]);
+  const overBudget = [...busy.slice(0, 2), { ...stagger, completed_at: at(741) }, job("Clippy (core+12)", 741, 745, 1791)];
+  budget = runBudget([0], overBudget);
   assert.equal(budget.status, 1, `a rest-wave row over the execution budget fails: ${budget.stdout}`);
   assert.equal(budget.outputs.exec_path_seconds, "1081", "1046 s of the row, 30 s of classification, 5 s of stagger");
   assert.equal(budget.outputs.budget_verdict, "exec_over_budget");
+
+  // Which runs the budget binds is ci.yml's ENFORCE_BUDGET expression,
+  // evaluated here for each event: the budget keeps pull-request feedback
+  // fast, and a push or a dispatch is a full validation run that only
+  // reports it. The same over-budget run fails a pull request and passes a
+  // push and a dispatch, with the overrun reported.
+  assert.deepEqual(workflowEvents(workflow).sort(), ["pull_request", "push", "workflow_dispatch"], "every event ci.yml runs on has a budget case");
+  const enforceBudget = extractStepEnv(workflow, "Enforce lane execution budget").ENFORCE_BUDGET;
+  const enforcedOn = enforceBudget?.match(/^\$\{\{ github\.event_name (==|!=) '([a-z_]+)' \}\}$/);
+  assert.ok(enforcedOn, `this selftest reads ENFORCE_BUDGET as \${{ github.event_name == (or !=) '<event>' }}, not ${enforceBudget}`);
+  for (const [event, enforced] of [["pull_request", true], ["push", false], ["workflow_dispatch", false]]) {
+    const value = String((event === enforcedOn[2]) === (enforcedOn[1] === "=="));
+    budget = runBudget([0], overBudget, { ENFORCE_BUDGET: value });
+    const seen = `${event} (ENFORCE_BUDGET=${value}): ${budget.stdout}${budget.stderr}`;
+    assert.equal(budget.outputs.budget_verdict, "exec_over_budget", `the budget reports the overrun on a ${seen}`);
+    assert.match(budget.stdout, /^Lane execution: 1081\/\d+ s /m, `the budget prints the measurement on a ${seen}`);
+    if (enforced) {
+      assert.equal(budget.status, 1, `the budget refuses an over-budget ${seen}`);
+      assert.match(budget.stdout, /^::error::CI exceeded the \d+-second lane execution budget \(1081 s;/m, `the refusal names the overrun on a ${seen}`);
+    } else {
+      assert.equal(budget.status, 0, `the budget only reports on a ${seen}`);
+      assert.doesNotMatch(budget.stdout, /::error::/, `the budget reports no error on a ${seen}`);
+    }
+  }
 
   // A GitHub API server error (5xx) is retried after each API_RETRY_DELAYS
   // delay. It fails an enforced measurement only after the last retry, and
@@ -872,8 +897,8 @@ process.stdout.write(JSON.stringify(fixture[path]));
   rmSync(scratch, { recursive: true, force: true });
 }
 
-// The literal `env:` entries of the named step (no expressions).
-function extractStepLiteralEnv(text, name) {
+// The `env:` entries of the named step, as written.
+function extractStepEnv(text, name) {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
   assert.ok(at >= 0, `ci.yml has a step named ${name}`);
@@ -889,10 +914,29 @@ function extractStepLiteralEnv(text, name) {
     }
     if (indent >= 0 && indent <= envIndent) break;
     const entry = lines[index].match(/^\s+([A-Z_]+): (.+)$/);
-    if (entry && !entry[2].includes("${{")) env[entry[1]] = entry[2];
+    if (entry) env[entry[1]] = entry[2];
   }
+  return env;
+}
+
+// The literal `env:` entries of the named step (no expressions).
+function extractStepLiteralEnv(text, name) {
+  const env = Object.fromEntries(Object.entries(extractStepEnv(text, name)).filter(([, value]) => !value.includes("${{")));
   assert.ok(Object.keys(env).length > 0, `step ${name} has literal env entries`);
   return env;
+}
+
+// The events ci.yml runs on: the keys of its top-level on: map.
+function workflowEvents(text) {
+  const lines = text.split("\n");
+  const at = lines.indexOf("on:");
+  assert.ok(at >= 0, "ci.yml has an on: map");
+  const events = [];
+  for (let index = at + 1; index < lines.length && !/^\S/.test(lines[index]); index += 1) {
+    const key = lines[index].match(/^ {2}([a-z_]+):/);
+    if (key) events.push(key[1]);
+  }
+  return events;
 }
 
 // The `run: |` body of the named step: the indented block under it.

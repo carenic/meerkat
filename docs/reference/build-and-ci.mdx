@@ -327,8 +327,10 @@ pull request, `main` push and nightly, and a busy hour fills that cap. The
 gate writes a typed verdict (`within_budget`, `queue_delayed`,
 `exec_over_budget`, `runaway`) with the execution path, terminal and queue
 seconds to its step outputs and summary, and prints the lane table on every
-run that was not cancelled, including runs whose lanes failed and `main`
-pushes, where nothing is enforced and a failure to measure is only a warning.
+run that was not cancelled, including runs whose lanes failed, pushes and
+dispatches. The budget keeps pull-request feedback fast; a push or a
+dispatch is a full validation run, where nothing is enforced and a failure to
+measure is only a warning.
 
 Sizing: the owner's cap is 20 minutes from the start of the pre-push hook to
 a green `CI gate`, and the hook takes about a minute, so 1080 s (18 minutes)

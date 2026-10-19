@@ -596,7 +596,8 @@ and its CI must be green before a release tag (`require_ci_green`):
   warning with a typed verdict, never a
   failure (the account's 40 concurrent hosted jobs are shared by every PR,
   main push and nightly); the lane table is reported on every non-cancelled
-  run, failed runs included; a failure to measure only warns on `main`;
+  run, failed runs included; a push or a dispatch is a full validation run
+  that only reports the budget (a failure to measure only warns there);
   schema-4 attestation (backend `github-hosted-cargo`) on successful `main`
   pushes. For a `release-projection` plan it re-verifies the reused parent
   attempt with the parent's copies of the scripts (`ci-release-evidence.mjs

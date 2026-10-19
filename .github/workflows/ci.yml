@@ -3105,9 +3105,11 @@ jobs:
       - name: Enforce lane execution budget
         # Runs on every run that was not cancelled, including runs whose lane
         # check above failed, so a failed run also names its slowest lanes.
-        # Enforced on pull requests only (the push-to-main run carries the
-        # deferred lanes and has no wall-clock budget; there it only reports,
-        # and a failure to measure is a warning).
+        # Enforced on pull requests only: the budget keeps pull-request
+        # feedback fast. A push (it carries the lanes a pull request left to
+        # it) and a dispatch (it plans the whole workspace) are full
+        # validation runs with no wall-clock budget: there the step only
+        # reports, and a failure to measure is a warning.
         #
         # Three numbers per lane, from the Actions jobs API:
         #   queued    created_at to started_at: waiting for a hosted runner
@@ -3134,7 +3136,7 @@ jobs:
           MAX_EXEC_SECONDS: ${{ env.CI_MAX_EXEC_SECONDS }}
           MAX_TERMINAL_SECONDS: ${{ env.CI_MAX_TERMINAL_SECONDS }}
           QUEUE_WARN_SECONDS: ${{ env.CI_QUEUE_WARN_SECONDS }}
-          ENFORCE_BUDGET: ${{ github.event_name != 'push' }}
+          ENFORCE_BUDGET: ${{ github.event_name == 'pull_request' }}
           GATE_JOB_NAME: CI gate
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
@@ -3241,8 +3243,8 @@ jobs:
 
           # Measurement needs the Actions API. A failure to measure fails a
           # pull request, whose budget is enforced, but only warns on a push
-          # to main, where the budget is a report: a transient API error must
-          # not turn main's CI gate red and block release readiness.
+          # or a dispatch, where the budget is a report: a transient API error
+          # must not turn main's CI gate red and block release readiness.
           try:
               lanes = collect_lanes()
           except (subprocess.CalledProcessError, KeyError, IndexError, TypeError, ValueError) as error:
