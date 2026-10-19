@@ -35,7 +35,54 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`, `meerkat-mcp`, wire and SDKs: the lifecycle bit of tool
+  configuration changes is named `settled`, not `persisted` (#1658). It says
+  whether a change is a settled lifecycle fact rather than a pending or
+  draining step. It never said whether anything was written to
+  configuration: that is the `persisted` of the `mcp/add`, `mcp/remove` and
+  `mcp/reload` requests and responses, which keep their name and meaning.
+  - Wire: `tool_config_changed` event payloads and stored `tool_config`
+    notice payloads carry `settled` instead of `persisted`, and so do `mcp`
+    notice blocks.
+  - Decoding derives `settled` from the payload's `status_info`, and from an
+    `mcp` block's `phase`, instead of reading a stored bit, so rows written by
+    0.9.3 and earlier decode with the right value. An `mcp` block without a
+    phase keeps its stored bit (`settled`, or `persisted` from 0.9.3).
+  - Rust API: `ToolConfigChangedPayload::new` takes no lifecycle argument
+    (the status decides it), and the public `ToolConfigChangedPayload`
+    field `persisted` is replaced by `ToolConfigChangedPayload::settled()`.
+    The public `ExternalToolDelta` field `persisted` is removed in favour of
+    `ExternalToolDelta::settled()`, derived from `phase` and not serialized.
+    `SystemNoticeBlock::Mcp { persisted }` is now
+    `SystemNoticeBlock::Mcp { settled }`, and `meerkat-mcp`'s
+    `ExternalToolSurfaceEffect::EmitExternalToolDelta { persisted }` is now
+    `{ settled }`. New: `ExternalToolDeltaPhase::is_settled` and
+    `ToolConfigChangeStatus::is_settled`.
+  - SDKs: the Python and TypeScript `ToolConfigChangedPayload.persisted` is
+    now `settled`. Their parsers read `settled` and fall back to `persisted`
+    from rkat-rpc 0.9.3 and earlier. The generated Python, TypeScript and Web
+    types follow the schema.
+  - Version skew: the 0.9.3 Python and TypeScript SDKs require `persisted`,
+    so a 0.9.3 SDK talking to a 0.9.4 rkat-rpc fails on every
+    `tool_config_changed` event. The SDKs fetch their own matching rkat-rpc,
+    so this happens only with an overridden binary path; the remedy is to
+    upgrade the SDK.
+  - Stored transcripts: 0.9.3 cannot read back a transcript that 0.9.4 wrote
+    with a `tool_config` notice (a tool-scope, deferred-catalog or
+    failed-closed notice), because 0.9.3 requires the payload's `persisted`.
+    An `mcp` notice block reads back on 0.9.3 with `persisted: false`, which
+    0.9.3 consults only for `McpPending` blocks, where 0.9.4 also writes
+    `false`.
+
 ### Changed
+
+- `meerkat-core`: the agent's tool-scope boundary, deferred-catalog and
+  failed-closed tool-scope events, and the MCP restore-refusal delta, now
+  report `settled: true` where they reported `persisted: false`: each is a
+  change that has already applied or failed. A consumer that showed them as
+  pending now shows them as settled (#1658).
 
 - `meerkat-runtime`: `MeerkatMachine::cancel_input_if_present` and
   `cancel_tracked_input_for_member_incarnation` no longer re-read an input

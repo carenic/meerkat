@@ -267,7 +267,6 @@ mod tests {
                         meerkat_core::ExternalToolDeltaPhase::Pending,
                         None,
                     ),
-                    false,
                 )
                 .with_applied_at_turn(Some(3)),
             },
@@ -275,13 +274,16 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(&event).expect("serialize");
+        // The lifecycle bit is written as `settled`, never as `persisted`.
+        assert_eq!(encoded["event"]["payload"]["settled"], false);
+        assert!(encoded["event"]["payload"].get("persisted").is_none());
         let decoded: WireEvent = serde_json::from_value(encoded).expect("deserialize");
         match decoded.event {
             AgentEvent::ToolConfigChanged { payload } => {
                 assert_eq!(payload.operation, ToolConfigChangeOperation::Remove);
                 assert_eq!(payload.target, "filesystem");
                 assert_eq!(payload.status_text(), "pending");
-                assert!(!payload.persisted);
+                assert!(!payload.settled());
                 assert_eq!(payload.applied_at_turn, Some(3));
             }
             other => panic!("expected tool_config_changed, got {other:?}"),

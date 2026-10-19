@@ -18932,10 +18932,6 @@
                 },
                 "type": "array"
               },
-              "persisted": {
-                "default": false,
-                "type": "boolean"
-              },
               "phase": {
                 "anyOf": [
                   {
@@ -18951,6 +18947,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Decoding derives it from\n`phase` when the block has one, and reads the stored bit (`settled`,\nor `persisted` from 0.9.3 and earlier) only for a block without one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -19860,7 +19861,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\n`settled` is derived from it too ([`ToolConfigChangeStatus::is_settled`]):\nit is written for consumers, and decoding derives it again instead of\nreading the stored bit (or the `persisted` bit that 0.9.3 and earlier\nwrote, which was `false` for changes that had already applied).",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -19893,7 +19894,7 @@
           "operation": {
             "$ref": "#/components/schemas/ToolConfigChangeOperation"
           },
-          "persisted": {
+          "settled": {
             "type": "boolean"
           },
           "status_info": {
@@ -19907,7 +19908,7 @@
           "operation",
           "target",
           "status_info",
-          "persisted"
+          "settled"
         ],
         "type": "object"
       },

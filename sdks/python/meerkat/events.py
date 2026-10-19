@@ -683,12 +683,18 @@ ToolConfigChangeStatus = (
 
 @dataclass(frozen=True, slots=True)
 class ToolConfigChangedPayload:
-    """Payload for tool configuration change notifications."""
+    """Payload for tool configuration change notifications.
+
+    ``settled`` says whether the change is a settled lifecycle fact rather than
+    a pending or draining step. It says nothing about configuration: whether a
+    change was written there is the ``persisted`` of the ``mcp_add`` /
+    ``mcp_remove`` response.
+    """
 
     operation: str | None = None
     target: str | None = None
     status_info: ToolConfigChangeStatus | None = None
-    persisted: bool | None = None
+    settled: bool | None = None
     applied_at_turn: int | None = None
 
 
@@ -1265,6 +1271,15 @@ def _require_bool(raw: dict[str, Any], field_name: str) -> bool:
     return value
 
 
+def _tool_config_settled_field(payload: dict[str, Any]) -> str:
+    """The field that carries a tool config payload's lifecycle bit.
+
+    rkat-rpc 0.9.4 and later write ``settled``; 0.9.3 and earlier wrote the
+    same bit as ``persisted``.
+    """
+    return "settled" if "settled" in payload else "persisted"
+
+
 def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
     if not isinstance(raw, dict):
         raise ValueError("interaction_failed.reason must be object")
@@ -1574,7 +1589,7 @@ def _validate_known_event(event_type: str, raw: dict[str, Any]) -> None:
         if operation not in {"add", "remove", "reload"}:
             raise ValueError("payload.operation must be add, remove, or reload")
         _require_str(payload, "target")
-        _require_bool(payload, "persisted")
+        _require_bool(payload, _tool_config_settled_field(payload))
         return
     if event_type == "turn_completed":
         stop_reason = raw.get("stop_reason")
@@ -1728,7 +1743,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
                     status_info=_parse_tool_config_change_status(
                         payload_raw.get("status_info")
                     ),
-                    persisted=payload_raw["persisted"],
+                    settled=payload_raw[_tool_config_settled_field(payload_raw)],
                     applied_at_turn=(
                         applied_at_turn_raw
                         if isinstance(applied_at_turn_raw, int)

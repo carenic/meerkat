@@ -621,7 +621,6 @@ fn agent_event_all_variants_roundtrip() {
                     meerkat_core::ExternalToolDeltaPhase::Applied,
                     None,
                 ),
-                true,
             )
             .with_applied_at_turn(Some(5)),
         },
@@ -912,7 +911,6 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
                     meerkat_core::ExternalToolDeltaPhase::Applied,
                     None,
                 ),
-                true,
             )
             .with_applied_at_turn(Some(1)),
         },

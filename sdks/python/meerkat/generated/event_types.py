@@ -1513,12 +1513,16 @@ class ToolConfigChangedPayload(TypedDict, total=False):
 
     The typed `status_info` is the sole owner of the change status; display
     text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+    `settled` is derived from it too ([`ToolConfigChangeStatus::is_settled`]):
+    it is written for consumers, and decoding derives it again instead of
+    reading the stored bit (or the `persisted` bit that 0.9.3 and earlier
+    wrote, which was `false` for changes that had already applied).
     """
     applied_at_turn: NotRequired[Optional[int]]
     deferred_catalog_delta: NotRequired[Optional[DeferredCatalogDelta]]
     domain: NotRequired[Optional[ToolConfigChangeDomain]]
     operation: Required[ToolConfigChangeOperation]
-    persisted: Required[bool]
+    settled: Required[bool]
     status_info: Required[ToolConfigChangeStatus]
     target: Required[str]
 

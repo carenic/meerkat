@@ -798,9 +798,9 @@ export type SystemNoticeBlock = {
   detail?: string | null;
   operation?: ToolConfigChangeOperation | null;
   pending_sources?: string[];
-  persisted?: boolean;
   phase?: ExternalToolDeltaPhase | null;
   server_id?: string | null;
+  settled?: boolean;
   type: "mcp";
 } | {
   detail?: string | null;
@@ -889,7 +889,7 @@ export type ToolConfigChangedPayload = {
   deferred_catalog_delta?: DeferredCatalogDelta | null;
   domain?: ToolConfigChangeDomain | null;
   operation: ToolConfigChangeOperation;
-  persisted: boolean;
+  settled: boolean;
   status_info: ToolConfigChangeStatus;
   target: string;
 };

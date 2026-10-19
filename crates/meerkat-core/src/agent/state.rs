@@ -5550,7 +5550,7 @@ where
                     server_id: None,
                     operation: None,
                     phase: Some(crate::event::ExternalToolDeltaPhase::Pending),
-                    persisted: false,
+                    settled: false,
                     detail: Some(body),
                     confinement_refusal: None,
                     pending_sources: pending_servers,
@@ -6046,7 +6046,6 @@ where
                             ToolConfigChangeOperation::Reload,
                             "tool_scope",
                             status_info,
-                            false,
                         )
                         .with_applied_at_turn(Some(ctx.turn_count))
                         .with_domain(Some(ToolConfigChangeDomain::ToolScope));
@@ -6118,7 +6117,6 @@ where
                                 ToolConfigChangeOperation::Reload,
                                 "deferred_catalog",
                                 status_info,
-                                false,
                             )
                             .with_applied_at_turn(Some(ctx.turn_count))
                             .with_domain(Some(ToolConfigChangeDomain::DeferredCatalog))
@@ -6190,7 +6188,6 @@ where
                         ToolConfigChangeOperation::Reload,
                         "tool_scope",
                         status_info,
-                        false,
                     )
                     .with_applied_at_turn(Some(ctx.turn_count))
                     .with_domain(Some(ToolConfigChangeDomain::ToolScope));
@@ -22214,6 +22211,10 @@ mod tests {
             payload.status_text(),
             "deferred_catalog_delta(added_hidden=0,removed_hidden=2,pending_sources=0)"
         );
+        assert!(
+            payload.settled(),
+            "an applied catalog delta is a settled fact"
+        );
     }
 
     #[tokio::test]
@@ -22514,6 +22515,10 @@ mod tests {
                 assert!(
                     error.contains("Injected"),
                     "unexpected fail-closed error: {error}"
+                );
+                assert!(
+                    payload.settled(),
+                    "a failed-closed boundary is a settled fact"
                 );
                 saw_warning_event = true;
             }

@@ -2347,8 +2347,12 @@ pub enum SystemNoticeBlock {
         operation: Option<crate::event::ToolConfigChangeOperation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phase: Option<crate::event::ExternalToolDeltaPhase>,
+        /// Whether the block reports a settled lifecycle fact, never whether
+        /// anything was written to configuration. Decoding derives it from
+        /// `phase` when the block has one, and reads the stored bit (`settled`,
+        /// or `persisted` from 0.9.3 and earlier) only for a block without one.
         #[serde(default)]
-        persisted: bool,
+        settled: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
         /// Bounded setup diagnostic supplied by the accepted lifecycle result.
@@ -2463,8 +2467,8 @@ enum SystemNoticeBlockKnown {
         operation: Option<crate::event::ToolConfigChangeOperation>,
         #[serde(default)]
         phase: Option<crate::event::ExternalToolDeltaPhase>,
-        #[serde(default)]
-        persisted: bool,
+        #[serde(default, alias = "persisted")]
+        settled: bool,
         #[serde(default)]
         detail: Option<String>,
         #[serde(default)]
@@ -2569,7 +2573,7 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 server_id,
                 operation,
                 phase,
-                persisted,
+                settled,
                 detail,
                 confinement_refusal,
                 pending_sources,
@@ -2577,7 +2581,7 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 server_id,
                 operation,
                 phase,
-                persisted,
+                settled: phase.map_or(settled, crate::event::ExternalToolDeltaPhase::is_settled),
                 detail,
                 confinement_refusal,
                 pending_sources,
@@ -3072,21 +3076,16 @@ impl SystemNoticeMessage {
 
     /// Whether this exact notice is an ephemeral refresh projection.
     ///
-    /// `McpPending` blocks with `persisted: true` are durable facts despite
+    /// `McpPending` blocks with `settled: true` are durable facts despite
     /// sharing the pending kind, so kind alone is not sufficient authority
     /// for mechanical transcript removal.
     #[must_use]
     pub fn is_synthetic_refresh_projection(&self) -> bool {
         match self.kind {
-            SystemNoticeKind::McpPending => self.blocks.iter().all(|block| {
-                matches!(
-                    block,
-                    SystemNoticeBlock::Mcp {
-                        persisted: false,
-                        ..
-                    }
-                )
-            }),
+            SystemNoticeKind::McpPending => self
+                .blocks
+                .iter()
+                .all(|block| matches!(block, SystemNoticeBlock::Mcp { settled: false, .. })),
             // A persisted completion record is durable history; only
             // non-persisted background-job notices are refresh projections.
             SystemNoticeKind::BackgroundJob => self.blocks.iter().all(|block| {

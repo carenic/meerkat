@@ -3050,7 +3050,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         field = {"confinement_refusal": refusal} if present else {}
         status = {"kind": "external_tool_delta", "phase": "failed",
             "detail": "required execution confinement is unsupported by this backend", **field}
-        payload = {"operation": "reload", "target": "local-server", "persisted": True,
+        payload = {"operation": "reload", "target": "local-server", "settled": True,
             "status_info": status}
         event = parse_event({"type": "tool_config_changed", "payload": payload})
         assert isinstance(event, ToolConfigChanged)
@@ -3058,7 +3058,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
         assert event.payload.status_info.phase == "failed"
         assert event.payload.status_info.confinement_refusal == (refusal if present else None)
         for block in [
-            {"type": "mcp", "server_id": "local-server", "phase": "failed", "persisted": True, **field},
+            {"type": "mcp", "server_id": "local-server", "phase": "failed", "settled": True, **field},
             {"type": "tool_config", "payload": payload},
         ]:
             message = {"role": "system_notice", "kind": "mcp", "body": "Continue with available tools.",
@@ -3069,7 +3069,7 @@ def test_optional_mcp_setup_refusal_retains_native_reason_and_transcript(refusal
 
 @pytest.mark.parametrize("refusal", ["future_reason", "", 7, False, {}, []])
 def test_malformed_mcp_refusal_preserves_raw_event_without_hiding_sibling(refusal):
-    payload = {"operation": "add", "target": "local-server", "persisted": True,
+    payload = {"operation": "add", "target": "local-server", "settled": True,
         "status_info": {"kind": "external_tool_delta", "phase": "failed", "confinement_refusal": refusal}}
     raw = {"type": "tool_config_changed", "payload": payload}
     events = [parse_event(value) for value in [raw, {"type": "text_delta", "delta": "permitted sibling"}]]
@@ -3111,7 +3111,7 @@ def test_parse_tool_config_changed():
                 "visible_changed": False,
                 "revision": 9,
             },
-            "persisted": False,
+            "settled": True,
             "applied_at_turn": 7,
         },
     }
@@ -3123,7 +3123,7 @@ def test_parse_tool_config_changed():
     assert event.payload.status_info.base_changed is True
     assert event.payload.status_info.visible_changed is False
     assert event.payload.status_info.revision == 9
-    assert event.payload.persisted is False
+    assert event.payload.settled is True
     assert event.payload.applied_at_turn == 7
 
 
@@ -3145,7 +3145,7 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": True,
+            "settled": True,
             "applied_at_turn": "oops",
         },
     }
@@ -3154,20 +3154,81 @@ def test_parse_tool_config_changed_with_bad_applied_at_turn():
     assert event.payload.applied_at_turn is None
 
 
-def test_parse_tool_config_changed_with_non_boolean_persisted():
+@pytest.mark.parametrize("field", ["settled", "persisted"])
+def test_parse_tool_config_changed_with_non_boolean_settled(field):
     raw = {
         "type": "tool_config_changed",
         "payload": {
             "operation": "add",
             "target": "filesystem",
             "status": "staged",
-            "persisted": "false",
+            field: "false",
         },
     }
     event = parse_event(raw)
     assert isinstance(event, UnknownEvent)
     assert event.type == "malformed_event"
     assert event.data == raw
+
+
+def test_parse_tool_config_changed_reads_settled_and_falls_back_to_persisted():
+    """rkat-rpc 0.9.4 writes the lifecycle bit as ``settled``; 0.9.3 and
+    earlier wrote the same bit as ``persisted``."""
+    status_info = {"kind": "external_tool_delta", "phase": "pending"}
+    for fields, settled in [
+        ({"settled": True}, True),
+        ({"settled": False}, False),
+        ({"persisted": True}, True),
+        ({"persisted": False}, False),
+        ({"settled": False, "persisted": True}, False),
+    ]:
+        raw = {
+            "type": "tool_config_changed",
+            "payload": {
+                "operation": "add",
+                "target": "filesystem",
+                "status_info": status_info,
+                **fields,
+            },
+        }
+        event = parse_event(raw)
+        assert isinstance(event, ToolConfigChanged), fields
+        assert event.payload.settled is settled, fields
+    raw = {
+        "type": "tool_config_changed",
+        "payload": {"operation": "add", "target": "filesystem", "status_info": status_info},
+    }
+    event = parse_event(raw)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"
+    assert event.data == raw
+
+
+def test_tool_config_transcript_blocks_read_settled_or_persisted():
+    """Stored notices from rkat-rpc 0.9.3 and earlier carry ``persisted``."""
+    status_info = {"kind": "external_tool_delta", "phase": "applied"}
+    for fields in [{"settled": True}, {"persisted": False}]:
+        payload = {"operation": "add", "target": "local-server", "status_info": status_info, **fields}
+        for block in [
+            {"type": "tool_config", "payload": payload},
+            {"type": "mcp", "server_id": "local-server", **fields},
+        ]:
+            message = {"role": "system_notice", "kind": "mcp", "body": "Tools changed.",
+                "blocks": [block], "created_at": "2026-05-26T10:00:00Z"}
+            parsed = MeerkatClient._parse_session_message(message)
+            assert MeerkatClient._serialize_transcript_rewrite_message(parsed) == message
+    for block in [
+        {"type": "tool_config", "payload": {"operation": "add", "target": "local-server",
+            "status_info": status_info}},
+        {"type": "mcp", "settled": "false"},
+        {"type": "mcp", "persisted": "false"},
+    ]:
+        with pytest.raises(MeerkatError) as error:
+            MeerkatClient._parse_session_message({
+                "role": "system_notice", "kind": "mcp", "blocks": [block],
+                "created_at": "2026-05-26T10:00:00Z",
+            })
+        assert error.value.code == "INVALID_RESPONSE", block
 
 
 def test_parse_background_job_completed_uses_typed_terminal_status():
@@ -3394,10 +3455,22 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "add",
                     "target": "filesystem",
                     "status": "staged",
+                    "settled": "false",
+                },
+            },
+            "non-boolean settled must not become false",
+        ),
+        (
+            {
+                "type": "tool_config_changed",
+                "payload": {
+                    "operation": "add",
+                    "target": "filesystem",
+                    "status": "staged",
                     "persisted": "false",
                 },
             },
-            "non-boolean persisted must not become false",
+            "non-boolean persisted from rkat-rpc 0.9.3 must not become false",
         ),
         (
             {
@@ -3406,7 +3479,7 @@ def test_parse_malformed_known_events_preserves_raw_payload():
                     "operation": "bogus",
                     "target": 0,
                     "status": 0,
-                    "persisted": "false",
+                    "settled": "false",
                 },
             },
             "malformed operation/status semantics must not become an empty typed payload",

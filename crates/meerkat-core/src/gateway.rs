@@ -750,7 +750,7 @@ impl AgentToolDispatcher for ToolGateway {
                     notice.target.clone(),
                     format!("{:?}", notice.operation),
                     notice.status_text(),
-                    notice.persisted,
+                    notice.settled(),
                     notice.applied_at_turn,
                 );
                 if seen_notices.insert(key) {

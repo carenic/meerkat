@@ -3120,3 +3120,36 @@ mod tool_artifact_refusal {
         assert_eq!(error.to_string(), refusal.to_string());
     }
 }
+
+/// An `mcp` block derives `settled` from its phase on decode, whatever bit it
+/// stored (`settled`, or `persisted` from 0.9.3); a block without a phase keeps
+/// its stored bit, the only record it has. The block is written as `settled`.
+#[test]
+fn mcp_notice_block_derives_settled_from_its_phase_on_decode() {
+    for (phase, stored, settled) in [
+        (Some("pending"), true, false),
+        (Some("draining"), true, false),
+        (Some("applied"), false, true),
+        (Some("failed"), false, true),
+        (None, true, true),
+        (None, false, false),
+    ] {
+        for key in ["persisted", "settled"] {
+            let mut raw = json!({"type": "mcp", "server_id": "server", key: stored});
+            if let Some(phase) = phase {
+                raw["phase"] = json!(phase);
+            }
+            let block: SystemNoticeBlock = serde_json::from_value(raw).unwrap();
+            let SystemNoticeBlock::Mcp {
+                settled: decoded, ..
+            } = &block
+            else {
+                panic!("expected an mcp block: {block:?}");
+            };
+            assert_eq!(*decoded, settled, "phase {phase:?}, stored {key}={stored}");
+            let written = serde_json::to_value(&block).unwrap();
+            assert_eq!(written["settled"], settled);
+            assert!(written.get("persisted").is_none());
+        }
+    }
+}

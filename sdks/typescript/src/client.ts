@@ -5319,7 +5319,12 @@ export class MeerkatClient {
       ["add", "remove", "reload"],
       context,
     );
-    MeerkatClient.requireBooleanField(payload, "persisted", context);
+    // rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+    MeerkatClient.requireBooleanField(
+      payload,
+      Object.prototype.hasOwnProperty.call(payload, "settled") ? "settled" : "persisted",
+      context,
+    );
     MeerkatClient.requirePresentStringField(payload, "target", context);
     MeerkatClient.validateToolConfigStatus(payload.status_info, `${context}: status_info`);
     if (Object.prototype.hasOwnProperty.call(payload, "applied_at_turn")) {
@@ -5452,7 +5457,10 @@ export class MeerkatClient {
       if (Object.prototype.hasOwnProperty.call(raw, "pending_sources")) {
         MeerkatClient.requireStringArray(raw.pending_sources, `${context}: pending_sources`);
       }
-      MeerkatClient.validateOptionalBooleanField(raw, "persisted", context);
+      // rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+      for (const field of ["settled", "persisted"] as const) {
+        MeerkatClient.validateOptionalBooleanField(raw, field, context);
+      }
       if (Object.prototype.hasOwnProperty.call(raw, "phase")) {
         MeerkatClient.requireClosedStringField(
           raw,

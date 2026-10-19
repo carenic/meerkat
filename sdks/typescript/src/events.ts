@@ -677,7 +677,12 @@ export interface ToolConfigChangedPayload {
   readonly operation?: ToolConfigChangeOperation;
   readonly target?: string;
   readonly status_info?: ToolConfigChangeStatus;
-  readonly persisted?: boolean;
+  /**
+   * Whether the change is a settled lifecycle fact rather than a pending or
+   * draining step. It says nothing about configuration: whether a change was
+   * written there is the `persisted` of the `mcp/add` / `mcp/remove` response.
+   */
+  readonly settled?: boolean;
   readonly applied_at_turn?: number;
 }
 
@@ -1869,7 +1874,8 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
           ...(statusInfo != null ? { status_info: statusInfo } : {}),
           operation: requireOneOf(requireStringField(payloadRaw, "operation"), "operation", ["add", "remove", "reload"] as const),
           target: requireStringField(payloadRaw, "target"),
-          persisted: requireBooleanField(payloadRaw, "persisted"),
+          // rkat-rpc 0.9.3 and earlier wrote the same bit as `persisted`.
+          settled: requireBooleanField(payloadRaw, hasOwn(payloadRaw, "settled") ? "settled" : "persisted"),
           ...(appliedAtTurn != null ? { applied_at_turn: appliedAtTurn } : {}),
         },
       };

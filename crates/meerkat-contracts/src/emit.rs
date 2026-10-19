@@ -822,12 +822,12 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
                     "properties": {
                         "payload": {
                             "type": "object",
-                            "required": ["operation", "target", "status", "persisted"],
+                            "required": ["operation", "target", "status", "settled"],
                             "properties": {
                                 "operation": {"type": "string", "enum": ["add", "remove", "reload"]},
                                 "target": {"type": "string"},
                                 "status": {"type": "string"},
-                                "persisted": {"type": "boolean"},
+                                "settled": {"type": "boolean"},
                                 "applied_at_turn": {"type": ["integer", "null"], "minimum": 0},
                             }
                         }

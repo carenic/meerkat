@@ -1372,13 +1372,17 @@ pub fn compare_event_envelopes<T>(a: &EventEnvelope<T>, b: &EventEnvelope<T>) ->
 ///
 /// The typed `status_info` is the sole owner of the change status; display
 /// text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+/// `settled` is derived from it too ([`ToolConfigChangeStatus::is_settled`]):
+/// it is written for consumers, and decoding derives it again instead of
+/// reading the stored bit (or the `persisted` bit that 0.9.3 and earlier
+/// wrote, which was `false` for changes that had already applied).
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolConfigChangedPayload {
     pub operation: ToolConfigChangeOperation,
     pub target: String,
     status_info: ToolConfigChangeStatus,
-    pub persisted: bool,
+    settled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at_turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1387,19 +1391,48 @@ pub struct ToolConfigChangedPayload {
     pub deferred_catalog_delta: Option<DeferredCatalogDelta>,
 }
 
+impl<'de> Deserialize<'de> for ToolConfigChangedPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        /// The stored shape without `settled`: a stored `settled` or
+        /// `persisted` is ignored, because the status decides it.
+        #[derive(Deserialize)]
+        struct Stored {
+            operation: ToolConfigChangeOperation,
+            target: String,
+            status_info: ToolConfigChangeStatus,
+            #[serde(default)]
+            applied_at_turn: Option<u32>,
+            #[serde(default)]
+            domain: Option<ToolConfigChangeDomain>,
+            #[serde(default)]
+            deferred_catalog_delta: Option<DeferredCatalogDelta>,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(
+            Self::new(stored.operation, stored.target, stored.status_info)
+                .with_applied_at_turn(stored.applied_at_turn)
+                .with_domain(stored.domain)
+                .with_deferred_catalog_delta(stored.deferred_catalog_delta),
+        )
+    }
+}
+
 impl ToolConfigChangedPayload {
     #[must_use]
     pub fn new(
         operation: ToolConfigChangeOperation,
         target: impl Into<String>,
         status_info: ToolConfigChangeStatus,
-        persisted: bool,
     ) -> Self {
+        let settled = status_info.is_settled();
         Self {
             operation,
             target: target.into(),
             status_info,
-            persisted,
+            settled,
             applied_at_turn: None,
             domain: None,
             deferred_catalog_delta: None,
@@ -1409,6 +1442,15 @@ impl ToolConfigChangedPayload {
     #[must_use]
     pub fn status_info(&self) -> &ToolConfigChangeStatus {
         &self.status_info
+    }
+
+    /// Whether the change is a settled lifecycle fact rather than a pending
+    /// or draining step. It says nothing about configuration: whether a change
+    /// was written there is the `mcp/add` / `mcp/remove` response's
+    /// `persisted`, and the realm configuration itself.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.settled
     }
 
     #[must_use]
@@ -1482,6 +1524,16 @@ pub enum ExternalToolDeltaPhase {
 }
 
 impl ExternalToolDeltaPhase {
+    /// Whether a delta in this phase is a settled lifecycle fact: every phase
+    /// except `Pending` and `Draining`.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        match self {
+            Self::Pending | Self::Draining => false,
+            Self::Applied | Self::Forced | Self::Failed => true,
+        }
+    }
+
     #[must_use]
     pub fn as_status(self) -> &'static str {
         match self {
@@ -1565,6 +1617,20 @@ impl ToolConfigChangeStatus {
         }
     }
 
+    /// Whether this status reports a settled lifecycle fact. A tool-scope
+    /// boundary, a deferred-catalog delta and a failed-closed warning report
+    /// changes that have already applied or closed; an external tool delta is
+    /// settled unless it is still pending or draining.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        match self {
+            Self::BoundaryApplied { .. }
+            | Self::DeferredCatalogDelta { .. }
+            | Self::WarningFailedClosed { .. } => true,
+            Self::ExternalToolDelta { phase, .. } => phase.is_settled(),
+        }
+    }
+
     #[must_use]
     pub fn status_text(&self) -> String {
         match self {
@@ -1599,12 +1665,15 @@ impl ToolConfigChangeStatus {
 }
 
 /// Canonical outward lifecycle delta for external-tool surface changes.
+///
+/// Whether the delta is settled is derived from its phase
+/// ([`Self::settled`]); it is not stored, and a stored `persisted` from 0.9.3
+/// and earlier is ignored on decode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalToolDelta {
     pub target: String,
     pub operation: ToolConfigChangeOperation,
     pub phase: ExternalToolDeltaPhase,
-    pub persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at_turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1653,7 +1722,7 @@ impl ExternalToolDelta {
                     server_id: Some(self.target.clone()),
                     operation: Some(self.operation.clone()),
                     phase: Some(self.phase),
-                    persisted: self.persisted,
+                    settled: self.settled(),
                     detail: Some(detail),
                     confinement_refusal: self.confinement_refusal,
                     pending_sources: Vec::new(),
@@ -1672,10 +1741,6 @@ impl ExternalToolDelta {
             target: target.into(),
             operation,
             phase,
-            persisted: !matches!(
-                phase,
-                ExternalToolDeltaPhase::Pending | ExternalToolDeltaPhase::Draining
-            ),
             applied_at_turn: None,
             tool_count: None,
             detail: None,
@@ -1714,6 +1779,13 @@ impl ExternalToolDelta {
         self
     }
 
+    /// Whether the delta is a settled lifecycle fact: its phase is neither
+    /// `Pending` nor `Draining`.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.phase.is_settled()
+    }
+
     #[must_use]
     pub fn status_text(&self) -> String {
         ToolConfigChangeStatus::external_tool_delta(self.phase, self.detail.clone()).status_text()
@@ -1727,13 +1799,8 @@ impl ExternalToolDelta {
             confinement_refusal: self.confinement_refusal,
             restore: self.restore,
         };
-        ToolConfigChangedPayload::new(
-            self.operation.clone(),
-            self.target.clone(),
-            status_info,
-            self.persisted,
-        )
-        .with_applied_at_turn(self.applied_at_turn)
+        ToolConfigChangedPayload::new(self.operation.clone(), self.target.clone(), status_info)
+            .with_applied_at_turn(self.applied_at_turn)
     }
 }
 
@@ -4052,7 +4119,6 @@ mod tests {
                 ToolConfigChangeOperation::Reload,
                 "tool_scope",
                 status.clone(),
-                false,
             )
             .with_applied_at_turn(Some(4))
             .with_domain(Some(ToolConfigChangeDomain::ToolScope)),
@@ -4062,6 +4128,11 @@ mod tests {
         assert!(
             json["payload"].get("status").is_none(),
             "derived status text must not be serialized beside typed status_info"
+        );
+        assert_eq!(json["payload"]["settled"], true);
+        assert!(
+            json["payload"].get("persisted").is_none(),
+            "the lifecycle bit is written as settled, never as persisted"
         );
         assert_eq!(json["payload"]["status_info"]["kind"], "boundary_applied");
         assert_eq!(json["payload"]["status_info"]["base_changed"], true);
@@ -4078,6 +4149,117 @@ mod tests {
         } else {
             panic!("expected tool_config_changed event");
         }
+    }
+
+    /// A tool-scope boundary, a deferred-catalog delta and a failed-closed
+    /// warning report changes that have already applied or closed, so the
+    /// agent's payloads for them are settled; an external tool delta is
+    /// settled unless pending or draining.
+    #[test]
+    fn agent_boundary_payloads_are_settled() {
+        for status in [
+            ToolConfigChangeStatus::boundary_applied(true, false, 3),
+            ToolConfigChangeStatus::deferred_catalog_delta(1, 0, 0),
+            ToolConfigChangeStatus::warning_failed_closed("denied"),
+        ] {
+            let payload = ToolConfigChangedPayload::new(
+                ToolConfigChangeOperation::Reload,
+                "tool_scope",
+                status,
+            );
+            assert!(payload.settled(), "{:?}", payload.status_info());
+        }
+        for (phase, settled) in [
+            (ExternalToolDeltaPhase::Pending, false),
+            (ExternalToolDeltaPhase::Draining, false),
+            (ExternalToolDeltaPhase::Applied, true),
+            (ExternalToolDeltaPhase::Forced, true),
+            (ExternalToolDeltaPhase::Failed, true),
+        ] {
+            let delta = ExternalToolDelta::new("server", ToolConfigChangeOperation::Add, phase);
+            assert_eq!(delta.settled(), settled, "{phase:?}");
+            assert_eq!(
+                delta.to_tool_config_changed_payload().settled(),
+                settled,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// 0.9.3 wrote `persisted`, `false` for the three agent-boundary
+    /// statuses although those changes had applied. Decoding derives
+    /// `settled` from the status and never reads the stored bit.
+    #[test]
+    fn tool_config_changed_payload_derives_settled_from_status_on_decode() {
+        let stored_093 = |status_info: serde_json::Value, persisted: bool| {
+            serde_json::json!({
+                "operation": "reload",
+                "target": "tool_scope",
+                "status_info": status_info,
+                "persisted": persisted,
+            })
+        };
+        for (status_info, settled) in [
+            (
+                serde_json::json!({
+                    "kind": "boundary_applied",
+                    "base_changed": true,
+                    "visible_changed": false,
+                    "revision": 2
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({
+                    "kind": "deferred_catalog_delta",
+                    "added_hidden_count": 1,
+                    "removed_hidden_count": 0,
+                    "pending_source_count": 0
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "warning_failed_closed", "error": "denied"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "applied"}),
+                true,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "pending"}),
+                false,
+            ),
+            (
+                serde_json::json!({"kind": "external_tool_delta", "phase": "draining"}),
+                false,
+            ),
+        ] {
+            for stored in [true, false] {
+                let payload: ToolConfigChangedPayload =
+                    serde_json::from_value(stored_093(status_info.clone(), stored)).unwrap();
+                assert_eq!(
+                    payload.settled(),
+                    settled,
+                    "{status_info} stored persisted={stored}"
+                );
+                let rewritten = serde_json::to_value(&payload).unwrap();
+                assert_eq!(rewritten["settled"], settled);
+                assert!(rewritten.get("persisted").is_none());
+            }
+        }
+        let mut current = stored_093(
+            serde_json::json!({"kind": "external_tool_delta", "phase": "pending"}),
+            false,
+        );
+        let object = current.as_object_mut().unwrap();
+        object.remove("persisted");
+        object.insert("settled".into(), serde_json::json!(true));
+        let payload: ToolConfigChangedPayload = serde_json::from_value(current).unwrap();
+        assert!(
+            !payload.settled(),
+            "a stored settled is not read back either"
+        );
     }
 
     #[test]
@@ -4331,7 +4513,6 @@ mod tests {
                         ExternalToolDeltaPhase::Pending,
                         None,
                     ),
-                    false,
                 )
                 .with_applied_at_turn(Some(12)),
             },
@@ -5133,7 +5314,6 @@ mod tests {
                         ExternalToolDeltaPhase::Applied,
                         None,
                     ),
-                    true,
                 )
                 .with_applied_at_turn(Some(1)),
             },

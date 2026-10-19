@@ -480,12 +480,12 @@ mod tests {
         }
     }
 
-    fn mcp_block(persisted: bool) -> SystemNoticeBlock {
+    fn mcp_block(settled: bool) -> SystemNoticeBlock {
         SystemNoticeBlock::Mcp {
             server_id: Some("server".to_string()),
             operation: None,
             phase: None,
-            persisted,
+            settled,
             detail: None,
             confinement_refusal: None,
             pending_sources: Vec::new(),
