@@ -11655,8 +11655,21 @@ ORDER BY runtime_id";
         }
     }
 
+    const _: () = assert!(
+        crate::store::COMMIT_BUSY_WINDOW.as_millis()
+            == meerkat_sqlite::SHARED_BUSY_TIMEOUT.as_millis(),
+        "the runtime commit busy window is the shared SQLite busy timeout"
+    );
+
     #[async_trait::async_trait]
     impl crate::store::RuntimeSessionAuthorityOps for SqliteRuntimeStore {
+        /// Its connections open on the Primary profile with the shared busy
+        /// timeout, and a boundary commits in one transaction: that busy
+        /// window plus one of margin.
+        fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+            Some(meerkat_sqlite::SHARED_BUSY_TIMEOUT.saturating_mul(2))
+        }
+
         fn execution_custody(&self) -> Option<&crate::store::RuntimeStoreExecutionCustody> {
             Some(&self.execution_custody)
         }

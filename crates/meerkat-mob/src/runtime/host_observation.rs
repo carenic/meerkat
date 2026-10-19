@@ -3378,12 +3378,15 @@ async fn run_directed_turn_watcher(
         Some(handle) => Some(handle.try_wait().await),
         None => None,
     };
-    if matches!(
-        &completion_result,
-        Some(Err(
-            CompletionWaitError::AttachmentReplaced | CompletionWaitError::AuthorityUnavailable(_)
-        ))
-    ) {
+    if completion_result.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .err()
+            .and_then(CompletionWaitError::wait_failure_observation)
+            == Some(
+                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+            )
+    }) {
         if let Some(Err(error)) = &completion_result {
             tracing::error!(
                 session_id = %session,

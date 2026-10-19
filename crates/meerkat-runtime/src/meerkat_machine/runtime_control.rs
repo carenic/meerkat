@@ -16776,7 +16776,7 @@ impl MeerkatMachine {
                 }
             };
             let (captured_session_gate, preacquired_gate_guard) = match &member_lease {
-                Some(lease) => (Arc::clone(&lease.session_mutation_gate), None),
+                Some(lease) => (lease.session_mutation_gate.clone(), None),
                 None => {
                     let guard = self
                         .lock_current_durability_ready_session_mutation_gate(session_id)
@@ -16789,14 +16789,17 @@ impl MeerkatMachine {
                                 .ok_or(RuntimeDriverError::NotReady {
                                     state: RuntimeState::Destroyed,
                                 })?;
-                        Arc::clone(&entry.mutation_gate)
+                        entry.mutation_gate.clone()
                     };
                     (gate, Some(guard))
                 }
             };
             let held_mutation_gate = match preacquired_gate_guard {
                 Some(guard) => guard,
-                None => Arc::clone(&captured_session_gate).lock_owned().await,
+                None => self
+                    .lock_live_session_mutation_gate(session_id, &captured_session_gate)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?,
             };
             let captured_dsl_authority = {
                 let sessions = self.sessions.read().await;
@@ -16811,7 +16814,7 @@ impl MeerkatMachine {
                         }
                     });
                 };
-                if !Arc::ptr_eq(&entry.mutation_gate, &captured_session_gate) {
+                if !entry.mutation_gate.same_gate(&captured_session_gate) {
                     return Err(RuntimeDriverError::StaleAuthority {
                         reason: "boundary-cancel runtime session was replaced".to_string(),
                     });
@@ -17009,7 +17012,7 @@ impl MeerkatMachine {
                     },
                 ));
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &captured_session_gate)
+            if !entry.mutation_gate.same_gate(&captured_session_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_dsl_authority)
             {
                 drop(sessions);
@@ -17527,7 +17530,7 @@ impl MeerkatMachine {
                 PublishQueued {
                     driver: crate::meerkat_machine::driver::SharedDriver,
                     completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
-                    mutation_gate: Arc<crate::tokio::sync::Mutex<()>>,
+                    mutation_gate: SessionMutationGate,
                     publication_handle: Option<
                         std::sync::Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
                     >,
@@ -17545,7 +17548,7 @@ impl MeerkatMachine {
             let authority = self
                 .lock_member_effect_authority(session_id, expected_member)
                 .await?;
-            let (driver, completions, mutation_gate, publication_handle) = {
+            let (driver, completions, mutation_gate, publication_handle, durability_health) = {
                 let sessions = self.sessions.read().await;
                 let entry =
                     sessions
@@ -17557,12 +17560,18 @@ impl MeerkatMachine {
                 (
                     entry.driver.clone(),
                     entry.completions.clone(),
-                    Arc::clone(&entry.mutation_gate),
+                    entry.mutation_gate.clone(),
                     entry.publication_handle(),
+                    entry.durability_health.clone(),
                 )
             };
             let action = {
-                let mut driver_guard = driver.lock().await;
+                // The member authority above is not M, so a commit past its
+                // deadline can still hold the driver: end typed once the
+                // session degrades instead of waiting for the store.
+                let mut driver_guard = super::lock_driver_live(&driver, durability_health.as_ref())
+                    .await
+                    .map_err(super::degraded_gate_wait_refusal)?;
                 let input_id = driver_guard
                     .as_driver()
                     .input_id_for_idempotency_key(idempotency_key);
@@ -17595,7 +17604,7 @@ impl MeerkatMachine {
                                 Action::PublishQueued {
                                     driver: driver.clone(),
                                     completions: completions.clone(),
-                                    mutation_gate: Arc::clone(&mutation_gate),
+                                    mutation_gate: mutation_gate.clone(),
                                     publication_handle: publication_handle.clone(),
                                     input_id,
                                     candidate_owner_input_id,
@@ -17820,7 +17829,7 @@ impl MeerkatMachine {
                 (
                     entry.completions.clone(),
                     entry.publication_handle(),
-                    Arc::clone(&entry.mutation_gate),
+                    entry.mutation_gate.clone(),
                 )
             };
             let action = {
