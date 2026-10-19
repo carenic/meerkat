@@ -2788,7 +2788,13 @@ struct SessionState {
     deferred_finished_notices: VecDeque<(GptLiveAppendToken, String, Vec<String>)>,
     /// Delegations that got a finished notice: at most one each, they leave
     /// the still-running lines, and their result cue takes the after-notice
-    /// head ([`LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD`]). Bounded by
+    /// head ([`LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD`]). The entry is
+    /// made when the notice is reserved and stays while a runtime notice
+    /// waits for the model to stop speaking, and after one is withdrawn. The
+    /// after-notice head stays accurate then: it claims only that the result
+    /// has just arrived and that anything said earlier was said before it
+    /// arrived, which holds whether or not the notice reached the model, and
+    /// a withdrawn notice means the result reached the session first. Bounded by
     /// the delegations this channel accepts
     /// ([`SessionState::MAX_DELEGATION_IDENTITIES`]); an entry leaves when
     /// its result's cue is decided.
@@ -10872,7 +10878,9 @@ mod tests {
                     .await
             }
         });
-        pause.paused.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.paused.notified())
+            .await
+            .expect("the finished notice reaches its pause point");
         end_floor.notify_one();
         // Give provider ordering every chance to release the held result
         // first: until the result reaches the provider, or 500 ms.
@@ -11585,7 +11593,9 @@ mod tests {
                     .await
             }
         });
-        pause.paused.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.paused.notified())
+            .await
+            .expect("the finished notice reaches its pause point");
         // The result is appended while the notice is reserved but not sent.
         let result = tokio::spawn({
             let session = Arc::clone(&session);

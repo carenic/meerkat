@@ -7654,6 +7654,53 @@ fn finished_pending_is_authorized_until_the_result_is_handed_to_delivery() {
         .is_err(),
         "a result handed to delivery is never noted as waiting"
     );
+    // The provider acknowledges the result: its delivery channel and digest
+    // entries leave, so only the delivery observation still records that
+    // the result was handed over.
+    apply(
+        &mut authority,
+        mm::MeerkatMachineInput::ResolveLiveDelegationResultDelivery {
+            channel_id: CHANNEL.to_string(),
+            runtime_id: runtime_id(),
+            fence_token: fence(),
+            generation: generation(),
+            operation_id: channel_operation(1),
+            result_digest: "bootstrap-held-result-digest".to_string(),
+            replacement_channel_id: String::new(),
+            canonical_seed_cursor: 0,
+            observation: mm::LiveDelegationResultDeliveryObservation::Delivered,
+        },
+    )
+    .expect("the provider acknowledges the result");
+    {
+        let state = authority.state();
+        assert!(
+            !state
+                .live_result_delivery_channel_by_operation
+                .contains_key(&channel_operation(1))
+                && !state
+                    .live_result_delivery_digest_by_operation
+                    .contains_key(&channel_operation(1)),
+            "a resolved delivery keeps no channel or digest entry"
+        );
+        assert_eq!(
+            state
+                .live_delegation_last_narration_by_operation
+                .get(&channel_operation(1))
+                .copied(),
+            Some(mm::LiveDelegationNarrationKind::Completed),
+            "the last narration is the Completed announcement"
+        );
+    }
+    assert!(
+        narrate(
+            &mut authority,
+            1,
+            mm::LiveDelegationNarrationKind::FinishedPending
+        )
+        .is_err(),
+        "a delivered result is never noted as waiting"
+    );
 }
 
 /// #1820: a completion recorded after the work's cancellation is
