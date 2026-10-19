@@ -4338,6 +4338,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireAtScopeMobNotRunningDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverMemberRestoreHostRefusedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`

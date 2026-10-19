@@ -19024,6 +19024,28 @@ RetireAtScopeMobNotRunningDestroyed(agent_identity, agent_runtime_id, fence_toke
     /\ UnchangedFrame_6442c4792a0a93bc
 
 
+ResolveMemberRevivalHostRefusedRunning(agent_identity, refusal_code, reason) ==
+    /\ phase = "Running"
+    /\ ((agent_identity \in member_revival_pending) = TRUE)
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ member_restore_failures' = MapSet(member_restore_failures, agent_identity, reason)
+    /\ member_restore_failure_codes' = MapSet(member_restore_failure_codes, agent_identity, refusal_code)
+    /\ member_revival_pending' = (member_revival_pending \ {agent_identity})
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UnchangedFrame_b5eef7a8a620c7f5
+
+
+RecoverMemberRestoreHostRefusedRunning(agent_identity, refusal_code, reason) ==
+    /\ phase = "Running"
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ member_restore_failures' = MapSet(member_restore_failures, agent_identity, reason)
+    /\ member_restore_failure_codes' = MapSet(member_restore_failure_codes, agent_identity, refusal_code)
+    /\ topology_epoch' = (topology_epoch) + 1
+    /\ UnchangedFrame_5feece892ea446eb
+
+
 Next ==
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityTerminalRunning(run_id, status)
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityNonTerminalRunning(run_id, status)
@@ -20461,6 +20483,8 @@ Next ==
     \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeStaleSessionBindingStopped(agent_identity, agent_runtime_id, fence_token, session_id)
     \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeMobNotRunningCompleted(agent_identity, agent_runtime_id, fence_token, session_id)
     \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeMobNotRunningDestroyed(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E refusal_code \in StringValues : \E reason \in StringValues : ResolveMemberRevivalHostRefusedRunning(agent_identity, refusal_code, reason)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E refusal_code \in StringValues : \E reason \in StringValues : RecoverMemberRestoreHostRefusedRunning(agent_identity, refusal_code, reason)
     \/ TerminalStutter
 
 stopped_mob_holds_member_run_starts == (IF (phase # "Stopped") THEN TRUE ELSE (member_run_starts_held = TRUE))

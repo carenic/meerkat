@@ -602,6 +602,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CreateRun`
 - `RecoverIdentityGenerationHighwater`(agent_identity: AgentIdentity, generation: Generation)
 - `SealIdentityGenerationHighwater`
+- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
+- `RecoverMemberRestoreHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -15300,6 +15302,18 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
 - Emits: `RetireAtScopeResolved`
 - To: `Destroyed`
+
+### `ResolveMemberRevivalHostRefusedRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
+- Guards:
+  - `revival_pending`
+- To: `Running`
+
+### `RecoverMemberRestoreHostRefusedRunning`
+- From: `Running`
+- On: `RecoverMemberRestoreHostRefused`(agent_identity, refusal_code, reason)
+- To: `Running`
 
 ## Coverage
 ### Code Anchors

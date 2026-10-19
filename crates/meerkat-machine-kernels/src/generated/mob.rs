@@ -9501,6 +9501,18 @@ pub mod signals {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SealIdentityGenerationHighwater {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveMemberRevivalHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverMemberRestoreHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -9583,6 +9595,8 @@ pub enum Signal {
     CreateRun(signals::CreateRun),
     RecoverIdentityGenerationHighwater(signals::RecoverIdentityGenerationHighwater),
     SealIdentityGenerationHighwater(signals::SealIdentityGenerationHighwater),
+    ResolveMemberRevivalHostRefused(signals::ResolveMemberRevivalHostRefused),
+    RecoverMemberRestoreHostRefused(signals::RecoverMemberRestoreHostRefused),
 }
 impl Signal {
     pub fn kind(&self) -> SignalKind {
@@ -9695,6 +9709,8 @@ impl Signal {
                 SignalKind::RecoverIdentityGenerationHighwater
             }
             Self::SealIdentityGenerationHighwater(_) => SignalKind::SealIdentityGenerationHighwater,
+            Self::ResolveMemberRevivalHostRefused(_) => SignalKind::ResolveMemberRevivalHostRefused,
+            Self::RecoverMemberRestoreHostRefused(_) => SignalKind::RecoverMemberRestoreHostRefused,
         }
     }
 }
@@ -9776,6 +9792,8 @@ pub enum SignalKind {
     CreateRun,
     RecoverIdentityGenerationHighwater,
     SealIdentityGenerationHighwater,
+    ResolveMemberRevivalHostRefused,
+    RecoverMemberRestoreHostRefused,
 }
 
 pub mod effects {
@@ -12520,6 +12538,8 @@ pub enum TransitionId {
     RetireAtScopeStaleSessionBindingStopped,
     RetireAtScopeMobNotRunningCompleted,
     RetireAtScopeMobNotRunningDestroyed,
+    ResolveMemberRevivalHostRefusedRunning,
+    RecoverMemberRestoreHostRefusedRunning,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
