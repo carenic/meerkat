@@ -17,6 +17,7 @@ const GENERATION: u64 = 7;
 /// records what it saw, and can pause or refuse.
 struct SelectingHost {
     seen: std::sync::Mutex<Vec<MemberRuntimeBuildIdentity>>,
+    expected_seen: std::sync::Mutex<Vec<MemberRuntimeBuildIdentity>>,
     expected_calls: AtomicUsize,
     expected_generation: AtomicU64,
     foreign_context: AtomicBool,
@@ -40,6 +41,7 @@ impl SelectingHost {
     fn new(pause: bool, refuse: bool) -> Arc<Self> {
         Arc::new(Self {
             seen: Default::default(),
+            expected_seen: Default::default(),
             expected_calls: AtomicUsize::new(0),
             expected_generation: AtomicU64::new(GENERATION),
             foreign_context: AtomicBool::new(false),
@@ -112,6 +114,7 @@ impl crate::MemberRuntimeRegistrationHook for SelectingHost {
         identity: &MemberRuntimeBuildIdentity,
     ) -> Result<MemberDestinationSelection, MobError> {
         self.expected_calls.fetch_add(1, Ordering::SeqCst);
+        self.expected_seen.lock().unwrap().push(identity.clone());
         Ok(Self::selection_at(
             identity,
             self.expected_generation.load(Ordering::SeqCst),
@@ -565,6 +568,43 @@ async fn attached_recovery_verifies_the_installed_destination() {
         "the actor is recovered on the same attachment"
     );
     assert_bound_at(&machine, &id, GENERATION).await;
+    machine.unregister_session(&id).await.unwrap();
+}
+
+/// Each hook call carries the member's exact registration: the fresh
+/// selection names the registration the provision prepared, and an attached
+/// recovery names that same, still current registration. This pins the
+/// plumbing only, since the member has a single registration here: exactness
+/// rests on the two call sites that read the witness at the call (the prepared
+/// transaction's witness in `create_owned_with_route`, and
+/// `current_session_registration_witness` in the provisioner's attached
+/// recovery), and meerkat-runtime's configured-provider test proves that the
+/// witness tells two registrations of one session apart.
+#[tokio::test]
+async fn each_hook_call_carries_the_members_exact_registration() {
+    let (backend, service, machine, host) = backend(false, false);
+    let (id, _attachment, recovery) =
+        attached_member_lost_its_actor(&backend, &service, &machine).await;
+    let registration = machine
+        .current_session_registration_witness(&id)
+        .await
+        .expect("the provisioned member is registered");
+    let fresh = host.seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        fresh.registration(),
+        &registration,
+        "the fresh selection names the registration the provision prepared"
+    );
+    backend
+        .provision_member(recovery)
+        .await
+        .expect("the verified member recovers its actor");
+    let recovered = host.expected_seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        recovered.registration(),
+        &registration,
+        "the attached recovery names the member's current registration"
+    );
     machine.unregister_session(&id).await.unwrap();
 }
 

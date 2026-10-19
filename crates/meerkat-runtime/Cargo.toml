@@ -95,8 +95,9 @@ meerkat-machine-schema = { workspace = true }
 meerkat-machine-kernels = { workspace = true, features = ["test-oracle"] }
 meerkat-comms = { workspace = true }
 # Integration tests drive the offline schema bridge directly against realms
-# written by published pre-0.8.10 binaries.
-meerkat-sqlite = { workspace = true }
+# written by published pre-0.8.10 binaries. `test-support` lets the store's
+# unit tests commit a concurrent schema change inside an open's preflight.
+meerkat-sqlite = { workspace = true, features = ["test-support"] }
 rusqlite = { workspace = true }
 
 # The feature set this crate's own tests need. The published package

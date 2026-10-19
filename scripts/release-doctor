@@ -193,9 +193,9 @@ else
 fi
 
 # Windows release binaries are cross-compiled from Linux with cargo-xwin and
-# then verified on a Windows runner; the binary gate requires both of those
-# jobs whichever lane builds Linux/macOS, and no hosted matrix entry builds
-# natively on windows-latest any more.
+# then verified on the pinned windows-2025-vs2026 runner; the binary gate
+# requires both of those jobs whichever lane builds Linux/macOS, and no
+# hosted matrix entry builds natively on windows-latest any more.
 if awk '
     /^  build_binaries_windows_cross:/ { in_job = 1; next }
     in_job && /^  [[:alnum:]_-]+:/ { in_job = 0 }
@@ -207,7 +207,7 @@ if awk '
   awk '
     /^  verify_windows_binaries:/ { in_job = 1; next }
     in_job && /^  [[:alnum:]_-]+:/ { in_job = 0 }
-    in_job && /runs-on: windows-latest/ { native = 1 }
+    in_job && /runs-on: windows-2025-vs2026$/ { native = 1 }
     in_job && /--version/ { version = 1 }
     END { exit (native && version) ? 0 : 1 }
   ' "${release_workflow}" &&
@@ -216,9 +216,9 @@ if awk '
   ! grep -Eq 'runs-on: *"?windows-latest"?.*target' "${release_workflow}" &&
   ! grep -Fq '"runs-on":"windows-latest","target":"x86_64-pc-windows-msvc"' "${release_workflow}" &&
   ! grep -Fq 'king.europe.buildbuddy.io' "${release_workflow}"; then
-  pass "Release workflow cross-compiles Windows binaries on Linux, verifies them on windows-latest, and gates on both"
+  pass "Release workflow cross-compiles Windows binaries on Linux, verifies them on the pinned windows-2025-vs2026 runner, and gates on both"
 else
-  bad "Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on windows-latest (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
+  bad "Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on the pinned windows-2025-vs2026 runner (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
 fi
 
 web_build_timeout="$(
@@ -320,7 +320,7 @@ else
 fi
 
 if caches_contract="$(workflow_contract release-caches)"; then
-  pass "GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
+  pass "GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job or semver readiness run restores a cache on any event, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
 else
   bad "A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or CI installs sccache through sccache-action or without a pinned sha256 (${caches_contract//$'\n'/; })"
 fi

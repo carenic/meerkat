@@ -2179,6 +2179,30 @@ impl Serialize for StoredInputState {
     }
 }
 
+/// Whether an authority association the row carries bounds its resource
+/// domains by owner (`DomainBound::OwnedBy`) in either ceiling, in the
+/// persisted input or in a retained contributor. Only stored input state v7
+/// and later can carry that bound.
+fn carries_owner_scoped_resource_domains(helper: &InputStateSerde) -> bool {
+    use meerkat_authorization_contracts::constraints::DomainBound;
+    use meerkat_authorization_contracts::work_association::InputAuthorityAssociation;
+    let owner_scoped = |association: &InputAuthorityAssociation| {
+        let claims = association.candidate();
+        [&claims.controller_ceiling, &claims.admitted_ceiling]
+            .into_iter()
+            .any(|ceiling| matches!(ceiling.resource_domains.bound(), DomainBound::OwnedBy(_)))
+    };
+    helper
+        .persisted_input
+        .as_ref()
+        .and_then(|input| input.header().authority_association.as_ref())
+        .is_some_and(owner_scoped)
+        || helper
+            .authority_contributors
+            .iter()
+            .any(|contributor| owner_scoped(contributor.association()))
+}
+
 impl<'de> Deserialize<'de> for StoredInputState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let helper = InputStateSerde::deserialize(deserializer)?;
@@ -2210,6 +2234,12 @@ impl<'de> Deserialize<'de> for StoredInputState {
         {
             return Err(<D::Error as serde::de::Error>::custom(
                 "stored input state before v6 cannot carry a mandatory hook withholding record",
+            ));
+        }
+        if observed_stored_input_state_version < 7 && carries_owner_scoped_resource_domains(&helper)
+        {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v7 cannot carry an owner-scoped resource restriction",
             ));
         }
         if observed_stored_input_state_version == 3 && helper.interaction_terminal_outbox.is_some()
@@ -3005,6 +3035,82 @@ mod tests {
         );
     }
 
+    /// A row whose authority association bounds its resource domains by owner
+    /// is written as stored input state v7. Stamped with an older version it
+    /// is refused, wherever the bound sits: either ceiling, of the persisted
+    /// input or of a retained contributor. The same rows with exact domains
+    /// still decode at v6.
+    #[test]
+    fn an_owner_scoped_resource_restriction_needs_stored_input_state_v7() {
+        use meerkat_authorization_contracts::constraints::DomainRestriction;
+        use meerkat_authorization_contracts::work_association::InputAuthorityAssociation;
+        use meerkat_core::{PrincipalKind, PrincipalRef, TrustDomainId};
+
+        let owner = PrincipalRef::in_domain(
+            PrincipalKind::ServiceAccount,
+            "application",
+            TrustDomainId::new("native-test").expect("domain"),
+        )
+        .expect("owner");
+        let row = |domains: &DomainRestriction, admitted_ceiling: bool, in_input: bool| {
+            let mut input = crate::input_authority::tests::input("requester");
+            let header = input.header_mut();
+            let mut claims = header
+                .authority_association
+                .as_ref()
+                .expect("governed fixture")
+                .candidate()
+                .clone();
+            if admitted_ceiling {
+                claims.admitted_ceiling.resource_domains = domains.clone();
+            } else {
+                claims.controller_ceiling.resource_domains = domains.clone();
+            }
+            header.authority_association =
+                Some(InputAuthorityAssociation::new(claims).expect("well-formed claims"));
+            let mut stored = StoredInputState::accepted_for_test(&input).expect("row");
+            if in_input {
+                stored.state.authority_contributors.clear();
+                stored.state.persisted_input = Some(input);
+            } else {
+                assert_eq!(stored.state.authority_contributors.len(), 1);
+            }
+            serde_json::to_value(stored).expect("serialize fixture")
+        };
+        let owned = DomainRestriction::owned_by([owner]);
+        let exact = DomainRestriction::exact([]);
+        for admitted_ceiling in [false, true] {
+            for in_input in [false, true] {
+                let case = format!("admitted_ceiling={admitted_ceiling} in_input={in_input}");
+                let current = row(&owned, admitted_ceiling, in_input);
+                assert_eq!(current["stored_input_state_version"], 7, "{case}");
+                let reread: StoredInputState =
+                    serde_json::from_value(current.clone()).expect("a v7 row decodes");
+                assert_eq!(
+                    serde_json::to_value(&reread).expect("encode"),
+                    current,
+                    "{case}"
+                );
+
+                let mut older = current;
+                older["stored_input_state_version"] = serde_json::json!(6);
+                let error = serde_json::from_value::<StoredInputState>(older)
+                    .expect_err("a pre-v7 row cannot carry an owner-scoped restriction");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("before v7 cannot carry an owner-scoped resource restriction"),
+                    "{case}: {error}"
+                );
+
+                let mut exact_v6 = row(&exact, admitted_ceiling, in_input);
+                exact_v6["stored_input_state_version"] = serde_json::json!(6);
+                serde_json::from_value::<StoredInputState>(exact_v6)
+                    .unwrap_or_else(|error| panic!("{case}: exact domains decode at v6: {error}"));
+            }
+        }
+    }
+
     /// v0.8.7 regression witness (release-bricking class): a stored-input-state
     /// v4 row whose interaction terminal outbox carries the
     /// pre-durable-callback `callback_pending` candidate shape (no
@@ -3147,11 +3253,11 @@ mod tests {
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =
             serde_json::to_value(StoredInputState::new_accepted(InputId::new())).unwrap();
-        for rejected in [2, 7] {
+        for rejected in [2, 8] {
             fixture["stored_input_state_version"] = serde_json::json!(rejected);
             let error = serde_json::from_value::<StoredInputState>(fixture.clone())
                 .expect_err("unknown historical and future versions must fail closed");
-            assert!(error.to_string().contains("expected current 6"));
+            assert!(error.to_string().contains("expected current 7"));
         }
 
         // 0.8.10 accepted still-retained v3 input rows lazily, so a supported

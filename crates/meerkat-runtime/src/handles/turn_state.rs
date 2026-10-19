@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use meerkat_core::handles::{DslTransitionError, TurnStateHandle, TurnStateSnapshot};
+use meerkat_core::handles::{
+    DslTransitionError, TurnStateHandle, TurnStateScalars, TurnStateSnapshot,
+};
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::ops::{AsyncOpRef, OperationId, WaitPolicy};
 use meerkat_core::retry::LlmRetrySchedule;
@@ -198,15 +200,14 @@ fn map_generated_turn_effect(
     }))
 }
 
-impl TurnStateHandle for RuntimeTurnStateHandle {
-    fn isolated_live_bridge_child(&self) -> Result<Arc<dyn TurnStateHandle>, DslTransitionError> {
-        Ok(Arc::new(Self::isolated_live_bridge()))
-    }
-
-    fn apply_turn_input(
+impl RuntimeTurnStateHandle {
+    /// Apply one typed turn input and run `sample` over the state that input
+    /// produced, in the same authority critical section as the transition.
+    fn apply_turn_input_sampling<S>(
         &self,
         input: TurnExecutionInput,
-    ) -> Result<Vec<TurnExecutionEffect>, DslTransitionError> {
+        sample: impl FnOnce(&mm_dsl::MeerkatMachineState) -> S,
+    ) -> Result<(Vec<TurnExecutionEffect>, S), DslTransitionError> {
         let context = "TurnStateHandle::apply_turn_input";
         let standalone_run_id = match &input {
             TurnExecutionInput::StartConversationRun { run_id, .. }
@@ -444,12 +445,46 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             }
             TurnExecutionInput::ForceCancelNoRun => mm_dsl::MeerkatMachineInput::ForceCancelNoRun,
         };
-        self.dsl
-            .apply_input_with_effects(dsl_input, context)?
+        let (transition, sampled) = self
+            .dsl
+            .apply_input_with_transition_and_sample(dsl_input, context, sample)?;
+        let effects = transition
+            .into_effects()
             .into_iter()
             .map(|effect| map_generated_turn_effect(effect, context))
             .filter_map(Result::transpose)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((effects, sampled))
+    }
+}
+
+impl TurnStateHandle for RuntimeTurnStateHandle {
+    fn isolated_live_bridge_child(&self) -> Result<Arc<dyn TurnStateHandle>, DslTransitionError> {
+        Ok(Arc::new(Self::isolated_live_bridge()))
+    }
+
+    fn apply_turn_input(
+        &self,
+        input: TurnExecutionInput,
+    ) -> Result<Vec<TurnExecutionEffect>, DslTransitionError> {
+        self.apply_turn_input_sampling(input, |_| ())
+            .map(|(effects, ())| effects)
+    }
+
+    fn apply_turn_input_observing_phase(
+        &self,
+        input: TurnExecutionInput,
+    ) -> Result<(Vec<TurnExecutionEffect>, TurnPhase), DslTransitionError> {
+        self.apply_turn_input_sampling(input, |state| map_turn_phase(state.turn_phase))
+    }
+
+    fn turn_phase(&self) -> TurnPhase {
+        self.dsl
+            .with_state_lock(|state| map_turn_phase(state.turn_phase))
+    }
+
+    fn scalars(&self) -> TurnStateScalars {
+        self.dsl.with_state_lock(project_turn_scalars)
     }
 
     fn start_conversation_run(
@@ -688,82 +723,133 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         self.close_standalone_turn(&run_id, mm_dsl::TurnPhase::Cancelled)
     }
 
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::panic)]
     fn snapshot(&self) -> TurnStateSnapshot {
-        let state = self.dsl.snapshot_state();
-        let turn_phase = map_turn_phase(state.turn_phase);
-        let barrier_operation_ids: BTreeSet<_> = state
-            .barrier_operation_ids
-            .iter()
-            .map(|id| parse_operation_id(id.0.as_str()))
-            .collect();
-        let pending_op_refs = state
-            .pending_op_refs
-            .iter()
-            .map(|id| {
-                let operation_id = parse_operation_id(id);
-                AsyncOpRef {
-                    wait_policy: if barrier_operation_ids.contains(&operation_id) {
-                        WaitPolicy::Barrier
-                    } else {
-                        WaitPolicy::Detached
-                    },
-                    operation_id,
-                }
-            })
-            .collect();
-        let turn_terminal = classify_turn_terminal(&state);
-        let active_run_id = if turn_terminal {
-            None
-        } else {
-            state.current_run_id.as_ref().map(parse_snapshot_run_id)
+        // One coherent observation under the authority lock: the projection
+        // copies only the fields it returns, and the generated terminality
+        // classification recovers (and so validates) the one owned copy taken
+        // in the same hold. The projection never panics under the lock, where
+        // a panic would poison it: a malformed generated value is reported
+        // here, after the lock is released.
+        let (projection, observed) = self
+            .dsl
+            .with_state_lock(|state| (project_turn_state(state), state.clone()));
+        let (mut snapshot, current_run_id) = match projection {
+            Ok(projected) => projected,
+            Err(MalformedTurnState(invariant)) => panic!("{invariant}"),
         };
-        TurnStateSnapshot {
-            active_run_id,
-            terminal_run_id: state
-                .turn_terminal_run_id
-                .as_ref()
-                .map(parse_snapshot_run_id),
-            loop_state: map_loop_state(state.turn_phase),
-            turn_phase,
-            turn_terminal,
-            primitive_kind: state.primitive_kind.map(TurnPrimitiveKind::from),
-            admitted_content_shape: state.admitted_content_shape.map(Into::into),
-            vision_enabled: state.vision_enabled,
-            image_tool_results_enabled: state.image_tool_results_enabled,
-            tool_calls_pending: state.tool_calls_pending,
-            pending_op_refs,
-            barrier_operation_ids,
-            has_barrier_ops: state.has_barrier_ops,
-            barrier_satisfied: state.barrier_satisfied,
-            boundary_count: state.boundary_count,
-            cancel_after_boundary: state.cancel_after_boundary,
-            terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
-            terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
-            extraction_attempts: state.extraction_attempts,
-            max_extraction_retries: state.max_extraction_retries,
-            extraction_active: state.extraction_active,
-            llm_retry_attempt: u32::try_from(state.llm_retry_attempt)
-                .expect("generated MeerkatMachine llm_retry_attempt must fit u32"),
-            llm_retry_max_retries: u32::try_from(state.llm_retry_max_retries)
-                .expect("generated MeerkatMachine llm_retry_max_retries must fit u32"),
-            llm_retry_selected_delay_ms: state.llm_retry_selected_delay_ms,
+        snapshot.turn_terminal = classify_turn_terminal(observed);
+        if !snapshot.turn_terminal {
+            snapshot.active_run_id = current_run_id;
         }
+        snapshot
     }
 }
 
-#[allow(clippy::expect_used)]
-fn parse_operation_id(value: &str) -> OperationId {
-    uuid::Uuid::parse_str(value)
-        .map(OperationId)
-        .expect("generated MeerkatMachine operation id projection must be well formed")
+/// The scalar facts of [`project_turn_state`], from a borrowed DSL state.
+fn project_turn_scalars(state: &mm_dsl::MeerkatMachineState) -> TurnStateScalars {
+    TurnStateScalars {
+        turn_phase: map_turn_phase(state.turn_phase),
+        cancel_after_boundary: state.cancel_after_boundary,
+        has_barrier_ops: state.has_barrier_ops,
+        extraction_active: state.extraction_active,
+        terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
+        terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
+        extraction_attempts: state.extraction_attempts,
+    }
 }
 
-#[allow(clippy::expect_used)]
-fn parse_snapshot_run_id(run_id: &mm_dsl::RunId) -> RunId {
+/// Project the returned turn-state fields from a borrowed DSL state, copying
+/// nothing else. The terminality verdict is not a state field: the projection
+/// is fail-closed (terminal, no active run) until the caller applies
+/// [`classify_turn_terminal`]'s verdict, and the current run id it then
+/// exposes for a live turn is returned beside it.
+///
+/// It runs under the authority lock, so it never panics there: a generated
+/// value it cannot represent is returned as [`MalformedTurnState`], for the
+/// caller to report after the lock is released.
+fn project_turn_state(
+    state: &mm_dsl::MeerkatMachineState,
+) -> Result<(TurnStateSnapshot, Option<RunId>), MalformedTurnState> {
+    let barrier_operation_ids = state
+        .barrier_operation_ids
+        .iter()
+        .map(|id| parse_operation_id(id.0.as_str()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let pending_op_refs = state
+        .pending_op_refs
+        .iter()
+        .map(|id| {
+            parse_operation_id(id).map(|operation_id| AsyncOpRef {
+                wait_policy: if barrier_operation_ids.contains(&operation_id) {
+                    WaitPolicy::Barrier
+                } else {
+                    WaitPolicy::Detached
+                },
+                operation_id,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let snapshot = TurnStateSnapshot {
+        active_run_id: None,
+        terminal_run_id: state
+            .turn_terminal_run_id
+            .as_ref()
+            .map(parse_snapshot_run_id)
+            .transpose()?,
+        loop_state: map_loop_state(state.turn_phase),
+        turn_phase: map_turn_phase(state.turn_phase),
+        turn_terminal: true,
+        primitive_kind: state.primitive_kind.map(TurnPrimitiveKind::from),
+        admitted_content_shape: state.admitted_content_shape.map(Into::into),
+        vision_enabled: state.vision_enabled,
+        image_tool_results_enabled: state.image_tool_results_enabled,
+        tool_calls_pending: state.tool_calls_pending,
+        pending_op_refs,
+        barrier_operation_ids,
+        has_barrier_ops: state.has_barrier_ops,
+        barrier_satisfied: state.barrier_satisfied,
+        boundary_count: state.boundary_count,
+        cancel_after_boundary: state.cancel_after_boundary,
+        terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
+        terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
+        extraction_attempts: state.extraction_attempts,
+        max_extraction_retries: state.max_extraction_retries,
+        extraction_active: state.extraction_active,
+        llm_retry_attempt: u32::try_from(state.llm_retry_attempt).map_err(|_| {
+            MalformedTurnState("generated MeerkatMachine llm_retry_attempt must fit u32")
+        })?,
+        llm_retry_max_retries: u32::try_from(state.llm_retry_max_retries).map_err(|_| {
+            MalformedTurnState("generated MeerkatMachine llm_retry_max_retries must fit u32")
+        })?,
+        llm_retry_selected_delay_ms: state.llm_retry_selected_delay_ms,
+    };
+    let current_run_id = state
+        .current_run_id
+        .as_ref()
+        .map(parse_snapshot_run_id)
+        .transpose()?;
+    Ok((snapshot, current_run_id))
+}
+
+/// A generated turn-state value [`project_turn_state`] cannot represent.
+#[derive(Debug)]
+struct MalformedTurnState(&'static str);
+
+fn parse_operation_id(value: &str) -> Result<OperationId, MalformedTurnState> {
+    uuid::Uuid::parse_str(value).map(OperationId).map_err(|_| {
+        MalformedTurnState("generated MeerkatMachine operation id projection must be well formed")
+    })
+}
+
+fn parse_snapshot_run_id(run_id: &mm_dsl::RunId) -> Result<RunId, MalformedTurnState> {
     uuid::Uuid::parse_str(&run_id.0)
         .map(RunId::from_uuid)
-        .expect("generated MeerkatMachine current_run_id projection must be well formed")
+        .map_err(|_| {
+            MalformedTurnState(
+                "generated MeerkatMachine current_run_id projection must be well formed",
+            )
+        })
 }
 
 /// Mirror the canonical MeerkatMachine turn-terminality verdict over the
@@ -774,10 +860,10 @@ fn parse_snapshot_run_id(run_id: &mm_dsl::RunId) -> RunId {
 /// state, drives the `ClassifyTurnTerminality` input, and mirrors the emitted
 /// `TurnTerminalityClassified.terminal`. It decides nothing. Fails closed:
 /// an unclassifiable state is treated as terminal so a live run is never assumed
-/// to still be active off an unreadable snapshot.
-fn classify_turn_terminal(state: &mm_dsl::MeerkatMachineState) -> bool {
-    let Ok(mut authority) = mm_dsl::MeerkatMachineAuthority::recover_from_state(state.clone())
-    else {
+/// to still be active off an unreadable snapshot. It takes the observed copy
+/// by value: recovery validates and consumes it, so no second copy is made.
+fn classify_turn_terminal(state: mm_dsl::MeerkatMachineState) -> bool {
+    let Ok(mut authority) = mm_dsl::MeerkatMachineAuthority::recover_from_state(state) else {
         return true;
     };
     let Ok(transition) = mm_dsl::MeerkatMachineMutator::apply(
@@ -1721,5 +1807,658 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.turn_phase, TurnPhase::ApplyingPrimitive);
         assert_eq!(snapshot.terminal_cause_kind, None);
+    }
+
+    /// The projection as it was before #24: a full copy of the state, the
+    /// projection from that copy, and the classification over a second copy.
+    /// The borrowed projection must equal it on every state.
+    #[allow(clippy::expect_used)]
+    fn legacy_snapshot(handle: &RuntimeTurnStateHandle) -> TurnStateSnapshot {
+        let state = handle.dsl.snapshot_state();
+        let turn_phase = map_turn_phase(state.turn_phase);
+        let barrier_operation_ids: BTreeSet<_> = state
+            .barrier_operation_ids
+            .iter()
+            .map(|id| legacy_parse_operation_id(id.0.as_str()))
+            .collect();
+        let pending_op_refs = state
+            .pending_op_refs
+            .iter()
+            .map(|id| {
+                let operation_id = legacy_parse_operation_id(id);
+                AsyncOpRef {
+                    wait_policy: if barrier_operation_ids.contains(&operation_id) {
+                        WaitPolicy::Barrier
+                    } else {
+                        WaitPolicy::Detached
+                    },
+                    operation_id,
+                }
+            })
+            .collect();
+        let turn_terminal = legacy_classify_turn_terminal(&state);
+        let active_run_id = if turn_terminal {
+            None
+        } else {
+            state
+                .current_run_id
+                .as_ref()
+                .map(legacy_parse_snapshot_run_id)
+        };
+        TurnStateSnapshot {
+            active_run_id,
+            terminal_run_id: state
+                .turn_terminal_run_id
+                .as_ref()
+                .map(legacy_parse_snapshot_run_id),
+            loop_state: map_loop_state(state.turn_phase),
+            turn_phase,
+            turn_terminal,
+            primitive_kind: state.primitive_kind.map(TurnPrimitiveKind::from),
+            admitted_content_shape: state.admitted_content_shape.map(Into::into),
+            vision_enabled: state.vision_enabled,
+            image_tool_results_enabled: state.image_tool_results_enabled,
+            tool_calls_pending: state.tool_calls_pending,
+            pending_op_refs,
+            barrier_operation_ids,
+            has_barrier_ops: state.has_barrier_ops,
+            barrier_satisfied: state.barrier_satisfied,
+            boundary_count: state.boundary_count,
+            cancel_after_boundary: state.cancel_after_boundary,
+            terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
+            terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
+            extraction_attempts: state.extraction_attempts,
+            max_extraction_retries: state.max_extraction_retries,
+            extraction_active: state.extraction_active,
+            llm_retry_attempt: u32::try_from(state.llm_retry_attempt)
+                .expect("generated MeerkatMachine llm_retry_attempt must fit u32"),
+            llm_retry_max_retries: u32::try_from(state.llm_retry_max_retries)
+                .expect("generated MeerkatMachine llm_retry_max_retries must fit u32"),
+            llm_retry_selected_delay_ms: state.llm_retry_selected_delay_ms,
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    fn legacy_parse_operation_id(value: &str) -> OperationId {
+        Uuid::parse_str(value)
+            .map(OperationId)
+            .expect("generated MeerkatMachine operation id projection must be well formed")
+    }
+
+    #[allow(clippy::expect_used)]
+    fn legacy_parse_snapshot_run_id(run_id: &mm_dsl::RunId) -> RunId {
+        Uuid::parse_str(&run_id.0)
+            .map(RunId::from_uuid)
+            .expect("generated MeerkatMachine current_run_id projection must be well formed")
+    }
+
+    fn legacy_classify_turn_terminal(state: &mm_dsl::MeerkatMachineState) -> bool {
+        let Ok(mut authority) = mm_dsl::MeerkatMachineAuthority::recover_from_state(state.clone())
+        else {
+            return true;
+        };
+        let Ok(transition) = mm_dsl::MeerkatMachineMutator::apply(
+            &mut authority,
+            mm_dsl::MeerkatMachineInput::ClassifyTurnTerminality {},
+        ) else {
+            return true;
+        };
+        let mut classified = None;
+        for effect in transition.effects() {
+            if let mm_dsl::MeerkatMachineEffect::TurnTerminalityClassified { terminal } = effect
+                && classified.replace(*terminal).is_some()
+            {
+                return true;
+            }
+        }
+        classified.unwrap_or(true)
+    }
+
+    /// One generated turn input of the differential walk, on run `n`.
+    #[derive(Clone, Copy, Debug)]
+    enum OracleStep {
+        Start(u128),
+        ImmediateAppend(u128),
+        PrimitiveApplied(u128),
+        ToolCalls(u128, u64),
+        RegisterOps(u128),
+        ToolsResolved(u128),
+        BarrierSatisfied(u128),
+        BoundaryContinue(u128),
+        LlmTerminal(u128),
+        BoundaryComplete(u128),
+        EnterExtraction(u128),
+        ExtractionStart(u128),
+        ExtractionRejected(u128),
+        ExtractionPassed(u128),
+        Recoverable(u128, u32),
+        Retry(u128, u32),
+        Fatal(u128),
+        CancelNow(u128),
+        CancellationObserved(u128),
+        CancelAfterBoundary(u128),
+        BudgetExhausted(u128),
+        TimeBudgetExceeded(u128),
+        TurnLimit(u128),
+        ForceCancelNoRun,
+    }
+
+    fn oracle_run(n: u128) -> RunId {
+        RunId(Uuid::from_u128(0x0de0_0000 + n))
+    }
+
+    fn oracle_ops() -> (BTreeSet<AsyncOpRef>, BTreeSet<OperationId>) {
+        let op = |n: u128| OperationId(Uuid::from_u128(0x0de1_0000 + n));
+        let refs = (0..8)
+            .map(|i| AsyncOpRef {
+                operation_id: op(i),
+                wait_policy: if i < 2 {
+                    WaitPolicy::Barrier
+                } else {
+                    WaitPolicy::Detached
+                },
+            })
+            .collect();
+        (refs, (0..2).map(op).collect())
+    }
+
+    fn apply_oracle_step(
+        handle: &RuntimeTurnStateHandle,
+        step: OracleStep,
+    ) -> Result<(), DslTransitionError> {
+        match step {
+            OracleStep::Start(n) => handle.start_conversation_run(
+                oracle_run(n),
+                TurnPrimitiveKind::ConversationTurn,
+                ContentShape::Conversation,
+                n % 2 == 0,
+                n % 3 == 0,
+                2,
+            ),
+            OracleStep::ImmediateAppend(n) => handle.start_immediate_append(oracle_run(n)),
+            OracleStep::PrimitiveApplied(n) => handle.primitive_applied(oracle_run(n)),
+            OracleStep::ToolCalls(n, count) => handle.llm_returned_tool_calls(oracle_run(n), count),
+            OracleStep::RegisterOps(n) => {
+                let (refs, barrier) = oracle_ops();
+                handle.register_pending_ops(oracle_run(n), refs, barrier)
+            }
+            OracleStep::ToolsResolved(n) => handle.tool_calls_resolved(oracle_run(n)),
+            OracleStep::BarrierSatisfied(n) => {
+                handle.ops_barrier_satisfied(oracle_run(n), oracle_ops().1)
+            }
+            OracleStep::BoundaryContinue(n) => handle.boundary_continue(oracle_run(n)),
+            OracleStep::LlmTerminal(n) => handle.llm_returned_terminal(oracle_run(n)),
+            OracleStep::BoundaryComplete(n) => handle.boundary_complete(oracle_run(n)),
+            OracleStep::EnterExtraction(n) => handle.enter_extraction(oracle_run(n), 2),
+            OracleStep::ExtractionStart(n) => handle.extraction_start(oracle_run(n)),
+            OracleStep::ExtractionRejected(n) => {
+                handle.extraction_validation_failed(oracle_run(n), "schema mismatch".into())
+            }
+            OracleStep::ExtractionPassed(n) => handle.extraction_validation_passed(oracle_run(n)),
+            OracleStep::Recoverable(n, attempt) => {
+                handle.recoverable_failure(oracle_run(n), retry_schedule(attempt))
+            }
+            OracleStep::Retry(n, attempt) => handle.retry_requested(oracle_run(n), attempt),
+            OracleStep::Fatal(n) => handle.fatal_failure(
+                oracle_run(n),
+                failure_source(TurnFailureSourceKind::Llm, "fatal provider failure"),
+            ),
+            OracleStep::CancelNow(n) => handle.cancel_now(oracle_run(n)),
+            OracleStep::CancellationObserved(n) => handle.cancellation_observed(oracle_run(n)),
+            OracleStep::CancelAfterBoundary(n) => {
+                handle.request_cancel_after_boundary(oracle_run(n))
+            }
+            OracleStep::BudgetExhausted(n) => handle.budget_exhausted(oracle_run(n)),
+            OracleStep::TimeBudgetExceeded(n) => handle.time_budget_exceeded(oracle_run(n)),
+            OracleStep::TurnLimit(n) => handle.turn_limit_reached(oracle_run(n), 4, 4),
+            OracleStep::ForceCancelNoRun => handle.force_cancel_no_run(),
+        }
+    }
+
+    /// Generated input scripts that between them reach every turn phase:
+    /// tool rounds with barrier ops, immediate appends, extraction with a
+    /// rejected attempt, retries, fatal and budget terminals, cancellation
+    /// now and after a boundary.
+    fn oracle_scripts() -> [Vec<OracleStep>; 5] {
+        use OracleStep::*;
+        [
+            vec![
+                Start(1),
+                PrimitiveApplied(1),
+                ToolCalls(1, 3),
+                RegisterOps(1),
+                BarrierSatisfied(1),
+                ToolsResolved(1),
+                BoundaryContinue(1),
+                LlmTerminal(1),
+                BoundaryComplete(1),
+                ImmediateAppend(2),
+                PrimitiveApplied(2),
+                BoundaryComplete(2),
+                Start(3),
+                PrimitiveApplied(3),
+                LlmTerminal(3),
+                CancelAfterBoundary(3),
+                BoundaryComplete(3),
+            ],
+            // The agent's order: every extraction reply drains a boundary
+            // and re-enters Extracting before it is validated.
+            vec![
+                Start(4),
+                PrimitiveApplied(4),
+                LlmTerminal(4),
+                EnterExtraction(4),
+                ExtractionStart(4),
+                LlmTerminal(4),
+                EnterExtraction(4),
+                ExtractionRejected(4),
+                LlmTerminal(4),
+                EnterExtraction(4),
+                ExtractionPassed(4),
+                BoundaryComplete(4),
+            ],
+            vec![
+                Start(5),
+                PrimitiveApplied(5),
+                Recoverable(5, 1),
+                Retry(5, 1),
+                Recoverable(5, 2),
+                Retry(5, 2),
+                Fatal(5),
+                Start(6),
+                PrimitiveApplied(6),
+                BudgetExhausted(6),
+                Start(7),
+                PrimitiveApplied(7),
+                TimeBudgetExceeded(7),
+                Start(8),
+                PrimitiveApplied(8),
+                TurnLimit(8),
+            ],
+            vec![
+                Start(9),
+                PrimitiveApplied(9),
+                ToolCalls(9, 1),
+                CancelNow(9),
+                CancellationObserved(9),
+                Start(10),
+                CancelNow(10),
+                CancellationObserved(10),
+            ],
+            vec![ForceCancelNoRun, Start(11), PrimitiveApplied(11)],
+        ]
+    }
+
+    /// Each snapshot field's non-default witness, by name: `turn_terminal`
+    /// takes both values, and `pending_op_refs` both wait policies, so a
+    /// projection that inverts or collapses the policy is observable. The
+    /// pattern names every field, so a field added to the snapshot must be
+    /// added here.
+    fn snapshot_field_witnesses(snapshot: &TurnStateSnapshot) -> [(&'static str, bool); 26] {
+        let TurnStateSnapshot {
+            active_run_id,
+            terminal_run_id,
+            loop_state,
+            turn_phase,
+            turn_terminal,
+            primitive_kind,
+            admitted_content_shape,
+            vision_enabled,
+            image_tool_results_enabled,
+            tool_calls_pending,
+            pending_op_refs,
+            barrier_operation_ids,
+            has_barrier_ops,
+            barrier_satisfied,
+            boundary_count,
+            cancel_after_boundary,
+            terminal_outcome,
+            terminal_cause_kind,
+            extraction_attempts,
+            max_extraction_retries,
+            extraction_active,
+            llm_retry_attempt,
+            llm_retry_max_retries,
+            llm_retry_selected_delay_ms,
+        } = snapshot;
+        let has_policy = |policy| pending_op_refs.iter().any(|op| op.wait_policy == policy);
+        [
+            ("active_run_id", active_run_id.is_some()),
+            ("terminal_run_id", terminal_run_id.is_some()),
+            (
+                "loop_state",
+                *loop_state != meerkat_core::LoopState::default(),
+            ),
+            ("turn_phase", *turn_phase != TurnPhase::Ready),
+            ("turn_terminal true", *turn_terminal),
+            ("turn_terminal false", !*turn_terminal),
+            ("primitive_kind", primitive_kind.is_some()),
+            ("admitted_content_shape", admitted_content_shape.is_some()),
+            ("vision_enabled", *vision_enabled),
+            ("image_tool_results_enabled", *image_tool_results_enabled),
+            ("tool_calls_pending", *tool_calls_pending > 0),
+            ("pending_op_refs Barrier", has_policy(WaitPolicy::Barrier)),
+            ("pending_op_refs Detached", has_policy(WaitPolicy::Detached)),
+            ("barrier_operation_ids", !barrier_operation_ids.is_empty()),
+            ("has_barrier_ops", *has_barrier_ops),
+            ("barrier_satisfied", *barrier_satisfied),
+            ("boundary_count", *boundary_count > 0),
+            ("cancel_after_boundary", *cancel_after_boundary),
+            ("terminal_outcome", terminal_outcome.is_some()),
+            ("terminal_cause_kind", terminal_cause_kind.is_some()),
+            ("extraction_attempts", *extraction_attempts > 0),
+            ("max_extraction_retries", *max_extraction_retries > 0),
+            ("extraction_active", *extraction_active),
+            ("llm_retry_attempt", *llm_retry_attempt > 0),
+            ("llm_retry_max_retries", *llm_retry_max_retries > 0),
+            (
+                "llm_retry_selected_delay_ms",
+                *llm_retry_selected_delay_ms > 0,
+            ),
+        ]
+    }
+
+    /// #24 differential oracle: the borrowed projection equals the copying
+    /// projection after every generated input of the walk, accepted or
+    /// refused, the walk observes every turn phase, and it gives every
+    /// snapshot field a non-default value at least once, so a field read
+    /// from the wrong source is observable.
+    #[test]
+    fn borrowed_projection_equals_copying_projection_on_every_turn_phase() {
+        let mut observed = Vec::new();
+        let mut witnessed = std::collections::BTreeMap::new();
+        let mut accepted = 0_usize;
+        for script in oracle_scripts() {
+            let handle = RuntimeTurnStateHandle::ephemeral();
+            let mut check = |step: Option<OracleStep>| {
+                let snapshot = handle.snapshot();
+                assert_eq!(snapshot, legacy_snapshot(&handle), "after {step:?}");
+                if !observed.contains(&snapshot.turn_phase) {
+                    observed.push(snapshot.turn_phase);
+                }
+                for (field, non_default) in snapshot_field_witnesses(&snapshot) {
+                    *witnessed.entry(field).or_insert(false) |= non_default;
+                }
+            };
+            check(None);
+            for step in script {
+                if apply_oracle_step(&handle, step).is_ok() {
+                    accepted += 1;
+                }
+                check(Some(step));
+            }
+        }
+        for phase in [
+            TurnPhase::Ready,
+            TurnPhase::ApplyingPrimitive,
+            TurnPhase::CallingLlm,
+            TurnPhase::WaitingForOps,
+            TurnPhase::DrainingBoundary,
+            TurnPhase::Extracting,
+            TurnPhase::ErrorRecovery,
+            TurnPhase::Cancelling,
+            TurnPhase::Completed,
+            TurnPhase::Failed,
+            TurnPhase::Cancelled,
+        ] {
+            assert!(
+                observed.contains(&phase),
+                "the walk never observed {phase:?}: {observed:?}"
+            );
+        }
+        let unmoved: Vec<_> = witnessed
+            .iter()
+            .filter(|(_, non_default)| !**non_default)
+            .map(|(field, _)| *field)
+            .collect();
+        assert!(
+            unmoved.is_empty(),
+            "the walk never gave these snapshot fields a non-default value: {unmoved:?}"
+        );
+        assert!(accepted >= 40, "only {accepted} inputs were accepted");
+    }
+
+    /// The owned classification keeps the copying one's verdicts, including
+    /// its fail-closed verdict for a state recovery refuses.
+    #[test]
+    fn owned_classification_matches_copying_classification_and_fails_closed() {
+        let handle = RuntimeTurnStateHandle::ephemeral();
+        let run_id = oracle_run(12);
+        start_running_conversation_turn(&handle, &run_id);
+        let live = handle.dsl.snapshot_state();
+        assert!(!legacy_classify_turn_terminal(&live));
+        assert!(!classify_turn_terminal(live.clone()));
+        let mut unrecoverable = live;
+        unrecoverable
+            .input_authority_bindings
+            .insert("orphan-input".into(), "orphan-binding".into());
+        assert!(
+            mm_dsl::MeerkatMachineAuthority::recover_from_state(unrecoverable.clone()).is_err(),
+            "the mutation must make the state unrecoverable"
+        );
+        assert!(legacy_classify_turn_terminal(&unrecoverable));
+        assert!(classify_turn_terminal(unrecoverable));
+    }
+
+    /// The typed turn input of one oracle step.
+    fn oracle_input(step: OracleStep) -> TurnExecutionInput {
+        match step {
+            OracleStep::Start(n) => TurnExecutionInput::StartConversationRun {
+                run_id: oracle_run(n),
+                primitive_kind: TurnPrimitiveKind::ConversationTurn,
+                admitted_content_shape: ContentShape::Conversation,
+                vision_enabled: n % 2 == 0,
+                image_tool_results_enabled: n % 3 == 0,
+                max_extraction_retries: 2,
+            },
+            OracleStep::ImmediateAppend(n) => TurnExecutionInput::StartImmediateAppend {
+                run_id: oracle_run(n),
+            },
+            OracleStep::PrimitiveApplied(n) => TurnExecutionInput::PrimitiveApplied {
+                run_id: oracle_run(n),
+            },
+            OracleStep::ToolCalls(n, count) => TurnExecutionInput::LlmReturnedToolCalls {
+                run_id: oracle_run(n),
+                tool_count: u32::try_from(count).unwrap(),
+            },
+            OracleStep::RegisterOps(n) => {
+                let (refs, barrier) = oracle_ops();
+                TurnExecutionInput::RegisterPendingOps {
+                    run_id: oracle_run(n),
+                    op_refs: refs.into_iter().collect(),
+                    barrier_operation_ids: barrier.into_iter().collect(),
+                    has_barrier_ops: true,
+                }
+            }
+            OracleStep::ToolsResolved(n) => TurnExecutionInput::ToolCallsResolved {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BarrierSatisfied(n) => TurnExecutionInput::OpsBarrierSatisfied {
+                run_id: oracle_run(n),
+                operation_ids: oracle_ops().1.into_iter().collect(),
+            },
+            OracleStep::BoundaryContinue(n) => TurnExecutionInput::BoundaryContinue {
+                run_id: oracle_run(n),
+            },
+            OracleStep::LlmTerminal(n) => TurnExecutionInput::LlmReturnedTerminal {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BoundaryComplete(n) => TurnExecutionInput::BoundaryComplete {
+                run_id: oracle_run(n),
+            },
+            OracleStep::EnterExtraction(n) => TurnExecutionInput::EnterExtraction {
+                run_id: oracle_run(n),
+                max_retries: 2,
+            },
+            OracleStep::ExtractionStart(n) => TurnExecutionInput::ExtractionStart {
+                run_id: oracle_run(n),
+            },
+            OracleStep::ExtractionRejected(n) => TurnExecutionInput::ExtractionValidationFailed {
+                run_id: oracle_run(n),
+                error: "schema mismatch".into(),
+            },
+            OracleStep::ExtractionPassed(n) => TurnExecutionInput::ExtractionValidationPassed {
+                run_id: oracle_run(n),
+            },
+            OracleStep::Recoverable(n, attempt) => TurnExecutionInput::RecoverableFailure {
+                run_id: oracle_run(n),
+                retry: retry_schedule(attempt),
+            },
+            OracleStep::Retry(n, attempt) => TurnExecutionInput::RetryRequested {
+                run_id: oracle_run(n),
+                retry_attempt: attempt,
+            },
+            OracleStep::Fatal(n) => TurnExecutionInput::FatalFailure {
+                run_id: oracle_run(n),
+                failure: failure_source(TurnFailureSourceKind::Llm, "fatal provider failure"),
+            },
+            OracleStep::CancelNow(n) => TurnExecutionInput::CancelNow {
+                run_id: oracle_run(n),
+            },
+            OracleStep::CancellationObserved(n) => TurnExecutionInput::CancellationObserved {
+                run_id: oracle_run(n),
+            },
+            OracleStep::CancelAfterBoundary(n) => TurnExecutionInput::CancelAfterBoundary {
+                run_id: oracle_run(n),
+            },
+            OracleStep::BudgetExhausted(n) => TurnExecutionInput::BudgetExhausted {
+                run_id: oracle_run(n),
+            },
+            OracleStep::TimeBudgetExceeded(n) => TurnExecutionInput::TimeBudgetExceeded {
+                run_id: oracle_run(n),
+            },
+            OracleStep::TurnLimit(n) => TurnExecutionInput::TurnLimitReached {
+                run_id: oracle_run(n),
+                turn_count: 4,
+                max_turns: 4,
+            },
+            OracleStep::ForceCancelNoRun => TurnExecutionInput::ForceCancelNoRun,
+        }
+    }
+
+    /// #24 P2: applying a typed input while observing the phase yields the
+    /// same effects and the same next phase as applying it and then reading
+    /// the projection, or the same refusal (its kind, context and reason, so
+    /// the Display text the agent embeds too), on every generated input of
+    /// the walk, and the phase read alone equals the projection's phase
+    /// before every input.
+    #[test]
+    fn observing_apply_matches_apply_then_read_on_every_input() {
+        let mut compared = 0_usize;
+        let mut refused = 0_usize;
+        for script in oracle_scripts() {
+            let observing = RuntimeTurnStateHandle::ephemeral();
+            let reading = RuntimeTurnStateHandle::ephemeral();
+            for step in script {
+                assert_eq!(
+                    observing.turn_phase(),
+                    reading.snapshot().turn_phase,
+                    "before {step:?}"
+                );
+                let observed = observing.apply_turn_input_observing_phase(oracle_input(step));
+                let read = reading
+                    .apply_turn_input(oracle_input(step))
+                    .map(|effects| (effects, reading.snapshot().turn_phase));
+                match (observed, read) {
+                    (Ok(observed), Ok(read)) => {
+                        assert_eq!(observed, read, "after {step:?}");
+                        compared += 1;
+                    }
+                    (Err(observed), Err(read)) => {
+                        assert_eq!(observed, read, "refusing {step:?}");
+                        assert_eq!(observed.to_string(), read.to_string(), "refusing {step:?}");
+                        refused += 1;
+                    }
+                    (observed, read) => {
+                        panic!("{step:?}: observing {observed:?}, reading {read:?}")
+                    }
+                }
+                assert_eq!(observing.snapshot(), reading.snapshot(), "after {step:?}");
+            }
+        }
+        assert!(compared >= 40, "only {compared} inputs were accepted");
+        assert!(refused >= 3, "only {refused} inputs were refused");
+    }
+
+    /// #24 N1: the projection runs under the authority lock and never
+    /// panics there. A malformed generated value still fails the snapshot,
+    /// after the lock is released, so the lock is not poisoned.
+    #[test]
+    fn malformed_turn_state_fails_the_snapshot_after_the_lock_is_released() {
+        let live = RuntimeTurnStateHandle::ephemeral();
+        for step in [
+            OracleStep::Start(13),
+            OracleStep::PrimitiveApplied(13),
+            OracleStep::ToolCalls(13, 3),
+            OracleStep::RegisterOps(13),
+        ] {
+            apply_oracle_step(&live, step).expect("the tool round is accepted");
+        }
+        let mut state = live.dsl.snapshot_state();
+        let detached = state
+            .pending_op_refs
+            .iter()
+            .find(|id| !state.barrier_operation_ids.iter().any(|b| b.0 == **id))
+            .cloned()
+            .expect("the round registers detached operations");
+        state.pending_op_refs.remove(&detached);
+        state.pending_op_refs.insert("not-an-operation-id".into());
+        let authority = Arc::new(std::sync::Mutex::new(
+            mm_dsl::MeerkatMachineAuthority::recover_from_state(state)
+                .expect("recovery does not parse operation ids"),
+        ));
+        let handle = RuntimeTurnStateHandle::new(Arc::new(HandleDslAuthority::from_shared(
+            Arc::clone(&authority),
+        )));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.snapshot()))
+            .expect_err("a malformed operation id must still fail the snapshot");
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("operation id projection must be well formed"),
+            "{message}"
+        );
+        assert!(
+            !authority.is_poisoned(),
+            "the projection panicked under the authority lock"
+        );
+    }
+
+    /// #24 P3: the borrowed scalar read equals the scalars of the copying
+    /// projection after every generated input of the walk, accepted or
+    /// refused, and the walk gives every scalar field a non-default value at
+    /// least once, so a field read from the wrong source is observable.
+    #[test]
+    fn borrowed_scalars_equal_copying_projection_scalars_on_every_input() {
+        let mut seen = [false; 6];
+        let mut compared = 0_usize;
+        for script in oracle_scripts() {
+            let handle = RuntimeTurnStateHandle::ephemeral();
+            let mut check = |step: Option<OracleStep>| {
+                let scalars = handle.scalars();
+                assert_eq!(
+                    scalars,
+                    TurnStateScalars::from_snapshot(&legacy_snapshot(&handle)),
+                    "after {step:?}"
+                );
+                seen[0] |= scalars.cancel_after_boundary;
+                seen[1] |= scalars.has_barrier_ops;
+                seen[2] |= scalars.extraction_active;
+                seen[3] |= scalars.terminal_outcome.is_some();
+                seen[4] |= scalars.terminal_cause_kind.is_some();
+                seen[5] |= scalars.extraction_attempts > 0;
+                compared += 1;
+            };
+            check(None);
+            for step in script {
+                let _ = apply_oracle_step(&handle, step);
+                check(Some(step));
+            }
+        }
+        assert_eq!(
+            seen, [true; 6],
+            "cancel_after_boundary, has_barrier_ops, extraction_active, terminal_outcome, \
+             terminal_cause_kind, extraction_attempts must each be non-default once"
+        );
+        assert!(compared >= 50, "only {compared} reads were compared");
     }
 }

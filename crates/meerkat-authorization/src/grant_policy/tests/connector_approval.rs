@@ -124,7 +124,7 @@ fn operate(
 
 fn every_operation(domains: Vec<ResourceDomain>) -> ExecutionRestrictions {
     ExecutionRestrictions {
-        resource_domains: ExactRestriction::exact(domains),
+        resource_domains: DomainRestriction::exact(domains),
         lifetime: LifetimeRestriction::window(100, 300),
         ..ExecutionRestrictions::unrestricted()
     }
@@ -139,7 +139,7 @@ fn exact_operations(extra: Option<ActionRef>) -> ExecutionRestrictions {
             })
             .chain(extra),
         ),
-        resource_domains: ExactRestriction::exact([domain("mcp-server/sentinel")]),
+        resource_domains: DomainRestriction::exact([domain("mcp-server/sentinel")]),
         lifetime: LifetimeRestriction::window(100, 300),
         ..ExecutionRestrictions::unrestricted()
     }
@@ -194,6 +194,46 @@ fn a_wildcard_operation_grant_approves_only_the_connector_its_domains_name() {
         assert!(
             is_denied(&verdict(&fixture, label, approved_a(), actual)),
             "{label}: a same-name connection bound to another account is refused"
+        );
+    }
+}
+
+/// An owner-scoped domain bound records no connector approval. It covers
+/// every namespace of the installation's owner, but it names no approval in
+/// the domain form and identifies no one installation for the action form,
+/// so a connection under it is missing evidence, never an approval adopted
+/// from the connection.
+#[test]
+fn an_owner_scoped_domain_bound_records_no_connector_approval() {
+    let fixture = Fixture::new();
+    let account_a = approval("aa");
+    let owner_scoped = |mut restrictions: ExecutionRestrictions| {
+        restrictions.resource_domains = DomainRestriction::owned_by([who("resource")]);
+        restrictions
+    };
+    for (label, restrictions, actual) in [
+        (
+            "owned-all-a",
+            owner_scoped(every_operation(vec![])),
+            &account_a,
+        ),
+        (
+            "owned-all-n",
+            owner_scoped(every_operation(vec![])),
+            &McpConnectorApproval::NoConnector,
+        ),
+        (
+            "owned-action-a",
+            owner_scoped(exact_operations(Some(mcp_connector_action(
+                "sentinel", &account_a,
+            )))),
+            &account_a,
+        ),
+    ] {
+        assert_eq!(
+            verdict(&fixture, label, restrictions, actual),
+            Err(meerkat_core::OperationAuthorizationError::Unavailable),
+            "{label}"
         );
     }
 }
@@ -353,7 +393,7 @@ fn retained_chains_are_checked_against_every_link_at_both_boundaries() {
     let fixture = Fixture::new();
     let (aa, bb) = (approval("aa"), approval("bb"));
     let bounded = |domains: Vec<ResourceDomain>| ExecutionRestrictions {
-        resource_domains: ExactRestriction::exact(domains),
+        resource_domains: DomainRestriction::exact(domains),
         lifetime: LifetimeRestriction::window(100, 300),
         ..ExecutionRestrictions::unrestricted()
     };

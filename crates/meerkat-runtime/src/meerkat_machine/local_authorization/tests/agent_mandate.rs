@@ -11,7 +11,9 @@ use meerkat_authorization::grants::LocalGrantAuthority;
 use meerkat_authorization::mcp_installation::{
     MCP_INSTALLATION_FEATURE, mcp_connector_action, mcp_connector_domain,
 };
-use meerkat_authorization_contracts::constraints::{ExactRestriction, LifetimeRestriction};
+use meerkat_authorization_contracts::constraints::{
+    DomainRestriction, ExactRestriction, LifetimeRestriction,
+};
 use meerkat_authorization_contracts::grant::GrantLineageRef;
 use meerkat_core::mcp_attachment::{ConfiguredMcpAttachmentAuthority, McpAttachmentRefusal};
 use meerkat_core::mcp_config::McpConnectorBinding;
@@ -106,7 +108,7 @@ struct WithoutPolicy {
 impl NativeWorkAuthorizationHost for WithoutPolicy {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -144,7 +146,7 @@ struct PerAgentHost {
 impl NativeWorkAuthorizationHost for PerAgentHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -254,7 +256,7 @@ impl Fixture {
                             mcp_connector_action(server, &McpConnectorApproval::NoConnector),
                         ]
                     })),
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         servers.iter().map(|server| server_domain(realm, server)),
                     ),
                     lifetime,
@@ -291,7 +293,7 @@ impl Fixture {
                                 .map(|approval| mcp_connector_action(server, approval)),
                         ),
                     ),
-                    resource_domains: ExactRestriction::exact([server_domain("alpha", server)]),
+                    resource_domains: DomainRestriction::exact([server_domain("alpha", server)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -314,7 +316,7 @@ impl Fixture {
                 who(agent),
                 None,
                 ExecutionRestrictions {
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         std::iter::once(server_domain("alpha", server)).chain(
                             approvals.iter().map(|approval| {
                                 mcp_connector_domain(&operator_of("alpha"), server, approval)
@@ -513,6 +515,73 @@ async fn the_generic_host_without_a_provider_refuses_configured_servers() {
     );
 }
 
+/// The configured provider is asked for the exact registration whose
+/// servers are staged: the registration current when the bindings are
+/// prepared and, after the session registers again, the new registration,
+/// which shares the session id but is not the ended one.
+#[tokio::test]
+async fn the_configured_provider_is_asked_for_the_exact_registration() {
+    type Asked = std::sync::Mutex<Vec<crate::meerkat_machine::RuntimeSessionRegistrationWitness>>;
+    let asked: Arc<Asked> = Arc::default();
+    let recorder = Arc::clone(&asked);
+    let (mut configuration, _, _) = super::configuration();
+    configuration.configured_mcp_attachment = Some(Arc::new(
+        move |registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
+              _agent: crate::meerkat_machine::SessionAgentBinding|
+              -> Option<Arc<dyn ConfiguredMcpAttachmentAuthority>> {
+            recorder.lock().expect("asked").push(registration.clone());
+            None
+        },
+    ));
+    let machine = MeerkatMachine::ephemeral()
+        .with_local_grant_authorization(configuration)
+        .expect("exclusive setup");
+    let session = SessionId::new();
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let first = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the first registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&first),
+        "the provider is asked for the registration whose servers are staged"
+    );
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("unregister");
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register again");
+    let second = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the second registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(first.session_id(), second.session_id(), "the same session");
+    assert_ne!(
+        first, second,
+        "a later registration of the same session is a different registration"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&second),
+        "the provider is asked for the new registration, never the ended one"
+    );
+}
+
 #[tokio::test]
 async fn the_installation_is_granted_per_selected_agent_before_any_input() {
     let fx = fixture();
@@ -708,6 +777,39 @@ async fn an_every_operation_grant_approves_only_the_connector_its_domains_name()
             authority.authorize_configured(&configured),
             Err(McpAttachmentRefusal::Denied),
             "a same-name descriptor with another binding"
+        );
+    }
+}
+
+/// An owner-scoped grant covers the installation's domain but records no
+/// connector approval: every configured descriptor of the server is
+/// unavailable (missing evidence), never admitted and never denied.
+#[tokio::test]
+async fn an_owner_scoped_grant_approves_no_connector() {
+    let fx = fixture();
+    let grant = fx
+        .grants
+        .issue_root(
+            &who("operator"),
+            EvidenceId::new("a-owned").expect("id"),
+            who("agent-a"),
+            None,
+            ExecutionRestrictions {
+                resource_domains: DomainRestriction::owned_by([operator_of("alpha")]),
+                ..ExecutionRestrictions::unrestricted()
+            },
+        )
+        .expect("issue");
+    let (_, witness, authority) = fx.session().await;
+    fx.select(&witness, "agent-a", grant).await.expect("select");
+    for configured in [
+        connector_server("sentinel", "account-a"),
+        server("sentinel"),
+    ] {
+        assert_eq!(
+            authority.authorize_configured(&configured),
+            Err(McpAttachmentRefusal::Unavailable),
+            "an owner bound records no approval"
         );
     }
 }
@@ -937,7 +1039,7 @@ struct MutatingPolicyHost {
 impl NativeWorkAuthorizationHost for MutatingPolicyHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -1020,5 +1122,176 @@ async fn a_grant_change_during_the_policy_decision_refuses_the_composite() {
     assert_eq!(
         authority.authorize_configured(&server("sentinel")),
         Err(McpAttachmentRefusal::Denied)
+    );
+}
+
+/// The host's installation decision, which here interferes with the grant
+/// owner before the per-agent grant is resolved (an owner change begun and
+/// held on another thread, or a poisoned grant publication) and then
+/// permits.
+struct InterferingInstallation {
+    pending: std::sync::Mutex<Option<GrantInterference>>,
+}
+
+enum GrantInterference {
+    HoldOwnerChange {
+        begin: std::sync::mpsc::SyncSender<()>,
+        held: std::sync::mpsc::Receiver<()>,
+    },
+    Poison(LocalAuthorizationPublication),
+}
+
+impl ConfiguredMcpAttachmentAuthority for InterferingInstallation {
+    fn authorize_configured(&self, _: &McpServerConfig) -> Result<(), McpAttachmentRefusal> {
+        match self.pending.lock().expect("slot").take() {
+            Some(GrantInterference::HoldOwnerChange { begin, held }) => {
+                begin.send(()).expect("ask for an owner change");
+                held.recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("the owner change is held");
+            }
+            Some(GrantInterference::Poison(publication)) => publication.poison(),
+            None => {}
+        }
+        Ok(())
+    }
+}
+
+struct InterferingInstallationHost {
+    grant: AgentInstallationGrant,
+    installation: Arc<InterferingInstallation>,
+}
+impl NativeWorkAuthorizationHost for InterferingInstallationHost {
+    fn configured_mcp_attachment_for_agent(
+        &self,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
+        agent: crate::meerkat_machine::SessionAgentBinding,
+    ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
+        self.grant.for_agent(
+            ConfiguredMcpConjuncts {
+                installation: Arc::clone(&self.installation)
+                    as Arc<dyn ConfiguredMcpAttachmentAuthority>,
+                policy: Some(Arc::new(PolicyRefuses("unpermitted"))),
+            },
+            agent,
+        )
+    }
+
+    fn authenticate_association(
+        &self,
+        _: &LogicalRuntimeId,
+        _: &Input,
+        _: &NativeIngressContext,
+        _: &InputAuthorityAssociation,
+    ) -> Result<(), crate::input_authority::NativeAdmissionError> {
+        Err(denied().into())
+    }
+
+    fn work_context(
+        &self,
+        _: &crate::input_authority::NativeWorkBatch,
+    ) -> Result<WorkAuthorizationContext, crate::input_authority::NativeWorkContextError> {
+        Err(crate::input_authority::NativeWorkContextError::MalformedAcceptedWork)
+    }
+}
+
+/// The grant owner's clock, failing on demand.
+struct SwitchClock(std::sync::atomic::AtomicBool);
+impl LocalAuthorizationClock for SwitchClock {
+    fn now(&self) -> Result<LocalAuthorizationTime, meerkat_authorization::clock::LocalClockError> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(meerkat_authorization::clock::LocalClockError::Unavailable);
+        }
+        Clock.now()
+    }
+}
+
+/// An owner change that publishes while the per-agent grant's lineage is
+/// read is a change during the decision: not current, as for one published
+/// after the grant was observed, never an unavailable grant owner. A fresh
+/// decision once the change completes permits. A failing grant owner clock
+/// or a poison at the same point stays unavailable.
+#[tokio::test]
+async fn a_grant_change_while_the_agent_grant_is_read_is_not_current() {
+    let publication = LocalAuthorizationPublication::new();
+    let clock = Arc::new(SwitchClock(std::sync::atomic::AtomicBool::new(false)));
+    let grants = Arc::new(
+        LocalGrantAuthority::new(
+            LocalGrantConfiguration {
+                root: who("operator"),
+                namespace: EvidenceId::new("installations").expect("id"),
+                generation: 1,
+            },
+            publication.clone(),
+            Arc::clone(&clock) as Arc<dyn LocalAuthorizationClock>,
+        )
+        .expect("grant owner"),
+    );
+    let installation = Arc::new(InterferingInstallation {
+        pending: std::sync::Mutex::new(None),
+    });
+    let grant =
+        AgentInstallationGrant::new(Arc::clone(&grants), Arc::new(Clock), operator_of("alpha"));
+    let host_installation = Arc::clone(&installation);
+    let machine = MeerkatMachine::ephemeral()
+        .install_native_work_authorization(|_| {
+            Arc::new(InterferingInstallationHost {
+                grant,
+                installation: host_installation,
+            })
+        })
+        .expect("exclusive setup");
+    let fx = Fixture { machine, grants };
+    let lineage = fx.issue("a-sentinel", "agent-a", &["sentinel"], "alpha");
+    let (_, witness, authority) = fx.session().await;
+    fx.select(&witness, "agent-a", lineage).await.expect("bind");
+
+    let (begin_tx, begin_rx) = std::sync::mpsc::sync_channel(1);
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let changer_publication = publication.clone();
+    let changer = std::thread::spawn(move || {
+        begin_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("asked to change an owner");
+        let change = changer_publication
+            .begin_owner_change()
+            .expect("an owner change in progress");
+        held_tx.send(()).expect("the change is held");
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("released by the test");
+        drop(change);
+    });
+    *installation.pending.lock().expect("slot") = Some(GrantInterference::HoldOwnerChange {
+        begin: begin_tx,
+        held: held_rx,
+    });
+    let during = authority.authorize_configured(&server("sentinel"));
+    release_tx.send(()).expect("release the owner change");
+    changer.join().expect("changer thread");
+    assert_eq!(
+        during,
+        Err(McpAttachmentRefusal::NotCurrent),
+        "a change published while the grant is read is not current, never unavailable"
+    );
+    assert_eq!(
+        authority.authorize_configured(&server("sentinel")),
+        Ok(()),
+        "a fresh decision once the change completes"
+    );
+
+    clock.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        authority.authorize_configured(&server("sentinel")),
+        Err(McpAttachmentRefusal::Unavailable),
+        "a failing grant owner clock stays unavailable"
+    );
+    clock.0.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    *installation.pending.lock().expect("slot") = Some(GrantInterference::Poison(publication));
+    assert_eq!(
+        authority.authorize_configured(&server("sentinel")),
+        Err(McpAttachmentRefusal::Unavailable),
+        "a poison stays unavailable"
     );
 }

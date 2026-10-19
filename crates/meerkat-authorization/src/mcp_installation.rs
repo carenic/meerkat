@@ -6,8 +6,8 @@
 //! first and conjoins this with its own installation and policy checks.
 
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, BoundMatch, ExecutionRestrictions, ResourceDomain, RestrictionDimension,
-    RestrictionFailure, SetBound,
+    ActionRef, BoundMatch, DomainBound, ExecutionRestrictions, ResourceDomain,
+    RestrictionDimension, RestrictionFailure, SetBound,
 };
 use meerkat_core::McpConnectorApproval;
 use meerkat_core::auth::PrincipalRef;
@@ -87,8 +87,10 @@ fn named_approvals(
         }
         _ => None,
     };
+    // Only exact domains name approvals: an owner-scoped or unrestricted
+    // domain bound names none, so its lineage reads as `Unrecorded`.
     let domains = match link.resource_domains.bound() {
-        SetBound::Exact(domains)
+        DomainBound::Exact(domains)
             if !resolved_only || link.resource_domains.unresolved_facts().is_empty() =>
         {
             Some(domains)
@@ -209,7 +211,9 @@ pub fn child_approvals_from(
 /// domains hold that installation domain and no other authority's domain of
 /// the same name. Otherwise the action form is ambiguous and binds nothing.
 fn action_binds(link: &ExecutionRestrictions, server: &str, installation: &ResourceDomain) -> bool {
-    let SetBound::Exact(domains) = link.resource_domains.bound() else {
+    // An owner-scoped or unrestricted domain bound identifies no one
+    // installation, so the action form is ambiguous there.
+    let DomainBound::Exact(domains) = link.resource_domains.bound() else {
         return false;
     };
     let mut approving = domains.iter().filter_map(|domain| {
@@ -477,8 +481,8 @@ fn unresolved_facts(
 mod tests {
     use super::*;
     use meerkat_authorization_contracts::constraints::{
-        AudienceRef, DelegationDepth, ExactRestriction, LifetimeRestriction, ProcessorRef,
-        UnresolvedConstraint,
+        AudienceRef, DelegationDepth, DomainRestriction, ExactRestriction, LifetimeRestriction,
+        ProcessorRef, UnresolvedConstraint,
     };
     use meerkat_core::{PrincipalKind, PrincipalRef, TrustDomainId};
 
@@ -516,7 +520,7 @@ mod tests {
                     mcp_connector_action(server, &McpConnectorApproval::NoConnector),
                 ]
             })),
-            resource_domains: ExactRestriction::exact([realm("alpha")]),
+            resource_domains: DomainRestriction::exact([realm("alpha")]),
             ..ExecutionRestrictions::unrestricted()
         }
     }
@@ -591,7 +595,7 @@ mod tests {
                 },
                 mcp_connector_action("sentinel", approval),
             ]),
-            resource_domains: ExactRestriction::exact([realm("alpha")]),
+            resource_domains: DomainRestriction::exact([realm("alpha")]),
             ..ExecutionRestrictions::unrestricted()
         };
         let installing = |approval: &McpConnectorApproval| {
@@ -626,7 +630,7 @@ mod tests {
                 feature: MCP_INSTALLATION_FEATURE.to_owned(),
                 action: "sentinel".to_owned(),
             }]),
-            resource_domains: ExactRestriction::exact([realm("alpha")]),
+            resource_domains: DomainRestriction::exact([realm("alpha")]),
             ..ExecutionRestrictions::unrestricted()
         };
         for approval in [&McpConnectorApproval::NoConnector, &account_a] {
@@ -662,7 +666,7 @@ mod tests {
             McpInstallationRef::new(realm("alpha"), "sentinel", approval).expect("installation")
         };
         let every_operation = |domains: Vec<ResourceDomain>| ExecutionRestrictions {
-            resource_domains: ExactRestriction::exact(domains),
+            resource_domains: DomainRestriction::exact(domains),
             ..ExecutionRestrictions::unrestricted()
         };
         let unapproved = every_operation(vec![realm("alpha")]);
@@ -899,7 +903,7 @@ mod tests {
             action: "sentinel".to_owned(),
         };
         let by_domain = |approval: &McpConnectorApproval| ExecutionRestrictions {
-            resource_domains: ExactRestriction::exact([
+            resource_domains: DomainRestriction::exact([
                 realm("alpha"),
                 mcp_connector_domain(&who("realm-config"), "sentinel", approval),
             ]),
@@ -911,7 +915,7 @@ mod tests {
                 installation.clone(),
                 mcp_connector_action("sentinel", approval),
             ]),
-            resource_domains: ExactRestriction::exact([realm("alpha")]),
+            resource_domains: DomainRestriction::exact([realm("alpha")]),
             ..ExecutionRestrictions::unrestricted()
         };
         let issue_root = |id: &str, restrictions| {
@@ -942,7 +946,7 @@ mod tests {
             "parent A by domain, child B by action"
         );
         let narrowed = ExecutionRestrictions {
-            resource_domains: ExactRestriction::exact([realm("alpha")]),
+            resource_domains: DomainRestriction::exact([realm("alpha")]),
             ..by_action(&account_b)
         };
         assert_eq!(
@@ -955,7 +959,7 @@ mod tests {
         let action_a = issue_root(
             "root-action-a",
             ExecutionRestrictions {
-                resource_domains: ExactRestriction::unrestricted(),
+                resource_domains: DomainRestriction::unrestricted(),
                 ..by_action(&account_a)
             },
         );
@@ -1004,7 +1008,7 @@ mod tests {
                 EvidenceId::new("middle-removed").expect("id"),
                 who("agent-m"),
                 ExecutionRestrictions {
-                    resource_domains: ExactRestriction::exact([realm("alpha")]),
+                    resource_domains: DomainRestriction::exact([realm("alpha")]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -1097,7 +1101,7 @@ mod tests {
                 &[
                     by_domain(&account_a),
                     ExecutionRestrictions {
-                        resource_domains: ExactRestriction::exact([realm("alpha")]),
+                        resource_domains: DomainRestriction::exact([realm("alpha")]),
                         ..ExecutionRestrictions::unrestricted()
                     },
                     by_action(&account_a),
@@ -1162,7 +1166,7 @@ mod tests {
                 who("agent"),
                 None,
                 ExecutionRestrictions {
-                    resource_domains: ExactRestriction::exact([
+                    resource_domains: DomainRestriction::exact([
                         installation_of("owner-a"),
                         mcp_connector_domain(&who("owner-a"), "sentinel", &aa),
                         installation_of("owner-b"),
@@ -1183,7 +1187,7 @@ mod tests {
                     None,
                     ExecutionRestrictions {
                         actions: ExactRestriction::exact([mcp_connector_action("sentinel", &aa)]),
-                        resource_domains: ExactRestriction::exact([
+                        resource_domains: DomainRestriction::exact([
                             installation_of("owner-a"),
                             mcp_connector_domain(&who("owner-a"), "sentinel", &aa),
                             installation_of("owner-b"),
@@ -1236,7 +1240,7 @@ mod tests {
                         },
                         mcp_connector_action("sentinel", &aa),
                     ]),
-                    resource_domains: ExactRestriction::exact([
+                    resource_domains: DomainRestriction::exact([
                         installation_of("owner-a"),
                         mcp_connector_domain(&who("owner-a"), "sentinel", &aa),
                     ]),

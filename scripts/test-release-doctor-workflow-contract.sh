@@ -37,9 +37,11 @@ BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gat
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+WINDOWS_PASS="PASS Release workflow cross-compiles Windows binaries on Linux, verifies them on the pinned windows-2025-vs2026 runner, and gates on both"
+WINDOWS_FAIL="FAIL Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on the pinned windows-2025-vs2026 runner (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job or semver readiness run restores a cache on any event, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
 STANDALONE_PASS="PASS Rust registry publication waits for the published crates' standalone tests at the release commit"
 STANDALONE_FAIL="FAIL Rust registry publication must need release_standalone_gate, which runs scripts/release-require-standalone-green on the release commit"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or CI installs sccache through sccache-action or without a pinned sha256"
@@ -431,6 +433,25 @@ elif name == "prebuild-web-unverified":
     if match is None:
         raise SystemExit(f"fixture `{name}` expects the Web SDK verification step")
     text = text[: match.start()] + text[match.end() :]
+elif name == "prebuild-any-backend":
+    # The request no longer checks the backend, so a GitHub-hosted prebuild
+    # can race a BuildBuddy tag run (v0.9.3).
+    replace_once(
+        '          if [[ "${RELEASE_BACKEND}" != "${TAG_RUN_BACKEND}" ]]; then\n'
+        '            echo "A release prebuild builds with the backend its tag run selects (${TAG_RUN_BACKEND}), '
+        'got release_backend=${RELEASE_BACKEND}: dispatch it with make release-prebuild or '
+        'release_backend=${TAG_RUN_BACKEND}." >&2\n'
+        '            exit 1\n'
+        '          fi\n',
+        "",
+    )
+elif name == "prebuild-backend-fixed":
+    # The request pins BuildBuddy instead of the tag run's own selection.
+    replace_once(
+        "          TAG_RUN_BACKEND: ${{ github.actor == 'lukacf' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || "
+        "vars.MEERKAT_RELEASE_BUILDBUDDY == '1') && 'buildbuddy' || 'github-hosted' }}\n",
+        "          TAG_RUN_BACKEND: buildbuddy\n",
+    )
 elif name == "prebuild-gate-renamed":
     replace_once("    name: Release prebuild gate\n", "    name: Prebuild complete\n")
 elif name == "prebuild-lookup-if-reflowed":
@@ -636,6 +657,9 @@ elif name == "reusable-on-dispatch":
         "    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
         "    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
     )
+elif name == "windows-verify-moving-image":
+    # The verify job back on the label whose image GitHub moves.
+    replace_once("    runs-on: windows-2025-vs2026\n", "    runs-on: windows-latest\n")
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -791,8 +815,29 @@ elif name == "semver-readiness-dispatch-save":
     # The pre-review semver measurement saved its rust-cache on a dispatch.
     replace_once(
         ".github/workflows/release-semver-readiness.yml",
-        "          save-if: ${{ github.event_name == 'push' }}\n",
-        "",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache Cargo\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          cache-bin: \"false\"\n\n      - name: Install cargo-semver-checks\n",
+    )
+elif name == "semver-gate-cache":
+    # The pre-0.9.4 semver gate restored a rust-cache on its dispatch
+    # measurement, whose target directory the build never used.
+    replace_once(
+        ".github/workflows/release.yml",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache cargo\n        if: ${{ github.event_name == 'workflow_dispatch' }}\n"
+        "        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n          cache-bin: \"false\"\n\n"
+        "      - name: Install cargo-semver-checks\n",
+    )
+elif name == "semver-readiness-restore":
+    # A restore-only rust-cache back in the readiness measurement: it saves
+    # on no run, and its build never reads a target cache.
+    replace_once(
+        ".github/workflows/release-semver-readiness.yml",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache Cargo\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          save-if: \"false\"\n          cache-bin: \"false\"\n\n      - name: Install cargo-semver-checks\n",
     )
 elif name == "ci-dispatch-save":
     # A CI lane that saves its rust-cache on a dispatch.
@@ -1050,6 +1095,12 @@ expect_fail_named prebuild-critical-full-gate "${TEST_ROOT}/prebuild-critical-fu
 mutate prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml"
 expect_fail_named prebuild-web-ungated "${TEST_ROOT}/prebuild-web-ungated.yml" \
   "job \`publish_web_sdk\` publishes on a tag push with a prebuild found and \`release_validate_gate\` failed" prebuild
+mutate prebuild-any-backend "${TEST_ROOT}/prebuild-any-backend.yml"
+expect_fail_named prebuild-any-backend "${TEST_ROOT}/prebuild-any-backend.yml" \
+  "accepts a prebuild by lukacf with release_backend=github-hosted (MEERKAT_RELEASE_BUILDBUDDY true), whose tag run builds on buildbuddy" prebuild
+mutate prebuild-backend-fixed "${TEST_ROOT}/prebuild-backend-fixed.yml"
+expect_fail_named prebuild-backend-fixed "${TEST_ROOT}/prebuild-backend-fixed.yml" \
+  "refuses a prebuild by lukacf with release_backend=github-hosted (MEERKAT_RELEASE_BUILDBUDDY unset), whose tag run builds on github-hosted" prebuild
 mutate prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml"
 expect_fail_named prebuild-gate-renamed "${TEST_ROOT}/prebuild-gate-renamed.yml" \
   "does not require the \`Prebuild complete\` job" prebuild
@@ -1155,6 +1206,12 @@ expect_tree_fail_named sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches
+mutate_tree semver-gate-cache "${TEST_ROOT}/semver-gate-cache"
+expect_tree_fail_named semver-gate-cache "${TEST_ROOT}/semver-gate-cache" \
+  "job \`release_semver_gate\` restores \`v0-rust-release_semver_gate\` on a dispatch; a release job restores no cache" release-caches
+mutate_tree semver-readiness-restore "${TEST_ROOT}/semver-readiness-restore"
+expect_tree_fail_named semver-readiness-restore "${TEST_ROOT}/semver-readiness-restore" \
+  "release-semver-readiness.yml job \`semver\` restores \`v0-rust-semver\` on a push run; the semver measurement restores no cache" release-caches
 mutate_tree ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save"
 expect_tree_fail_named ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save" \
   "ci.yml job \`fmt-governance\` saves a cache on a workflow_dispatch run" release-caches
@@ -1187,7 +1244,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS" "$STANDALONE_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$WINDOWS_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS" "$STANDALONE_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -1236,6 +1293,13 @@ run_doctor "${TEST_ROOT}/doctor-trailing.yml" "${TEST_ROOT}/doctor-trailing.log"
 if ! grep -Fq "$TRAILING_FAIL" "${TEST_ROOT}/doctor-trailing.log"; then
   fail "doctor does not report \`${TRAILING_FAIL}\` for a workflow whose critical assets wait for the trailing lanes" \
     "$(cat "${TEST_ROOT}/doctor-trailing.log")"
+fi
+
+mutate windows-verify-moving-image "${TEST_ROOT}/doctor-windows.yml"
+run_doctor "${TEST_ROOT}/doctor-windows.yml" "${TEST_ROOT}/doctor-windows.log"
+if ! grep -Fxq "$WINDOWS_FAIL" "${TEST_ROOT}/doctor-windows.log"; then
+  fail "doctor does not report \`${WINDOWS_FAIL}\` for a workflow that verifies the Windows binaries on windows-latest" \
+    "$(cat "${TEST_ROOT}/doctor-windows.log")"
 fi
 
 mutate cache-xwin-dispatch-save "${TEST_ROOT}/doctor-caches.yml"

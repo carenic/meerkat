@@ -234,7 +234,7 @@ impl Fixture {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions,
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         servers.iter().map(|name| domain(&format!("mcp-{name}"))),
                     ),
                     lifetime,
@@ -553,7 +553,7 @@ fn catalog_controls_resolve_the_targeted_base() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action("catalog-read")]),
-                    resource_domains: ExactRestriction::exact([domain(domain_name)]),
+                    resource_domains: DomainRestriction::exact([domain(domain_name)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -625,7 +625,7 @@ fn a_two_link_catalog_base_covers_the_controls_through_every_link() {
     let policy = fixture.mcp_policy();
     let catalog_read = |domains: &[&str]| ExecutionRestrictions {
         actions: ExactRestriction::exact([action("catalog-read")]),
-        resource_domains: ExactRestriction::exact(domains.iter().map(|name| domain(name))),
+        resource_domains: DomainRestriction::exact(domains.iter().map(|name| domain(name))),
         ..ExecutionRestrictions::unrestricted()
     };
     let root = fixture
@@ -837,7 +837,7 @@ fn a_bundle_operation_resolves_only_its_own_exact_lineage() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action(operation)]),
-                    resource_domains: ExactRestriction::exact([domain("bundle-mail")]),
+                    resource_domains: DomainRestriction::exact([domain("bundle-mail")]),
                     lifetime,
                     ..ExecutionRestrictions::unrestricted()
                 },
@@ -1120,7 +1120,7 @@ fn peer_and_memory_operations_resolve_only_their_own_exact_lineage() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action(operation)]),
-                    resource_domains: ExactRestriction::exact([domain(namespace)]),
+                    resource_domains: DomainRestriction::exact([domain(namespace)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )

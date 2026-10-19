@@ -25,12 +25,16 @@
 //! - the session's canonical destination ([`destination`]) and the actual
 //!   pinned controller ([`controller::StockControllerPin`]).
 //!
-//! A CLI prompt reaches the governed runtime only through
-//! [`StockGovernance::bind_prompt`], and a host-authenticated caller's input
-//! only through [`StockGovernance::bind_caller_prompt`]: the session is bound
-//! to its destination, the original is authenticated and recorded, and the
-//! final input is bound to it with [`bind_scoped_original`]. Every failure
-//! there is a typed local refusal before the input is submitted.
+//! A prompt of the local operator (from the CLI or a governed JSONL
+//! connection) reaches the governed runtime only through
+//! [`StockGovernance::bind_prompt`], the outcome of an administrative
+//! command the operator's own process reports only through
+//! [`StockGovernance::bind_host_outcome`], with the stock ingress itself as
+//! its requester, and a host-authenticated caller's input only through
+//! [`StockGovernance::bind_caller_prompt`]: the session is bound to its
+//! destination, the original is authenticated and recorded, and the final
+//! input is bound to it with [`bind_scoped_original`]. Every failure there
+//! is a typed local refusal before the input is submitted.
 //!
 //! Bounded checkpoint: the originals ledger is process memory and the stock
 //! composition offers no retained-work resume. Work admitted by an earlier
@@ -67,14 +71,14 @@ use meerkat_authorization_contracts::protocol::ContractRequirements;
 use meerkat_authorization_contracts::resource::ResourceRef;
 use meerkat_authorization_contracts::work_association::{
     GrantLineageRef, InputAuthorityAssociation, InputAuthorityAssociationCandidate,
-    OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
+    NativeWorkTarget, OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
 };
 use meerkat_core::connection::RealmId;
 use meerkat_core::{
-    ControllerModelClient, OperationAuthorizationError, OperationRefusalKind, OperationRefused,
-    PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
+    ControllerModelClient, ControllerModelSelection, OperationAuthorizationError,
+    OperationRefusalKind, OperationRefused, PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
 };
-use meerkat_runtime::input::Input;
+use meerkat_runtime::input::{ExternalEventInput, Input, InputDurability, InputOrigin};
 use meerkat_runtime::meerkat_machine::{
     AuthenticatedOriginal, AuthenticatedOriginalSource, ScopedInvocation, bind_scoped_original,
 };
@@ -174,6 +178,16 @@ impl StockPrincipals {
             ingress_actor: principal(PrincipalKind::RuntimeHost, "rkat-cli".to_string())?,
             executor: principal(PrincipalKind::PersonalAgent, "rkat-agent".to_string())?,
         })
+    }
+
+    /// The composition's ingress namespace: the stock ingress's
+    /// `cli-prompts` domain, in which binding records every original and
+    /// admission resolves it.
+    fn ingress_domain(&self) -> ResourceDomain {
+        ResourceDomain {
+            authority: self.ingress_actor.clone(),
+            namespace: PROMPT_NAMESPACE.into(),
+        }
     }
 }
 
@@ -669,13 +683,6 @@ impl StockGovernance {
         Arc::clone(&self.ledger) as Arc<dyn AuthenticatedOriginalSource>
     }
 
-    fn ingress_domain(&self) -> ResourceDomain {
-        ResourceDomain {
-            authority: self.principals.ingress_actor.clone(),
-            namespace: PROMPT_NAMESPACE.into(),
-        }
-    }
-
     /// The realm machine's composition over the restored grant owner, or why
     /// it is unavailable. Called once, while the realm opens.
     pub(crate) async fn composition(
@@ -723,7 +730,7 @@ impl StockGovernance {
         }
         Ok(meerkat_runtime::meerkat_machine::ScopedGrantComposition {
             grants,
-            ingress_domain: self.ingress_domain(),
+            ingress_domain: self.principals.ingress_domain(),
             originals: self.originals(),
             invocation: ScopedInvocation::from_policy(Arc::clone(&policy)),
             operation_owner: policy,
@@ -731,17 +738,28 @@ impl StockGovernance {
         })
     }
 
-    /// Bind one CLI prompt of the local operator for `session_id` to an
+    /// Bind one prompt of the local operator (the CLI's, or a governed JSONL
+    /// connection's, [`Self::bind_jsonl_input`]) for `session_id` to an
     /// authenticated original on the realm's machine `machine`, with the
-    /// session's actual pinned controller `controller`. The session is first
-    /// bound to its canonical destination. The returned input is submitted
-    /// through the ordinary runtime accept, and the returned candidate
-    /// original is then admitted ([`PendingOriginal::admit`]) once the
-    /// runtime accepted that exact input; dropping it withdraws the
-    /// candidate. Every refusal here is local and typed, before any
-    /// submission. A host-authenticated composition refuses it
-    /// ([`StockGovernanceError::RequesterUnsupported`]): its operator is no
-    /// requester.
+    /// session's actual pinned controller `controller`. The original names
+    /// the operator as its requester, authenticated by this process, under
+    /// the prompt labels: occurrence `prompt-<event>`, root event
+    /// `prompt-events` and idempotency key `rkat-prompt-<event>`. The
+    /// session is first bound to its canonical destination. The returned
+    /// input is submitted through the ordinary runtime accept, and the
+    /// returned candidate original is then admitted
+    /// ([`PendingOriginal::admit`]) once the runtime accepted that exact
+    /// input; dropping it withdraws the candidate. Each call is a new
+    /// occurrence: an uncertain delivery is retried by resubmitting the exact
+    /// input returned here, never by binding again.
+    ///
+    /// Every refusal here is local and typed, before anything is written.
+    /// Any input but a prompt is refused
+    /// ([`StockGovernanceError::RequesterUnsupported`]): the operator is the
+    /// requester only of a prompt, and an administrative outcome the
+    /// operator's own process reports binds with [`Self::bind_host_outcome`].
+    /// A host-authenticated composition refuses every input here: its
+    /// operator is no requester.
     pub async fn bind_prompt(
         &self,
         machine: &MeerkatMachine,
@@ -755,26 +773,119 @@ impl StockGovernance {
                     .to_string(),
             ));
         }
+        if !matches!(input, Input::Prompt(_)) {
+            return Err(StockGovernanceError::RequesterUnsupported(
+                "the local operator is the requester only of a prompt; an administrative \
+                 outcome its process reports binds with bind_host_outcome"
+                    .to_string(),
+            ));
+        }
         self.bind_original(machine, session_id, input, controller, Requesting::Operator)
             .await
+    }
+
+    /// Bind one external event through which the local operator's own
+    /// process reports the outcome of an administrative command, for
+    /// `session_id`, to an authenticated original on the realm's machine
+    /// `machine`, with the session's actual pinned controller `controller`.
+    ///
+    /// The original's requester is this composition's stock ingress itself
+    /// ([`StockPrincipals::ingress_actor`], a runtime host), never the
+    /// operator: no person requested this work, and it is not the operator's
+    /// consent. It runs under the operator's authority, the same
+    /// grant-lineage mandate as an operator prompt, at the operator's
+    /// canonical session destination and with no represented subject, so it
+    /// widens nothing. The original is authenticated by this process's own
+    /// observation (evidence namespace `host-outcome-authentication`) under
+    /// the host labels: occurrence `host-outcome-<event>`, root event
+    /// `host-outcome-events` and idempotency key
+    /// `rkat-host-outcome-<event>`, in the composition's `cli-prompts`
+    /// ingress namespace. The review and consent of its operations state
+    /// that requester, and its operations are reviewed under the operator's
+    /// review tiers, the same as an operator prompt's. A turn's identity
+    /// includes its requester, so an outcome never shares a turn with a
+    /// queued operator prompt: each outcome runs its own turn.
+    ///
+    /// The event carries only the outcome that process retained, nothing
+    /// from another source. The stock rules cannot verify that the command
+    /// ran: the event's content is attributed to the ingress, never
+    /// asserted. Its origin must be [`InputOrigin::External`] and its
+    /// durability [`InputDurability::Durable`]. Any other origin is refused
+    /// ([`StockGovernanceError::RequesterUnsupported`]), the runtime's own
+    /// system origin included, and so is any other durability: the runtime
+    /// refuses a derived external event only at its accept, after this
+    /// binding's writes, and an ephemeral one may be lost while the outcome
+    /// it reports stands. A host-authenticated composition is refused too:
+    /// it admits its ingress as no requester. Every refusal here is local
+    /// and typed, before anything is written.
+    ///
+    /// As for a prompt, the returned input is submitted through the ordinary
+    /// runtime accept and the returned candidate original then admitted
+    /// ([`PendingOriginal::admit`]) once the runtime accepted that exact
+    /// input; dropping it withdraws the candidate. Each call is a new
+    /// occurrence: an uncertain delivery is retried by resubmitting the exact
+    /// input returned here, never by binding again.
+    ///
+    /// For example, a host whose setup flow finalizes a reviewed connector
+    /// installation ([`finalize::ReviewedConnectorFinalization`]) and then
+    /// tells the session's agent the outcome builds a durable
+    /// [`ExternalEventInput`] from that retained outcome, of origin
+    /// `InputOrigin::External { source_name: "connector-finalization" }`,
+    /// and binds it here, while the operator's own prompts in the same
+    /// session keep binding with [`Self::bind_prompt`].
+    pub async fn bind_host_outcome(
+        &self,
+        machine: &MeerkatMachine,
+        session_id: &SessionId,
+        event: ExternalEventInput,
+        controller: ControllerModelClient,
+    ) -> Result<(Input, PendingOriginal), StockGovernanceError> {
+        if !matches!(self.posture, StockCallerPosture::LocalOperator) {
+            return Err(StockGovernanceError::RequesterUnsupported(
+                "a host-authenticated composition admits its ingress as no requester".to_string(),
+            ));
+        }
+        // Exactly an external event source: every other origin names another
+        // requester, and the runtime's own system origin may be derived work.
+        if !matches!(event.header.source, InputOrigin::External { .. }) {
+            return Err(StockGovernanceError::RequesterUnsupported(
+                "an administrative outcome binds only as an event of external origin".to_string(),
+            ));
+        }
+        // Exactly a durable event: the runtime refuses a derived external
+        // event only at its accept, after this binding's writes, and an
+        // ephemeral one may be lost while the outcome it reports stands.
+        if !matches!(event.header.durability, InputDurability::Durable) {
+            return Err(StockGovernanceError::RequesterUnsupported(
+                "an administrative outcome binds only as a durable event".to_string(),
+            ));
+        }
+        self.bind_original(
+            machine,
+            session_id,
+            Input::ExternalEvent(event),
+            controller,
+            Requesting::Ingress,
+        )
+        .await
     }
 
     /// Bind one input of `caller`, a caller the trusted host authenticated,
     /// for `session_id`, as [`Self::bind_prompt`] binds an operator prompt:
     /// the session (owned by the operator) is bound to its canonical
     /// destination and the original, authenticated as the host recorded, is
-    /// the caller's. The stock requester rule (never the operator, otherwise
-    /// the host's exact-target decision) is asked before the session's
-    /// binding changes, and the binding commits only while that decision is
-    /// still current, held current through the commit
-    /// ([`Self::bind_caller_session`]); native admission and every operation
+    /// the caller's. The stock requester rule (never the operator or the
+    /// stock ingress, otherwise the host's exact-target decision) is asked
+    /// before the session's binding changes, and the binding commits only
+    /// while that decision is still current, held current through the commit
+    /// (`Self::bind_caller_session`); native admission and every operation
     /// ask again. A refused caller
     /// ([`StockGovernanceError::CallerNotAdmitted`]: Denied for the operator
-    /// named as a caller, otherwise the host's Denied verdict or
-    /// unavailability) leaves the session's binding, and the disclosure of
-    /// its earlier results, unchanged. The local-operator composition
-    /// refuses it ([`StockGovernanceError::RequesterUnsupported`]): it admits
-    /// no caller.
+    /// or the stock ingress named as a caller, otherwise the host's Denied
+    /// verdict or unavailability) leaves the session's binding, and the
+    /// disclosure of its earlier results, unchanged. The local-operator
+    /// composition refuses it ([`StockGovernanceError::RequesterUnsupported`]):
+    /// it admits no caller.
     pub async fn bind_caller_prompt(
         &self,
         machine: &MeerkatMachine,
@@ -812,7 +923,7 @@ impl StockGovernance {
             .prompt_selection()
             .ok_or(StockGovernanceError::GrantsUnavailable)?;
         let destination = match requesting {
-            Requesting::Operator => {
+            Requesting::Operator | Requesting::Ingress => {
                 destination::bind_stock_session(machine, &self.principals.operator, session_id)
                     .await
                     .map_err(|error| StockGovernanceError::Destination(error.to_string()))?
@@ -822,75 +933,40 @@ impl StockGovernance {
                     .await?
             }
         };
-        let event = uuid::Uuid::now_v7();
-        let id = |value: String| {
-            EvidenceId::new(value).map_err(|error| StockGovernanceError::Binding(error.to_string()))
-        };
-        let occurrence = id(format!("prompt-{event}"))?;
-        let namespace = QualifiedIngressNamespace {
-            realm: self.realm.clone(),
-            ingress: self.ingress_domain(),
-            occurrence_scope: occurrence.clone(),
-        };
-        let (requester, authentication) = match requesting {
-            Requesting::Operator => (
-                self.principals.operator.clone(),
-                self.evidence("operator-authentication", process_id(), event)?,
-            ),
-            Requesting::Caller(caller) => {
-                (caller.requester().clone(), caller.authentication().clone())
-            }
-        };
-        let root_event = self.evidence("prompt-events", event.to_string(), event)?;
-        let original = OriginalWorkRef {
-            authority: self.principals.ingress_actor.clone(),
-            work: occurrence.clone(),
-        };
+        let claims = StockOriginalClaims::new(
+            &self.principals,
+            &self.realm,
+            &requesting,
+            destination.target(),
+            authority_basis.clone(),
+            controller_grant,
+            controller.selection().clone(),
+            uuid::Uuid::now_v7(),
+        )?;
         let pending = self
             .ledger
             .record_candidate(
-                &namespace,
-                &requester,
+                &claims.namespace,
+                &claims.requester,
                 AuthenticatedOriginal {
-                    original_work: original.clone(),
-                    occurrence_scope: occurrence,
-                    original_authentication: authentication.clone(),
-                    root_event: root_event.clone(),
+                    original_work: claims.original.clone(),
+                    occurrence_scope: claims.namespace.occurrence_scope.clone(),
+                    original_authentication: claims.authentication.clone(),
+                    root_event: claims.root_event.clone(),
                     contributing_work: Vec::new(),
                     target: destination.target().clone(),
-                    authority_basis: authority_basis.clone(),
+                    authority_basis,
                 },
             )
             .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
-        let association = InputAuthorityAssociation::new(InputAuthorityAssociationCandidate {
-            requester: requester.clone(),
-            ingress_actor: self.principals.ingress_actor.clone(),
-            represented_subject: None,
-            original_authentication: authentication.clone(),
-            logical_executor: self.principals.executor.clone(),
-            target: destination.target().clone(),
-            original_work: original,
-            root_event,
-            contributing_work: Vec::new(),
-            authority_basis,
-            controller_grant_lineage: vec![controller_grant],
-            controller_model: Some(controller.selection().clone()),
-            // The grants and current policy narrow; the claims do not widen.
-            controller_ceiling: ExecutionRestrictions::unrestricted(),
-            admitted_ceiling: ExecutionRestrictions::unrestricted(),
-            source_observations: Vec::new(),
-            ingress_namespace: namespace,
-            contract: ContractRequirements::local_governed_v1(),
-        })
-        .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
         let input = bind_scoped_original(
             input,
-            association,
-            IdempotencyKey::new(format!("rkat-prompt-{event}")),
-            requester,
+            claims.association,
+            IdempotencyKey::new(claims.key),
+            claims.requester,
             self.principals.ingress_actor.clone(),
             self.realm.clone(),
-            authentication,
+            claims.authentication,
             controller,
         )
         .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
@@ -899,12 +975,12 @@ impl StockGovernance {
 
     /// Bind `session_id` to its canonical destination for an input of
     /// `caller`, only while the stock requester rule admits that exact caller
-    /// there ([`policy::admit_stock_requester`]: never the operator,
-    /// otherwise the trusted host's decision for the caller, the realm's
-    /// executor, the session's canonical owner and the session). The rule is
-    /// observed under this composition's publication (to which the host
-    /// joins its access facts) and a refusal returns typed before any
-    /// binding. The binding then commits only within that observation: at
+    /// there ([`policy::admit_stock_requester`]: never the operator or the
+    /// stock ingress, otherwise the trusted host's decision for the caller,
+    /// the realm's executor, the session's canonical owner and the session).
+    /// The rule is observed under this composition's publication (to which
+    /// the host joins its access facts) and a refusal returns typed before
+    /// any binding. The binding then commits only within that observation: at
     /// the commit, with the session's machine authority held
     /// ([`destination::bind_stock_session_within`]), the observation must
     /// still be current, and it stays current through the commit because
@@ -930,6 +1006,7 @@ impl StockGovernance {
                 policy::admit_stock_requester(
                     &self.posture,
                     &self.principals.operator,
+                    &self.principals.ingress_actor,
                     &self.principals.executor,
                     caller.requester(),
                     Some(caller.authentication()),
@@ -941,7 +1018,7 @@ impl StockGovernance {
             // login's own deadline has not passed, even before its host
             // retires it.
             let (stamp, login) = match observed {
-                Ok((Ok(login), stamp)) => (stamp, login),
+                Ok((Ok((_, login)), stamp)) => (stamp, login),
                 Ok((Err(refusal), _)) => {
                     return Err(StockGovernanceError::CallerNotAdmitted(refusal));
                 }
@@ -1010,22 +1087,147 @@ impl StockGovernance {
         resource_id: String,
         event: uuid::Uuid,
     ) -> Result<HistoricalEvidenceRef, StockGovernanceError> {
-        let mut digest = [0_u8; 32];
-        digest[..16].copy_from_slice(event.as_bytes());
-        digest[16..].copy_from_slice(process_uuid().as_bytes());
-        Ok(HistoricalEvidenceRef {
-            resource: ResourceRef {
-                domain: ResourceDomain {
-                    authority: self.principals.ingress_actor.clone(),
-                    namespace: namespace.into(),
-                },
-                resource_id,
+        process_evidence(
+            &self.principals.ingress_actor,
+            namespace,
+            resource_id,
+            event,
+        )
+    }
+}
+
+/// This process's observation `event` in the evidence `namespace` of its
+/// stock ingress `ingress_actor`.
+fn process_evidence(
+    ingress_actor: &PrincipalRef,
+    namespace: &str,
+    resource_id: String,
+    event: uuid::Uuid,
+) -> Result<HistoricalEvidenceRef, StockGovernanceError> {
+    let mut digest = [0_u8; 32];
+    digest[..16].copy_from_slice(event.as_bytes());
+    digest[16..].copy_from_slice(process_uuid().as_bytes());
+    Ok(HistoricalEvidenceRef {
+        resource: ResourceRef {
+            domain: ResourceDomain {
+                authority: ingress_actor.clone(),
+                namespace: namespace.into(),
             },
-            revision: EvidenceId::new(format!("process-{}", process_uuid()))
-                .map_err(|error| StockGovernanceError::Binding(error.to_string()))?,
-            // An identity of this observation, not a content digest: the
-            // final input's replay digest binds its content.
-            digest: EvidenceDigest::from_array(digest),
+            resource_id,
+        },
+        revision: EvidenceId::new(format!("process-{}", process_uuid()))
+            .map_err(|error| StockGovernanceError::Binding(error.to_string()))?,
+        // An identity of this observation, not a content digest: the
+        // final input's replay digest binds its content.
+        digest: EvidenceDigest::from_array(digest),
+    })
+}
+
+/// The claims of one original the stock composition binds: its requester
+/// and how it was authenticated, its occurrence and root event, the key of
+/// its event and the association its input carries. The one builder of
+/// [`StockGovernance::bind_original`], so what is read from these claims
+/// is exactly what a binding records.
+struct StockOriginalClaims {
+    requester: PrincipalRef,
+    authentication: HistoricalEvidenceRef,
+    namespace: QualifiedIngressNamespace,
+    original: OriginalWorkRef,
+    root_event: HistoricalEvidenceRef,
+    /// The event's idempotency key.
+    key: String,
+    association: InputAuthorityAssociation,
+}
+
+impl StockOriginalClaims {
+    /// The claims of the original of `requesting` for event `event`, at
+    /// the session destination `target` of the stock composition of
+    /// `principals` in `realm`, under `authority_basis`, with the
+    /// controller grant `controller_grant` and the actual controller
+    /// selection `controller`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        principals: &StockPrincipals,
+        realm: &RealmId,
+        requesting: &Requesting<'_>,
+        target: &NativeWorkTarget,
+        authority_basis: WorkAuthorityBasis,
+        controller_grant: GrantLineageRef,
+        controller: ControllerModelSelection,
+        event: uuid::Uuid,
+    ) -> Result<Self, StockGovernanceError> {
+        let labels = requesting.labels();
+        let occurrence = EvidenceId::new(format!("{}-{event}", labels.occurrence))
+            .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
+        let namespace = QualifiedIngressNamespace {
+            realm: realm.clone(),
+            ingress: principals.ingress_domain(),
+            occurrence_scope: occurrence.clone(),
+        };
+        let (requester, authentication) = match requesting {
+            Requesting::Operator => (
+                principals.operator.clone(),
+                process_evidence(
+                    &principals.ingress_actor,
+                    "operator-authentication",
+                    process_id(),
+                    event,
+                )?,
+            ),
+            // Nothing about the operator is authenticated here: the process
+            // observes itself, its own ingress.
+            Requesting::Ingress => (
+                principals.ingress_actor.clone(),
+                process_evidence(
+                    &principals.ingress_actor,
+                    "host-outcome-authentication",
+                    process_id(),
+                    event,
+                )?,
+            ),
+            Requesting::Caller(caller) => {
+                (caller.requester().clone(), caller.authentication().clone())
+            }
+        };
+        let root_event = process_evidence(
+            &principals.ingress_actor,
+            labels.root_events,
+            event.to_string(),
+            event,
+        )?;
+        let original = OriginalWorkRef {
+            authority: principals.ingress_actor.clone(),
+            work: occurrence,
+        };
+        let association = InputAuthorityAssociation::new(InputAuthorityAssociationCandidate {
+            requester: requester.clone(),
+            ingress_actor: principals.ingress_actor.clone(),
+            represented_subject: None,
+            original_authentication: authentication.clone(),
+            logical_executor: principals.executor.clone(),
+            target: target.clone(),
+            original_work: original.clone(),
+            root_event: root_event.clone(),
+            contributing_work: Vec::new(),
+            authority_basis,
+            controller_grant_lineage: vec![controller_grant],
+            controller_model: Some(controller),
+            // The grants and current policy narrow; the claims do not widen.
+            controller_ceiling: ExecutionRestrictions::unrestricted(),
+            admitted_ceiling: ExecutionRestrictions::unrestricted(),
+            source_observations: Vec::new(),
+            ingress_namespace: namespace.clone(),
+            contract: ContractRequirements::local_governed_v1(),
+        })
+        .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
+        Ok(Self {
+            requester,
+            authentication,
+            namespace,
+            original,
+            root_event,
+            key: format!("{}-{event}", labels.key),
+            association,
         })
     }
 }
@@ -1064,8 +1266,40 @@ impl crate::surface::ScheduledSessionAgentBinding for StockGovernance {
 enum Requesting<'a> {
     /// The local operator, authenticated by this process.
     Operator,
+    /// The composition's stock ingress itself, reporting the outcome of an
+    /// administrative command its process ran.
+    Ingress,
     /// A caller the trusted host authenticated.
     Caller(&'a StockAuthenticatedCaller),
+}
+
+/// The labels of one requester's originals.
+struct OriginalLabels {
+    /// The prefix of the occurrence.
+    occurrence: &'static str,
+    /// The namespace of the root event.
+    root_events: &'static str,
+    /// The prefix of the event's idempotency key.
+    key: &'static str,
+}
+
+impl Requesting<'_> {
+    /// The labels this requester's originals carry: the prompt labels for
+    /// a person's input, the host-outcome labels for the ingress's own.
+    fn labels(&self) -> OriginalLabels {
+        match self {
+            Self::Operator | Self::Caller(_) => OriginalLabels {
+                occurrence: "prompt",
+                root_events: "prompt-events",
+                key: "rkat-prompt",
+            },
+            Self::Ingress => OriginalLabels {
+                occurrence: "host-outcome",
+                root_events: "host-outcome-events",
+                key: "rkat-host-outcome",
+            },
+        }
+    }
 }
 
 /// This process's one authentication observation of its operator.
