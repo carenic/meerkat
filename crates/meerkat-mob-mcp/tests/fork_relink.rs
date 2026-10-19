@@ -2480,9 +2480,10 @@ async fn a_destroy_that_cannot_reload_a_degraded_member_is_incomplete_and_retrya
 
 /// A member's boundary commit fails while the destroy's retire of that member
 /// waits for the member session's mutation gate, which the runtime loop holds
-/// across the commit. Once the member's durability degrades the wait ends
-/// typed, so the destroy reloads the member and retires it, instead of
-/// waiting behind the gate the exited runtime loop keeps.
+/// across the commit. The parked detach takes the gate when the loop releases
+/// it, and the retire's admission refuses typed for the member's degraded
+/// durability, so the destroy reloads the member and retries the retirement
+/// once instead of answering incomplete.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boundary_commit_that_fails_during_the_destroy_detach_is_reloaded_and_retired() {
     let held = fork_child_whose_boundary_commit_is_held_to_fail("detach-reloaded-child").await;
@@ -2502,7 +2503,7 @@ async fn a_boundary_commit_that_fails_during_the_destroy_detach_is_reloaded_and_
         tokio::join!(destroy, fail_the_commit_during_the_wait)
     })
     .await
-    .expect("the destroy finishes instead of waiting behind the exited loop's gate");
+    .expect("the destroy finishes within the bound");
     let report = report.expect("the destroy reloads the degraded member and retires it");
     assert!(report.errors.is_empty(), "{report:?}");
     assert_eq!(

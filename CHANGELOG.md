@@ -37,17 +37,19 @@ them.
 
 ### Fixed
 
-- A mob destroy no longer hangs when a member's boundary commit fails while
-  the destroy waits on that member's ingress detach. A wait for a session's
-  durability-ready mutation gate now ends with the typed
-  `RuntimeDriverError::RecoveryRepairBlocked` once the session's durability
-  degrades, instead of waiting behind the gate the exited runtime loop
-  keeps; the destroy then reloads the member, retries it once, and names it
-  in `reloaded_members`. Every such wait ends this way, including the
-  run-start hold a mob Shutdown takes on each member. An unregister that
-  waits for the gate before it stages its final unregister also ends typed
-  and releases its teardown coordinator, so the reload-required discard can
-  run. This was a 0.9.3 known limitation.
+- A mob destroy whose member's boundary commit fails while the destroy
+  waits on that member's ingress detach now reloads the member, retries its
+  retirement once, and names it in `reloaded_members`. It answered
+  `MobDestroyError::Incomplete`; 0.9.3 listed this as a known limitation.
+- A wait for a session's durability-ready mutation gate now ends with the
+  typed `RuntimeDriverError::RecoveryRepairBlocked` as soon as the session's
+  durability degrades, even while another holder keeps the gate. The exited
+  runtime loop of a member whose boundary commit failed keeps the gate until
+  a reload, so such a wait lasted until the member was reloaded. This
+  includes the run-start hold a mob Shutdown takes on each member. An
+  unregister that waits for the gate before it stages its final unregister
+  also ends typed and releases its teardown coordinator, so the
+  reload-required discard can run.
 
 ## [0.9.3] - 2026-10-18
 

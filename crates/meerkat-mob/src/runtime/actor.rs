@@ -48607,11 +48607,11 @@ impl MobActor {
                     boxed_arm_future(|| self.admit_member_retire_for_destroy(entry)).await
                 {
                     // A boundary commit that fails while the ingress detach
-                    // waits for the session's mutation gate ends that wait
-                    // typed instead of leaving it behind the gate the exited
-                    // runtime loop keeps. Reload the degraded member and
-                    // retry its admission once: the retry takes the pending
-                    // detach the failed attempt recorded.
+                    // waits for the session's mutation gate makes this
+                    // admission refuse typed for the degraded durability.
+                    // Reload the degraded member and retry its admission
+                    // once: the retry takes the pending detach the failed
+                    // attempt recorded.
                     #[cfg(feature = "runtime-adapter")]
                     match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry))
                         .await
