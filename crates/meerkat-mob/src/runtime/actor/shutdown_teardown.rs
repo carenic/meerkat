@@ -271,7 +271,9 @@ impl MobActor {
 /// and with a settlement that follows the exact registration afterwards. A
 /// durability-degraded registration goes through the runtime's
 /// reload-required discard first, as retire and destroy do, and the cold
-/// successor the discard publishes is the registration unregistered.
+/// successor that discard returns as published is the registration
+/// unregistered. Shutdown owns the registration until it returns, so its own
+/// discard and unregister are not gated on the registration's use.
 #[cfg(feature = "runtime-adapter")]
 pub(in crate::runtime) async fn teardown_session(
     adapter: &Arc<meerkat_runtime::MeerkatMachine>,
@@ -286,18 +288,20 @@ pub(in crate::runtime) async fn teardown_session(
     let pending =
         |stage: &'static str,
          registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+         published_use: Option<meerkat_runtime::RuntimeSessionRegistrationUse>,
          observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>| {
-            ShutdownUnregisterOutcome::Pending {
+            pending_unregister(
+                adapter,
+                ops_adapter,
                 stage,
-                settlement: crate::runtime::MemberUnregisterSettlement::new(
-                    registration,
-                    observer.clone(),
-                    adapter,
-                    Some(ops_adapter),
-                ),
+                registration,
+                published_use,
                 observer,
-            }
+            )
         };
+    // The use of a successor the teardown's own discard published, as the
+    // discard returned it.
+    let mut published_use = None;
     let mut observer = match retained {
         Some(observer) => observer,
         None => {
@@ -314,15 +318,26 @@ pub(in crate::runtime) async fn teardown_session(
                 adapter,
                 Some(ops_adapter),
                 &registration,
+                None,
                 deadline,
             )
             .await
             {
                 DegradedUnregisterStep::Unchanged => registration,
-                DegradedUnregisterStep::Replaced(successor) => successor,
-                DegradedUnregisterStep::Gone => return ShutdownUnregisterOutcome::Unregistered,
+                DegradedUnregisterStep::Replaced {
+                    successor,
+                    successor_use,
+                } => {
+                    published_use = Some(successor_use);
+                    successor
+                }
                 DegradedUnregisterStep::TimedOut => {
-                    return pending("durability_reload_discard", registration, None);
+                    return pending("durability_reload_discard", registration, None, None).await;
+                }
+                DegradedUnregisterStep::HandedOver => {
+                    return ShutdownUnregisterOutcome::Failed(format!(
+                        "runtime session {session_id} was handed to another user during mob teardown"
+                    ));
                 }
                 DegradedUnregisterStep::Failed(failure) => {
                     return ShutdownUnregisterOutcome::Failed(format!(
@@ -341,12 +356,24 @@ pub(in crate::runtime) async fn teardown_session(
             .await;
             match admitted {
                 Err(_) => {
-                    return pending("registration_transaction_admission", registration, None);
+                    return pending(
+                        "registration_transaction_admission",
+                        registration,
+                        published_use,
+                        None,
+                    )
+                    .await;
                 }
                 // Refused until the registration's durability is repaired:
                 // the settlement runs the discard and admits it again.
                 Ok(Err(error)) if crate::runtime::unregister_refused_until_repair(&error) => {
-                    return pending("durability_reload_discard", registration, None);
+                    return pending(
+                        "durability_reload_discard",
+                        registration,
+                        published_use,
+                        None,
+                    )
+                    .await;
                 }
                 Ok(Err(error)) => {
                     return ShutdownUnregisterOutcome::Failed(format!(
@@ -378,17 +405,62 @@ pub(in crate::runtime) async fn teardown_session(
     let registration = observer.registration().clone();
     let waited = crate::tokio::time::timeout(remaining(), observer.wait_for_result()).await;
     match waited {
-        Err(_) => pending("shutdown_runtime_unregister", registration, Some(observer)),
+        Err(_) => {
+            pending(
+                "shutdown_runtime_unregister",
+                registration,
+                published_use,
+                Some(observer),
+            )
+            .await
+        }
         // The coordinator ended without unregistering and released the
         // registration for the discard: the settlement runs it and admits the
         // unregister again.
         Ok(Err(error)) if crate::runtime::unregister_refused_until_repair(&error) => {
-            pending("durability_reload_discard", registration, None)
+            pending(
+                "durability_reload_discard",
+                registration,
+                published_use,
+                None,
+            )
+            .await
         }
         Ok(Err(error)) => ShutdownUnregisterOutcome::Failed(format!(
             "failed to unregister runtime session {session_id} during mob teardown: {error}"
         )),
         Ok(Ok(())) => verify_unregistered(adapter, session_id, &registration).await,
+    }
+}
+
+/// A `Pending` outcome whose settlement follows `registration` after
+/// Shutdown returns. The settlement admits the unregister, or runs the
+/// reload-required discard, only while the registration's use is still the
+/// one it has here, as Shutdown hands it back: `published_use` for a
+/// successor the teardown's own discard published, otherwise read now.
+#[cfg(feature = "runtime-adapter")]
+async fn pending_unregister(
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    ops_adapter: &Arc<super::super::ops_adapter::MobOpsAdapter>,
+    stage: &'static str,
+    registration: meerkat_runtime::RuntimeSessionRegistrationWitness,
+    published_use: Option<meerkat_runtime::RuntimeSessionRegistrationUse>,
+    observer: Option<meerkat_runtime::RuntimeSessionUnregisterObserver>,
+) -> ShutdownUnregisterOutcome {
+    let registration_use = match published_use {
+        Some(published) => Some(published),
+        None => adapter.session_registration_use(&registration).await,
+    };
+    ShutdownUnregisterOutcome::Pending {
+        stage,
+        settlement: crate::runtime::MemberUnregisterSettlement::new(
+            registration,
+            registration_use,
+            observer.clone(),
+            adapter,
+            Some(ops_adapter),
+        ),
+        observer,
     }
 }
 

@@ -45,16 +45,42 @@ them.
 ### Added
 
 - `meerkat-mob`: `MemberUnregisterSettlement` and `MemberUnregisterState`
-  (`Settled`, `Pending`, `Failed`; non-exhaustive). A settlement reads its
-  state without waiting (`try_state`) or waits for it until a deadline
-  (`settle_within`), also after the mob's actor exited. It joins the
-  runtime's unregister coordinator for the member's exact registration,
-  admits that unregister through the same exact-registration path when
-  Shutdown's deadline passed before it was admitted, and holds the mob's
-  runtime handle only weakly: a dropped handle settles only once the
-  registration has provably ended.
+  (`Settled`, `Pending`, `Failed`, `HandedOver`; non-exhaustive). A
+  settlement reads its state without waiting (`try_state`) or waits for it
+  until a deadline (`settle_within`), also after the mob's actor exited. It
+  joins the runtime's unregister coordinator for the member's exact
+  registration, admits that unregister through the same exact-registration
+  path when Shutdown's deadline passed before it was admitted, and holds the
+  mob's runtime handle only weakly: a dropped handle settles only once the
+  registration has provably ended. It admits that unregister, or the
+  reload-required discard before it, only while nobody has taken the
+  registration over since Shutdown returned; otherwise it reports the
+  terminal `HandedOver` and touches nothing, leaving the registration to its
+  new owner.
 - `meerkat-runtime`: `RuntimeSessionRegistrationWitness::has_ended`, whether
   an exact registration has ended for good (no runtime holds its entry).
+- `meerkat-runtime`: `RuntimeSessionRegistrationUse` and
+  `MeerkatMachine::session_registration_use`. A registration can be handed to
+  a new user without being replaced, keeping its witness: a
+  `register_session` that reuses it as it is, an executor attachment or an
+  actor materialization that adopts it in place. Each such adoption stamps
+  the registration with a fresh use, so a use read earlier differs from the
+  current one once anyone has taken the registration since. Opaque; compare
+  for equality only.
+- `meerkat-runtime`: `MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`
+  and `RuntimeSessionUnregisterUseAdmission` (`Admitted`, `Changed`;
+  non-exhaustive): the exact unregister admission of
+  `observe_unregister_session_registration_if_current`, started or joined
+  only while the registration's use is the one the caller read, and
+  answering `Changed` without starting or joining anything otherwise.
+- `meerkat-runtime`: `MeerkatMachine::reload_required_registration_settlement_if_current`
+  and `ReloadRequiredRegistrationUseSettlement` (`NotCurrent`, `NotDegraded`,
+  `Discarded { successor, successor_use }`, `Changed`; non-exhaustive): the
+  reload-required discard of an exact registration, answering with the exact
+  successor it published and the use that successor starts at, read where it
+  is published. With an expected use, it starts or joins the discard only
+  while the registration's use is still that one, and answers `Changed`
+  without discarding otherwise.
 - `meerkat-runtime`: `MeerkatMachine::stage_registration_run_start_hold_only`
   and `MeerkatMachine::unstage_registration_run_start_hold`. The first stages
   a run-start hold that the session's next registration applies, without
@@ -95,6 +121,27 @@ them.
   An unregister coordinator admitted before the session degraded still waits
   on the fence; its settlement stays pending, bounded by each call's
   deadline.
+- A pending member unregister that a mob Shutdown reported no longer
+  unregisters a registration that a later owner took over (`meerkat-mob`,
+  `meerkat-runtime`). When Shutdown's deadline passed before a member's
+  exact unregister was admitted, its settlement admitted that unregister
+  later through the member's exact registration witness. A later owner can
+  take a registration over in place under the same witness: a mob
+  reconstructed in-process over the same stores prepares its members'
+  bindings on the registrations the old incarnation left, a
+  `register_session` reuses a registration as it is, an executor
+  registration takes over a registration's live runtime loop as it is, and
+  an executor attachment or actor materialization adopts a registration
+  without a runtime loop. The settlement then unregistered the later
+  owner's live registration, or ran the reload-required discard on it once
+  it degraded.
+  It also followed whatever registration of the session was current once
+  its discard returned, which a later owner could already have replaced.
+  The runtime now stamps a registration's use at every adoption, Shutdown
+  reads it when it hands the member's registration back, and the settlement
+  starts the discard or the unregister only while that use is unchanged,
+  reporting `MemberUnregisterState::HandedOver` otherwise. It follows only
+  the successor its discard returns as published.
 
 ## [0.9.3] - 2026-10-18
 

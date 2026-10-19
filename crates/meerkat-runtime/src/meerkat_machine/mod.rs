@@ -1242,7 +1242,8 @@ enum CommittedEffectDispatchFailure {
 
 type UnregisterTeardownResult = Result<(), RuntimeDriverError>;
 type RuntimeStopCleanupResult = Result<(), RuntimeDriverError>;
-type ReloadRequiredDiscardResult = Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError>;
+type ReloadRequiredDiscardResult =
+    Result<ReloadRequiredRegistrationUseSettlement, RuntimeDriverError>;
 
 /// Joinable result channel for the one owned unregister saga of an epoch.
 #[derive(Clone)]
@@ -1339,6 +1340,20 @@ pub enum RuntimeSessionUnregisterAdmission {
     /// The exact coordinator remains process-owned; poll this observer on a
     /// later caller retry.
     Pending(RuntimeSessionUnregisterObserver),
+}
+
+/// Answer of
+/// [`MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RuntimeSessionUnregisterUseAdmission {
+    /// The registration's use was the expected one when the unregister was
+    /// started or joined, or the registration is no longer current: the
+    /// exact admission's answer.
+    Admitted(RuntimeSessionUnregisterAdmission),
+    /// The registration is current but was handed to another user after the
+    /// expected use was read. Nothing was started or joined.
+    Changed,
 }
 
 /// Typed answer of the same-registration quiescent close admission
@@ -1509,6 +1524,12 @@ impl UnregisterTeardownMechanicalObservations {
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
     runtime_id: LogicalRuntimeId,
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]):
+    /// stamped from the machine-wide sequence when the entry is built, and
+    /// stamped again by every adoption that hands the registration to a new
+    /// user. Adoptions stamp it under the session map lock, which every
+    /// reader of it holds too.
+    registration_use: std::sync::atomic::AtomicU64,
     /// The agent this registration's session acts as, bound by the trusted
     /// governed host. Every registration owns a fresh, unbound slot.
     agent_binding: agent_mandate::SessionAgentBinding,
@@ -2248,6 +2269,20 @@ impl PartialEq for RuntimeSessionRegistrationWitness {
 
 impl Eq for RuntimeSessionRegistrationWitness {}
 
+/// Which use of one exact runtime-session registration a caller saw.
+///
+/// A registration can be handed to a new user without being replaced: a
+/// later `register_session` reuses it as it is, and an executor attachment
+/// or an actor materialization adopts it in place, so its
+/// [`RuntimeSessionRegistrationWitness`] stays the same. Every such adoption
+/// stamps the registration with a fresh value of one machine-wide sequence.
+/// A use read earlier therefore differs from the current one once anyone
+/// has taken the registration since, and a successor registration never
+/// carries its predecessor's use. Opaque: compare it for equality only. Read
+/// it with [`MeerkatMachine::session_registration_use`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSessionRegistrationUse(u64);
+
 /// Result of exact cleanup for one durability-degraded runtime registration.
 ///
 /// This classification is registration-incarnation scoped. `NotCurrent`
@@ -2302,6 +2337,47 @@ impl ReloadRequiredRegistrationSettlement {
             Self::NotCurrent => ReloadRequiredRegistrationDisposition::NotCurrent,
             Self::NotDegraded => ReloadRequiredRegistrationDisposition::NotDegraded,
             Self::Discarded { .. } => ReloadRequiredRegistrationDisposition::Discarded,
+        }
+    }
+}
+
+/// Answer of
+/// [`MeerkatMachine::reload_required_registration_settlement_if_current`]:
+/// the registration reload's terminal result, with the use the published
+/// successor starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReloadRequiredRegistrationUseSettlement {
+    /// The witness no longer names this machine's exact current registration.
+    NotCurrent,
+    /// The exact registration remains durability-ready and was left untouched.
+    NotDegraded,
+    /// The exact ReloadRequired process shell was replaced by `successor`,
+    /// the registration this reload published, whose use starts at
+    /// `successor_use`.
+    Discarded {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after the expected use
+    /// was read: nothing was discarded and no running discard was joined.
+    Changed,
+}
+
+impl ReloadRequiredRegistrationUseSettlement {
+    /// The settlement of a reload that was not gated on a use.
+    fn into_ungated_settlement(
+        self,
+    ) -> Result<ReloadRequiredRegistrationSettlement, RuntimeDriverError> {
+        match self {
+            Self::NotCurrent => Ok(ReloadRequiredRegistrationSettlement::NotCurrent),
+            Self::NotDegraded => Ok(ReloadRequiredRegistrationSettlement::NotDegraded),
+            Self::Discarded { successor, .. } => {
+                Ok(ReloadRequiredRegistrationSettlement::Discarded { successor })
+            }
+            Self::Changed => Err(RuntimeDriverError::Internal(
+                "a use-gated reload result reached a caller that gave no expected use".to_string(),
+            )),
         }
     }
 }
@@ -6087,6 +6163,23 @@ impl RuntimeSessionEntry {
         )
     }
 
+    /// This registration's current use ([`RuntimeSessionRegistrationUse`]).
+    /// The caller holds the session map lock.
+    fn registration_use(&self) -> RuntimeSessionRegistrationUse {
+        RuntimeSessionRegistrationUse(
+            self.registration_use
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Hand this registration to a new user: stamp it with `stamp`, a fresh
+    /// value of the machine-wide sequence. The caller holds the session map
+    /// lock.
+    fn stamp_adoption(&self, stamp: u64) {
+        self.registration_use
+            .store(stamp, std::sync::atomic::Ordering::Release);
+    }
+
     fn live_attachment_id(&self) -> Option<RuntimeLoopAttachmentId> {
         match &self.attachment_slot {
             RuntimeLoopAttachmentSlot::Pending(attachment)
@@ -9790,6 +9883,9 @@ impl Drop for RunStartHoldInFlightForTest<'_> {
 #[doc(hidden)]
 pub struct MeerkatMachineShared {
     native_work_authorization_host: crate::input_authority::NativeWorkAuthorizationSlot,
+    /// Source of [`RuntimeSessionRegistrationUse`] stamps: one machine-wide
+    /// sequence, so no two stamps this machine hands out are equal.
+    registration_use_sequence: std::sync::atomic::AtomicU64,
     /// The issuing consent owner's owner-loss settlement, installed by the
     /// composition before any session is registered. Empty: nothing is
     /// settled and nothing is recorded as settled.
@@ -11856,6 +11952,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -12090,6 +12187,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -12995,6 +13093,14 @@ impl Drop for MeerkatMachineShared {
 }
 
 impl MeerkatMachineShared {
+    /// A fresh [`RuntimeSessionRegistrationUse`] stamp value: the next value
+    /// of the machine-wide sequence.
+    fn next_registration_use(&self) -> u64 {
+        self.registration_use_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
     fn require_governed_execution_custody(&self) -> Result<(), RuntimeDriverError> {
         if self.store.is_none()
             || self

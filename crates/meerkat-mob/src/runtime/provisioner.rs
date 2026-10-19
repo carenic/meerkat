@@ -2876,11 +2876,17 @@ pub(super) enum DegradedUnregisterStep {
     /// interrupt dispatch, or its cold recovery cannot run yet): the exact
     /// unregister then joins that owner or waits within its own deadline.
     Unchanged,
-    /// The discard replaced the degraded process shell with this cold
-    /// successor, whose exact unregister follows.
-    Replaced(RuntimeSessionRegistrationWitness),
-    /// The discard ran and no registration of the session is current.
-    Gone,
+    /// The discard replaced the degraded process shell with `successor`, the
+    /// exact cold registration it published, whose use starts at
+    /// `successor_use`. The successor's exact unregister follows.
+    Replaced {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: meerkat_runtime::RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after its expected use
+    /// was read. Nothing was discarded, and the registration is not the
+    /// caller's to unregister.
+    HandedOver,
     /// The deadline passed before the discard settled.
     TimedOut,
     /// The discard failed.
@@ -4137,12 +4143,20 @@ impl MemberSessionDisposalArc {
     /// discard replaces the degraded process shell with a cold successor
     /// recovered from durable authority, retaining the member's bound
     /// operation as retire's discard does, and the caller unregisters that
-    /// successor. It is read once, right after the discard published it, as
-    /// retire reads it.
+    /// successor: the exact registration the discard returns as published,
+    /// never the session's registration read after the discard returned,
+    /// which can already be a later owner's.
+    ///
+    /// With `expected_use`, the discard runs only while the registration's
+    /// use is still that one: a caller that handed the registration back
+    /// passes the use it had then. Any other use means a later owner took the
+    /// registration over, which is reported as
+    /// [`DegradedUnregisterStep::HandedOver`] without discarding.
     pub(super) async fn discard_degraded_registration_first(
         adapter: &Arc<MeerkatMachine>,
         ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
         registration: &RuntimeSessionRegistrationWitness,
+        expected_use: Option<meerkat_runtime::RuntimeSessionRegistrationUse>,
         deadline: Instant,
     ) -> DegradedUnregisterStep {
         let session_id = registration.session_id();
@@ -4164,8 +4178,9 @@ impl MemberSessionDisposalArc {
         };
         let discarded = tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
-            adapter.recover_or_discard_reload_required_registration_with_operation_if_current(
+            adapter.reload_required_registration_settlement_if_current(
                 registration,
+                expected_use,
                 prior_ops_binding
                     .as_ref()
                     .map(|witness| witness.retention_request()),
@@ -4174,22 +4189,26 @@ impl MemberSessionDisposalArc {
         .await;
         match discarded {
             Err(_) => DegradedUnregisterStep::TimedOut,
-            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationDisposition::Discarded)) => {
-                match adapter
-                    .current_session_registration_witness(session_id)
-                    .await
-                {
-                    Some(successor) => DegradedUnregisterStep::Replaced(successor),
-                    None => DegradedUnregisterStep::Gone,
-                }
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Discarded {
+                successor,
+                successor_use,
+            })) => DegradedUnregisterStep::Replaced {
+                successor,
+                successor_use,
+            },
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Changed)) => {
+                DegradedUnregisterStep::HandedOver
             }
             Ok(
                 Ok(
-                    meerkat_runtime::ReloadRequiredRegistrationDisposition::NotDegraded
-                    | meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+                    meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotDegraded
+                    | meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotCurrent,
                 )
                 | Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }),
             ) => DegradedUnregisterStep::Unchanged,
+            Ok(Ok(settlement)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} answered an unknown settlement: {settlement:?}"
+            )),
             Ok(Err(error)) => DegradedUnregisterStep::Failed(format!(
                 "durability-reload discard of runtime session {session_id} failed: {error}"
             )),
