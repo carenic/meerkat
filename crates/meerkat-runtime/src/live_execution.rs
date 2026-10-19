@@ -330,6 +330,12 @@ struct LiveDelegationRecoveryOperation {
     /// and derive it from the worker phase and terminal on restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     schedule_state: Option<crate::meerkat_machine::dsl::LiveDelegationScheduleState>,
+    /// The delegation's last authorized narration kind. A `FinishedPending`
+    /// narration is never written (#1820): a runtime from before it cannot
+    /// decode the kind, so the session's lifecycle record would read as
+    /// malformed there and the session would be quarantined. Nothing is lost:
+    /// narration memory only gates narration, which needs the channel's live
+    /// binding, and an image restores no channel binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_narration: Option<crate::meerkat_machine::dsl::LiveDelegationNarrationKind>,
 }
@@ -616,7 +622,11 @@ impl LiveBridgeRecoveryImage {
                 last_narration: state
                     .live_delegation_last_narration_by_operation
                     .get(operation_id)
-                    .copied(),
+                    .copied()
+                    .filter(|kind| {
+                        *kind
+                            != crate::meerkat_machine::dsl::LiveDelegationNarrationKind::FinishedPending
+                    }),
             });
         }
         delegations.sort_by(|a, b| a.operation_id.cmp(&b.operation_id));
@@ -6652,6 +6662,146 @@ mod tests {
         assert!(!rendered.contains("provider-turn-secret"));
         assert!(!rendered.contains("delegation-secret"));
         assert!(!rendered.contains("executor-input-secret"));
+    }
+
+    /// A slot-blocked delegation as a durable image row: its work completed
+    /// and its result is eligible but not yet released, with `narration` as
+    /// the last narration kind.
+    fn slot_blocked_delegation_image(narration: &str) -> serde_json::Value {
+        serde_json::json!({
+            "operations": [],
+            "delegations": [{
+                "operation_id": "00000000-0000-0000-0000-000000001820",
+                "channel_id": "finished-pending-channel",
+                "channel_revoked": false,
+                "interaction_id": "00000000-0000-0000-0000-000000001821",
+                "provider_turn_ref": "finished-pending-turn",
+                "worker_identity": "finished-pending-worker",
+                "worker_ownership": "OwnedMember",
+                "phase": "Terminal",
+                "reconciliation": "Confirmed",
+                "terminal": "Completed",
+                "cancellation_reason": null,
+                "abandoned": false,
+                "late": false,
+                "result_eligible": true,
+                "schedule_state": "Completed",
+                "last_narration": narration
+            }]
+        })
+    }
+
+    /// The durable image as 0.9.3 decodes it (#1820): the same strict rows,
+    /// and only the narration kinds 0.9.3 knows.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Image093 {
+        operations: Vec<serde_json::Value>,
+        #[serde(default)]
+        delegations: Vec<DelegationRow093>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct DelegationRow093 {
+        operation_id: String,
+        channel_id: String,
+        channel_revoked: bool,
+        interaction_id: String,
+        provider_turn_ref: String,
+        worker_identity: String,
+        worker_ownership: serde_json::Value,
+        phase: serde_json::Value,
+        reconciliation: serde_json::Value,
+        terminal: Option<serde_json::Value>,
+        cancellation_reason: Option<serde_json::Value>,
+        abandoned: bool,
+        late: bool,
+        result_eligible: bool,
+        #[serde(default)]
+        schedule_state: Option<serde_json::Value>,
+        #[serde(default)]
+        last_narration: Option<Narration093>,
+    }
+
+    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+    #[allow(dead_code)]
+    enum Narration093 {
+        Queued,
+        Claimed,
+        Blocked,
+        Completed,
+        SourceBusy,
+        Failed,
+    }
+
+    /// #1820: a slot-blocked delegation's FinishedPending narration never
+    /// reaches the durable image. 0.9.3 decodes the image strictly and has no
+    /// such kind, so a rolled-back runtime would read the session's lifecycle
+    /// record as malformed and quarantine the session.
+    #[test]
+    fn a_finished_pending_narration_never_reaches_the_durable_image() {
+        use crate::meerkat_machine::dsl::{
+            LiveDelegationNarrationKind, MeerkatMachineState, OperationId,
+        };
+        let image: LiveBridgeRecoveryImage =
+            serde_json::from_value(slot_blocked_delegation_image("FinishedPending"))
+                .expect("decode a slot-blocked delegation row");
+        let mut state = MeerkatMachineState::default();
+        image.restore_into(&mut state).expect("restore the row");
+        let operation = OperationId("00000000-0000-0000-0000-000000001820".to_string());
+        assert_eq!(
+            state
+                .live_delegation_last_narration_by_operation
+                .get(&operation),
+            Some(&LiveDelegationNarrationKind::FinishedPending),
+            "precondition: the session remembers the finished notice"
+        );
+
+        let captured = LiveBridgeRecoveryImage::capture(&state).expect("capture the image");
+        let persisted = serde_json::to_value(&captured).expect("persist the image");
+        let older: Image093 =
+            serde_json::from_value(persisted).expect("0.9.3 decodes the persisted image");
+        assert_eq!(older.delegations.len(), 1);
+        assert!(older.delegations[0].last_narration.is_none());
+
+        // Restored, the delegation has no narration memory and is otherwise
+        // the same image.
+        let mut restored = MeerkatMachineState::default();
+        captured
+            .restore_into(&mut restored)
+            .expect("restore the persisted image");
+        assert_eq!(
+            restored
+                .live_delegation_last_narration_by_operation
+                .get(&operation),
+            None
+        );
+        assert_eq!(
+            LiveBridgeRecoveryImage::capture(&restored).expect("capture again"),
+            captured
+        );
+    }
+
+    /// A narration kind 0.9.3 knows is persisted as before.
+    #[test]
+    fn a_narration_older_runtimes_know_is_still_persisted() {
+        let image: LiveBridgeRecoveryImage =
+            serde_json::from_value(slot_blocked_delegation_image("Claimed"))
+                .expect("decode a slot-blocked delegation row");
+        let mut state = crate::meerkat_machine::dsl::MeerkatMachineState::default();
+        image.restore_into(&mut state).expect("restore the row");
+        let captured = LiveBridgeRecoveryImage::capture(&state).expect("capture the image");
+        assert_eq!(captured, image);
+        let older: Image093 =
+            serde_json::from_value(serde_json::to_value(&captured).expect("persist the image"))
+                .expect("0.9.3 decodes the persisted image");
+        assert_eq!(
+            older.delegations[0].last_narration,
+            Some(Narration093::Claimed)
+        );
     }
 
     #[test]
