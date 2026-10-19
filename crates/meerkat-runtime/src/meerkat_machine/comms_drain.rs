@@ -417,7 +417,15 @@ impl MeerkatMachine {
         session_id: &SessionId,
         runtime: &Arc<dyn meerkat_core::agent::CommsRuntime>,
     ) -> Result<bool, SupervisorBindingStageError> {
-        let Some(_gate_guard) = self.lock_current_session_mutation_gate(session_id).await else {
+        // A session that degrades while another holder keeps its gate is not
+        // a current ingress runtime.
+        let Ok(gate_guard) = self
+            .lock_current_live_session_mutation_gate(session_id)
+            .await
+        else {
+            return Ok(false);
+        };
+        let Some(_gate_guard) = gate_guard else {
             return Err(SupervisorBindingStageError::SessionNotRegistered);
         };
         let sessions = self.sessions.read().await;

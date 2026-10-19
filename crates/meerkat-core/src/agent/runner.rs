@@ -1642,7 +1642,10 @@ where
     /// Called in the same synchronous segment that took the delivery (no await
     /// in between), so a hard-cancel future drop cannot split the witness from
     /// the Session write. The messages were lowered when the runtime built the
-    /// delivery, so the write itself cannot fail. Returns the events to
+    /// delivery, so the write itself cannot fail. The delivery's peer reply
+    /// capabilities join the running turn's dispatch context in the same
+    /// segment (typed, so that cannot fail either), so `reply_to_peer` can
+    /// answer it from the next tool call on. Returns the events to
     /// publish when the appends were written (`BoundaryAppendApplied`, then
     /// one `PeerContentIngested` per incoming comms block, exactly as the
     /// turn-start path publishes them); `None` when the delivery was withdrawn
@@ -1665,6 +1668,7 @@ where
             messages,
             model_projection,
             peer_ingested_events,
+            peer_reply_capabilities,
         } = appends.into_parts();
         let append_count = u32::try_from(messages.len()).unwrap_or(u32::MAX);
         let transcript_start = self.session.messages().len() as u64;
@@ -1681,6 +1685,8 @@ where
             }
             self.session.push(message);
         }
+        self.tool_dispatch_context
+            .record_boundary_peer_replies(peer_reply_capabilities);
         let mut events = Vec::with_capacity(1 + peer_ingested_events.len());
         events.push(AgentEvent::BoundaryAppendApplied {
             run_id: run_id.clone(),
@@ -1781,7 +1787,7 @@ where
     ) -> Result<Vec<Message>, AgentError> {
         self.session
             .validate_instruction_activation_turn_readiness()
-            .map_err(|error| AgentError::ConfigError(error.to_string()))?;
+            .map_err(AgentError::InstructionActivation)?;
         let mut messages = self.session.messages_for_model_boundary();
         if let Some(instructions) = self.output_schema_request_instructions() {
             crate::structured_output::project_output_schema_instructions(
@@ -3948,6 +3954,8 @@ mod skill_activation_effect_tests {
                         summary: None,
                         payload: None,
                         content: vec![image.clone()],
+                        delivery_id: None,
+                        in_reply_to: None,
                     }],
                 },
             ),

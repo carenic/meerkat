@@ -106,6 +106,9 @@ rusqlite = { workspace = true }
 # (scripts/published_crates_standalone.py) reads them from here.
 [package.metadata.meerkat.standalone-tests]
 features = ["test-support", "sqlite-store", "live", "local-authorization"]
+# The README's command sets this thread stack, the workspace's
+# (.cargo/config.toml [env]); the suite is not checked at Rust's 2 MiB default.
+min-stack = 8388608
 
 [lints]
 workspace = true

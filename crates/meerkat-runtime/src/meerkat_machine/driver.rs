@@ -822,6 +822,10 @@ impl IngressView<'_> {
         self.driver.steer_lane()
     }
 
+    pub(crate) fn durable_steer_order(&self) -> Arc<crate::driver::ephemeral::DurableSteerOrder> {
+        self.driver.durable_steer_order()
+    }
+
     pub(crate) fn admission_order(&self) -> Vec<InputId> {
         self.driver.admission_order()
     }
@@ -980,6 +984,20 @@ pub(crate) struct PreparedDestroy {
 }
 
 impl DriverEntry {
+    /// How long a runtime loop over this driver waits for its boundary
+    /// commits and run terminalizations: the store's declared commit outcome
+    /// deadline, with the session durability health a missed deadline
+    /// degrades. `None` for an ephemeral driver, a persistent driver without
+    /// durability health, or a store whose commits cannot stall.
+    pub(crate) fn runtime_loop_commit_deadline(
+        &self,
+    ) -> Option<crate::runtime_loop::RuntimeLoopCommitDeadline> {
+        match self {
+            DriverEntry::Ephemeral(_) => None,
+            DriverEntry::Persistent(driver) => driver.runtime_loop_commit_deadline(),
+        }
+    }
+
     fn shell_driver_mut(&mut self) -> &mut EphemeralRuntimeDriver {
         match self {
             DriverEntry::Ephemeral(driver) => driver,

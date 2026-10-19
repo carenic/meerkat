@@ -4354,6 +4354,16 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     "ResourceClaimOverlapObserved",
                 ],
             ),
+            NamedTypeBinding::string_enum(
+                "RetireAtScopeVerdictKind",
+                &[
+                    "Current",
+                    "NoCurrentIncarnation",
+                    "StaleFenceToken",
+                    "StaleSessionBinding",
+                    "MobNotRunning",
+                ],
+            ),
         ],
         input_variant_ids(MOB_MACHINE_RUNTIME_INTERNAL_INPUTS),
     )
@@ -4578,6 +4588,10 @@ runtime_internal_inputs!(
         BeginExplicitResumeCleanup,
         SettleExplicitResumeCleanup,
         FinishExplicitResume,
+        // A scoped retire carries a delivery scope; the actor drives this
+        // classifier in the same command as the step it guards, so it is
+        // never a standalone surface command.
+        RetireAtScope,
     ]
 );
 

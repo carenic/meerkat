@@ -560,6 +560,12 @@ pub struct PeerInput {
     /// on durable input persistence (absent on older persisted inputs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injected_context: Vec<ContentInput>,
+    /// The delivery a peer message says it answers: the sender's signed
+    /// `in_reply_to` (set by its `reply_to_peer`). Rendered on the message
+    /// notice as `In reply to`; never routing or authority. Additive on
+    /// durable input persistence (absent on older persisted inputs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<meerkat_core::interaction::InteractionId>,
 }
 
 /// Peer communication conventions.
@@ -658,6 +664,7 @@ pub fn peer_response_terminal_input(
         // Bridge-projected terminal responses carry no comms envelope, so no
         // sender declaration exists.
         sender_taint: None,
+        in_reply_to: None,
     })
 }
 
@@ -1220,6 +1227,26 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
     let notice_peer = meerkat_core::comms::PeerId::parse(&peer_id)
         .ok()
         .map(|id| SystemNoticePeer { id, display_name });
+    // A peer message from a canonical peer names its delivery: the sender's
+    // envelope id, which the comms bridge stamps as the correlation id. It is
+    // exactly the `in_reply_to` of the reply capability the same input mints
+    // ([`peer_reply_capability`]), so the id the model reads is the one
+    // `reply_to_peer` accepts.
+    let delivery_id = if matches!(kind, CommsNoticeKind::Message) && notice_peer.is_some() {
+        peer.header
+            .correlation_id
+            .as_ref()
+            .map(|correlation| meerkat_core::InteractionId(correlation.0))
+    } else {
+        None
+    };
+    // The delivery the sender says this message answers (its signed
+    // `in_reply_to`): shown on message notices only.
+    let in_reply_to = if matches!(kind, CommsNoticeKind::Message) {
+        peer.in_reply_to
+    } else {
+        None
+    };
     Some(CoreRenderable::SystemNotice {
         kind: SystemNoticeKind::Comms,
         body: Some(summary.clone()),
@@ -1237,6 +1264,8 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
             summary: Some(summary),
             payload: peer.payload.clone(),
             content,
+            delivery_id,
+            in_reply_to,
         }],
     })
 }
@@ -1460,41 +1489,65 @@ pub(crate) fn runtime_input_projection_for_machine_batch(
 
 /// Typed shape of `input`'s runtime-authored transcript appends, reported to
 /// `ResolveAdmissionPlan`. This reads typed structure only (the variant, each
-/// append's typed role, identity slot and notice kind, and which typed
-/// turn-metadata fields are set), never text content.
+/// append's typed role, identity slot and notice kind, which typed
+/// turn-metadata fields are set, and whether the input is a directed
+/// interaction), never text content.
 ///
-/// A prompt is `InTurnEligible` when every typed append can be written into a
-/// running turn ([`meerkat_core::lifecycle::conversation_append_joins_running_turn`]:
-/// a `SystemNotice`, `User` or `InjectedContext` row without an append
-/// identity, and never a synthetic refresh-projection notice that the next
-/// boundary refresh would remove) AND its turn metadata carries nothing a
-/// running turn cannot honour
-/// ([`meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata::joins_running_turn`]:
-/// no System prompts, skill references, tool overlay, model routing and so
-/// on). Any other prompt with typed appends is `FollowUpOnly`, so it takes the
-/// follow-up turn that applies all of it. Every other input is `Untyped`.
-/// Prompts are never directed interactions, so a durable in-turn delivery
-/// never owns a directed terminal.
+/// A content input (a prompt, a peer message, request or lifecycle notice, an
+/// external event or a flow step) is `InTurnEligible` when ALL of:
+/// - it is not a directed interaction: a directed peer input or flow step owns
+///   a terminal whose `RunStarted` attribution needs its own turn;
+/// - the turn metadata it carries of its own
+///   ([`crate::runtime_loop::input_own_turn_metadata`]) holds nothing a running
+///   turn cannot honour
+///   ([`meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata::joins_running_turn`]:
+///   no System prompts, skill references, tool overlay, model routing, render
+///   metadata and so on);
+/// - its projection writes at least one transcript row, and every row can be
+///   written into a running turn
+///   ([`meerkat_core::lifecycle::conversation_append_joins_running_turn`]: a
+///   `SystemNotice`, `User` or `InjectedContext` row without an append
+///   identity, and never a synthetic refresh-projection notice that the next
+///   boundary refresh would remove).
+///
+/// Any other content input is `FollowUpOnly`, so it takes the follow-up turn
+/// that applies all of it. Peer responses, continuations and operations carry
+/// no content row of their own and report `Untyped`.
 pub(crate) fn admission_turn_append_shape(
     input: &Input,
 ) -> crate::meerkat_machine::dsl::AdmissionTurnAppendShape {
     use crate::meerkat_machine::dsl::AdmissionTurnAppendShape;
-    match input {
-        Input::Prompt(prompt) if !prompt.typed_turn_appends.is_empty() => {
-            let appends_join = prompt
-                .typed_turn_appends
-                .iter()
-                .all(meerkat_core::lifecycle::conversation_append_joins_running_turn);
-            let metadata_joins = prompt.turn_metadata.as_ref().is_none_or(
-                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata::joins_running_turn,
-            );
-            if appends_join && metadata_joins {
-                AdmissionTurnAppendShape::InTurnEligible
-            } else {
-                AdmissionTurnAppendShape::FollowUpOnly
-            }
+    let directed = match input {
+        Input::Prompt(_) | Input::ExternalEvent(_) => false,
+        Input::Peer(peer) => match peer.convention {
+            Some(
+                PeerConvention::ResponseProgress { .. } | PeerConvention::ResponseTerminal { .. },
+            ) => return AdmissionTurnAppendShape::Untyped,
+            Some(
+                PeerConvention::Message
+                | PeerConvention::Request { .. }
+                | PeerConvention::Lifecycle { .. },
+            )
+            | None => peer.directed_interaction_id.is_some(),
+        },
+        Input::FlowStep(flow_step) => flow_step.directed_interaction_id.is_some(),
+        Input::Continuation(_) | Input::Operation(_) => {
+            return AdmissionTurnAppendShape::Untyped;
         }
-        _ => AdmissionTurnAppendShape::Untyped,
+    };
+    if directed {
+        return AdmissionTurnAppendShape::FollowUpOnly;
+    }
+    let metadata_joins = crate::runtime_loop::input_own_turn_metadata(input).joins_running_turn();
+    let appends = projection_durable_boundary_appends(&runtime_input_projection(input));
+    let appends_join = !appends.is_empty()
+        && appends
+            .iter()
+            .all(meerkat_core::lifecycle::conversation_append_joins_running_turn);
+    if metadata_joins && appends_join {
+        AdmissionTurnAppendShape::InTurnEligible
+    } else {
+        AdmissionTurnAppendShape::FollowUpOnly
     }
 }
 
@@ -1769,6 +1822,7 @@ mod tests {
             content: "work content".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection(&input);
@@ -1856,6 +1910,7 @@ mod tests {
             content: "hi there".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["input_type"], "peer");
@@ -1886,6 +1941,7 @@ mod tests {
             content: "hi there".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -2124,6 +2180,7 @@ mod tests {
             ]),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let Input::Peer(peer) = &input else {
@@ -2186,6 +2243,7 @@ mod tests {
                 content: "hello from peer".into(),
                 payload: None,
                 handling_mode: None,
+                in_reply_to: None,
             });
             let projection = runtime_input_projection(&input);
             let append = projection.append.expect("conversation append");
@@ -2251,6 +2309,7 @@ mod tests {
             content: "response body".into(),
             payload: Some(serde_json::json!({"answer":"ok"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let Input::Peer(peer) = &input else {
@@ -2354,26 +2413,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_peer_steer_is_request_only_and_idle_normalization_is_durable() {
+    fn steer_peer_input(convention: PeerConvention, body: &str) -> Input {
         let mut header = make_header();
         header.source = InputOrigin::Peer {
             peer_id: "peer-a".into(),
             display_identity: Some("Peer A".into()),
             runtime_id: None,
         };
-        let input = Input::Peer(PeerInput {
+        Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
             system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header,
-            convention: Some(PeerConvention::Message),
-            content: "please look at this while you work".into(),
+            convention: Some(convention),
+            content: body.into(),
             payload: None,
             handling_mode: Some(HandlingMode::Steer),
-        });
+            in_reply_to: None,
+        })
+    }
+
+    #[test]
+    fn live_peer_steer_is_durable_append_and_idle_normalization_is_durable() {
+        let input = steer_peer_input(
+            PeerConvention::Message,
+            "please look at this while you work",
+        );
         let projection = runtime_input_projection(&input);
         let live_semantics =
             crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(
@@ -2384,16 +2451,197 @@ mod tests {
             crate::ingress_types::RuntimeInputSemantics::try_from_generated_admission(&input, true)
                 .expect("idle steer admission");
 
-        let rendered = projection_transient_context_text(&projection, live_semantics).unwrap();
-        assert!(
-            rendered.contains("please look at this while you work"),
-            "peer message should be renderable as request-only steer context: {rendered:?}"
+        // A running steer is a durable in-turn delivery: never request-only
+        // context, always the one Comms notice row its follow-up would write.
+        assert_eq!(
+            live_semantics.live_boundary_delivery(),
+            Some(crate::ingress_types::LiveBoundaryDeliveryClass::DurableAppend)
         );
-        assert!(projection_conversation_appends(&projection, live_semantics).is_empty());
+        assert!(projection_transient_context_text(&projection, live_semantics).is_none());
+        let durable = projection_durable_boundary_appends(&projection);
+        assert_eq!(
+            durable,
+            projection_conversation_appends(&projection, live_semantics),
+            "the in-turn delivery writes exactly the rows its follow-up would write"
+        );
+        let [notice] = durable.as_slice() else {
+            panic!("one Comms notice row: {durable:?}");
+        };
+        assert_eq!(notice.role, ConversationAppendRole::SystemNotice);
+        let CoreRenderable::SystemNotice { blocks, .. } = &notice.content else {
+            panic!("a system notice: {notice:?}");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [meerkat_core::types::SystemNoticeBlock::Comms {
+                kind: meerkat_core::types::CommsNoticeKind::Message,
+                direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                content,
+                ..
+            }] if content.iter().any(|block| block.text_projection().contains("please look at this while you work"))
+        ));
+        let appends =
+            meerkat_core::DurableTurnBoundaryAppends::try_new(input.id().clone(), durable, None)
+                .expect("the peer notice can join a running turn");
+        assert_eq!(appends.messages().len(), 1);
+        assert_eq!(
+            appends.peer_ingested_events().len(),
+            1,
+            "the in-turn write publishes exactly one peer_content_ingested"
+        );
+
+        // Idle normalization is unchanged: an ordinary queued turn that writes
+        // the same row.
         assert!(projection_transient_context_text(&projection, idle_semantics).is_none());
         assert_eq!(
             projection_conversation_appends(&projection, idle_semantics).len(),
             1
+        );
+    }
+
+    /// A peer message from a canonical peer names its delivery on the notice
+    /// and on its ingestion event: the id its reply capability carries, so
+    /// the id the model reads is the one `reply_to_peer` accepts. Other
+    /// conventions and non-canonical senders name none.
+    #[test]
+    fn peer_message_notice_names_the_delivery_its_reply_capability_answers() {
+        let sender = uuid::Uuid::from_u128(0xC1);
+        let delivery = meerkat_core::InteractionId(uuid::Uuid::from_u128(0xD1));
+        let peer_input = |convention: PeerConvention, peer_id: String| {
+            let mut input = steer_peer_input(convention, "please look");
+            if let Input::Peer(peer) = &mut input {
+                peer.header.source = InputOrigin::Peer {
+                    peer_id,
+                    display_identity: Some("Peer A".into()),
+                    runtime_id: None,
+                };
+                peer.header.correlation_id = Some(crate::CorrelationId::from_uuid(delivery.0));
+            }
+            input
+        };
+        let notice_delivery_id = |input: &Input| {
+            let appends = projection_durable_boundary_appends(&runtime_input_projection(input));
+            match appends.as_slice() {
+                [append] => match &append.content {
+                    CoreRenderable::SystemNotice { blocks, .. } => match blocks.as_slice() {
+                        [meerkat_core::types::SystemNoticeBlock::Comms { delivery_id, .. }] => {
+                            *delivery_id
+                        }
+                        other => panic!("one comms block: {other:?}"),
+                    },
+                    other => panic!("a system notice: {other:?}"),
+                },
+                other => panic!("one notice row: {other:?}"),
+            }
+        };
+
+        let message = peer_input(PeerConvention::Message, sender.to_string());
+        assert_eq!(notice_delivery_id(&message), Some(delivery));
+        assert_eq!(
+            peer_reply_capability(&message).map(|capability| capability.in_reply_to),
+            Some(delivery),
+            "the notice names exactly the delivery the capability answers"
+        );
+        let appends = meerkat_core::DurableTurnBoundaryAppends::try_new(
+            message.id().clone(),
+            projection_durable_boundary_appends(&runtime_input_projection(&message)),
+            None,
+        )
+        .expect("the peer notice can join a running turn");
+        assert!(matches!(
+            appends.peer_ingested_events(),
+            [meerkat_core::AgentEvent::PeerContentIngested { delivery_id: Some(id), .. }]
+                if *id == delivery
+        ));
+
+        assert_eq!(
+            notice_delivery_id(&peer_input(PeerConvention::Message, "peer-a".into())),
+            None,
+            "a sender that is not a canonical peer has no reply capability to name"
+        );
+        assert_eq!(
+            notice_delivery_id(&peer_input(
+                PeerConvention::Request {
+                    request_id: "request-1".into(),
+                    intent: "review".into(),
+                },
+                sender.to_string()
+            )),
+            None,
+            "a request is answered with send_response, not reply_to_peer"
+        );
+    }
+
+    /// A peer message that answers a delivery shows it: its notice block
+    /// carries the sender's `in_reply_to`, and the model reads it as an
+    /// `In reply to` line. A request shows none.
+    #[test]
+    fn peer_message_notice_shows_the_delivery_it_answers() {
+        let answered = meerkat_core::InteractionId(uuid::Uuid::from_u128(0xA1));
+        let notice_block = |convention: PeerConvention| {
+            let mut input = steer_peer_input(convention, "on it");
+            if let Input::Peer(peer) = &mut input {
+                peer.header.source = InputOrigin::Peer {
+                    peer_id: uuid::Uuid::from_u128(0xC1).to_string(),
+                    display_identity: Some("Peer A".into()),
+                    runtime_id: None,
+                };
+                peer.in_reply_to = Some(answered);
+            }
+            let appends = projection_durable_boundary_appends(&runtime_input_projection(&input));
+            match appends.as_slice() {
+                [append] => match &append.content {
+                    CoreRenderable::SystemNotice { blocks, .. } => match blocks.as_slice() {
+                        [block] => block.clone(),
+                        other => panic!("one comms block: {other:?}"),
+                    },
+                    other => panic!("a system notice: {other:?}"),
+                },
+                other => panic!("one notice row: {other:?}"),
+            }
+        };
+
+        let message = notice_block(PeerConvention::Message);
+        assert!(matches!(
+            &message,
+            meerkat_core::types::SystemNoticeBlock::Comms {
+                in_reply_to: Some(id),
+                ..
+            } if *id == answered
+        ));
+        let line = format!("In reply to: {answered}");
+        assert!(
+            message.model_projection_text().contains(&line),
+            "{}",
+            message.model_projection_text()
+        );
+
+        let request = notice_block(PeerConvention::Request {
+            request_id: "request-1".into(),
+            intent: "review".into(),
+        });
+        assert!(matches!(
+            &request,
+            meerkat_core::types::SystemNoticeBlock::Comms {
+                in_reply_to: None,
+                ..
+            }
+        ));
+        assert!(!request.model_projection_text().contains("In reply to"));
+    }
+
+    #[test]
+    fn directed_peer_steer_takes_the_follow_up_turn() {
+        let mut input = steer_peer_input(PeerConvention::Message, "directed work");
+        if let Input::Peer(peer) = &mut input {
+            peer.directed_interaction_id = Some(meerkat_core::interaction::InteractionId(
+                uuid::Uuid::new_v4(),
+            ));
+        }
+        assert_eq!(
+            admission_turn_append_shape(&input),
+            crate::meerkat_machine::dsl::AdmissionTurnAppendShape::FollowUpOnly,
+            "a directed input owns a terminal its own turn must start"
         );
     }
 
@@ -2533,8 +2781,71 @@ mod tests {
         let plain = Input::Prompt(PromptInput::new("plain", None));
         assert_eq!(
             admission_turn_append_shape(&plain),
-            AdmissionTurnAppendShape::Untyped
+            AdmissionTurnAppendShape::InTurnEligible,
+            "a text-only prompt writes one User row a running turn accepts"
         );
+        let routed = Input::Prompt(PromptInput::new(
+            "routed",
+            Some(
+                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                    model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
+                        "claude-sonnet-4-5",
+                    )),
+                    ..Default::default()
+                },
+            ),
+        ));
+        assert_eq!(
+            admission_turn_append_shape(&routed),
+            AdmissionTurnAppendShape::FollowUpOnly,
+            "model routing applies only to a fresh turn"
+        );
+    }
+
+    #[test]
+    fn admission_turn_append_shape_covers_every_content_kind() {
+        use crate::meerkat_machine::dsl::AdmissionTurnAppendShape;
+        for convention in [
+            PeerConvention::Message,
+            PeerConvention::Request {
+                request_id: "req-1".into(),
+                intent: "checksum_token".into(),
+            },
+            PeerConvention::Lifecycle {
+                kind: meerkat_core::comms::PeerLifecycleKind::PeerAdded,
+            },
+        ] {
+            assert_eq!(
+                admission_turn_append_shape(&steer_peer_input(convention.clone(), "body")),
+                AdmissionTurnAppendShape::InTurnEligible,
+                "{convention:?}"
+            );
+        }
+        let mut prompted = steer_peer_input(PeerConvention::Message, "body");
+        if let Input::Peer(peer) = &mut prompted {
+            peer.system_prompts = vec!["be terse".into()];
+        }
+        assert_eq!(
+            admission_turn_append_shape(&prompted),
+            AdmissionTurnAppendShape::FollowUpOnly,
+            "System prompts apply only to a fresh turn"
+        );
+        for convention in [
+            PeerConvention::ResponseProgress {
+                request_id: "req-1".into(),
+                phase: ResponseProgressPhase::Accepted,
+            },
+            PeerConvention::ResponseTerminal {
+                request_id: "req-1".into(),
+                status: ResponseTerminalStatus::Completed,
+            },
+        ] {
+            assert_eq!(
+                admission_turn_append_shape(&steer_peer_input(convention.clone(), "body")),
+                AdmissionTurnAppendShape::Untyped,
+                "{convention:?}"
+            );
+        }
     }
 
     fn typed_notice_steer_prompt_with(
@@ -2734,6 +3045,7 @@ mod tests {
             }]),
             payload: Some(serde_json::json!({"answer":"ok"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -2773,6 +3085,7 @@ mod tests {
             content: "Agent joined".into(),
             payload: Some(serde_json::json!({"name": "agent-1"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -2799,6 +3112,7 @@ mod tests {
             content: "Done".into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -2821,6 +3135,7 @@ mod tests {
             content: "Working...".into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         let parsed: Input = serde_json::from_value(json).unwrap();
@@ -2950,6 +3265,7 @@ mod tests {
             ]),
             payload: None,
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection(&input);
@@ -3201,6 +3517,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(peer_msg.kind(), InputKind::PeerMessage);
 
@@ -3218,6 +3535,7 @@ mod tests {
             content: "hi".into(),
             payload: Some(serde_json::json!({"subject": "x"})),
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(peer_req.kind(), InputKind::PeerRequest);
 
@@ -3309,6 +3627,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["handling_mode"], "queue");
@@ -3436,6 +3755,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["handling_mode"], "steer");
@@ -3459,6 +3779,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let json = serde_json::to_value(&input).unwrap();
         assert!(json.get("handling_mode").is_none());

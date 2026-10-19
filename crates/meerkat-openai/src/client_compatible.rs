@@ -2412,6 +2412,8 @@ mod tests {
                         ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
                             .expect("structured response block"),
                     ],
+                    delivery_id: None,
+                    in_reply_to: None,
                 },
             ))])
             .expect("project chat messages");
@@ -3434,6 +3436,108 @@ mod tests {
             "a combined delta must emit its reasoning before its content"
         );
         handle.abort();
+    }
+
+    /// The transcript a durable in-turn steer leaves when it joins a running
+    /// turn at the boundary after a tool call: the call, its result, the row
+    /// the steer wrote, then the model's next answer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
+        vec![
+            Message::User(UserMessage::text("start the job")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "call_1".to_string(),
+                "lookup result".to_string(),
+                false,
+            )]),
+            steer_row,
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "noted".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+        ]
+    }
+
+    /// Encodes `steer_row` after the tool results: the assistant tool call,
+    /// then its tool message with nothing between them, then the steer as
+    /// a user message of its own, never merged into the tool output.
+    fn assert_durable_in_turn_chat_order(steer_row: Message, steer_text: &str) {
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            "http://localhost:11434/v1".to_string(),
+            None,
+            options(true, true, true, false),
+        );
+        let request = LlmRequest::new("gemma-4-31b", durable_in_turn_transcript_with(steer_row));
+        let body = client
+            .build_chat_completions_body(&request)
+            .expect("body should build");
+        let messages = body["messages"].as_array().expect("chat messages array");
+        let call_index = messages
+            .iter()
+            .position(|message| {
+                message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty())
+            })
+            .expect("assistant tool call message");
+        assert_eq!(messages[call_index]["role"], "assistant");
+        assert_eq!(messages[call_index]["tool_calls"][0]["id"], "call_1");
+        let output_index = messages
+            .iter()
+            .position(|message| message["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(messages[output_index]["tool_call_id"], "call_1");
+        assert_eq!(
+            output_index,
+            call_index + 1,
+            "nothing sits between the call and its output"
+        );
+        assert!(
+            !messages[output_index].to_string().contains(steer_text),
+            "the steer is never merged into the tool output"
+        );
+        let steer_index = messages
+            .iter()
+            .position(|message| message.to_string().contains(steer_text))
+            .expect("steer message");
+        assert_eq!(
+            steer_index,
+            output_index + 1,
+            "the steer's row directly follows the tool output"
+        );
+        assert_eq!(messages[steer_index]["role"], "user");
+    }
+
+    #[test]
+    fn durable_in_turn_notice_after_tool_results_builds_a_valid_chat_body() {
+        assert_durable_in_turn_chat_order(
+            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            )),
+            "background job finished",
+        );
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_chat_body() {
+        assert_durable_in_turn_chat_order(
+            Message::User(UserMessage::text("also check the second file")),
+            "also check the second file",
+        );
     }
 
     #[test]

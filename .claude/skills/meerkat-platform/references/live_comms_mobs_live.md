@@ -167,6 +167,21 @@ Minimal WebSocket flow:
   the server judges them. `media_fault` (no audible frame and a peak below
   0.002) closes the channel before the reply. `reopen_recommended` is true
   only for a session's first media fault.
+- Failed responses (since 0.9.4): a provider response that ends without
+  completing arrives as a `turn_failed` observation. Route on
+  `failure.status` (`failed`, `incomplete` or `in_progress`; a status without
+  a wire name arrives as `{"unknown": {"debug": ...}}`); the provider's
+  `reason`, `code` and `message` are diagnostics only. `incomplete` for
+  `max_output_tokens` or `content_filter` keeps its earlier mapping. A failed
+  response is not terminal: the channel stays open, Meerkat neither cancels
+  nor retries it, nothing of it is committed (the transcript records
+  `assistant_turn_failed`), and a WebRTC peer stops the audio still queued
+  for it. Reported usage is charged; without it the session event stream
+  carries `turn_usage_accounting_unmeasured`. 0.9.3 and earlier committed the
+  partial text as a finished `end_turn` reply, and a failed response without
+  usage closed the channel. Upgrade SDKs with the server: older SDKs reject
+  the new observation. A session that recorded a failed response cannot be
+  opened by 0.9.3 (realtime sidecar event schema 4).
 
 ### Transcript rows in session history
 
@@ -230,6 +245,20 @@ backchannel or repeat details back while the user talks, and to act only
 once the user has clearly finished. A Rust host replaces them with
 `PublicGptLiveOpenAuthorityConfig.session_instructions`, or keeps them and
 prepends its own knowledge with `session_instructions_preface`.
+
+Held results: Meerkat holds a finished delegation's result while the user's
+latest utterance is unanswered, and delivers one result at a time. Since
+0.9.4 a held result first sends the voice a notice that the work has finished
+but its result has not arrived, so it no longer answers "not yet". The voice
+may say the work just finished but must not state or guess the outcome until
+the result arrives. The notice waits while the voice is speaking and is
+dropped if the result reaches the session first.
+
+Known limitation: public GPT Live delegates through the client for the
+whole session, and the provider's delegation events carry no typed reason,
+so a question the user starts while the voice is still speaking (before the
+cue for a delegated result is sent) can go to the executor even when it asks
+about the conversation itself.
 
 ## Live channels on mob members
 

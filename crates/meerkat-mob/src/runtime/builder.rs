@@ -647,6 +647,9 @@ pub struct MobBuilder {
     /// W1-C coverage matrix can be exercised end-to-end without per-test
     /// TCP orchestration.
     realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+    /// Host policy for the activation rows a durable fork child of this
+    /// mob's members inherits ([`MobBuilder::with_fork_instruction_policy`]).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// Controlling-side reverse-lane acceptor composition (ADJ-P4-2).
     /// `None` means mixed-host routes that need a local reverse lane fail
     /// closed instead of publishing the member's process-local endpoint.
@@ -1384,6 +1387,7 @@ async fn record_seeded_member_endpoint_broken(
             bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
             reason,
             hold: None,
+            registration_refusal: None,
         },
     );
     Ok(())
@@ -3747,6 +3751,21 @@ fn seed_mob_authority_sync_from_events(
                     // the exact remote spawn ladder reject its own durable
                     // carrier. The key is incarnation-scoped so older
                     // generations still replay and retain history.
+                    //
+                    // The live membership commit cleared the identity's
+                    // kickoff at this point of the history, so clear it here
+                    // too: the incarnation the carrier installs must not
+                    // surface a predecessor's replayed kickoff. Its own
+                    // kickoff updates follow this event and still replay.
+                    apply_seeded_mob_input(
+                        authority,
+                        mob_dsl::MobMachineInput::KickoffClear {
+                            member_id: mob_dsl::AgentIdentity::from_domain(
+                                &member_spawned.agent_identity,
+                            ),
+                        },
+                        "recover_placed_member_spawned_kickoff_clear",
+                    )?;
                     continue;
                 }
                 apply_seeded_mob_signal(
@@ -7004,16 +7023,24 @@ fn seed_mob_authority_restore_failures(
 ) -> Result<(), MobError> {
     use crate::machines::mob_machine as mob_dsl;
     for (identity, diagnostic) in restore_diagnostics {
-        apply_seeded_mob_signal(
-            authority,
-            mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
-                agent_identity: mob_dsl::AgentIdentity::from_domain(
-                    &crate::ids::AgentIdentity::from(identity.as_str()),
-                ),
-                reason: diagnostic.reason.clone(),
+        let agent_identity = mob_dsl::AgentIdentity::from_domain(&crate::ids::AgentIdentity::from(
+            identity.as_str(),
+        ));
+        let reason = diagnostic.reason.clone();
+        // A host refusal of the member's registration keeps its typed code
+        // (instead of the plain failure, whose transition clears the code).
+        let signal = match diagnostic.registration_refusal {
+            Some(call) => mob_dsl::MobMachineSignal::RecoverMemberRestoreHostRefused {
+                agent_identity,
+                refusal_code: call.as_code().to_string(),
+                reason,
             },
-            "recover_member_restore_failure",
-        )?;
+            None => mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
+                agent_identity,
+                reason,
+            },
+        };
+        apply_seeded_mob_signal(authority, signal, "recover_member_restore_failure")?;
     }
     Ok(())
 }
@@ -7143,6 +7170,7 @@ impl MobBuilder {
             spawn_member_customizer: None,
             owner_bridge_session_create_authority: None,
             realtime_session_factory: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
@@ -7226,6 +7254,7 @@ impl MobBuilder {
             spawn_member_customizer: None,
             owner_bridge_session_create_authority: None,
             realtime_session_factory: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
@@ -7436,6 +7465,23 @@ impl MobBuilder {
         self
     }
 
+    /// Set the host policy for the activation rows a durable fork child of
+    /// this mob's members inherits: `fork_member`, `fork_off`, the bounded
+    /// and turn-boundary forks, and council participants forked from this
+    /// mob. It is the host's setting, never a member or tool argument and
+    /// never part of the mob definition. The default
+    /// ([`meerkat_core::ForkInstructionPolicy::RequireExplicitActivation`])
+    /// refuses, before anything is committed, a fork that starts the child's
+    /// first turn itself, since the host has no window to activate the
+    /// child; `fork_member` leaves that activation to the host.
+    pub fn with_fork_instruction_policy(
+        mut self,
+        policy: meerkat_core::ForkInstructionPolicy,
+    ) -> Self {
+        self.fork_instruction_policy = policy;
+        self
+    }
+
     /// Inject a [`meerkat_client::RealtimeSessionFactory`] for mob-provisioned
     /// members that open a realtime channel (W2-E / issue #264).
     ///
@@ -7540,6 +7586,7 @@ impl MobBuilder {
                 spawn_member_customizer,
                 owner_bridge_session_create_authority,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 // A created mob has no restored members to hold.
@@ -7758,6 +7805,7 @@ impl MobBuilder {
                     storage.forked_participants.clone(),
                     notify_orchestrator_on_resume,
                     realtime_session_factory,
+                    fork_instruction_policy,
                     controlling_acceptor,
                     member_live_host,
                     before_activation,
@@ -7827,6 +7875,7 @@ impl MobBuilder {
             spawn_member_customizer,
             owner_bridge_session_create_authority: _,
             realtime_session_factory,
+            fork_instruction_policy,
             controlling_acceptor,
             member_live_host,
             restored_member_run_start_holds,
@@ -8304,6 +8353,7 @@ impl MobBuilder {
                 reachability_observations,
                 phase_watch_rx: preview_phase_rx,
                 realtime_session_factory: realtime_session_factory.clone(),
+                fork_instruction_policy,
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
                 explicit_resume_operations: Arc::clone(&explicit_resume_operations),
                 member_admission_backlog: Arc::clone(&member_admission_backlog),
@@ -8603,6 +8653,7 @@ impl MobBuilder {
                 member_admission_backlog,
                 lifecycle_observations,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 // Cold resume already bound the preview handle before any
@@ -9273,6 +9324,7 @@ impl MobBuilder {
                         bridge_session_id: Some(bridge_session_id),
                         reason,
                         hold: None,
+                        registration_refusal: None,
                     },
                 );
             };
@@ -9780,7 +9832,8 @@ impl MobBuilder {
                         generated_self_owned_operation_owner: Some(
                             generated_self_owned_operation_owner,
                         ),
-                        runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                        runtime_revival_intent:
+                            super::provisioner::RuntimeRevivalIntent::ColdRestore,
                         held_bound: None,
                     })
                     .await
@@ -9835,13 +9888,25 @@ impl MobBuilder {
                             .remove(&entry.agent_identity);
                     }
                     Err(error) => {
-                        record_restore_failure(
-                            bridge_session_id.clone(),
-                            format!(
-                                "failed to restore durable session '{bridge_session_id}': {error}"
-                            ),
-                        )
-                        .await;
+                        // The provision's refusal slot is the only source of
+                        // this typed refusal; the seed records its code, and
+                        // the transaction's own rollback already removed the
+                        // registration the host was asked about.
+                        let registration_refusal = match &error {
+                            MobError::MemberRegistrationRefused { call, .. } => Some(*call),
+                            _ => None,
+                        };
+                        tool_handle.restore_diagnostics.write().await.insert(
+                            entry.agent_identity.clone(),
+                            super::handle::RestoreFailureDiagnostic {
+                                bridge_session_id: Some(bridge_session_id.clone()),
+                                reason: format!(
+                                    "failed to restore durable session '{bridge_session_id}': {error}"
+                                ),
+                                hold: None,
+                                registration_refusal,
+                            },
+                        );
                     }
                 }
                 continue;
@@ -10315,6 +10380,7 @@ impl MobBuilder {
         forked_participant_store: Option<Arc<dyn crate::store::ForkedParticipantStore>>,
         notify_orchestrator_on_resume: bool,
         realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+        fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
@@ -10422,6 +10488,7 @@ impl MobBuilder {
                 member_admission_backlog,
                 lifecycle_observations,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 before_activation,
@@ -10473,6 +10540,7 @@ impl MobBuilder {
         member_admission_backlog: Arc<super::handle::MemberAdmissionBacklogGauge>,
         lifecycle_observations: Arc<super::MemberLifecycleObservations>,
         realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+        fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
@@ -10552,6 +10620,7 @@ impl MobBuilder {
                 reachability_observations: Arc::clone(&reachability_observations),
                 phase_watch_rx,
                 realtime_session_factory,
+                fork_instruction_policy,
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
                 explicit_resume_operations: Arc::clone(&explicit_resume_operations),
                 member_admission_backlog: Arc::clone(&member_admission_backlog),
@@ -10862,6 +10931,7 @@ impl MobBuilder {
                 default_external_tools_provider,
                 identity_local_external_tools_provider,
                 per_spawn_external_tools,
+                fork_instruction_policy,
                 spawn_base_prompt_source,
                 spawn_member_customizer,
                 realm_profile_store,
@@ -13568,6 +13638,113 @@ mod tests {
         assert_eq!(
             authority.state().member_placement.get(&dsl_identity),
             Some(&host)
+        );
+    }
+
+    #[test]
+    fn deferred_placed_spawn_drops_the_predecessors_kickoff() {
+        let definition = MobDefinition::explicit("placed-kickoff-successor");
+        let identity = AgentIdentity::from("placed-kickoff-worker");
+        let generation_zero = Generation::INITIAL;
+        let generation_one = Generation::new(1);
+        let retired_spawn_id = crate::ids::PlacedSpawnId::new();
+        let current_spawn_id = crate::ids::PlacedSpawnId::new();
+        let kickoff_event =
+            |cursor: u64, phase: MobMemberKickoffPhase, error: Option<&str>| MobEvent {
+                cursor,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MemberKickoffUpdated {
+                    member: identity.clone(),
+                    kickoff: MobMemberKickoffSnapshot {
+                        objective_id: None,
+                        phase,
+                        error: error.map(str::to_string),
+                        updated_at: UNIX_EPOCH,
+                    },
+                },
+            };
+        let mut events = vec![
+            MobEvent {
+                cursor: 1,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MobOwnerBridgeSessionBound {
+                    bridge_session_id: meerkat_core::SessionId::new(),
+                    destroy_on_owner_archive: false,
+                    implicit_delegation_mob: false,
+                },
+            },
+            placed_spawned_event(
+                &definition.id,
+                2,
+                &identity,
+                generation_zero,
+                FenceToken::new(7),
+                &retired_spawn_id,
+            ),
+            kickoff_event(
+                3,
+                MobMemberKickoffPhase::Failed,
+                Some("the predecessor's kickoff failed"),
+            ),
+            MobEvent {
+                cursor: 4,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MemberRetired {
+                    agent_identity: identity.clone(),
+                    generation: generation_zero,
+                    role: ProfileName::from("worker"),
+                },
+            },
+            placed_spawned_event(
+                &definition.id,
+                5,
+                &identity,
+                generation_one,
+                FenceToken::new(8),
+                &current_spawn_id,
+            ),
+        ];
+        let committed_keys = BTreeSet::from([(
+            identity.as_str().to_string(),
+            generation_one.get(),
+            current_spawn_id,
+        )]);
+        let replay = |events: &[MobEvent]| {
+            let mut authority = seed_mob_authority();
+            seed_mob_authority_sync_from_events(
+                &mut authority,
+                events,
+                &definition,
+                false,
+                &committed_keys,
+            )
+            .expect("placed replay keeps its kickoff history consistent");
+            authority
+        };
+
+        let authority = replay(&events);
+        assert_eq!(
+            authority
+                .state()
+                .kickoff_material_for_member_id(identity.as_str()),
+            None,
+            "the incarnation the carrier installs must not inherit its predecessor's kickoff"
+        );
+
+        events.push(kickoff_event(6, MobMemberKickoffPhase::Started, None));
+        let authority = replay(&events);
+        assert_eq!(
+            authority
+                .state()
+                .kickoff_material_for_member_id(identity.as_str()),
+            Some(mob_dsl::MobMemberKickoffMaterial {
+                phase: mob_dsl::KickoffPhase::Started,
+                error: None,
+            }),
+            "the incarnation's own kickoff, recorded after its spawn, still replays"
         );
     }
 

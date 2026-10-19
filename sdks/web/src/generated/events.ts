@@ -817,7 +817,9 @@ export type SummarizationTrimStage = "tool_results" | "context" | "user_requests
 
 export type SystemNoticeBlock = {
   content?: ContentBlock[];
+  delivery_id?: InteractionId | null;
   direction: SystemNoticeDirection;
+  in_reply_to?: InteractionId | null;
   intent?: string | null;
   kind: CommsNoticeKind;
   payload?: unknown;
@@ -1357,6 +1359,7 @@ export interface ProviderCacheBreakpointsDiscardedEvent {
 }
 
 export interface PeerContentIngestedEvent {
+  delivery_id?: InteractionId | null;
   kind: CommsNoticeKind;
   peer?: SystemNoticePeer | null;
   request_id?: string | null;

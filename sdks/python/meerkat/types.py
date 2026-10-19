@@ -310,6 +310,7 @@ from .generated.types import (
     WireProjectionProvenance as WireProjectionProvenance,
     WireReachability as WireReachability,
     WireMemberPreviewUnavailable as WireMemberPreviewUnavailable,
+    WireMemberRegistrationHookCall as WireMemberRegistrationHookCall,
     WireRouteInstallObligation as WireRouteInstallObligation,
     WireRuntimeBinding as WireRuntimeBinding,
     WireToolAccessPolicy as WireToolAccessPolicy,
@@ -981,6 +982,15 @@ class SessionTranscriptRevisionList:
 TranscriptEditRunningBehavior = Literal["reject"]
 """Behavior for transcript edit requests when the source session has active work."""
 
+ForkInstructionPolicy = Literal[
+    "require_explicit_activation", "reactivate_inherited", "refuse"
+]
+"""What a fork does with the instruction activations its child inherits.
+
+``require_explicit_activation`` (the default) and ``refuse`` refuse a
+``session/fork_at`` or ``session/fork_replace`` whose child would inherit
+activations; ``reactivate_inherited`` re-activates them in the child."""
+
 
 class TranscriptMessageReplacement(TypedDict):
     type: Literal["message"]
@@ -1174,6 +1184,9 @@ class SessionForkResult:
     message_count: int
     cache_inheritance: ForkCacheInheritance
     session_ref: str | None = None
+    reactivated_instruction_count: int = 0
+    """Instruction re-activation rows the fork appended after the copied
+    prefix; ``message_count`` counts them."""
 
 
 @dataclass(frozen=True, slots=True)

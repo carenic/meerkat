@@ -257,7 +257,8 @@ impl TurnFailureSourceKind {
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
             | AgentError::ControlAppendBlockedByCallbackBatch
-            | AgentError::ClientModelChangeRequiresHotSwap { .. } => Self::ConfigError,
+            | AgentError::ClientModelChangeRequiresHotSwap { .. }
+            | AgentError::InstructionActivation(_) => Self::ConfigError,
         })
     }
 

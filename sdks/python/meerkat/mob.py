@@ -39,6 +39,7 @@ from .generated.types import (
     WireNonPortableResourceKind,
     WireReachability,
     WireMemberPreviewUnavailable,
+    WireMemberRegistrationHookCall,
     WireRuntimeBinding,
     WireToolAccessPolicy,
     WireToolFilter,
@@ -204,6 +205,10 @@ MobMemberSnapshot = TypedDict(
         # output_preview and tokens_used are then missing, not an empty
         # preview and a zero count. Absent when they are observations.
         "preview_unavailable": NotRequired[WireMemberPreviewUnavailable],
+        # Set when the member's host refused its restored registration: the
+        # hook call that refused it. The member stays broken until an
+        # explicit repair.
+        "registration_refusal": NotRequired[WireMemberRegistrationHookCall],
     },
 )
 
@@ -223,6 +228,7 @@ MobKickoffMemberSnapshot = TypedDict(
         "kickoff": NotRequired[dict[str, Any]],
         # As on MobMemberSnapshot.
         "preview_unavailable": NotRequired[WireMemberPreviewUnavailable],
+        "registration_refusal": NotRequired[WireMemberRegistrationHookCall],
     },
 )
 

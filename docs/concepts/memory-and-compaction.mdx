@@ -52,14 +52,23 @@ The default compactor can react to four different pressure signals:
 
 The minimum-boundary cadence is a cost guard, not capacity authority. It may
 suppress an ordinary provider high-water mark, but it cannot veto recovery
-when live history or request bytes already cross a capacity threshold. Under
-byte pressure, the compactor may retain fewer recent turns than the configured
-maximum so the rebuilt request actually fits.
+when request bytes cross a capacity threshold, or when live history does and
+the last rewrite got the history under the threshold. Since 0.9.4, when the
+last rewrite left the history at or above the threshold (for example because
+the System rows alone exceed an explicit `auto_compact_threshold`), a history
+crossing waits for the cadence instead of paying for a summary that recovers
+nothing, and a warning names the remedies. Under byte pressure, the compactor
+may retain fewer recent turns than the configured maximum so the rebuilt
+request actually fits.
 
 ## Summary authority
 
-By default, Meerkat asks the active LLM to write the compaction summary. Hosts
-can instead supply a `CompactionCurator`. A curator replaces only summary
+By default, Meerkat asks the active LLM (after any model fallback, or the
+admitted controller) to write the compaction summary, and since 0.9.4 it sizes
+the transcript it sends for that model's context window.
+`compaction_completed.summary_source` reports who wrote the summary and how
+much of the history its source carried. Hosts can instead supply a
+`CompactionCurator`. A curator replaces only summary
 content production: the runtime still owns the trigger, rewrite validation,
 memory projection, and commit. Curator failure has no LLM fallback and leaves
 history untouched.

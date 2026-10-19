@@ -2811,3 +2811,262 @@ async fn restoration_alone_schedules_recovery_for_unfinished_councils() {
 
     fixture.teardown().await;
 }
+
+// ===========================================================================
+// Fork instruction policy: participants forked from a member with activated
+// host instructions
+// ===========================================================================
+
+const STANDING_BODY: &str = "Always state your uncertainty explicitly.";
+
+/// `definition` with every inline profile on a model that can represent an
+/// ordered mid-conversation System activation (instruction activation needs
+/// it).
+fn activation_capable(mut definition: meerkat_mob::MobDefinition) -> meerkat_mob::MobDefinition {
+    for binding in definition.profiles.values_mut() {
+        if let Some(profile) = meerkat_mob::ProfileBinding::as_inline_mut(binding) {
+            profile.model = "claude-opus-5".to_string();
+        }
+    }
+    definition
+}
+
+/// Seed the source mob on an activation-capable model and activate one host
+/// instruction on `researcher`, the source of participant 0.
+async fn seed_activated_source(fixture: &CouncilFixture) {
+    fixture
+        .seed_source_mob_from(
+            activation_capable(council_definition(fixture.source_mob_id().as_str())),
+            &["researcher", "reviewer"],
+        )
+        .await;
+    let source = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .expect("source mob handle");
+    source
+        .activate_member_instruction(
+            &identity("researcher"),
+            meerkat_core::InstructionActivationRequest {
+                revision: meerkat_core::InstructionRevisionRef {
+                    namespace: meerkat_core::InstructionNamespace::new("host.standing").unwrap(),
+                    key: meerkat_core::InstructionKey::new("member").unwrap(),
+                    revision_id: meerkat_core::InstructionRevisionId::new("rev-standing-1")
+                        .unwrap(),
+                    content_sha256: meerkat_core::InstructionContentDigest::for_body(STANDING_BODY),
+                },
+                activation_id: meerkat_core::InstructionActivationId::new("standing-1").unwrap(),
+                expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                supersedes: None,
+                body: STANDING_BODY.to_string(),
+            },
+        )
+        .await
+        .expect("the host activates an instruction on the source member");
+}
+
+fn activated_source_request(fixture: &CouncilFixture, id: &str) -> TemporaryCouncilRequest {
+    TemporaryCouncilRequest::new(
+        fixture.council_id(id),
+        activation_capable(council_definition("template-is-replaced")),
+        vec![
+            participant(fixture, 0, "analyst", "researcher", "analyst"),
+            participant(fixture, 1, "critic", "reviewer", "critic"),
+        ],
+        "Should we ship the migration this week?",
+        bounds(1, 120),
+        MergeBackPolicy::BoundedTextSummary {
+            finalizer: identity("critic"),
+            max_bytes: 2048,
+        },
+    )
+}
+
+/// A council participant runs its first council turn as soon as it is seated,
+/// so the host has no window to activate inherited keys on it. Under the
+/// default policy the participant fork is refused before anything is
+/// committed, and the council ends with the typed refusal (not a seating
+/// detail string) naming the participant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participant_of_an_activated_member_ends_the_council_with_the_typed_refusal() {
+    let fixture = CouncilFixture::new(role_script);
+    seed_activated_source(&fixture).await;
+    let calls_before = fixture.provider_calls();
+
+    let outcome = fixture
+        .state
+        .temporary_council()
+        .run(activated_source_request(&fixture, "activated-default"))
+        .await
+        .expect("the council reaches a terminal outcome");
+    match &outcome.result.exit_reason {
+        TemporaryCouncilExitReason::ParticipantForkInstructionRefused {
+            participant_order,
+            refusal,
+        } => {
+            assert_eq!(*participant_order, 0, "the activated source's participant");
+            assert_eq!(
+                refusal.cause,
+                meerkat_core::ForkInstructionRefusalCause::PolicyRefuses
+            );
+            assert_eq!(
+                refusal.keys,
+                vec![(
+                    meerkat_core::InstructionNamespace::new("host.standing").unwrap(),
+                    meerkat_core::InstructionKey::new("member").unwrap(),
+                )]
+            );
+        }
+        other => panic!("expected the typed participant fork instruction refusal, got {other:?}"),
+    }
+    assert_eq!(
+        fixture.provider_calls(),
+        calls_before,
+        "no participant reached the model"
+    );
+    // The owner refused the create, typed, before committing anything: the
+    // slot settles as `Refused` in the sealed record, so cleanup has nothing
+    // to revoke and owes nothing for it.
+    let record = fixture
+        .state
+        .temporary_council()
+        .load(&fixture.council_id("activated-default"))
+        .await
+        .expect("load")
+        .expect("record present");
+    assert_eq!(
+        record.result.as_ref().map(|result| &result.exit_reason),
+        Some(&outcome.result.exit_reason),
+        "the sealed record carries the typed exit"
+    );
+    assert_eq!(
+        record
+            .participant(0)
+            .expect("participant 0 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::Refused
+    );
+    assert_eq!(
+        record
+            .participant(1)
+            .expect("participant 1 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::NotAttempted
+    );
+    assert!(
+        outcome.cleanup.temporary_mob_destroyed,
+        "cleanup: {:?}",
+        outcome.cleanup
+    );
+    assert!(
+        outcome.cleanup.revoked_participants.is_empty(),
+        "nothing is revoked for the refused slot: {:?}",
+        outcome.cleanup
+    );
+    assert!(
+        outcome.cleanup.debts.is_empty() && outcome.cleanup.settled(),
+        "the refused slot leaves no cleanup debt: {:?}",
+        outcome.cleanup
+    );
+    fixture.teardown().await;
+}
+
+/// Control: a create that fails with any other error keeps its slot
+/// `Pending`, so cleanup still reconciles it by its request id and records the
+/// unknown outcome as debt. Only the typed fork instruction refusal settles a
+/// slot as `Refused`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_fails_untyped_keeps_its_slot_pending_with_debt() {
+    let fixture = CouncilFixture::new_with(role_script, |state, _root| {
+        let inner: Arc<dyn meerkat_mob::store::ForkedParticipantStore> =
+            Arc::new(meerkat_mob::store::InMemoryForkedParticipantStore::new());
+        state.with_forked_participant_store(Arc::new(FlakyCapabilityStore::failing_reservation(
+            inner, 1,
+        )))
+    });
+    fixture.seed_source_mob(&["researcher", "reviewer"]).await;
+
+    let request =
+        two_participant_request(&fixture, "create-fails", MergeBackPolicy::NoMerge, 1, 240);
+    let council_id = request.council_id.clone();
+    let outcome = fixture
+        .state
+        .temporary_council()
+        .run(request)
+        .await
+        .expect("the council reaches a terminal outcome");
+    match &outcome.result.exit_reason {
+        TemporaryCouncilExitReason::ParticipantSeatingFailed {
+            participant_order,
+            detail,
+        } => {
+            assert_eq!(*participant_order, 0);
+            assert!(
+                detail.contains("capability creation failed"),
+                "an untyped create failure: {detail}"
+            );
+        }
+        other => panic!("expected a seating failure, got {other:?}"),
+    }
+    let record = fixture
+        .state
+        .temporary_council()
+        .load(&council_id)
+        .await
+        .expect("load")
+        .expect("record present");
+    assert_eq!(
+        record
+            .participant(0)
+            .expect("participant 0 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::Pending
+    );
+    let request_id = council_id.capability_request_id(0).expect("request id");
+    assert!(
+        outcome
+            .cleanup
+            .debts
+            .iter()
+            .any(|debt| debt.subject == format!("capability:{request_id}")),
+        "the unknown create outcome is reconciled as debt: {:?}",
+        outcome.cleanup
+    );
+    fixture.teardown().await;
+}
+
+/// With `ReactivateInherited` the same council seats the participant with its
+/// own activation of the inherited key and runs to completion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participant_of_an_activated_member_runs_when_the_host_opts_in() {
+    let fixture = CouncilFixture::new_with(role_script, |state, _root| {
+        state.with_fork_instruction_policy(meerkat_core::ForkInstructionPolicy::ReactivateInherited)
+    });
+    seed_activated_source(&fixture).await;
+
+    let outcome = fixture
+        .state
+        .temporary_council()
+        .run(activated_source_request(&fixture, "activated-reactivate"))
+        .await
+        .expect("the council reaches a terminal outcome");
+    assert_eq!(
+        outcome.result.exit_reason,
+        TemporaryCouncilExitReason::Completed,
+        "the council completes with the re-activated participant"
+    );
+    let texts = completed_texts(&outcome);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("position from analyst")),
+        "the activated source's participant took its council turn: {texts:?}"
+    );
+    assert!(
+        outcome.cleanup.settled(),
+        "cleanup debt: {:?}",
+        outcome.cleanup
+    );
+    fixture.teardown().await;
+}

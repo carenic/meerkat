@@ -83,6 +83,7 @@ fn create_payload(
         scope: BridgeForkedParticipantScope::InvokeAndObserve,
         reuse: BridgeForkedParticipantReuse::OneShot,
         ttl_millis: u64::try_from(ttl.as_millis()).expect("ttl fits"),
+        inherited_instructions: None,
     }
 }
 

@@ -158,6 +158,19 @@ reports a typed `participant_seating_failed` exit reason. Expiry of the
 remaining deadline reports `deadline_exceeded`; neither case fabricates a
 successfully seated participant.
 
+A participant forked from a member with activated host instructions is forked
+under the host's fork instruction policy (see [Mobs](/guides/mobs)). A
+participant runs its first council turn as soon as it is seated, so under the
+default policy the fork is refused before anything is committed and the council
+ends with the typed `participant_fork_instruction_refused` exit reason. It
+carries the participant's order and the typed refusal, and it is the same for
+local and host-placed sources. Nothing was created for the refused
+participant, so cleanup has nothing to revoke and records no cleanup debt for
+its slot. With `reactivate_inherited` the participant starts with its own
+activation of every key that was effective in its source.
+A member host older than this release cannot take the policy; asking it to
+re-activate ends the council with the refusal cause `member_host_unsupported`.
+
 ## Idempotency
 
 The council id is the idempotency key.
@@ -210,8 +223,8 @@ mob. How the sealed result reaches the caller depends on the host:
   revived when the continuation is applied: through its mob when it is a mob member, or through the
   host's `DetachedOwnerHost` when it is a plain session. The status is
   **`failed`** when the exit reason is a failure (`participant_seating_failed`,
-  `participant_source_replaced`, `wiring_incomplete`, `exchange_failed`,
-  `coordinator_interrupted`); the
+  `participant_fork_instruction_refused`, `participant_source_replaced`,
+  `wiring_incomplete`, `exchange_failed`, `coordinator_interrupted`); the
   record still carries the full sealed outcome, and bound-limited ends
   (`max_exchanges_reached`, `deadline_exceeded`) complete normally with their
   partial result. The notice survives later model calls, turns, and reloads

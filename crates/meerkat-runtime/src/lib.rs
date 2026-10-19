@@ -135,6 +135,9 @@ pub(crate) struct SessionRuntimeBindingsAuthority {
     /// converts it into a one-shot claim if the window is still vacant.
     pub(crate) legacy_actor_materialization_generation: Option<u64>,
     pub(crate) release_materialization_claim_on_drop: bool,
+    /// Minted by an attached actor recovery lease, whose claim sits on an
+    /// entry with a serving attachment. Such bindings own no rollback.
+    pub(crate) attached_actor_recovery: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +239,31 @@ pub(crate) fn session_runtime_bindings_authority(
         materialization_claim_state,
         legacy_actor_materialization_generation,
         release_materialization_claim_on_drop,
+        attached_actor_recovery: false,
+    })
+}
+
+/// The binding authority of an attached actor recovery lease: its exact
+/// claim, no compatibility generation, nothing released on drop (the lease
+/// reverts the claim), and no rollback authority.
+pub(crate) fn attached_actor_recovery_bindings_authority(
+    session_id: meerkat_core::SessionId,
+    epoch_id: meerkat_core::RuntimeEpochId,
+    dsl_authority: Arc<std::sync::Mutex<meerkat_machine::dsl::MeerkatMachineAuthority>>,
+    teardown_gate: Arc<handles::HandleTeardownGate>,
+    materialization_claim_id: uuid::Uuid,
+    materialization_claim_state: Arc<std::sync::Mutex<RuntimeActorMaterializationClaimState>>,
+) -> Arc<dyn Any + Send + Sync> {
+    Arc::new(SessionRuntimeBindingsAuthority {
+        session_id,
+        epoch_id,
+        dsl_authority,
+        teardown_gate,
+        materialization_claim_id: Some(materialization_claim_id),
+        materialization_claim_state,
+        legacy_actor_materialization_generation: None,
+        release_materialization_claim_on_drop: false,
+        attached_actor_recovery: true,
     })
 }
 

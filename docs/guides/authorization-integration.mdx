@@ -12,34 +12,34 @@ separate fixed-host, single-connection JSONL profile, use
 [Native governed embedding](/rust/native-authorization).
 
 <Note>
-**Preview integration contract, October 2026.** The Rust implementation is under
-active integration. These steps identify real owner interfaces and deployment
-responsibilities; they are not a copy-and-paste configuration recipe. No new CLI
-flag or universal REST/RPC authorization setup is documented here. Existing
-[provider login](/guides/auth) remains credential setup, not activation of this
-governed profile.
+These steps identify real owner interfaces and deployment responsibilities for
+an embedding application; they are not a copy-and-paste configuration recipe.
+The stock `rkat` CLI and `rkat-rpc` instead open a governed realm configured
+through [Governance settings](/concepts/configuration#governance-settings).
+Existing [provider login](/guides/auth) remains credential setup, not
+activation of this governed profile.
 </Note>
 
 Each protected operation needs current native permission. Its owner's policy
 selects no additional review (R1), bounded model review (R2), or fresh human
 approval (R3). Review and consent cannot supply missing permission. Refused or
 action-required operations return local feedback while permitted work continues.
-The support table below separates recorded evidence from remaining work; the
-[review requirements](#model-review-requirements) explain how to integrate each
-choice.
+The support table below summarizes what is supported and its current limits;
+the [review requirements](#model-review-requirements) explain how to integrate
+each choice.
 
 ## Check support before rollout
 
-| Area | Current evidence and remaining work |
+| Area | What is supported and current limits |
 | --- | --- |
-| Native input, grants, and tool feedback | Completed-turn SQLite has direct acceptance in actual separate processes, marked File-credential restoration, fresh current host grants and new authenticated model-tool-model work. The published fixed-host JSONL profile has focused public-entry acceptance and recorded CI qualification for local refusal, permitted siblings and same-run notification feedback, using in-memory storage and loopback callbacks. The [implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md) owns exact source scope and test inventories. Ordinary constructors, JWT ingress, interrupted recovery and all-surface activation remain unqualified. |
-| Model/provider and infrastructure errors | Focused tests exercise primary infrastructure-error classification through three provider adapters, native deferred siblings, and live/fallback fixtures. They do not certify every production route, retry, hosted capability, or live mode. |
-| Controller continuity | Actual controller selection and retained work references exist; the qualified cold case pins the reconstructed actor and issues current host grants. Storeless grant mutation uses actual native custody and vetoes unfinished controller lineages. Persistent controller administration remains unavailable; complete account-policy, credential-removal and concurrent-admission coverage remains open. |
-| Application tool policy on mob resume | Core 0.8.51 release-tag source drops the host policy registry during cold member restore and can replace an explicitly tightened application policy with the older persisted binding on resume. The Core 0.8.52 local rebuild candidate has independent source review and passing real-factory cold/explicit-resume controls linked to its source. Candidate hooks, CI and publication remain separate. Already-live reseating does not apply a changed binding or registry, and placed-member resume retains an unresolved portable policy-intent gap. These findings concern application consequence policy, separately from native tool-access restrictions. See the [implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md). |
-| Durable operation audit | Completed-turn SQLite acceptance preserves committed input-row audit and the original transcript prefix through cold reconstruction and fresh work. The fixed-host JSONL cases also assert native audit. These results do not prove crash-safe pre-effect evidence, interrupted recovery, every observation-failure path or complete commit-race coverage. |
-| Human consent | The existing approval owner maintains request, decision, and expiry audit records. A source candidate adds authenticated action-bound decisions, conditional consumption and restored history without live consent. Targeted store corrections have passing tests; current host/account context, authenticated presentation, later decision delivery and interrupted recovery remain unqualified. See [Human consent](#human-consent) for the store outcomes and restored history. |
-| OS confinement | Local macOS tests cover shell launch, bootstrap, foreground/background execution and recovered monitors. A native foreground scenario also verifies a blocked syscall, permitted sibling, continued model turn and input-row audit. Command hooks, restart, Linux, Windows, containers and browser/WASM retain their separate integration and acceptance requirements. |
-| Console access administration | Access refresh and typed local feedback have component, browser and published Console CI qualification. The Access panel edits Meta console ABAC, not native tool, source or account grants. Console projection does not activate native governance or establish an integrated native-plus-Console route. |
+| Native input, grants, and tool feedback | Native input admission, current host grants and local tool feedback work for explicit Rust embeddings (storeless, in-memory or SQLite), the fixed-host JSONL profile, and a governed realm opened by the stock `rkat` CLI or `rkat-rpc`. A completed-turn SQLite session reopens in a new process with the host's stored credential and fresh current host grants. Caller authentication stays with the host: Meerkat ships no token-verifying (for example JWT) governed ingress. The stock REST and MCP servers refuse to start on a governed realm. |
+| Model/provider and infrastructure errors | Provider adapters, native deferred siblings, and live and fallback paths classify primary infrastructure errors as typed infrastructure outcomes, distinct from permission refusals; section 4 below covers how to handle each. |
+| Controller continuity | Admission pins the actual controller and retains its selection with the work. Controller grant administration (`try_controller_grant_mutation`) takes actual native custody on a storeless machine or one over the InMemory or SQLite runtime store, vetoes unfinished controller lineages, and refuses on contention instead of waiting. |
+| Application tool policy on mob resume | Cold restore, its fresh fallback, explicit resume and warm revival forward the host's current policy registry, and an explicit current choice (`SpawnMemberSpec::application_tool_policy = Some(binding)`) replaces a resumed member's older durable binding. A member whose session is already live when a resume reaches it keeps its running binding and registry; a changed choice is not applied to it. A placed (remote) member's portable spec carries a concrete binding, so it cannot yet tell an absent choice from an explicit one; an absent choice compiles to the default. This concerns application consequence policy, separately from native tool-access restrictions. |
+| Durable operation audit | Committed input-row audit and the original transcript prefix survive SQLite close and reopen and later fresh work; the fixed-host JSONL profile records native audit too. Observations commit with the existing native commits, not before each effect, so do not promise crash-proof pre-effect evidence. |
+| Human consent | The existing approval owner maintains request, decision, and expiry audit records. Native R3 consent (since 0.9.0) adds authenticated action-bound decisions and conditional consumption at entry; a restored consent record is history only. See [Human consent](#human-consent). |
+| OS confinement | Required confinement covers shell launches (foreground, background and recovered monitors), command hooks and local MCP stdio servers, with backends on macOS and Linux; on other platforms a required launch refuses. Containers count only for the isolation they really provide. |
+| Console access administration | The Access panel edits Meta console ABAC, not native tool, source or account grants. Console projection does not activate native governance. |
 | Publication and overhead | The explicit native and fixed-host JSONL profiles have normal publication and recorded CI qualification. Completed measurements have not met the cheap-default target: the representative study's six conditional mean comparisons missed their threshold. Full-platform and per-operation p99 acceptance remain open; the implementation checkpoint retains the exact measurements and their limits. |
 | Full application coverage | Tool/source access, peers, schedules, memory/history/export, Elephant, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
 
@@ -64,6 +64,28 @@ Verify that the actual caller may invoke the delegation. An agent holding a
 grant for a represented user does not mean every caller may use it. A restore,
 retry, or fresh login must not rewrite the original requester.
 
+In a stock governed realm, keep each input's requester exact (0.9.4).
+`StockGovernance::bind_prompt` binds only a prompt of the local operator
+(`Input::Prompt`, from the CLI or a governed JSONL connection, under the labels
+`prompt-<event>`, `prompt-events` and `rkat-prompt-<event>`). Any other input,
+an external event included, is refused with
+`StockGovernanceError::RequesterUnsupported` before anything is written; 0.9.3
+bound any input with the operator as its requester. An outcome your own process
+reports after an administrative command, for example a finalized connector
+installation, is not the operator's request: bind it with
+`StockGovernance::bind_host_outcome` as a durable external event
+(`InputOrigin::External`, `InputDurability::Durable`; any other origin or
+durability is refused). Its requester is the composition's stock ingress, a
+runtime host; it runs under the operator's grant-lineage mandate at the
+operator's session with no represented subject, under the labels
+`host-outcome-<event>`, `host-outcome-events` and `rkat-host-outcome-<event>`,
+and in a turn of its own. Both calls return the input to submit and a
+`PendingOriginal` to admit once the runtime accepted that exact input; after an
+uncertain delivery, resubmit that input instead of binding again. A
+host-authenticated composition refuses both, and since 0.9.4 also refuses its
+own stock ingress principal (`StockPrincipals::ingress_actor`) as a requester,
+with a Denied verdict before the host is asked.
+
 ## 2. Compose grants with resource policy
 
 The current Rust composition uses `LocalGrantAuthority` and
@@ -77,6 +99,13 @@ The current Rust composition uses `LocalGrantAuthority` and
 Both use the grant owner's local publication ordering. They read current local
 facts without hidden network requests. A publication stamp invalidates decisions;
 it is not a second policy database.
+
+Resource-domain restrictions can be owner-scoped (0.9.4):
+`DomainRestriction::owned_by(owners)` permits every domain whose typed authority
+is one of the owners, so a parent grant can fix the application while each child
+names its exact session domain with `DomainRestriction::exact`. See
+[native authorization](/rust/native-authorization) for conjunction, review text
+and the downgrade boundary.
 
 For an external API, retain the credential in a trusted connector and enforce
 the narrower operation grant before use. Resolve a calendar ID, tenant, database,
@@ -113,6 +142,37 @@ Map typed errors before rendering text:
 - `OperationAuthorizationError::Refused` represents an ordinary operation
   refusal. Give the agent audience-safe feedback, preserve permitted siblings,
   and let it choose a different action within existing budgets.
+- A refusal of kind `OperationRefusalKind::ReprepareRequired` is a stale read:
+  the owners' publication changed while the operation was prepared or checked.
+  It is not a denial. Since 0.9.4 a grant resolution that meets an owner change
+  reports that stale read instead of an unavailable grant authority: a
+  grant-backed preparation rebuilds once, controller admission reports
+  `RuntimeDriverError::ControllerReadinessUnavailable` with
+  `ControllerReadinessFailure::PolicyChanged`, a review read refuses as stale
+  instead of reporting an unavailable review context, and a configured MCP
+  attachment's per-agent grant check answers `McpAttachmentRefusal::NotCurrent`.
+  A governed helper's admission fence and a helper child issuance answer
+  `Unavailable` rather than `Denied` when their check refuses to rebuild. A
+  poisoned publication, failed durable grant custody and a clock failure still
+  answer `Unavailable`. See [Owner changes in progress](#owner-changes-in-progress).
+- The model-facing `operation_refused` payload carries `data` with exactly the
+  closed kind and whether the tool ran (0.9.4):
+  `{"kind": "reprepare_required", "tool_invoked": false}`, with kinds
+  `reprepare_required`, `denied` and `malformed_facts` and `tool_invoked`
+  `false` or `"unknown"` (always present, so its absence never reads as not
+  invoked). Neither field is a permission; the message, `Display`, `Debug` and
+  tracing stay uniform. `OperationRefused::dispatch` returns the
+  `RefusalDispatch` behind `tool_invoked`: `NotDispatched` only when the fenced
+  dispatch, a retained consent attempt or the execution policy gate met the
+  refusal before invoking the tool code it guards, otherwise `Unknown`. A
+  dispatcher layer that runs tool code of its own before delegating forwards
+  `OperationRefused::new(refusal.kind())`. `OperationRefused` equality now
+  includes that fact: compare `kind()` and `dispatch()` rather than a value
+  built with `OperationRefused::new(kind)`. A mob member upcall keeps carrying
+  the bare kind (a 0.9.3 peer decodes it as before; the receiving model reads
+  `"unknown"`), and an upcall refusal whose data is absent or names no known
+  kind decodes as `operation_authorization_unavailable`, since it is no verdict
+  the peer gave.
 - `OperationAuthorizationError::Unavailable` means the authorization owner
   could not supply authority. Preserve `operation_authorization_unavailable`;
   this is not a policy denial or reviewer verdict. Repair the owner for that
@@ -138,13 +198,13 @@ result, not string matching. Keep private grant, account, and source details out
 of public status text.
 
 Before resubmitting an operation, use its typed outcome to choose the next step.
-These are integration responsibilities; human routing retains the preview
-limits in [Human consent](#human-consent).
+These are integration responsibilities; for human routing, see
+[Human consent](#human-consent).
 
 | Outcome | Next step |
 | --- | --- |
 | Permission or review denied | Check the current operation policy or review decision. Preserve permitted sibling results and let the agent choose an allowed action. Do not restart the whole turn solely because this operation was refused. |
-| Review context changed | A later explicit attempt needs current authorization and a fresh review. The previous allow cannot authorize changed work. |
+| Review context changed | A later explicit attempt needs current authorization and a fresh review. The previous allow cannot authorize changed work. Since 0.9.4 a model-reviewed call superseded only by one owner change, with unchanged material, is reviewed once more by the dispatch itself. |
 | Human consent required or escalated | Use a configured, supported route to an eligible human for the exact retained candidate. With no such route, return local feedback. Displaying an approval reference or receiving a decision does not execute the action. |
 | Reviewer unavailable | Inspect the typed reason: missing reviewer, unsupported entry, expired deadline and unavailable owner need different repairs. None supplies an allow verdict or authorizes automatic retry. |
 | Required audit observation failed | Repair the observation owner. Retain entered effects, permitted sibling results and separate settlement diagnostics. Keep the infrastructure failure distinct from denial; approval cannot repair it. |
@@ -167,6 +227,66 @@ existing native commit, preserving concurrent suffixes and rollback behavior.
 Report process-lifetime storage as such; do not add an undisclosed fsync to each
 operation or promise crash-proof pre-effect evidence.
 
+Since 0.9.4 a `Refused` audit observation carries an `AuditRefusalRead` that
+says where the refusal was decided: its `basis` (`owner_answer`: the owners
+answered at one coherent publication, a prepared decision's own validity window
+included; `publication_changed`: the publication changed under the attempt and
+the change completed; `change_in_progress`), the observation time, the sequence
+the attempt read, the live sequence when the publication changed, and the
+publication instance. A `Prepared` record's `AuditPolicyRead` names its
+publication instance too; sequences of different instances do not compare.
+These are process-local diagnostics, not permissions or freshness proofs.
+`AuditObservation` is `#[non_exhaustive]`: match it with a wildcard arm. Rows
+carry both fields at stored input state version 7; a row stamped earlier that
+carries either is refused, and records written before 0.9.4 read with neither.
+
+### Owner changes in progress
+
+An owner that holds a change across its storage commit used to outlast every
+built-in rebuild, so ordinary operations failed during routine owner changes.
+Since 0.9.4 an operation refused to rebuild while a change is in progress on its
+work's own publication waits for that change to complete and rebuilds under the
+same operation: a model request (one deadline per model call: 2 s or the
+remaining run budget if less, at most 3 free rebuilds), a governed tool dispatch
+at its prepared entry, its body entry and the call-level policy gate (inside the
+tool's timeout), the `web_search` helper's model request (within the call's
+remaining tool time) and a compaction summary. A free rebuild starts only once
+no change is in progress. Past the bounds the refusal takes its ordinary path
+(one rebuild, then local feedback), as does any other refusal kind. A run whose
+budget runs out while waiting ends with the time-budget terminal, not a refusal.
+Waiting never weakens a check: the rebuild still needs a coherent observation
+and every current check.
+
+A custom `WorkAuthorization` reports a change in progress through
+`owner_change_in_progress` (provided; default `None`), a waiting hint that is
+never a permission. `LocalAuthorizationPublication::change_in_progress` answers
+it for the local owners, and the native run and audit wrappers forward it.
+`meerkat_core::authorization::OwnerChangeChurn` implements the bounded wait
+(`OWNER_CHANGE_WAIT_BOUND` 2 s, `OWNER_CHANGE_FREE_REBUILDS` 3); a tool that
+waits inside its body bounds it by `ToolDispatchContext::remaining_tool_time`.
+Each wait is one `debug` event of target `meerkat::authz::owner_change_wait`
+with `site`, `operation_id`, `waited_ms` and `settled`, and each refused attempt
+keeps its own audit record. A delegate operation of a tool call takes that call's
+waiting state from `ToolDispatchContext::owner_change_churn`, so its waits report
+as the call's.
+
+To see what Core did with each refusal, install an `OperationRefusalObserver`
+with `AgentBuilder::with_operation_refusal_observer` or
+`AgentFactory::with_operation_refusal_observer` (0.9.4). It receives an
+`OperationRefusalObservation` per decided disposition: the session, the run and
+the refused operation; the surface (the model request, a tool call by its
+tool-use id, or a compaction summary); the outcome (the closed kind with its
+`RefusalDispatch`, read from the same value the model payload renders, or owners
+that could not decide); and the disposition (waited for an owner change, with how
+long and whether it settled; rebuilt; sent to the controller; returned as the
+tool result; skipped the compaction; failed the run). It is a diagnostic at
+decision time, not exactly-once across a crash: an operation reported as waiting
+or rebuilding may still fail afterwards. It is called synchronously on the
+deciding task and must not block, so hand observations to your own channel.
+Nothing of it enters the event stream, a wire type or any model context. Review
+outcomes and exact-control refusals (MCP attachments, tool applications, context
+controls) are not observed.
+
 ### SDK error compatibility
 
 The corrected SDK error contract in this release exposes `outcome_uncertain` in
@@ -184,55 +304,24 @@ into success, denial, or permission to retry. A compatible version handshake
 alone does not establish that a client can decode every new enum value.
 
 The correction preserves released Rust enum ordinals and updates the closed
-TypeScript and Python validators. Recorded Rust, Python and TypeScript checks
-pass on that change; see the exact scope in the
-[implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md).
-These checks do not establish full end-to-end SDK support.
+TypeScript and Python validators.
 
-### Preserve restrictions during respawn (candidate)
+### Preserve restrictions across respawn
 
-For a locally bound predecessor, the respawn candidate carries its inherited
-launch policy and tool visibility ceiling into its successor. It reads those
-restrictions from the actual retained session owner before retiring it.
-
-If that authority is lost, `RespawnPredecessorRestrictionsUnavailable` refuses
-the respawn and retains the member, including a Broken member after partial
-cold restart. Preserve usable siblings and give the calling agent local feedback.
-A surviving profile name or session reference cannot reconstruct the lost
-restrictions. A generation proven never to have had a local session is a
-different case; its successor still keeps its own inherited policy and ceiling.
+`MobHandle::respawn` retires a member and spawns its successor in a fresh
+session with the same profile, labels, wiring, binding (or placement), profile
+and model overrides and runtime mode. It does not copy restrictions the
+predecessor received at spawn time, such as its `SpawnMemberSpec`
+`tool_access_policy` or `inherited_tool_filter` (the inherited tool visibility
+ceiling). To keep them, respawn with `respawn_with_successor_spec` and a spec
+that carries them again, or re-apply them in a `SpawnMemberCustomizer`, which
+also runs for respawns (`SpawnSource::Respawn`). A surviving profile name or
+session reference cannot reconstruct lost restrictions.
 
 Explicit retirement and a fresh spawn are separate governed operations under
-current authorization and inherited restrictions. They do not recover the lost
+current authorization and inherited restrictions. They do not recover lost
 predecessor authority, and an acknowledgement cannot make that authority
-unrestricted. A pending respawn correction candidate passes the corrected
-cold-loss scenario:
-respawn returns the typed refusal, preserves the exact Broken member, and
-installs no replacement trust. A separate surviving-session scenario passes
-replacement and reciprocal peer wiring after service reconstruction. These
-tests retain an in-memory RuntimeStore within one process and use default
-profiles; separate-process recovery and continuity of nontrivial inherited
-restrictions remain unproven. See the
-[implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md)
-for the exact source and executed scope.
-
-### Preserve child ownership during shutdown (candidate)
-
-Durable-child shutdown must settle the state owner's admitted creation and
-recovery work as well as its child actors before releasing root ownership.
-A closed actor channel is not a clean settlement report. Preserve pending
-cleanup or effect debt across repeat shutdown calls and cancelled callers.
-Until that contract is implemented, the interim design requires retaining the
-existing root claim until process exit; same-process reopen then returns
-AlreadyClaimed. This is a later implementation slice, not released durable-child
-recovery support.
-
-Choose child durability explicitly. ProcessBound remains valid long term.
-The definition-based `.persistent_state()` convenience path persists session
-and runtime data while keeping mob storage in memory; durable-child support
-through that path remains open. A supplied `.mob_spec(spec)` can carry a
-durable composition. Preserve the actual selected custody and its matching
-provenance instead of inferring child durability from a constructor name.
+unrestricted.
 
 ## 5. Retain a usable controller for admitted work
 
@@ -254,10 +343,6 @@ that condition. Audit failures do not authorize retrying an effect.
 ## 6. Add review, consent, or confinement where required
 
 ### Model review requirements
-
-The [model-review and consent amendment](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
-defines the accepted integration direction. The responsibilities below do not
-establish end-to-end implementation or qualification.
 
 Have the existing native policy owner select the requirement for each operation.
 Check policy coverage at activation and when adding dynamic operations; unknown
@@ -281,9 +366,9 @@ Have each owner distinguish required material, genuine inapplicability, and
 unavailable context. Missing or unsupported facts are not inapplicability;
 required facts that cannot be supplied or disclosed produce typed unavailable
 review before reviewer transport. The action account comes from the action's
-actual owner, not the reviewer's credential route. Concrete host/account
-derivations still need integration. Keep this optional review-context work off
-the R1 path.
+actual owner (`review_action_account`), not the reviewer's credential route; an
+owner that does not implement it fails closed as unavailable. Keep this optional
+review-context work off the R1 path.
 
 The reviewer itself needs authorization for its actual model, processor,
 credential route, investigation tools, and information sources under that work
@@ -300,14 +385,45 @@ queued work continue. Required audit-observation failure remains an infrastructu
 error, not a denial or ordinary reviewer-unavailable result. Human approval cannot
 repair that failure.
 
+Since 0.9.4 one owner change alone does not fail a model-reviewed (R2) call.
+When it lands during the review, at its verdict's commit, or at the dispatch's
+entry staging before the tool's dispatcher runs, and the operation is still
+permitted at R2 with the same review material, the fenced dispatch re-prepares
+it and reviews it once more from the start, as a second attempt for the same
+`tool_call_id`; the earlier verdict is never used. Deciding to review again
+reads the successor's material once through `review_operation_context`, so an
+owner sees one more read per superseded call. At most one re-review runs per
+call, only after an allow or a reviewer failure, and only with enough tool time
+left for a whole review deadline. A review observer can see a `ContextChanged`
+retirement followed by that second attempt (a second `ReviewAttemptStarted`
+audit record after the successor's `Prepared` record): do not treat the
+retirement as the call's final outcome. A second change, a denial or escalation,
+an expired review, a changed tier (human consent included), changed or
+unreadable material, and a change once the tool's dispatcher is running settle
+as before. An owner change still in progress when the verdict is checked is
+waited out within the attempt's review deadline (2 s at most).
+
+In the stock governed realm the review mandate follows the work's actual
+requester (0.9.4). A reviewer reads it as the current mandate and a person sees
+it as the `stock.review_mandate` consent label. For an outcome bound with
+`bind_host_outcome` it states that the stock ingress requested the work, that no
+person did and that it is not the operator's consent, that it runs under the
+operator's grant-lineage mandate, and it attributes the event's content to the
+ingress instead of asserting it. The texts for an operator's prompt and a
+host-authenticated caller are unchanged. The requester a stock consent surface
+presents is the person the approval is presented to; the work's own requester
+is in the mandate.
+
 ### Human consent
 
 The existing `ApprovalService` exposes `request`, `get`, `list`, and `decide` for
 approval audit records. These methods do not authenticate supplied actor
-identities or execute effects. The native consent candidate adds a separate
-authenticated decision and retained-action path; the workflow is not qualified
-end to end. Its store outcomes and restored history, described below,
-remain subject to the current integration status.
+identities or execute effects. Native R3 consent (since 0.9.0) is a separate
+authenticated decision and retained-action path:
+`BoundOperationReview::with_human_consent(route, validity)` installs the host's
+`HumanConsentRoute`, `ApprovalService::decide_consent` records an
+`AuthenticatedConsentDecision`, and `dispatch_retained_consent_attempt` makes
+the fresh explicit attempt.
 
 For that integration, the host authenticates the decision event, checks
 current approver eligibility, and binds the presented facts to the exact retained
@@ -331,12 +447,12 @@ effect; fresh consent alone does not establish non-delivery. An audit record
 cannot recreate executable consent. Test presentation, delivery, and sink
 integration before advertising this workflow.
 
-The candidate restores consent records as history only. An old Pending or
-Approved row does not restore the original retained action, even when it has no
-`consumed_at`. A real human denial remains Denied; closing the original run or
-withdrawing its authority is a separate withdrawal. A new service refusing an
-old reference and completing fresh work is a safety control, not proof of
-interrupted-run resumption or automatic decision delivery.
+Spendable consent lives in memory: a restored consent record is history only.
+An old Pending or Approved row does not restore the original retained action,
+even when it has no `consumed_at`. A real human denial remains Denied; closing
+the original run or withdrawing its authority is a separate withdrawal. A new
+service refuses an old reference; it does not resume the interrupted run or
+deliver its decision.
 
 Several services may open the same approval store. A service that opens it
 reads consent rows as history: an empty set of retained candidates proves only
@@ -414,12 +530,12 @@ its own administrator authorization and expiry. Present the action approval and
 policy change separately; eligibility to approve does not confer policy-edit
 authority.
 
-### Mandatory hook migration (candidate)
+### Mandatory hook migration
 
-This candidate introduces the hook-locality correction and the
-`model_operations` configuration field. Qualification and full lifecycle
-coverage remain open. This section describes the candidate migration, not
-released availability.
+Since 0.9.0, unsupported mandatory hook configurations are rejected before
+activation (`Config::validate`) and before run admission
+(`AgentError::HookConfigInvalid`), and the `model_operations` field scopes a
+mandatory model-request hook.
 
 Before activation, reject any mandatory model-request hook configuration that
 would also gate the feedback request needed to report its own refusal. Apply
@@ -440,10 +556,11 @@ withheld while permitted work continues; later ordinary requests through the
 same controller must still pass their mandatory hooks. A feedback failure must
 not start another feedback loop.
 
-Unsupported mandatory `RunStarted` and `TurnBoundary` configurations must also
-be rejected before activation or admission in this slice. Per-item boundary
-withholding and full hook-lifecycle coverage remain open; silently skipping
-these gates is not a migration.
+Mandatory `RunStarted` and `TurnBoundary` hooks are rejected before activation
+and admission (`HookTopologyError::UnsupportedLifecycleGate`): per-item boundary
+withholding is not yet supported. Remove such a gate, move its policy to a
+supported point, or change it to `observe` and accept that `observe` enforces
+nothing; silently skipping these gates is not a migration.
 
 Describe outcomes at the actual boundary. `PreLlmRequest` can withhold the model
 request. `PostLlmResponse` runs after the provider call and possible streamed
@@ -468,11 +585,11 @@ The stock hosts (`rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp`) select the
 shell, command-hook and MCP stdio requirements from the `[confinement]` config
 section or their `--confinement` flags and install them through these factory
 settings; see [OS process confinement](/concepts/configuration#os-process-confinement).
-Source-reviewed factory integration also binds required confinement through the
-native command-hook owner. That integration remains queued source, with full
-hook-locality, protected-audit, and platform qualification open; it does not
-establish coverage for every subprocess owner. See the
-[native embedding guide](/rust/native-authorization) for the current checkpoint.
+`AgentFactory::with_command_hook_confinement` binds required confinement
+through the native command-hook owner; `with_host_confinement` installs a stock
+host's resolved shell, command-hook and MCP stdio requirements together. These
+are the launches required confinement covers; another subprocess owner needs
+its own boundary.
 
 At host setup, validate the backend's real capabilities and compile supported
 policy for the configuration generation. Bind exact command inputs at launch

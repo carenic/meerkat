@@ -5748,6 +5748,68 @@ impl std::fmt::Display for ResumeMemberOutcomeDisposition {
         f.write_str(self.as_str())
     }
 }
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum RetireAtScopeVerdictKind {
+    #[default]
+    #[serde(rename = "Current")]
+    Current,
+    #[serde(rename = "NoCurrentIncarnation")]
+    NoCurrentIncarnation,
+    #[serde(rename = "StaleFenceToken")]
+    StaleFenceToken,
+    #[serde(rename = "StaleSessionBinding")]
+    StaleSessionBinding,
+    #[serde(rename = "MobNotRunning")]
+    MobNotRunning,
+}
+impl RetireAtScopeVerdictKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::NoCurrentIncarnation => "NoCurrentIncarnation",
+            Self::StaleFenceToken => "StaleFenceToken",
+            Self::StaleSessionBinding => "StaleSessionBinding",
+            Self::MobNotRunning => "MobNotRunning",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for RetireAtScopeVerdictKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Current" => Ok(Self::Current),
+            "NoCurrentIncarnation" => Ok(Self::NoCurrentIncarnation),
+            "StaleFenceToken" => Ok(Self::StaleFenceToken),
+            "StaleSessionBinding" => Ok(Self::StaleSessionBinding),
+            "MobNotRunning" => Ok(Self::MobNotRunning),
+            other => Err(format!("invalid RetireAtScopeVerdictKind value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for RetireAtScopeVerdictKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for RetireAtScopeVerdictKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 pub type RouteInstallObligation =
     meerkat_machine_schema::catalog::dsl::mob_machine::RouteInstallObligation;
 #[derive(
@@ -8257,6 +8319,13 @@ pub mod inputs {
     pub struct FinishExplicitResume {
         pub attempt: ResumeAttemptId,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireAtScope {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub session_id: SessionId,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -8486,6 +8555,7 @@ pub enum Input {
     BeginExplicitResumeCleanup(inputs::BeginExplicitResumeCleanup),
     SettleExplicitResumeCleanup(inputs::SettleExplicitResumeCleanup),
     FinishExplicitResume(inputs::FinishExplicitResume),
+    RetireAtScope(inputs::RetireAtScope),
 }
 impl Input {
     pub fn kind(&self) -> InputKind {
@@ -8791,6 +8861,7 @@ impl Input {
             Self::BeginExplicitResumeCleanup(_) => InputKind::BeginExplicitResumeCleanup,
             Self::SettleExplicitResumeCleanup(_) => InputKind::SettleExplicitResumeCleanup,
             Self::FinishExplicitResume(_) => InputKind::FinishExplicitResume,
+            Self::RetireAtScope(_) => InputKind::RetireAtScope,
         }
     }
 }
@@ -9013,6 +9084,7 @@ pub enum InputKind {
     BeginExplicitResumeCleanup,
     SettleExplicitResumeCleanup,
     FinishExplicitResume,
+    RetireAtScope,
 }
 
 pub mod signals {
@@ -9429,6 +9501,18 @@ pub mod signals {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SealIdentityGenerationHighwater {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveMemberRevivalHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverMemberRestoreHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -9511,6 +9595,8 @@ pub enum Signal {
     CreateRun(signals::CreateRun),
     RecoverIdentityGenerationHighwater(signals::RecoverIdentityGenerationHighwater),
     SealIdentityGenerationHighwater(signals::SealIdentityGenerationHighwater),
+    ResolveMemberRevivalHostRefused(signals::ResolveMemberRevivalHostRefused),
+    RecoverMemberRestoreHostRefused(signals::RecoverMemberRestoreHostRefused),
 }
 impl Signal {
     pub fn kind(&self) -> SignalKind {
@@ -9623,6 +9709,8 @@ impl Signal {
                 SignalKind::RecoverIdentityGenerationHighwater
             }
             Self::SealIdentityGenerationHighwater(_) => SignalKind::SealIdentityGenerationHighwater,
+            Self::ResolveMemberRevivalHostRefused(_) => SignalKind::ResolveMemberRevivalHostRefused,
+            Self::RecoverMemberRestoreHostRefused(_) => SignalKind::RecoverMemberRestoreHostRefused,
         }
     }
 }
@@ -9704,6 +9792,8 @@ pub enum SignalKind {
     CreateRun,
     RecoverIdentityGenerationHighwater,
     SealIdentityGenerationHighwater,
+    ResolveMemberRevivalHostRefused,
+    RecoverMemberRestoreHostRefused,
 }
 
 pub mod effects {
@@ -10555,6 +10645,15 @@ pub mod effects {
         pub attempt: ResumeAttemptId,
         pub cancelled: bool,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireAtScopeResolved {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub verdict: RetireAtScopeVerdictKind,
+        pub expected_fence_token: Option<FenceToken>,
+        pub actual_fence_token: Option<FenceToken>,
+        pub current_session_id: Option<SessionId>,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10711,6 +10810,7 @@ pub enum Effect {
     GrantRevoked(effects::GrantRevoked),
     ExplicitResumeMemberOutcomeClassified(effects::ExplicitResumeMemberOutcomeClassified),
     ExplicitResumeFinished(effects::ExplicitResumeFinished),
+    RetireAtScopeResolved(effects::RetireAtScopeResolved),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -10862,6 +10962,7 @@ pub enum EffectKind {
     GrantRevoked,
     ExplicitResumeMemberOutcomeClassified,
     ExplicitResumeFinished,
+    RetireAtScopeResolved,
 }
 
 pub mod command_capabilities {
@@ -12427,6 +12528,18 @@ pub enum TransitionId {
     SealIdentityGenerationHighwaterStopped,
     SealIdentityGenerationHighwaterCompleted,
     SealIdentityGenerationHighwaterDestroyed,
+    RetireAtScopeCurrentRunning,
+    RetireAtScopeCurrentStopped,
+    RetireAtScopeNoCurrentIncarnationRunning,
+    RetireAtScopeNoCurrentIncarnationStopped,
+    RetireAtScopeStaleFenceTokenRunning,
+    RetireAtScopeStaleFenceTokenStopped,
+    RetireAtScopeStaleSessionBindingRunning,
+    RetireAtScopeStaleSessionBindingStopped,
+    RetireAtScopeMobNotRunningCompleted,
+    RetireAtScopeMobNotRunningDestroyed,
+    ResolveMemberRevivalHostRefusedRunning,
+    RecoverMemberRestoreHostRefusedRunning,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

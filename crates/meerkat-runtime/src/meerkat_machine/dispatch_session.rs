@@ -25,6 +25,9 @@ enum MaterializationClaimRequest<'a> {
         state_sink: &'a std::sync::Mutex<
             Option<Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>>,
         >,
+        /// Set once the prepare knows whether it inserted the session's
+        /// registration or found one already current.
+        inserted_sink: &'a std::sync::atomic::AtomicBool,
     },
 }
 
@@ -1567,7 +1570,7 @@ impl MeerkatMachine {
                     Arc::downgrade(&self.shared),
                     session_id.clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 ),
                 entry.agent_binding.clone(),
                 entry.tool_surface_gate.clone(),
@@ -1715,14 +1718,17 @@ impl MeerkatMachine {
             None => None,
         };
         let gate_guard = if let Some(lease) = &member_lease {
-            let guard = Arc::clone(&lease.session_mutation_gate).lock_owned().await;
+            let guard = self
+                .lock_live_session_mutation_gate(session_id, &lease.session_mutation_gate)
+                .await
+                .map_err(degraded_gate_wait_refusal)?;
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: "user interrupt runtime session disappeared".to_string(),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &lease.session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&lease.session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: "user interrupt runtime session was replaced".to_string(),
                 });
@@ -1734,19 +1740,26 @@ impl MeerkatMachine {
                 // current gate. Session absence/replacement means the expected run
                 // is already no longer current, which is the level-triggered
                 // terminal condition rather than a cancellation error.
-                Some(_) => match self.lock_current_session_mutation_gate(session_id).await {
+                Some(_) => match self
+                    .lock_current_live_session_mutation_gate(session_id)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?
+                {
                     Some(guard) => guard,
                     None => return Ok(false),
                 },
                 None => {
                     let gate = self.session_mutation_gate(session_id).await;
                     match gate {
-                        Some(g) => match Arc::clone(&g).try_lock_owned() {
+                        Some(g) => match g.try_lock() {
                             Ok(guard) => guard,
                             Err(_) if self.generated_stop_deferred(session_id).await => {
                                 return Ok(false);
                             }
-                            Err(_) => g.lock_owned().await,
+                            Err(_) => self
+                                .lock_live_session_mutation_gate(session_id, &g)
+                                .await
+                                .map_err(degraded_gate_wait_refusal)?,
                         },
                         None => return Ok(false),
                     }
@@ -1805,7 +1818,7 @@ impl MeerkatMachine {
                 return Err(RuntimeDriverError::NotReady { state: phase });
             };
             (
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 Arc::clone(&entry.dsl_authority),
                 entry.live_attachment_id(),
                 entry.provisional_materialization_claim_id,
@@ -1945,7 +1958,7 @@ impl MeerkatMachine {
             let Some(entry) = sessions.get_mut(session_id) else {
                 return Ok(false);
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &captured_gate)
+            if !entry.mutation_gate.same_gate(&captured_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_authority)
                 || entry.live_attachment_id() != attachment_id
                 || entry.provisional_materialization_claim_id != provisional_claim_id
@@ -2140,14 +2153,19 @@ impl MeerkatMachine {
         claim: MaterializationClaimRequest<'_>,
         expected_registration: Option<&RuntimeSessionRegistrationWitness>,
     ) -> Result<MeerkatMachineCommandResult, RuntimeDriverError> {
-        let (requested_claim_id, release_materialization_claim_on_drop, claim_state_sink) =
-            match claim {
-                MaterializationClaimRequest::ReleaseOnDrop => (uuid::Uuid::new_v4(), true, None),
-                MaterializationClaimRequest::Owned {
-                    claim_id,
-                    state_sink,
-                } => (claim_id, false, Some(state_sink)),
-            };
+        let (
+            requested_claim_id,
+            release_materialization_claim_on_drop,
+            claim_state_sink,
+            inserted_sink,
+        ) = match claim {
+            MaterializationClaimRequest::ReleaseOnDrop => (uuid::Uuid::new_v4(), true, None, None),
+            MaterializationClaimRequest::Owned {
+                claim_id,
+                state_sink,
+                inserted_sink,
+            } => (claim_id, false, Some(state_sink), Some(inserted_sink)),
+        };
         let unique_materialization_transaction = !release_materialization_claim_on_drop;
         let candidate_materialization_claim_state = Arc::new(std::sync::Mutex::new(
             crate::RuntimeActorMaterializationClaimState::new(unique_materialization_transaction),
@@ -2213,6 +2231,9 @@ impl MeerkatMachine {
             ?preparation,
             "MeerkatMachine::prepare_session_runtime_bindings registered session"
         );
+        if let Some(inserted_sink) = inserted_sink {
+            inserted_sink.store(inserted_by_call, std::sync::atomic::Ordering::Release);
+        }
         // #1446: the binding transaction below runs in its own boxed block, so
         // its temporaries are not reserved in this frame while the registration
         // call above recurses. Its `return`s are the function's own returns.
@@ -2863,6 +2884,7 @@ impl MeerkatMachine {
                     RuntimeBindingsError::PrepareFailed(session_id.clone(), error.to_string())
                 })?;
         let claim_state_slot = pending.claim_state_slot();
+        let inserted_registration = std::sync::atomic::AtomicBool::new(false);
         let result = self
             .prepare_session_runtime_bindings_with_claim(
                 session_id.clone(),
@@ -2871,6 +2893,7 @@ impl MeerkatMachine {
                 MaterializationClaimRequest::Owned {
                     claim_id,
                     state_sink: &claim_state_slot,
+                    inserted_sink: &inserted_registration,
                 },
                 expected_registration.as_ref(),
             )
@@ -2891,6 +2914,7 @@ impl MeerkatMachine {
             Arc::clone(self),
             bindings,
             claim_id,
+            inserted_registration.load(std::sync::atomic::Ordering::Acquire),
             pending.cleanup_spawner(),
         )
         .map_err(|error| {

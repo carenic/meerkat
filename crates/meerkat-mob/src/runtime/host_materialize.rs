@@ -1070,6 +1070,8 @@ pub struct HostMemberMaterializer {
     /// release/dispose clears exactly the entries the materializer
     /// registered. Transport-only owner context — never lifecycle truth.
     runtime_sessions: Arc<tokio::sync::RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
+    /// The routes of the surface gates this materializer installed.
+    surface_gate_routes: super::registration_hook::MemberSurfaceGateRoutes,
 }
 
 const fn member_runtime_is_healthy(
@@ -1095,6 +1097,7 @@ impl HostMemberMaterializer {
             live_runtimes: HashMap::new(),
             upcall_binding_stamps: HashMap::new(),
             runtime_sessions,
+            surface_gate_routes: Default::default(),
         }
     }
 
@@ -2128,8 +2131,10 @@ impl HostMemberMaterializer {
                         (
                             Arc::clone(&self.substrate.runtime_adapter),
                             Arc::clone(hook),
+                            self.surface_gate_routes.clone(),
                         )
                     }),
+                None,
                 None,
             )
             .await
@@ -2742,8 +2747,10 @@ impl HostMemberMaterializer {
                         (
                             Arc::clone(&self.substrate.runtime_adapter),
                             Arc::clone(hook),
+                            self.surface_gate_routes.clone(),
                         )
                     }),
+                None,
                 None,
             )
             .await

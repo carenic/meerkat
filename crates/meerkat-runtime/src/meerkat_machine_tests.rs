@@ -4640,13 +4640,13 @@ async fn completion_waiter_fails_closed_when_runtime_finalization_fails() {
     .expect_err("a rejected durable boundary must not publish a terminal outcome");
 
     match completion_error {
-        crate::completion::CompletionWaitError::AuthorityUnavailable(detail) => {
+        crate::completion::CompletionWaitError::BoundaryRolledBack { detail, .. } => {
             assert!(
                 detail.contains("synthetic atomic_apply failure"),
-                "mechanical waiter failure must retain the durable commit cause: {detail}"
+                "the typed waiter failure must retain the durable commit cause: {detail}"
             );
         }
-        other => panic!("expected authority-unavailable waiter failure, got {other:?}"),
+        other => panic!("expected a rolled-back boundary waiter failure, got {other:?}"),
     }
 }
 
@@ -4799,10 +4799,10 @@ async fn directed_machine_terminal_commit_failure_fails_waiter_without_publicati
     assert!(
         matches!(
             completion_error,
-            crate::completion::CompletionWaitError::AuthorityUnavailable(ref detail)
+            crate::completion::CompletionWaitError::BoundaryRolledBack { ref detail, .. }
                 if detail.contains("atomic_apply_with_machine_lifecycle")
         ),
-        "mechanical waiter failure must retain the rejected atomic seam: {completion_error:?}"
+        "the typed waiter failure must retain the rejected atomic seam: {completion_error:?}"
     );
 
     let events = publisher
@@ -4916,10 +4916,10 @@ async fn nondirected_machine_terminal_commit_failure_fails_waiter_without_termin
     assert!(
         matches!(
             completion_error,
-            crate::completion::CompletionWaitError::AuthorityUnavailable(ref detail)
+            crate::completion::CompletionWaitError::BoundaryRolledBack { ref detail, .. }
                 if detail.contains("atomic_apply_with_machine_lifecycle")
         ),
-        "mechanical waiter failure must retain the rejected atomic seam: {completion_error:?}"
+        "the typed waiter failure must retain the rejected atomic seam: {completion_error:?}"
     );
 }
 
@@ -6123,6 +6123,7 @@ async fn idle_explicit_steer_peer_request_runs_through_runtime_loop() {
         ]),
         payload: Some(serde_json::json!({"subject": "mdm-smoke"})),
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
 
     let (_outcome, completion_handle) = adapter
@@ -6414,6 +6415,7 @@ fn make_progress_input(label: &str) -> Input {
         content: format!("progress-{label}").into(),
         payload: Some(serde_json::json!({ "label": label })),
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 
@@ -6690,6 +6692,76 @@ async fn non_respawnable_drain_exit_quiesces_rotation_carrier_before_clearing_ru
             .expect("inspect cleared runtime fence"),
         "cleared non-respawnable drain runtime must fail the worker fence"
     );
+}
+
+/// AbortAll aborts every session whose gate it can take, and then answers
+/// the typed refusal naming the durability-degraded session whose gate
+/// another holder keeps, instead of answering Ok as if it aborted them all.
+#[tokio::test]
+async fn abort_all_aborts_the_others_and_names_a_degraded_session_it_skipped() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(store, memory_blob_store()).expect("persistent machine"),
+    );
+    let degraded = SessionId::new();
+    adapter
+        .register_session(degraded.clone())
+        .await
+        .expect("register the session that degrades");
+    let aborted = SessionId::new();
+    adapter
+        .register_session(aborted.clone())
+        .await
+        .expect("register the session that is aborted");
+    let runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    assert!(
+        adapter
+            .update_peer_ingress_context(&aborted, true, Some(Arc::clone(&runtime)))
+            .await
+            .expect("attach drain runtime")
+    );
+    let carrier_dropped = install_test_rotation_carrier(
+        &adapter,
+        &aborted,
+        Arc::clone(&runtime),
+        "abort-all-skip-carrier",
+    )
+    .await;
+    let held = adapter
+        .session_mutation_gate(&degraded)
+        .await
+        .expect("registered session gate")
+        .lock_settled(SettledGateWait::TestFixture)
+        .await;
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&degraded)
+            .await,
+        "the fixture degrades the session behind the holder"
+    );
+
+    let refusal = tokio::time::timeout(Duration::from_secs(5), adapter.abort_comms_drains())
+        .await
+        .expect("AbortAll does not wait for the held gate")
+        .expect_err("AbortAll reports the session it skipped");
+    match refusal {
+        RuntimeDriverError::RecoveryRepairBlocked { reason, .. } => {
+            assert!(
+                reason.contains(&degraded.to_string()),
+                "the refusal names the skipped session: {reason}"
+            );
+            assert!(
+                !reason.contains(&aborted.to_string()),
+                "the refusal names only skipped sessions: {reason}"
+            );
+        }
+        other => panic!("expected the typed repair-blocked refusal, got {other:?}"),
+    }
+    assert!(
+        carrier_dropped.load(Ordering::SeqCst),
+        "AbortAll still aborts the session whose gate it takes"
+    );
+    drop(held);
 }
 
 #[tokio::test]
@@ -8984,9 +9056,9 @@ async fn quiescent_close_busy_leaves_the_owner_serving_its_queued_input() {
 /// mutation gate this test holds. While it waits, the ingress owns two
 /// references to the gate: the one it read from the registry and the one its
 /// lock acquisition consumed.
-async fn await_ingress_waiting_on_gate<T>(gate: &Arc<T>, before: usize) {
+async fn await_ingress_waiting_on_gate(gate: &SessionMutationGate, before: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(gate) < before + 2 {
+        while gate.copy_count() < before + 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -9019,16 +9091,10 @@ async fn quiescent_close_that_wins_the_mutation_gate_refuses_ingress_queued_behi
         .current_session_registration_witness(&session_id)
         .await
         .expect("a registered runtime exposes its exact registration");
-    let mutation_gate = {
-        let sessions = machine.sessions.read().await;
-        Arc::clone(
-            &sessions
-                .get(&session_id)
-                .expect("registered session entry")
-                .mutation_gate,
-        )
-    };
-    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+    let mutation_gate = sessions_mutation_gate(&machine, &session_id).await;
+    let held_gate = mutation_gate
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
 
     let close = machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
     tokio::pin!(close);
@@ -9050,7 +9116,7 @@ async fn quiescent_close_that_wins_the_mutation_gate_refuses_ingress_queued_behi
     }
 
     // Ingress queues on the same gate, behind the waiting close.
-    let before_ingress = Arc::strong_count(&mutation_gate);
+    let before_ingress = mutation_gate.copy_count();
     let ingress = {
         let machine = Arc::clone(&machine);
         let session_id = session_id.clone();
@@ -9117,19 +9183,13 @@ async fn quiescent_close_queued_behind_ingress_that_won_the_mutation_gate_answer
         .current_session_registration_witness(&session_id)
         .await
         .expect("a registered runtime exposes its exact registration");
-    let mutation_gate = {
-        let sessions = machine.sessions.read().await;
-        Arc::clone(
-            &sessions
-                .get(&session_id)
-                .expect("registered session entry")
-                .mutation_gate,
-        )
-    };
-    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+    let mutation_gate = sessions_mutation_gate(&machine, &session_id).await;
+    let held_gate = mutation_gate
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
 
     // Ingress reaches the gate first and waits behind this test.
-    let before_ingress = Arc::strong_count(&mutation_gate);
+    let before_ingress = mutation_gate.copy_count();
     let won = make_prompt("wins the gate");
     let won_id = won.id().clone();
     let ingress = {
@@ -19857,13 +19917,15 @@ mod stop_teardown_coordinator_class {
                 .get(&session_id)
                 .expect("attached session must remain registered");
             (
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 entry.wake_sender().expect("attached loop wake sender"),
                 Arc::clone(&entry.completions),
             )
         };
         let completion = completions.lock().await.register(input_id);
-        let mutation_guard = mutation_gate.lock_owned().await;
+        let mutation_guard = mutation_gate
+            .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+            .await;
 
         let stop = machine.stop_runtime_executor(&session_id, "linearized stop ownership");
         tokio::pin!(stop);
@@ -22807,7 +22869,10 @@ mod stop_under_gate_deadlock_class {
 
         let mutation_guard = tokio::time::timeout(
             Duration::from_secs(1),
-            machine.lock_current_session_mutation_gate(&session_id),
+            machine.lock_current_settled_session_mutation_gate(
+                &session_id,
+                crate::meerkat_machine::SettledGateWait::TestFixture,
+            ),
         )
         .await
         .expect("surface cleanup must not retain the machine mutation gate")
@@ -24647,6 +24712,7 @@ async fn apply_input_intermediate_peer_input_during_running_turn_wakes_without_b
         content: "interrupt while running".into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     });
     let peer_input_id = peer_input.id().clone();
     let peer_outcome = adapter
@@ -24917,6 +24983,7 @@ async fn service_peer_admission_wakes_without_live_cancel_after_boundary() {
         content: "interrupt through service ext ingest".into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     });
 
     let peer_outcome = <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(
@@ -25379,7 +25446,30 @@ fn interrupt_yielding_peer_input(
         content: body.into(),
         payload: None,
         handling_mode,
+        in_reply_to: None,
     });
+    let input_id = input.id().clone();
+    (input, input_id)
+}
+
+/// A request-only Steer that takes the exact live-boundary path: an ordinary
+/// continuation carrying a typed notice append. A peer steer joins the running
+/// run through the durable path, one per boundary, so the exact-boundary
+/// tests drive this input instead.
+fn interrupt_yielding_request_only_input(body: &str) -> (Input, InputId) {
+    let mut continuation = crate::input::ContinuationInput::detached_background_op_completed();
+    continuation.header.durability = crate::input::InputDurability::Durable;
+    continuation.turn_append = Some(meerkat_core::lifecycle::ConversationAppend {
+        runtime_source: None,
+        role: meerkat_core::lifecycle::ConversationAppendRole::SystemNotice,
+        content: meerkat_core::lifecycle::CoreRenderable::SystemNotice {
+            kind: meerkat_core::types::SystemNoticeKind::Generic,
+            body: Some(body.to_string()),
+            blocks: Vec::new(),
+        },
+        identity: None,
+    });
+    let input = Input::Continuation(continuation);
     let input_id = input.id().clone();
     (input, input_id)
 }
@@ -25417,6 +25507,7 @@ fn directed_interrupt_yielding_peer_input(body: &str) -> (Input, InputId) {
         content: body.into(),
         payload: None,
         handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
     });
     (input, input_id)
 }
@@ -25524,10 +25615,8 @@ async fn unavailable_exact_boundary_uses_queued_fallback() {
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "unavailable exact boundary remains queued",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("unavailable exact boundary remains queued");
     let (outcome, completion_handle) = rig
         .adapter
         .accept_input_with_completion(&rig.session_id, peer_input)
@@ -25578,10 +25667,8 @@ async fn stale_exact_boundary_uses_queued_fallback() {
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "stale exact boundary remains queued",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("stale exact boundary remains queued");
     let (outcome, completion_handle) = rig
         .adapter
         .accept_input_with_completion(&rig.session_id, peer_input)
@@ -25627,10 +25714,8 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
     let mut accepts = Vec::with_capacity(FAN_IN);
 
     for index in 0..FAN_IN {
-        let (peer_input, input_id) = interrupt_yielding_peer_input(
-            &format!("concurrent peer report {index}"),
-            Some(meerkat_core::types::HandlingMode::Steer),
-        );
+        let (peer_input, input_id) =
+            interrupt_yielding_request_only_input(&format!("concurrent peer report {index}"));
         input_ids.push(input_id);
         let adapter = Arc::clone(&rig.adapter);
         let session_id = rig.session_id.clone();
@@ -25710,10 +25795,8 @@ async fn stalled_boundary_optimization_does_not_block_sixty_nine_durable_admissi
     let accepts = tokio::spawn(async move {
         let mut accepted_ids = Vec::with_capacity(FAN_IN);
         for index in 0..FAN_IN {
-            let (peer_input, input_id) = interrupt_yielding_peer_input(
-                &format!("serial peer report {index}"),
-                Some(meerkat_core::types::HandlingMode::Steer),
-            );
+            let (peer_input, input_id) =
+                interrupt_yielding_request_only_input(&format!("serial peer report {index}"));
             let (outcome, completion_handle) = adapter
                 .accept_input_with_completion(&session_id, peer_input)
                 .await
@@ -25763,8 +25846,10 @@ async fn stalled_boundary_optimization_does_not_block_sixty_nine_durable_admissi
     let stalled_index = prepared_texts
         .last()
         .and_then(|text| {
-            text.lines()
-                .find_map(|line| line.strip_prefix("serial peer report "))
+            text.lines().find_map(|line| {
+                line.split_once("serial peer report ")
+                    .map(|(_, index)| index.trim())
+            })
         })
         .and_then(|index| index.parse::<usize>().ok())
         .unwrap_or_else(|| {
@@ -25840,10 +25925,8 @@ async fn run_advancing_during_live_boundary_preparation_preserves_successor_clai
     let rig = InterruptYieldingTestRig::new_with_adapter(adapter, Some(probe.clone()), None).await;
     rig.start_busy_turn().await;
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "run advance must not drop accepted peer input",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("run advance must not drop accepted peer input");
     let accept = {
         let adapter = Arc::clone(&rig.adapter);
         let session_id = rig.session_id.clone();
@@ -25942,10 +26025,8 @@ async fn assert_faulted_boundary_terminalizes_exact_input() {
     let (hint, runless_terminal_tells, _told) = counting_runless_terminal_hint();
     rig.adapter.set_runless_input_terminal_hint(hint);
 
-    let (peer_input, peer_id) = interrupt_yielding_peer_input(
-        "failed exact boundary must not fall back",
-        Some(meerkat_core::types::HandlingMode::Steer),
-    );
+    let (peer_input, peer_id) =
+        interrupt_yielding_request_only_input("failed exact boundary must not fall back");
     let (outcome, completion_handle) = tokio::time::timeout(
         Duration::from_secs(1),
         rig.adapter
@@ -34900,8 +34981,70 @@ fn machine_terminal_receipt(
     }
 }
 
-struct RuntimeCommitAtomicityStore {
+/// A store commit held until the test releases it: it reports that it was
+/// entered, then commits or fails as released (a dropped release fails it).
+pub(super) struct HeldStoreCommit {
+    /// The input whose commit this hold takes; other commits pass.
+    input_id: InputId,
+    entered: Arc<Notify>,
+    release: tokio::sync::oneshot::Receiver<HeldStoreCommitRelease>,
+}
+
+/// How a held store commit ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeldStoreCommitRelease {
+    /// The commit reaches the inner store.
+    Commit,
+    /// The commit fails with a store write error and commits nothing.
+    Fail,
+}
+
+/// The test's end of a [`HeldStoreCommit`].
+pub(super) struct HeldStoreCommitControl {
+    pub(super) entered: Arc<Notify>,
+    release: tokio::sync::oneshot::Sender<HeldStoreCommitRelease>,
+}
+
+impl HeldStoreCommitControl {
+    pub(super) fn release(self, release: HeldStoreCommitRelease) {
+        let _ = self.release.send(release);
+    }
+}
+
+impl HeldStoreCommit {
+    fn armed(input_id: &InputId) -> (Self, HeldStoreCommitControl) {
+        let entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                input_id: input_id.clone(),
+                entered: Arc::clone(&entered),
+                release: release_rx,
+            },
+            HeldStoreCommitControl {
+                entered,
+                release: release_tx,
+            },
+        )
+    }
+
+    async fn wait(self) -> HeldStoreCommitRelease {
+        self.entered.notify_one();
+        self.release.await.unwrap_or(HeldStoreCommitRelease::Fail)
+    }
+}
+
+pub(super) struct RuntimeCommitAtomicityStore {
     inner: Arc<crate::store::InMemoryRuntimeStore>,
+    /// The commit outcome deadline this store declares; `None` forwards the
+    /// inner store's declaration.
+    declared_commit_outcome_deadline: std::sync::Mutex<Option<Duration>>,
+    /// Holds the next success boundary commit before it commits.
+    success_boundary_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
+    /// Holds the next machine lifecycle commit before it commits.
+    machine_lifecycle_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
+    /// How long every success boundary commit takes before it commits.
+    success_boundary_delay: std::sync::Mutex<Option<Duration>>,
     fail_atomic_apply: AtomicBool,
     unsupported_atomic_machine_lifecycle: AtomicBool,
     fail_commit_machine_lifecycle: AtomicBool,
@@ -34931,9 +35074,13 @@ struct RuntimeCommitAtomicityStore {
 }
 
 impl RuntimeCommitAtomicityStore {
-    fn pass_through(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
+    pub(super) fn pass_through(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
         Self {
             inner,
+            declared_commit_outcome_deadline: std::sync::Mutex::new(None),
+            success_boundary_hold: std::sync::Mutex::new(None),
+            machine_lifecycle_hold: std::sync::Mutex::new(None),
+            success_boundary_delay: std::sync::Mutex::new(None),
             fail_atomic_apply: AtomicBool::new(false),
             unsupported_atomic_machine_lifecycle: AtomicBool::new(false),
             fail_commit_machine_lifecycle: AtomicBool::new(false),
@@ -35057,6 +35204,50 @@ impl RuntimeCommitAtomicityStore {
         store
     }
 
+    /// Declare `deadline` as this store's commit outcome deadline.
+    pub(super) fn declare_commit_outcome_deadline(&self, deadline: Duration) {
+        *self
+            .declared_commit_outcome_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
+
+    /// Hold the next success boundary commit of `input_id`'s run until the
+    /// returned control releases it.
+    pub(super) fn hold_next_success_boundary_commit(
+        &self,
+        input_id: &InputId,
+    ) -> HeldStoreCommitControl {
+        let (hold, control) = HeldStoreCommit::armed(input_id);
+        *self
+            .success_boundary_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        control
+    }
+
+    /// Hold the next machine lifecycle commit that persists `input_id` until
+    /// the returned control releases it.
+    pub(super) fn hold_next_machine_lifecycle_commit(
+        &self,
+        input_id: &InputId,
+    ) -> HeldStoreCommitControl {
+        let (hold, control) = HeldStoreCommit::armed(input_id);
+        *self
+            .machine_lifecycle_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        control
+    }
+
+    /// Make every success boundary commit take `delay` before it commits.
+    pub(super) fn delay_success_boundary_commits(&self, delay: Duration) {
+        *self
+            .success_boundary_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(delay);
+    }
+
     fn arm_block_initialize_ops_after_selection(&self, entered: Arc<Notify>, release: Arc<Notify>) {
         *self
             .block_initialize_ops_after_selection
@@ -35131,6 +35322,14 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         RuntimeStore::session_boundary_authority_read_cost(self.inner.as_ref())
     }
 
+    fn commit_outcome_deadline(&self) -> Option<Duration> {
+        let declared = *self
+            .declared_commit_outcome_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        declared.or_else(|| RuntimeStore::commit_outcome_deadline(self.inner.as_ref()))
+    }
+
     async fn commit_prepared_session_boundary(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -35140,6 +35339,34 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         use crate::store::PreparedRuntimeSessionCommitKind;
 
         let kind = request.kind();
+        if matches!(kind, PreparedRuntimeSessionCommitKind::Success) {
+            let delay = *self
+                .success_boundary_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let hold = {
+                let mut slot = self
+                    .success_boundary_hold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let targets_this_run = slot.as_ref().is_some_and(|hold| {
+                    request.receipt().is_some_and(|receipt| {
+                        receipt.contributing_input_ids.contains(&hold.input_id)
+                    })
+                });
+                if targets_this_run { slot.take() } else { None }
+            };
+            if let Some(hold) = hold
+                && hold.wait().await == HeldStoreCommitRelease::Fail
+            {
+                return Err(crate::store::RuntimeStoreError::WriteFailed(
+                    "synthetic held boundary commit failure".into(),
+                ));
+            }
+        }
         if request.session().is_some() {
             self.session_snapshot_commits.fetch_add(1, Ordering::SeqCst);
         }
@@ -35567,6 +35794,29 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         {
             return Err(crate::store::RuntimeStoreError::WriteFailed(
                 "synthetic commit_machine_lifecycle failure".into(),
+            ));
+        }
+        let hold = {
+            let mut slot = self
+                .machine_lifecycle_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let persists_the_input = slot.as_ref().is_some_and(|hold| {
+                input_states
+                    .iter()
+                    .any(|record| record.as_stored().state.input_id == hold.input_id)
+            });
+            if persists_the_input {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hold) = hold
+            && hold.wait().await == HeldStoreCommitRelease::Fail
+        {
+            return Err(crate::store::RuntimeStoreError::WriteFailed(
+                "synthetic held commit_machine_lifecycle failure".into(),
             ));
         }
         let unregister_progress = commit.snapshot().unregister_progress().map(|progress| {
@@ -37319,6 +37569,7 @@ async fn runtime_input_hooks_follow_committed_accept_dedup_and_reject_outcomes()
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
+        in_reply_to: None,
     });
     let (peer_accepted, _) = adapter
         .accept_input_with_completion(&session_id, valid_peer)
@@ -37359,6 +37610,7 @@ async fn runtime_input_hooks_follow_committed_accept_dedup_and_reject_outcomes()
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
+        in_reply_to: None,
     });
     adapter
         .accept_input_with_completion(&session_id, invalid_peer)
@@ -39630,7 +39882,10 @@ async fn unregister_retains_live_lifecycle_gate_through_entry_removal() {
         .await
         .expect("registered session has a live/lifecycle gate");
     let mutation_guard = machine
-        .lock_current_session_mutation_gate(&session_id)
+        .lock_current_settled_session_mutation_gate(
+            &session_id,
+            crate::meerkat_machine::SettledGateWait::TestFixture,
+        )
         .await
         .expect("registered session has a mutation gate");
 
@@ -39713,9 +39968,15 @@ async fn stale_live_lifecycle_lease_cannot_target_same_id_replacement() {
 
     assert!(
         machine
-            .lock_session_mutation_gate_for_live_lifecycle_lease(&session_id, &stale_lease)
+            .lock_session_mutation_gate_for_live_lifecycle_lease(
+                &session_id,
+                &stale_lease,
+                crate::meerkat_machine::SessionMutationGateWait::Settled(
+                    crate::meerkat_machine::SettledGateWait::TestFixture
+                ),
+            )
             .await
-            .is_none(),
+            .is_ok_and(|guard| guard.is_none()),
         "an old live gate must not authorize mutation of a same-ID replacement"
     );
     assert!(
@@ -41700,7 +41961,7 @@ async fn recovered_predecessor_inputs_are_silently_abandoned_before_attachment_s
 /// a waiter (a runtime loop it lets serve) queues a [`GateReleaseWitness`]
 /// first, and its tells are then classified by that witness's grant instead.
 struct RunlessTerminalTells {
-    gate: Arc<tokio::sync::Mutex<()>>,
+    gate: SessionMutationGate,
     with_gate_free: Arc<AtomicUsize>,
     under_gate: Arc<AtomicUsize>,
     told: Arc<Notify>,
@@ -41743,7 +42004,7 @@ impl RunlessTerminalTells {
         let witness_queued = Arc::new(AtomicBool::new(false));
         let witness_granted = Arc::new(AtomicBool::new(false));
         machine.set_runless_input_terminal_hint(Arc::new({
-            let gate = Arc::clone(&gate);
+            let gate = gate.clone();
             let with_gate_free = Arc::clone(&with_gate_free);
             let under_gate = Arc::clone(&under_gate);
             let told = Arc::clone(&told);
@@ -41779,9 +42040,11 @@ impl RunlessTerminalTells {
     fn queue_release_witness(&self) -> GateReleaseWitness {
         // Unconstrained: an exhausted coop budget would return Pending
         // without queueing, and wake the flag.
-        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(
-            Arc::clone(&self.gate).lock_owned(),
-        ));
+        let gate = self.gate.clone();
+        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(async move {
+            gate.lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+                .await
+        }));
         let waker = std::task::Waker::from(Arc::new(GrantFlag(Arc::clone(&self.witness_granted))));
         let queued =
             std::future::Future::poll(waiter.as_mut(), &mut std::task::Context::from_waker(&waker))
@@ -44246,7 +44509,7 @@ async fn cancelled_executor_setup_caller_leaves_process_owned_claim_to_commit() 
     let (driver, mutation_gate) = {
         let sessions = adapter.sessions.read().await;
         let entry = sessions.get(&session_id).expect("registered session entry");
-        (entry.driver.clone(), Arc::clone(&entry.mutation_gate))
+        (entry.driver.clone(), entry.mutation_gate.clone())
     };
 
     // Hold the driver lock to park setup while the session mutation gate is
@@ -44272,7 +44535,7 @@ async fn cancelled_executor_setup_caller_leaves_process_owned_claim_to_commit() 
                     state.lifecycle_phase == mm_dsl::MeerkatPhase::Attached
                         && state.registration_phase == mm_dsl::RegistrationPhase::Active
                 });
-            if claim_is_staged && Arc::clone(&mutation_gate).try_lock_owned().is_err() {
+            if claim_is_staged && mutation_gate.try_lock().is_err() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -47968,6 +48231,7 @@ fn runtime_parity_peer_message(text: &str) -> Input {
         content: text.into(),
         payload: None,
         handling_mode: None,
+        in_reply_to: None,
     })
 }
 
@@ -48262,6 +48526,7 @@ async fn wake_runtime_if_active_inputs_drains_existing_attached_queue() {
                 content: "done".into(),
                 payload: Some(serde_json::json!({ "token": "birch seventeen" })),
                 handling_mode: None,
+                in_reply_to: None,
             }))
             .await
             .expect("direct driver accept should queue terminal peer response");
@@ -49965,6 +50230,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
             format!("materialization_registration_owned:{session_id}")
         }
         RuntimeDriverError::Internal(reason) => format!("internal:{reason}"),
+        RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested } => {
+            format!("scoped_context_generation_not_advanced:{bound}:{requested}")
+        }
     }
 }
 
@@ -54018,14 +54286,23 @@ async fn dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shut
 async fn registration_shell_identity(
     machine: &Arc<MeerkatMachine>,
     session_id: &SessionId,
-) -> Arc<crate::tokio::sync::Mutex<()>> {
-    let sessions = machine.sessions.read().await;
-    Arc::clone(
-        &sessions
-            .get(session_id)
-            .expect("registered session entry")
-            .mutation_gate,
-    )
+) -> SessionMutationGate {
+    sessions_mutation_gate(machine, session_id).await
+}
+
+/// A copy of the registered entry's mutation gate.
+async fn sessions_mutation_gate(
+    machine: &MeerkatMachine,
+    session_id: &SessionId,
+) -> SessionMutationGate {
+    machine
+        .sessions
+        .read()
+        .await
+        .get(session_id)
+        .expect("registered session entry")
+        .mutation_gate
+        .clone()
 }
 
 /// A durability skew is a condition to recover from, not a life sentence.
@@ -54134,7 +54411,7 @@ async fn degraded_non_mob_registration_cold_reloads_instead_of_bricking() {
 
     let reloaded_shell = registration_shell_identity(&machine, &session_id).await;
     assert!(
-        !Arc::ptr_eq(&bricked_shell, &reloaded_shell),
+        !bricked_shell.same_gate(&reloaded_shell),
         "recovery must publish a replacement registration cold-loaded from durable truth, not \
          republish the unreadable shell as healthy"
     );

@@ -365,9 +365,21 @@ export interface TranscriptEditOptions {
   readonly runningBehavior?: TranscriptEditRunningBehavior;
 }
 
+/**
+ * What a fork does with the instruction activations its child inherits.
+ * `require_explicit_activation` (the default) and `refuse` refuse a
+ * `session/fork_at` or `session/fork_replace` whose child would inherit
+ * activations; `reactivate_inherited` re-activates them in the child.
+ */
+export type ForkInstructionPolicy =
+  | "require_explicit_activation"
+  | "reactivate_inherited"
+  | "refuse";
+
 /** Options specific to transcript fork APIs. */
 export interface TranscriptForkOptions extends TranscriptEditOptions {
   readonly toolAccessPolicy?: WireToolAccessPolicy;
+  readonly inheritedInstructions?: ForkInstructionPolicy;
 }
 
 /** Canonical message-shaped replacement payload for `session/fork_replace`. */
@@ -626,6 +638,11 @@ export interface SessionForkResult {
   readonly sessionRef?: string;
   readonly messageCount: number;
   readonly cacheInheritance: ForkCacheInheritance;
+  /**
+   * Instruction re-activation rows the fork appended after the copied
+   * prefix; `messageCount` counts them.
+   */
+  readonly reactivatedInstructionCount: number;
 }
 
 /** Session listing filters for `session/list`. */

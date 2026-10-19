@@ -732,6 +732,7 @@ pub(crate) mod tests {
             objective_id: None,
             system_prompts: vec!["first system".into(), "second system".into()],
             injected_context: vec!["peer context".into()],
+            in_reply_to: None,
         });
         let flow = Input::FlowStep(FlowStepInput {
             header: crate::input::InputHeader {

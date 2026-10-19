@@ -233,6 +233,15 @@ Every ordered System message must fit. Runtime context and complete image identi
 tombstone, and accounting sidecars remain outside the window. Any truncation
 reports degraded continuity, and the server rejects zero.
 
+`MeerkatClient.parseLiveObservation(raw)` types a frame from the live transport
+as a `WireLiveAdapterObservation`. Since 0.9.4 the union includes `turn_failed`,
+a response the provider ended without completing. Its `failure` is a
+`WireLiveResponseFailure`: route on `status` (`"failed"`, `"incomplete"`,
+`"in_progress"`, or `{ unknown: { debug } }` for a status without a wire name);
+`reason`, `code` and `message` are diagnostics only. `WireLiveResponseFailure`
+and `WireLiveResponseFailureStatus` are exported from `@rkat/sdk`. See the
+[realtime guide](/guides/realtime) for what the channel does next.
+
 ### Usage
 
 Token usage. All fields are camelCase - there is no `total_tokens` field.
@@ -537,6 +546,41 @@ may still reopen the channel with its retained context.
 Content may be text or content blocks; the continuation variant does not
 fabricate a prompt. `RunFailedEvent` accepts the current `error_report` and
 derives its `errorClass` and `error` display fields from that report.
+
+Since 0.9.4 a run that failed because the provider refused or filtered the
+response (`errorClass` `content_filtered`) carries `errorReport.reason` as a
+`ContentFilteredAgentErrorReason`: `reasonType: "content_filtered"`, `stop`
+(`"refusal"` or `"content_filter"`) and an optional `detail`, the provider's own
+account tagged by `provider` (`anthropic`, `open_ai` or `gemini`). A `detail`
+that is not a provider-tagged object reads as absent, and a `stop` the SDK does
+not know reads as an unknown reason with the wire object in `raw`. SDKs before
+0.9.4 read every such reason as unknown and keep it raw.
+
+```typescript
+interface ContentFilteredAgentErrorReason {
+  readonly reasonType: "content_filtered";
+  readonly stop: "refusal" | "content_filter";
+  readonly detail?: ContentFilteredStopDetail; // { provider: string, ... }
+}
+```
+
+`ToolConfigChangedPayload.settled` replaces `persisted` in 0.9.4 (see
+[Tool config events](#tool-config-events)): the parser derives it from
+`status_info` and uses a stored bit (`settled`, or `persisted` from
+`rkat-rpc` 0.9.3 and earlier) only for a status it does not know. It says
+nothing about configuration: whether a change was written there is the
+`persisted` of the `mcpAdd`, `mcpRemove` and `mcpReload` responses. A 0.9.3 SDK
+requires `persisted` and fails on every `tool_config_changed` event from a
+0.9.4 `rkat-rpc`. The binary the SDK downloads always matches it, so this
+happens only with a binary you supply (`MEERKAT_BIN_PATH`, an explicit path,
+or `rkat-rpc` on `PATH`); upgrade the SDK with the binary.
+
+`CompactionCompletedEvent.summarySource` and
+`CompactionCompletedEvent.estimatedHistoryTokensAfter` (see
+[Compaction events](#compaction-events)) are new in 0.9.4. Both are absent on
+completions recorded before 0.9.4; `estimatedHistoryTokensAfter` is also absent
+when the rewritten history could not be measured. A summary source or source
+bound kind the SDK does not know parses to `{ kind: "unknown", rawKind, raw }`.
 
 `RetryingEvent` parses the current wire shape, which carries one typed
 `retry` schedule: `attempt`, `maxAttempts`, `error` and `delayMs` are
@@ -889,6 +933,8 @@ class BinaryIntegrityError extends MeerkatError {
 | `BINARY_DOWNLOAD_FAILED` | The release download failed (a transport fault or a cut-off body), or redirected to a non-HTTPS URL |
 | `BINARY_DOWNLOAD_TOO_LARGE` | The release archive is over 256 MiB, far above any `rkat-rpc` release archive |
 | `UNKNOWN_EVENT_TYPE` | Streamed event `type` not in the generated known-event inventory |
+| `PROCESS_EXITED` | The `rkat-rpc` child exited before replying (a crash, for example). Since 0.9.4 pending requests fail with it at most about a second after the exit, even while a process the child started still holds its pipes |
+| `PROTOCOL_ERROR` | A reply line was not JSON, so the stream can no longer be trusted. Since 0.9.4 the client then stops the child the way `close()` does |
 
 ### Typed comms/send errors
 

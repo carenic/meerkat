@@ -1074,6 +1074,7 @@ impl LiveProjectionError {
             | SessionError::ExternalWriteFenceBackoff { .. }
             | SessionError::ServedElsewhere { .. }
             | SessionError::HostingUnavailable { .. }
+            | SessionError::ForkInstructionRefused(_)
             | SessionError::FailedWithData { .. } => Self::Session { code, message },
         }
     }
@@ -1947,6 +1948,7 @@ impl LiveToolDispatchError {
             | SessionError::ExternalWriteFenceBackoff { .. }
             | SessionError::ServedElsewhere { .. }
             | SessionError::HostingUnavailable { .. }
+            | SessionError::ForkInstructionRefused(_)
             | SessionError::FailedWithData { .. } => Self::Session { code, message },
         }
     }

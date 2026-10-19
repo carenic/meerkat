@@ -19,6 +19,7 @@ fn message(body: &str) -> MessageKind {
         body: body.to_string(),
         blocks: None,
         handling_mode: None,
+        in_reply_to: None,
     }
 }
 

@@ -71,6 +71,10 @@ pub struct PlannedForkRequest {
     pub planned_child_session_id: SessionId,
     /// Complete-boundary prefix length; `None` selects the head.
     pub prefix_message_count: Option<usize>,
+    /// The controller host's fork instruction policy, already resolved for a
+    /// participant fork: the council admits the participant's turns itself,
+    /// so the host has no window to activate inherited instruction keys.
+    pub inherited_instructions: meerkat_core::ForkInstructionPolicy,
 }
 
 /// Provenance returned by a successful planned fork.
@@ -668,10 +672,33 @@ impl ForkedParticipantService {
         Ok(())
     }
 
-    /// Create (or converge on) the durable fork for a reserved request.
+    /// Create (or converge on) the durable fork for a reserved request, under
+    /// the default fork instruction policy (see
+    /// [`Self::create_with_fork_instruction_policy`]).
     pub async fn create(
         &self,
         request: &ForkedParticipantRequest,
+        now: DateTime<Utc>,
+    ) -> Result<ForkedParticipantRef, ForkedParticipantError> {
+        self.create_with_fork_instruction_policy(
+            request,
+            meerkat_core::ForkInstructionPolicy::default(),
+            now,
+        )
+        .await
+    }
+
+    /// [`Self::create`] under the controller host's fork instruction policy.
+    ///
+    /// The council admits a participant's turns itself, so the host has no
+    /// window to activate inherited instruction keys on the child: `policy`
+    /// resolves against [`meerkat_core::ActivationWindow::None`]. A fork the
+    /// policy refuses commits no child; the capability activation then fails
+    /// with the typed [`SessionError::ForkInstructionRefused`].
+    pub async fn create_with_fork_instruction_policy(
+        &self,
+        request: &ForkedParticipantRequest,
+        policy: meerkat_core::ForkInstructionPolicy,
         now: DateTime<Utc>,
     ) -> Result<ForkedParticipantRef, ForkedParticipantError> {
         self.require_owned_route(&request.owner_route)?;
@@ -741,6 +768,8 @@ impl ForkedParticipantService {
                         source_session_id: request.source_session_id.clone(),
                         planned_child_session_id: planned_child.clone(),
                         prefix_message_count: request.prefix_message_count,
+                        inherited_instructions: policy
+                            .effective(meerkat_core::ActivationWindow::None),
                     })
                     .await
                 {

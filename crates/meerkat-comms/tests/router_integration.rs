@@ -38,6 +38,7 @@ async fn integration_real_router_unknown_peer_fails_closed() {
                 body: "hello".to_string(),
                 blocks: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         )
         .await;
@@ -75,6 +76,7 @@ async fn integration_real_router_inproc_peer_not_found() {
                 body: "hello".to_string(),
                 blocks: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
         )
         .await;

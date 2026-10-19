@@ -103,6 +103,7 @@ mod tests {
                 blocks: None,
                 body: "hello from tcp".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };

@@ -89,6 +89,7 @@ mod tests {
             content: "working".into(),
             payload: Some(serde_json::json!({"progress": "working"})),
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         let err = validate_peer_handling_mode(&input).unwrap_err();
         assert!(matches!(
@@ -113,6 +114,7 @@ mod tests {
             content: "done".into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -133,6 +135,7 @@ mod tests {
             content: "done".into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -150,6 +153,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -170,6 +174,7 @@ mod tests {
             content: "do it".into(),
             payload: Some(serde_json::json!({"subject": "x"})),
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -187,6 +192,7 @@ mod tests {
             content: "hi".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -208,6 +214,7 @@ mod tests {
             content: "urgent".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Steer),
+            in_reply_to: None,
         });
         let err = validate_peer_handling_mode(&input).unwrap_err();
         assert!(matches!(
@@ -233,6 +240,7 @@ mod tests {
             content: "work".into(),
             payload: None,
             handling_mode: Some(HandlingMode::Queue),
+            in_reply_to: None,
         });
         assert!(validate_peer_handling_mode(&input).is_ok());
     }
@@ -266,6 +274,7 @@ mod tests {
                 content: "hi".into(),
                 payload: None,
                 handling_mode: None,
+                in_reply_to: None,
             });
             assert!(
                 validate_peer_handling_mode(&input).is_ok(),

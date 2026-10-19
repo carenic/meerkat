@@ -419,6 +419,17 @@ error gets a `hint:` line naming the usual causes and `RKAT_WORKER_THREADS`;
 a library that does not handle the refusal can abort the process instead.
 Leave headroom rather than sizing the limit to the worker count.
 
+Since 0.9.4 one such library failure no longer aborts the host: when a SQLite
+change watch registers its file notifications and notify's inotify event-loop
+thread cannot start, the watch keeps running on its bounded sweep alone (every
+5 seconds by default) and logs "sqlite change watch notifications are
+unavailable; the watch runs on its sweep alone". The same happens at an inotify
+instance or watch limit; raise `fs.inotify.max_user_instances` or
+`fs.inotify.max_user_watches` on the host and restart to get notifications
+back. Each watch registers on a thread of its own that ends once the platform
+has registered (at once with inotify), and at most 64 registrations run at once
+in a process.
+
 ## Where The Prebuilt Binaries Come From
 
 `.github/workflows/release.yml` builds and publishes the release assets when a

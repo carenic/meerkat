@@ -744,7 +744,9 @@ pub(super) enum MobCommand {
     },
     Retire {
         agent_identity: AgentIdentity,
-        expected_incarnation: RetireMemberIncarnation,
+        /// What this command may retire: the exact roster incarnation the
+        /// handle observed, or one step of a scoped retire.
+        target: RetireTarget,
         /// Re-drive a stuck retirement instead of answering
         /// `MemberRetirementStuck` (typed re-drive transition).
         redrive: bool,
@@ -1752,6 +1754,107 @@ pub(super) struct RetireMemberIncarnation {
     pub generation: Generation,
     pub fence_token: FenceToken,
     pub member_ref: MemberRef,
+}
+
+/// What one [`MobCommand::Retire`] may retire.
+#[derive(Debug)]
+pub(super) enum RetireTarget {
+    /// The exact roster incarnation the handle observed: `MobHandle::retire`
+    /// and its descendant cascade.
+    Exact(RetireMemberIncarnation),
+    /// One step of `MobHandle::retire_at_scope`.
+    Scoped(ScopedRetireStep),
+}
+
+/// One step of a scoped retire. The actor classifies the root scope with
+/// MobMachine's `RetireAtScope` input in the step's own command, before it
+/// retires anything; the step's kind says which verdict admits it.
+#[derive(Debug)]
+pub(super) struct ScopedRetireStep {
+    /// The delivery scope the caller passed: the root member's incarnation.
+    pub root: super::MemberDeliveryScope,
+    pub kind: ScopedRetireStepKind,
+    /// Receives the root scope's verdict once the actor classified it.
+    pub verdict_tx: oneshot::Sender<ScopedRetireVerdict>,
+}
+
+#[derive(Debug)]
+pub(super) enum ScopedRetireStepKind {
+    /// A descendant of the root, retired while the root's incarnation is
+    /// current.
+    DescendantBeforeRoot(RetireMemberIncarnation),
+    /// The root incarnation the scope names.
+    Root,
+    /// A descendant of the root, retired once no incarnation of the root
+    /// identity is current.
+    DescendantAfterRoot(RetireMemberIncarnation),
+}
+
+impl ScopedRetireStepKind {
+    /// Whether the root scope's `verdict` admits this step.
+    pub(super) fn admits(&self, verdict: mob_dsl::RetireAtScopeVerdictKind) -> bool {
+        match self {
+            Self::DescendantBeforeRoot(_) => verdict == mob_dsl::RetireAtScopeVerdictKind::Current,
+            Self::Root => matches!(
+                verdict,
+                mob_dsl::RetireAtScopeVerdictKind::Current
+                    | mob_dsl::RetireAtScopeVerdictKind::NoCurrentIncarnation
+            ),
+            Self::DescendantAfterRoot(_) => {
+                verdict == mob_dsl::RetireAtScopeVerdictKind::NoCurrentIncarnation
+            }
+        }
+    }
+}
+
+/// MobMachine's `RetireAtScope` verdict on a scoped retire's root scope, as
+/// one step's actor command took it.
+#[derive(Debug, Clone)]
+pub(super) struct ScopedRetireVerdict {
+    pub verdict: mob_dsl::RetireAtScopeVerdictKind,
+    /// The identity's current fence when another incarnation is current.
+    pub expected_fence_token: Option<FenceToken>,
+    /// The member's bound session when the scope names another session.
+    pub current_session_id: Option<SessionId>,
+    /// The mob's lifecycle state when the verdict was taken.
+    pub mob_state: MobState,
+    /// Whether the step went ahead.
+    pub admitted: bool,
+}
+
+impl ScopedRetireVerdict {
+    /// The typed refusal of a scoped retire whose root step this verdict
+    /// declined.
+    pub(super) fn root_refusal(&self, scope: &super::MemberDeliveryScope) -> MobError {
+        match self.verdict {
+            mob_dsl::RetireAtScopeVerdictKind::StaleFenceToken => match self.expected_fence_token {
+                Some(expected) => MobError::StaleFenceToken {
+                    runtime_id: scope.runtime_id().clone(),
+                    expected,
+                    actual: scope.fence_token(),
+                },
+                None => MobError::Internal(
+                    "MobMachine refused a scoped retire as stale without the current fence"
+                        .to_string(),
+                ),
+            },
+            mob_dsl::RetireAtScopeVerdictKind::StaleSessionBinding => {
+                MobError::StaleDeliveryScope {
+                    agent_identity: scope.agent_identity().clone(),
+                    expected_session: scope.session_id().clone(),
+                    actual_session: self.current_session_id.clone(),
+                }
+            }
+            mob_dsl::RetireAtScopeVerdictKind::MobNotRunning => MobError::InvalidTransition {
+                from: self.mob_state,
+                to: MobState::Running,
+            },
+            mob_dsl::RetireAtScopeVerdictKind::Current
+            | mob_dsl::RetireAtScopeVerdictKind::NoCurrentIncarnation => MobError::Internal(
+                "a scoped retire's root step was declined under an admitting verdict".to_string(),
+            ),
+        }
+    }
 }
 
 impl MobCommand {

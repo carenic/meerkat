@@ -280,6 +280,7 @@ pub enum MessageKind {
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
         objective_id: Option<ObjectiveId>,
+        in_reply_to: Option<Uuid>,
     },
     #[serde(rename = "incarnation_fenced_message")]
     IncarnationFencedMessage {
@@ -333,6 +334,9 @@ Controlled bridge responders use the correlated path for alternate-authority
 probes whose temporary listener port differs from the peer's durable route.
 
 `objective_id` is optional signed causality metadata for content-bearing kinds.
+On `message`, `in_reply_to` is the delivery a `reply_to_peer` reply answers: it
+is signed when present, omitted when absent, and only a label (routing and
+authorization never read it).
 `incarnation_fenced_message` is internal placed-member routing: the exact
 recipient generation and fence are signed and checked before work admission.
 </Accordion>
@@ -414,12 +418,13 @@ Send a collaboration message to a peer.
 </Accordion>
 
 <Accordion title="reply_to_peer">
-Reply to the peer message that triggered the current turn. The runtime mints a
-turn-scoped, pre-addressed reply capability, so this tool deliberately has no
+Reply to a peer message delivered in the current turn: one that started the
+turn, or one written into it while it ran. The runtime mints a turn-scoped,
+pre-addressed reply capability for each, so this tool deliberately has no
 `peer_id` field.
 
 <ParamField path="reply_to" type="string">
-  Optional delivery ID. Supply it only when several peer messages were admitted into this turn; an `ambiguous_reply` error lists the valid IDs.
+  Optional delivery ID, shown as the `Delivery ID` line of the message notice. Supply it only when several peer messages were delivered in this turn; an `ambiguous_reply` error lists the valid IDs with their senders.
 </ParamField>
 
 <ParamField path="body" type="string" required>
@@ -437,9 +442,10 @@ turn-scoped, pre-addressed reply capability, so this tool deliberately has no
 **Response**: `{"status": "sent", "kind": "peer_message", "receipt": {...}}`
 
 The capability exists only for peer-message deliveries in the current turn.
-Calls fail with `no_reply_capability` when no such message caused the turn,
-`ambiguous_reply` when a selector is needed, and `unknown_reply_to` for an
-invalid selector. Trust and reachability are rechecked at dispatch time. Use
+Calls fail with `no_reply_capability` when the turn holds no such message,
+`ambiguous_reply` when a selector is needed or when the selected id belongs to
+messages from more than one peer (nothing is sent; answer one of them with
+`send_message`), and `unknown_reply_to` for an invalid selector. Trust and reachability are rechecked at dispatch time. Use
 `send_message` for unsolicited outreach and `send_response` only for typed
 request traffic.
 </Accordion>
@@ -975,7 +981,8 @@ Incoming comms are persisted as typed `system_notice` blocks with `comms` payloa
 
 At the commit seam, each incoming comms block also projects a
 `peer_content_ingested` event containing the typed comms kind, canonical peer
-fact, request correlation, and the sender's signed content-taint declaration.
+fact, request correlation, the delivery id of a peer message, and the sender's
+signed content-taint declaration.
 This event is best-effort observation. The typed transcript block remains the
 durable owner, and an absent taint declaration remains distinct from `clean`.
 

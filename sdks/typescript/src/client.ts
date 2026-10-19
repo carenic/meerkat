@@ -159,6 +159,7 @@ import {
   type WireMemberLifecycleCapabilities,
   type WireNonPortableResourceKind,
   type WireMemberPreviewUnavailable,
+  type WireMemberRegistrationHookCall,
   type WireReachability,
   type ToolDispatchAdmissionSource,
   type ToolDispatchSettlementFailure,
@@ -1694,6 +1695,9 @@ export class MeerkatClient {
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
     }
+    if (options?.inheritedInstructions !== undefined) {
+      params.inherited_instructions = options.inheritedInstructions;
+    }
     const raw = await this.request("session/fork_at", params);
     return MeerkatClient.parseSessionForkResult(raw);
   }
@@ -1714,6 +1718,9 @@ export class MeerkatClient {
     }
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
+    }
+    if (options?.inheritedInstructions !== undefined) {
+      params.inherited_instructions = options.inheritedInstructions;
     }
     const raw = await this.request("session/fork_replace", params);
     return MeerkatClient.parseSessionForkResult(raw);
@@ -3236,6 +3243,13 @@ export class MeerkatClient {
     if (previewUnavailable !== undefined) {
       snapshot.previewUnavailable = previewUnavailable;
     }
+    const registrationRefusal = MeerkatClient.parseWireMemberRegistrationRefusal(
+      result.registration_refusal,
+      "Invalid mob/member_status response",
+    );
+    if (registrationRefusal !== undefined) {
+      snapshot.registrationRefusal = registrationRefusal;
+    }
     return snapshot;
   }
 
@@ -3499,6 +3513,10 @@ export class MeerkatClient {
         member.preview_unavailable,
         "Invalid mob/wait_kickoff response",
       );
+      const registrationRefusal = MeerkatClient.parseWireMemberRegistrationRefusal(
+        member.registration_refusal,
+        "Invalid mob/wait_kickoff response",
+      );
       return {
         agentIdentity,
         status,
@@ -3512,6 +3530,7 @@ export class MeerkatClient {
           "Invalid mob/wait_kickoff response",
         ),
         ...(previewUnavailable !== undefined ? { previewUnavailable } : {}),
+        ...(registrationRefusal !== undefined ? { registrationRefusal } : {}),
       };
     });
   }
@@ -3559,6 +3578,10 @@ export class MeerkatClient {
         member.preview_unavailable,
         "Invalid mob/wait_ready response",
       );
+      const registrationRefusal = MeerkatClient.parseWireMemberRegistrationRefusal(
+        member.registration_refusal,
+        "Invalid mob/wait_ready response",
+      );
       return {
         agentIdentity,
         status,
@@ -3572,6 +3595,7 @@ export class MeerkatClient {
           "Invalid mob/wait_ready response",
         ),
         ...(previewUnavailable !== undefined ? { previewUnavailable } : {}),
+        ...(registrationRefusal !== undefined ? { registrationRefusal } : {}),
       };
     });
   }
@@ -6059,6 +6083,33 @@ export class MeerkatClient {
     );
   }
 
+  /**
+   * Parse the registration hook call that refused a restored member's
+   * registration. Absent (or `null`) means no host refused the member; a
+   * value outside the closed vocabulary fails closed.
+   */
+  private static parseWireMemberRegistrationRefusal(
+    raw: unknown,
+    context: string,
+  ): WireMemberRegistrationHookCall | undefined {
+    if (raw == null) {
+      return undefined;
+    }
+    const values: readonly WireMemberRegistrationHookCall[] = [
+      "select_destination",
+      "select_agent_mandate",
+      "prepare_member_surface",
+      "verify_member_surface",
+    ];
+    if (typeof raw === "string" && values.includes(raw as WireMemberRegistrationHookCall)) {
+      return raw as WireMemberRegistrationHookCall;
+    }
+    throw new MeerkatError(
+      "INVALID_RESPONSE",
+      `${context}: registration_refusal must be a valid registration hook call`,
+    );
+  }
+
   private static parseMobPeerConnectivitySnapshot(
     raw: unknown,
     context: string,
@@ -7706,6 +7757,14 @@ export class MeerkatClient {
         wire.cache_inheritance,
         context,
       ),
+      reactivatedInstructionCount:
+        wire.reactivated_instruction_count == null
+          ? 0
+          : MeerkatClient.requireNonNegativeIntegerField(
+              wire,
+              "reactivated_instruction_count",
+              context,
+            ),
     };
   }
 

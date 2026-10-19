@@ -5206,6 +5206,7 @@ impl MobSessionService for MockSessionService {
                 },
             },
             session_ref: None,
+            reactivated_instruction_count: 0,
         })
     }
 
@@ -64808,6 +64809,7 @@ async fn test_peer_message_reaches_ready_autonomous_member_before_kickoff_settle
                 },
             ]),
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -64942,6 +64944,7 @@ async fn test_peer_messages_reach_all_ready_autonomous_members_before_kickoff_se
                     },
                 ]),
                 handling_mode: meerkat_core::types::HandlingMode::Steer,
+                in_reply_to: None,
             },
         )
         .await
@@ -65097,6 +65100,7 @@ async fn test_running_peer_message_to_autonomous_member_queues_when_exact_bounda
                 },
             ]),
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -65128,6 +65132,7 @@ async fn test_running_peer_message_to_autonomous_member_queues_when_exact_bounda
             body: "body: second peer message while running".to_string(),
             blocks: None,
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -66332,6 +66337,7 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
             body: "body: keep requester busy".to_string(),
             blocks: None,
             handling_mode: meerkat_core::types::HandlingMode::Steer,
+            in_reply_to: None,
         },
     )
     .await
@@ -66945,13 +66951,13 @@ async fn test_member_reads_bypass_saturated_actor_command_queue() {
             super::state::MobCommand::Retire {
                 agent_identity: queued_identity.clone(),
                 redrive: false,
-                expected_incarnation: super::state::RetireMemberIncarnation {
+                target: super::state::RetireTarget::Exact(super::state::RetireMemberIncarnation {
                     agent_identity: queued_identity.clone(),
                     agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
                     generation: queued_generation,
                     fence_token: FenceToken::new(1),
                     member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
-                },
+                }),
                 deadline: Instant::now(),
                 admission_tx,
                 reply_tx,
@@ -67065,13 +67071,13 @@ async fn test_retire_saturated_actor_queue_reports_not_admitted_without_authorit
             super::state::MobCommand::Retire {
                 agent_identity: queued_identity.clone(),
                 redrive: false,
-                expected_incarnation: super::state::RetireMemberIncarnation {
+                target: super::state::RetireTarget::Exact(super::state::RetireMemberIncarnation {
                     agent_identity: queued_identity.clone(),
                     agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
                     generation: queued_generation,
                     fence_token: FenceToken::new(1),
                     member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
-                },
+                }),
                 deadline: Instant::now(),
                 admission_tx,
                 reply_tx,
@@ -69922,6 +69928,72 @@ async fn test_failed_execution_snapshot_takes_run_state_from_runtime_machine() {
         run_state == before || run_state == after,
         "a failed snapshot is resolved through the runtime machine: got {run_state:?}, runtime \
          {before:?} then {after:?}"
+    );
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+/// A respawned member does not inherit its predecessor's execution health:
+/// the first status read of the new incarnation is progress at that read's
+/// time, even when the new session reports the same raw snapshot the
+/// predecessor last reported.
+#[tokio::test]
+async fn test_respawned_member_status_starts_a_fresh_progress_clock() {
+    let (handle, service) = create_test_mob(with_unique_mob_id(
+        sample_definition(),
+        "respawn-progress-clock",
+    ))
+    .await;
+    let member_id = AgentIdentity::from("respawn-progress-clock-worker");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the first incarnation");
+    // One open run whose raw snapshot never changes, so both incarnations
+    // report the same progress token.
+    let open = test_member_execution_snapshot(1, 0);
+    service.set_execution_snapshots(std::iter::repeat_n(open.clone(), 4));
+    let first = handle
+        .member_status(&member_id)
+        .await
+        .expect("status of the first incarnation")
+        .progress
+        .expect("a local member's status carries progress");
+    assert_eq!(
+        first.last_progress_event,
+        super::handle::MemberProgressEvent::ExecutionAdvanced
+    );
+
+    handle
+        .respawn(member_id.clone(), None)
+        .await
+        .expect("respawn the member");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let respawned_at_ms =
+        super::actor::member_status_wall_clock_ms().expect("member-status wall clock");
+    service.set_execution_snapshots(std::iter::repeat_n(open, 4));
+    let second = handle
+        .member_status(&member_id)
+        .await
+        .expect("status of the respawned incarnation")
+        .progress
+        .expect("a local member's status carries progress");
+    assert_eq!(
+        second.last_progress_event,
+        super::handle::MemberProgressEvent::ExecutionAdvanced,
+        "the new incarnation's first observation is progress, not its predecessor's unchanged run"
+    );
+    assert_eq!(second.health, super::handle::MemberHealthClass::Healthy);
+    assert!(
+        second.last_progress_at_ms >= respawned_at_ms,
+        "the progress clock starts at the new incarnation's first observation: {} < {}",
+        second.last_progress_at_ms,
+        respawned_at_ms
     );
     handle.shutdown().await.expect("shutdown test mob");
 }
@@ -82582,6 +82654,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "member_role_migration_rejected".to_string()
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
+        MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
         MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
         MobError::ShutdownInProgress { .. } => "shutdown_in_progress".to_string(),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
@@ -82790,6 +82863,12 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::RetirementInterrupted { stage, .. } => {
             format!("retirement_interrupted:{stage}")
+        }
+        MobError::MemberRegistrationRefused { call, .. } => {
+            format!("member_registration_refused:{call}")
+        }
+        MobError::MemberDestinationNotInstalled { .. } => {
+            "member_destination_not_installed".to_string()
         }
     }
 }
@@ -87374,6 +87453,44 @@ fn a_member_cancel_whose_delivery_outcome_is_unknown_reports_the_recorded_cancel
     );
 }
 
+/// A member work cancel the runtime refused with the typed
+/// `RecoveryRepairBlocked` answers the member's `MemberReloadRequired`, whose
+/// repair is `MobHandle::reload_member_registration`. Any other refusal stays
+/// internal.
+#[test]
+fn a_member_cancel_refused_for_a_durability_reload_answers_member_reload_required() {
+    use super::provisioner::member_work_cancel_error;
+    let member = AgentIdentity::from("cancelled-member");
+    let refused = member_work_cancel_error(
+        &member,
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+            evidence_digest: None,
+            reason: "durability reload required after `atomic_apply`: outcome unknown".to_string(),
+        },
+        || "abandoning the queued input failed".to_string(),
+    );
+    match refused {
+        MobError::MemberReloadRequired { member_id, reason } => {
+            assert_eq!(member_id, member);
+            assert!(reason.contains("durability reload required"), "{reason}");
+        }
+        other => panic!("a reload-required refusal answers MemberReloadRequired: {other:?}"),
+    }
+    let other = member_work_cancel_error(
+        &member,
+        meerkat_runtime::RuntimeDriverError::Internal("boom".to_string()),
+        || "abandoning the queued input failed".to_string(),
+    );
+    assert!(
+        matches!(
+            &other,
+            MobError::Internal(text)
+                if text.contains("abandoning the queued input failed") && text.contains("boom")
+        ),
+        "{other:?}"
+    );
+}
+
 /// #1500: a turn-driven member's running turn is not cancelled by Stop; the
 /// report names that run, and the member's run starts are held.
 #[tokio::test]
@@ -90339,6 +90456,10 @@ mod member_instruction_gates;
 mod owned_retirement;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod resume_bind_custody;
+/// `MobHandle::retire_at_scope` retires the incarnation its delivery scope
+/// names, admitted in every step's own actor command, or nothing.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod retire_at_scope;
 mod retirement_isolation;
 /// #1814 owned rollbacks release the turn-finalization boundary before they
 /// take the lease a concurrent raw unregister holds into its cleanup.

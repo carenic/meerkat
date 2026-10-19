@@ -24,6 +24,7 @@ pub fn jsonrpc_code(err: &SessionError) -> i64 {
         SessionError::ExternalWriteFenceConflict { .. } => -32011,
         SessionError::ExternalWriteFenceBackoff { .. } => -32012,
         SessionError::WholeBlobAuditedEndpointDivergence { .. } => -32013,
+        SessionError::ForkInstructionRefused(_) => -32037,
         SessionError::Agent(_) | SessionError::FailedWithData { .. } => -32000,
     }
 }
@@ -43,6 +44,7 @@ pub fn http_status(err: &SessionError) -> u16 {
         | SessionError::WholeBlobAuditedEndpointDivergence { .. }
         | SessionError::ExternalWriteFenceConflict { .. }
         | SessionError::ExternalWriteFenceBackoff { .. } => 409,
+        SessionError::ForkInstructionRefused(_) => 422,
         SessionError::CapabilityUnavailable(_)
         | SessionError::PersistenceDisabled
         | SessionError::CompactionDisabled

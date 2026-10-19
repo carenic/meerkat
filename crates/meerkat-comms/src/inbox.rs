@@ -1500,6 +1500,7 @@ mod tests {
                 blocks: None,
                 body: "test".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: crate::identity::Signature::new([0u8; 64]),
         }

@@ -101,12 +101,19 @@ pub(super) fn wire_reuse(reuse: ForkedParticipantReusePolicy) -> BridgeForkedPar
 /// The TTL is carried in whole milliseconds; a duration that cannot be
 /// represented is refused rather than truncated, because the TTL is part of
 /// the request fingerprint the owner replays against.
+///
+/// The controller's fork instruction policy travels only as
+/// `reactivate_inherited`. Without the field the member host applies the
+/// default, which already refuses a participant that would inherit activation
+/// rows, so `refuse` and `require_explicit_activation` need no field and a
+/// member host that predates it still serves them.
 pub(super) fn create_payload(
     supervisor: BridgePeerSpec,
     epoch: u64,
     binding_generation: u64,
     source_member: BridgeMemberIncarnation,
     request: &ForkedParticipantCreateRequest,
+    inherited_instructions: meerkat_core::ForkInstructionPolicy,
 ) -> Option<BridgeCreateForkedParticipantPayload> {
     Some(BridgeCreateForkedParticipantPayload {
         supervisor,
@@ -123,7 +130,18 @@ pub(super) fn create_payload(
         scope: wire_scope(request.scope),
         reuse: wire_reuse(request.reuse),
         ttl_millis: u64::try_from(request.ttl.as_millis()).ok()?,
+        inherited_instructions: carried_fork_instruction_policy(inherited_instructions),
     })
+}
+
+/// The fork instruction policy a create payload carries to the member host:
+/// `reactivate_inherited` only (see [`create_payload`]). One definition, so
+/// the controller's version-skew mapping and the payload agree on whether a
+/// member host saw the field.
+pub(super) fn carried_fork_instruction_policy(
+    policy: meerkat_core::ForkInstructionPolicy,
+) -> Option<meerkat_core::ForkInstructionPolicy> {
+    (policy == meerkat_core::ForkInstructionPolicy::ReactivateInherited).then_some(policy)
 }
 
 /// Build the V6 revoke payload for one capability.

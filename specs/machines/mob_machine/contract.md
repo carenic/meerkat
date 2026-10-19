@@ -523,6 +523,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `BeginExplicitResumeCleanup`(attempt: ResumeAttemptId)
 - `SettleExplicitResumeCleanup`(attempt: ResumeAttemptId)
 - `FinishExplicitResume`(attempt: ResumeAttemptId)
+- `RetireAtScope`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId)
 
 ## Signals
 - `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
@@ -601,6 +602,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CreateRun`
 - `RecoverIdentityGenerationHighwater`(agent_identity: AgentIdentity, generation: Generation)
 - `SealIdentityGenerationHighwater`
+- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
+- `RecoverMemberRestoreHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -751,6 +754,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `GrantRevoked`(principal: PrincipalId, revoked: Set<ControlScope>, remaining: Set<ControlScope>)
 - `ExplicitResumeMemberOutcomeClassified`(attempt: ResumeAttemptId, agent_identity: AgentIdentity, binding: ResumeMemberBinding, disposition: ResumeMemberOutcomeDisposition)
 - `ExplicitResumeFinished`(attempt: ResumeAttemptId, cancelled: Bool)
+- `RetireAtScopeResolved`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, verdict: RetireAtScopeVerdictKind, expected_fence_token: Option<FenceToken>, actual_fence_token: Option<FenceToken>, current_session_id: Option<SessionId>)
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
@@ -4578,6 +4582,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `releasing_absent`
   - `session_absent`
   - `binding_absent`
+  - `retirement_session_absent`
   - `retiring_peer_endpoint_consistent`
 - To: `Running`
 
@@ -4841,7 +4846,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `RecoverRosterMemberRetired`(agent_identity, agent_runtime_id, generation)
 - Guards:
-  - `identity_or_generation_advanced`
+  - `identity_unmapped`
+  - `generation_advanced`
 - To: `Running`
 
 ### `RecoverMemberKickoffPending`
@@ -15204,6 +15210,110 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `highwater_recovery_open`
 - To: `Destroyed`
+
+### `RetireAtScopeCurrentRunning`
+- From: `Running`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_runtime_current`
+  - `scope_fence_current`
+  - `scope_session_current`
+- Emits: `RetireAtScopeResolved`
+- To: `Running`
+
+### `RetireAtScopeCurrentStopped`
+- From: `Stopped`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_runtime_current`
+  - `scope_fence_current`
+  - `scope_session_current`
+- Emits: `RetireAtScopeResolved`
+- To: `Stopped`
+
+### `RetireAtScopeNoCurrentIncarnationRunning`
+- From: `Running`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_unmapped`
+- Emits: `RetireAtScopeResolved`
+- To: `Running`
+
+### `RetireAtScopeNoCurrentIncarnationStopped`
+- From: `Stopped`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_unmapped`
+- Emits: `RetireAtScopeResolved`
+- To: `Stopped`
+
+### `RetireAtScopeStaleFenceTokenRunning`
+- From: `Running`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_incarnation_stale`
+- Emits: `RetireAtScopeResolved`
+- To: `Running`
+
+### `RetireAtScopeStaleFenceTokenStopped`
+- From: `Stopped`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_incarnation_stale`
+- Emits: `RetireAtScopeResolved`
+- To: `Stopped`
+
+### `RetireAtScopeStaleSessionBindingRunning`
+- From: `Running`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_runtime_current`
+  - `scope_fence_current`
+  - `scope_session_not_bound`
+  - `scope_session_not_releasing`
+- Emits: `RetireAtScopeResolved`
+- To: `Running`
+
+### `RetireAtScopeStaleSessionBindingStopped`
+- From: `Stopped`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `identity_mapped`
+  - `scope_runtime_current`
+  - `scope_fence_current`
+  - `scope_session_not_bound`
+  - `scope_session_not_releasing`
+- Emits: `RetireAtScopeResolved`
+- To: `Stopped`
+
+### `RetireAtScopeMobNotRunningCompleted`
+- From: `Completed`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Emits: `RetireAtScopeResolved`
+- To: `Completed`
+
+### `RetireAtScopeMobNotRunningDestroyed`
+- From: `Destroyed`
+- On: `RetireAtScope`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Emits: `RetireAtScopeResolved`
+- To: `Destroyed`
+
+### `ResolveMemberRevivalHostRefusedRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
+- Guards:
+  - `revival_pending`
+- To: `Running`
+
+### `RecoverMemberRestoreHostRefusedRunning`
+- From: `Running`
+- On: `RecoverMemberRestoreHostRefused`(agent_identity, refusal_code, reason)
+- To: `Running`
 
 ## Coverage
 ### Code Anchors

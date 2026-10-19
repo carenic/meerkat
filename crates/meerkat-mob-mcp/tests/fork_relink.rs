@@ -2255,7 +2255,73 @@ struct DegradedChild {
     child_session: meerkat_core::SessionId,
 }
 
+/// A forked child whose run waits at the scripted turn gate, with its
+/// supervisor ended as a process exit ends it.
+struct GatedChild {
+    fixture: CouncilFixture,
+    store: Arc<support::commit_gate::CommitGateRuntimeStore>,
+    gate: Arc<TurnGate>,
+    runtime: Arc<meerkat_runtime::MeerkatMachine>,
+    child: AgentIdentity,
+    child_session: meerkat_core::SessionId,
+}
+
 async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
+    let GatedChild {
+        fixture,
+        store,
+        gate,
+        runtime,
+        child,
+        child_session,
+    } = fork_child_at_its_gated_turn(child).await;
+    store.arm_failure(meerkat_runtime::LogicalRuntimeId::for_session(
+        &child_session,
+    ));
+    gate.open();
+    store.failed().await;
+    let degraded = runtime
+        .session_has_uncommitted_run_input(&child_session)
+        .await
+        .expect_err("the child's durability is degraded");
+    assert!(
+        matches!(
+            degraded,
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+        ),
+        "{degraded:?}"
+    );
+    DegradedChild {
+        fixture,
+        store,
+        child,
+        child_session,
+    }
+}
+
+/// A forked child whose terminal boundary commit waits at the store, armed to
+/// fail once released. The child's runtime loop holds the session's mutation
+/// gate while the commit waits.
+async fn fork_child_whose_boundary_commit_is_held_to_fail(child: &str) -> GatedChild {
+    let gated = fork_child_at_its_gated_turn(child).await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&gated.child_session);
+    gated.store.arm(runtime_id.clone());
+    gated.store.arm_failure(runtime_id);
+    gated.gate.open();
+    gated.store.entered().await;
+    gated
+}
+
+async fn fork_child_at_its_gated_turn(child: &str) -> GatedChild {
+    fork_child_at_its_gated_turn_measured_in(child, None).await
+}
+
+/// As [`fork_child_at_its_gated_turn`], with the fixture's runtime measuring
+/// its store's commit outcome deadline in busy windows of `busy_window`.
+async fn fork_child_at_its_gated_turn_measured_in(
+    child: &str,
+    busy_window: Option<Duration>,
+) -> GatedChild {
     let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
     let gate = TurnGate::new();
     let turn_gate = Arc::clone(&gate);
@@ -2269,6 +2335,12 @@ async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
         },
         store.clone(),
     );
+    if let Some(busy_window) = busy_window {
+        meerkat_mob::MobSessionService::acquire_runtime_adapter(fixture.service.as_ref(), None)
+            .expect("acquire runtime authority")
+            .expect("the service derives its runtime")
+            .set_runtime_commit_busy_window_for_test(busy_window);
+    }
     fixture.seed_source_mob(&["forker"]).await;
     let owner = forker_session(&fixture).await;
     let handle = fixture
@@ -2310,25 +2382,11 @@ async fn fork_child_whose_boundary_commit_failed(child: &str) -> DegradedChild {
         meerkat_mob::MobSessionService::acquire_runtime_adapter(fixture.service.as_ref(), None)
             .expect("acquire runtime authority")
             .expect("the service derives its runtime");
-    store.arm_failure(meerkat_runtime::LogicalRuntimeId::for_session(
-        &child_session,
-    ));
-    gate.open();
-    store.failed().await;
-    let degraded = runtime
-        .session_has_uncommitted_run_input(&child_session)
-        .await
-        .expect_err("the child's durability is degraded");
-    assert!(
-        matches!(
-            degraded,
-            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
-        ),
-        "{degraded:?}"
-    );
-    DegradedChild {
+    GatedChild {
         fixture,
         store,
+        gate,
+        runtime,
         child,
         child_session,
     }
@@ -2433,6 +2491,239 @@ async fn a_destroy_that_cannot_reload_a_degraded_member_is_incomplete_and_retrya
         degraded.fixture.state.handle_for(&mob_id).await.is_err(),
         "the destroyed mob is gone"
     );
+}
+
+/// A member's boundary commit fails while the destroy's retire of that member
+/// waits for the member session's mutation gate, which the runtime loop holds
+/// across the commit. The parked detach takes the gate when the loop releases
+/// it, and the retire's admission refuses typed for the member's degraded
+/// durability, so the destroy reloads the member and retries the retirement
+/// once instead of answering incomplete.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boundary_commit_that_fails_during_the_destroy_detach_is_reloaded_and_retired() {
+    let held = fork_child_whose_boundary_commit_is_held_to_fail("detach-reloaded-child").await;
+    let mob_id = held.fixture.source_mob_id();
+    let parked = held
+        .runtime
+        .arm_mutation_gate_wait_observer_for_test(held.child_session.clone());
+    let destroy = held.fixture.state.mob_destroy(&mob_id);
+    let fail_the_commit_during_the_wait = async {
+        parked
+            .await
+            .expect("the wait observer stays armed until a wait parks");
+        held.store.release();
+        held.store.failed().await;
+    };
+    let (report, ()) = tokio::time::timeout(DEGRADED_DESTROY_BOUND, async {
+        tokio::join!(destroy, fail_the_commit_during_the_wait)
+    })
+    .await
+    .expect("the destroy finishes within the bound");
+    let report = report.expect("the destroy reloads the degraded member and retires it");
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        report.reloaded_members,
+        vec![held.child.clone()],
+        "the report names the member the destroy reloaded"
+    );
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_err(),
+        "the destroyed mob is gone"
+    );
+    let inputs = meerkat_runtime::RuntimeStore::load_input_states_strict(
+        held.store.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&held.child_session),
+    )
+    .await
+    .expect("the child's durable inputs");
+    assert!(
+        inputs.iter().any(|stored| stored.seed.terminal_outcome
+            == Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::InputAbandonReason::Retired,
+            })),
+        "the retirement records the input the failed commit never consumed durably: {:?}",
+        inputs
+            .iter()
+            .map(|stored| (
+                stored.state.input_id.clone(),
+                stored.seed.phase,
+                stored.seed.terminal_outcome.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The busy window the hung-commit destroy test measures its store's
+/// declaration in: the deadline is two of them.
+const HUNG_COMMIT_BUSY_WINDOW: Duration = Duration::from_secs(1);
+
+/// A forked child whose terminal boundary commit waits at the store, which
+/// never answers until the test releases it.
+async fn fork_child_whose_boundary_commit_hangs(child: &str) -> GatedChild {
+    let gated =
+        fork_child_at_its_gated_turn_measured_in(child, Some(HUNG_COMMIT_BUSY_WINDOW)).await;
+    gated
+        .store
+        .arm(meerkat_runtime::LogicalRuntimeId::for_session(
+            &gated.child_session,
+        ));
+    gated.gate.open();
+    gated.store.entered().await;
+    gated
+}
+
+/// A member whose boundary commit the store never answers no longer keeps a
+/// destroy waiting. At the store's declared deadline the member's session
+/// degrades, so the destroy's retirement of it ends typed, and the destroy
+/// answers incomplete, naming the member, while the store still has not
+/// answered. Once the store answers, the same destroy reloads the member and
+/// completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_it_answers() {
+    let held = fork_child_whose_boundary_commit_hangs("hung-commit-child").await;
+    let mob_id = held.fixture.source_mob_id();
+    let refused = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the destroy answers while the store has not");
+    let report = match refused {
+        Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report }) => report,
+        other => panic!("a destroy behind the hung commit is incomplete: {other:?}"),
+    };
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains(held.child.as_str())),
+        "the report names the member: {report:?}"
+    );
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_ok(),
+        "the mob stays for a retry"
+    );
+
+    held.store.release();
+    let report = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the retried destroy finishes")
+    .expect("the retried destroy reloads the member and completes");
+    assert_eq!(report.reloaded_members, vec![held.child.clone()]);
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_err(),
+        "the destroyed mob is gone"
+    );
+}
+
+/// Closing a mob's admission if it is idle asks each member whether it has
+/// active inputs. Behind a member's boundary commit that the store never
+/// answers, that read answers busy once the member's session degrades at the
+/// store's deadline, so the close answers within the bound and leaves the
+/// busy mob open. Before, the read waited for the member's driver, which the
+/// commit holds, and so for the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_mob_if_idle_behind_a_commit_the_store_never_answers_answers_busy() {
+    let held = fork_child_whose_boundary_commit_hangs("hung-close-child").await;
+    let handle = held
+        .fixture
+        .state
+        .handle_for(&held.fixture.source_mob_id())
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(DEGRADED_DESTROY_BOUND, handle.close_if_idle())
+        .await
+        .expect("closing if idle answers while the store has not")
+        .expect("the mob answers the close");
+    assert!(
+        handle.admission_closed().borrow().is_none(),
+        "the member answers busy, so the mob stays open: {outcome:?}"
+    );
+    held.store.release();
+}
+
+/// Force-cancelling a member whose runtime needs a durability reload answers
+/// the typed `MemberReloadRequired`, naming the member, at once: it neither
+/// waits on the member session's gates nor fails untyped behind them. A
+/// cancel of all of its work answers the same. The repair it names,
+/// `reload_member_registration`, then lets the cancel run, and the member's
+/// durable input ends terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn force_cancelling_a_member_that_needs_a_reload_answers_typed_until_it_is_reloaded() {
+    let degraded = fork_child_whose_boundary_commit_failed("cancelled-child").await;
+    let handle = degraded
+        .fixture
+        .state
+        .handle_for(&degraded.fixture.source_mob_id())
+        .await
+        .unwrap();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.force_cancel_member(degraded.child.clone()),
+    )
+    .await
+    .expect("the cancel answers at once");
+    match refused {
+        Err(meerkat_mob::MobError::MemberReloadRequired { member_id, .. }) => {
+            assert_eq!(member_id, degraded.child, "the refusal names the member");
+        }
+        other => panic!("a degraded member's cancel answers MemberReloadRequired: {other:?}"),
+    }
+    let entry = handle
+        .get_member(&degraded.child)
+        .await
+        .expect("the roster answers")
+        .expect("the degraded member stays in the roster");
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token),
+    )
+    .await
+    .expect("the cancel of all its work answers at once");
+    match refused {
+        Err(meerkat_mob::MobError::MemberReloadRequired { member_id, .. }) => {
+            assert_eq!(member_id, degraded.child, "the refusal names the member");
+        }
+        other => panic!(
+            "a degraded member's cancel of all its work answers MemberReloadRequired: {other:?}"
+        ),
+    }
+
+    handle
+        .reload_member_registration(&degraded.child)
+        .await
+        .expect("the named repair reloads the member");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.force_cancel_member(degraded.child.clone()),
+    )
+    .await
+    .expect("the cancel answers")
+    .expect("the reloaded member's cancel runs");
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&degraded.child_session);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let inputs = meerkat_runtime::RuntimeStore::load_input_states_strict(
+                degraded.store.as_ref(),
+                &runtime_id,
+            )
+            .await
+            .expect("the child's durable inputs");
+            if !inputs.is_empty()
+                && inputs
+                    .iter()
+                    .all(|stored| stored.seed.terminal_outcome.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the member's durable input ends terminal");
 }
 
 /// A receipt that lands while the ceiling-deciding status read is held is

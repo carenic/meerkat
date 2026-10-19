@@ -199,6 +199,11 @@ pub enum SessionError {
     /// waiting at the physical session boundary. No target write was invoked.
     #[error("external session write fence backoff: {reason}")]
     ExternalWriteFenceBackoff { reason: String },
+
+    /// A durable fork was refused before commit because of the activation
+    /// rows its child would inherit. No child session exists.
+    #[error(transparent)]
+    ForkInstructionRefused(crate::ForkInstructionRefusal),
 }
 
 /// Why a durable session refuses to serve a resume while its content stays
@@ -527,6 +532,11 @@ impl SessionError {
     /// wire, where it travels under the runtime-unavailable code.
     pub const HOSTING_UNAVAILABLE_KIND: &'static str = "session_hosting_unavailable";
 
+    /// Structured-data `kind` of a [`Self::ForkInstructionRefused`] refusal on
+    /// the wire. The `fork_instruction_refusal` member carries the typed cause
+    /// and keys.
+    pub const FORK_INSTRUCTION_REFUSED_KIND: &'static str = "fork_instruction_refused";
+
     /// Return a stable error code string for wire formats.
     pub fn code(&self) -> &'static str {
         match self {
@@ -549,6 +559,7 @@ impl SessionError {
             Self::Unsupported(_) => "SESSION_UNSUPPORTED",
             Self::ExternalWriteFenceConflict { .. } => "SESSION_EXTERNAL_WRITE_FENCE_CONFLICT",
             Self::ExternalWriteFenceBackoff { .. } => "SESSION_EXTERNAL_WRITE_FENCE_BACKOFF",
+            Self::ForkInstructionRefused(_) => "FORK_INSTRUCTION_REFUSED",
             Self::Agent(_) => "AGENT_ERROR",
             Self::FailedWithData { .. } => "SESSION_ERROR",
             Self::CapabilityUnavailable(_) => "CAPABILITY_UNAVAILABLE",
@@ -591,6 +602,10 @@ impl SessionError {
             Self::WholeBlobAuditedEndpointDivergence { id } => Some(
                 self.durable_resume_hold_data(DurableResumeHold::AuditedEndpointDivergence, id),
             ),
+            Self::ForkInstructionRefused(refusal) => Some(serde_json::json!({
+                "kind": Self::FORK_INSTRUCTION_REFUSED_KIND,
+                "fork_instruction_refusal": refusal,
+            })),
             _ => None,
         }
     }
@@ -2820,6 +2835,10 @@ pub struct SessionForkAtRequest {
     /// concrete allow/deny policies replace it on the fork only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. `None` is
+    /// [`crate::ForkInstructionPolicy::RequireExplicitActivation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<crate::ForkInstructionPolicy>,
 }
 
 /// Request to fork a session and apply a typed transcript replacement.
@@ -2837,6 +2856,10 @@ pub struct SessionForkReplaceRequest {
     /// concrete allow/deny policies replace it on the fork only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
+    /// Host policy for the activation rows the child inherits. `None` is
+    /// [`crate::ForkInstructionPolicy::RequireExplicitActivation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_instructions: Option<crate::ForkInstructionPolicy>,
 }
 
 /// A provider-cache-compatible durable transcript fork point.
@@ -3039,6 +3062,9 @@ pub struct DurableSessionForkTarget {
     /// How the durable fork owner treats a source session whose runtime is
     /// currently running a turn.
     pub source_admission: DurableForkSourceAdmission,
+    /// The fork instruction policy this fork applies, already resolved for
+    /// the path's activation window ([`crate::ForkInstructionPolicy::effective`]).
+    pub inherited_instructions: crate::ForkInstructionPolicy,
 }
 
 /// Outcome of a durable fork that first waited, bounded, for the source
@@ -3129,6 +3155,25 @@ pub struct SessionForkResult {
     pub cache_inheritance: ForkCacheInheritance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
+    /// Instruction re-activation rows the fork appended to the child after
+    /// the copied prefix ([`crate::ForkInstructionPolicy::ReactivateInherited`]).
+    /// `message_count` counts them; [`Self::prefix_message_count`] does not.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reactivated_instruction_count: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl SessionForkResult {
+    /// Messages the child copied from its source: the fork prefix, without
+    /// the instruction re-activation rows the fork appended after it.
+    #[must_use]
+    pub fn prefix_message_count(&self) -> usize {
+        self.message_count
+            .saturating_sub(self.reactivated_instruction_count)
+    }
 }
 
 /// Request to rewrite the current transcript head without changing SessionId.

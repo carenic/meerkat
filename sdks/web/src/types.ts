@@ -6,6 +6,7 @@ import type {
   WireMemberLifecycleCapabilities,
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
+  WireMemberRegistrationHookCall,
   WireMobMemberStatus,
   WireNonPortableResourceKind,
   WireReachability,
@@ -18,6 +19,7 @@ import type {
 export type {
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
+  WireMemberRegistrationHookCall,
 } from './generated/mob.js';
 
 // ─── Bootstrap / session config (generated wire parity) ─────────
@@ -446,6 +448,11 @@ export interface MobMemberSnapshot {
    * Absent when they are observations.
    */
   preview_unavailable?: WireMemberPreviewUnavailable;
+  /**
+   * Set when the member's host refused its restored registration: the hook
+   * call that refused it. The member stays broken until an explicit repair.
+   */
+  registration_refusal?: WireMemberRegistrationHookCall;
 }
 
 /** Result envelope for helper-style mob flows. */

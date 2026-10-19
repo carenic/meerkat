@@ -435,7 +435,7 @@ async fn exact_cancellation_after_the_bound_reports_a_pending_dispatch() {
         (
             entry.driver.clone(),
             entry.completions.clone(),
-            Arc::clone(&entry.mutation_gate),
+            entry.mutation_gate.clone(),
         )
     };
     let (_dispatch_result, start_permit) = machine

@@ -362,9 +362,11 @@ them.
     optional.
   - Version skew: the 0.9.3 Python and TypeScript SDKs require `persisted`,
     so a 0.9.3 SDK talking to a 0.9.4 rkat-rpc fails on every
-    `tool_config_changed` event that 0.9.4 builds. The SDKs fetch their own
-    matching rkat-rpc, so this happens only with an overridden binary path;
-    the remedy is to upgrade the SDK.
+    `tool_config_changed` event that 0.9.4 builds. An SDK downloads its own
+    matching rkat-rpc only when it is given none, so this happens with a
+    binary it is given: `MEERKAT_BIN_PATH`, an explicit path, or an rkat-rpc
+    on `PATH` (a Homebrew upgrade, for example); the remedy is to upgrade the
+    SDK.
   - Stored transcripts: 0.9.3 cannot read back a transcript that 0.9.4 wrote
     with a `tool_config` notice (a tool-scope, deferred-catalog or
     failed-closed notice), because 0.9.3 requires the payload's `persisted`.
@@ -420,6 +422,199 @@ them.
   `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
   it with `{ stage, .. }`. The settlement follows the exact registration's
   runtime unregister after Shutdown returns.
+- Behaviour (no type change): every content steer admitted while a turn runs
+  (a prompt, a peer message, request or lifecycle notice, an external event or
+  a local flow step) is now written into the running turn's transcript at a
+  model boundary (`MeerkatMachine` delivery class `DurableAppend`) or, when it
+  carries something only a fresh turn applies or is a directed delivery,
+  taken by exactly one follow-up turn. Before, peer message and request
+  steers and text-only prompt steers reached exactly one model request and
+  never the transcript. Hosts and consoles now see their rows in history,
+  `boundary_append_applied` when the runner writes them, and one
+  `peer_content_ingested` per incoming comms notice. Durable steers join one
+  per boundary, in arrival order: a steer admitted while an earlier one still
+  waits joins the boundary after it, in the same run, instead of falling back
+  to the follow-up turn; steers still waiting when the run ends take the
+  follow-up turn in arrival order. Before, every peer or text steer admitted
+  during one boundary reached the next model request; now one durable steer
+  joins per boundary, and the later ones land at later boundaries of the run
+  or in the follow-up turn.
+- `meerkat-core`: `SystemNoticeBlock::Comms` and
+  `AgentEvent::PeerContentIngested` gain the field
+  `delivery_id: Option<InteractionId>`: the delivery id of an incoming peer
+  message, which `reply_to_peer` takes as `reply_to` (see Fixed). Struct
+  literals and exhaustive patterns of either variant name it. On the wire it
+  is optional (`delivery_id` on the notice block and on
+  `peer_content_ingested`) and omitted when absent.
+- `meerkat-core`: `CommsCommand::PeerMessage`, `InteractionContent::Message`
+  and `SystemNoticeBlock::Comms` gain `in_reply_to: Option<InteractionId>`;
+  `meerkat-comms`: `MessageKind::Message` gains `in_reply_to: Option<Uuid>`;
+  `meerkat-runtime`: `PeerInput` gains `in_reply_to`. It is the delivery a
+  `reply_to_peer` reply answers (see Added). Struct literals and exhaustive
+  patterns name it. On the wire it is optional (`in_reply_to` on the notice
+  block) and omitted when absent.
+- Behaviour (no type change): the text the model reads for an incoming peer
+  message notice now carries a `Delivery ID: <id>` line after its payload, and
+  an `In reply to: <id>` line when the message is a reply.
+- Compatibility (not measured by the gate): the transcript content digest
+  erases a comms notice's `delivery_id` and `in_reply_to`, as it erases a
+  notice's runtime origin, so a row's revision is the same with or without
+  them. A 0.9.3 reader, which drops the keys when it decodes the row, computes
+  the revision 0.9.4 stored and loads the session. One residual: an append
+  retried after a crash over rows already stored compares the re-serialized
+  rows byte for byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote
+  would refuse the retry; the stored input state 7 entry above already keeps
+  0.9.3 off a runtime store that 0.9.4 wrote.
+- Compatibility (wire): a 0.9.3 receiver that checks signatures (the default,
+  and always at a host acceptor) refuses a `reply_to_peer` reply from 0.9.4.
+  Its message kind does not know `in_reply_to`, so it re-serializes the signed
+  envelope without the field, the signature check fails, and it drops the
+  envelope; the sender sees no acknowledgement, and `reply_to_peer` reports an
+  ambiguous delivery outcome, not a failure. A 0.9.3 receiver with peer auth
+  off accepts the reply without the label. `send_message` and every other
+  message kind are unchanged, so a 0.9.3 peer still receives them.
+- `meerkat-runtime`: `CompletionWaitError` is `#[non_exhaustive]` and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (see Changed). A match on it outside the crate needs a wildcard arm.
+  `wait_failure_observation()` maps both new variants to
+  `AuthorityUnavailable`, as it maps `AuthorityUnavailable(_)`, and
+  `is_boundary_rolled_back()` and `is_durable_outcome_unknown()` name them.
+- `meerkat-core`: `SessionError` gains `ForkInstructionRefused`: a durable
+  fork refused before commit by the host's fork instruction policy (see
+  Added). Exhaustive matches handle it; on the wire it is
+  `FORK_INSTRUCTION_REFUSED`. `DurableSessionForkTarget` gains
+  `inherited_instructions`, the policy the fork applies, already resolved for
+  its path. `SessionForkAtRequest` and `SessionForkReplaceRequest` gain
+  `inherited_instructions` (`None` is the default policy), and
+  `SessionForkResult` gains `reactivated_instruction_count`. Struct literals
+  set the new fields.
+- `meerkat-session`: `PersistentSessionService::fork_durable_session_with_planned_identity`
+  takes the fork instruction policy of a fork without a target.
+  `meerkat-mob`: `PlannedForkRequest` gains `inherited_instructions`, and
+  `MobError` gains `ForkInstructionRefused { source_member_id, refusal }`.
+  `meerkat-contracts`: `BridgeCreateForkedParticipantPayload` gains
+  `inherited_instructions`, `BridgeRejectionCause` gains
+  `ForkInstructionRefused`, and `ErrorCode` gains `ForkInstructionRefused`.
+  Every `MobSessionService` decorator that forwards planned forks forwards the
+  field.
+- Behaviour (not measured by the gate): forks whose copied prefix carries
+  activated host instructions. Under the default fork instruction policy,
+  `require_explicit_activation`, the forks that start the child's first turn
+  themselves are now refused before anything is committed, with the typed
+  refusal: `fork_off`, `MobHandle::fork_member_then_run_bounded` and
+  `fork_member_then_run_detached`, `fork_member_at_turn_boundary` (and so the
+  live delegation's durable fork), and council participants, local or
+  host-placed. So are the RPC forks `session/fork_at` and `session/fork_replace`,
+  whose child nobody can activate before its first turn. 0.9.3 committed such a
+  child and its first turn failed. `fork_member` keeps the host's activation
+  window. A host that wants the fork to carry the activations sets
+  `reactivate_inherited`; an RPC client passes `inherited_instructions`. Forks of
+  sources without activation rows are unchanged.
+- Behaviour (not measured by the gate): `meerkat-core`: a model turn refused
+  because a fork child never activated its inherited instruction keys fails
+  with `AgentError::InstructionActivation`, carrying the typed activation error,
+  instead of `AgentError::ConfigError(String)`. Its error class and wire code
+  are unchanged.
+- Council records: `TemporaryCouncilExitReason` gains
+  `ParticipantForkInstructionRefused { participant_order, refusal }`, and
+  `TemporaryCouncilAcquisition` gains `Refused`: the owner refused that
+  participant's create before committing anything, so cleanup neither revokes
+  nor records debt for the slot. A 0.9.3 reader of a record that holds either
+  cannot decode it.
+- Mixed versions: a 0.9.3 member host does not know the fork instruction
+  policy. A controller with `reactivate_inherited` gets the typed refusal cause
+  `member_host_unsupported` from it; under the other policies the controller
+  sends no field and a 0.9.3 member host forks a participant as before, without
+  re-activation. Upgrade member hosts before their controller: until then a
+  0.9.3 member host forks participants, council participants included, without
+  the policy, and a participant whose source has activated host instructions
+  fails its first turn.
+- MobMachine classifies a member delivery scope: `MobMachineInput`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineInputVariant` (meerkat-machine-schema), and the kernel `Input`
+  and `InputKind` gain the variant `RetireAtScope`; `MobMachineEffect`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineEffectVariant` (meerkat-machine-schema), and the kernel `Effect`
+  and `EffectKind` gain `RetireAtScopeResolved`. The kernel
+  `generated::mob::TransitionId` gains `RetireAtScopeCurrentRunning`,
+  `RetireAtScopeCurrentStopped`, `RetireAtScopeNoCurrentIncarnationRunning`,
+  `RetireAtScopeNoCurrentIncarnationStopped`,
+  `RetireAtScopeStaleFenceTokenRunning`, `RetireAtScopeStaleFenceTokenStopped`,
+  `RetireAtScopeStaleSessionBindingRunning`,
+  `RetireAtScopeStaleSessionBindingStopped`,
+  `RetireAtScopeMobNotRunningCompleted` and
+  `RetireAtScopeMobNotRunningDestroyed`. Every new variant is appended last,
+  so no existing variant's discriminant moves. Exhaustive matches must add
+  the arms.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a host refusal
+  of a restored member's registration (`select_destination`,
+  `select_agent_mandate`, `prepare_member_surface` or
+  `verify_member_surface`) now removes that registration exactly, as a new
+  member's refusal does. The removal is the canonical unregister: it is
+  recorded in the session's durable history, and it terminates every input
+  the session still holds (abandoned as `Stopped`, their completions
+  resolved as runtime-terminated). The owner context the restore bound to
+  the member is released with it. The member stays Broken with the typed
+  refusal (`MobError::MemberRegistrationRefused`, shown in
+  `MobMemberSnapshot::registration_refusal`) until an explicit repair, and
+  `ensure_member_live` returns that refusal without asking the host again.
+  A member that `MobBuilder::resume` restores at boot (a mob running at the
+  crash) gets the same typed refusal, and no registration of its session is
+  current after the refusal: the boot restore's own rollback removes the
+  registration it inserted, as before, and the actor's startup no longer
+  registers the refused member's session again. A refused member, on either
+  path, can be retired, respawned or destroyed: the retirement archives its
+  durable session without routing a retire to the runtime the refusal
+  released. A member the boot recreates on a fresh session still fails the
+  whole resume with the host's error. A failure that is not the host's
+  refusal keeps the restored registration for the repair to reuse, and a
+  spawn that adopts a session registered before it keeps that registration
+  on a refusal, as does the recovery of an attached member's actor.
+- `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
+  member_id, session_id, call, reason }`: a restored member's host refused
+  its registration at `call` (see above). Its RPC error data has the kind
+  `mob_member_registration_refused` with the refusing `hook_call`. Code that
+  matches `MobError` exhaustively adds an arm.
+- `meerkat-mob`: `MobError` gains the variant `MemberDestinationNotInstalled {
+  session_id, error }`, appended last: the member's runtime did not install
+  the destination its host selected, and `error` is the runtime's own
+  verdict. It is the runtime's answer, not a host refusal: a restored member
+  keeps its registration. Such a failure was a `MobError::WiringError`
+  before. Its `failure_class()` is `MobFailureClass::RuntimeRejected`, where
+  the `WiringError` was `MobRejected`, so schedule delivery now records the
+  failure reason `runtime_rejected` instead of `mob_rejected` for a delivery
+  whose member revival hits it. Its RPC error data has the kind
+  `mob_member_destination_not_installed` with the `session_id`, the runtime
+  verdict as a stable snake_case `cause` (for example
+  `scoped_context_generation_not_advanced` or `validation_failed`), the
+  `bound_generation` and `requested_generation` of a selection that does
+  not advance (null for any other cause) and `retryable: false`. A failed
+  revival's destination stays bound on the restored registration it keeps,
+  so a host's re-selection for that registration must advance
+  `context_generation`: a selection of the bound generation gets this
+  variant with the cause `scoped_context_generation_not_advanced`, and the
+  repair selects again with an advanced generation. Code that matches
+  `MobError` exhaustively adds an arm.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance past the bound one with the new
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound,
+  requested }`, appended last, instead of `RuntimeDriverError::Internal`.
+  `RuntimeDriverError` is `non_exhaustive`, so the variant itself breaks
+  no match.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
+  the wire unless a restored member's host refused its registration. Code
+  that builds the result with a struct literal sets it.
+- `MobMachineSignal` (meerkat-machine-schema and meerkat-mob), its variant
+  enum `MobMachineSignalVariant` (meerkat-machine-schema), and the kernel
+  `Signal` and `SignalKind` (meerkat-machine-kernels) gain the variants
+  `ResolveMemberRevivalHostRefused` and `RecoverMemberRestoreHostRefused`,
+  appended last: they record a host's refusal of a restored member's
+  registration with the refusing hook call's code. The kernel
+  `generated::mob::TransitionId` gains `ResolveMemberRevivalHostRefusedRunning`
+  and `RecoverMemberRestoreHostRefusedRunning`, appended last. Code that
+  matches these enums exhaustively adds the arms.
 
 ### Security
 
@@ -781,6 +976,102 @@ them.
   staged reason and leaves a hold the current registration applies in place.
   A runtime unregister keeps staged reasons, so a registration that replaces
   the session's (a reload) applies them.
+- `meerkat-comms`: a receiver checks a peer envelope's signature over the
+  envelope as received, including message-kind fields it does not know, and
+  drops such fields only after the check. A newer sender can add an optional
+  field to a signed message kind without 0.9.4 receivers refusing the
+  message. An envelope whose encoding repeats a map key, or keys a map by
+  anything but a text string, at any depth is refused. A request carrying an
+  unknown field keeps its delivery but not its TCP callback route.
+- `meerkat-core`: `ToolDispatchContext::peer_reply_deliveries` returns the
+  running turn's reply capabilities as one typed list (the deliveries that
+  started the turn and those that joined it at a model boundary, one per
+  sender and delivery id), or `PeerReplyContextError::Malformed` when the
+  turn-start list does not parse. `PeerReplyDispatchContext::insert_delivery`
+  adds a delivery unless the same sender's delivery with that id is listed.
+  `DurableTurnBoundaryAppends::with_peer_reply_capabilities` and
+  `peer_reply_capabilities` carry a durable in-turn delivery's reply
+  capabilities to the runner.
+- `meerkat-comms`: `ReplySelectionError` (`#[non_exhaustive]`), the typed
+  refusals of reply selection (`NoReplyCapability`, `InvalidReplyContext`,
+  `UnknownReplyTo`, `AmbiguousReply`); `reply_to_peer` reports each with its
+  stable code prefix.
+- A reply sent with `reply_to_peer` names the delivery it answers: the
+  signed message carries that delivery id as `in_reply_to`, and the
+  receiver's message notice shows it as an `In reply to` line (`meerkat-comms`,
+  `meerkat-core`, `meerkat-runtime`). It is a label the sender declares:
+  routing and authorization never read it, and `send_message` never sets it.
+- `RuntimeStore::commit_outcome_deadline` declares the longest a boundary
+  commit or run terminalization through the store may legitimately take
+  before it reports its durable outcome (see Changed). The backend declares
+  it through the new `RuntimeSessionAuthorityOps::commit_outcome_deadline`,
+  so a pure decorator forwards it. A composed store whose commit runs
+  lock-acquiring transactions of its own declares its inner store's
+  declaration plus the busy timeout of each such transaction. The default is
+  `DEFAULT_COMMIT_OUTCOME_DEADLINE`, two `COMMIT_BUSY_WINDOW`s of 60 s.
+  `SqliteRuntimeStore` declares the same from the shared SQLite busy timeout,
+  and `InMemoryRuntimeStore` declares none.
+- `meerkat-core`: `ForkInstructionPolicy` (`require_explicit_activation`, the
+  default; `reactivate_inherited`; `refuse`) and `ActivationWindow`, with
+  `ForkInstructionPolicy::effective`, which resolves the default to `refuse`
+  on a fork that leaves the host no activation window. The typed
+  `ForkInstructionRefusal` names its keys and a `ForkInstructionRefusalCause`:
+  `policy_refuses`, `not_effective_in_source`, `lineage_body_budget_exceeded`,
+  `activation` or `member_host_unsupported`.
+  `Session::apply_fork_instruction_policy` applies a policy to a fork child
+  before its save; under `reactivate_inherited` it appends one origin-local
+  activation per inherited key, re-activating the key's head at the fork
+  boundary, in (namespace, key) order and through the ordinary activation
+  rules. `Session::fork_reactivation_suffix_len` verifies those rows by
+  reproducing them, and `SessionForkResult::prefix_message_count()` gives the
+  copied prefix without them.
+- `meerkat-mob`: `MobBuilder::with_fork_instruction_policy`, and
+  `meerkat-mob-mcp`: `MobMcpState::with_fork_instruction_policy`, set the
+  host's policy for every mob built or resumed. It is never a tool argument or
+  part of a mob definition.
+- `meerkat-contracts`: the error code `FORK_INSTRUCTION_REFUSED` (JSON-RPC
+  -32037, HTTP 422, CLI exit 57), whose `data` carries
+  `kind: "fork_instruction_refused"` and the typed `fork_instruction_refusal`.
+  `session/fork_at` and `session/fork_replace` take `inherited_instructions`
+  and report `reactivated_instruction_count`. The Python and TypeScript SDKs
+  take the option on their fork calls and read the count.
+- `meerkat-machine-schema`: MobMachine decides whether a member delivery
+  scope still names its member's current incarnation. The runtime-internal
+  input `RetireAtScope` names an identity, a runtime id, the identity's fence
+  and a session, and answers without a state change through the effect
+  `RetireAtScopeResolved` and its `RetireAtScopeVerdictKind`: `Current` when
+  the identity maps to that runtime id, its fence is the scope's, and the
+  session is the member's binding or the session its retirement is
+  releasing; `NoCurrentIncarnation` when the identity maps to no
+  incarnation; `StaleFenceToken` when another incarnation is current;
+  `StaleSessionBinding` when the incarnation is current but the session is
+  not one it holds; and `MobNotRunning` in a completed or destroyed mob. The
+  verdicts are total and mutually exclusive. The member lifecycle TLC audit
+  checks both in every state its domains reach and for every scope they can
+  name, and that a Current verdict admits a Retire of that incarnation; five
+  `meerkat_mob_seam` witnesses reach each verdict.
+- `meerkat-mob`: `MobHandle::retire_at_scope` retires exactly the member
+  incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
+  semantics. Each step, every descendant and the member itself, is admitted
+  by MobMachine's `RetireAtScope` verdict on the scope in the same actor
+  command that retires it, so a successor minted while the call runs is
+  never retired through an older scope. A scope whose incarnation was
+  replaced answers `StaleFenceToken`, a moved session binding
+  `StaleDeliveryScope`, and a completed or destroyed mob
+  `InvalidTransition`; a refusal stops the call. After the member's own
+  step, descendants are retired only while no incarnation of the identity
+  is current. `Ok(())` is `retire`'s barrier:
+  with no incarnation current, the call waits out a retirement the mob still
+  owns for the identity, answers `Ok(())` only once the identity has no
+  roster entry and no stuck retirement, and answers a stuck retirement with
+  `MemberRetirementStuck`.
+- `meerkat-mob`: `MemberRegistrationHookCall`, the registration hook call
+  that refused a restored member's registration, and
+  `MobMemberSnapshot::registration_refusal`, which carries it for a Broken
+  member. `meerkat-contracts` mirrors it as `WireMemberRegistrationHookCall`.
+- `meerkat-runtime`: `PreparedSessionMaterialization::inserted_registration()`
+  tells whether the materialization's own prepare inserted the session's
+  registration or found one already current.
 
 ### Changed
 
@@ -899,7 +1190,11 @@ them.
   features, and passes with the features its
   `[package.metadata.meerkat.standalone-tests]` declares (meerkat,
   meerkat-runtime and meerkat-mob, whose packages now carry a README.md
-  that prints the command). Plain `cargo test` runs a binary's tests as
+  that prints the command). Those three also declare the 8 MiB test thread
+  stack the workspace runs them with, and their README command sets
+  `RUST_MIN_STACK=8388608`; no suite has been measured at Rust's 2 MiB
+  default, so the other 43 published crates' tests may need the same
+  setting. Plain `cargo test` runs a binary's tests as
   threads of one process, and three suites no longer collide there:
   meerkat's realtime pipeline tests take the process-wide open reservation
   one at a time, meerkat-rpc's callback-ownership tests give each case its
@@ -933,8 +1228,8 @@ them.
   every test target's test names with the workspace's. Publication does not
   wait for it yet: the release gate on a passing run at the release commit
   returns once a nightly run has passed and its duration is measured.
-  `scripts/release-require-standalone-green` checks that a run passed at a
-  given commit.
+  `scripts/release-require-standalone-green` checks that a run on main passed
+  at a given commit.
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
   until Resume; a member spawned into a Stopped mob, or held again after a
@@ -950,6 +1245,30 @@ them.
   `UnregisterPending` at the stage `durability_reload_discard`, not as a
   Shutdown teardown failure: its settlement runs the reload-required discard
   and admits the unregister again.
+- `MobHandle::force_cancel_member` on a member whose runtime requires a
+  durability reload answers `MobError::MemberReloadRequired` at once, naming
+  the member, where it failed with `MobError::Internal` wrapping the
+  runtime's repair-blocked error. `MobHandle::cancel_all_work` answers the
+  same. On the wire this is the dedicated `MEMBER_RELOAD_REQUIRED` error:
+  JSON-RPC `-32029` from `mob/force_cancel`, HTTP 409 from
+  `POST /mob/{id}/members/{agent_identity}/cancel`, and exit 49 from
+  `rkat mob force-cancel`. Reload the member with
+  `MobHandle::reload_member_registration`, then cancel again. This was a
+  0.9.3 known limitation.
+- A persistent session's boundary commit or run terminalization that reports
+  no durable outcome within its store's declared deadline (120 s for the
+  SQLite store) now marks the session reload-required. The runtime loop
+  stops waiting and leaves the commit running; it keeps the session's
+  mutation gate until the store answers. The run's completion waiters fail
+  with `CompletionWaitError::DurableOutcomeUnknown`, and a run whose boundary
+  commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
+  where they got `AuthorityUnavailable` with a message. In both cases the
+  input stays durably admitted: read it after the reload instead of
+  resubmitting it. A reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
+  replaces the registration from durable truth. A mob member's tracked turn
+  stays pending on either failure, as on `AuthorityUnavailable`, and a
+  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
 
 ### Fixed
 
@@ -962,7 +1281,10 @@ them.
   same occurrences incrementally: the retired base as a
   `session_transcript_retirements` row and rewrite rows for the retained
   generations only, and the synthesized head is the head the migration
-  writes. The in-memory store still refuses such a session typed.
+  writes. A host that reads such a session's head at every committed
+  boundary, like a persistent Meta gateway without a roster, no longer stops
+  accepting work for a member after its fifth compaction. The in-memory store
+  still refuses such a session typed.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved
@@ -1475,6 +1797,153 @@ them.
   registration whose runtime loop is still attached keeps its fence until
   that loop hands it back, and the discard waits for that handoff, as
   before.
+- A peer message or request steered into a running turn was shown to the
+  model for one request and then lost (`meerkat-runtime`,
+  `meerkat-machine-schema`):
+  the machine classified it request-only, so it was consumed when it was
+  injected, never written to the transcript, missing from every later request
+  of the run and from history, and no `peer_content_ingested` event was
+  published for it. Text-only prompt steers, external-event steers and local
+  flow-step steers lost the same way. They now take the durable in-turn path
+  (see Breaking): one transcript row, committed with the run, recovered by
+  exactly one follow-up turn when its image is discarded or the process stops
+  mid-run. Pre-existing in 0.9.2 and 0.9.3.
+- `reply_to_peer` can answer a peer message that joined the running turn
+  (`meerkat-core`, `meerkat-runtime`, `meerkat-comms`). The turn's reply
+  capabilities came only from the deliveries that started it, so a message
+  delivered into the running turn was refused with `no_reply_capability`, or
+  with `unknown_reply_to` for its id. The durable in-turn delivery now adds
+  the message's reply capability to the running turn, and the message's
+  notice shows the `Delivery ID` that `reply_to` takes. When the selected id
+  matches deliveries of two different senders in one turn, the tool refuses
+  with `ambiguous_reply`, names each sender and sends nothing; before, it
+  answered the first. Pre-existing in 0.9.3.
+- A mob destroy whose member's boundary commit fails while the destroy
+  waits on that member's ingress detach now reloads the member, retries its
+  retirement once, and names it in `reloaded_members`. It answered
+  `MobDestroyError::Incomplete`; 0.9.3 listed this as a known limitation.
+- A wait for a session's durability-ready mutation gate now ends with the
+  typed `RuntimeDriverError::RecoveryRepairBlocked` as soon as the session's
+  durability degrades, even while another holder keeps the gate. The exited
+  runtime loop of a member whose boundary commit failed keeps the gate until
+  a reload, so such a wait lasted until the member was reloaded. This
+  includes the run-start hold a mob Shutdown takes on each member. An
+  unregister that waits for the gate before it stages its final unregister
+  also ends typed and releases its teardown coordinator, so the
+  reload-required discard can run.
+- The other waits for a session's mutation gate that serve live work now end
+  the same way instead of waiting for a holder of the gate once the session's
+  durability degrades: an exact-run interrupt and its reconciliation, the
+  recover and destroy control commands (`RuntimeControlPlaneError::StoreError`
+  carrying the refusal, as their durability-ready wait answers), a comms abort
+  (an abort of every session aborts the others, then answers the typed
+  refusal naming the sessions it skipped),
+  unregistering or retiring an executor attachment, an explicit stop and its
+  post-stop fence, installing an unregister coordinator, closing an idle
+  registration, input admission, the return to the gate after a boundary
+  callback, a member effect, the admitted-original read
+  (`AdmittedOriginalRefusal::Unavailable`), registering an executor over an
+  existing entry, and the runless terminal publication task. A session that
+  has already degraded refuses such a wait whenever another holder keeps the
+  gate. Waits that run only once the degraded holder has released the gate
+  (the reload-required discard) or before any runtime loop exists keep
+  waiting.
+- Reads of a session's runtime state that take no mutation gate (whether it
+  has active inputs, which a mob's close-if-idle and last-owner release ask;
+  a runtime wake; whether a run input awaits its boundary; a stopped run's
+  contributor terminal; an input's terminal completion) and a member's
+  tracked-input cancel waited behind a boundary commit or run
+  terminalization that holds the session's driver. Past its deadline such a
+  commit holds the driver until the store answers, so once the session
+  degrades they answer without it: the active-input read answers busy, the
+  contributor terminal is unknown, and the others refuse with the typed,
+  retryable `RecoveryRepairBlocked`.
+- A boundary commit whose store never answered (a stalled disk or a hung
+  network filesystem, for example) kept the session's mutation gate for
+  good, so every later wait for the gate waited for it, a mob destroy's
+  retirement of the member and a force cancel of it included. The commit's
+  declared deadline now degrades the session (see Changed), those waits end
+  typed, and a reload replaces the registration once the store has answered.
+- A fork child of a member or session with activated host instructions no
+  longer commits only to fail its first turn ("forked session must explicitly
+  activate inherited instruction keys"). `fork_off`, council participants, the
+  other self-starting forks and the RPC forks now either carry the source's
+  effective activations into the child (`reactivate_inherited`) or are refused,
+  typed, before commit. Council crash recovery verifies a planned child's
+  re-activation rows exactly and measures its prefix without them.
+- Generated TLA+ models now evaluate ordering comparisons between optional
+  values. The renderer wrote MobMachine's member progress guards
+  (`get_copied(id) <= Some(observed_at_ms)` and its `>` twin) as a plain `<=`
+  or `>` between option records, which TLC cannot evaluate, so any MobMachine
+  run with members stopped at the first state where a member progress
+  observation could fire: the deep profile stopped after nine states, before
+  any member transition was checked. Such comparisons now render with Rust's
+  `Option` order (`None` below every `Some`, two `Some`s by their values)
+  through `OptionLt` / `OptionLe`, which a model defines only when it uses
+  them, with ASSUMEs that re-check the order on every TLC run. The operators
+  branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
+  action-level `\/`. The Rust kernel already applied this order; only the
+  models of MobMachine and the two compositions that embed it change.
+  A TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`, lane
+  shard audits-b) now model-checks the member lifecycle around those guards,
+  over the whole reachable space of its domains, which no generated profile
+  checks to the end: roster recovery and
+  reset, session binding (fresh, replacing, already current), progress
+  observations, the local retire arms and the RetireMember signal, the
+  runtime retirement and archive observations, the resume path's replay
+  arms, stop and resume, and the recovery of an archived identity's next
+  incarnation. Every one of those arms must fire, a member's recorded
+  observation time never decreases, and the audit fails when a progress arm
+  loses its guard or the guard is rendered as a plain `<=` again.
+- MobMachine closes two latent gaps in its roster replay arms
+  (`meerkat-machine-schema`, `meerkat-mob`); no shell path feeds either
+  sequence.
+  - A replayed peer-only retirement start is refused for a runtime whose
+    retirement already records a session. Replayed over a releasing
+    retirement in flight, whose binding is already gone, the start removed
+    the recorded session while that session's ingress detach was still
+    pending, which broke the generated invariant that every pending detach
+    keeps its session. The resume path replays at most one start per
+    incarnation into freshly recovered state.
+  - A replayed Retired record that names the identity's current runtime
+    with another generation now matches no arm. The stale-incarnation arm
+    took it and pruned that runtime's state while the identity still mapped
+    to it, which broke the generated invariant that an identity held for a
+    respawn maps to no runtime or to a Retiring one. A consistent record
+    cannot carry that pairing: a runtime id names its generation. The arm
+    now takes only an identity that maps to no runtime and whose recorded
+    generation differs, so it no longer overlaps the current-runtime and
+    remapped-identity arms, which keep taking every record they took
+    before.
+  The member lifecycle audit, which now drives every replay arm, fails on
+  either gap.
+- A respawned member no longer starts from its predecessor's execution-health
+  record (`meerkat-machine-schema`, `meerkat-mob`). MobMachine kept each
+  identity's run state, in-flight work, progress token, last observation,
+  last progress time and event, and health class across incarnations, because
+  no arm removed them: until the new incarnation's session answered an
+  execution snapshot, its status reported the predecessor's in-flight work and
+  last progress time, and a first snapshot equal to the predecessor's last one
+  read as unchanged at the predecessor's progress time. Every arm that mints an
+  incarnation (spawn commit, placed and roster recovery, roster reset) now
+  clears that record, so a new incarnation's progress clock starts at its
+  first observation.
+- An idle close no longer counts a retired member's last observed work
+  (`meerkat-mob`). `close_if_idle` and the latched close after the last owner
+  releases summed the in-flight work of every identity's last execution
+  observation, retired ones included, so a member whose last status read saw
+  work in flight and that then retired kept the mob busy for its life:
+  admission never closed idle, and `MobBusy` reported runs that did not exist.
+  Only identities with a current incarnation count now. Pre-existing in 0.9.3.
+- After a restart, a placed member no longer shows its predecessor's kickoff
+  (`meerkat-mob`). The startup replay applies kickoff updates per identity and
+  installs the current placed incarnation from its committed carrier only after
+  the whole event pass, so the kickoff phase and error of an earlier
+  incarnation of the same identity (a failed kickoff, for example) carried
+  over to a placed incarnation that had no kickoff of its own, although the
+  live spawn commit had cleared them. The replay now clears the identity's
+  kickoff where that incarnation's spawn event sits; the incarnation's own
+  kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

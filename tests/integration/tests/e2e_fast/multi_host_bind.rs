@@ -160,6 +160,7 @@ async fn two_hosts_bind_to_one_mob_and_demux_round_trips() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await;
     assert!(

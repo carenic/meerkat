@@ -4173,6 +4173,7 @@ where
                 request.planned_child_session_id,
                 None,
                 None,
+                request.inherited_instructions,
             )
             .await?;
         Ok(crate::forked_participant::PlannedForkOutcome {
@@ -4195,12 +4196,22 @@ where
         else {
             return Ok(None);
         };
-        let prefix_message_count = child.messages().len();
-        let prefix_digest = child.transcript_content_digest().map_err(|error| {
+        // The fork appended its instruction re-activation rows after the
+        // copied prefix. The evidence measures the prefix, and the suffix must
+        // be exactly the rows the fork derives from that prefix.
+        let reactivated = child.fork_reactivation_suffix_len().map_err(|error| {
             SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                "failed to digest planned fork child {child_session_id}: {error}"
+                "planned fork child {child_session_id} does not end with its fork re-activation: {error}"
             )))
         })?;
+        let prefix_message_count = child.messages().len().saturating_sub(reactivated);
+        let prefix_digest = child
+            .transcript_prefix_digest(prefix_message_count)
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to digest planned fork child {child_session_id}: {error}"
+                )))
+            })?;
         Ok(Some(crate::forked_participant::PlannedChildEvidence {
             prefix_digest,
             prefix_message_count,

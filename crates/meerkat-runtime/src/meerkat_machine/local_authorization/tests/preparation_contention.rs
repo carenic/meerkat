@@ -115,7 +115,7 @@ async fn assert_coordination_is_not_permission(which: HeldCoordination) {
     let (driver, mutation) = {
         let sessions = machine.sessions.read().await;
         let entry = sessions.get(&session).expect("actual registered session");
-        (Arc::clone(&entry.driver), Arc::clone(&entry.mutation_gate))
+        (Arc::clone(&entry.driver), entry.mutation_gate.clone())
     };
     let (audit, retained_contributors) = {
         let locked = driver.lock().await;
@@ -158,7 +158,9 @@ async fn assert_coordination_is_not_permission(which: HeldCoordination) {
             Arc::clone(&bodies),
         ),
         HeldCoordination::Mutation => exercise_while_held(
-            mutation.lock().await,
+            mutation
+                .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+                .await,
             context.clone(),
             attempt,
             Arc::clone(&bodies),

@@ -1,6 +1,7 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::rc::Rc;
 
 struct InfallibleWrite;
 
@@ -41,6 +42,29 @@ const TLA_RUST_U64_MAX_CONSTANT: &str = "RustU64Max";
 const TLC_SAFE_RUST_U64_MAX_VALUE: u64 = 2_147_483_647;
 const SESSION_ID_STRING_BRIDGE_HELPER: &str = "meerkat_machine_session_id_matches_string";
 const TLC_REPRESENTATIVE_DOMAIN_HELPER: &str = "TlcRepresentativeDomain";
+
+/// Rust's `Option` order over the model's option records: `None` sorts below
+/// every `Some`, and two `Some`s compare their values. TLC cannot order
+/// records, so an ordering comparison with an option operand renders through
+/// these operators (`a > b` as `OptionLt(b, a)`, `a >= b` as `OptionLe(b, a)`).
+/// A module defines them only when it uses them, and its ASSUMEs re-check the
+/// order on every TLC run of that module.
+///
+/// The operators branch with `IF`, never `\/`: TLC evaluates every disjunct of
+/// an action-level `\/` to enumerate successors (see
+/// `render_or_short_circuit`), and a `None` record's `value` is the string
+/// `"none"`, which TLC cannot order against a number. An `IF` evaluates only
+/// the branch its condition selects, so a `.value` is read only after both
+/// `tag`s say `"some"`.
+const TLA_OPTION_ORDER_DEFINITIONS: &str = concat!(
+    "OptionLt(a, b) == IF b.tag = \"none\" THEN FALSE ELSE IF a.tag = \"none\" THEN TRUE ELSE a.value < b.value\n",
+    "OptionLe(a, b) == IF a.tag = \"none\" THEN TRUE ELSE IF b.tag = \"none\" THEN FALSE ELSE a.value <= b.value\n",
+    "ASSUME ~OptionLt(None, None) /\\ OptionLt(None, Some(0)) /\\ ~OptionLt(Some(0), None) /\\ ",
+    "OptionLt(Some(0), Some(1)) /\\ ~OptionLt(Some(1), Some(1)) /\\ ~OptionLt(Some(1), Some(0))\n",
+    "ASSUME OptionLe(None, None) /\\ OptionLe(None, Some(0)) /\\ ~OptionLe(Some(0), None) /\\ ",
+    "OptionLe(Some(0), Some(1)) /\\ OptionLe(Some(1), Some(1)) /\\ ~OptionLe(Some(1), Some(0))\n",
+    "\n",
+);
 
 use meerkat_machine_schema::{
     CompositionCoverageManifest, CompositionInvariantKind, CompositionSchema,
@@ -6304,6 +6328,501 @@ mod tests {
             "MobMachine TLA adaptive-run custody operator must preserve the Rust absence, zero-active-member, and terminal-layer contract"
         );
     }
+
+    /// Every conjunct of the option-order ASSUME table states what Rust's
+    /// `Option` order computes, so a TLC run that accepts the ASSUMEs proves
+    /// `OptionLt` / `OptionLe` right. The table covers both operators over
+    /// None/None, None/Some, Some/None and Some/Some below, equal and above.
+    #[test]
+    #[allow(clippy::panic)]
+    fn the_option_order_assume_table_is_rusts_option_order() {
+        use std::cmp::Ordering;
+
+        fn operand(text: &str) -> Option<u64> {
+            if text == "None" {
+                return None;
+            }
+            let value = text
+                .strip_prefix("Some(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("unexpected operand {text}"));
+            Some(
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("unexpected operand {text}")),
+            )
+        }
+
+        // TLC evaluates every disjunct of an action-level `\/`, so a `\/` in
+        // either definition would read a `None` record's `value` inside a
+        // guard; the ASSUMEs alone cannot see that.
+        for line in TLA_OPTION_ORDER_DEFINITIONS
+            .lines()
+            .filter(|line| line.starts_with("OptionL"))
+        {
+            assert!(!line.contains("\\/"), "{line} branches with a disjunction");
+        }
+
+        let mut covered = BTreeSet::new();
+        for line in TLA_OPTION_ORDER_DEFINITIONS.lines() {
+            let Some(table) = line.strip_prefix("ASSUME ") else {
+                continue;
+            };
+            for conjunct in table.split(" /\\ ") {
+                let (expected, call) = match conjunct.strip_prefix('~') {
+                    Some(call) => (false, call),
+                    None => (true, conjunct),
+                };
+                let (operator, operands) = call.split_once('(').expect("an operator call");
+                let (left, right) = operands
+                    .strip_suffix(')')
+                    .and_then(|operands| operands.split_once(", "))
+                    .expect("two operands");
+                let (left, right) = (operand(left), operand(right));
+                let rust = match operator {
+                    "OptionLt" => left < right,
+                    "OptionLe" => left <= right,
+                    other => panic!("unexpected operator {other}"),
+                };
+                assert_eq!(
+                    expected, rust,
+                    "{conjunct} disagrees with Rust's Option order"
+                );
+                covered.insert((operator, left.is_some(), right.is_some(), left.cmp(&right)));
+            }
+        }
+        for operator in ["OptionLt", "OptionLe"] {
+            for case in [
+                (false, false, Ordering::Equal),
+                (false, true, Ordering::Less),
+                (true, false, Ordering::Greater),
+                (true, true, Ordering::Less),
+                (true, true, Ordering::Equal),
+                (true, true, Ordering::Greater),
+            ] {
+                assert!(
+                    covered.contains(&(operator, case.0, case.1, case.2)),
+                    "the ASSUME table misses {operator} over {case:?}"
+                );
+            }
+        }
+    }
+
+    /// An ordering comparison with an option operand renders through
+    /// `OptionLt` / `OptionLe` (`>` and `>=` with the operands swapped) for
+    /// every way an operand is an option, on either side; a plain ordering
+    /// keeps its TLA+ operator and leaves the module without the definitions.
+    #[test]
+    fn an_ordering_with_an_option_operand_renders_in_rusts_option_order() {
+        let mut schema = mob_machine();
+        schema.helpers.push(HelperSchema {
+            name: "maybe_epoch".into(),
+            params: Vec::new(),
+            returns: TypeRef::Option(Box::new(TypeRef::U64)),
+            body: Expr::None,
+        });
+        let field = |name: &str| {
+            Box::new(Expr::Field(
+                meerkat_machine_schema::identity::FieldId::parse(name).expect("field id"),
+            ))
+        };
+        let binding = |name: &str| Box::new(Expr::Binding(name.to_owned()));
+        let binding_types = BTreeMap::from([
+            ("agent_identity".to_owned(), TypeRef::String),
+            ("maybe".to_owned(), TypeRef::Option(Box::new(TypeRef::U64))),
+            ("n".to_owned(), TypeRef::U64),
+            ("run_id".to_owned(), TypeRef::String),
+        ]);
+        let options = [
+            ("a None literal", Expr::None),
+            ("a Some literal", Expr::Some(Box::new(Expr::U64(3)))),
+            ("an option binding", Expr::Binding("maybe".to_owned())),
+            ("an option field", *field("supervisor_authority_epoch")),
+            (
+                "the get_copied lowering",
+                Expr::IfElse {
+                    condition: Box::new(Expr::MapContainsKey {
+                        map: field("member_last_observed_at_ms"),
+                        key: binding("agent_identity"),
+                    }),
+                    then_expr: Box::new(Expr::Some(Box::new(Expr::MapGet {
+                        map: field("member_last_observed_at_ms"),
+                        key: binding("agent_identity"),
+                    }))),
+                    else_expr: Box::new(Expr::None),
+                },
+            ),
+            (
+                "a read of a map with option values",
+                Expr::MapGet {
+                    map: field("run_last_granted_frame"),
+                    key: binding("run_id"),
+                },
+            ),
+            (
+                "a helper returning an option",
+                Expr::Call {
+                    helper: "maybe_epoch".to_owned(),
+                    args: Vec::new(),
+                },
+            ),
+        ];
+        let other = Expr::Some(binding("n"));
+        for (shape, option) in &options {
+            let compiler = MachineTlaCompiler::new(&schema);
+            let render = |expr: &Expr| {
+                compiler.render_expr_with_types(
+                    expr,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &binding_types,
+                )
+            };
+            let (a, b) = (render(option), render(&other));
+            let pair = || (Box::new(option.clone()), Box::new(other.clone()));
+            let swapped = || (Box::new(other.clone()), Box::new(option.clone()));
+            for (expr, expected) in [
+                (Expr::Lt(pair().0, pair().1), format!("OptionLt({a}, {b})")),
+                (Expr::Lte(pair().0, pair().1), format!("OptionLe({a}, {b})")),
+                (Expr::Gt(pair().0, pair().1), format!("OptionLt({b}, {a})")),
+                (Expr::Gte(pair().0, pair().1), format!("OptionLe({b}, {a})")),
+                (
+                    Expr::Lt(swapped().0, swapped().1),
+                    format!("OptionLt({b}, {a})"),
+                ),
+                (
+                    Expr::Gte(swapped().0, swapped().1),
+                    format!("OptionLe({a}, {b})"),
+                ),
+            ] {
+                assert_eq!(render(&expr), expected, "{shape}: {expr:?}");
+            }
+            assert!(compiler.option_order_used.get(), "{shape} marks the module");
+        }
+
+        let compiler = MachineTlaCompiler::new(&schema);
+        let render = |expr: Expr| {
+            compiler.render_expr_with_types(
+                &expr,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &binding_types,
+            )
+        };
+        let one = || Box::new(Expr::U64(1));
+        assert_eq!(render(Expr::Lt(binding("n"), one())), "(n < 1)");
+        assert_eq!(render(Expr::Lte(binding("n"), one())), "(n <= 1)");
+        assert_eq!(render(Expr::Gt(binding("n"), one())), "(n > 1)");
+        assert_eq!(render(Expr::Gte(binding("n"), one())), "(n >= 1)");
+        assert!(
+            !compiler.option_order_used.get(),
+            "a plain ordering needs no option-order definitions"
+        );
+    }
+
+    /// A machine or composition module defines `OptionLt` / `OptionLe` if
+    /// and only if it calls them, so the definitions land only beside an
+    /// option ordering.
+    #[test]
+    fn a_module_defines_the_option_order_operators_iff_it_calls_them() {
+        let calls_operators = |module: &str, model: &str| {
+            let defined = model.matches(TLA_OPTION_ORDER_DEFINITIONS).count();
+            assert!(
+                defined <= 1,
+                "{module} defines the operators {defined} times"
+            );
+            let body = model.replacen(TLA_OPTION_ORDER_DEFINITIONS, "", 1);
+            let called = body.contains("OptionLt(") || body.contains("OptionLe(");
+            assert_eq!(
+                defined == 1,
+                called,
+                "{module}: defined {defined} time(s), called: {called}"
+            );
+            called
+        };
+        let mut callers = Vec::new();
+        for machine in canonical_machine_schemas() {
+            let model = render_machine_semantic_model(&machine).expect("render machine model");
+            if calls_operators(machine.machine.as_str(), &model) {
+                callers.push(machine.machine.as_str().to_owned());
+            }
+        }
+        for composition in meerkat_machine_schema::canonical_composition_schemas() {
+            // meerkat_mob_seam takes about 45 s to render. Its MobMachine part
+            // goes through the same per-instance compilers as
+            // adaptive_mob_bundle's two MobMachine instances below, and
+            // machine-check-drift holds its regenerated model.
+            if composition.name.as_str() == "meerkat_mob_seam" {
+                continue;
+            }
+            let model =
+                render_composition_semantic_model(&composition).expect("render composition model");
+            if calls_operators(composition.name.as_str(), &model) {
+                callers.push(composition.name.as_str().to_owned());
+            }
+        }
+        for caller in ["MobMachine", "adaptive_mob_bundle"] {
+            assert!(
+                callers.iter().any(|candidate| candidate == caller),
+                "{caller} orders options (MobMachine's member progress guards): {callers:?}"
+            );
+        }
+    }
+
+    /// The option-ordering contract: every ordering comparison in a
+    /// canonical machine whose operand is option-shaped renders through
+    /// `OptionLt` / `OptionLe`, never as a plain comparison TLC cannot
+    /// evaluate. The walk decides "option-shaped" from the schema's declared
+    /// types (state fields, trigger bindings, helper parameters and returns,
+    /// map value types, `Some` / `None` literals), independently of the
+    /// renderer's own inference, so a new guard cannot bring the class back
+    /// through a shape the renderer misses.
+    #[test]
+    fn every_canonical_option_ordering_renders_in_rusts_option_order() {
+        struct Walk<'a> {
+            schema: &'a MachineSchema,
+            compiler: MachineTlaCompiler<'a>,
+            checked: usize,
+            plain: Vec<String>,
+        }
+
+        impl Walk<'_> {
+            fn declared<'t>(
+                &'t self,
+                expr: &Expr,
+                bindings: &'t BTreeMap<String, TypeRef>,
+            ) -> Option<&'t TypeRef> {
+                match expr {
+                    Expr::Field(field) => self
+                        .schema
+                        .state
+                        .fields
+                        .iter()
+                        .find(|candidate| candidate.name == *field)
+                        .map(|candidate| &candidate.ty),
+                    Expr::Binding(name) => bindings.get(name),
+                    Expr::Call { helper, .. } => self
+                        .schema
+                        .helpers
+                        .iter()
+                        .chain(self.schema.derived.iter())
+                        .find(|candidate| candidate.name == *helper)
+                        .map(|candidate| &candidate.returns),
+                    Expr::MapGet { map, .. } | Expr::MapValue { map, .. } => {
+                        match self.declared(map, bindings)? {
+                            TypeRef::Map(_, value) => Some(value.as_ref()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            fn option_shaped(&self, expr: &Expr, bindings: &BTreeMap<String, TypeRef>) -> bool {
+                match expr {
+                    Expr::Some(_) | Expr::None => true,
+                    Expr::IfElse {
+                        then_expr,
+                        else_expr,
+                        ..
+                    } => {
+                        self.option_shaped(then_expr, bindings)
+                            || self.option_shaped(else_expr, bindings)
+                    }
+                    other => matches!(self.declared(other, bindings), Some(TypeRef::Option(_))),
+                }
+            }
+
+            fn walk(&mut self, site: &str, expr: &Expr, bindings: &BTreeMap<String, TypeRef>) {
+                match expr {
+                    Expr::Lt(left, right)
+                    | Expr::Lte(left, right)
+                    | Expr::Gt(left, right)
+                    | Expr::Gte(left, right) => {
+                        if self.option_shaped(left, bindings) || self.option_shaped(right, bindings)
+                        {
+                            self.checked += 1;
+                            let rendered = self.compiler.render_expr_with_types(
+                                expr,
+                                &BTreeMap::new(),
+                                &BTreeMap::new(),
+                                bindings,
+                            );
+                            if !rendered.starts_with("OptionLt(")
+                                && !rendered.starts_with("OptionLe(")
+                            {
+                                self.plain
+                                    .push(format!("{} {site}: {rendered}", self.schema.machine));
+                            }
+                        }
+                        self.walk(site, left, bindings);
+                        self.walk(site, right, bindings);
+                    }
+                    Expr::Bool(_)
+                    | Expr::U64(_)
+                    | Expr::U64Max
+                    | Expr::String(_)
+                    | Expr::NamedVariant { .. }
+                    | Expr::EmptySet
+                    | Expr::EmptyMap
+                    | Expr::CurrentPhase
+                    | Expr::Phase(_)
+                    | Expr::Field(_)
+                    | Expr::Binding(_)
+                    | Expr::Variant(_)
+                    | Expr::None => {}
+                    Expr::FieldAccess { base, .. } => self.walk(site, base, bindings),
+                    Expr::EnumVariantIs { value, .. }
+                    | Expr::EnumStringSetPayload { value, .. } => self.walk(site, value, bindings),
+                    Expr::SeqLiteral(items) | Expr::And(items) | Expr::Or(items) => {
+                        for item in items {
+                            self.walk(site, item, bindings);
+                        }
+                    }
+                    Expr::IfElse {
+                        condition,
+                        then_expr,
+                        else_expr,
+                    } => {
+                        self.walk(site, condition, bindings);
+                        self.walk(site, then_expr, bindings);
+                        self.walk(site, else_expr, bindings);
+                    }
+                    Expr::Not(inner)
+                    | Expr::SeqElements(inner)
+                    | Expr::Len(inner)
+                    | Expr::Head(inner)
+                    | Expr::MapKeys(inner)
+                    | Expr::Some(inner) => self.walk(site, inner, bindings),
+                    Expr::Eq(left, right)
+                    | Expr::Neq(left, right)
+                    | Expr::Add(left, right)
+                    | Expr::Sub(left, right) => {
+                        self.walk(site, left, bindings);
+                        self.walk(site, right, bindings);
+                    }
+                    Expr::Contains { collection, value } | Expr::Count { collection, value } => {
+                        self.walk(site, collection, bindings);
+                        self.walk(site, value, bindings);
+                    }
+                    Expr::MapContainsKey { map, key }
+                    | Expr::MapGet { map, key }
+                    | Expr::MapValue { map, key } => {
+                        self.walk(site, map, bindings);
+                        self.walk(site, key, bindings);
+                    }
+                    Expr::SeqStartsWith { seq, prefix } => {
+                        self.walk(site, seq, bindings);
+                        self.walk(site, prefix, bindings);
+                    }
+                    Expr::MapLiteral(entries) => {
+                        for (key, value) in entries {
+                            self.walk(site, key, bindings);
+                            self.walk(site, value, bindings);
+                        }
+                    }
+                    Expr::Call { args, .. } => {
+                        for arg in args {
+                            self.walk(site, arg, bindings);
+                        }
+                    }
+                    Expr::Quantified { over, body, .. } => {
+                        self.walk(site, over, bindings);
+                        self.walk(site, body, bindings);
+                    }
+                }
+            }
+
+            fn walk_updates(
+                &mut self,
+                site: &str,
+                updates: &[Update],
+                bindings: &BTreeMap<String, TypeRef>,
+            ) {
+                for update in updates {
+                    match update {
+                        Update::Assign { expr, .. } => self.walk(site, expr, bindings),
+                        Update::Increment { .. }
+                        | Update::Decrement { .. }
+                        | Update::SeqPopFront { .. } => {}
+                        Update::MapInsert { key, value, .. } => {
+                            self.walk(site, key, bindings);
+                            self.walk(site, value, bindings);
+                        }
+                        Update::MapIncrement { key, .. }
+                        | Update::MapDecrement { key, .. }
+                        | Update::MapRemove { key, .. } => self.walk(site, key, bindings),
+                        Update::SetInsert { value, .. }
+                        | Update::SetRemove { value, .. }
+                        | Update::SeqAppend { value, .. }
+                        | Update::SeqRemoveValue { value, .. } => self.walk(site, value, bindings),
+                        Update::SeqPrepend { values, .. } | Update::SeqRemoveAll { values, .. } => {
+                            self.walk(site, values, bindings)
+                        }
+                        Update::Conditional {
+                            condition,
+                            then_updates,
+                            else_updates,
+                        } => {
+                            self.walk(site, condition, bindings);
+                            self.walk_updates(site, then_updates, bindings);
+                            self.walk_updates(site, else_updates, bindings);
+                        }
+                        Update::ForEach { over, updates, .. } => {
+                            self.walk(site, over, bindings);
+                            self.walk_updates(site, updates, bindings);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut checked = 0;
+        let mut plain = Vec::new();
+        for schema in canonical_machine_schemas() {
+            let mut walk = Walk {
+                schema: &schema,
+                compiler: MachineTlaCompiler::new(&schema),
+                checked: 0,
+                plain: Vec::new(),
+            };
+            let none = BTreeMap::new();
+            for transition in &schema.transitions {
+                let bindings = walk.compiler.binding_type_map(transition);
+                let site = transition.name.as_str();
+                for guard in &transition.guards {
+                    walk.walk(site, &guard.expr, &bindings);
+                }
+                walk.walk_updates(site, &transition.updates, &bindings);
+                for emit in &transition.emit {
+                    for expr in emit.fields.values() {
+                        walk.walk(site, expr, &bindings);
+                    }
+                }
+            }
+            for invariant in &schema.invariants {
+                walk.walk(&invariant.name, &invariant.expr, &none);
+            }
+            for helper in schema.helpers.iter().chain(schema.derived.iter()) {
+                let params = helper
+                    .params
+                    .iter()
+                    .map(|param| (param.name.as_str().to_owned(), param.ty.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                walk.walk(&helper.name, &helper.body, &params);
+            }
+            checked += walk.checked;
+            plain.extend(walk.plain);
+        }
+        assert!(
+            plain.is_empty(),
+            "option orderings rendered as plain comparisons (TLC cannot order option records):\n{}",
+            plain.join("\n")
+        );
+        // MobMachine's seven member-progress guards order options: the walk
+        // must find them, or the contract passes vacuously.
+        assert!(checked >= 7, "the walk found {checked} option orderings");
+    }
 }
 
 fn render_sequence_domain_definition(inner: &TypeRef) -> String {
@@ -6447,6 +6966,9 @@ struct CompositionTlaCompiler<'a> {
     named_bindings: BTreeMap<String, meerkat_machine_schema::RustTypeAtom>,
     fallback_machine: &'a MachineSchema,
     unchanged_frames: RefCell<UnchangedFrameInterner>,
+    /// Shared with every machine compiler that renders into this module (see
+    /// `MachineTlaCompiler::option_order_used`).
+    option_order_used: Rc<Cell<bool>>,
 }
 
 const COMPOSITION_UNCHANGED_CHUNK_SIZE: usize = 64;
@@ -6628,7 +7150,23 @@ impl<'a> CompositionTlaCompiler<'a> {
                 )
             })?,
             unchanged_frames: RefCell::new(UnchangedFrameInterner::default()),
+            option_order_used: Rc::default(),
         })
+    }
+
+    /// The machine compiler for one instance's part of this module. Every
+    /// compiler that renders into the module shares its option-order flag, so
+    /// an `OptionLt` / `OptionLe` call never reaches the module without the
+    /// definitions.
+    fn instance_compiler(
+        &self,
+        instance_id: &str,
+        helper_prefix: String,
+    ) -> MachineTlaCompiler<'_> {
+        MachineTlaCompiler::new_with_helper_prefix(self.machine(instance_id), helper_prefix)
+            .with_phase_symbol(self.phase_var(instance_id))
+            .with_field_env_override(self.machine_field_env(instance_id))
+            .with_option_order_flag(Rc::clone(&self.option_order_used))
     }
 
     fn render_unchanged_vars(&self, out: &mut String, prefix: &str, vars: &[String]) {
@@ -6708,6 +7246,7 @@ impl<'a> CompositionTlaCompiler<'a> {
             .expect("write to string");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
+        let option_order_anchor = out.len();
 
         push_cfg_assignment_operator_definitions(
             &mut out,
@@ -6903,13 +7442,9 @@ impl<'a> CompositionTlaCompiler<'a> {
                     .iter()
                     .find(|item| item.field == field.name)
                     .map(|item| {
-                        let compiler = MachineTlaCompiler::new_with_helper_prefix(
-                            machine,
+                        let compiler = self.instance_compiler(
+                            instance.instance_id.as_str(),
                             format!("{}__", tla_ident(&instance.instance_id)),
-                        )
-                        .with_phase_symbol(self.phase_var(instance.instance_id.as_str()))
-                        .with_field_env_override(
-                            self.machine_field_env(instance.instance_id.as_str()),
                         );
                         compiler.render_expr(&item.expr, &BTreeMap::new(), &BTreeMap::new())
                     })
@@ -6979,9 +7514,7 @@ impl<'a> CompositionTlaCompiler<'a> {
         for instance in &self.schema.machines {
             let machine = self.machine(instance.instance_id.as_str());
             let helper_prefix = format!("{}__", tla_ident(&instance.instance_id));
-            let mut compiler = MachineTlaCompiler::new_with_helper_prefix(machine, helper_prefix)
-                .with_phase_symbol(self.phase_var(instance.instance_id.as_str()))
-                .with_field_env_override(self.machine_field_env(instance.instance_id.as_str()));
+            let mut compiler = self.instance_compiler(instance.instance_id.as_str(), helper_prefix);
             for derived in helper_dependency_order(machine)? {
                 compiler.render_helper(&mut out, derived);
                 pushln!(&mut out);
@@ -7295,6 +7828,10 @@ impl<'a> CompositionTlaCompiler<'a> {
             });
         }
         out.insert_str(unchanged_frame_anchor, &frames.definitions_block());
+        // Before the frame anchor, so inserting it last leaves that one valid.
+        if self.option_order_used.get() {
+            out.insert_str(option_order_anchor, TLA_OPTION_ORDER_DEFINITIONS);
+        }
 
         Ok(out)
     }
@@ -8286,9 +8823,7 @@ impl<'a> CompositionTlaCompiler<'a> {
         for instance in &self.schema.machines {
             let machine = self.machine(instance.instance_id.as_str());
             let helper_prefix = format!("{}__entry_packet__", tla_ident(&instance.instance_id));
-            let mut compiler = MachineTlaCompiler::new_with_helper_prefix(machine, helper_prefix)
-                .with_phase_symbol(self.phase_var(instance.instance_id.as_str()))
-                .with_field_env_override(self.machine_field_env(instance.instance_id.as_str()));
+            let mut compiler = self.instance_compiler(instance.instance_id.as_str(), helper_prefix);
 
             for derived in helper_dependency_order(machine)? {
                 compiler.render_helper(out, derived);
@@ -9704,6 +10239,14 @@ impl<'a> CompositionTlaCompiler<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OrderingOperator {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
 struct MachineTlaCompiler<'a> {
     schema: &'a MachineSchema,
     named_bindings: BTreeMap<String, meerkat_machine_schema::RustTypeAtom>,
@@ -9713,6 +10256,10 @@ struct MachineTlaCompiler<'a> {
     phase_symbol: Option<String>,
     field_env_override: Option<BTreeMap<String, String>>,
     unchanged_frames: UnchangedFrameInterner,
+    /// Set when an ordering comparison renders through `OptionLt` /
+    /// `OptionLe`; the module then defines them. Shared by every compiler
+    /// that renders into the same module.
+    option_order_used: Rc<Cell<bool>>,
 }
 
 impl<'a> MachineTlaCompiler<'a> {
@@ -9726,6 +10273,7 @@ impl<'a> MachineTlaCompiler<'a> {
             phase_symbol: None,
             field_env_override: None,
             unchanged_frames: UnchangedFrameInterner::default(),
+            option_order_used: Rc::default(),
         }
     }
 
@@ -9739,7 +10287,13 @@ impl<'a> MachineTlaCompiler<'a> {
             phase_symbol: None,
             field_env_override: None,
             unchanged_frames: UnchangedFrameInterner::default(),
+            option_order_used: Rc::default(),
         }
+    }
+
+    fn with_option_order_flag(mut self, option_order_used: Rc<Cell<bool>>) -> Self {
+        self.option_order_used = option_order_used;
+        self
     }
 
     fn with_phase_symbol(mut self, phase_symbol: impl Into<String>) -> Self {
@@ -9801,6 +10355,7 @@ impl<'a> MachineTlaCompiler<'a> {
         pushln!(&mut out, "None == [tag |-> \"none\", value |-> \"none\"]");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
+        let option_order_anchor = out.len();
 
         push_cfg_assignment_operator_definitions(
             &mut out,
@@ -10145,6 +10700,9 @@ impl<'a> MachineTlaCompiler<'a> {
         )
         .expect("write to string");
 
+        if self.option_order_used.get() {
+            out.insert_str(option_order_anchor, TLA_OPTION_ORDER_DEFINITIONS);
+        }
         Ok(out)
     }
 
@@ -12317,25 +12875,37 @@ impl<'a> MachineTlaCompiler<'a> {
                 self.render_expr_with_types(left, env, binding_env, binding_types),
                 self.render_expr_with_types(right, env, binding_env, binding_types)
             ),
-            Expr::Gt(left, right) => format!(
-                "({} > {})",
-                self.render_expr_with_types(left, env, binding_env, binding_types),
-                self.render_expr_with_types(right, env, binding_env, binding_types)
+            Expr::Gt(left, right) => self.render_ordering(
+                OrderingOperator::Gt,
+                left,
+                right,
+                env,
+                binding_env,
+                binding_types,
             ),
-            Expr::Gte(left, right) => format!(
-                "({} >= {})",
-                self.render_expr_with_types(left, env, binding_env, binding_types),
-                self.render_expr_with_types(right, env, binding_env, binding_types)
+            Expr::Gte(left, right) => self.render_ordering(
+                OrderingOperator::Gte,
+                left,
+                right,
+                env,
+                binding_env,
+                binding_types,
             ),
-            Expr::Lt(left, right) => format!(
-                "({} < {})",
-                self.render_expr_with_types(left, env, binding_env, binding_types),
-                self.render_expr_with_types(right, env, binding_env, binding_types)
+            Expr::Lt(left, right) => self.render_ordering(
+                OrderingOperator::Lt,
+                left,
+                right,
+                env,
+                binding_env,
+                binding_types,
             ),
-            Expr::Lte(left, right) => format!(
-                "({} <= {})",
-                self.render_expr_with_types(left, env, binding_env, binding_types),
-                self.render_expr_with_types(right, env, binding_env, binding_types)
+            Expr::Lte(left, right) => self.render_ordering(
+                OrderingOperator::Lte,
+                left,
+                right,
+                env,
+                binding_env,
+                binding_types,
             ),
             Expr::Contains { collection, value } => format!(
                 "({} \\in {})",
@@ -12466,6 +13036,52 @@ impl<'a> MachineTlaCompiler<'a> {
                 )
             }
         }
+    }
+
+    /// `left op right` for an ordering comparison. With an `Option` operand
+    /// it takes Rust's order through `OptionLt` / `OptionLe` (see
+    /// [`TLA_OPTION_ORDER_DEFINITIONS`]); otherwise the TLA+ operator.
+    fn render_ordering(
+        &self,
+        operator: OrderingOperator,
+        left: &Expr,
+        right: &Expr,
+        env: &BTreeMap<String, String>,
+        binding_env: &BTreeMap<String, String>,
+        binding_types: &BTreeMap<String, TypeRef>,
+    ) -> String {
+        let left_tla = self.render_expr_with_types(left, env, binding_env, binding_types);
+        let right_tla = self.render_expr_with_types(right, env, binding_env, binding_types);
+        if !self.is_option_operand(left, binding_types)
+            && !self.is_option_operand(right, binding_types)
+        {
+            let symbol = match operator {
+                OrderingOperator::Lt => "<",
+                OrderingOperator::Lte => "<=",
+                OrderingOperator::Gt => ">",
+                OrderingOperator::Gte => ">=",
+            };
+            return format!("({left_tla} {symbol} {right_tla})");
+        }
+        self.option_order_used.set(true);
+        match operator {
+            OrderingOperator::Lt => format!("OptionLt({left_tla}, {right_tla})"),
+            OrderingOperator::Lte => format!("OptionLe({left_tla}, {right_tla})"),
+            OrderingOperator::Gt => format!("OptionLt({right_tla}, {left_tla})"),
+            OrderingOperator::Gte => format!("OptionLe({right_tla}, {left_tla})"),
+        }
+    }
+
+    /// Whether `expr` is an `Option` value: a `None` / `Some` literal, or an
+    /// operand whose type is `Option<_>` (a field, a trigger binding or helper
+    /// parameter, a helper call, a map read, the `get_copied` / `get_cloned`
+    /// lowering).
+    fn is_option_operand(&self, expr: &Expr, binding_types: &BTreeMap<String, TypeRef>) -> bool {
+        matches!(expr, Expr::None | Expr::Some(_))
+            || matches!(
+                self.infer_expr_type_for_render(expr, binding_types),
+                Some(TypeRef::Option(_))
+            )
     }
 
     fn infer_expr_type_for_render(

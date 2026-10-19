@@ -99,16 +99,31 @@ impl AgentLlmClient for RecordingClient {
     }
 }
 
+/// The peer deliveries `reply_to_peer` could answer, as each `probe_step`
+/// dispatch saw them.
+type ObservedReplies = Arc<
+    Mutex<
+        Vec<
+            Result<
+                meerkat_core::comms::PeerReplyDispatchContext,
+                meerkat_core::comms::PeerReplyContextError,
+            >,
+        >,
+    >,
+>;
+
 /// `probe_block` parks until the test releases it, so the post-tool model
-/// boundary is open while a delivery is prepared.
+/// boundary is open while a delivery is prepared. `probe_step`, the tool call
+/// after that boundary, records the turn's peer reply deliveries.
 struct GatedTools {
     tools: Arc<[Arc<ToolDef>]>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    observed_replies: ObservedReplies,
 }
 
 impl GatedTools {
-    fn new(entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+    fn new(entered: Arc<Notify>, release: Arc<Notify>, observed_replies: ObservedReplies) -> Self {
         let schema = serde_json::json!({ "type": "object" });
         Self {
             tools: Arc::from([
@@ -117,6 +132,7 @@ impl GatedTools {
             ]),
             entered,
             release,
+            observed_replies,
         }
     }
 }
@@ -136,6 +152,20 @@ impl AgentToolDispatcher for GatedTools {
             self.release.notified().await;
         }
         Ok(ToolResult::new(call.id.to_string(), format!("{} ok", call.name), false).into())
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        if call.name == "probe_step" {
+            self.observed_replies
+                .lock()
+                .unwrap()
+                .push(context.peer_reply_deliveries().cloned());
+        }
+        self.dispatch(call).await
     }
 }
 
@@ -158,21 +188,42 @@ async fn gated_agent(
     entered: Arc<Notify>,
     release: Arc<Notify>,
 ) -> meerkat_core::Agent<RecordingClient, GatedTools, NoopStore> {
+    gated_agent_observing(client, entered, release, ObservedReplies::default(), false).await
+}
+
+async fn gated_agent_observing(
+    client: Arc<RecordingClient>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    observed_replies: ObservedReplies,
+    turn_overlay: bool,
+) -> meerkat_core::Agent<RecordingClient, GatedTools, NoopStore> {
     let mut session = meerkat_core::Session::new();
     session
         .set_build_state(meerkat_core::SessionBuildState::default())
         .expect("test session build state should serialize");
-    AgentBuilder::new()
+    let mut builder = AgentBuilder::new()
         .resume_session(session)
         .with_turn_state_handle(Arc::new(
             crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
         ))
         .with_runtime_execution_kind_for_test(
             meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
-        )
+        );
+    if turn_overlay {
+        // A turn tool overlay (how the runtime hands a turn its reply
+        // context) needs the generated tool visibility authority that a
+        // runtime-backed agent has.
+        let owner: Arc<dyn crate::ToolVisibilityOwner> =
+            Arc::new(crate::tool_scope::GeneratedTestToolVisibilityOwner::new());
+        builder = builder.with_tool_visibility_owner(
+            crate::tool_scope::generated_test_tool_visibility_owner_from(owner),
+        );
+    }
+    builder
         .build_standalone(
             client,
-            Arc::new(GatedTools::new(entered, release)),
+            Arc::new(GatedTools::new(entered, release, observed_replies)),
             Arc::new(NoopStore),
         )
         .await
@@ -443,10 +494,49 @@ async fn run_with_durable_delivery_at_post_tool_boundary(
     meerkat_core::lifecycle::CoreBoundaryDeliveryWitness,
     Vec<AgentEvent>,
 ) {
+    run_with_durable_delivery_at_post_tool_boundary_observing(
+        delivery,
+        None,
+        ObservedReplies::default(),
+    )
+    .await
+}
+
+/// [`run_with_durable_delivery_at_post_tool_boundary`] for a turn that starts
+/// with `turn_start_replies` (the runtime's turn-start peer reply context),
+/// recording what `probe_step` can answer after the boundary.
+async fn run_with_durable_delivery_at_post_tool_boundary_observing(
+    delivery: meerkat_core::lifecycle::TurnBoundaryDelivery,
+    turn_start_replies: Option<Vec<meerkat_core::comms::PeerReplyCapability>>,
+    observed_replies: ObservedReplies,
+) -> (
+    meerkat_core::Agent<RecordingClient, GatedTools, NoopStore>,
+    meerkat_core::Session,
+    meerkat_core::lifecycle::CoreBoundaryDeliveryWitness,
+    Vec<AgentEvent>,
+) {
     let client = Arc::new(RecordingClient::new());
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let mut agent = gated_agent(client, Arc::clone(&entered), Arc::clone(&release)).await;
+    let mut agent = gated_agent_observing(
+        client,
+        Arc::clone(&entered),
+        Arc::clone(&release),
+        observed_replies,
+        turn_start_replies.is_some(),
+    )
+    .await;
+    if let Some(deliveries) = turn_start_replies {
+        let context = meerkat_core::comms::PeerReplyDispatchContext { deliveries };
+        let mut overlay = meerkat_core::service::TurnToolOverlay::default();
+        overlay.dispatch_context.insert(
+            meerkat_core::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY.to_string(),
+            serde_json::to_value(&context).expect("reply context serializes"),
+        );
+        agent
+            .set_turn_tool_overlay(Some(overlay))
+            .expect("turn-start reply overlay installs");
+    }
     let pre_run_session = agent.session().clone();
     let state = agent.transient_turn_context_state();
     let (tx, mut rx) = mpsc::channel(256);
@@ -611,6 +701,8 @@ async fn durable_comms_notice_publishes_peer_content_ingested_in_turn() {
                 content: vec![meerkat_core::types::ContentBlock::Text {
                     text: NOTICE_TOKEN.to_string(),
                 }],
+                delivery_id: None,
+                in_reply_to: None,
             }],
         },
         identity: None,
@@ -646,6 +738,141 @@ async fn durable_comms_notice_publishes_peer_content_ingested_in_turn() {
         &events[applied_at + 1],
         AgentEvent::PeerContentIngested { request_id, .. } if request_id.as_deref() == Some("req-1")
     ));
+}
+
+fn peer_reply(
+    peer_id: meerkat_core::comms::PeerId,
+    delivery: u128,
+) -> meerkat_core::comms::PeerReplyCapability {
+    meerkat_core::comms::PeerReplyCapability {
+        in_reply_to: meerkat_core::interaction::InteractionId(uuid::Uuid::from_u128(delivery)),
+        peer_id,
+        display_name: None,
+        kind: meerkat_core::comms::PeerReplyDeliveryKind::Message,
+    }
+}
+
+/// A turn-start reply list that does not parse fails the turn's reply context
+/// closed, and a delivery that joins the turn later does not reopen it.
+#[test]
+fn a_malformed_turn_start_reply_list_stays_closed_after_a_boundary_join() {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        meerkat_core::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY.to_string(),
+        serde_json::json!("not a reply list"),
+    );
+    let mut context = crate::ToolDispatchContext::default().with_turn_metadata(metadata);
+    assert!(matches!(
+        context.peer_reply_deliveries(),
+        Err(meerkat_core::comms::PeerReplyContextError::Malformed(_))
+    ));
+    context.record_boundary_peer_replies([peer_reply(meerkat_core::comms::PeerId::new(), 31)]);
+    assert!(matches!(
+        context.peer_reply_deliveries(),
+        Err(meerkat_core::comms::PeerReplyContextError::Malformed(_))
+    ));
+}
+
+fn durable_peer_message(
+    peer_id: meerkat_core::comms::PeerId,
+    replies: Vec<meerkat_core::comms::PeerReplyCapability>,
+) -> meerkat_core::lifecycle::TurnBoundaryDelivery {
+    let notice = meerkat_core::lifecycle::ConversationAppend {
+        runtime_source: None,
+        role: meerkat_core::lifecycle::ConversationAppendRole::SystemNotice,
+        content: meerkat_core::lifecycle::CoreRenderable::SystemNotice {
+            kind: meerkat_core::types::SystemNoticeKind::Comms,
+            body: None,
+            blocks: vec![meerkat_core::types::SystemNoticeBlock::Comms {
+                kind: meerkat_core::types::CommsNoticeKind::Message,
+                direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                peer: Some(meerkat_core::types::SystemNoticePeer {
+                    id: peer_id,
+                    display_name: None,
+                }),
+                sender_taint: None,
+                request_id: None,
+                intent: None,
+                status: None,
+                summary: None,
+                payload: None,
+                content: vec![meerkat_core::types::ContentBlock::Text {
+                    text: NOTICE_TOKEN.to_string(),
+                }],
+                delivery_id: None,
+                in_reply_to: None,
+            }],
+        },
+        identity: None,
+    };
+    meerkat_core::lifecycle::TurnBoundaryDelivery::DurableAppends(
+        meerkat_core::lifecycle::DurableTurnBoundaryAppends::try_new(
+            meerkat_core::lifecycle::InputId::new(),
+            vec![notice],
+            None,
+        )
+        .expect("eligible peer message notice")
+        .with_peer_reply_capabilities(replies),
+    )
+}
+
+/// A peer message that joins the running turn is answerable like one that
+/// started it: its reply capability reaches the tool calls after the
+/// boundary that wrote its row, in the same synchronous segment.
+#[tokio::test]
+async fn durable_peer_message_reply_capability_joins_the_running_turn() {
+    let sender = meerkat_core::comms::PeerId::new();
+    let observed = ObservedReplies::default();
+    let (_agent, _pre_run_session, witness, _events) =
+        run_with_durable_delivery_at_post_tool_boundary_observing(
+            durable_peer_message(sender, vec![peer_reply(sender, 21)]),
+            None,
+            Arc::clone(&observed),
+        )
+        .await;
+    assert_eq!(
+        witness.outcome(),
+        meerkat_core::lifecycle::CoreBoundaryDeliveryOutcome::Applied
+    );
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![Ok(meerkat_core::comms::PeerReplyDispatchContext {
+            deliveries: vec![peer_reply(sender, 21)],
+        })],
+        "the tool call after the boundary can answer the delivery that joined"
+    );
+}
+
+/// Turn-start and boundary capabilities are keyed by (sender, delivery id),
+/// in arrival order: a second sender reusing the turn-start delivery id keeps
+/// its own capability after the first, and a capability recorded again (the
+/// first sender's, and the second sender's twice) appears once.
+#[tokio::test]
+async fn durable_peer_reply_capabilities_are_keyed_by_sender_and_id() {
+    let first = meerkat_core::comms::PeerId::new();
+    let second = meerkat_core::comms::PeerId::new();
+    let observed = ObservedReplies::default();
+    let _ = run_with_durable_delivery_at_post_tool_boundary_observing(
+        durable_peer_message(
+            second,
+            vec![
+                peer_reply(second, 22),
+                peer_reply(first, 22),
+                peer_reply(second, 22),
+            ],
+        ),
+        Some(vec![peer_reply(first, 22)]),
+        Arc::clone(&observed),
+    )
+    .await;
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![Ok(meerkat_core::comms::PeerReplyDispatchContext {
+            deliveries: vec![peer_reply(first, 22), peer_reply(second, 22)],
+        })]
+    );
 }
 
 // These contract tests deliberately inspect serialized public facts so they

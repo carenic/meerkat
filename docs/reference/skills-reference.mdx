@@ -47,6 +47,30 @@ Shadowing is keyed by the full `SkillKey`, not by `skill_name` alone. Two source
 | HTTP | `type = "http"`, `url`, auth fields | Requires the HTTP skills feature. |
 | Stdio | `type = "stdio"`, `command`, `args` | External skill source process. |
 
+## Frontmatter parsing
+
+`SKILL.md` frontmatter is one YAML 1.2 document between `---` markers, parsed
+by a pure-Rust parser since 0.9.4.
+
+- Fields: `name` and `description` (required), `requires_capabilities`,
+  `metadata` (text values) and `version` (stored as `metadata.version`). Any
+  other key must be a namespaced extension key (`vendor.key`); a mapping or
+  sequence value needs a `vendor.version` key beside it.
+- `yes`, `on` and `off` stay strings; `<<` is an ordinary key, never a merge;
+  a second document is refused.
+- Refused since 0.9.4, accepted by 0.9.3 and earlier: a key given twice at any
+  level, a null (`~` or an empty value) as `description` or a `metadata` value,
+  an unrecognized tag (`!custom`), a `...` document end marker line, nesting
+  deeper than 64 levels, and 100 or more aliases that outnumber their anchors
+  more than ten to one. An alias expansion bomb is refused as before.
+- A block scalar (`|`, `|+`, `>`) that ends the frontmatter keeps its final
+  line break.
+- `SkillDocument.extensions` values are text projected from the YAML data: a
+  string as written, any other value as YAML rendered from its resolved value
+  (`1.10` is `1.1`, `1_000` is `1000`, `0x1F` is `31`, `~` is `null`, a mapping
+  or sequence is block YAML). Quote values whose text matters, such as a file
+  mode: unquoted, `0755` is `755.0`.
+
 ## Companion Skill Convention
 
 Meerkat-owned nontrivial agent-facing tool families use embedded companion

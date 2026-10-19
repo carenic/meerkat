@@ -15,10 +15,10 @@ This guide is an overview. The reference documents below carry the detail; read 
 - `references/sessions_runtime_surfaces_sessions.md` - sessions on every surface: create, resume, list, read, history, archive, turn queueing and the attempt cap, interrupt versus `turn/stop_run`, forks, transcript edits, system prompts, events and replay, ATIF export, durable resume holds and tool-process recovery.
 - `references/sessions_runtime_surfaces_storage_config.md` - realm ids and where state lives, backends, multiprocess hosting, SQLite, `rkat storage`, runtime health and shutdown, WorkGraph limits, schedules, `rkat config` and config keys.
 - `references/sessions_runtime_surfaces_api_changes.md` - JSON-RPC methods and REST routes added or renamed since 0.8.40, the `ErrorCode` table with HTTP statuses and `rkat` exit codes, SDK changes, binaries and installs, Rust embedding, removals.
-- `references/providers_and_auth_models.md` - choosing a provider and model, default models and the catalog, capabilities, thinking and effort, `provider_params` and prompt caching, realtime, voice and image models, self-hosted servers, provider errors.
+- `references/providers_and_auth_models.md` - choosing a provider and model, default models and the catalog, capabilities, thinking and effort, `provider_params` and prompt caching, realtime, voice and image models, self-hosted servers, provider errors, refusals and content filters.
 - `references/providers_and_auth_credentials.md` - env-var API keys, realm backends, auth profiles and bindings, base URLs and cloud routes, credential storage and keychain refusals, every `rkat auth` subcommand, `--auth-binding`, auth RPC/REST/SDK methods and errors, connector OAuth clients.
 - `references/security.md` - OS sandboxing (process confinement) and what is not a sandbox, shell command policy, tool access policy and read-only, where credentials and secrets live, MCP security boundaries, audit, security errors and refusals.
-- `references/security_governance.md` - governed realms (`rkat realm govern`, grants, `--as-agent`, governed `rkat-rpc`), review tiers R1/R2/R3, human consent and approvals, native authorization for Rust hosts.
+- `references/security_governance.md` - governed realms (`rkat realm govern`, grants, `--as-agent`, governed `rkat-rpc`), review tiers R1/R2/R3, human consent and approvals, native authorization for Rust hosts, authorization changes while work runs.
 - `references/mcp_tools_skills_mcp.md` - MCP servers: `mcp.toml` and realm config, every `rkat mcp` flag, which hosts start configured servers, MCP OAuth, access ceilings, live `mcp/*`, deferred tools, MCP Apps, MCP errors.
 - `references/mcp_tools_skills_tools.md` - built-in tool families and exact names, `--tools` presets, `[shell]`/`[tools]` config, tool errors, filters and overlays, `tool_access_policy`, streaming tool deadlines, callback tools.
 - `references/mcp_tools_skills_skills.md` - skills: SKILL.md format, identity and sources, `[skills]` config, `rkat skill`, `rkat run --skill`, `preload_skills` and `skill_refs`, mob skills, introspection, skill errors.
@@ -28,8 +28,8 @@ This guide is an overview. The reference documents below carry the detail; read 
 - `references/live_comms_mobs_live.md` - live (realtime voice) channels: `live/*` on `rkat-rpc`, realtime models, audio and size limits, SDK calls, the GPT Live preview, mob member live (`rkat mob live`).
 - `references/live_comms_mobs_comms.md` - agent-to-agent comms: transports, `[comms]` config, `rkat run --comms-*` flags, comms tools, `comms/send` on every surface and its delivery outcomes, remote signed peers.
 - `references/mobs.md` - multi-agent orchestration in depth.
-- `references/live_comms_mobs_mobs.md` - mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy, member lifetime, helpers, `fork_off`, council, profile keys, flows and runs, multi-host mobs, mobpacks and deploy, error codes.
-- `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes).
+- `references/live_comms_mobs_mobs.md` - mob changes since 0.8.40 (through 0.9.4): stop, shutdown, destroy and admission close, member lifetime, member binding history, helpers, `fork_off`, council, profile keys, flows and runs, multi-host mobs, mobpacks and deploy, error codes.
+- `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes), and 0.9.3 to 0.9.4.
 - `references/migration_0_5.md` - only if you're upgrading from 0.5 (`host_mode` → `keep_alive`, etc.).
 
 ## Realm-first model
@@ -317,6 +317,37 @@ for live messages.
 For platform integration answers in this checkout, assume the current branch
 surface, not the old live-adapter/docs-refresh snapshot:
 
+- **0.9.4.** Breaking changes and a checklist are in the last section of
+  `references/migration_0_9.md`. In short:
+  - No downgrade to 0.9.3 after 0.9.4 writes a runtime store (stored input
+    state version 7); upgrade every process that shares one together.
+  - SKILL.md frontmatter is parsed by serde-saphyr and refuses duplicated
+    keys, a null `description` or a null value under `metadata`, custom tags
+    and `...` lines. Unquoted extension values resolve as YAML (`0755` reads
+    as `755.0`), so quote values that must stay text.
+  - An admitted mob Shutdown closes admission at once (`AdmissionClosed`,
+    reason `shutdown`); requests during its drain get the retryable
+    `MobError::ShutdownInProgress`; destroy, durability fail-stop, actor loss
+    and dispatch failure also end owner leases. `MobError` is non-exhaustive.
+  - Provider refusals and content filters fail the run as `content_filtered`
+    with a typed stop and detail (`error_report.reason` is an object); refusal
+    text is never committed as an answer.
+  - Compaction sizes the summary source for the summarizing model and reports
+    it (`summary_source`, `estimated_history_tokens_after`); custom
+    `Compactor`s implement the new `prepare_for_summarization`.
+  - `Agent::replace_client` and `SessionService::set_session_client` refuse a
+    client for another provider or model
+    (`AgentError::ClientModelChangeRequiresHotSwap`); change the model of a
+    running session with `hot_swap_llm_identity` /
+    `hot_swap_session_llm_identity`.
+  - Governed realms: `bind_prompt` binds only operator prompts; host-reported
+    outcomes use `bind_host_outcome`.
+  - The tool configuration change bit is `settled`, not `persisted` (rows
+    stored before 0.9.4 keep `persisted`); a 0.9.3 SDK against a 0.9.4
+    `rkat-rpc` fails on `tool_config_changed`, so upgrade SDKs together.
+  - Realtime: a response the provider ends without completing it arrives as
+    the non-terminal `turn_failed` live observation (route on
+    `failure.status`); nothing of it is committed and it is not retried.
 - **0.9.0 (2026-10-13).** Breaking changes and an upgrade checklist are in
   `references/migration_0_9.md`. In short:
   - MobKit is now Meta in Core's public surface, with no aliases: JSON-RPC
@@ -508,7 +539,7 @@ surface, not the old live-adapter/docs-refresh snapshot:
   invoke the provider without another user call. Turn-driven members and
   recovery-suppressed kickoff paths are distinct; see the mobs reference.
 - Mob persistence is SQLite/WAL-backed (`MobStorage::persistent()` opens `SqliteMobStores`). In-memory storage is used for tests, WASM and `rkat mob deploy`. The previous exclusive-handle mob store has been removed.
-- Rust hosts: a mob closes admission once the last exported `MobHandle` clone drops and it is idle (`MobError::AdmissionClosed` for later spawns, work, flows, wiring and resume; stop, destroy, retirement and reads stay available), so keep a handle for as long as the mob must admit work. A destroy removes the mob's database files only after its actor ended and its observer drained; while a handle or store in the process still holds it, every surface answers the retryable `mob_destroy_incomplete` and keeps the files: drop the handles and retry.
+- Rust hosts: a mob closes admission once the last exported `MobHandle` clone drops and it is idle (`MobError::AdmissionClosed` for later spawns, work, flows, wiring and resume; stop, destroy, retirement and reads stay available), so keep a handle for as long as the mob must admit work. Since 0.9.4 an admitted Shutdown, an admitted destroy, a durability fail-stop, a lost actor and a dispatch failure close admission too (reasons `shutdown`, `destroyed`, `durability fail-stop`, `actor lost`, `dispatch failure`), and `acquire_owner` is refused after any of them; while a Shutdown drains, other requests get the retryable `MobError::ShutdownInProgress`. A destroy removes the mob's database files only after its actor ended and its observer drained; while a handle or store in the process still holds it, every surface answers the retryable `mob_destroy_incomplete` and keeps the files: drop the handles and retry.
 - Prefabs are gone. All mob creation uses `MobDefinition` only (CLI, REST, RPC, MCP, SDKs).
 - `AgentMobToolSurface` in `meerkat-mob-mcp` has thirteen base definitions:
   `delegate`, `conclude_objective`, `mob_create`, `mob_destroy`,
@@ -1049,7 +1080,7 @@ For detailed surface schemas and examples, also load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
-- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9, or 0.9.3 to 0.9.4)
 - Sessions and storage: `references/sessions_runtime_surfaces_sessions.md`, `references/sessions_runtime_surfaces_storage_config.md`, `references/sessions_runtime_surfaces_api_changes.md`
 - Providers and auth: `references/providers_and_auth_models.md`, `references/providers_and_auth_credentials.md`
 - Security: `references/security.md`, `references/security_governance.md`
@@ -1510,9 +1541,11 @@ retired (it stays in the roster and can take new turns). It converges
 idempotently: with nothing left to cancel (an idle member, a run that already
 ended, a member already retiring or no longer live) it is a no-op success,
 never an `invalid state transition` error, and no cancel is left behind for a
-later run. Only an identity the roster has never seen is refused, as
-`MemberNotFound`. For an immediate, run-fenced stop use `mob/stop_member_run`
-(or `mob/hard_cancel_member` for host-level immediate cancel).
+later run. An identity the roster has never seen is refused, as
+`MemberNotFound`. Since 0.9.4 a member whose runtime needs a durability reload
+is refused, as `MemberReloadRequired`, until its registration is reloaded. For
+an immediate, run-fenced stop use `mob/stop_member_run` (or
+`mob/hard_cancel_member` for host-level immediate cancel).
 
 Spawned/forked members can be capability-contained: pass `tool_access_policy` (`allow_list` / `deny_list` / `read_only` / `inherit`) on the spawn spec / `HelperOptions` / `AgentBuildConfig`. Since 0.8.52 (#1807) tools an allow or deny list (or a mob profile `tools.deny`) makes unreachable by name are hidden from the model's tool list as well as refused at call time; a denied call returns an ordinary `access_denied` tool error and the run continues. Conditional policy stays visible and is refused at call time, by three separate gates: `read_only` intent (decided per call on each tool's declared mutation class; `access_denied`), the application tool (consequence) policy (`policy_denied` or `policy_indeterminate`), and dispatch admission. `inherit` (and omitting the policy) composes the PARENT member's effective policy, so a restricted member cannot shed its restrictions by spawning helpers. Provider-native tools need no separate step: under any restricting `tool_access_policy`, a governing application tool policy or dispatch admission, the build turns off every provider-native tool (native web search included); an explicit web-search enable then gets the ordinary `web_search` tool.
 
@@ -1623,7 +1656,7 @@ For complete method signatures and multi-surface examples, load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
-- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9, or 0.9.3 to 0.9.4)
 - `references/migration_0_5.md` (only if migrating from 0.5)
 - Sessions and storage: `references/sessions_runtime_surfaces_sessions.md`, `references/sessions_runtime_surfaces_storage_config.md`, `references/sessions_runtime_surfaces_api_changes.md`
 - Providers and auth: `references/providers_and_auth_models.md`, `references/providers_and_auth_credentials.md`

@@ -212,6 +212,14 @@ pub enum RuntimeDriverError {
     /// Internal error.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// A scoped destination bind whose `context_generation` does not advance
+    /// past the generation the session document is already bound at. A
+    /// rebind of the same registration selects a later generation.
+    #[error(
+        "scoped context generation {requested} does not advance past the bound generation {bound}"
+    )]
+    ScopedContextGenerationNotAdvanced { bound: u64, requested: u64 },
 }
 
 impl RuntimeDriverError {

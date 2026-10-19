@@ -1353,7 +1353,7 @@ impl meerkat_mob::store::TemporaryCouncilStore for GatedClaimCouncilStore {
     }
 }
 
-/// A capability store with two independent, precisely-placed fault knobs.
+/// A capability store with three independent, precisely-placed fault knobs.
 ///
 /// * `request_id_failures` fails `load_by_request_id` for ACTIVATED records.
 ///   `usize::MAX` models the condition a HOST-owned capability creates: this
@@ -1363,11 +1363,14 @@ impl meerkat_mob::store::TemporaryCouncilStore for GatedClaimCouncilStore {
 ///   lookup an owner-side revocation performs. Gating on the slot keeps the
 ///   fault off the attach path, so the resulting cleanup debt is real and
 ///   lands where the test says it does.
+/// * `reservation_failures` fails `insert_reserved`: the owner's create call
+///   fails with an untyped store error before anything is reserved.
 pub struct FlakyCapabilityStore {
     inner: Arc<dyn meerkat_mob::store::ForkedParticipantStore>,
     request_id_failures: AtomicUsize,
     capability_id_failures: AtomicUsize,
     capability_id_fault_slot: Option<String>,
+    reservation_failures: AtomicUsize,
 }
 
 impl FlakyCapabilityStore {
@@ -1381,6 +1384,7 @@ impl FlakyCapabilityStore {
             request_id_failures: AtomicUsize::new(failures),
             capability_id_failures: AtomicUsize::new(0),
             capability_id_fault_slot: None,
+            reservation_failures: AtomicUsize::new(0),
         }
     }
 
@@ -1396,6 +1400,22 @@ impl FlakyCapabilityStore {
             request_id_failures: AtomicUsize::new(0),
             capability_id_failures: AtomicUsize::new(failures),
             capability_id_fault_slot: Some(slot_suffix.to_string()),
+            reservation_failures: AtomicUsize::new(0),
+        }
+    }
+
+    /// Fail the owner's reservation write `failures` times, so a create call
+    /// fails with an untyped store error.
+    pub fn failing_reservation(
+        inner: Arc<dyn meerkat_mob::store::ForkedParticipantStore>,
+        failures: usize,
+    ) -> Self {
+        Self {
+            inner,
+            request_id_failures: AtomicUsize::new(0),
+            capability_id_failures: AtomicUsize::new(0),
+            capability_id_fault_slot: None,
+            reservation_failures: AtomicUsize::new(failures),
         }
     }
 
@@ -1420,6 +1440,11 @@ impl meerkat_mob::store::ForkedParticipantStore for FlakyCapabilityStore {
         record: &meerkat_mob::store::ForkedParticipantRecord,
     ) -> Result<meerkat_mob::store::ForkedParticipantRecord, meerkat_mob::store::MobStoreError>
     {
+        if Self::take(&self.reservation_failures) {
+            return Err(meerkat_mob::store::MobStoreError::WriteFailed(
+                "injected capability reservation fault".to_string(),
+            ));
+        }
         self.inner.insert_reserved(record).await
     }
 

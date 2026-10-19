@@ -1073,6 +1073,7 @@ mod tests {
             blocks: None,
             body: body.to_string(),
             handling_mode: None,
+            in_reply_to: None,
         }
     }
 
@@ -1160,7 +1161,11 @@ mod tests {
             (second_candidate, "to realm two"),
         ] {
             match candidate.interaction.content {
-                meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                meerkat_core::InteractionContent::Message {
+                    body,
+                    blocks: None,
+                    in_reply_to: _,
+                } => {
                     assert_eq!(body, expected);
                 }
                 other => panic!("expected Message interaction, got {other:?}"),
@@ -1249,7 +1254,11 @@ mod tests {
         ));
         let candidate = finalize.await.expect("incumbent finalizer completes");
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "incumbent keeps routing");
             }
             other => panic!("expected Message interaction, got {other:?}"),
@@ -1356,7 +1365,11 @@ mod tests {
             .await
             .expect("predecessor finalizer completes");
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "after the refused claim");
             }
             other => panic!("expected Message interaction, got {other:?}"),
@@ -1790,6 +1803,7 @@ mod tests {
                     blocks: None,
                     body: "hello inproc".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -1809,7 +1823,11 @@ mod tests {
             sender_keypair.public_key().to_pubkey_string()
         );
         match candidate.interaction.content {
-            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+            meerkat_core::InteractionContent::Message {
+                body,
+                blocks: None,
+                in_reply_to: _,
+            } => {
                 assert_eq!(body, "hello inproc");
             }
             other => panic!("expected Message interaction, got {other:?}"),
@@ -1832,6 +1850,7 @@ mod tests {
             blocks: None,
             body: "stable retry".to_string(),
             handling_mode: None,
+            in_reply_to: None,
         };
 
         let first_finalize = spawn_runtime_finalization(Arc::clone(&inbox), Arc::clone(&finalizer));
@@ -1960,6 +1979,7 @@ mod tests {
             blocks: None,
             body: body.to_string(),
             handling_mode: None,
+            in_reply_to: None,
         }
     }
 
@@ -2274,6 +2294,7 @@ mod tests {
                     blocks: None,
                     body: "hello".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2308,6 +2329,7 @@ mod tests {
                     blocks: None,
                     body: "hello".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2359,6 +2381,7 @@ mod tests {
                     blocks: None,
                     body: "hello scoped".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2385,6 +2408,7 @@ mod tests {
                     blocks: None,
                     body: "should not deliver".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2435,6 +2459,7 @@ mod tests {
                     blocks: None,
                     body: "hello canonical".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,
@@ -2491,6 +2516,7 @@ mod tests {
                     blocks: None,
                     body: "ambiguous identity".to_string(),
                     handling_mode: None,
+                    in_reply_to: None,
                 },
                 true,
                 TEST_PARK_BOUND,

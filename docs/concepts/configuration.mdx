@@ -224,7 +224,10 @@ hosting = "multiprocess"   # default: "single_process"
 
 It is layered like every realm option (a child realm's explicit value, including
 `single_process`, wins). With `multiprocess`, every surface refuses to start when the
-realm's stores cannot provide trusted cross-process hosting. See
+realm's stores cannot provide trusted cross-process hosting or the runtime
+store's watch cannot start its sweep. Since 0.9.4 it does not refuse because file
+notifications cannot be registered (an inotify limit, for example): the sweep,
+every 5 seconds by default, is then the cross-process wake. See
 [Realms: multi-process hosting](/concepts/realms#multi-process-hosting).
 
 ## Compaction settings

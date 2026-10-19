@@ -201,6 +201,7 @@ from .generated.types import (
     WireProjectionProvenance,
     WireReachability,
     WireMemberPreviewUnavailable,
+    WireMemberRegistrationHookCall,
     WireExternalRouteInstallObligation,
     WireRouteInstallObligation,
     WireRuntimeBinding,
@@ -280,6 +281,7 @@ from .types import (
     ForkCacheLoweredRequestProvenance,
     ForkCacheProvider,
     ForkCacheTtl,
+    ForkInstructionPolicy,
     ForkPoint,
     HelpExecutionMode,
     InstructionActivationAbsent,
@@ -1981,8 +1983,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session at a transcript message index."""
+        """Fork an idle session at a transcript message index.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -1991,6 +1998,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_at", params
         )
@@ -2004,8 +2013,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session and apply a typed transcript replacement."""
+        """Fork an idle session and apply a typed transcript replacement.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -2015,6 +2029,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_replace", params
         )
@@ -3853,6 +3869,9 @@ class MeerkatClient:
         preview_unavailable = self._parse_member_preview_unavailable(
             result, "Invalid mob/member_status response"
         )
+        registration_refusal = self._parse_member_registration_refusal(
+            result, "Invalid mob/member_status response"
+        )
         return {
             "status": self._require_string_field(
                 result,
@@ -3924,6 +3943,11 @@ class MeerkatClient:
                 if preview_unavailable is not None
                 else {}
             ),
+            **(
+                {"registration_refusal": registration_refusal}
+                if registration_refusal is not None
+                else {}
+            ),
         }
 
     async def wait_mob_kickoff(
@@ -3959,6 +3983,9 @@ class MeerkatClient:
                 "Invalid mob/wait_kickoff response",
             )
             preview_unavailable = self._parse_member_preview_unavailable(
+                entry, "Invalid mob/wait_kickoff response"
+            )
+            registration_refusal = self._parse_member_registration_refusal(
                 entry, "Invalid mob/wait_kickoff response"
             )
             normalized.append(
@@ -4004,6 +4031,11 @@ class MeerkatClient:
                         if preview_unavailable is not None
                         else {}
                     ),
+                    **(
+                        {"registration_refusal": registration_refusal}
+                        if registration_refusal is not None
+                        else {}
+                    ),
                 }
             )
         return normalized
@@ -4041,6 +4073,9 @@ class MeerkatClient:
                 "Invalid mob/wait_ready response",
             )
             preview_unavailable = self._parse_member_preview_unavailable(
+                entry, "Invalid mob/wait_ready response"
+            )
+            registration_refusal = self._parse_member_registration_refusal(
                 entry, "Invalid mob/wait_ready response"
             )
             normalized.append(
@@ -4084,6 +4119,11 @@ class MeerkatClient:
                     **(
                         {"preview_unavailable": preview_unavailable}
                         if preview_unavailable is not None
+                        else {}
+                    ),
+                    **(
+                        {"registration_refusal": registration_refusal}
+                        if registration_refusal is not None
                         else {}
                     ),
                 }
@@ -8045,6 +8085,29 @@ class MeerkatClient:
         return cast(WireMemberPreviewUnavailable, value)
 
     @staticmethod
+    def _parse_member_registration_refusal(
+        raw: dict[str, Any], context: str
+    ) -> WireMemberRegistrationHookCall | None:
+        """Return the hook call that refused a restored member's registration.
+
+        Absent or ``null`` means no host refused the member; a value outside
+        the closed vocabulary fails closed.
+        """
+        value = raw.get("registration_refusal")
+        if value is None:
+            return None
+        if not isinstance(value, str) or value not in {
+            "select_destination",
+            "select_agent_mandate",
+            "prepare_member_surface",
+            "verify_member_surface",
+        }:
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid registration_refusal"
+            )
+        return cast(WireMemberRegistrationHookCall, value)
+
+    @staticmethod
     def _optional_string_field(
         raw: dict[str, Any], field: str, context: str
     ) -> str | None:
@@ -8659,6 +8722,10 @@ class MeerkatClient:
                 data.get("cache_inheritance"),
                 context,
             ),
+            reactivated_instruction_count=MeerkatClient._optional_non_negative_integer_field(
+                data, "reactivated_instruction_count", context
+            )
+            or 0,
         )
 
     @staticmethod

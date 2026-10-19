@@ -63,6 +63,26 @@ impl MeerkatMachine {
         }
     }
 
+    /// The current entry's mutation gate for a control command that serves a
+    /// live session (see [`MeerkatMachine::lock_current_live_session_mutation_gate`]):
+    /// `NotFound` once the session is not registered, and the repair-blocked
+    /// refusal the ready-gated control wait reports once the session degrades
+    /// while another holder keeps the gate.
+    async fn lock_current_control_live_session_mutation_gate(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        session_id: &SessionId,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeControlPlaneError> {
+        self.lock_current_live_session_mutation_gate(session_id)
+            .await
+            .map_err(|required| {
+                RuntimeControlPlaneError::StoreError(
+                    degraded_gate_wait_refusal(required).to_string(),
+                )
+            })?
+            .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))
+    }
+
     async fn lock_current_control_durability_ready_session_mutation_gate(
         &self,
         session_id: &SessionId,
@@ -352,7 +372,7 @@ impl MeerkatMachine {
                                     .to_string(),
                             ));
                         }
-                        Arc::clone(&entry.mutation_gate)
+                        entry.mutation_gate.clone()
                     };
                     let mut gate_guard = Some(ready_guard);
                     let (
@@ -373,7 +393,7 @@ impl MeerkatMachine {
                                 state: RuntimeState::Destroyed,
                             },
                         )?;
-                        if !Arc::ptr_eq(&entry.mutation_gate, &mutation_gate)
+                        if !entry.mutation_gate.same_gate(&mutation_gate)
                             || !Arc::ptr_eq(&entry.driver, &driver)
                             || entry.runtime_id != runtime_id
                         {
@@ -584,7 +604,7 @@ impl MeerkatMachine {
                                         })?;
                                         Ok(RuntimeAcceptedBoundaryCancelPlan {
                                             witness: RuntimeEffectDispatchAttachmentWitness {
-                                                mutation_gate: Arc::clone(&mutation_gate),
+                                                mutation_gate: mutation_gate.clone(),
                                                 driver: driver.clone(),
                                                 dsl_authority: Arc::clone(&dsl_authority),
                                                 attachment_id,
@@ -682,7 +702,7 @@ impl MeerkatMachine {
                         ) {
                         Some(RuntimeAcceptedLiveBoundaryPlan {
                             witness: RuntimeLiveBoundaryAttachmentWitness {
-                                mutation_gate: Arc::clone(&mutation_gate),
+                                mutation_gate: mutation_gate.clone(),
                                 driver: driver.clone(),
                                 dsl_authority: Arc::clone(&dsl_authority),
                                 attachment_id,
@@ -922,7 +942,7 @@ impl MeerkatMachine {
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .current
                                     .is_some(),
-                                Arc::clone(&entry.mutation_gate),
+                                entry.mutation_gate.clone(),
                                 entry.publication_handle(),
                             )
                         };
@@ -1043,9 +1063,8 @@ impl MeerkatMachine {
                     )
                     .await;
                     let mutation_guard = self
-                        .lock_current_session_mutation_gate(&session_id)
-                        .await
-                        .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
+                        .lock_current_control_live_session_mutation_gate(&runtime_id, &session_id)
+                        .await?;
                     let MutationGuardedControlEntry {
                         driver,
                         completions,
@@ -1131,14 +1150,19 @@ impl MeerkatMachine {
                         .lock_session_mutation_gate_for_live_lifecycle_lease(
                             &session_id,
                             &live_lifecycle_lease,
+                            SessionMutationGateWait::Live,
                         )
                         .await
+                        .map_err(|required| {
+                            RuntimeControlPlaneError::StoreError(
+                                degraded_gate_wait_refusal(required).to_string(),
+                            )
+                        })?
                         .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
                     #[cfg(not(feature = "live"))]
                     let mutation_guard = self
-                        .lock_current_session_mutation_gate(&session_id)
-                        .await
-                        .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
+                        .lock_current_control_live_session_mutation_gate(&runtime_id, &session_id)
+                        .await?;
                     let MutationGuardedControlEntry {
                         driver,
                         completions,

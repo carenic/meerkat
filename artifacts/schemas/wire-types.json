@@ -1733,8 +1733,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -6319,8 +6330,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -14321,6 +14354,26 @@
         ],
         "type": "object"
       },
+      "ForkInstructionPolicy": {
+        "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
+        "oneOf": [
+          {
+            "const": "require_explicit_activation",
+            "description": "The host activates each inherited key on the child before its first\nturn. A fork that leaves no window for that is refused instead (see\n[`ForkInstructionPolicy::effective`]).",
+            "type": "string"
+          },
+          {
+            "const": "reactivate_inherited",
+            "description": "The fork owner re-activates, in the child and before the child is\ncommitted, every key that was effective in the source at the fork\nboundary.",
+            "type": "string"
+          },
+          {
+            "const": "refuse",
+            "description": "A fork whose child would inherit any activation row is refused before\nanything is committed.",
+            "type": "string"
+          }
+        ]
+      },
       "HandlingMode": {
         "description": "Handling mode for ordinary content-bearing work.\n\n`Queue` means outer-loop / next-turn handling and leaves the current run\nuntouched.\n`Steer` means inner-loop handling and requests injection at the earliest\nadmissible cooperative boundary, while remaining ordinary work rather than\nan out-of-band control-plane command.",
         "enum": [
@@ -18429,6 +18482,17 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "inherited_instructions": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ForkInstructionPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The controller host's fork instruction policy for the participant's\nfork. Sent only for `reactivate_inherited`: a member host that sees\nno field applies the default, which refuses a participant that would\ninherit activation rows (the council admits the participant's turns\nitself, so nothing else can activate them). A member host older than\nthis field rejects a payload that carries it."
           },
           "prefix_message_count": {
             "format": "uint64",
@@ -26765,8 +26829,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -31515,8 +31590,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -33951,8 +34048,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -37885,6 +38004,139 @@
         ],
         "type": "string"
       },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      },
+      "InstructionKey": {
+        "description": "Application-owned instruction key within one namespace.",
+        "type": "string"
+      },
+      "InstructionNamespace": {
+        "description": "Application or issuer namespace for one instruction artifact family.",
+        "type": "string"
+      },
       "MemberBuildRejection": {
         "description": "Typed \"host cannot build the member\" taxonomy (§14.4). Closed — every\nowning-host build failure maps onto one of these, never a generic\nfailure. Externally tagged (like the parent cause enum) so the\n`kind`-named detail fields don't collide with a tag key.",
         "oneOf": [
@@ -38576,6 +38828,27 @@
         },
         "required": [
           "session_ownership_conflict"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+        "properties": {
+          "fork_instruction_refused": {
+            "properties": {
+              "refusal": {
+                "$ref": "#/$defs/ForkInstructionRefusal"
+              }
+            },
+            "required": [
+              "refusal"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "fork_instruction_refused"
         ],
         "type": "object"
       }
@@ -40303,8 +40576,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -42594,6 +42878,27 @@
               "session_ownership_conflict"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/$defs/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -43975,6 +44280,117 @@
         ],
         "type": "string"
       },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "GeminiImageMetadata": {
         "properties": {
           "continuity_ref": {
@@ -44184,6 +44600,20 @@
       },
       "InputId": {
         "description": "Opaque identifier for an input accepted by the runtime layer.\n\nCore passes this through in `contributing_input_ids` on receipts and events\nbut NEVER interprets it. The runtime layer creates and manages these.",
+        "type": "string"
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
         "type": "string"
       },
       "InstructionActivationId": {
@@ -47219,8 +47649,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -55539,8 +55991,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -58100,6 +58563,17 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "inherited_instructions": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ForkInstructionPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The controller host's fork instruction policy for the participant's\nfork. Sent only for `reactivate_inherited`: a member host that sees\nno field applies the default, which refuses a participant that would\ninherit activation rows (the council admits the participant's turns\nitself, so nothing else can activate them). A member host older than\nthis field rejects a payload that carries it."
+              },
               "prefix_message_count": {
                 "format": "uint64",
                 "minimum": 0,
@@ -59789,6 +60263,27 @@
             },
             "required": [
               "session_ownership_conflict"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/$defs/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
             ],
             "type": "object"
           }
@@ -62264,6 +62759,137 @@
         ],
         "type": "string"
       },
+      "ForkInstructionPolicy": {
+        "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
+        "oneOf": [
+          {
+            "const": "require_explicit_activation",
+            "description": "The host activates each inherited key on the child before its first\nturn. A fork that leaves no window for that is refused instead (see\n[`ForkInstructionPolicy::effective`]).",
+            "type": "string"
+          },
+          {
+            "const": "reactivate_inherited",
+            "description": "The fork owner re-activates, in the child and before the child is\ncommitted, every key that was effective in the source at the fork\nboundary.",
+            "type": "string"
+          },
+          {
+            "const": "refuse",
+            "description": "A fork whose child would inherit any activation row is refused before\nanything is committed.",
+            "type": "string"
+          }
+        ]
+      },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "GeminiImageMetadata": {
         "properties": {
           "continuity_ref": {
@@ -62508,6 +63134,20 @@
             "type": "string"
           }
         ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
       },
       "InstructionActivationId": {
         "description": "Caller-stable identity for one activation or rollback event.",
@@ -66778,8 +67418,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -73355,6 +74017,17 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "inherited_instructions": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ForkInstructionPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The controller host's fork instruction policy for the participant's\nfork. Sent only for `reactivate_inherited`: a member host that sees\nno field applies the default, which refuses a participant that would\ninherit activation rows (the council admits the participant's turns\nitself, so nothing else can activate them). A member host older than\nthis field rejects a payload that carries it."
+              },
               "prefix_message_count": {
                 "format": "uint64",
                 "minimum": 0,
@@ -74401,6 +75074,26 @@
           "nanos"
         ],
         "type": "object"
+      },
+      "ForkInstructionPolicy": {
+        "description": "Host policy for the activation rows a durable fork child inherits.\n\nA fork child holds its source's activation rows as historical context and\nruns no model turn until each inherited key has an origin-local activation\nin the child. The policy says who appends that activation. It belongs to\nthe host (a mob builder, or an RPC fork request) and is never a tool\nargument.",
+        "oneOf": [
+          {
+            "const": "require_explicit_activation",
+            "description": "The host activates each inherited key on the child before its first\nturn. A fork that leaves no window for that is refused instead (see\n[`ForkInstructionPolicy::effective`]).",
+            "type": "string"
+          },
+          {
+            "const": "reactivate_inherited",
+            "description": "The fork owner re-activates, in the child and before the child is\ncommitted, every key that was effective in the source at the fork\nboundary.",
+            "type": "string"
+          },
+          {
+            "const": "refuse",
+            "description": "A fork whose child would inherit any activation row is refused before\nanything is committed.",
+            "type": "string"
+          }
+        ]
       },
       "HandlingMode": {
         "description": "Handling mode for ordinary content-bearing work.\n\n`Queue` means outer-loop / next-turn handling and leaves the current run\nuntouched.\n`Steer` means inner-loop handling and requests injection at the earliest\nadmissible cooperative boundary, while remaining ordinary work rather than\nan out-of-band control-plane command.",
@@ -78559,8 +79252,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -80850,6 +81554,27 @@
               "session_ownership_conflict"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/$defs/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -83044,6 +83769,117 @@
         ],
         "type": "string"
       },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "GeminiImageMetadata": {
         "properties": {
           "continuity_ref": {
@@ -83253,6 +84089,20 @@
       },
       "InputId": {
         "description": "Opaque identifier for an input accepted by the runtime layer.\n\nCore passes this through in `contributing_input_ids` on receipts and events\nbut NEVER interprets it. The runtime layer creates and manages these.",
+        "type": "string"
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
         "type": "string"
       },
       "InstructionActivationId": {
@@ -86288,8 +87138,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -94407,8 +95279,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -99082,8 +99965,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -100842,6 +101747,241 @@
     },
     "title": "ExecutionPlacementIdentity",
     "type": "object"
+  },
+  "ForkInstructionRefusal": {
+    "$defs": {
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      },
+      "InstructionKey": {
+        "description": "Application-owned instruction key within one namespace.",
+        "type": "string"
+      },
+      "InstructionNamespace": {
+        "description": "Application or issuer namespace for one instruction artifact family.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+    "properties": {
+      "cause": {
+        "$ref": "#/$defs/ForkInstructionRefusalCause"
+      },
+      "keys": {
+        "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+        "items": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/InstructionNamespace"
+            },
+            {
+              "$ref": "#/$defs/InstructionKey"
+            }
+          ],
+          "type": "array"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "cause",
+      "keys"
+    ],
+    "title": "ForkInstructionRefusal",
+    "type": "object"
+  },
+  "ForkInstructionRefusalCause": {
+    "$defs": {
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Why a fork that would inherit activation rows was refused.",
+    "oneOf": [
+      {
+        "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+        "properties": {
+          "kind": {
+            "const": "policy_refuses",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+        "properties": {
+          "kind": {
+            "const": "not_effective_in_source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+        "properties": {
+          "kind": {
+            "const": "lineage_body_budget_exceeded",
+            "type": "string"
+          },
+          "max_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "max_bytes"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The activation rules refused a re-activation row.",
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/InstructionActivationErrorCode"
+          },
+          "kind": {
+            "const": "activation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+        "properties": {
+          "kind": {
+            "const": "member_host_unsupported",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ForkInstructionRefusalCause"
   },
   "GoalAttentionTarget": {
     "$defs": {
@@ -111763,6 +112903,27 @@
               "session_ownership_conflict"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/$defs/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -111779,6 +112940,139 @@
           "provider_mismatch",
           "realm_chain"
         ],
+        "type": "string"
+      },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      },
+      "InstructionKey": {
+        "description": "Application-owned instruction key within one namespace.",
+        "type": "string"
+      },
+      "InstructionNamespace": {
+        "description": "Application or issuer namespace for one instruction artifact family.",
         "type": "string"
       },
       "MemberBuildRejection": {
@@ -112554,6 +113848,27 @@
               "session_ownership_conflict"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The member host refused a forked participant before committing any\nchild: the child would inherit activated host instructions that the\ncontroller's fork instruction policy does not carry into it.",
+            "properties": {
+              "fork_instruction_refused": {
+                "properties": {
+                  "refusal": {
+                    "$ref": "#/$defs/ForkInstructionRefusal"
+                  }
+                },
+                "required": [
+                  "refusal"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "fork_instruction_refused"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -112570,6 +113885,139 @@
           "provider_mismatch",
           "realm_chain"
         ],
+        "type": "string"
+      },
+      "ForkInstructionRefusal": {
+        "additionalProperties": false,
+        "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+        "properties": {
+          "cause": {
+            "$ref": "#/$defs/ForkInstructionRefusalCause"
+          },
+          "keys": {
+            "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "$ref": "#/$defs/InstructionNamespace"
+                },
+                {
+                  "$ref": "#/$defs/InstructionKey"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "cause",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      },
+      "InstructionKey": {
+        "description": "Application-owned instruction key within one namespace.",
+        "type": "string"
+      },
+      "InstructionNamespace": {
+        "description": "Application or issuer namespace for one instruction artifact family.",
         "type": "string"
       },
       "MemberBuildRejection": {
@@ -122021,8 +123469,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -124496,6 +125966,31 @@
         "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
         "type": "string"
       },
+      "WireMemberRegistrationHookCall": {
+        "description": "The member registration hook call that refused a restored member's\nregistration.",
+        "oneOf": [
+          {
+            "const": "select_destination",
+            "description": "The host refused to select the member's destination.",
+            "type": "string"
+          },
+          {
+            "const": "select_agent_mandate",
+            "description": "The host refused to select the agent the member's registration acts as.",
+            "type": "string"
+          },
+          {
+            "const": "prepare_member_surface",
+            "description": "The host refused the member's prepared tool surface.",
+            "type": "string"
+          },
+          {
+            "const": "verify_member_surface",
+            "description": "The host refused the member's built tool surface.",
+            "type": "string"
+          }
+        ]
+      },
       "WireMemberRunState": {
         "enum": [
           "idle",
@@ -124827,6 +126322,17 @@
             "type": "null"
           }
         ]
+      },
+      "registration_refusal": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMemberRegistrationHookCall"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Present when the member's host refused its restored registration: the\nhook call that refused it. The member stays Broken until an explicit\nrepair. Absent-omitted for byte-compat with released SDKs."
       },
       "resolved_capabilities": {
         "anyOf": [
@@ -129138,6 +130644,11 @@
           {
             "const": "STALE_DELIVERY_SCOPE",
             "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
+          },
+          {
+            "const": "FORK_INSTRUCTION_REFUSED",
+            "description": "A durable fork was refused before commit because of the activation\nrows its child would inherit, under the host's fork instruction\npolicy. No child exists; the typed cause and keys ride in the error\ndata. A fork request may set `inherited_instructions` to\n`reactivate_inherited` to carry the source's effective activations.",
             "type": "string"
           }
         ]
@@ -146388,6 +147899,12 @@
         "minimum": 0,
         "type": "integer"
       },
+      "reactivated_instruction_count": {
+        "description": "Instruction re-activation rows the fork appended to the child after\nthe copied prefix ([`crate::ForkInstructionPolicy::ReactivateInherited`]).\n`message_count` counts them; [`Self::prefix_message_count`] does not.",
+        "format": "uint",
+        "minimum": 0,
+        "type": "integer"
+      },
       "session_id": {
         "type": "string"
       },
@@ -147792,6 +149309,10 @@
         ],
         "type": "object"
       },
+      "InteractionId": {
+        "description": "Unique identifier for an interaction.",
+        "type": "string"
+      },
       "InterruptedInputKind": {
         "description": "What kind of input an interrupted run had in flight.",
         "oneOf": [
@@ -148135,8 +149656,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -156302,8 +157845,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -160926,8 +162480,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -163974,8 +165550,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -173246,8 +174844,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -175418,6 +177038,33 @@
     ],
     "title": "WireMemberProgressSnapshot",
     "type": "object"
+  },
+  "WireMemberRegistrationHookCall": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The member registration hook call that refused a restored member's\nregistration.",
+    "oneOf": [
+      {
+        "const": "select_destination",
+        "description": "The host refused to select the member's destination.",
+        "type": "string"
+      },
+      {
+        "const": "select_agent_mandate",
+        "description": "The host refused to select the agent the member's registration acts as.",
+        "type": "string"
+      },
+      {
+        "const": "prepare_member_surface",
+        "description": "The host refused the member's prepared tool surface.",
+        "type": "string"
+      },
+      {
+        "const": "verify_member_surface",
+        "description": "The host refused the member's built tool surface.",
+        "type": "string"
+      }
+    ],
+    "title": "WireMemberRegistrationHookCall"
   },
   "WireMemberRunState": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -181239,8 +182886,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -184139,8 +185808,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -187499,8 +189190,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [

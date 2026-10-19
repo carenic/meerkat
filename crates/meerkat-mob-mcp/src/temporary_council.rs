@@ -2179,7 +2179,10 @@ impl CouncilRun {
         let (merge, merge_truncated) = self.apply_merge(&discussion.exit_reason).await?;
 
         // 6. Seal the immutable result BEFORE cleanup, so a later cleanup
-        //    failure cannot invalidate it.
+        //    failure cannot invalidate it. A slot whose create the source
+        //    host's fork instruction policy refused settles in this same write
+        //    as the typed exit.
+        settle_refused_participant(&mut self.record.participants, &discussion.exit_reason);
         let truncated_exchange_count = self
             .record
             .exchanges
@@ -2479,12 +2482,7 @@ impl CouncilRun {
                 .await;
             let capability = match created {
                 Ok(Ok(capability)) => capability,
-                Ok(Err(error)) => {
-                    return Err(TemporaryCouncilExitReason::ParticipantSeatingFailed {
-                        participant_order: custody.order,
-                        detail: format!("capability creation failed: {error}"),
-                    });
-                }
+                Ok(Err(error)) => return Err(capability_creation_exit(custody.order, error)),
                 Err(_) => return Err(TemporaryCouncilExitReason::DeadlineExceeded),
             };
 
@@ -2752,6 +2750,51 @@ impl CouncilRun {
                 ),
             })
         }
+    }
+}
+
+/// The council's exit for a participant whose capability could not be
+/// created. The one mapping for local and placed sources: a participant fork
+/// that the source host's fork instruction policy refused keeps its typed
+/// refusal; every other failure is a seating failure.
+fn capability_creation_exit(participant_order: u32, error: MobError) -> TemporaryCouncilExitReason {
+    match error {
+        MobError::ForkInstructionRefused { refusal, .. } => {
+            TemporaryCouncilExitReason::ParticipantForkInstructionRefused {
+                participant_order,
+                refusal,
+            }
+        }
+        error => TemporaryCouncilExitReason::ParticipantSeatingFailed {
+            participant_order,
+            detail: format!("capability creation failed: {error}"),
+        },
+    }
+}
+
+/// Settle the slot of a participant whose create came back with the typed
+/// fork instruction refusal as `Refused`: the owner committed nothing, so
+/// cleanup has nothing to revoke and records no debt for it.
+///
+/// That exit comes only from [`capability_creation_exit`], while the slot's
+/// acquisition is still `Pending`. Only a `Pending` slot is settled, and every
+/// other create failure keeps `Pending` with its reconciliation.
+fn settle_refused_participant(
+    participants: &mut [TemporaryCouncilParticipantCustody],
+    exit_reason: &TemporaryCouncilExitReason,
+) {
+    let TemporaryCouncilExitReason::ParticipantForkInstructionRefused {
+        participant_order, ..
+    } = exit_reason
+    else {
+        return;
+    };
+    if let Some(slot) = participants
+        .iter_mut()
+        .find(|slot| slot.order == *participant_order)
+        && slot.acquisition == TemporaryCouncilAcquisition::Pending
+    {
+        slot.acquisition = TemporaryCouncilAcquisition::Refused;
     }
 }
 

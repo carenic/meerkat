@@ -353,6 +353,7 @@ async fn release_full_disposal_archives_and_removes_the_member_identity() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await;
     assert!(

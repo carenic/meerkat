@@ -10,18 +10,13 @@ peer. Permissions belong to the authenticated work and the actual operation,
 not to a model's claim that it is authorized.
 
 <Note>
-**Bounded native support.** Explicit native embedding has acceptance for local
-refusal feedback, permitted siblings and model continuation, input-owned audit,
-completed-turn SQLite reconstruction in a new process followed by fresh governed
-work, and the commissioned JSONL profile. These are fixed-host, loopback
-qualifications, not full surface or live-provider coverage. Ordinary constructors,
-provider login and Console access administration do not activate native permission.
-The measured conditional fresh-turn means missed the cheap-default target;
-full-platform and per-operation p99 acceptance remain open. This page describes
-the full contract. See [integration and current support](/guides/authorization-integration),
-the [implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md)
-and [acceptance scope](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/acceptance-plan.md)
-for deployment boundaries and qualified evidence.
+Native authorization is available to explicit Rust embeddings, to the
+fixed-host governed JSONL profile, and to a governed realm opened by the stock
+`rkat` CLI or `rkat-rpc`. Ordinary constructors, provider login and Console
+access administration do not activate native permission. This page describes
+the full contract. See [integration and current support](/guides/authorization-integration)
+and [Native governed embedding](/rust/native-authorization) for deployment
+boundaries.
 </Note>
 
 ## Authentication does not grant every action
@@ -50,6 +45,14 @@ but be forbidden to delete events. A connected OAuth token with delete access
 does not widen the assistant's grant. Another person using the same assistant
 does not inherit the account owner's authority either.
 
+A host process that tells an agent the outcome of an administrative command,
+for example that a connector installation finished, is not the person who ran
+that command. Since 0.9.4 the stock governed realm binds such an outcome as its
+own input whose requester is the host's ingress: no person requested it and it
+is not anyone's consent. It runs under the operator's mandate in a turn of its
+own, and a reviewer or approver sees that requester in the mandate text. Only
+the operator's own prompts name the operator as their requester.
+
 ## Grants narrow authority
 
 A root grant states the authority given to an agent. A child grant can narrow
@@ -66,6 +69,11 @@ Rules also preserve their combinations. A rule allowing **read calendar A** and
 another allowing **delete calendar B** do not allow **delete calendar A** merely
 because both the action and calendar appear somewhere in the policy.
 
+A resource bound names exact resources, or since 0.9.4 every resource owned by
+one of a set of owners. A parent grant can then fix the application while each
+child grant names the exact session resource it needs; a child that names a
+resource of another owner permits nothing.
+
 ## Check the operation that will actually run
 
 The adapter retains an immutable binding with the actual request or execution
@@ -80,8 +88,8 @@ decision is process-local and is not a serializable bearer token.
 
 The design adds no authorization network round trip or separate audit fsync to
 each operation. It targets constant-time warm checking; preparation and recording
-still have a cost. Performance acceptance requires measurement, not just a fast
-lookup in a unit test.
+still have a cost; measure it in your deployment, since a fast lookup in a unit
+test does not show it.
 
 ## A denied operation gives feedback
 
@@ -90,6 +98,10 @@ tool call. It does not by itself fail the run, cancel allowed sibling actions,
 or put the session into a security hold. The agent may choose another permitted
 action within its existing budgets. An unchanged denied operation is not
 automatically retried, and a governed refusal never falls back to trusted execution.
+Since 0.9.4 the feedback names only the closed refusal kind (`reprepare_required`,
+`denied` or `malformed_facts`) and whether the tool ran (`tool_invoked`: `false`,
+or `"unknown"` when nothing certifies it). Neither is a permission: a new call is
+a new operation with fresh admission.
 
 Infrastructure failure is different:
 
@@ -102,6 +114,22 @@ Infrastructure failure is different:
 Detailed policy, source, principal, and account information belongs in protected
 records. Public error text must not disclose it to an audience that cannot read it.
 
+## A changing policy is a stale read, not a denial
+
+Owners publish every change (a grant issued or revoked, a policy, identity,
+destination or account change) through one local publication. An operation that
+reads the policy while a change is being published is refused to rebuild: its
+read is stale, which says nothing about whether the operation is permitted.
+Since 0.9.4 the agent waits for such a change to complete before it rebuilds a
+model request, a tool call, a hosted search helper or a compaction summary,
+within fixed bounds (at most 2 seconds and 3 extra rebuilds per wait, inside the
+tool's timeout and the run's budget). Past the bounds the refusal takes its
+ordinary path; a refusal the owners decided is never waited on. A model-reviewed
+tool call superseded only by such a change is reviewed once more instead of
+failing. The protected audit records which kind each refusal was: an owner
+answer, a publication that changed under the attempt, or a change still in
+progress.
+
 ## Keep the controller usable
 
 The controller model drives the agent's reasoning and receives operation results.
@@ -113,8 +141,7 @@ not automatically permit hosted actions.
 Ordinary grant, route, and credential changes must preserve or atomically replace
 the last usable controller while unfinished work depends on it, or receive an
 administrative refusal. Deliberate stopping is a separate, attributed operation.
-This is not an indefinite lease for idle sessions. Complete controller mutation
-and credential continuity are still being integrated.
+This is not an indefinite lease for idle sessions.
 
 ## Sources, peers, and Elephant
 

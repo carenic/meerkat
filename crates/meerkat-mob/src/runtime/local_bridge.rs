@@ -150,6 +150,7 @@ impl MobBoundMemberRuntimeBridge for LocalMobRuntimeBridge {
             // Lowers as InjectedContext-role appends immediately before this
             // input's peer append.
             injected_context,
+            in_reply_to: None,
         });
 
         match self
