@@ -144,7 +144,8 @@ indexmap = { workspace = true }
 # identical defect alive for the other gates, which is not progress under
 # Rule 9. `integration-real-tests` and the live/realtime features stay out:
 # those need real resources and belong to the e2e lanes.
-meerkat = { path = ".", features = ["workspace-tests", 
+meerkat = { path = ".", features = [
+    "workspace-tests",
     "local-authorization",
     "session-store",
     # Enabling `session-store` alone makes the cold-restart compaction batteries

@@ -269,6 +269,7 @@ async fn live_delegation_worker_start_resolves_after_its_channel_closed() {
         .expect("the committed start replays idempotently after the close");
 }
 
+#[cfg(feature = "live")]
 #[tokio::test]
 async fn live_delegation_runtime_reconciles_already_committed_worker_edges() {
     let machine = MeerkatMachine::ephemeral();
@@ -3457,11 +3458,13 @@ async fn teardown_required_runtime_loop_exit_unregisters_after_exact_cleanup() {
 /// A [`CoreExecutor`] whose post-stop cleanup reports that it started and then
 /// waits for its release, so a test can hold an unregister after the runtime
 /// loop has exited and handed the executor off.
+#[cfg(feature = "test-support")]
 struct HeldTeardownCleanupExecutor {
     cleanup_started: Arc<Notify>,
     release_cleanup: Arc<Notify>,
 }
 
+#[cfg(feature = "test-support")]
 #[async_trait::async_trait]
 impl CoreExecutor for HeldTeardownCleanupExecutor {
     async fn apply(
@@ -3491,6 +3494,7 @@ impl CoreExecutor for HeldTeardownCleanupExecutor {
 
 /// A persistent machine over an in-memory store that owns execution custody,
 /// with one session attached through a [`HeldTeardownCleanupExecutor`].
+#[cfg(feature = "test-support")]
 struct HeldTeardownSession {
     store: Arc<dyn crate::store::RuntimeStore>,
     machine: Arc<MeerkatMachine>,
@@ -3500,6 +3504,7 @@ struct HeldTeardownSession {
     release_cleanup: Arc<Notify>,
 }
 
+#[cfg(feature = "test-support")]
 async fn held_teardown_session() -> HeldTeardownSession {
     let store: Arc<dyn crate::store::RuntimeStore> =
         Arc::new(crate::store::InMemoryRuntimeStore::new());
@@ -3548,6 +3553,7 @@ async fn held_teardown_session() -> HeldTeardownSession {
 /// to its first suspension before this test resumes, so no scheduling decides
 /// what is observed. Every wait is bounded, and the unregister is released and
 /// joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn teardown_watcher_waits_for_its_unregister_without_the_machine() {
     let HeldTeardownSession {
@@ -3618,6 +3624,7 @@ async fn teardown_watcher_waits_for_its_unregister_without_the_machine() {
 /// drops its handle and reopens while the kickoff still holds the machine,
 /// and finds the custody busy. Every wait is bounded, and the kickoff is
 /// released and the unregister joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn unregister_publication_waits_for_the_watcher_kickoff_to_release_the_machine() {
     let HeldTeardownSession {
@@ -3721,6 +3728,7 @@ async fn unregister_publication_waits_for_the_watcher_kickoff_to_release_the_mac
 /// holds the machine, in which case the reopen finds the custody busy. Every
 /// wait is bounded, and a parked kickoff is released and the unregister
 /// joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_watcher_waking_after_its_successful_unregister_does_not_take_the_machine() {
     let HeldTeardownSession {
@@ -52406,6 +52414,7 @@ mod prepared_materialization_transactions {
     /// own wait can prove the registration gone. The saga is held until the
     /// rollback has dispatched its wait, and the machine witnesses which wait
     /// that was, so no scheduling decides the outcome.
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn prepared_rollback_joins_an_already_started_unregister_until_terminal() {
         let machine = Arc::new(MeerkatMachine::ephemeral());

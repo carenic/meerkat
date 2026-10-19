@@ -1695,11 +1695,13 @@ async fn a_job_without_a_member_address_reaches_its_origin_session() {
 }
 
 /// Reports one session as the current session of the member at `address`.
+#[cfg(feature = "session-store")]
 struct MemberSessions {
     session: SessionId,
     address: meerkat_runtime::LogicalRuntimeId,
 }
 
+#[cfg(feature = "session-store")]
 #[async_trait::async_trait]
 impl meerkat::ContinuationAddressResolver for MemberSessions {
     async fn current_address(
@@ -1724,8 +1726,10 @@ impl meerkat::ContinuationAddressResolver for MemberSessions {
     }
 }
 
+#[cfg(feature = "session-store")]
 struct NoRetainedJobs;
 
+#[cfg(feature = "session-store")]
 #[async_trait::async_trait]
 impl meerkat::RetainedJobSource for NoRetainedJobs {
     async fn retained_job(
@@ -1806,11 +1810,13 @@ async fn a_bundles_job_store_records_the_submitting_members_address() {
 
 /// Reports `current` as the current session of the member at `address`;
 /// the test moves the member by replacing `current`.
+#[cfg(feature = "session-store")]
 struct RepointableMember {
     current: std::sync::Mutex<SessionId>,
     address: meerkat_runtime::LogicalRuntimeId,
 }
 
+#[cfg(feature = "session-store")]
 #[async_trait::async_trait]
 impl meerkat::ContinuationAddressResolver for RepointableMember {
     async fn current_address(

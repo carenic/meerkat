@@ -1443,6 +1443,7 @@ async fn discarded_boundary_batch_preserves_order_and_excludes_unapplied_input()
     assert_eq!(rig.script.discarded.lock().unwrap().len(), 1);
 }
 
+#[cfg(feature = "sqlite-store")]
 #[tokio::test]
 async fn boundary_discard_write_failure_emits_no_source_event() {
     use crate::store::RuntimeStore;

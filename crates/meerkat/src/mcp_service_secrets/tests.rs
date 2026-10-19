@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use meerkat_core::auth::{
     McpServiceSecretPresence, McpServiceSecretRef, McpServiceSecretRefusal, TokenStore,
-    clear_mcp_service_secret, load_mcp_service_secret, save_mcp_service_secret,
+    clear_mcp_service_secret, save_mcp_service_secret,
 };
 use meerkat_core::connection::{RealmConfigSection, RealmId};
 use meerkat_core::mcp_config::McpTransportConfig;
@@ -205,11 +205,13 @@ async fn an_observation_names_the_owner_and_presence_without_the_value() {
 }
 
 /// An explicit credential source with answers of its own for every method.
+#[cfg(feature = "mcp")]
 struct Explicit {
     egress: meerkat_mcp::HttpEgressProfile,
     custody: Option<Result<meerkat_core::auth::McpServiceSecretValues, McpServiceSecretRefusal>>,
 }
 
+#[cfg(feature = "mcp")]
 #[async_trait::async_trait]
 impl meerkat_mcp::McpAuthResolver for Explicit {
     async fn stored_bearer_token(
@@ -249,6 +251,7 @@ impl meerkat_mcp::McpAuthResolver for Explicit {
     }
 }
 
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn the_custody_resolver_forwards_every_credential_method_and_keeps_explicit_custody() {
     let defined = search(&[]);
@@ -315,6 +318,7 @@ async fn the_custody_resolver_forwards_every_credential_method_and_keeps_explici
     );
 }
 
+#[cfg(feature = "mcp")]
 #[tokio::test]
 async fn the_custody_resolver_keeps_the_account_its_inner_source_selected() {
     use meerkat_core::OperationAccount;
@@ -369,6 +373,7 @@ async fn the_custody_resolver_keeps_the_account_its_inner_source_selected() {
 mod owner_updates {
     use std::path::{Path, PathBuf};
 
+    use meerkat_core::auth::load_mcp_service_secret;
     use meerkat_core::storage_layout::ResolvedStorage;
     use meerkat_core::{ConfigRuntime, FileConfigStore, McpRealmPersistTarget};
 
