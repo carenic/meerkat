@@ -84,6 +84,21 @@ them.
 
 ### Fixed
 
+- `meerkat-openai`: on public GPT Live, a delegation result held behind the
+  user's unanswered question no longer leaves the voice model believing the
+  work is still in progress (#1820). Meerkat holds a result while the user's
+  latest utterance is unanswered, so the model answers that first; the
+  model's only fact about the delegation was then its in-progress
+  instruction, so "is it done yet?" got "Not yet" while the finished result
+  waited behind that very question. A held result now sends a notice at
+  once, on the instructions lane and bound to its delegation: the work has
+  finished, its result has not reached the model yet, and the model may say
+  it has just finished but must not state, guess or imply the outcome until
+  the result arrives. The notice carries no result content and promises no
+  timing, the result is still released only by the existing triggers, later
+  "still running" lines stop naming that delegation, and the result's cue
+  no longer tells the model that anything it said earlier was said before
+  the work was done.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved

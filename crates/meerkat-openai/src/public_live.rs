@@ -1767,6 +1767,8 @@ impl PublicLiveBrokerSession {
                 }
             })?;
         }
+        // A held result's finished notice is due now.
+        self.send_due_finished_notices().await;
         Ok(result_token)
     }
 
@@ -1777,17 +1779,65 @@ impl PublicLiveBrokerSession {
         result_of: Option<&GptLiveDelegationRef>,
     ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
         let text = require_context(text)?;
-        let (token, event) = {
+        let (token, send) = {
             let mut state = self.state.lock().await;
             let token = state
                 .reserve_delegation_commentary(result_of.map(|delegation| delegation.0.clone()))?;
             let event = Self::commentary_event(token, text, Nullable(Some(delegation.0.clone())));
-            match state.hold_or_send_commentary(token, event) {
-                Some(event) => (token, event),
-                None => return Ok(token),
-            }
+            (token, state.hold_or_send_commentary(token, event))
         };
-        self.deliver_append(token, event).await
+        match send {
+            Some(event) => self.deliver_append(token, event).await,
+            None => {
+                // Held: a held result's finished notice is due now.
+                self.send_due_finished_notices().await;
+                Ok(token)
+            }
+        }
+    }
+
+    /// Send the finished notices of results held back from the model, each
+    /// bound to its delegation ([`delegation_finished_pending_notice_sections`]).
+    /// Never held: the notice carries no result content. A notice that cannot
+    /// be reserved stays due for the next observation; one that cannot be
+    /// sent is logged, and the held result it announces stays held and owned
+    /// either way.
+    async fn send_due_finished_notices(&self) {
+        loop {
+            let reserved = self.state.lock().await.reserve_due_finished_notice();
+            let (token, delegation_id, fragments) = match reserved {
+                Ok(Some(reserved)) => reserved,
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "public Live finished notice could not be reserved; it stays due"
+                    );
+                    return;
+                }
+            };
+            for (index, content) in fragments.into_iter().enumerate() {
+                let event = ClientEvent {
+                    event_id: Field::Value(instructions_event_id(token, index)),
+                    command: Command::InstructionsAppend {
+                        content,
+                        delegation_id: Nullable(Some(delegation_id.clone())),
+                    },
+                };
+                if let Err(error) = self.deliver_append(token, event).await {
+                    tracing::warn!(
+                        ?error,
+                        delegation_id = %delegation_id,
+                        "public Live finished notice could not be sent; the transport is gone"
+                    );
+                    return;
+                }
+            }
+            tracing::info!(
+                delegation_id = %delegation_id,
+                "public Live delegation finished notice sent"
+            );
+        }
     }
 
     /// Send the in-progress notices of created client delegations, each
@@ -2075,6 +2125,8 @@ impl PublicLiveBrokerSession {
             let applied = state.apply_frame(frame);
             let cues_due = !state.due_result_cues.is_empty() && !state.close_requested;
             let notices_due = !state.due_progress_notices.is_empty() && !state.close_requested;
+            let finished_notices_due =
+                !state.due_finished_notices.is_empty() && !state.close_requested;
             #[cfg(feature = "test-realtime-fixtures")]
             if let Some(capture) = &self.thinking_capture
                 && let Some((client_event_id, matched_owned)) = instructions_ack
@@ -2180,10 +2232,13 @@ impl PublicLiveBrokerSession {
                     ),
                 }
             }
-            if cues_due || notices_due {
+            if cues_due || notices_due || finished_notices_due {
                 drop(state);
                 if notices_due {
                     self.send_due_progress_notices().await?;
+                }
+                if finished_notices_due {
+                    self.send_due_finished_notices().await;
                 }
                 if cues_due {
                     self.send_due_result_cues().await?;
@@ -2349,6 +2404,9 @@ enum InternalAppend {
     /// The notice sent ahead of a result whose work asked members that have
     /// not answered ([`peer_reply_pending_notice`]).
     PeerReplyPendingNotice,
+    /// The notice sent when a delegation's result is held back from the
+    /// model ([`delegation_finished_pending_notice_sections`]).
+    FinishedNotice,
 }
 
 impl InternalAppend {
@@ -2357,6 +2415,7 @@ impl InternalAppend {
             Self::ResultCue => "result cue",
             Self::ProgressNotice => "in-progress notice",
             Self::PeerReplyPendingNotice => "peer reply pending notice",
+            Self::FinishedNotice => "finished notice",
         }
     }
 }
@@ -2502,6 +2561,17 @@ struct SessionState {
     /// Client delegations created whose in-progress notice is not yet sent,
     /// in creation order ([`LIVE_DELEGATION_IN_PROGRESS`]).
     due_progress_notices: VecDeque<String>,
+    /// Delegations whose result is held back from the model and whose
+    /// finished notice is not yet sent, in hold order
+    /// ([`delegation_finished_pending_notice_sections`]).
+    due_finished_notices: VecDeque<String>,
+    /// Delegations that got a finished notice: at most one each, they leave
+    /// the still-running lines, and their result cue takes the after-notice
+    /// head ([`LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD`]). Bounded by
+    /// the delegations this channel accepts
+    /// ([`SessionState::MAX_DELEGATION_IDENTITIES`]); an entry leaves when
+    /// its result's cue is decided.
+    finished_notice_sent: HashSet<String>,
     /// Delegations whose result reported members asked and not yet
     /// answering; their cue takes the awaiting-peer form ([`result_cue_text`]).
     awaiting_peer_results: HashSet<String>,
@@ -2630,6 +2700,8 @@ impl Default for SessionState {
             output_silence_run_ms: OUTPUT_SILENCE_RELEASE_MS,
             result_inserted_through_ms: HashMap::new(),
             due_progress_notices: VecDeque::new(),
+            due_finished_notices: VecDeque::new(),
+            finished_notice_sent: HashSet::new(),
             awaiting_peer_results: HashSet::new(),
             unanswered_user_input: false,
             user_request_open: false,
@@ -2729,15 +2801,64 @@ impl SessionState {
     }
 
     /// The still-running line for a notice or cue about `delegation_id`,
-    /// naming every other outstanding delegation.
+    /// naming every other outstanding delegation whose work has not
+    /// finished: one with a finished notice is no longer running, and
+    /// naming it would contradict that notice.
     fn outstanding_line_except(&self, delegation_id: &str) -> Option<String> {
         let labels: Vec<&str> = self
             .outstanding_delegations
             .iter()
-            .filter(|(outstanding, _)| outstanding != delegation_id)
+            .filter(|(outstanding, _)| {
+                outstanding != delegation_id && !self.finished_notice_sent.contains(outstanding)
+            })
             .map(|(_, label)| label.as_str())
             .collect();
         outstanding_delegations_line(&labels)
+    }
+
+    /// A result of `delegation_id` is held back from the model: its finished
+    /// notice becomes due, once per delegation, and replaces an in-progress
+    /// notice not yet sent.
+    fn queue_finished_notice(&mut self, delegation_id: &str) {
+        if self.finished_notice_sent.contains(delegation_id)
+            || self
+                .due_finished_notices
+                .iter()
+                .any(|due| due == delegation_id)
+        {
+            return;
+        }
+        self.due_progress_notices.retain(|due| due != delegation_id);
+        self.due_finished_notices
+            .push_back(delegation_id.to_owned());
+    }
+
+    /// Reserve the next due finished notice as a broker-owned instructions
+    /// append bound to its delegation.
+    fn reserve_due_finished_notice(
+        &mut self,
+    ) -> Result<Option<(GptLiveAppendToken, String, Vec<String>)>, GptLiveBrokerError> {
+        let Some(delegation_id) = self.due_finished_notices.pop_front() else {
+            return Ok(None);
+        };
+        let label = self
+            .outstanding_delegations
+            .iter()
+            .find(|(outstanding, _)| *outstanding == delegation_id)
+            .map(|(_, label)| label.as_str());
+        let fragments = pack_sections(delegation_finished_pending_notice_sections(label));
+        let token = match self.reserve_instructions_append(fragments.len()) {
+            Ok(token) => token,
+            Err(error) => {
+                self.due_finished_notices.push_front(delegation_id);
+                return Err(error);
+            }
+        };
+        if let Some(pending) = self.pending_appends.back_mut() {
+            pending.internal = Some(InternalAppend::FinishedNotice);
+        }
+        self.finished_notice_sent.insert(delegation_id.clone());
+        Ok(Some((token, delegation_id, fragments)))
     }
 
     /// Record an output delta against every result awaiting its cue that it
@@ -2818,6 +2939,7 @@ impl SessionState {
             if voiced_since_result {
                 self.awaiting_peer_results.remove(&delegation_id);
                 self.result_inserted_through_ms.remove(&delegation_id);
+                self.finished_notice_sent.remove(&delegation_id);
                 tracing::info!(
                     delegation_id = %delegation_id,
                     "public Live result voiced since it landed; no result cue"
@@ -2829,6 +2951,7 @@ impl SessionState {
                 user_request_open: self.user_request_open,
                 outstanding: self.outstanding_line_except(&delegation_id),
                 user_spoke_first,
+                finished_notice_sent: self.finished_notice_sent.contains(&delegation_id),
             };
             // The thinking lane, not the instructions lane: instructions
             // persist as standing session instructions, and a persisted
@@ -2847,6 +2970,7 @@ impl SessionState {
             }
             self.awaiting_peer_results.remove(&delegation_id);
             self.result_inserted_through_ms.remove(&delegation_id);
+            self.finished_notice_sent.remove(&delegation_id);
             return Ok(Some((token, delegation_id, wording)));
         }
     }
@@ -3045,6 +3169,18 @@ impl SessionState {
                 token = token.0,
                 "public Live delegation commentary held: the user's latest utterance is unanswered"
             );
+            // A held result is finished work the model has not been told
+            // about: its finished notice goes out now, the result stays held
+            // (#1820).
+            if let Some(delegation_id) = self.result_cue_candidates.get(&token).cloned() {
+                tracing::info!(
+                    token = token.0,
+                    delegation_id = %delegation_id,
+                    floor_held = self.user_holds_floor(),
+                    "public Live delegation result held behind the user's floor; its finished notice is due"
+                );
+                self.queue_finished_notice(&delegation_id);
+            }
             self.held_commentary.push_back((token, event));
             return None;
         }
@@ -4085,6 +4221,12 @@ fn thinking_event_id(token: GptLiveAppendToken, index: usize) -> String {
 /// " ready." of a reply under way spanned the insertion itself and was taken
 /// as the report).
 const LIVE_RESULT_UNREPORTED_CUE_HEAD: &str = "This delegation's result has just arrived and you have not told the user its outcome yet; anything you said about this request before now was said before it was done.";
+/// [`LIVE_RESULT_UNREPORTED_CUE_HEAD`] for a result whose delegation got a
+/// finished notice first ([`delegation_finished_pending_notice_sections`]): the model
+/// may since have said, truthfully, that the work had just finished, so
+/// earlier speech is anchored to the result's arrival, not to the work being
+/// done.
+const LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD: &str = "This delegation's result has just arrived and you have not told the user its outcome yet; anything you said about this request before now was said before its result arrived.";
 const LIVE_RESULT_UNREPORTED_CUE_ACTION: &str = "the user the actual outcome of this result now, even when it reports an error or that nothing could be done.";
 /// Tail of the outcome cue: an "I asked them" result is not their answer
 /// (S102 r2).
@@ -4135,6 +4277,9 @@ struct ResultCueWording {
     /// say done", S100 r1 on 93b6aaec), which no typed fact can tell, so the
     /// cue defers to it ([`LIVE_RESULT_CUE_USER_SPOKE_FIRST`]).
     user_spoke_first: bool,
+    /// The delegation got a finished notice before its result arrived
+    /// ([`LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD`]).
+    finished_notice_sent: bool,
 }
 
 /// The cue for an acknowledged result the model has not spoken since: the
@@ -4155,6 +4300,12 @@ fn result_cue_sections(wording: &ResultCueWording) -> Vec<String> {
             LIVE_RESULT_AWAITING_PEER_UNREPORTED_CUE_HEAD,
             LIVE_RESULT_AWAITING_PEER_UNREPORTED_CUE_ACTION,
             None,
+        )
+    } else if wording.finished_notice_sent {
+        (
+            LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD,
+            LIVE_RESULT_UNREPORTED_CUE_ACTION,
+            Some(LIVE_RESULT_CUE_TAIL),
         )
     } else {
         (
@@ -4251,6 +4402,18 @@ const OUTSTANDING_MAX_NAMES: usize = 3;
 /// Characters kept of each label in [`outstanding_delegations_line`].
 const OUTSTANDING_LABEL_CHARS: usize = 60;
 
+/// The user's words for a delegated request, quoted and cut to
+/// [`OUTSTANDING_LABEL_CHARS`].
+fn quoted_request_label(label: &str) -> String {
+    let label = label.trim();
+    if label.chars().count() > OUTSTANDING_LABEL_CHARS {
+        let kept: String = label.chars().take(OUTSTANDING_LABEL_CHARS - 3).collect();
+        format!("\"{}...\"", kept.trim_end())
+    } else {
+        format!("\"{label}\"")
+    }
+}
+
 /// The delegations still running, by the user's words for them, and the
 /// rule that goes with them: none of them is done until its result arrives
 /// (S101 on 37b1cebb9: the model said "the second one is also done" 10-14 s
@@ -4263,15 +4426,7 @@ fn outstanding_delegations_line(labels: &[&str]) -> Option<String> {
     let mut names: Vec<String> = labels
         .iter()
         .take(OUTSTANDING_MAX_NAMES)
-        .map(|label| {
-            let label = label.trim();
-            if label.chars().count() > OUTSTANDING_LABEL_CHARS {
-                let kept: String = label.chars().take(OUTSTANDING_LABEL_CHARS - 3).collect();
-                format!("\"{}...\"", kept.trim_end())
-            } else {
-                format!("\"{label}\"")
-            }
-        })
+        .map(|label| quoted_request_label(label))
         .collect();
     let unnamed = labels.len().saturating_sub(names.len());
     if unnamed > 0 {
@@ -4342,6 +4497,37 @@ fn peer_reply_pending_notice(peers: &[String]) -> String {
 /// it carries the peer case too, with the correction once the answer
 /// arrives.
 const LIVE_DELEGATION_IN_PROGRESS: &str = "This delegated request is now in progress. Until its result arrives, do not say or imply that it is done and do not state its outcome; you may say that you are working on it. If its result says someone else was asked, their answer is not part of that result: do not state, guess, or imply what they said until their answer arrives as its own update, then tell the user what they actually said, correcting anything said before.";
+
+/// The notice sent on the instructions lane, bound to a delegation, the
+/// moment its result is held back from the model (#1820): behind the user's
+/// unanswered utterance, or behind earlier held commentary. It replaces
+/// [`LIVE_DELEGATION_IN_PROGRESS`] for that delegation, whose "until its
+/// result arrives, do not say that it is done" had the model answer "Not
+/// yet" to the very question that held the finished result back. It carries
+/// no result content, so unlike the result it cannot divert the model from
+/// the user's request, and it promises no timing: the held result is still
+/// released only by the existing triggers. `label` is the user's words for
+/// the request, quoted as in [`outstanding_delegations_line`].
+///
+/// Returned as its sentences in order, the quoted request in the first:
+/// packed into fragments split only between them ([`pack_sections`]), so a
+/// long multi-byte label never pushes a fragment past
+/// [`CONTEXT_FRAGMENT_MAX_BYTES`] or splits a word.
+fn delegation_finished_pending_notice_sections(label: Option<&str>) -> Vec<String> {
+    let request = label.map_or_else(|| "this delegated request".to_owned(), quoted_request_label);
+    vec![
+        format!(
+            "This replaces the earlier in-progress instruction for {request}: that work has finished running, and its result has not reached you yet."
+        ),
+        "If the user asks, say it has just finished and that you will tell them how it went as soon as the result arrives. Do not state, guess or imply its outcome before then. If its result says someone else was asked, their answer is not part of it.".to_owned(),
+    ]
+}
+
+/// The whole finished notice ([`delegation_finished_pending_notice_sections`]).
+#[cfg(test)]
+fn delegation_finished_pending_notice(label: Option<&str>) -> String {
+    delegation_finished_pending_notice_sections(label).join(" ")
+}
 
 fn instructions_event_id(token: GptLiveAppendToken, index: usize) -> String {
     format!("meerkat-instructions-{}-{index}", token.0)
@@ -8371,6 +8557,236 @@ mod tests {
         assert_eq!(released_tokens(&mut state), [narration, result]);
     }
 
+    /// #1820: the user asked "is it done yet?" just as the result was
+    /// ready, the result was held behind that question, and the model,
+    /// whose only fact was the in-progress instruction, said "Not yet". A
+    /// held result now makes its finished notice due at once, bound to its
+    /// delegation, broker-owned and free of result content, while the
+    /// result itself stays held until an existing trigger releases it.
+    #[test]
+    fn a_held_result_makes_its_finished_notice_due_while_it_stays_held() {
+        let mut state = state_with_spoken_delegation();
+        state
+            .apply_frame(frame(input_delta_at("is it done yet", 2500.0)))
+            .unwrap();
+        let (result, event) = result_append(&mut state, "dlg_cue");
+        assert!(
+            state.hold_or_send_commentary(result, event).is_none(),
+            "held behind the unanswered utterance"
+        );
+        assert_eq!(state.due_finished_notices, ["dlg_cue"]);
+        let (notice, delegation, fragments) = state
+            .reserve_due_finished_notice()
+            .unwrap()
+            .expect("the finished notice is due");
+        assert_eq!(delegation, "dlg_cue");
+        assert_eq!(
+            fragments.join(" "),
+            delegation_finished_pending_notice(Some("book a table"))
+        );
+        assert!(
+            !fragments.concat().contains("executor result"),
+            "the notice carries no result content"
+        );
+        assert!(
+            state
+                .pending_appends
+                .iter()
+                .any(|pending| pending.token == notice
+                    && pending.internal == Some(InternalAppend::FinishedNotice)),
+            "broker-owned: its receipt is consumed by the broker"
+        );
+        assert!(
+            released_tokens(&mut state).is_empty(),
+            "the notice releases nothing: the result stays held"
+        );
+        state
+            .apply_frame(frame(delegation_created("dlg_next", "client")))
+            .unwrap();
+        assert_eq!(
+            released_tokens(&mut state),
+            [result],
+            "the existing trigger releases the result"
+        );
+        assert!(state.due_finished_notices.is_empty());
+    }
+
+    /// Only finished work gets the notice: a held narration makes none due,
+    /// and a delegation gets one notice however its result is held.
+    #[test]
+    fn a_finished_notice_is_due_once_per_held_result_and_never_for_a_narration() {
+        let mut state = state_with_spoken_delegation();
+        state
+            .apply_frame(frame(input_delta_at(
+                "and then the second slow job",
+                2500.0,
+            )))
+            .unwrap();
+        let narration = state.reserve_delegation_commentary(None).unwrap();
+        let event = PublicLiveBrokerSession::commentary_event(
+            narration,
+            "Started voice request".to_owned(),
+            Nullable(Some("dlg_cue".to_owned())),
+        );
+        assert!(state.hold_or_send_commentary(narration, event).is_none());
+        assert!(
+            state.due_finished_notices.is_empty(),
+            "a narration is not finished work"
+        );
+        let (result, event) = result_append(&mut state, "dlg_cue");
+        assert!(state.hold_or_send_commentary(result, event).is_none());
+        assert_eq!(state.due_finished_notices, ["dlg_cue"]);
+        state
+            .reserve_due_finished_notice()
+            .unwrap()
+            .expect("the finished notice is due");
+        state.queue_finished_notice("dlg_cue");
+        assert!(
+            state.due_finished_notices.is_empty(),
+            "one notice per delegation"
+        );
+    }
+
+    /// A result sent at once reaches the model with nothing between: the
+    /// in-progress instruction's own condition ("until its result arrives")
+    /// is met, and no notice goes out.
+    #[test]
+    fn a_result_sent_at_once_makes_no_finished_notice_due() {
+        let mut state = state_with_spoken_delegation();
+        let (result, event) = result_append(&mut state, "dlg_cue");
+        assert!(state.hold_or_send_commentary(result, event).is_some());
+        assert!(state.due_finished_notices.is_empty());
+        assert!(state.reserve_due_finished_notice().unwrap().is_none());
+    }
+
+    /// A finished notice due before the delegation's in-progress notice
+    /// went out replaces it: the in-progress notice would otherwise land
+    /// after the notice that supersedes it.
+    #[test]
+    fn a_finished_notice_replaces_an_in_progress_notice_still_due() {
+        let mut state = SessionState::default();
+        state
+            .apply_frame(frame(input_delta("move it to friday")))
+            .unwrap();
+        state
+            .apply_frame(frame(delegation_created("dlg_friday", "client")))
+            .unwrap();
+        assert_eq!(state.due_progress_notices, ["dlg_friday"]);
+        state.queue_finished_notice("dlg_friday");
+        assert!(state.due_progress_notices.is_empty());
+        assert_eq!(state.due_finished_notices, ["dlg_friday"]);
+    }
+
+    /// The notice supersedes the in-progress instruction, keeps its outcome
+    /// guard, promises no timing the broker cannot know (the floor can also
+    /// end on silence or a delegation), and quotes the request like the
+    /// still-running line.
+    #[test]
+    fn the_finished_notice_supersedes_the_in_progress_instruction_and_promises_no_timing() {
+        let notice = delegation_finished_pending_notice(Some("book a table"));
+        assert!(notice.starts_with(
+            "This replaces the earlier in-progress instruction for \"book a table\": that work has finished running, and its result has not reached you yet."
+        ));
+        assert!(notice.contains("Do not state, guess or imply its outcome before then."));
+        assert!(notice.contains("their answer is not part of it"));
+        assert!(!notice.contains("right after your answer"));
+        assert!(notice.len() <= CONTEXT_FRAGMENT_MAX_BYTES);
+        assert!(delegation_finished_pending_notice(None).starts_with(
+            "This replaces the earlier in-progress instruction for this delegated request:"
+        ));
+        let long = "x".repeat(200);
+        let sections = delegation_finished_pending_notice_sections(Some(&long));
+        assert!(sections[0].contains(&format!(
+            "\"{}...\"",
+            "x".repeat(OUTSTANDING_LABEL_CHARS - 3)
+        )));
+        // A label of four-byte characters still packs within the bound,
+        // split only between sentences.
+        let wide = "\u{1F600}".repeat(OUTSTANDING_LABEL_CHARS);
+        let fragments = pack_sections(delegation_finished_pending_notice_sections(Some(&wide)));
+        assert_eq!(fragments.len(), 2);
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment.len() <= CONTEXT_FRAGMENT_MAX_BYTES)
+        );
+    }
+
+    /// A delegation whose finished notice went out is no longer running:
+    /// later notices and cues stop naming it, as they stop naming one whose
+    /// result arrived.
+    #[test]
+    fn a_finished_delegation_leaves_the_still_running_lines() {
+        let mut state = state_with_three_running_delegations();
+        state.queue_finished_notice("dlg_job1");
+        state
+            .reserve_due_finished_notice()
+            .unwrap()
+            .expect("job1's finished notice");
+        acknowledge_result(&mut state, "dlg_quick", 9000.0);
+        drain(&mut state);
+        let (_, delegation, wording) = state
+            .reserve_due_result_cue()
+            .unwrap()
+            .expect("the quick job's cue");
+        assert_eq!(delegation, "dlg_quick");
+        assert_eq!(
+            wording.outstanding.as_deref(),
+            Some(
+                "Still running: \"create marker two dot txt\". Do not say it is done until its result arrives."
+            ),
+            "job1 finished; only job2 still runs"
+        );
+    }
+
+    /// The cue of a result that got a finished notice first anchors earlier
+    /// speech to the result's arrival: "it has just finished", said after
+    /// the notice, was true, not a claim made before the work was done.
+    #[test]
+    fn a_result_after_its_finished_notice_takes_the_after_notice_cue_head() {
+        let mut state = state_with_spoken_delegation();
+        state
+            .apply_frame(frame(input_delta_at("is it done yet", 2500.0)))
+            .unwrap();
+        let (result, event) = result_append(&mut state, "dlg_cue");
+        assert!(state.hold_or_send_commentary(result, event).is_none());
+        state
+            .reserve_due_finished_notice()
+            .unwrap()
+            .expect("the finished notice is due");
+        state
+            .apply_frame(frame(delegation_created("dlg_next", "client")))
+            .unwrap();
+        assert_eq!(released_tokens(&mut state), [result]);
+        state
+            .apply_frame(frame(ack_at(&pending_event_id(result), 4000.0)))
+            .unwrap();
+        drain(&mut state);
+        let (_, delegation, wording) = state
+            .reserve_due_result_cue()
+            .unwrap()
+            .expect("the result's cue");
+        assert_eq!(delegation, "dlg_cue");
+        assert!(wording.finished_notice_sent);
+        assert!(
+            result_cue_text(&wording).starts_with(LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD)
+        );
+        assert!(
+            !state.finished_notice_sent.contains("dlg_cue"),
+            "the entry leaves once the cue is decided"
+        );
+        // Without a notice the head is unchanged.
+        let mut plain = state_with_spoken_delegation();
+        acknowledge_result(&mut plain, "dlg_cue", 2400.0);
+        drain(&mut plain);
+        let (_, _, wording) = plain
+            .reserve_due_result_cue()
+            .unwrap()
+            .expect("the result's cue");
+        assert!(!wording.finished_notice_sent);
+        assert!(result_cue_text(&wording).starts_with(LIVE_RESULT_UNREPORTED_CUE_HEAD));
+    }
+
     /// S103 run 1 (soak 35728bf0): the model said "I'll use Friday" 5 ms
     /// before the Friday result arrived, then took the old cue's "if you
     /// already have, do not repeat it" as satisfied and never voiced the
@@ -8384,6 +8800,7 @@ mod tests {
             user_request_open: true,
             outstanding: None,
             user_spoke_first: false,
+            finished_notice_sent: false,
         });
         assert!(
             cue.contains(
@@ -8501,6 +8918,7 @@ mod tests {
             user_request_open: true,
             outstanding: None,
             user_spoke_first: false,
+            finished_notice_sent: false,
         };
         assert!(result_cue_text(&wording(false)).starts_with(LIVE_RESULT_UNREPORTED_CUE_HEAD));
         let awaiting = result_cue_text(&wording(true));
@@ -8561,6 +8979,7 @@ mod tests {
                     user_request_open,
                     outstanding: None,
                     user_spoke_first: false,
+                    finished_notice_sent: false,
                 };
                 let cue = result_cue_text(&wording);
                 let open = if user_request_open {
@@ -9785,6 +10204,134 @@ mod tests {
         assert!(acked_at.is_some_and(|acked| recorded_at < acked));
     }
 
+    /// #1820 on the wire: a result held behind the user's question sends its
+    /// finished notice at once, an instructions append bound to the
+    /// delegation that carries no result text, and the result itself goes
+    /// out only when the hold releases it.
+    #[tokio::test]
+    async fn a_held_result_sends_its_finished_notice_before_it_is_released() {
+        let capture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let held = Arc::new(tokio::sync::Notify::new());
+        let server_held = Arc::clone(&held);
+        let attach = move |State(capture): State<SharedCapture>, upgrade: WebSocketUpgrade| {
+            let held = Arc::clone(&server_held);
+            async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    send_json(&mut socket, json!({"type":"session.started","event_id":"s","session":{"id":"live_fixture","model":"gpt-live-1","status":"active","expires_at":1.0}})).await;
+                    send_json(&mut socket, input_delta("book a table")).await;
+                    send_json(&mut socket, delegation_created("dlg_cue", "client")).await;
+                    send_json(&mut socket, output_delta_span("one moment", 1500.0, 2000.0)).await;
+                    send_json(&mut socket, input_delta_at("is it done yet", 2500.0)).await;
+                    held.notified().await;
+                    send_json(&mut socket, delegation_created("dlg_next", "client")).await;
+                    loop {
+                        let event = recv_json(&mut socket, &capture).await;
+                        match event["type"].as_str() {
+                            Some("session.commentary.append") => {
+                                send_json(&mut socket, ack(event["event_id"].as_str())).await;
+                            }
+                            Some("session.thinking.append" | "session.instructions.append") => {
+                                let mut receipt = ack(event["event_id"].as_str());
+                                receipt["type"] =
+                                    json!(if event["type"] == "session.thinking.append" {
+                                        "session.thinking.appended"
+                                    } else {
+                                        "session.instructions.appended"
+                                    });
+                                send_json(&mut socket, receipt).await;
+                            }
+                            Some("session.close") => {
+                                send_json(&mut socket, session_closed()).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+            }
+        };
+        let app = Router::new()
+            .route("/v1/live/sessions", post(create_session))
+            .route("/v1/live/sessions/{session_id}/attach", get(attach))
+            .with_state(Arc::clone(&capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_, session) = PublicLiveBrokerFactory::__try_from_target_with_base_url(
+            realtime_target("gpt-live-1", OpenAiBackendKind::OpenAiApi),
+            &format!("http://{address}/v1/"),
+        )
+        .unwrap()
+        .open(PublicLiveOpenConfig::new("v=0", "marin").unwrap())
+        .await
+        .unwrap()
+        .into_parts();
+        loop {
+            if let Some(GptLiveBrokerObservation::UserTranscriptFragment { text, .. }) =
+                session.next_observation().await.unwrap()
+                && text.contains("done yet")
+            {
+                break;
+            }
+        }
+        let delegation = GptLiveDelegationRef("dlg_cue".to_string());
+        let token = session
+            .append_delegation_result(&delegation, "Table booked for two.")
+            .await
+            .expect("result appended and held");
+        held.notify_one();
+        loop {
+            if let Some(GptLiveBrokerObservation::DelegationContextAppendAcknowledged {
+                token: acked,
+            }) = session.next_observation().await.unwrap()
+                && acked == token
+            {
+                break;
+            }
+        }
+        session.close().await.expect("close requested");
+        while session.next_observation().await.unwrap().is_some() {}
+        server.abort();
+
+        let events = capture.lock().expect("capture lock").client_events.clone();
+        let notices: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event["type"] == "session.instructions.append"
+                    && event["content"].as_str().is_some_and(|content| {
+                        content.starts_with(
+                            "This replaces the earlier in-progress instruction for \"book a table\": that work has finished running, and its result has not reached you yet.",
+                        )
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let [notice_at] = notices.as_slice() else {
+            panic!("exactly one finished notice: {events:?}");
+        };
+        assert_eq!(events[*notice_at]["delegation_id"], "dlg_cue");
+        assert!(
+            !events[*notice_at]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Table booked")),
+            "the notice carries no result content"
+        );
+        let result_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.commentary.append"
+                    && event["content"] == "Table booked for two."
+            })
+            .expect("the released result");
+        assert!(
+            *notice_at < result_at,
+            "the notice goes out while the result is held"
+        );
+    }
+
     /// result that says "I asked", and the result's cue is the awaiting cue.
     #[tokio::test]
     async fn a_result_awaiting_a_peer_answer_is_preceded_by_the_pending_notice() {
@@ -9825,6 +10372,7 @@ mod tests {
                         user_request_open: false,
                         outstanding: None,
                         user_spoke_first: false,
+                        finished_notice_sent: false,
                     })
                 );
                 let mut cue_ack = ack(cue["event_id"].as_str());
