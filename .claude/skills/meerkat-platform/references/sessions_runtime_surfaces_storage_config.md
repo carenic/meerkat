@@ -156,7 +156,9 @@ Since 0.9.4 every input row a binary writes is version 7, including a row it
 read at an older version. 0.9.3 and older refuse a version 7 row before
 installing state (the stored bytes stay in place), so once a 0.9.4 binary has
 written any input row there is no downgrade to 0.9.3. Upgrade every process
-that shares a runtime store together.
+that shares a runtime store together. Likewise a HeadCanonical session that
+records a failed realtime response writes realtime sidecar event schema 4,
+which 0.9.3 and earlier refuse ("unsupported realtime event schema 4").
 
 A database whose ledger is newer than the binary is refused as
 `SchemaFromTheFuture` before any write. SQLite files must be regular files with
