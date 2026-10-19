@@ -1,9 +1,11 @@
 /**
  * `close()` leaves nothing behind that keeps the Node process alive.
  *
- * `close()` ends the child's stdin, signals it, and waits for it to close,
- * up to 5 s before it escalates to SIGKILL. A timer left running after the
- * child closed first kept every caller's process alive for those 5 s.
+ * `close()` ends the child's stdin, signals it, and waits for it to exit, up
+ * to 5 s before it escalates to SIGKILL. A timer left running after the child
+ * exited first kept every caller's process alive for those 5 s. Waiting for
+ * the child's pipes to close instead of its exit let a descendant that holds
+ * them keep `close()` waiting for the whole 5 s, or for ever after the kill.
  */
 
 import assert from "node:assert/strict";
@@ -17,8 +19,12 @@ import { CONTRACT_VERSION } from "../dist/generated/types.js";
 
 const CLIENT_URL = new URL("../dist/client.js", import.meta.url).href;
 
-/** A fake rkat-rpc that answers the handshake; `stubborn` ignores SIGTERM and stdin EOF. */
-function writeFixture(root, { stubborn }) {
+/**
+ * A fake rkat-rpc that answers the handshake. `stubborn` ignores SIGTERM and
+ * stdin EOF; `holder` leaves a descendant that inherited its stdout and
+ * stderr; `exitAfterHandshake` exits once the handshake is answered.
+ */
+function writeFixture(root, { stubborn = false, holder = false, exitAfterHandshake = false }) {
   const bin = path.join(root, "rkat-rpc.cjs");
   writeFileSync(bin, `#!/usr/bin/env node
 const rl = require("node:readline").createInterface({ input: process.stdin });
@@ -28,8 +34,10 @@ rl.on("line", (line) => {
     ? { contract_version: ${JSON.stringify(CONTRACT_VERSION)}, methods: [] }
     : { capabilities: [] };
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");
+  ${exitAfterHandshake ? 'if (msg.method !== "initialize") process.exit(0);' : ""}
 });
 ${stubborn ? 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);' : ""}
+${holder ? 'require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "inherit", "inherit"] }).unref();' : ""}
 `);
   chmodSync(bin, 0o755);
   return bin;
@@ -40,16 +48,19 @@ const CLOSER_DEADLINE_MS = 15_000;
 
 /**
  * Run a separate Node process that connects to `bin`, closes the client and
- * then has nothing left to do. Reports how long close() took, how long the
- * process lived after close() returned, and what it wrote to stderr.
+ * then has nothing left to do; with `afterExit`, it closes only once the
+ * child has exited. Reports how long close() took, how long the process lived
+ * after close() returned, what it wrote to stderr, and its process group.
  */
-function runCloser(root, bin) {
+function runCloser(root, bin, { afterExit = false } = {}) {
   const closer = path.join(root, "closer.mjs");
   writeFileSync(closer, `
 import { MeerkatClient } from ${JSON.stringify(CLIENT_URL)};
 const client = new MeerkatClient(${JSON.stringify(bin)});
 await client.connect();
-const pid = client.process.pid;
+const child = client.process;
+const pid = child.pid;
+${afterExit ? 'if (child.exitCode === null && child.signalCode === null) await new Promise((resolve) => child.once("exit", resolve));' : ""}
 const started = performance.now();
 await client.close();
 process.stdout.write(JSON.stringify({ pid, closeMs: performance.now() - started }) + "\\n");
@@ -99,9 +110,18 @@ process.stdout.write(JSON.stringify({ pid, closeMs: performance.now() - started 
         reject(new Error(`closer failed (code ${code}, signal ${signal}): ${stderr}`));
         return;
       }
-      resolve({ ...JSON.parse(stdout.trim()), lingerMs: exitedAt - closedAt, stderr });
+      resolve({ ...JSON.parse(stdout.trim()), lingerMs: exitedAt - closedAt, stderr, group: child.pid });
     });
   });
+}
+
+/** Kill what is left of a closer's process group, such as a fixture's descendant. */
+function killGroup(group) {
+  try {
+    process.kill(-group, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
 }
 
 function alive(pid) {
@@ -145,6 +165,66 @@ describe("MeerkatClient.close()", () => {
       );
       assert.equal(run.stderr, "");
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns once a killed child has exited, even when a descendant holds its pipes", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    let group;
+    try {
+      const run = await runCloser(root, writeFixture(root, { stubborn: true, holder: true }));
+      group = run.group;
+      assert.ok(
+        run.closeMs >= 4_500 && run.closeMs < 9_000,
+        `close() took ${Math.round(run.closeMs)} ms, not the 5 s cap`,
+      );
+      assert.equal(alive(run.pid), false, "close() must kill the stubborn child");
+      assert.ok(
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
+      );
+      assert.equal(run.stderr, "");
+    } finally {
+      if (group !== undefined) killGroup(group);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns as soon as the child exits, even when a descendant holds its pipes", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    let group;
+    try {
+      const run = await runCloser(root, writeFixture(root, { holder: true }));
+      group = run.group;
+      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      assert.equal(alive(run.pid), false, "the child must have exited");
+      assert.ok(
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
+      );
+      assert.equal(run.stderr, "");
+    } finally {
+      if (group !== undefined) killGroup(group);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns at once for a child that has already exited while a descendant holds its pipes", { timeout: 20_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "meerkat-ts-close-"));
+    let group;
+    try {
+      const fixture = writeFixture(root, { holder: true, exitAfterHandshake: true });
+      const run = await runCloser(root, fixture, { afterExit: true });
+      group = run.group;
+      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      assert.ok(
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
+      );
+      assert.equal(run.stderr, "");
+    } finally {
+      if (group !== undefined) killGroup(group);
       rmSync(root, { recursive: true, force: true });
     }
   });

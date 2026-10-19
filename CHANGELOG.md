@@ -332,11 +332,14 @@ them.
   rkat package and runs in the repository only.
 - `@rkat/sdk`: a Node process that calls `MeerkatClient.close()` now exits
   as soon as it has nothing else to do, instead of about 5 seconds later.
-  `close()` waits up to 5 seconds for the `rkat-rpc` child to close before
+  `close()` waits up to 5 seconds for the `rkat-rpc` child to exit before
   it kills the child with SIGKILL, and the timer for that wait kept running
-  when the child closed first. It is now cancelled; a child that does not
-  close within 5 seconds is still killed as before. Pre-existing since
-  0.6.0.
+  when the child exited first. It is now cancelled; a child that does not
+  exit within 5 seconds is still killed as before. `close()` also settles on
+  the child's exit instead of on its output pipes closing: a process the
+  child started that still held those pipes made `close()` wait the full
+  5 seconds after the child had exited, or wait forever after the SIGKILL.
+  Pre-existing since 0.6.0.
 
 ## [0.9.3] - 2026-10-18
 

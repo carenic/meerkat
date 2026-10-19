@@ -1264,17 +1264,26 @@ export class MeerkatClient {
     this.closeQueues();
     if (process) {
       process.stdin?.end();
-      const closed = once(process, "close").catch(() => []);
+      // Settle on the child's exit, not its "close": a descendant that
+      // inherited the child's stdio can hold those pipes open long after the
+      // child is gone. A child that has already exited settles at once.
+      const exited =
+        process.exitCode != null || process.signalCode != null
+          ? Promise.resolve()
+          : once(process, "exit").then(
+              () => undefined,
+              () => undefined,
+            );
       process.kill();
-      // Cancel the 5 s cap once the child has closed: a pending timer keeps
+      // Cancel the 5 s cap once the child has exited: a pending timer keeps
       // the caller's Node process alive until it fires.
       const cap = new AbortController();
       const timeout = delay(5000, "timeout" as const, { signal: cap.signal });
-      const outcome = await Promise.race([closed, timeout]);
+      const outcome = await Promise.race([exited, timeout]);
       cap.abort();
       if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
         process.kill("SIGKILL");
-        await closed.catch(() => {});
+        await exited;
       }
       process.stdin?.destroy();
       process.stdout?.destroy();
