@@ -371,6 +371,15 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- `rkat` builds without its default features
+  (`cargo check -p rkat --no-default-features`). Five helpers named types
+  and methods that exist only with `session-store` and failed to compile
+  without it: the ungoverned `bind_stock_prompt`, the governed-realm MCP
+  server lookup (`persistence_is_governed`, `GovernedMcpServers`,
+  `governed_configured_mcp_servers`) and the runtime-backed service builder
+  that waits for MCP servers. They are now gated on `session-store`, and a
+  build without it no longer warns about the session code it leaves out.
+  Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

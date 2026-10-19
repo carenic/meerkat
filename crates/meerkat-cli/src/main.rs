@@ -6,6 +6,13 @@
     clippy::needless_borrows_for_generic_args,
     clippy::redundant_closure_for_method_calls
 )]
+// Without `session-store` rkat has no session runtime: the run, resume,
+// session and mob commands compile out, and the helpers only they reach are
+// dead in that build.
+#![cfg_attr(
+    not(feature = "session-store"),
+    allow(dead_code, unused_imports, unused_variables)
+)]
 
 mod cli_parse;
 mod exit_status;
@@ -11081,7 +11088,7 @@ async fn bind_stock_prompt(
     Ok((input, Some(pending), route_hint))
 }
 
-#[cfg(not(feature = "local-authorization"))]
+#[cfg(all(feature = "session-store", not(feature = "local-authorization")))]
 async fn bind_stock_prompt(
     _persistence: &PersistenceBundle,
     _service: &meerkat::PersistentSessionService<FactoryAgentBuilder>,
@@ -11913,6 +11920,7 @@ fn cli_mcp_stdio_profile(_factory: &AgentFactory) -> CliMcpStdioProfile {}
 /// governed host installed, with or without available stock owners. Without
 /// owners the host's configured-attachment authority refuses every server,
 /// so the governed route never falls back to the ordinary preload.
+#[cfg(feature = "session-store")]
 fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
     persistence
         .runtime_adapter()
@@ -11922,6 +11930,7 @@ fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
 /// The configured MCP servers of a governed realm's session build: the
 /// declarative servers the factory connects through the governed host, and
 /// the servers refused before setup, which the session reports to the model.
+#[cfg(feature = "session-store")]
 #[derive(Debug, Default)]
 struct GovernedMcpServers {
     servers: Vec<meerkat_core::McpServerConfig>,
@@ -11936,6 +11945,7 @@ struct GovernedMcpServers {
 /// confined process could write) goes into the build with its typed
 /// refusal, so the model sees it as that server's failed setup. `None`
 /// keeps the ordinary CLI loader.
+#[cfg(feature = "session-store")]
 async fn governed_configured_mcp_servers(
     persistence: &PersistenceBundle,
     scope: &RuntimeScope,
@@ -13795,6 +13805,7 @@ fn build_cli_runtime_backed_service_with_defaults(
 /// is refused as ownerless; with it, that realm's own config documents serve
 /// them ([`meerkat::surface::install_default_mcp_auth_resolver_for_realm`]).
 /// `None` only for compositions over stores without realm documents.
+#[cfg(feature = "session-store")]
 #[allow(clippy::too_many_arguments)]
 fn build_cli_runtime_backed_service_waiting_for_mcp(
     factory: AgentFactory,
