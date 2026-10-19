@@ -438,7 +438,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
         "//crates/meerkat-mcp-server:rkat_mcp_bin",
     ],
     env = {

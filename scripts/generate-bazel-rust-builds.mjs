@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
+import { namesRepoScripts } from "./rust-source-text.mjs";
 import { testSourcePaths as sharedTestSourcePaths } from "./rust-test-selector.mjs";
 
 const checkOnly = process.argv.includes("--check");
@@ -1121,7 +1122,8 @@ function workspaceDataLabels(target, source = targetScanSource(target)) {
   if (source.includes(".github/")) {
     labels.add("//:github_workflows");
   }
-  if (source.includes("scripts/")) {
+  // A comment that mentions a script is not a read of it.
+  if (namesRepoScripts(source)) {
     labels.add("//:repo_governance_files");
   }
   if (source.includes('"clippy.toml"')) {
