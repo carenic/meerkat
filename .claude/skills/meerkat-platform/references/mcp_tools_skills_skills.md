@@ -1,7 +1,7 @@
-Covers: Skills in Meerkat 0.9. The SKILL.md format and skill names, skill
-identity (`source_uuid` + `skill_name`), skill sources (embedded built-ins and their
-source UUID, `[[skills.repositories]]` git/http/filesystem/stdio, project
-`.rkat/skills`), the `[skills]` config, `rkat skill add|remove|get|list|inspect`,
+Covers: Skills in Meerkat 0.9. The SKILL.md format, frontmatter parsing rules
+(0.9.4) and extension values, skill identity (`source_uuid` + `skill_name`), skill
+sources (embedded built-ins, `[[skills.repositories]]` git/http/filesystem/stdio,
+project `.rkat/skills`), the `[skills]` config, `rkat skill add|remove|get|list|inspect`,
 `rkat run --skill`, `preload_skills` and `skill_refs` (RPC, REST, SDKs), mob and
 mobpack skills, introspection (`skills/list`, `GET /skills`) and skill errors.
 
@@ -35,7 +35,24 @@ Steps the agent should follow ...
 ```
 
 - Frontmatter: `name` (must equal the directory name) and `description` are
-  required; `requires_capabilities`, `metadata` and `version` are optional.
+  required; `requires_capabilities`, `metadata` (a map of text) and `version`
+  are optional. Any other key must be a namespaced extension key
+  (`vendor.key`); a mapping or sequence value needs a `vendor.version` key
+  beside it.
+- Since 0.9.4 the frontmatter is parsed as one YAML 1.2 document by a
+  pure-Rust parser (no Meerkat build includes `unsafe-libyaml` any more).
+  `yes`, `on` and `off` stay strings, `<<` is an ordinary key, and a second
+  document is refused. Also refused, where 0.9.3 accepted them: a key given
+  twice at any level (0.9.3 kept the last), a null (`~` or an empty value) as
+  `description` or a `metadata` value, an unrecognized tag such as `!custom`,
+  nesting deeper than 64 levels, 100 or more aliases that outnumber their
+  anchors more than ten to one, and a `...` document end marker line. A block
+  scalar (`|`, `|+`, `>`) that ends the frontmatter keeps its final line break.
+- Extension values (`SkillDocument.extensions`) are text: a string as
+  written, any other value as YAML rendered from its resolved value, not the
+  source text (`1.10` is `1.1`, `1_000` is `1000`, `tRUE` is `true`, `6.02e23`
+  is `6.02e+23`). Quote a value with leading zeros, such as a file mode
+  (`'0755'`): unquoted, `0755` becomes `755.0`.
 - Names are lowercase slugs: `a-z`, `0-9` and `-`, not starting or ending with
   `-`, no `--`.
 - Identity is a `SkillKey {source_uuid, skill_name}`: the same name in two
