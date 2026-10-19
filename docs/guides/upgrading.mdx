@@ -79,7 +79,10 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
     [Tool configuration events](#tool-configuration-events));
   - a session that recorded a failed realtime response (realtime sidecar
     event schema 4; 0.9.3 refuses it with "unsupported realtime event schema
-    4"; see [Realtime responses that fail](#realtime-responses-that-fail)).
+    4"; see [Realtime responses that fail](#realtime-responses-that-fail));
+  - a temporary council record that holds a participant refused by the fork
+    instruction policy (see
+    [Forks and activated host instructions](#forks-and-activated-host-instructions)).
 - **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
   fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
   downloads its own matching `rkat-rpc` only when you supply none, so this
@@ -90,6 +93,13 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
 - **Upgrade every process that shares a runtime store together:** stop them
   all, back up the state root, then start 0.9.4 on all of them (steps 1, 2
   and 5 of [How to upgrade](#how-to-upgrade)).
+- **Peers and member hosts on other versions:** a 0.9.3 peer that checks
+  signatures (the default) drops a `reply_to_peer` reply from 0.9.4, and the
+  sender's `reply_to_peer` reports an ambiguous delivery outcome; other
+  message kinds are unchanged (see
+  [Peer steers and replies](#peer-steers-and-replies)). For mobs placed on
+  member hosts, upgrade the member hosts before their controller (see
+  [Forks and activated host instructions](#forks-and-activated-host-instructions)).
 
 ### Breaking changes and what to do
 
@@ -160,6 +170,28 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   and `settle_within(deadline)` waits for it, also after the actor exited
   (`MemberUnregisterState`: `Settled`, `Pending`, `Failed`, or `HandedOver`
   when a later owner took the registration over).
+- **A host's refusal of a restored member's registration** (at
+  `select_destination`, `select_agent_mandate`, `prepare_member_surface` or
+  `verify_member_surface`) now removes that registration through the
+  canonical unregister, terminating the inputs the session still held, and
+  leaves the member Broken with the new `MobError::MemberRegistrationRefused`
+  (RPC data kind `mob_member_registration_refused`) until an explicit repair;
+  `MobMemberSnapshot::registration_refusal` and the wire
+  `MobMemberStatusResult::registration_refusal` show it (set the field in
+  struct literals). A refused member can be retired, respawned or destroyed.
+- **A runtime that did not install the destination its host selected** now
+  answers `MobError::MemberDestinationNotInstalled` (RPC data kind
+  `mob_member_destination_not_installed`, not retryable), where it answered
+  `MobError::WiringError`; its failure class is `RuntimeRejected`, so
+  schedule delivery records `runtime_rejected` instead of `mob_rejected`. A
+  host's re-selection for a kept registration must advance
+  `context_generation`.
+- **`force_cancel_member` and `cancel_all_work` on a member whose runtime
+  needs a durability reload** answer `MobError::MemberReloadRequired` at once
+  (`MEMBER_RELOAD_REQUIRED`: JSON-RPC -32029, HTTP 409,
+  `rkat mob force-cancel` exit 49) instead of `MobError::Internal`. **Do:**
+  reload the member with `MobHandle::reload_member_registration`, then cancel
+  again.
 
 #### Tool configuration events
 
@@ -231,6 +263,64 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   `RealtimeTranscriptStopReasonKind` gains `Failed`; all are exhaustive, so
   add the arms. `LiveProjectionSink` gains the required method
   `signal_turn_failed(session_id, response_id, failure, accounting)`.
+
+#### Forks and activated host instructions
+
+- **Forks whose copied prefix carries activated host instructions:** under
+  the default fork instruction policy, `require_explicit_activation`, the
+  forks that start the child's first turn themselves are refused before
+  anything is committed: `fork_off`, `MobHandle::fork_member_then_run_bounded`
+  and `fork_member_then_run_detached`, `fork_member_at_turn_boundary` (and so
+  the live delegation's durable fork), council participants, and the RPC
+  forks `session/fork_at` and `session/fork_replace`. The error is
+  `FORK_INSTRUCTION_REFUSED` (JSON-RPC -32037, HTTP 422, CLI exit 57). 0.9.3
+  committed such a child, and its first turn failed. `fork_member` keeps the
+  host's activation window, and forks of sources without activation rows are
+  unchanged.
+- **Do:** a host that wants such forks to carry the activations sets
+  `reactivate_inherited` with `MobBuilder::with_fork_instruction_policy` or
+  `MobMcpState::with_fork_instruction_policy`; an RPC client passes
+  `inherited_instructions` to the fork call, whose result reports
+  `reactivated_instruction_count`.
+- **Mixed versions:** a 0.9.3 member host does not know the policy. Upgrade
+  member hosts before their controller: until then a 0.9.3 member host forks
+  participants without the policy, and a participant whose source has
+  activated host instructions fails its first turn.
+- **Do (Rust):** `SessionError` gains `ForkInstructionRefused` and `MobError`
+  gains `ForkInstructionRefused { source_member_id, refusal }` (exhaustive
+  matches need the arms). `SessionForkAtRequest`, `SessionForkReplaceRequest`,
+  `DurableSessionForkTarget`, `PlannedForkRequest` and
+  `BridgeCreateForkedParticipantPayload` gain `inherited_instructions`, and
+  `SessionForkResult` gains `reactivated_instruction_count` (set them in
+  struct literals). `TemporaryCouncilExitReason` gains
+  `ParticipantForkInstructionRefused` and `TemporaryCouncilAcquisition` gains
+  `Refused`. A turn refused because a fork child never activated its
+  inherited instruction keys fails with `AgentError::InstructionActivation`
+  instead of `AgentError::ConfigError`.
+
+#### Peer steers and replies
+
+- **In-turn steers are durable:** every content steer admitted while a turn
+  runs (a prompt, a peer message, request or lifecycle notice, an external
+  event, a local flow step) is now written into the running turn's
+  transcript at a model boundary, one per boundary in arrival order, or taken
+  by exactly one follow-up turn. 0.9.3 showed peer and text-only prompt
+  steers to one model request and never stored them. History now holds their
+  rows, `boundary_append_applied` reports them, and each incoming comms
+  notice publishes one `peer_content_ingested`.
+- **Replies name what they answer:** the model's peer message notice gains a
+  `Delivery ID: <id>` line and, for a reply, an `In reply to: <id>` line.
+  `reply_to_peer` can answer a message that joined the running turn.
+- **Mixed versions:** a 0.9.3 receiver that checks signatures refuses a
+  `reply_to_peer` reply from 0.9.4 (it does not know `in_reply_to`), and the
+  sender sees an ambiguous delivery outcome. `send_message` and every other
+  message kind still reach a 0.9.3 peer. Upgrade peers together.
+- **Do (Rust):** `SystemNoticeBlock::Comms` and
+  `AgentEvent::PeerContentIngested` gain `delivery_id`; `CommsCommand::PeerMessage`,
+  `InteractionContent::Message` and `SystemNoticeBlock::Comms` gain
+  `in_reply_to`, as do `meerkat-comms`'s `MessageKind::Message` and
+  `meerkat-runtime`'s `PeerInput`. Struct literals and exhaustive patterns
+  name them.
 
 #### Changing the model of a running session
 
@@ -326,6 +416,20 @@ The compaction types around it change too:
 - `RuntimeDeliveryOwnerRetirement::join` returns a `#[must_use]`
   `RuntimeDeliveryOwnerRetired` report instead of `()`: match `Ok(_)` or read
   the report.
+- **A boundary commit the store does not answer:** a persistent session's
+  boundary commit or run terminalization that reports no durable outcome
+  within its store's declared deadline (120 s for the SQLite store) now marks
+  the session reload-required, and its completion waiters fail with the new
+  `CompletionWaitError::DurableOutcomeUnknown`; a rejected boundary commit
+  fails them with `CompletionWaitError::BoundaryRolledBack` instead of
+  `AuthorityUnavailable`. `CompletionWaitError` is now `#[non_exhaustive]`.
+  **Do:** the input stays durably admitted, so read it after the reload
+  instead of resubmitting it; a reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers.
+- `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance with
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`
+  instead of `Internal`.
 - GPT Live adapters: `LiveDelegationNarrationKind` gains `FinishedPending`
   and `GptLiveBrokerObservation` gains `InstructionsContextAppendWithdrawn`
   (both appended last), and `LiveSidebandProviderCommand` gains
@@ -339,8 +443,10 @@ new fields and variants: `SessionPersistenceVersionAuthorityMachineState`
 gains `stored_input_state_migration_v6`; `MobMachineState` and the kernel
 `State` gain `identity_generation_highwater` and
 `identity_generation_highwater_sealed`; the mob machine signals and kernel
-transition ids gain the identity generation high-water variants, appended
-last.
+transition ids gain the identity generation high-water variants and
+`ResolveMemberRevivalHostRefused` / `RecoverMemberRestoreHostRefused`, and the
+mob machine inputs, effects and transition ids gain `RetireAtScope` and
+`RetireAtScopeResolved`, all appended last.
 
 ### Other behaviour changes
 
@@ -400,7 +506,8 @@ last.
   `close()` returns once the child has exited.
 - **Published crates:** `cargo test` in an unpacked published Meerkat crate
   passes (`meerkat`, `meerkat-runtime` and `meerkat-mob` with the features
-  their README prints), and `rkat` builds without its default features.
+  and the 8 MiB test stack, `RUST_MIN_STACK=8388608`, that their README
+  prints), and `rkat` builds without its default features.
 
 ### Upgrade checklist
 
@@ -425,6 +532,11 @@ last.
     rows stored before 0.9.4).
 11. Realtime clients: handle the `turn_failed` observation, and add the new
     arms and `signal_turn_failed` in Rust.
+12. Forks: handle `FORK_INSTRUCTION_REFUSED`, and set `reactivate_inherited`
+    or pass `inherited_instructions` where a fork must carry activated host
+    instructions; upgrade member hosts before their controller.
+13. Comms: upgrade peers together (a 0.9.3 peer drops `reply_to_peer`
+    replies), and expect in-turn steers in history.
 
 ## Upgrading to 0.8.51
 

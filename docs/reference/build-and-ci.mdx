@@ -546,8 +546,12 @@ workspace. Per crate, without sibling feature unification, it runs plain
 prints the command), checks that `cargo test --no-run` compiles with the
 default features, and compares each test target's test names with the
 workspace's, minus the files and tests `ci/standalone-workspace-only.toml`
-declares workspace-only. The `fmt-governance` job of pull-request CI runs the
-static half (`make published-crates-standalone-selftest` and
+declares workspace-only. `meerkat`, `meerkat-runtime` and `meerkat-mob` also
+declare the 8 MiB test thread stack the workspace runs their tests with, and
+their README command sets `RUST_MIN_STACK=8388608`; the other crates' suites
+have not been measured at Rust's 2 MiB default and may need the same setting.
+The `fmt-governance` job of pull-request CI runs the static half
+(`make published-crates-standalone-selftest` and
 `make check-published-crates-standalone-guard`). Publication does not wait for
 the census yet.
 
