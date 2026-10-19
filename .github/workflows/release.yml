@@ -1466,7 +1466,10 @@ jobs:
     name: Verify Windows binaries on a Windows runner
     needs: [build_binaries_windows_cross]
     if: always() && needs.build_binaries_windows_cross.result == 'success'
-    runs-on: windows-latest
+    # A pinned runner image: windows-latest moves to a new image on GitHub's
+    # schedule. The windows-2025-vs2026 label is offered to public
+    # repositories only.
+    runs-on: windows-2025-vs2026
     timeout-minutes: 20
     steps:
       - name: Download Windows artifacts
@@ -1497,7 +1500,7 @@ jobs:
           }
           & (Join-Path extracted 'rkat.exe') --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "rkat --help exited $LASTEXITCODE" }
-          Write-Host "all four Windows binaries run on windows-latest"
+          Write-Host "all four Windows binaries run on windows-2025-vs2026"
 
   # Intel macOS is a trailing platform: its archives may reach the release
   # after the critical Linux and macOS arm64 ones (publish_github_release
@@ -2403,7 +2406,7 @@ jobs:
           # verified on a Windows runner, Intel macOS is cross-compiled on
           # Apple silicon.
           echo "Windows cross-compile (Linux, cargo-xwin): ${windows_cross_result}"
-          echo "Windows binary verification (windows-latest): ${windows_verify_result}"
+          echo "Windows binary verification (windows-2025-vs2026): ${windows_verify_result}"
           [[ "${windows_cross_result}" == "success" && "${windows_verify_result}" == "success" ]] || exit 1
           echo "Intel macOS cross-compile (Apple silicon): ${macos_x86_result}"
           [[ "${macos_x86_result}" == "success" ]] || exit 1

@@ -52,9 +52,12 @@ jobs:
           if-no-files-found: error
 
   verify_windows_binaries:
-    name: Verify Windows binaries on windows-latest
+    name: Verify Windows binaries on windows-2025-vs2026
     needs: build_windows_cross
-    runs-on: windows-latest
+    # A pinned runner image: windows-latest moves to a new image on GitHub's
+    # schedule. The windows-2025-vs2026 label is offered to public
+    # repositories only.
+    runs-on: windows-2025-vs2026
     timeout-minutes: 20
     steps:
       - name: Download artifacts
@@ -85,4 +88,4 @@ jobs:
           }
           & (Join-Path extracted 'rkat.exe') --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "rkat --help exited $LASTEXITCODE" }
-          Write-Host "all four Windows binaries run on windows-latest"
+          Write-Host "all four Windows binaries run on windows-2025-vs2026"
