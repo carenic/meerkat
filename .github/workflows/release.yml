@@ -798,6 +798,40 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: scripts/release-npm-publish-preflight
 
+  # The published crates' tests must pass from their packages alone:
+  # a run of published-crates-standalone.yml on main at exactly the release
+  # commit, dispatched once that commit is main's head, must have passed
+  # before any crate publishes. A run still going is waited for; without one
+  # the publication stops before the first crate, naming the dispatch.
+  release_standalone_gate:
+    name: Require standalone crate tests
+    needs: [require_ci_green]
+    if: >-
+      always() &&
+      needs.require_ci_green.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_packages == 'true' &&
+        github.event.inputs.publish_web_sdk_only != 'true'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 250
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # The check runs from the workflow commit, like the other release
+      # helpers; it reads the run evidence of the release commit itself.
+      - name: Checkout workflow helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Require a green standalone census at the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.require_ci_green.outputs.sha }}
+        run: scripts/release-require-standalone-green "${RELEASE_SHA}"
+
   # Public-API breaks are allowed in 0.x patch releases and must be DECLARED.
   # This is its own job rather than a step in release_validate_cargo because
   # that job is not the tag's validation whenever the tag's exact-tree CI
@@ -2893,6 +2927,7 @@ jobs:
       needs.require_ci_green.result == 'success' &&
       needs.release_validate_gate.result == 'success' &&
       needs.registry_credentials_preflight.result == 'success' &&
+      needs.release_standalone_gate.result == 'success' &&
       (needs.release_semver_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true' &&
@@ -2901,7 +2936,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        github.event.inputs.publish_release_packages == 'true' &&
        github.event.inputs.publish_web_sdk_only != 'true'))
-    needs: [require_ci_green, release_validate_gate, release_semver_gate, registry_credentials_preflight]
+    needs: [require_ci_green, release_validate_gate, release_semver_gate, registry_credentials_preflight, release_standalone_gate]
     runs-on: ubuntu-24.04
     # The SDK packages can wait up to 150 minutes for the release's binary
     # manifest (Stamp the SDK binary digests) after the crates publish; the

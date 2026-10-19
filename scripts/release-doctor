@@ -343,6 +343,27 @@ else
   bad "Rust registry publication has an invalid critical-path dependency: ${registry_needs:-missing needs}"
 fi
 
+# No crate publishes before its tests passed from the published
+# package at the release commit (published-crates-standalone.yml).
+standalone_job="$(workflow_job release_standalone_gate)"
+if grep -Fq 'scripts/release-require-standalone-green' <<<"${standalone_job}" &&
+  grep -Fq 'release_standalone_gate' <<<"${registry_needs}" &&
+  grep -Fq "needs.release_standalone_gate.result == 'success'" <<<"${registry_job}"; then
+  pass "Rust registry publication waits for the published crates' standalone tests at the release commit"
+else
+  bad "Rust registry publication must need release_standalone_gate, which runs scripts/release-require-standalone-green on the release commit"
+fi
+if [[ -n "${MEERKAT_RELEASE_COMMIT:-}" ]]; then
+  if GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)}" \
+    MEERKAT_STANDALONE_WAIT_SECONDS=0 scripts/release-require-standalone-green "${MEERKAT_RELEASE_COMMIT}" >/dev/null 2>&1; then
+    pass "published-crates-standalone.yml passed at the release commit ${MEERKAT_RELEASE_COMMIT}"
+  else
+    note "no passing published-crates-standalone.yml run at ${MEERKAT_RELEASE_COMMIT} yet; dispatch it on main once that commit is main's head (gh workflow run published-crates-standalone.yml --ref main)"
+  fi
+else
+  note "MEERKAT_RELEASE_COMMIT not set; skipping the published-crates-standalone.yml run check"
+fi
+
 if slo_contract="$(workflow_contract registry-slo)"; then
   pass "Rust registry publication reads crates back before the SDKs and enforces the 30 minute publication SLO"
 else

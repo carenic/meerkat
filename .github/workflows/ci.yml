@@ -580,6 +580,9 @@ jobs:
       - name: Release prebuild lookup selects only usable exact-commit prebuilds
         run: scripts/test-release-find-prebuild.sh
 
+      - name: Release crate publication requires the standalone census at the release commit
+        run: scripts/test-release-require-standalone-green.sh
+
       - name: Release asset provenance accepts an earlier run only through its build gate
         run: scripts/test-verify-release-asset-provenance.sh
 

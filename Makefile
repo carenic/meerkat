@@ -863,6 +863,7 @@ release-doctor:
 	@scripts/test-release-npm-publish-preflight.sh
 	@scripts/test-release-doctor-workflow-contract.sh
 	@scripts/test-release-find-prebuild.sh
+	@scripts/test-release-require-standalone-green.sh
 	@scripts/test-verify-release-asset-provenance.sh
 	@$(PYTHON) scripts/test_release_stamp_sdk_binary_digests.py
 	@scripts/test-check-macos-x86-release-binary.sh
