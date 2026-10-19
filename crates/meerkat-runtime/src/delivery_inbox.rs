@@ -613,6 +613,10 @@ pub struct RuntimeDeliveryInbox {
     /// Whether a [`RuntimeDeliveryOwnership`] is outstanding, shared by all
     /// clones.
     owner_claimed: Arc<AtomicBool>,
+    /// Test support: how many of the next submits through any clone fail,
+    /// shared by all clones.
+    #[cfg(any(test, feature = "test-support"))]
+    failing_submits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The generated authority's verdict for one delivery id.
@@ -810,7 +814,18 @@ impl RuntimeDeliveryInbox {
             commits: Arc::new(commits),
             committed_runtimes: Arc::new(Mutex::new(HashSet::new())),
             owner_claimed: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            failing_submits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Test support: the next `count` submits through this inbox or any
+    /// clone fail with a store write error before they touch the store, as
+    /// failed delivery writes do. Zero stops failing them.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn fail_next_submits_for_test(&self, count: usize) {
+        self.failing_submits.store(count, Ordering::Release);
     }
 
     /// Claim exclusive delivery ownership of this inbox.
@@ -914,6 +929,19 @@ impl RuntimeDeliveryInbox {
         submission: RuntimeDeliverySubmission,
         acknowledge: bool,
     ) -> Result<RuntimeDeliveryReceipt, RuntimeDeliveryError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .failing_submits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(RuntimeStoreError::WriteFailed(
+                "injected delivery write failure (test support)".to_string(),
+            )
+            .into());
+        }
         for _ in 0..MAX_CAS_ATTEMPTS {
             let observed = self
                 .store

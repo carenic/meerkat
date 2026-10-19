@@ -37,6 +37,11 @@ them.
 
 ### Breaking
 
+- `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
+  `retained_registrations: usize`: notification registrations of the
+  drained observer's change watches that were still running when the drain
+  stopped them (see Fixed). Code that builds the report with a struct
+  literal sets it.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` or
   `RefUnwindSafe`: it now carries the member's exact
   `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
@@ -53,6 +58,32 @@ them.
 
 ### Added
 
+- `LocalGrantAuthority::resolve_lineage_observed`,
+  `resolve_controller_lineage_observed` and
+  `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
+  its own observation of the grant publication, and return
+  `LineageResolutionRefusal`: `Changed` when an owner change published
+  during the resolution, which that caller classifies as a stale read, or
+  `Refused` with the refusal the standalone resolution reports.
+- `meerkat-runtime`: `MeerkatMachine::durable_admitted_original`, the durable
+  sibling of `with_admitted_original`. It reads the historical admission of a
+  keyed governed original from the session's durable runtime store alone, so a
+  source owner can resolve it after the session retired, with no registration,
+  attachment or actor. It derives the runtime-qualified key from the expected
+  original, reads the store-owned key index, and returns the actual input id,
+  the retained association and the durable phase, terminal outcome, last run
+  and attempt count (`DurableAdmittedOriginal`) only for the exact admission:
+  one own contributor with that association and the exact replay of the
+  expected original. `DurableAdmittedOriginalRefusal` (`Conflict`,
+  `NotAdmitted`, `UnknownRuntime`, `Unavailable`; non-exhaustive) keeps a
+  mismatch, absence under the key, an unknown session and unreadable evidence
+  apart. The read consults no live state, revives nothing, and submits,
+  replays or releases nothing. `SessionServiceRuntimeExt::durable_admitted_original`
+  forwards it; its default answers `Unavailable`.
+- `meerkat-sqlite`: `preflight_domain_version` runs the schema eligibility
+  check that `preflight_schema_eligibility` runs and returns the ledger
+  version it verified (`None` for a fresh domain), read in the same snapshot
+  as the check.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
   member's exact runtime registration, so every
   `MemberRuntimeRegistrationHook` call names the registration it is made
@@ -61,6 +92,105 @@ them.
   registration instead of to an identity it derives from the member's
   session id or labels; a later registration of the same session is a
   different registration.
+
+### Changed
+
+- `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
+  no longer refuses when the runtime store's file notifications cannot be
+  registered (at an inotify watch limit, for example). The store watch's
+  sweep, every 5 seconds by default, is the cross-process wake;
+  notifications only shorten it. It still refuses when the sweep cannot
+  start. A runtime delivery owner on such a store keeps its store watch on
+  the sweep alone instead of reporting cross-process wake unavailable.
+
+### Fixed
+
+- A command sent to a mob while its actor is exiting after a shutdown now
+  settles instead of going unanswered (`meerkat-mob`). The actor dropped its
+  command channel without waiting for a send that had already reserved
+  capacity, so a command written just after that drop stayed queued, with
+  its reply sender, for as long as any handle to the mob lived: an unbounded
+  caller waited forever, and `MobMcpState::close_admission` or `stand_down`
+  called right after shutting a managed mob down waited out its deadline and
+  reported "admission close not answered before the deadline". The exiting
+  actor now closes the channel and receives until it is empty, after it has
+  dropped itself, so such a command is dropped and its caller sees the reply
+  channel close. A caller that observes `ActorCommandChannelClosed` still
+  does so only after the actor has quiesced and dropped. Pre-existing in
+  0.9.2 and 0.9.3.
+- A grant resolution read inside an enclosing observation of the grant
+  publication that meets an owner change published during the resolution
+  is now that observation's stale read, as for any other concurrent owner
+  change, instead of an unavailable grant authority. A grant-backed
+  operation preparation refuses it as
+  `OperationRefusalKind::ReprepareRequired` and rebuilds once, for the
+  work's own grant and for the contributor ceilings of work that names
+  other originals (a helper's source); controller admission refuses it as
+  `ReprepareRequired`, which the runtime driver reports as
+  `RuntimeDriverError::ControllerReadinessUnavailable` with reason
+  `ControllerReadinessFailure::PolicyChanged`. A review read, which reads
+  its material once by design, is not rebuilt: when the stock governed
+  realm's review mandate or
+  a contributor ceiling meets such a change, the review now refuses as
+  stale (`ToolError::AuthorizationRefused` with `ReprepareRequired`)
+  instead of reporting an unavailable review context, and a fresh attempt
+  reads it again. The per-agent grant check of a configured MCP attachment
+  (`AgentInstallationGrant`) reports such a change while it reads the
+  agent's lineage as `McpAttachmentRefusal::NotCurrent`, as it already did
+  for one published after the read, instead of `Unavailable`. A poisoned
+  publication still answers `Unavailable` and is never retried. Failed
+  durable grant custody and a clock failure still answer `Unavailable`,
+  except that one the resolution meets while an owner change publishes is
+  discarded with that stale read; a preparation's one rebuild then answers
+  `Unavailable` if the failure persists. A standalone
+  `LocalGrantAuthority::resolve_lineage` still reports a concurrent change
+  as `GrantRefusal::Unavailable`.
+- Stores no longer refuse to open with "schema domain ... has no ledger row
+  but already owns objects" when another process creates the same schema
+  domain at that moment (the 0.9.3 known issue "First concurrent durable
+  delivery"). The open-time check now reads the schema ledger and the
+  catalog in one snapshot, so a domain created concurrently is seen whole or
+  not at all. Two processes racing their first durable delivery write
+  (`runtime-delivery`) hit this most often. A durable delivery read also
+  decides from the version its own check verified whether that domain
+  exists and which of its tables to read, so a domain stamped after the read
+  opened, possibly by a newer binary, is checked before it is read.
+- A job delivery whose projection into the runtime inbox failed is retried
+  on the delivery owner's next wake of any kind. While it keeps failing,
+  each further retry waits for twice as many wakes (up to 64), so a busy
+  runtime does not retry it on every wake; it is never retried by itself
+  or in a loop. Before, only a job commit or a delivery generation change
+  retried it, so it could stay pending until the process restarted. This
+  was the retry half of the 0.9.3 known issue "First concurrent durable
+  delivery".
+- `meerkat-sqlite`: starting a SQLite change watch no longer waits for the
+  operating system to register file notifications. On macOS, FSEvents
+  registration held the first mob storage open for over 30 seconds, with
+  the process-wide mob observer registry locked, so every other mob storage
+  open waited too. The bounded sweep worker now starts first, and the
+  registration runs on a thread of its own: `SqliteChangeWatch::registration`
+  reports where it stands (`SqliteWatchRegistration`). Stopping a watch
+  cancels a registration still running without waiting for it: its thread
+  discards its result when the platform call returns, and is never
+  detached. It stays with the watch and, once the watch is dropped, with
+  the process (`meerkat_sqlite::watch::retained_registrations`). A mob
+  observer drain counts such registrations
+  (`SqliteMobObserverDrainReport::retained_registrations`). This covers
+  `MobStorage::persistent`, `SqliteMobStores::open`, arming a runtime
+  delivery owner and the multi-process hosting check. At most 64
+  registrations run at once in a process, so a long FSEvents stall cannot
+  use up its threads: a watch started while 64 are pending runs on its
+  sweep alone for the rest of its life and logs one warning.
+- `meerkat-sqlite`: a change watch whose notification registration fails
+  (at an inotify instance or watch limit, for example) keeps its sweep.
+  Before, the watch did not start at all, and a mob event observer then ran
+  with no cross-process catch-up.
+- `meerkat-sqlite`: registering a change watch's notifications no longer
+  aborts the process when notify's inotify event-loop thread could not
+  start (the process at its thread limit). notify 8.2.0 ignores that failed
+  spawn, then panics in `watch()` and again in its `Drop` while the first
+  panic unwinds. The registration now contains the panic, leaks that
+  watcher instead of dropping it, and leaves the watch on its sweep.
 
 ## [0.9.3] - 2026-10-18
 
