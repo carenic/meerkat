@@ -1,9 +1,9 @@
 Covers: Meerkat mob changes since 0.8.40 (through 0.9.4): stop, shutdown
 (ShutdownInProgress), destroy, admission close reasons, cancelling member work,
-member lifetime, reset and re-spawn, helpers, fork_off, council, profile keys,
-flows and runs (run-flow waits, --detach), multi-host mobs, mobpacks and
-deploy budgets, error codes. Live: live_comms_mobs_live.md. Comms:
-live_comms_mobs_comms.md.
+member lifetime, reset and re-spawn, member binding history, helpers,
+fork_off, council, profile keys, flows and runs (run-flow waits, --detach),
+multi-host mobs, mobpacks and deploy budgets, error codes. Live:
+live_comms_mobs_live.md. Comms: live_comms_mobs_comms.md.
 
 # Mob Changes Since 0.8.40 (0.9)
 
@@ -119,6 +119,12 @@ hand out an owner lease on a stopped actor.
   failed that resume with an internal error), and the re-spawned member always
   gets a generation above every earlier one, so it never reuses its pre-reset
   runtime id or member address.
+- Since 0.9.4 a Rust host can read which member incarnation held which
+  session: `MobHandle::member_binding_history()` (also on `read_handle()`;
+  needs `ControlScope::List`) answers per session across mob resets, and per
+  identity (live or retired) since the latest reset, without the actor queue.
+  `MobStorage::read_member_binding_history(path)` reads a stopped mob's store
+  read-only. Details in `references/mobs.md`.
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
