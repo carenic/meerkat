@@ -42,9 +42,10 @@ them.
   exhaustive, so a `match` over it needs the new arm.
 - `meerkat-core`: `RealtimeTranscriptEvent` gains the variant
   `AssistantTurnFailed { response_id }` (#1883). The enum is exhaustive.
-- `meerkat-core` and `meerkat-machine-kernels`: the generated
-  `RealtimeTranscriptStopReasonKind` gains the variant `Failed`, appended
-  after `Other` (#1883). Both generated copies are exhaustive.
+- `meerkat-machine-schema`, `meerkat-core` and `meerkat-machine-kernels`:
+  `RealtimeTranscriptStopReasonKind` (the session document's DSL enum and
+  its two generated copies) gains the variant `Failed`, appended after
+  `Other` (#1883). All three are exhaustive.
 - `meerkat-live`: `LiveProjectionSink` gains the required method
   `signal_turn_failed(session_id, response_id, failure, accounting)` (#1883).
   It has no default body: every sink decides what a failed response
