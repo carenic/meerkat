@@ -4891,9 +4891,6 @@ mod tests {
 
     // ─── Phase 7 (T-A5): `mob_call_error` classifier rendering ──────────
 
-    /// T-A5: the four multi-host codes render their JSON-RPC codes with
-    /// typed BARE detail data; everything else stays byte-identical to the
-    /// phase-5 `invalid_params` rendering.
     /// A create that opts into a tool bundle not offered to it is an argument
     /// error on the wire, and its message lists what the host offers.
     #[test]
@@ -4913,6 +4910,9 @@ mod tests {
         );
     }
 
+    /// T-A5: the four multi-host codes render their JSON-RPC codes with
+    /// typed BARE detail data; everything else stays byte-identical to the
+    /// phase-5 `invalid_params` rendering.
     #[test]
     fn mob_call_error_renders_classified_codes_with_typed_data() {
         use meerkat_mob::{AgentRuntimeId, FenceToken};

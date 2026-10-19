@@ -226,8 +226,8 @@ the member's tool catalog (the tool list sent to the model) on every build, a
 resume included. A call to a denied name is still refused with an ordinary
 `access_denied` tool error, and a spawn cannot widen the list. An unknown name,
 such as a typo, fails the member's build with `DeclaredToolUnknown`, unless the
-profile declares an MCP server that maps no `tool_names`; then the name is
-checked only at call time.
+profile declares an MCP server that maps no `tool_names` or opts into a bundle
+the build withholds; then the name is checked only at call time.
 
 ### Opting into host tool bundles
 
@@ -238,8 +238,9 @@ mounts each `bundles` entry the mob's builder registered and withholds the
 rest. `MobHandle::withheld_tool_bundles()` reports what is withheld. The
 registrations are the ceiling and are read again at every build, a resume
 included, so a host that stops offering a bundle withdraws it from every
-member that opted into it. While an opted bundle is withheld, a deny name it
-may own is checked only at call time.
+member that opted into it. While any opted bundle is withheld, every deny name
+in no vocabulary is checked only at call time, so a typo is reported at build
+only once the bundle is mounted again.
 
 Through the public profile input (the agent `mob_create` tool, `mob/create`),
 only an inline profile of a child mob, a mob a member creates with
@@ -247,10 +248,10 @@ only an inline profile of a child mob, a mob a member creates with
 `ChildToolBundleAvailability::ChildOffered`. Any other name is refused with
 `ToolBundleNotOffered`, which lists the bundles the host offers; an empty or
 repeated name is an argument error. Realm profile writes and spawn-time
-profiles cannot opt in. The offer is the host's, the same for every child mob,
-whatever tools the creating member itself mounts. A bundle the host registered
-as `ChildAvailable` still reaches every inline child profile without an
-opt-in.
+profiles given as public profile input (the agent mob tools) cannot opt in. The
+offer is the host's, the same for every child mob, whatever tools the creating
+member itself mounts. A bundle the host registered as `ChildAvailable` still
+reaches every inline child profile without an opt-in.
 
 ```json
 {

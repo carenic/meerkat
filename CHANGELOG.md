@@ -69,16 +69,18 @@ them.
   offer is its ceiling at every build, a resume included: an opted bundle
   the host no longer offers is withheld, never failing the member build, and
   `MobHandle::withheld_tool_bundles` (`WithheldToolBundle`) reports it.
-  While a bundle is withheld, a deny name it may own is checked only at call
-  time (`ToolVocabularySource::WithheldBundle`). A host may still set
-  `bundles` where it names `rust_bundles` itself, on a realm profile it
-  stores or on a definition it composes with `MobBuilder`, as the lenient
-  twin of the strict `rust_bundles`. Like a `rust_bundles` entry, an opted
-  bundle makes a profile non-portable, so a placed member is refused, and
-  adaptive policy evidence counts it. Registering an MCP server as
-  `ChildOffered` is refused with
-  `ChildMcpServerRegistrationError::OfferNotSupported`: MCP descriptors have
-  no opt-in. A binary older than this release ignores the persisted
+  While any opted bundle is withheld, every deny name in no vocabulary is
+  checked only at call time (`ToolVocabularySource::WithheldBundle`), so a
+  typo is reported at build only once the bundle is mounted again. The
+  adaptive `LayerDecision` schema stays the released one and does not list
+  `tools.bundles`. A host may still set `bundles` where it names
+  `rust_bundles` itself, on a realm profile it stores or on a definition it
+  composes with `MobBuilder`, as the lenient twin of the strict
+  `rust_bundles`. Like a `rust_bundles` entry, an opted bundle makes a
+  profile non-portable, so a placed member is refused, and adaptive policy
+  evidence counts it. Registering an MCP server as `ChildOffered` is refused
+  with `ChildMcpServerRegistrationError::OfferNotSupported`: MCP descriptors
+  have no opt-in. A binary older than this release ignores the persisted
   `bundles` key, so after a downgrade those members run without the bundle
   and without the marker.
 

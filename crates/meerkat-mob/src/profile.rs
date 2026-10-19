@@ -110,15 +110,20 @@ pub struct ToolConfig {
     /// withholds the rest, so an opted bundle never fails a member build;
     /// [`crate::MobHandle::withheld_tool_bundles`] reports what is withheld.
     /// The registrations are the ceiling, and they are read again at every
-    /// build, a resume included. The names persist with the definition. While
-    /// a bundle is withheld, a deny name it may own is checked only at call
-    /// time.
+    /// build, a resume included. The names persist with the definition. The
+    /// deny list may name the tools of each mounted opted bundle; while any
+    /// opted bundle is withheld, every deny name in no vocabulary is checked
+    /// only at call time, so a typo shows at build only once the bundle is
+    /// mounted again.
     ///
     /// The public profile input (`tools.bundles`) accepts this list only on
     /// an inline profile of a child mob, and only for bundles the host offers
     /// to child mobs; that offer is the host's, the same for every child mob,
-    /// whatever the creating member itself mounts. A host (TOML, realm
-    /// profiles, [`crate::MobBuilder`]) may set it on any profile.
+    /// whatever the creating member itself mounts. A host sets it where it
+    /// names `rust_bundles` itself: on a realm profile it stores, or on a
+    /// definition it builds with [`crate::MobBuilder`]. A `MobMcpState`
+    /// create that is not a child mob's refuses it, a TOML definition
+    /// included when it goes through one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundles: Vec<String>,
 }
