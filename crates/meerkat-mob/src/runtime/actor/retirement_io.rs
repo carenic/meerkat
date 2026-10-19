@@ -5776,4 +5776,134 @@ mod tests {
             }
         }
     }
+
+    /// A host-refused member's runtime is released only when the runtime holds
+    /// nothing for its session. Over one persistent runtime store: a current
+    /// registration is not released; a bound durable row a runtime left behind
+    /// without unregistering the session (a crash in the middle of the
+    /// refusal's unregister) is archive residue, so a later runtime that holds
+    /// no registration and no attachment for the session is still not
+    /// released; after the canonical unregister a later runtime holds nothing.
+    /// The executor attachment needs a registration, so no row reaches that
+    /// conjunct alone.
+    #[cfg(feature = "runtime-adapter")]
+    #[tokio::test]
+    async fn a_refused_members_runtime_is_released_only_without_registration_or_residue() {
+        use meerkat_core::lifecycle::core_executor::{
+            CoreApplyOutput, CoreExecutor, CoreExecutorError,
+        };
+        use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+        /// Fails every run at once.
+        struct FailingExecutor;
+
+        #[async_trait::async_trait]
+        impl CoreExecutor for FailingExecutor {
+            async fn apply(
+                &mut self,
+                _run_id: meerkat_core::RunId,
+                _primitive: RunPrimitive,
+            ) -> Result<CoreApplyOutput, CoreExecutorError> {
+                Err(CoreExecutorError::Internal(
+                    "the run fails at once".to_string(),
+                ))
+            }
+
+            async fn cancel_after_boundary(
+                &mut self,
+                _reason: String,
+            ) -> Result<(), CoreExecutorError> {
+                Ok(())
+            }
+
+            async fn stop_runtime_executor(
+                &mut self,
+                _reason: String,
+            ) -> Result<(), CoreExecutorError> {
+                Ok(())
+            }
+        }
+
+        let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let runtime = || {
+            Arc::new(
+                meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+                    .expect("a runtime over the store"),
+            )
+        };
+        let session = SessionId::new();
+        let first = runtime();
+        // A binding reaches the durable row only with a lifecycle commit, and
+        // the end of a run makes one.
+        first
+            .prepare_bindings(session.clone())
+            .await
+            .expect("the runtime registers and binds the session");
+        first
+            .register_session_with_executor(session.clone(), Box::new(FailingExecutor))
+            .await
+            .expect("the runtime attaches the executor");
+        let (_, completion) = first
+            .accept_input_with_completion(
+                &session,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new("one run", None)),
+            )
+            .await
+            .expect("the runtime accepts the input");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            completion.expect("the input has a completion").wait(),
+        )
+        .await
+        .expect("the run ends")
+        .expect("the run's completion is observed");
+
+        assert!(
+            !refused_member_runtime_released(&first, &session)
+                .await
+                .expect("the predicate reads the runtime"),
+            "a current registration is not a released runtime"
+        );
+
+        let after_crash = runtime();
+        assert!(
+            after_crash
+                .current_session_registration_witness(&session)
+                .await
+                .is_none(),
+            "a later runtime holds no registration of the session"
+        );
+        assert!(
+            after_crash
+                .current_executor_attachment_witness(&session)
+                .await
+                .is_none(),
+            "a later runtime holds no executor attachment for the session"
+        );
+        assert!(
+            after_crash
+                .archive_runtime_residue_present(&session)
+                .await
+                .expect("the residue read"),
+            "the bound row the first runtime left without unregistering is residue"
+        );
+        assert!(
+            !refused_member_runtime_released(&after_crash, &session)
+                .await
+                .expect("the predicate reads the runtime"),
+            "archive residue is not a released runtime"
+        );
+
+        first
+            .unregister_session(&session)
+            .await
+            .expect("the canonical unregister");
+        assert!(
+            refused_member_runtime_released(&runtime(), &session)
+                .await
+                .expect("the predicate reads the runtime"),
+            "after the canonical unregister a later runtime holds nothing for the session"
+        );
+    }
 }

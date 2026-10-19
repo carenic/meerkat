@@ -144,7 +144,10 @@ them.
   the destination its host selected, and `error` is the runtime's own
   verdict. It is the runtime's answer, not a host refusal: a restored member
   keeps its registration. Such a failure was a `MobError::WiringError`
-  before. Its RPC error data has the kind
+  before. Its `failure_class()` is `MobFailureClass::RuntimeRejected`, where
+  the `WiringError` was `MobRejected`, so schedule delivery now records the
+  failure reason `runtime_rejected` instead of `mob_rejected` for a delivery
+  whose member revival hits it. Its RPC error data has the kind
   `mob_member_destination_not_installed` with the `session_id`, the runtime
   verdict as a stable snake_case `cause` (for example
   `scoped_context_generation_not_advanced` or `validation_failed`), the
