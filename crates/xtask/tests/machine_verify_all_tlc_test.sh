@@ -156,7 +156,10 @@ fi
 # of one runtime-loop run, under every generated invariant plus the audit's
 # exactly-once invariants. Its TLC config is derived from the generated ci.cfg
 # on each run, so it cannot drift from the model. 16 steps reach every
-# resolution followed by every run-ending arm; deeper bounds run by hand.
+# resolution followed by every run-ending arm; deeper bounds run by hand. It
+# then requires TLC to reach a durable join of the late Steer input once per
+# content input kind (five short runs), so the invariants are not vacuous for
+# any of them.
 durable_steer_audit="${workspace_root}/specs/machines/meerkat_machine/durable_in_turn_steer_audit.sh"
 if [[ ! -x "${durable_steer_audit}" ]]; then
   echo "error: durable in-turn steer audit runner is missing from workspace runfiles: ${durable_steer_audit}" >&2
@@ -432,10 +435,12 @@ run_machine_verify() {
 # close (26 s): 502 s; plus mob operator grant with --mutants (88 s on a
 # local 4-worker run, not yet hosted; the other audits' hosted runs took
 # 1.5-3.1x their local ones, so expect 130-270 s);
-# audits-b = durable in-turn steer (352 s), live delegation steer (44 s),
-# peer request maps with --mutants (64 s measured on a local 4-worker run,
-# not yet hosted; the other audits' hosted runs took 1.5-3.1x their local
-# ones, so expect 100-200 s): about 500-600 s (208 s for the shard locally);
+# audits-b = durable in-turn steer (352 s, plus its five per-kind goal runs:
+# 26 s on a local 4-worker run beside 135 s for its safety run, so expect
+# 40-80 s hosted), live delegation steer (44 s), peer request maps with
+# --mutants (64 s measured on a local 4-worker run, not yet hosted; the
+# other audits' hosted runs took 1.5-3.1x their local ones, so expect
+# 100-200 s): about 540-680 s (234 s for the shard locally);
 # audits-c = run-start hold (239 s), live media health (155 s),
 # live-context causal-tail batch with --mutants (112 s): 506 s; plus the
 # generation high-water audit with --mutants (30 s on a local 4-worker run,

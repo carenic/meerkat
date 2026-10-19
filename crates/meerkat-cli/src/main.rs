@@ -22748,6 +22748,8 @@ mod tests {
             summary: Some("Peer terminal response".to_string()),
             payload: None,
             content: Vec::new(),
+            delivery_id: None,
+            in_reply_to: None,
         }];
         let content = meerkat_core::lifecycle::run_primitive::CoreRenderable::SystemNotice {
             kind: meerkat_core::types::SystemNoticeKind::Comms,

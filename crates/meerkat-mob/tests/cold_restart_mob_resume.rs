@@ -413,6 +413,7 @@ async fn send_peer_message_direct(
             body: body.to_string(),
             blocks: None,
             handling_mode: HandlingMode::Steer,
+            in_reply_to: None,
         })
         .await
         .expect("direct peer message send");

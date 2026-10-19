@@ -52,6 +52,59 @@ fn semantics_class_is_durable(
         == Some(crate::ingress_types::LiveBoundaryDeliveryClass::DurableAppend)
 }
 
+/// The disposition of a durable steer that is no longer in the steer lane
+/// once its wait for an earlier durable steer ends, read from the generated
+/// phase as revalidation reads it after a preparation: still queued (in
+/// another lane) takes the queued fallback; staged into or applied by the
+/// current run, consumed by a later one, or resolved without a run is machine
+/// progress that already owns it.
+fn waited_durable_steer_disposition(
+    driver: &DriverEntry,
+    input_id: &InputId,
+) -> Result<LiveBoundaryInputDisposition, RuntimeDriverError> {
+    let current_run_id = driver.current_run_id();
+    let wake_needed = || {
+        current_run_id.is_none() && driver.has_queued_input_outside(std::slice::from_ref(input_id))
+    };
+    let Some(phase) = driver
+        .as_driver()
+        .stored_input_state(input_id)
+        .map(|stored| stored.seed.phase)
+    else {
+        return Ok(LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: wake_needed(),
+        });
+    };
+    let current_run_owns_input =
+        || current_run_id.is_some() && driver.input_last_run_id(input_id) == current_run_id;
+    match phase {
+        InputLifecycleState::Queued => Ok(LiveBoundaryInputDisposition::QueuedFallback),
+        InputLifecycleState::Staged
+        | InputLifecycleState::Applied
+        | InputLifecycleState::AppliedPendingConsumption
+            if current_run_owns_input() =>
+        {
+            Ok(LiveBoundaryInputDisposition::SuccessorClaimed { wake_needed: false })
+        }
+        InputLifecycleState::Consumed
+        | InputLifecycleState::Superseded
+        | InputLifecycleState::Coalesced
+        | InputLifecycleState::Abandoned => Ok(LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: wake_needed(),
+        }),
+        InputLifecycleState::Accepted
+        | InputLifecycleState::Staged
+        | InputLifecycleState::Applied
+        | InputLifecycleState::AppliedPendingConsumption => {
+            Err(RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "durable steer {input_id} left the steer lane while it waited and reached {phase:?} without current-run ownership"
+                ),
+            })
+        }
+    }
+}
+
 enum RetryableLiveBoundaryPreparation {
     Prepared(meerkat_core::lifecycle::CoreBoundaryStageOutput),
     Unavailable { reason: String },
@@ -635,8 +688,34 @@ impl MeerkatMachine {
         ),
         RuntimeDriverError,
     > {
-        let live_boundary_plan = {
+        // Held until this function returns: a durable Steer's place in the
+        // session's durable Steer order (`DurableSteerOrder`).
+        let mut durable_work = None;
+        let live_boundary_plan = loop {
             let driver = witness.driver.lock().await;
+            if durable_work.is_some()
+                && !driver
+                    .driver_ingress()
+                    .steer_queue()
+                    .iter()
+                    .any(|candidate| candidate == input_id)
+            {
+                // It waited for an earlier durable steer with M released, and
+                // the lane moved on meanwhile: its run ended and the runtime
+                // loop took it into the follow-up run (the loop serves the
+                // steer lane first), or it was queued elsewhere. No boundary
+                // of the run it waited in can take it any more, so it
+                // prepares nothing; the generated phase says who owns it.
+                let disposition = waited_durable_steer_disposition(&driver, input_id)?;
+                drop(driver);
+                tracing::debug!(
+                    session_id = %session_id,
+                    input_id = %input_id,
+                    ?disposition,
+                    "durable steer left the steer lane while it waited; preparing nothing"
+                );
+                return Ok((held_mutation_gate, disposition));
+            }
             let Some(run_id) = driver.current_run_id() else {
                 tracing::debug!(
                     session_id = %session_id,
@@ -655,8 +734,11 @@ impl MeerkatMachine {
             // FIFO is per machine-owned delivery class: a durable delivery
             // occupies its own boundary slot (and may wait across a closed
             // window), so it never pushes a later request-only steer to a
-            // follow-up turn, and vice versa. Within a class the earliest
-            // admission keeps the head.
+            // follow-up turn, and vice versa. Within the request-only class
+            // the earliest admission keeps the head. Within the durable class
+            // each boundary takes one delivery, oldest first: a later durable
+            // steer waits for the older one's work to settle and then joins
+            // the following boundary, or follows it to its follow-up turn.
             let ingress = driver.driver_ingress();
             let candidate_is_durable =
                 semantics_class_is_durable(ingress.runtime_semantics(input_id));
@@ -665,9 +747,46 @@ impl MeerkatMachine {
                 semantics_class_is_durable(ingress.runtime_semantics(candidate))
                     == candidate_is_durable
             });
-            if steer_queue.iter().any(|candidate| candidate == input_id)
-                && class_head != Some(input_id)
-            {
+            let in_steer_lane = steer_queue.iter().any(|candidate| candidate == input_id);
+            if in_steer_lane && candidate_is_durable {
+                let work = durable_work
+                    .get_or_insert_with(|| ingress.durable_steer_order().begin(input_id));
+                let mut settled = std::pin::pin!(work.settled().notified());
+                settled.as_mut().enable();
+                match work.turn(class_head) {
+                    crate::driver::ephemeral::DurableSteerTurn::Prepare => {}
+                    crate::driver::ephemeral::DurableSteerTurn::Wait => {
+                        drop(driver);
+                        drop(held_mutation_gate);
+                        settled.await;
+                        #[cfg(test)]
+                        {
+                            let test_gate = self
+                                .test_durable_steer_relock_hold
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            if let Some((reached, release)) = test_gate {
+                                let _ = reached.send(());
+                                let _ = release.await;
+                            }
+                        }
+                        held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+                        continue;
+                    }
+                    crate::driver::ephemeral::DurableSteerTurn::FollowUp => {
+                        // It keeps its steer-lane state behind the earlier
+                        // one, so the follow-up turn delivers both in order.
+                        drop(driver);
+                        return Ok(Self::durable_live_boundary_fallback(
+                            session_id,
+                            input_id,
+                            held_mutation_gate,
+                            &"an earlier durable steer in the lane takes its follow-up turn",
+                        ));
+                    }
+                }
+            } else if in_steer_lane && class_head != Some(input_id) {
                 drop(driver);
                 held_mutation_gate = self
                     .normalize_live_boundary_queued_fallback(
@@ -683,7 +802,7 @@ impl MeerkatMachine {
                 tracing::debug!(
                     session_id = %session_id,
                     input_id = %input_id,
-                    "later live-boundary candidate retained durable FIFO behind earlier active-run admission"
+                    "later request-only live-boundary candidate retained FIFO behind earlier active-run admission"
                 );
                 return Ok((
                     held_mutation_gate,
@@ -728,24 +847,32 @@ impl MeerkatMachine {
                     .await;
                 return Err(error);
             };
-            if semantics.live_boundary_delivery()
+            break if semantics.live_boundary_delivery()
                 == Some(crate::ingress_types::LiveBoundaryDeliveryClass::DurableAppend)
             {
                 // The durable payload is exactly the appends the fallback
                 // follow-up turn would write, lowered with the input's own
                 // transcript identity so both paths produce the same rows.
-                let transcript_identity = driver
+                // A peer message keeps the reply capability its follow-up
+                // turn would carry, so `reply_to_peer` can answer it in the
+                // run it joins.
+                let persisted_input = driver
                     .as_driver()
                     .input_state(input_id)
-                    .and_then(|state| state.persisted_input.as_ref())
-                    .map(|input| {
-                        crate::runtime_loop::for_input(input, semantics).transcript_identity
-                    });
+                    .and_then(|state| state.persisted_input.as_ref());
+                let transcript_identity = persisted_input.map(|input| {
+                    crate::runtime_loop::for_input(input, semantics).transcript_identity
+                });
+                let reply_capabilities = persisted_input
+                    .and_then(crate::input::peer_reply_capability)
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let appends = meerkat_core::DurableTurnBoundaryAppends::try_new(
                     input_id.clone(),
                     crate::input::projection_durable_boundary_appends(&projection),
                     transcript_identity,
-                );
+                )
+                .map(|appends| appends.with_peer_reply_capabilities(reply_capabilities));
                 match appends {
                     Ok(appends) => (run_id, LiveBoundaryDeliveryPlan::Durable(appends)),
                     Err(error) => {
@@ -783,7 +910,7 @@ impl MeerkatMachine {
                     ));
                 }
                 (run_id, LiveBoundaryDeliveryPlan::RequestOnly(contexts))
-            }
+            };
         };
         let (run_id, contexts) = match live_boundary_plan {
             (run_id, LiveBoundaryDeliveryPlan::RequestOnly(contexts)) => (run_id, contexts),

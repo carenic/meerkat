@@ -128,8 +128,8 @@ where
         stream,
         TransportCodec::new(crate::transport::MAX_PAYLOAD_SIZE),
     );
-    let envelope = match framed.next().await {
-        Some(Ok(frame)) => frame.envelope,
+    let frame = match framed.next().await {
+        Some(Ok(frame)) => frame,
         Some(Err(err)) => return Err(IoTaskError::Io(err)),
         None => {
             return Err(IoTaskError::Io(std::io::Error::new(
@@ -139,17 +139,19 @@ where
         }
     };
 
-    // Verify signature (when peer auth is enabled).
+    // Verify signature (when peer auth is enabled), over the frame as
+    // received: a signed field this build does not know is still covered.
     //
     // A rejected envelope is a *failed* admission, not successful handling.
     // Return a typed auth/address fault (mirroring the `IngressDropped` arm
     // below) so the listener's `Err -> warn` arm records the rejection fact
     // rather than treating the silent `Ok(())` as a clean connection.
-    if require_peer_auth && !envelope.verify() {
+    if require_peer_auth && !frame.verify_signature() {
         return Err(IoTaskError::InvalidSignature {
-            envelope_id: envelope.id,
+            envelope_id: frame.envelope.id,
         });
     }
+    let envelope = frame.envelope;
 
     // Verify the envelope is addressed to a resolvable local identity. One
     // typed error covers both "never registered" and "registered then
@@ -501,6 +503,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -542,6 +545,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -593,6 +597,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -635,6 +640,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -659,6 +665,66 @@ mod tests {
 
     #[cfg(feature = "workspace-tests")]
     #[tokio::test]
+    async fn test_io_task_admits_a_signed_field_this_build_does_not_know() {
+        use crate::transport::codec::test_frames::{frame_bytes, message_kind, signed_map, text};
+
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&sender_keypair.public_key());
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
+        let kind = message_kind(vec![(text("future_field"), text("kept"))]);
+        let (expected_id, entries) = signed_map(
+            &sender_keypair,
+            &receiver_keypair.public_key(),
+            kind.clone(),
+            kind,
+        );
+        let bytes = frame_bytes(entries);
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        handle_connection(server, true, &receiver_keypair, &inbox_sender)
+            .await
+            .expect("a newer sender's optional signed field is admitted");
+        let ack = read_one_envelope(&mut client_read).await.unwrap();
+        assert!(matches!(ack.kind, MessageKind::Ack { in_reply_to } if in_reply_to == expected_id));
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_io_task_refuses_a_signed_field_altered_after_signing() {
+        use crate::transport::codec::test_frames::{frame_bytes, message_kind, signed_map, text};
+
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&sender_keypair.public_key());
+        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (_, entries) = signed_map(
+            &sender_keypair,
+            &receiver_keypair.public_key(),
+            message_kind(vec![(text("future_field"), text("kept"))]),
+            message_kind(vec![(text("future_field"), text("altered"))]),
+        );
+        let bytes = frame_bytes(entries);
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        let result = handle_connection(server, true, &receiver_keypair, &inbox_sender).await;
+        assert!(matches!(result, Err(IoTaskError::InvalidSignature { .. })));
+    }
+
+    #[tokio::test]
     async fn test_io_task_accepts_invalid_signature_when_auth_disabled() {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
@@ -677,6 +743,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid signature
         };
@@ -724,6 +791,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -769,6 +837,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -821,6 +890,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -863,6 +933,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -912,6 +983,7 @@ mod tests {
                 }]),
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -1267,6 +1339,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // Invalid
         };
@@ -1316,6 +1389,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1362,6 +1436,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1411,6 +1486,7 @@ mod tests {
                 blocks: None,
                 body: "hello".to_string(),
                 handling_mode: None,
+                in_reply_to: None,
             },
         );
         let envelope_id = envelope.id;
@@ -1498,6 +1574,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;
@@ -1600,6 +1677,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1669,6 +1747,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let bytes = envelope_to_bytes(&envelope).await;
@@ -1710,6 +1789,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]), // unsigned
         };
@@ -1755,6 +1835,7 @@ mod tests {
                 body: "hello".to_string(),
                 handling_mode: None,
                 objective_id: None,
+                in_reply_to: None,
             },
         );
         let original_id = envelope.id;

@@ -5357,7 +5357,7 @@ export interface CommsSendParamsPeerResponse {
   blocks?: ContentBlock[] | null;
   content_taint?: SendTaintOverride | null;
   handling_mode?: HandlingMode | null;
-  in_reply_to: string;
+  in_reply_to: InteractionId;
   kind: "peer_response";
   result?: CommsPeerResponseResult | null;
   session_id: string;
@@ -6827,6 +6827,8 @@ export type BackgroundJobTerminalStatus = "completed" | "failed" | "aborted" | "
 
 export type CommsNoticeKind = string;
 
+export type InteractionId = string;
+
 export type InterruptedInputKind = "prompt" | "peer" | "flow_step" | "external_event" | "continuation" | "operation" | "unknown";
 
 export interface InterruptedToolRunDispositionInputsSettled {
@@ -6909,7 +6911,9 @@ export type ToolProcessSpawner = ToolProcessSpawnerShellCall | ToolProcessSpawne
 
 export interface SystemNoticeBlockComms {
   content?: ContentBlock[];
+  delivery_id?: InteractionId | null;
   direction: SystemNoticeDirection;
+  in_reply_to?: InteractionId | null;
   intent?: string | null;
   kind: CommsNoticeKind;
   payload?: unknown;
@@ -7243,7 +7247,7 @@ export interface WireSessionMessageSystemNotice {
 export interface WireSessionMessageUser {
   content: WireContentInput;
   created_at: string;
-  interaction_id?: string | null;
+  interaction_id?: InteractionId | null;
   role: "user";
   run_id?: RunId | null;
   transcript_role?: TranscriptUserRole;
@@ -7253,7 +7257,7 @@ export interface WireSessionMessageBlockAssistant {
   assistant_message_id?: string | null;
   blocks: WireAssistantBlock[];
   created_at: string;
-  interaction_id?: string | null;
+  interaction_id?: InteractionId | null;
   realtime_origin?: RealtimeMessageOrigin | null;
   role: "block_assistant";
   run_id?: RunId | null;

@@ -8326,6 +8326,10 @@ impl MeerkatMachine {
                     let _ = release.await;
                 }
             }
+            #[cfg(test)]
+            let outcome_input_id = live_boundary_plan
+                .as_ref()
+                .map(|plan| plan.input_id.clone());
             let dispatched = machine
                 .dispatch_accepted_ingress_boundary_work_owned(
                     &work_session_id,
@@ -8339,6 +8343,18 @@ impl MeerkatMachine {
                 )
                 .await;
             drop(runless_terminal);
+            #[cfg(test)]
+            if let Some(outcomes) = machine
+                .test_accepted_boundary_work_outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                let _ = outcomes.send((
+                    outcome_input_id,
+                    dispatched.as_ref().copied().map_err(ToString::to_string),
+                ));
+            }
             if let Err(error) = dispatched {
                 tracing::error!(
                     session_id = %work_session_id,
@@ -10285,6 +10301,22 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// Deterministic test gate in a durable steer's live-boundary work after
+    /// its wait for an earlier durable steer ended, before it retakes the
+    /// session mutation gate. One-shot: the first waiter to get there takes it.
+    #[cfg(test)]
+    test_durable_steer_relock_hold: StdMutex<
+        Option<(
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// Receives each accepted-ingress boundary work's input and outcome, when
+    /// a test installs a sender.
+    #[cfg(test)]
+    test_accepted_boundary_work_outcomes: StdMutex<
+        Option<crate::tokio::sync::mpsc::UnboundedSender<(Option<InputId>, Result<(), String>)>>,
+    >,
     /// Deterministic test gate after an executor attachment's runtime loop
     /// has released the registration gate it held through startup recovery,
     /// before the attachment reacquires that gate as its pending guard.
@@ -12196,6 +12228,10 @@ impl MeerkatMachine {
                 #[cfg(test)]
                 test_accepted_boundary_work_hold: StdMutex::new(None),
                 #[cfg(test)]
+                test_durable_steer_relock_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_accepted_boundary_work_outcomes: StdMutex::new(None),
+                #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]
                 test_registration_transaction_contention_probe: StdMutex::new(None),
@@ -12434,6 +12470,10 @@ impl MeerkatMachine {
                 test_fenced_accept_after_lease: StdMutex::new(None),
                 #[cfg(test)]
                 test_accepted_boundary_work_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_durable_steer_relock_hold: StdMutex::new(None),
+                #[cfg(test)]
+                test_accepted_boundary_work_outcomes: StdMutex::new(None),
                 #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]

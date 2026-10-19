@@ -65,6 +65,7 @@ mod tests {
             content: "test body".into(),
             payload: Some(serde_json::json!({"intent": intent_str})),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -92,6 +93,7 @@ mod tests {
             content: "test body".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 

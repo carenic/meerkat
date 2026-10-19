@@ -1416,6 +1416,7 @@ async fn mixed_demux_routes_by_to_with_per_identity_acks_and_typed_rejects() {
                 blocks: None,
                 handling_mode: HandlingMode::Queue,
                 objective_id: None,
+                in_reply_to: None,
             })
             .await
             .expect("demuxed send must be acked by the addressed identity");
@@ -1462,6 +1463,7 @@ async fn mixed_demux_routes_by_to_with_per_identity_acks_and_typed_rejects() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await;
     assert!(
@@ -1489,6 +1491,7 @@ async fn mixed_demux_routes_by_to_with_per_identity_acks_and_typed_rejects() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await
         .expect("identity still registered after refused removal");
@@ -1515,6 +1518,7 @@ async fn mixed_demux_routes_by_to_with_per_identity_acks_and_typed_rejects() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await;
     assert!(

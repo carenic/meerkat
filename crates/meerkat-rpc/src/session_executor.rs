@@ -631,6 +631,8 @@ mod typed_context_append_tests {
             summary: Some("Peer terminal response".to_string()),
             payload: None,
             content: Vec::new(),
+            delivery_id: None,
+            in_reply_to: None,
         }];
         let content = CoreRenderable::SystemNotice {
             kind: SystemNoticeKind::Comms,

@@ -42507,6 +42507,7 @@ impl MobActor {
                 content_taint: None,
                 handling_mode,
                 objective_id: None,
+                in_reply_to: None,
             },
         };
         Ok(PeerMessageDeliveryPlan {

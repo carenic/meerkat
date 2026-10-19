@@ -108,6 +108,11 @@ pub enum InteractionContent {
         /// Optional multimodal content blocks.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocks: Option<Vec<ContentBlock>>,
+        /// The delivery this message answers, as its sender declared it in
+        /// the signed envelope (`reply_to_peer` sets it). Advisory: it labels
+        /// the message and never routes or authorizes anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<InteractionId>,
     },
     /// Authenticated peer message whose signed envelope carried an exact
     /// recipient residency. Runtime admission validates the mandatory fence
@@ -1334,6 +1339,7 @@ mod tests {
         let content = InteractionContent::Message {
             body: "hello".to_string(),
             blocks: None,
+            in_reply_to: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "message");
@@ -1397,6 +1403,7 @@ mod tests {
                     data: "iVBORw0KGgo=".into(),
                 },
             ]),
+            in_reply_to: None,
         };
         let json = serde_json::to_value(&content).unwrap();
         assert_eq!(json["type"], "message");
@@ -1415,6 +1422,7 @@ mod tests {
             content: InteractionContent::Message {
                 body: "hello".into(),
                 blocks: None,
+                in_reply_to: None,
             },
             rendered_text: "External event via webhook: hello".into(),
             handling_mode: HandlingMode::Steer,
@@ -1435,9 +1443,14 @@ mod tests {
         let old_json = r#"{"type":"message","body":"hello"}"#;
         let parsed: InteractionContent = serde_json::from_str(old_json).unwrap();
         match parsed {
-            InteractionContent::Message { body, blocks } => {
+            InteractionContent::Message {
+                body,
+                blocks,
+                in_reply_to,
+            } => {
                 assert_eq!(body, "hello");
                 assert_eq!(blocks, None);
+                assert_eq!(in_reply_to, None);
             }
             other => panic!("Expected Message, got {other:?}"),
         }
@@ -1446,12 +1459,17 @@ mod tests {
         let content = InteractionContent::Message {
             body: "test".to_string(),
             blocks: None,
+            in_reply_to: None,
         };
         let json = serde_json::to_string(&content).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(
             value.get("blocks").is_none(),
             "blocks: None should not appear in JSON"
+        );
+        assert!(
+            value.get("in_reply_to").is_none(),
+            "in_reply_to: None should not appear in JSON"
         );
     }
 

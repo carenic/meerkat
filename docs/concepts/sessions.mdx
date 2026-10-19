@@ -63,17 +63,17 @@ semantic-memory indexing and do not masquerade as ordinary user requests.
 bytes stay with the pending input for crash retry, but it is never appended to
 the Session transcript or rewrite history, or included in compaction or
 structured-output extraction. At an authorized foreground model-request
-boundary, temporary injected-context User rows are appended at the current
-request tail: caller context first, then accepted steers. This needs no
+boundary, a temporary injected-context User row carrying it is appended at the
+current request tail. This needs no
 conversational-row anchor and does not change the durable `injected_context`
 before-user rule above. A deferred create cannot carry it because no runtime
 input exists yet; attach it to the eventual turn.
 
-A steer prompt that carries typed conversation appends is not request-only: its
-rows are written into the running turn's transcript at the next model boundary
-and committed with the run, or delivered by exactly one follow-up turn when no
-boundary opens in time. See
-[Request-only and durable steer](/reference/session-contracts#request-only-and-durable-steer).
+A content steer is never request-only: its rows (a prompt's user row, a peer
+message's comms notice, an external event's notice) are written into the
+running turn's transcript at the next model boundary and committed with the
+run, or delivered by exactly one follow-up turn when no boundary opens in time.
+See [Durable steer](/reference/session-contracts#durable-steer).
 
 The JSON-RPC `session/inject_context` method is a separate compatibility
 surface: it appends durable system context with a source and optional

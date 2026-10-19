@@ -823,6 +823,10 @@ pub struct ToolDispatchContext {
     application_control: Option<Arc<crate::ToolApplicationControlRequest>>,
     current_turn: Option<CurrentTurnContent>,
     turn_metadata: BTreeMap<String, serde_json::Value>,
+    /// Every peer delivery this turn can answer with `reply_to_peer`, typed:
+    /// parsed once from the turn metadata when it is set, then extended by
+    /// the deliveries written into the running turn at model boundaries.
+    peer_replies: TurnPeerReplies,
     origin_session_id: Option<crate::types::SessionId>,
     interaction_lineage_id: Option<crate::interaction::InteractionId>,
     run_id: Option<crate::RunId>,
@@ -844,6 +848,44 @@ pub struct ToolDispatchContext {
     refusal_observer: Option<crate::authorization::RefusalObserverBinding>,
     // Monotonic restriction set by the core execution policy owner.
     read_only_execution_required: bool,
+}
+
+/// The reply capabilities of one turn: the turn-start list, parsed once when
+/// the turn metadata is set, then the deliveries the agent wrote into the
+/// running turn at model boundaries, in apply order. Each (sender, delivery
+/// id) appears once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnPeerReplies {
+    deliveries: crate::comms::PeerReplyDispatchContext,
+    /// Set when the turn-start value does not decode: the turn's reply
+    /// context then fails closed, whatever joins it later.
+    malformed: Option<crate::comms::PeerReplyContextError>,
+}
+
+impl TurnPeerReplies {
+    fn from_turn_metadata(metadata: &BTreeMap<String, serde_json::Value>) -> Self {
+        let Some(value) = metadata.get(crate::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY) else {
+            return Self::default();
+        };
+        match serde_json::from_value::<crate::comms::PeerReplyDispatchContext>(value.clone()) {
+            Ok(turn_start) => {
+                let mut deliveries = crate::comms::PeerReplyDispatchContext::default();
+                for delivery in turn_start.deliveries {
+                    deliveries.insert_delivery(delivery);
+                }
+                Self {
+                    deliveries,
+                    malformed: None,
+                }
+            }
+            Err(error) => Self {
+                deliveries: crate::comms::PeerReplyDispatchContext::default(),
+                malformed: Some(crate::comms::PeerReplyContextError::Malformed(
+                    error.to_string(),
+                )),
+            },
+        }
+    }
 }
 
 /// Owned, single-use native entry for a leaf whose effect runs on a worker.
@@ -1276,6 +1318,7 @@ impl std::fmt::Debug for ToolDispatchContext {
             .debug_struct("ToolDispatchContext")
             .field("current_turn", &self.current_turn)
             .field("turn_metadata", &self.turn_metadata)
+            .field("peer_replies", &self.peer_replies)
             .field("origin_session_id", &self.origin_session_id)
             .field("interaction_lineage_id", &self.interaction_lineage_id)
             .field("run_id", &self.run_id)
@@ -1305,6 +1348,7 @@ impl PartialEq for ToolDispatchContext {
             }
             && self.current_turn == other.current_turn
             && self.turn_metadata == other.turn_metadata
+            && self.peer_replies == other.peer_replies
             && self.origin_session_id == other.origin_session_id
             && self.interaction_lineage_id == other.interaction_lineage_id
             && self.run_id == other.run_id
@@ -1392,6 +1436,7 @@ impl ToolDispatchContext {
             application_control: None,
             current_turn: blocks.map(CurrentTurnContent::new),
             turn_metadata: BTreeMap::new(),
+            peer_replies: TurnPeerReplies::default(),
             origin_session_id: None,
             interaction_lineage_id: None,
             run_id: None,
@@ -2046,13 +2091,51 @@ impl ToolDispatchContext {
     }
 
     #[must_use]
+    /// Set the turn-scoped dispatch metadata. The peer reply context under
+    /// [`crate::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY`] is parsed here,
+    /// once; [`Self::peer_reply_deliveries`] reads the typed result.
     pub fn with_turn_metadata(mut self, metadata: BTreeMap<String, serde_json::Value>) -> Self {
+        self.peer_replies = TurnPeerReplies::from_turn_metadata(&metadata);
         self.turn_metadata = metadata;
         self
     }
 
     pub fn turn_metadata(&self, key: &str) -> Option<&serde_json::Value> {
         self.turn_metadata.get(key)
+    }
+
+    /// Record the reply capabilities of peer deliveries written into the
+    /// running turn at a model boundary. Typed and infallible: each one is
+    /// added unless the same sender's delivery with the same id is already
+    /// recorded ([`crate::comms::PeerReplyDispatchContext::insert_delivery`]).
+    pub(crate) fn record_boundary_peer_replies(
+        &mut self,
+        deliveries: impl IntoIterator<Item = crate::comms::PeerReplyCapability>,
+    ) {
+        for delivery in deliveries {
+            self.peer_replies.deliveries.insert_delivery(delivery);
+        }
+    }
+
+    /// Every peer delivery this turn can answer with `reply_to_peer`: the
+    /// turn-start deliveries the runtime minted under
+    /// [`crate::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY`] (parsed once,
+    /// by [`Self::with_turn_metadata`]), then the deliveries written into the
+    /// running turn at model boundaries. Each (sender, delivery id) appears
+    /// once.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::comms::PeerReplyContextError::Malformed`] when the turn-start
+    /// value does not decode. It fails closed instead of being coerced or
+    /// ignored.
+    pub fn peer_reply_deliveries(
+        &self,
+    ) -> Result<&crate::comms::PeerReplyDispatchContext, crate::comms::PeerReplyContextError> {
+        match &self.peer_replies.malformed {
+            Some(error) => Err(error.clone()),
+            None => Ok(&self.peer_replies.deliveries),
+        }
     }
 
     pub fn current_turn(&self) -> Option<&CurrentTurnContent> {

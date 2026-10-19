@@ -8806,6 +8806,7 @@ mod tests {
             content: "helper finished via comms".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let (_outcome, handle) = router
@@ -8863,6 +8864,7 @@ mod tests {
             content: "urgent helper update via comms".into(),
             payload: None,
             handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+            in_reply_to: None,
         });
 
         let (_outcome, handle) = router

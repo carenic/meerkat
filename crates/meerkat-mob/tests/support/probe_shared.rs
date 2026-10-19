@@ -425,6 +425,7 @@ pub async fn send_peer_text(
         content_taint: None,
         handling_mode: HandlingMode::Queue,
         objective_id: None,
+        in_reply_to: None,
     })
     .await
 }

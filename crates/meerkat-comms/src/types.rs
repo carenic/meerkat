@@ -63,6 +63,16 @@ pub enum MessageKind {
         handling_mode: Option<HandlingMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+        /// The envelope id of the delivery this message answers, set by
+        /// `reply_to_peer`. Signed when present, omitted when `None`, so a
+        /// message without it keeps the canonical bytes of messages produced
+        /// before the field existed (as `content_taint`). A 0.9.3 receiver
+        /// that checks signatures (the default) does not know the field,
+        /// recomputes the signable bytes without it and refuses the envelope;
+        /// one with peer auth off drops the label. Advisory: never routing or
+        /// authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<Uuid>,
     },
     /// A peer message with a mandatory exact recipient residency. The
     /// authenticated member sender is unchanged; the fence is inside the
@@ -170,6 +180,47 @@ impl MessageKind {
     }
 }
 
+/// Sort every CBOR map in `value` by canonical key order (RFC 8949),
+/// recursively. It never removes or merges entries: a map that holds a key
+/// twice keeps both, so a repeated key changes the encoded bytes instead of
+/// disappearing from them.
+pub(crate) fn canonicalize_cbor(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_cbor(item);
+            }
+        }
+        Value::Map(entries) => {
+            for (key, val) in entries.iter_mut() {
+                canonicalize_cbor(key);
+                canonicalize_cbor(val);
+            }
+
+            entries.sort_by(|(k1, _), (k2, _)| match (k1, k2) {
+                (Value::Text(a), Value::Text(b)) => match a.len().cmp(&b.len()) {
+                    std::cmp::Ordering::Equal => a.cmp(b),
+                    ord => ord,
+                },
+                _ => CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone())),
+            });
+        }
+        Value::Tag(_, inner) => canonicalize_cbor(inner),
+        _ => {}
+    }
+}
+
+/// The canonical CBOR encoding of `value` (see [`canonicalize_cbor`]); empty
+/// when it cannot be encoded.
+pub(crate) fn canonical_cbor_bytes(mut value: Value) -> Vec<u8> {
+    canonicalize_cbor(&mut value);
+    let mut buf = Vec::new();
+    if ciborium::into_writer(&value, &mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
 /// A signed message envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -202,48 +253,12 @@ impl Envelope {
     /// RFC 8949 edge-case fix must land in BOTH; the contracts side pins the
     /// semantics with a known-answer vector test.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        fn canonicalize(value: &mut Value) {
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        canonicalize(item);
-                    }
-                }
-                Value::Map(entries) => {
-                    for (key, val) in entries.iter_mut() {
-                        canonicalize(key);
-                        canonicalize(val);
-                    }
-
-                    entries.sort_by(|(k1, _), (k2, _)| match (k1, k2) {
-                        (Value::Text(a), Value::Text(b)) => match a.len().cmp(&b.len()) {
-                            std::cmp::Ordering::Equal => a.cmp(b),
-                            ord => ord,
-                        },
-                        _ => {
-                            CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone()))
-                        }
-                    });
-                }
-                Value::Tag(_, inner) => canonicalize(inner),
-                _ => {}
-            }
-        }
-
         // Create a tuple of (id, from, to, kind) for signing.
         let signable = (&self.id, &self.from, &self.to, &self.kind);
-
-        let mut value = match Value::serialized(&signable) {
-            Ok(value) => value,
-            Err(_) => return Vec::new(),
-        };
-        canonicalize(&mut value);
-
-        let mut buf = Vec::new();
-        if ciborium::into_writer(&value, &mut buf).is_err() {
-            return Vec::new();
+        match Value::serialized(&signable) {
+            Ok(value) => canonical_cbor_bytes(value),
+            Err(_) => Vec::new(),
         }
-        buf
     }
 
     /// Sign the envelope with the given keypair, updating the sig field.
@@ -318,6 +333,7 @@ mod tests {
             blocks: None,
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
         if let MessageKind::Message {
             body,
@@ -334,6 +350,19 @@ mod tests {
         } else {
             panic!("Expected Message variant");
         }
+    }
+
+    #[test]
+    fn canonicalization_keeps_every_entry_of_a_map_with_a_repeated_key() {
+        let entry =
+            |key: &str, value: i64| (Value::Text(key.to_string()), Value::Integer(value.into()));
+        let mut value = Value::Map(vec![entry("b", 1), entry("a", 2), entry("b", 3)]);
+        canonicalize_cbor(&mut value);
+        assert_eq!(
+            value,
+            Value::Map(vec![entry("a", 2), entry("b", 1), entry("b", 3)]),
+            "sorted, nothing merged or dropped"
+        );
     }
 
     #[test]
@@ -567,6 +596,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -594,6 +624,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             MessageKind::Request {
                 objective_id: None,
@@ -619,6 +650,7 @@ mod tests {
                 blocks: None,
                 content_taint: Some(SenderContentTaint::Tainted),
                 handling_mode: None,
+                in_reply_to: None,
             },
             MessageKind::Response {
                 objective_id: None,
@@ -653,6 +685,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -740,6 +773,7 @@ mod tests {
             blocks: None,
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&msg, &mut buf).unwrap();
@@ -765,6 +799,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -788,6 +823,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -811,6 +847,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -830,6 +867,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -870,6 +908,7 @@ mod tests {
                 blocks: None,
                 content_taint: None,
                 handling_mode: None,
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -1177,6 +1216,7 @@ mod tests {
             ]),
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
         let mut buf = Vec::new();
         ciborium::into_writer(&kind, &mut buf).unwrap();
@@ -1197,6 +1237,7 @@ mod tests {
             blocks: None,
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
 
         // CBOR roundtrip preserves None
@@ -1265,6 +1306,7 @@ mod tests {
                 blocks: None,
                 content_taint: Some(SenderContentTaint::Tainted),
                 handling_mode: Some(HandlingMode::Queue),
+                in_reply_to: None,
             },
             sig: Signature::new([0u8; 64]),
         };
@@ -1297,6 +1339,100 @@ mod tests {
         expected.extend_from_slice(&[0x65, b'q', b'u', b'e', b'u', b'e']);
 
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn test_rct_contracts_signable_bytes_with_in_reply_to_are_canonical() {
+        // Exact-byte pin for a reply: `in_reply_to` (len 11) sorts after
+        // `body` and `type` (len 4) in the RFC 8949 length-then-lex canonical
+        // key order, and the uuid encodes as a 16-byte string like the
+        // envelope id. A message without it keeps the 0.9.3 bytes
+        // (test_rct_contracts_envelope_signable_bytes_are_canonical).
+        let answered = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+        let envelope = Envelope {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            from: PubKey::new([1u8; 32]),
+            to: PubKey::new([2u8; 32]),
+            kind: MessageKind::Message {
+                objective_id: None,
+                body: "hello".to_string(),
+                blocks: None,
+                content_taint: None,
+                handling_mode: None,
+                in_reply_to: Some(answered),
+            },
+            sig: Signature::new([0u8; 64]),
+        };
+
+        let bytes = envelope.signable_bytes();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&[
+            0x84, 0x50, 0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66,
+            0x55, 0x44, 0x00, 0x00, 0x58, 0x20,
+        ]);
+        expected.extend(std::iter::repeat_n(0x01, 32));
+        expected.extend_from_slice(&[0x58, 0x20]);
+        expected.extend(std::iter::repeat_n(0x02, 32));
+        // Map of 3 entries in canonical order:
+        //   "body" -> "hello", "type" -> "message", "in_reply_to" -> uuid.
+        expected.push(0xa3);
+        expected.extend_from_slice(&[0x64, b'b', b'o', b'd', b'y']);
+        expected.extend_from_slice(&[0x65, b'h', b'e', b'l', b'l', b'o']);
+        expected.extend_from_slice(&[0x64, b't', b'y', b'p', b'e']);
+        expected.extend_from_slice(&[0x67, b'm', b'e', b's', b's', b'a', b'g', b'e']);
+        expected.extend_from_slice(&[
+            0x6b, b'i', b'n', b'_', b'r', b'e', b'p', b'l', b'y', b'_', b't', b'o',
+        ]);
+        expected.push(0x50);
+        expected.extend_from_slice(answered.as_bytes());
+
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn test_reply_envelope_does_not_verify_once_a_receiver_drops_in_reply_to() {
+        // The compatibility cost of the signed field: a receiver whose
+        // MessageKind does not know `in_reply_to` drops it on decode,
+        // recomputes the signable bytes without it and refuses the envelope.
+        // Every message without the field verifies as before.
+        use crate::identity::Keypair;
+
+        let sender = Keypair::generate();
+        let receiver = Keypair::generate();
+        let message = |in_reply_to| MessageKind::Message {
+            objective_id: None,
+            body: "on it".to_string(),
+            blocks: None,
+            content_taint: None,
+            handling_mode: None,
+            in_reply_to,
+        };
+        let mut reply = Envelope {
+            id: Uuid::new_v4(),
+            from: sender.public_key(),
+            to: receiver.public_key(),
+            kind: message(Some(Uuid::new_v4())),
+            sig: Signature::new([0u8; 64]),
+        };
+        reply.sign(&sender);
+        assert!(reply.verify(), "the reply verifies as sent");
+        let mut as_an_older_receiver_decodes_it = reply.clone();
+        as_an_older_receiver_decodes_it.kind = message(None);
+        assert!(
+            !as_an_older_receiver_decodes_it.verify(),
+            "dropping the signed field invalidates the signature"
+        );
+
+        let mut plain = Envelope {
+            id: Uuid::new_v4(),
+            from: sender.public_key(),
+            to: receiver.public_key(),
+            kind: message(None),
+            sig: Signature::new([0u8; 64]),
+        };
+        plain.sign(&sender);
+        assert!(plain.verify());
     }
 
     #[test]
@@ -1350,6 +1486,7 @@ mod tests {
             blocks: None,
             content_taint: None,
             handling_mode: None,
+            in_reply_to: None,
         };
         let clean = MessageKind::Message {
             objective_id: None,
@@ -1357,6 +1494,7 @@ mod tests {
             blocks: None,
             content_taint: Some(SenderContentTaint::Clean),
             handling_mode: None,
+            in_reply_to: None,
         };
         assert_ne!(undeclared, clean);
 

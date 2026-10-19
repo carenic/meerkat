@@ -2503,8 +2503,19 @@
             "type": "object"
           },
           {
-            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it — a queued delivery appended to the\ntranscript at run assembly, or a steer delivery injected as a\nrequest-local User message at the model boundary. One event per committed comms\nblock, so a host taint tracker classifies peer ingestion from typed\nfacts (canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
+            "description": "Inbound peer content was committed into this session's context.\n\nEmitted as a pure projection of the typed transcript carrier\n([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)\nat the moment the agent commits it: a delivery appended to the\ntranscript at run assembly, or a steer written into the running turn's\ntranscript at a model boundary. One event per committed comms block, so\na host taint tracker classifies peer ingestion from typed facts\n(canonical peer identity + the sender's signed content-taint\ndeclaration) instead of parsing rendered projection text.\n\nThe event stream is best-effort observability (see `event_tap`); the\ntranscript block remains the durable owner of these facts.",
             "properties": {
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message (the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`), read from the same\ntranscript block. `None` for other kinds and for deliveries that\ncarry no id."
+              },
               "kind": {
                 "$ref": "#/$defs/CommsNoticeKind",
                 "description": "Typed comms notice kind (message, request, response progress or\nterminal, lifecycle)."
@@ -13742,8 +13753,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -21730,6 +21763,10 @@
         ],
         "type": "object"
       },
+      "InteractionId": {
+        "description": "Unique identifier for an interaction.",
+        "type": "string"
+      },
       "InterruptedInputKind": {
         "description": "What kind of input an interrupted run had in flight.",
         "oneOf": [
@@ -22073,8 +22110,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -24508,6 +24567,10 @@
         ],
         "type": "string"
       },
+      "InteractionId": {
+        "description": "Unique identifier for an interaction.",
+        "type": "string"
+      },
       "InterruptedInputKind": {
         "description": "What kind of input an interrupted run had in flight.",
         "oneOf": [
@@ -24679,8 +24742,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [
@@ -39738,6 +39823,10 @@
         ],
         "type": "object"
       },
+      "InteractionId": {
+        "description": "Unique identifier for an interaction.",
+        "type": "string"
+      },
       "InterruptedInputKind": {
         "description": "What kind of input an interrupted run had in flight.",
         "oneOf": [
@@ -40081,8 +40170,30 @@
                 },
                 "type": "array"
               },
+              "delivery_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery id of an incoming peer message: the sender's envelope\nid, which `reply_to_peer` takes as `reply_to`. The model reads it\nas the notice's `Delivery ID` line. A correlation fact, so the\ntranscript content digest erases it like a notice's runtime\norigin, and a reader that drops the field digests the row the\nsame way."
+              },
               "direction": {
                 "$ref": "#/$defs/SystemNoticeDirection"
+              },
+              "in_reply_to": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/InteractionId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The delivery an incoming peer message answers, as its sender\ndeclared it (`reply_to_peer` sets it). The model reads it as the\nnotice's `In reply to` line. A correlation fact: the transcript\ncontent digest erases it like `delivery_id`."
               },
               "intent": {
                 "type": [

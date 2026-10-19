@@ -2491,6 +2491,20 @@ pub enum SystemNoticeBlock {
         payload: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         content: Vec<ContentBlock>,
+        /// The delivery id of an incoming peer message: the sender's envelope
+        /// id, which `reply_to_peer` takes as `reply_to`. The model reads it
+        /// as the notice's `Delivery ID` line. A correlation fact, so the
+        /// transcript content digest erases it like a notice's runtime
+        /// origin, and a reader that drops the field digests the row the
+        /// same way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_id: Option<crate::interaction::InteractionId>,
+        /// The delivery an incoming peer message answers, as its sender
+        /// declared it (`reply_to_peer` sets it). The model reads it as the
+        /// notice's `In reply to` line. A correlation fact: the transcript
+        /// content digest erases it like `delivery_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<crate::interaction::InteractionId>,
     },
     ExternalEvent {
         source: String,
@@ -2611,6 +2625,10 @@ enum SystemNoticeBlockKnown {
         payload: Option<Value>,
         #[serde(default)]
         content: Vec<ContentBlock>,
+        #[serde(default)]
+        delivery_id: Option<crate::interaction::InteractionId>,
+        #[serde(default)]
+        in_reply_to: Option<crate::interaction::InteractionId>,
     },
     ExternalEvent {
         source: String,
@@ -2710,6 +2728,8 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
             } => Self::Comms {
                 kind,
                 direction,
@@ -2721,6 +2741,8 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
             },
             SystemNoticeBlockKnown::ExternalEvent {
                 source,
@@ -2898,6 +2920,8 @@ impl SystemNoticeBlock {
                 summary,
                 payload,
                 content,
+                delivery_id,
+                in_reply_to,
                 ..
             } => {
                 let peer_id = peer.as_ref().map(|peer| peer.id);
@@ -3007,6 +3031,17 @@ impl SystemNoticeBlock {
                     && appends_extras
                 {
                     lines.push(format!("Payload: {}", format_notice_payload(payload)));
+                }
+                // The id `reply_to_peer` takes as `reply_to` for this
+                // delivery, before the taint marker so that stays last.
+                if let Some(delivery_id) = delivery_id {
+                    lines.push(format!("Delivery ID: {delivery_id}"));
+                }
+                // The delivery the sender says this message answers. Only a
+                // label: the sender declares it, so the model reads it as the
+                // sender's claim.
+                if let Some(in_reply_to) = in_reply_to {
+                    lines.push(format!("In reply to: {in_reply_to}"));
                 }
                 // Model-visible marker for DECLARED-tainted content only.
                 // `Clean` and `None` (no declaration) deliberately render

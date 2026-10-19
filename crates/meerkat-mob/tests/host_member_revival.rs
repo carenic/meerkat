@@ -174,6 +174,7 @@ async fn restart_revives_member_from_stored_spec_with_zero_bridge_traffic() {
             blocks: None,
             handling_mode: HandlingMode::Queue,
             objective_id: None,
+            in_reply_to: None,
         })
         .await
         .expect("revived member identity acks at the SAME pubkey");

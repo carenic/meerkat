@@ -922,6 +922,7 @@ mod tests {
                 to: peer_route(&receiver_name, receiver.public_key()),
                 body: "must not pass sdk local ingress classifier".to_string(),
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
+                in_reply_to: None,
             },
         )
         .await;

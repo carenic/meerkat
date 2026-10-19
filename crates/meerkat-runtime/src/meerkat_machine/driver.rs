@@ -822,6 +822,10 @@ impl IngressView<'_> {
         self.driver.steer_lane()
     }
 
+    pub(crate) fn durable_steer_order(&self) -> Arc<crate::driver::ephemeral::DurableSteerOrder> {
+        self.driver.durable_steer_order()
+    }
+
     pub(crate) fn admission_order(&self) -> Vec<InputId> {
         self.driver.admission_order()
     }

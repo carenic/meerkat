@@ -3091,7 +3091,7 @@ live transport's realtime observations. See
 | `background_job_completed` | Background shell job reached a typed terminal status; `terminal_status` is semantic and `status` is only an optional display mirror |
 | `transcript_rewrite_committed` | Legacy 0.8.10 compatibility/read-only full-body rewrite row; current writers must not emit it |
 | `transcript_rewrite_audit_receipt_committed` | Current receipt-only evidence for a committed ordered transcript rewrite suffix |
-| `peer_content_ingested` | Typed peer content committed into session context, with correlation/peer facts and optional sender taint; absent taint is not clean |
+| `peer_content_ingested` | Typed peer content committed into session context, with correlation/peer facts, the delivery id of a peer message, and optional sender taint; absent taint is not clean |
 | `provider_cache_breakpoints_discarded` | Cache evidence no longer binds to the committed transcript; cache reuse is reduced without itself failing the turn |
 | `boundary_append_applied` | A durable steer's typed appends were written into the running turn at a model boundary; carries `run_id`, `input_id`, model-projected `content`, `append_count`, optional canonical `notices`, and optional application-time `transcript_start` offset |
 | `boundary_appends_discarded` | Exact discarded application facts (`session_id`, `run_id`, `input_ids`), published after any required requeue persistence succeeds |

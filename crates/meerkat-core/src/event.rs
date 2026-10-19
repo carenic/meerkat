@@ -1324,12 +1324,14 @@ pub fn peer_content_ingested_events(
                 peer,
                 request_id,
                 sender_taint,
+                delivery_id,
                 ..
             } => Some(AgentEvent::PeerContentIngested {
                 kind: kind.clone(),
                 peer: peer.clone(),
                 request_id: request_id.clone(),
                 sender_taint: *sender_taint,
+                delivery_id: *delivery_id,
             }),
             _ => None,
         })
@@ -2958,11 +2960,11 @@ pub enum AgentEvent {
     ///
     /// Emitted as a pure projection of the typed transcript carrier
     /// ([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)
-    /// at the moment the agent commits it — a queued delivery appended to the
-    /// transcript at run assembly, or a steer delivery injected as a
-    /// request-local User message at the model boundary. One event per committed comms
-    /// block, so a host taint tracker classifies peer ingestion from typed
-    /// facts (canonical peer identity + the sender's signed content-taint
+    /// at the moment the agent commits it: a delivery appended to the
+    /// transcript at run assembly, or a steer written into the running turn's
+    /// transcript at a model boundary. One event per committed comms block, so
+    /// a host taint tracker classifies peer ingestion from typed facts
+    /// (canonical peer identity + the sender's signed content-taint
     /// declaration) instead of parsing rendered projection text.
     ///
     /// The event stream is best-effort observability (see `event_tap`); the
@@ -2984,6 +2986,12 @@ pub enum AgentEvent {
         /// third state that consumers must never coalesce into `Clean`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sender_taint: Option<crate::comms::SenderContentTaint>,
+        /// The delivery id of an incoming peer message (the sender's envelope
+        /// id, which `reply_to_peer` takes as `reply_to`), read from the same
+        /// transcript block. `None` for other kinds and for deliveries that
+        /// carry no id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_id: Option<crate::interaction::InteractionId>,
     },
 
     /// One model turn's provider token accounting was absent.
@@ -3912,6 +3920,8 @@ mod tests {
                 summary: None,
                 payload: None,
                 content: Vec::new(),
+                delivery_id: None,
+                in_reply_to: None,
             }
         }
 
@@ -3936,8 +3946,10 @@ mod tests {
                     peer,
                     request_id,
                     sender_taint,
+                    delivery_id,
                 } => {
                     assert_eq!(*kind, CommsNoticeKind::Message);
+                    assert_eq!(*delivery_id, None, "no delivery id on the block");
                     assert!(peer.is_some(), "peer identity must project");
                     assert_eq!(request_id.as_deref(), Some("req-1"));
                     assert_eq!(*sender_taint, Some(SenderContentTaint::Tainted));

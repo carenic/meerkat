@@ -420,6 +420,57 @@ them.
   `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
   it with `{ stage, .. }`. The settlement follows the exact registration's
   runtime unregister after Shutdown returns.
+- Behaviour (no type change): every content steer admitted while a turn runs
+  (a prompt, a peer message, request or lifecycle notice, an external event or
+  a local flow step) is now written into the running turn's transcript at a
+  model boundary (`MeerkatMachine` delivery class `DurableAppend`) or, when it
+  carries something only a fresh turn applies or is a directed delivery,
+  taken by exactly one follow-up turn. Before, peer message and request
+  steers and text-only prompt steers reached exactly one model request and
+  never the transcript. Hosts and consoles now see their rows in history,
+  `boundary_append_applied` when the runner writes them, and one
+  `peer_content_ingested` per incoming comms notice. Durable steers join one
+  per boundary, in arrival order: a steer admitted while an earlier one still
+  waits joins the boundary after it, in the same run, instead of falling back
+  to the follow-up turn; steers still waiting when the run ends take the
+  follow-up turn in arrival order. Before, every peer or text steer admitted
+  during one boundary reached the next model request; now one durable steer
+  joins per boundary, and the later ones land at later boundaries of the run
+  or in the follow-up turn.
+- `meerkat-core`: `SystemNoticeBlock::Comms` and
+  `AgentEvent::PeerContentIngested` gain the field
+  `delivery_id: Option<InteractionId>`: the delivery id of an incoming peer
+  message, which `reply_to_peer` takes as `reply_to` (see Fixed). Struct
+  literals and exhaustive patterns of either variant name it. On the wire it
+  is optional (`delivery_id` on the notice block and on
+  `peer_content_ingested`) and omitted when absent.
+- `meerkat-core`: `CommsCommand::PeerMessage`, `InteractionContent::Message`
+  and `SystemNoticeBlock::Comms` gain `in_reply_to: Option<InteractionId>`;
+  `meerkat-comms`: `MessageKind::Message` gains `in_reply_to: Option<Uuid>`;
+  `meerkat-runtime`: `PeerInput` gains `in_reply_to`. It is the delivery a
+  `reply_to_peer` reply answers (see Added). Struct literals and exhaustive
+  patterns name it. On the wire it is optional (`in_reply_to` on the notice
+  block) and omitted when absent.
+- Behaviour (no type change): the text the model reads for an incoming peer
+  message notice now carries a `Delivery ID: <id>` line after its payload, and
+  an `In reply to: <id>` line when the message is a reply.
+- Compatibility (not measured by the gate): the transcript content digest
+  erases a comms notice's `delivery_id` and `in_reply_to`, as it erases a
+  notice's runtime origin, so a row's revision is the same with or without
+  them. A 0.9.3 reader, which drops the keys when it decodes the row, computes
+  the revision 0.9.4 stored and loads the session. One residual: an append
+  retried after a crash over rows already stored compares the re-serialized
+  rows byte for byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote
+  would refuse the retry; the stored input state 7 entry above already keeps
+  0.9.3 off a runtime store that 0.9.4 wrote.
+- Compatibility (wire): a 0.9.3 receiver that checks signatures (the default,
+  and always at a host acceptor) refuses a `reply_to_peer` reply from 0.9.4.
+  Its message kind does not know `in_reply_to`, so it re-serializes the signed
+  envelope without the field, the signature check fails, and it drops the
+  envelope; the sender sees no acknowledgement, and `reply_to_peer` reports an
+  ambiguous delivery outcome, not a failure. A 0.9.3 receiver with peer auth
+  off accepts the reply without the label. `send_message` and every other
+  message kind are unchanged, so a 0.9.3 peer still receives them.
 
 ### Security
 
@@ -781,6 +832,31 @@ them.
   staged reason and leaves a hold the current registration applies in place.
   A runtime unregister keeps staged reasons, so a registration that replaces
   the session's (a reload) applies them.
+- `meerkat-comms`: a receiver checks a peer envelope's signature over the
+  envelope as received, including message-kind fields it does not know, and
+  drops such fields only after the check. A newer sender can add an optional
+  field to a signed message kind without 0.9.4 receivers refusing the
+  message. An envelope whose encoding repeats a map key, or keys a map by
+  anything but a text string, at any depth is refused. A request carrying an
+  unknown field keeps its delivery but not its TCP callback route.
+- `meerkat-core`: `ToolDispatchContext::peer_reply_deliveries` returns the
+  running turn's reply capabilities as one typed list (the deliveries that
+  started the turn and those that joined it at a model boundary, one per
+  sender and delivery id), or `PeerReplyContextError::Malformed` when the
+  turn-start list does not parse. `PeerReplyDispatchContext::insert_delivery`
+  adds a delivery unless the same sender's delivery with that id is listed.
+  `DurableTurnBoundaryAppends::with_peer_reply_capabilities` and
+  `peer_reply_capabilities` carry a durable in-turn delivery's reply
+  capabilities to the runner.
+- `meerkat-comms`: `ReplySelectionError` (`#[non_exhaustive]`), the typed
+  refusals of reply selection (`NoReplyCapability`, `InvalidReplyContext`,
+  `UnknownReplyTo`, `AmbiguousReply`); `reply_to_peer` reports each with its
+  stable code prefix.
+- A reply sent with `reply_to_peer` names the delivery it answers: the
+  signed message carries that delivery id as `in_reply_to`, and the
+  receiver's message notice shows it as an `In reply to` line (`meerkat-comms`,
+  `meerkat-core`, `meerkat-runtime`). It is a label the sender declares:
+  routing and authorization never read it, and `send_message` never sets it.
 
 ### Changed
 
@@ -1479,6 +1555,27 @@ them.
   registration whose runtime loop is still attached keeps its fence until
   that loop hands it back, and the discard waits for that handoff, as
   before.
+- A peer message or request steered into a running turn was shown to the
+  model for one request and then lost (`meerkat-runtime`,
+  `meerkat-machine-schema`):
+  the machine classified it request-only, so it was consumed when it was
+  injected, never written to the transcript, missing from every later request
+  of the run and from history, and no `peer_content_ingested` event was
+  published for it. Text-only prompt steers, external-event steers and local
+  flow-step steers lost the same way. They now take the durable in-turn path
+  (see Breaking): one transcript row, committed with the run, recovered by
+  exactly one follow-up turn when its image is discarded or the process stops
+  mid-run. Pre-existing in 0.9.2 and 0.9.3.
+- `reply_to_peer` can answer a peer message that joined the running turn
+  (`meerkat-core`, `meerkat-runtime`, `meerkat-comms`). The turn's reply
+  capabilities came only from the deliveries that started it, so a message
+  delivered into the running turn was refused with `no_reply_capability`, or
+  with `unknown_reply_to` for its id. The durable in-turn delivery now adds
+  the message's reply capability to the running turn, and the message's
+  notice shows the `Delivery ID` that `reply_to` takes. When the selected id
+  matches deliveries of two different senders in one turn, the tool refuses
+  with `ambiguous_reply`, names each sender and sends nothing; before, it
+  answered the first. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

@@ -56,12 +56,18 @@ struct StampedInput {
     own_interaction: bool,
 }
 
-fn stamp_input(
+/// The turn metadata `input` carries of its own, before the admission
+/// semantics stamp execution facts onto it: a prompt's or flow step's
+/// caller-authored metadata, and the handling mode, render metadata, System
+/// prompts and objective an external event or peer input brings. Admission
+/// reads it to decide whether a running turn can honour the input
+/// ([`crate::input::admission_turn_append_shape`]); [`for_input`] stamps the
+/// rest onto the same value, so the two can never disagree.
+pub(crate) fn input_own_turn_metadata(
     input: &Input,
-    semantics: crate::ingress_types::RuntimeInputSemantics,
-) -> StampedInput {
+) -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
     use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
-    let mut metadata = match input {
+    match input {
         Input::Prompt(prompt) => prompt.turn_metadata.clone().unwrap_or_default(),
         Input::FlowStep(flow_step) => flow_step.turn_metadata.clone().unwrap_or_default(),
         Input::ExternalEvent(event) => RuntimeTurnMetadata {
@@ -88,7 +94,14 @@ fn stamp_input(
             ..Default::default()
         },
         _ => RuntimeTurnMetadata::default(),
-    };
+    }
+}
+
+fn stamp_input(
+    input: &Input,
+    semantics: crate::ingress_types::RuntimeInputSemantics,
+) -> StampedInput {
+    let mut metadata = input_own_turn_metadata(input);
     // Directed terminal publication is runtime-minted capability data. Never
     // preserve IDs supplied through caller-authored turn metadata.
     metadata.directed_interaction_ids.clear();
@@ -254,14 +267,19 @@ pub(crate) fn merge_batch_turn_metadata(
         metadata.request_reasoning_disposition = request_reasoning.finish();
     }
     // Batch-level peer-reply capability mint: every peer *message* delivery
-    // in the admitted batch contributes one typed reply capability. Minted
-    // AFTER the per-input fold so the scalar overlay merge above never sees a
-    // runtime-minted overlay (which would spuriously conflict across inputs).
-    let deliveries = inputs
+    // in the admitted batch contributes one typed reply capability, keyed by
+    // (sender, delivery id) so two senders that chose the same id each keep
+    // their own. Minted AFTER the per-input fold so the scalar overlay merge
+    // above never sees a runtime-minted overlay (which would spuriously
+    // conflict across inputs).
+    let mut deliveries = meerkat_core::comms::PeerReplyDispatchContext::default();
+    for capability in inputs
         .iter()
         .filter_map(|(_, input)| crate::input::peer_reply_capability(input))
-        .collect::<Vec<_>>();
-    if !deliveries.is_empty() {
+    {
+        deliveries.insert_delivery(capability);
+    }
+    if !deliveries.deliveries.is_empty() {
         // `for_input` stamps `execution_kind` on every input, so a non-empty
         // batch always folded into `Some`; a missing accumulator here is a
         // logic error and fails closed with a typed error.
@@ -432,11 +450,10 @@ impl TranscriptIdentityConsensus {
 /// NOT a second `RuntimeTurnMetadata` construction site.
 fn attach_peer_reply_capabilities(
     metadata: &mut meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata,
-    deliveries: Vec<meerkat_core::comms::PeerReplyCapability>,
+    context: meerkat_core::comms::PeerReplyDispatchContext,
 ) -> Result<(), meerkat_core::lifecycle::run_primitive::TurnMetadataMergeConflict> {
     use meerkat_core::lifecycle::run_primitive::TurnMetadataMergeConflict;
 
-    let context = meerkat_core::comms::PeerReplyDispatchContext { deliveries };
     let value = serde_json::to_value(&context).map_err(|error| {
         tracing::error!(
             error = %error,
@@ -9597,6 +9614,7 @@ mod tests {
             content: "peer message".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         assert_eq!(input_to_prompt(&input), "peer message");
     }
@@ -9630,6 +9648,7 @@ mod tests {
             content: "plain body payload".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
 
         assert_eq!(input_to_prompt(&input), "plain body payload");
@@ -9667,6 +9686,7 @@ mod tests {
             content: "stale helper-local comms prose".into(),
             payload: Some(serde_json::json!({"subject": "alpha beta gamma"})),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let prompt = input_to_prompt(&input);
@@ -9716,6 +9736,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -9774,6 +9795,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
@@ -9846,6 +9868,8 @@ mod tests {
                     summary: Some("Peer message".to_string()),
                     payload: None,
                     content: Vec::new(),
+                    delivery_id: None,
+                    in_reply_to: None,
                 }],
             },
             identity: None,
@@ -10001,6 +10025,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
         let input_id = input.id().clone();
 
@@ -10077,6 +10102,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
@@ -10133,6 +10159,7 @@ mod tests {
             content: String::new().into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
             .expect("single input metadata cannot conflict");
@@ -10193,6 +10220,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
             .expect("single input metadata cannot conflict");
@@ -10264,6 +10292,7 @@ mod tests {
                 "token": "birch seventeen"
             })),
             handling_mode: None,
+            in_reply_to: None,
         });
 
         let policy = crate::policy_table::DefaultPolicyTable::resolve(&input, true);
@@ -10333,6 +10362,7 @@ mod tests {
             content: body.into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -11048,6 +11078,66 @@ mod tests {
         );
     }
 
+    /// Reply capabilities are keyed by (sender, delivery id): two senders that
+    /// chose the same id each keep their own capability, so `reply_to_peer`
+    /// answers ambiguous instead of routing to whichever came first, and one
+    /// sender's repeated id collapses to one.
+    #[test]
+    fn peer_message_batch_keys_reply_capabilities_by_sender_and_id() {
+        let first_peer = uuid::Uuid::from_u128(0xB1);
+        let second_peer = uuid::Uuid::from_u128(0xB2);
+        let shared_id = uuid::Uuid::from_u128(9);
+        let message = |peer: uuid::Uuid, body: &str| {
+            let mut input = make_peer_message(&peer.to_string(), body);
+            if let Input::Peer(peer) = &mut input {
+                peer.header.correlation_id = Some(crate::CorrelationId::from_uuid(shared_id));
+            }
+            input
+        };
+        let inputs = vec![
+            (InputId::new(), message(first_peer, "from the first sender")),
+            (
+                InputId::new(),
+                message(second_peer, "same id, second sender"),
+            ),
+            (
+                InputId::new(),
+                message(first_peer, "same id, first sender again"),
+            ),
+        ];
+        let semantics = inputs
+            .iter()
+            .map(|(_, input)| admission_semantics(input))
+            .collect::<Vec<_>>();
+
+        let metadata = merge_batch_turn_metadata(&inputs, &semantics)
+            .expect("peer message batch must merge")
+            .expect("peer message batch carries metadata");
+
+        let overlay = metadata
+            .turn_tool_overlay
+            .expect("peer message batch must mint a reply-capability overlay");
+        let context = reply_context_from_overlay(&overlay);
+        assert_eq!(
+            context
+                .deliveries
+                .iter()
+                .map(|capability| (capability.peer_id, capability.in_reply_to))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    meerkat_core::comms::PeerId::from_uuid(first_peer),
+                    InteractionId(shared_id)
+                ),
+                (
+                    meerkat_core::comms::PeerId::from_uuid(second_peer),
+                    InteractionId(shared_id)
+                ),
+            ],
+            "each sender keeps its own capability for a shared id, once"
+        );
+    }
+
     /// Non-message peer conventions and non-canonical peer ids mint no
     /// overlay at the batch level.
     #[test]
@@ -11163,6 +11253,7 @@ mod tests {
             content: String::new().into(),
             payload: Some(serde_json::json!({"ok": true})),
             handling_mode: None,
+            in_reply_to: None,
         })
     }
 
@@ -12643,6 +12734,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let input_id = input.id().clone();
         let primitive =
@@ -12710,6 +12802,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -12771,6 +12864,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -12831,6 +12925,7 @@ mod tests {
             content: meerkat_core::types::ContentInput::Blocks(blocks.clone()),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let staged = match input_to_primitive(&input, input.id().clone())
             .expect("single input metadata cannot conflict")
@@ -13082,6 +13177,7 @@ mod tests {
                     content: InteractionContent::Message {
                         body: "build failed".into(),
                         blocks: None,
+                        in_reply_to: None,
                     },
                     rendered_text: "External event via webhook: build failed".into(),
                     handling_mode: meerkat_core::types::HandlingMode::Queue,
@@ -14457,6 +14553,7 @@ mod tests {
             content: "done".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let id = input.id().clone();
         let primitive =
@@ -14502,6 +14599,7 @@ mod tests {
             content: "msg".into(),
             payload: None,
             handling_mode: None,
+            in_reply_to: None,
         });
         let continuation =
             Input::Continuation(ContinuationInput::detached_background_op_completed());

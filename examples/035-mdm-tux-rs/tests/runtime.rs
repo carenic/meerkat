@@ -861,6 +861,7 @@ fn managed_peer_ingress_and_schedule_use_the_rpc_session_owner() {
                 content_taint: None,
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 objective_id: None,
+                in_reply_to: None,
             })
             .await
             .unwrap();

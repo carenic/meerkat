@@ -9,6 +9,19 @@
 # deterministic-prefix constraint. Nothing is hand-copied, so a DSL change
 # regenerates ci.cfg and the audit follows it; an anchor this script expects
 # but cannot find fails the run instead of silently narrowing the check.
+#
+# The safety run admits the late Steer input as a Prompt. That stands for every
+# content input kind: the admission writes the kind only into input_is_prompt,
+# and nothing in the generated model reads that flag's value, so every kind
+# reaches the Prompt run's states up to the flag. This script checks both
+# premises on the generated model before it runs TLC and fails if either stops
+# holding. DURABLE_STEER_AUDIT_ALL_KINDS=1 runs the safety run over every
+# content kind instead (by hand; about twice the cost).
+#
+# It then runs TLC once per content kind with the late input narrowed to that
+# kind and AuditLateNeverJoins as an extra invariant, and requires TLC to report
+# it violated: the admission lets every kind join within the bound, so the
+# exactly-once invariants are not vacuous for any of them.
 set -euo pipefail
 
 max_steps="${1:?usage: durable_in_turn_steer_audit.sh <max-steps> [extra tlc args...]}"
@@ -21,7 +34,8 @@ fi
 spec_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ci_cfg="${spec_dir}/ci.cfg"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/durable-steer-audit.XXXXXX")"
-trap 'rm -rf "${work_dir}"' EXIT
+# An interrupted or killed run ends its TLC child too (tlc_run_cap.sh).
+trap 'if declare -F tlc_run_cap_reap >/dev/null; then tlc_run_cap_reap; fi; rm -rf "${work_dir}"' EXIT
 audit_cfg="${work_dir}/audit.cfg"
 
 replace_exact_line() {
@@ -43,8 +57,16 @@ replace_exact_line "  InputIdValues = {}" '  InputIdValues = {"input_batch", "in
 replace_exact_line "  RunIdValues = {}" '  RunIdValues = {"runid_1"}' "${audit_cfg}"
 replace_exact_line "  SessionIdValues = {}" '  SessionIdValues = {"sessionid_1"}' "${audit_cfg}"
 replace_exact_line "  StringValues = {}" '  StringValues = {"input_batch", "input_late", "alpha"}' "${audit_cfg}"
+content_kinds=(Prompt PeerMessage PeerRequest ExternalEvent FlowStep)
+if [[ "${DURABLE_STEER_AUDIT_ALL_KINDS:-0}" == "1" ]]; then
+  safety_kinds="$(printf '"%s", ' "${content_kinds[@]}")"
+  safety_kinds="${safety_kinds%, }"
+else
+  safety_kinds='"Prompt"'
+fi
 replace_exact_line "CONSTANTS" "CONSTANTS
-  AuditMaxSteps = ${max_steps}" "${audit_cfg}"
+  AuditMaxSteps = ${max_steps}
+  AuditLateKinds = {${safety_kinds}}" "${audit_cfg}"
 replace_exact_line "INVARIANTS" "INVARIANTS
   AuditRetainedJoinNeverRequeued
   AuditPublishedJoinIsStaged
@@ -62,16 +84,87 @@ if [[ " ${JDK_JAVA_OPTIONS:-} " != *" -Xss"* ]]; then
   export JDK_JAVA_OPTIONS="-Xss512m${JDK_JAVA_OPTIONS:+ ${JDK_JAVA_OPTIONS}}"
 fi
 
+# The premises that let the Prompt safety run stand for every content kind.
+# 1. The late admission's updates read the kind only to set input_is_prompt
+#    (and the execution kind, which is "ContentTurn" for every content kind).
+# 2. The generated model never reads input_is_prompt's values: it appears only
+#    in its own updates, Init, the variable lists and the DOMAIN sizes of the
+#    state constraints.
+model="${spec_dir}/model.tla"
+if [[ "${DURABLE_STEER_AUDIT_ALL_KINDS:-0}" != "1" ]]; then
+  admission_kind_updates="$(
+    awk '/^ResolveAdmissionPlanRequestedSteerRunning\(/ { body = 1 } body && /^$/ { exit } body' "${model}" \
+      | grep -E "^ +/\\\\ [a-z_]+' = " | grep -F 'input_kind' || true
+  )"
+  expected_admission_kind_updates="$(printf '%s\n' \
+    "    /\\ input_runtime_execution_kind' = MapSet(input_runtime_execution_kind, input_id, (IF (input_kind = \"Continuation\") THEN \"ResumePending\" ELSE \"ContentTurn\"))" \
+    "    /\\ input_is_prompt' = MapSet(input_is_prompt, input_id, (input_kind = \"Prompt\"))")"
+  if [[ "${admission_kind_updates}" != "${expected_admission_kind_updates}" ]]; then
+    printf '%s\n' "${admission_kind_updates}" >&2
+    echo "error: ResolveAdmissionPlanRequestedSteerRunning now writes the input kind elsewhere; the Prompt safety run no longer stands for every content kind (run with DURABLE_STEER_AUDIT_ALL_KINDS=1 and widen the default)" >&2
+    exit 1
+  fi
+  flag_reads="$(
+    grep -n -F 'input_is_prompt' "${model}" \
+      | grep -v -E "^[0-9]+:(UnchangedFrame_|VARIABLES |vars == |[A-Za-z]+StateConstraint == )" \
+      | grep -v -E "^[0-9]+: +/\\\\ input_is_prompt' = " \
+      | grep -v -F -x "$(grep -n -F -x '    /\ input_is_prompt = [x \in {} |-> None]' "${model}" || true)" \
+      || true
+  )"
+  map_reads="$(grep -o -E 'Map[A-Za-z]*\(input_is_prompt,' "${model}" | grep -v -E '^Map(Set|Remove)\(' || true)"
+  if [[ -n "${flag_reads}" || -n "${map_reads}" ]] || grep -q -F 'input_is_prompt[' "${model}"; then
+    printf '%s\n' "${flag_reads}" "${map_reads}" >&2
+    echo "error: the generated model now reads input_is_prompt; the Prompt safety run no longer stands for every content kind (run with DURABLE_STEER_AUDIT_ALL_KINDS=1 and widen the default)" >&2
+    exit 1
+  fi
+fi
+
 workers="${TLC_WORKERS:-auto}"
-log="${work_dir}/tlc.log"
+# Each TLC run is held to the canonical lane's per-run cap (fails closed as
+# TLC INCOMPLETE, exit 3).
+# shellcheck source=tlc_run_cap.sh
+source "${spec_dir}/tlc_run_cap.sh"
 cd "${spec_dir}"
-set +e
-tlc -workers "${workers}" -metadir "${work_dir}/states" -config "${audit_cfg}" "$@" \
-  durable_in_turn_steer_audit.tla 2>&1 | tee "${log}"
-tlc_status="${PIPESTATUS[0]}"
-set -e
-if [[ "${tlc_status}" != "0" ]] || ! grep -q "Model checking completed. No error has been found." "${log}"; then
+
+# run_tlc <name> <cfg> -> leaves the log at ${work_dir}/<name>.log
+run_tlc() {
+  local name="$1" cfg="$2"
+  local log="${work_dir}/${name}.log"
+  tlc_status=0
+  # Goal runs end in a violation by design: -noGenerateSpecTE keeps TLC from
+  # writing trace-explorer specs next to the model.
+  tlc_run_capped durable_in_turn_steer_audit "${name}" "${log}" \
+    -workers "${workers}" -metadir "${work_dir}/${name}-states" -noGenerateSpecTE -config "${cfg}" "${extra_tlc_args[@]}" \
+    durable_in_turn_steer_audit.tla || tlc_status=$?
+  grep -E 'states generated|distinct states|is violated|Error:' "${log}" | sed "s/^/[${name}] /" || true
+}
+extra_tlc_args=("$@")
+
+run_tlc safety "${audit_cfg}"
+if [[ "${tlc_status}" != "0" ]] \
+  || ! grep -q "Model checking completed. No error has been found." "${work_dir}/safety.log"; then
+  cat "${work_dir}/safety.log" >&2
   echo "error: durable in-turn steer audit failed (tlc exit ${tlc_status}, bound ${max_steps})" >&2
   exit 1
 fi
-echo "durable in-turn steer audit passed at model_step_count <= ${max_steps}"
+
+# Every content kind must reach a durable join within the bound: TLC has to
+# report AuditLateNeverJoins violated with the late input narrowed to it.
+for kind in "${content_kinds[@]}"; do
+  name="join-${kind}"
+  goal_cfg="${work_dir}/${name}.cfg"
+  if ! FROM="  AuditLateKinds = {${safety_kinds}}" TO="  AuditLateKinds = {\"${kind}\"}" \
+    awk '$0 == ENVIRON["FROM"] { print ENVIRON["TO"]; found = 1; next } { print } END { exit found ? 0 : 1 }' \
+    "${audit_cfg}" > "${goal_cfg}"; then
+    echo "error: the audit config lost its AuditLateKinds line" >&2
+    exit 1
+  fi
+  printf 'INVARIANT\n  AuditLateNeverJoins\n' >> "${goal_cfg}"
+  run_tlc "${name}" "${goal_cfg}"
+  if ! grep -q "AuditLateNeverJoins is violated" "${work_dir}/${name}.log"; then
+    cat "${work_dir}/${name}.log" >&2
+    echo "error: durable in-turn steer audit: a late ${kind} steer never joins within bound ${max_steps}" >&2
+    exit 1
+  fi
+done
+echo "durable in-turn steer audit passed at model_step_count <= ${max_steps} (safety kinds {${safety_kinds}}; ${#content_kinds[@]} content kinds join)"
