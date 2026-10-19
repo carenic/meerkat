@@ -4,6 +4,7 @@
 //! commit, while the model request prepares.
 
 use super::*;
+use meerkat_authorization_contracts::audit::AuditRefusalBasis;
 use meerkat_core::OperationId;
 use meerkat_core::authorization::{
     OWNER_CHANGE_FREE_REBUILDS, OwnerChangeInProgress, PolicyPublicationObservation,
@@ -412,6 +413,23 @@ fn refusal_notice(messages: &[Message]) -> bool {
     })
 }
 
+/// Every refusal record names the change it met: still in progress, at the
+/// odd publication the held change began.
+fn assert_refusals_met(records: &[&AuditObservation], held: OwnerChangeInProgress) {
+    for record in records {
+        if let AuditObservation::Refused { read, .. } = record {
+            let read = read.as_ref().expect("a refusal carries its read");
+            assert_eq!(read.basis, AuditRefusalBasis::ChangeInProgress);
+            assert_eq!(read.live_sequence, Some(read.publication_sequence));
+            assert_eq!(
+                OwnerChangeInProgress::new(read.publication_instance, read.publication_sequence),
+                held,
+                "the refusal read the held change"
+            );
+        }
+    }
+}
+
 /// An owner change held across the first model request outlasts the
 /// request's immediate rebuild. The request waits for it to complete and
 /// rebuilds under the same operation: the run answers with no refusal
@@ -484,6 +502,7 @@ async fn a_held_owner_change_is_waited_out_by_the_native_model_request() {
             .all(|reason| *reason == OperationRefusalKind::ReprepareRequired),
         "{refused:?}"
     );
+    assert_refusals_met(&records, held);
     assert!(
         !records.iter().any(|observation| matches!(
             observation,
@@ -669,6 +688,7 @@ async fn a_held_owner_change_is_waited_out_by_the_native_tool_dispatch() {
             .all(|reason| *reason == OperationRefusalKind::ReprepareRequired),
         "{refused:?}"
     );
+    assert_refusals_met(&records, held);
     let prepared: Vec<u64> = records
         .iter()
         .filter_map(|observation| match observation {

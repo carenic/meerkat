@@ -22,7 +22,8 @@ pub use meerkat_authorization::policy::{
 pub use meerkat_authorization::publication::LocalAuthorizationPublication;
 pub use meerkat_authorization::work::HostAuthorizationClock;
 pub use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, ExactRestriction, ExecutionRestrictions, ProcessorRef, ResourceDomain,
+    ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    ProcessorRef, ResourceDomain,
 };
 pub use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -155,7 +156,7 @@ pub fn domain() -> ResourceDomain {
 pub fn ceiling(action_name: &str) -> ExecutionRestrictions {
     let mut bounds = ExecutionRestrictions::unrestricted();
     bounds.actions = ExactRestriction::exact([action(action_name)]);
-    bounds.resource_domains = ExactRestriction::exact([domain()]);
+    bounds.resource_domains = DomainRestriction::exact([domain()]);
     bounds.processors = ExactRestriction::exact([ProcessorRef::Principal {
         principal: principal("executor"),
     }]);

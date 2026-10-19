@@ -235,8 +235,8 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `closure-tests`: the deterministic workspace test lanes (`scripts/pre-push-unit.sh`) for the test scope: integration-fast, HeadCanonical and `e2e-fast` rows | deferred | yes | `make test-int`, `make e2e-fast` | Bazel integration lanes |
 | `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | deferred | yes | - | - |
 | `feature-check`: the changed packages' Bazel feature sets and the Make feature-matrix check rows | deferred | yes | feature matrix | Bazel graph |
-| `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | deferred | yes | - | - |
-| `wasm-check` | when the web runtime, the contracts or the CLI web template change | yes | browser contract suite | Bazel wasm-check |
+| `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | when the pull request touches the lane's own inputs (`GUARD_LANE_INPUTS`: the files defining the selected cases and their crates' manifests), changes its definition between base and head (`GUARD_LANE_DEFINITIONS`: its ci.yml job without comments, the Makefile's confinement rule and assignments, the default nextest profile's selection, the selected modules' declarations) or has no diff, deferred otherwise | yes | - | - |
+| `wasm-check` | when the web runtime or a workspace crate it compiles (its dependency closure, the provider crates included) or the CLI web template changes, or the plan is the whole workspace | yes | browser contract suite | Bazel wasm-check |
 | `sdk-host`: Python + TypeScript SDK suites | deferred | yes | yes, plus Web SDK | Bazel SDK suites |
 | `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change | yes | - | - |
 | dense Mob topology, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
@@ -402,7 +402,18 @@ graph.
 - Nightly, `cargo.yml` and the dense Mob topology workflow still install
   sccache through `mozilla-actions/sccache-action` (with a pinned
   `version`), by design: they use its GitHub Actions cache backend, which
-  needs the token the action exports.
+  needs the token the action exports. A failed install there leaves the job
+  without sccache too: the step continues on error, and the next one sets
+  an empty `RUSTC_WRAPPER` with a warning.
+- A CI lane downloads the pinned sccache release with the job's own token
+  first (`gh release download`) and from the anonymous release URL only
+  when that fails. A lane that cannot download it either way (every try
+  answered 403, say), or whose sccache server does not start, runs without
+  sccache, with a warning that names the cause: it compiles cold, and a
+  pull request's gate still holds it to the lane execution budget. A
+  download whose sha256 does not match the pin still fails the lane. Once
+  installed, a server that stops answering mid-job degrades a compile to a
+  plain rustc run (`SCCACHE_IGNORE_SERVER_IO_ERROR`) instead of failing it.
 - A release job whose checkout can be an older tag runs its setup action
   from `.release-tooling`, a sparse checkout of the workflow's own commit,
   but a local action that action calls in turn (`uses: ./.github/actions/...`)
@@ -524,7 +535,7 @@ and publishes the platform-specific release artifacts from the attested
 source. The critical Linux and macOS arm64 archives publish first; Windows
 binaries are cross-compiled and packaged with cargo-xwin (clang-cl, lld-link,
 the Windows SDK) on a hosted Ubuntu runner, then executed for verification on
-a windows-latest runner, and Intel macOS binaries are cross-compiled on an
+a windows-2025-vs2026 runner, and Intel macOS binaries are cross-compiled on an
 Apple silicon runner; those trailing archives are added afterwards, never
 replacing a published asset. A pre-tag prebuild
 (`make release-prebuild`, a `release.yml` dispatch on `main` that publishes

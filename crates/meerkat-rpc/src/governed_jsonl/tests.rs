@@ -22,7 +22,8 @@ use meerkat_authorization_contracts::audit::{
     AuditObservation, AuditTarget, StoredAuthorizationAuditObservation,
 };
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, ExactRestriction, ExecutionRestrictions, ProcessorRef, ResourceDomain,
+    ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    ProcessorRef, ResourceDomain,
 };
 use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -138,7 +139,7 @@ fn domain() -> ResourceDomain {
 fn ceiling(action_name: &str) -> ExecutionRestrictions {
     let mut bounds = ExecutionRestrictions::unrestricted();
     bounds.actions = ExactRestriction::exact([action(action_name)]);
-    bounds.resource_domains = ExactRestriction::exact([domain()]);
+    bounds.resource_domains = DomainRestriction::exact([domain()]);
     bounds.processors = ExactRestriction::exact([ProcessorRef::Principal {
         principal: principal("executor"),
     }]);
@@ -1620,7 +1621,7 @@ async fn governed_jsonl_public_entry_preserves_refusal_sibling_feedback_and_comp
             .iter()
             .filter(|record| {
                 matches!(&record.observation.observation,
-            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
             if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
                 if call_id == DENIED_CALL && tool_name == "delete_record"))
             })
@@ -1756,7 +1757,7 @@ async fn governed_jsonl_public_entry_preserves_refusal_sibling_feedback_and_comp
             refused
                 .iter()
                 .filter(|record| matches!(&record.observation.observation,
-            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
             if matches!(target.as_ref(), AuditTarget::Model(_))))
                 .count(),
             1
@@ -2139,7 +2140,7 @@ async fn governed_jsonl_refusal_retains_actor_seed_and_context_then_same_run_rea
             .iter()
             .filter(|record| {
                 matches!(&record.observation.observation,
-            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
             if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
                 if call_id == DENIED_CALL && tool_name == "delete_record"))
             })

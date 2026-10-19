@@ -666,7 +666,7 @@ async fn exercise_a2(server: &Server, order: Order) {
         );
     }
     let refused: Vec<_> = audit.iter().filter(|record| matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == DELETE_T && tool_name == "delete_record"))).collect();
     assert_eq!(refused.len(), 1);
     let denied_operation_id = refused[0].observation.operation_id.clone();

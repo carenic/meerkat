@@ -115,8 +115,11 @@ pub enum OperationEntryBoundary {
     ToolDispatch,
     /// The call-level execution policy gate's staging of a tool call
     /// ([`crate::ExecutionPolicyGatedDispatcher`]), after the gate's own
-    /// awaits. A staging that waits out an owner change in progress records
-    /// its entry again, for the decision prepared after the change.
+    /// awaits. Like the root staging, it records its entry between its first
+    /// and final checks: when the final check refuses while an owner change
+    /// is in progress, and the staging waits that change out and stages
+    /// again, the operation records this boundary twice, the second time for
+    /// the decision checked after the wait.
     ToolExecutionPolicy,
     /// The owning tool leaf's single consuming entry, immediately before
     /// its effect or transport handoff

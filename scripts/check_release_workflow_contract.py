@@ -1297,6 +1297,7 @@ PREBUILD_INPUT = "prebuild_release_artifacts"
 PREBUILD_LOOKUP_JOB = "release_prebuild"
 PREBUILD_GATE_JOB = "release_prebuild_gate"
 PREBUILD_LOOKUP_SCRIPT = "scripts/release-find-prebuild"
+PREBUILD_BACKEND_REFUSAL = "A release prebuild builds with the backend its tag run selects"
 PROVENANCE_VERIFIER = "scripts/verify-release-asset-provenance"
 BINARY_BUILD_JOBS = (
     "build_binaries",
@@ -1651,6 +1652,40 @@ def check_prebuild(text: str) -> list[str]:
             f"job `{WEB_SDK_PUBLISH_JOB}` must verify the prebuilt package's attestation "
             f"(`gh attestation verify ... --source-ref refs/heads/main`) before publishing on {reused.label}"
         )
+
+    # 7. A prebuild builds with the backend its tag run selects: on the other
+    #    one its critical lanes queue behind other runners and miss the tag's
+    #    bounded wait. The request refuses the other backend, for the owner
+    #    and for others, with MEERKAT_RELEASE_BUILDBUDDY true, 1, false and
+    #    unset; the tag's choice is read from whether its GitHub-hosted
+    #    critical lane runs.
+    if len(requests) == 1:
+        request = requests[0]
+        for actor in ("lukacf", "release-bot"):
+            for flag in ("true", "1", "false", ""):
+                variables = {"MEERKAT_RELEASE_BUILDBUDDY": flag} if flag else {}
+                tag_run = EventContext(**{**fresh.__dict__, "actor": actor, "variables": variables})
+                selected = "github-hosted" if _job_runs(text, "build_binaries", tag_run) else "buildbuddy"
+                for backend in ("github-hosted", "buildbuddy"):
+                    context = EventContext(
+                        **{
+                            **prebuild.__dict__,
+                            "label": (
+                                f"a prebuild by {actor} with release_backend={backend} "
+                                f"(MEERKAT_RELEASE_BUILDBUDDY {flag or 'unset'})"
+                            ),
+                            "actor": actor,
+                            "variables": variables,
+                            "inputs": {**prebuild.inputs, "release_backend": backend},
+                        }
+                    )
+                    status, output = _run_gate_script(request, context)
+                    refused = status != 0 and PREBUILD_BACKEND_REFUSAL in output
+                    if refused != (backend != selected):
+                        violations.append(
+                            f"step `{request.name}` {'refuses' if refused else 'accepts'} {context.label}, "
+                            f"whose tag run builds on {selected}"
+                        )
     return violations
 
 SEMVER_BASELINE_JOB = "publish_semver_baseline"
@@ -2015,12 +2050,14 @@ BAZEL_REPOSITORY_CACHE = ("key", "buildbuddy-bazel-repository-*")
 # its inputs choose, saves no cache: it would save into the scope the next
 # trusted run restores from.
 TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml")
-# The one release.yml job that restores a cache: the semver gate's dispatch
-# measurement, whose family release-semver-readiness.yml's push to main
-# writes. Every other release job restores none, on a tag or a dispatch
-# (a prebuild or a recovery): nothing on main saves their keys, so a
-# restore could only return an entry some other run wrote.
-RELEASE_RESTORE_JOBS = ("release_semver_gate",)
+# The release.yml jobs that may restore a cache: none. No release job
+# restores one, on a tag or a dispatch (a prebuild, a recovery or the
+# semver gate's measurement): nothing on main saves their keys, so a
+# restore could only return an entry some other run wrote. The semver
+# measurement builds through repo-cargo in a per-run target directory, so a
+# target cache never reached it. release-semver-readiness.yml's measurement,
+# which builds the same way, restores none either, on any of its triggers.
+RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
 # schedule runs set the sccache client to write them (a client-side
@@ -2642,8 +2679,9 @@ def check_release_caches(text: str) -> list[str]:
     dispatch; no rust-cache caches ~/.cargo/bin, so a restored binary cannot
     shadow a tool on PATH; a job holding a registry or publish token (or
     `contents: write`) runs no cache step; no release job restores a cache,
-    on a tag or a dispatch, but the semver gate's dispatch measurement
-    (RELEASE_RESTORE_JOBS); and a job that mints OIDC tokens or attests
+    on a tag or a dispatch (RELEASE_RESTORE_JOBS is empty), and no job of
+    release-semver-readiness.yml restores one on any of its triggers; and a job that
+    mints OIDC tokens or attests
     artifacts
     (`id-token` or `attestations: write`) restores only caches that no
     workflow in the repository saves on a dispatch-like run (any trigger but
@@ -2729,6 +2767,22 @@ def check_release_caches(text: str) -> list[str]:
             report(f"{trusted}, a workflow whose runs a tag trusts, is missing; update TAG_TRUSTED_WORKFLOWS")
     for workflow, source in sorted(sources.items()):
         triggers = _workflow_triggers(source)
+        if workflow == READINESS_WORKFLOW.name:
+            for trigger in sorted(triggers):
+                frame = OpenFrame(
+                    label=f"a {trigger} run",
+                    event_name=None if trigger == "workflow_call" else trigger,
+                )
+                for job in _job_names(source):
+                    uses = _job_cache_uses(source, workflow, job, frame, root)
+                    if uses is None:
+                        report(f"{workflow} job `{job}` calls a reusable workflow, whose caches this check does not read")
+                    for use in uses or []:
+                        for spec in use.key_specs()[0] if use.may_restore() else []:
+                            report(
+                                f"{workflow} {use.where} restores `{spec[1]}` on {frame.label}; "
+                                "the semver measurement restores no cache"
+                            )
         # release.yml's own jobs are checked on a dispatch above.
         guarded = [] if workflow == DEFAULT_WORKFLOW.name else [
             reason

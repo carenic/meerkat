@@ -641,7 +641,7 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
         .iter()
         .filter(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == DENIED_CALL && tool_name == "delete_record"))
         })

@@ -876,7 +876,7 @@ async fn exercise_a8(server: &Server, barrier: &Arc<EntryBarrier>) {
         .iter()
         .find(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == SECOND_CALL && tool_name == "delete_record"))
         })

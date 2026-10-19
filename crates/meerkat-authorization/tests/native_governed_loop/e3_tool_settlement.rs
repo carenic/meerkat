@@ -676,7 +676,7 @@ async fn exercise(server: &Server) {
         );
     }
     let refused = audit.iter().find(|record| matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == DENIED_CALL && tool_name == "delete_record"))).unwrap();
     let allowed = audit.iter().find(|record| matches!(&record.observation.observation,
         AuditObservation::Prepared { target, .. }

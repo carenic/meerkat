@@ -256,7 +256,7 @@ fn assert_stock_turn_audit_with_models(
         .iter()
         .filter(|record| {
             matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. }
             if call_id == denied_call && tool_name == "delete_record"))
         })

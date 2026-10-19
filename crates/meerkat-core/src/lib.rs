@@ -304,8 +304,8 @@ pub use handles::{
     PeerResponseTerminalFact, PeerResponseTerminalFactError, PeerResponseTerminalProjectionStatus,
     PeerResponseTerminalRenderPayload, PeerResponseTerminalRouteIdentity,
     PeerResponseTerminalSource, PeerResponseTerminalTransportIdentity, SessionAdmissionHandle,
-    SurfaceDiagnosticSnapshot, SurfaceSnapshot, TurnStateHandle, TurnStateSnapshot,
-    peer_response_terminal_context_key,
+    SurfaceDiagnosticSnapshot, SurfaceSnapshot, TurnStateHandle, TurnStateScalars,
+    TurnStateSnapshot, peer_response_terminal_context_key,
 };
 pub use hooks::{
     HookCapability, HookDecision, HookDenial, HookEngine, HookEngineError, HookExecutionMode,

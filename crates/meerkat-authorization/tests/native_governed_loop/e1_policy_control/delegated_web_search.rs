@@ -80,7 +80,7 @@ fn values(domain: ResourceDomain, actions: &[&str]) -> Vec<LocalOperationValues>
 fn search_bounds(actions: &[&str]) -> ExecutionRestrictions {
     let mut bounds = ExecutionRestrictions::unrestricted();
     bounds.actions = ExactRestriction::exact(actions.iter().map(|name| action(name)));
-    bounds.resource_domains = ExactRestriction::exact([search_domain()]);
+    bounds.resource_domains = DomainRestriction::exact([search_domain()]);
     bounds
 }
 
