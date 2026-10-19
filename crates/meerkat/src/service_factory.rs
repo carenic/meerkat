@@ -2806,6 +2806,89 @@ mod tests {
         Ok(())
     }
 
+    /// The ephemeral service's live client replacement reaches the agent's
+    /// refusal: a client for another model is refused with the typed hot-swap
+    /// error and leaves the live identity alone, and a client for the
+    /// session's own model is accepted.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn session_service_client_replacement_keeps_the_session_model() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|err| format!("tempdir: {err}"))?;
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut builder = FactoryAgentBuilder::new(factory, self_hosted_inline_video_config(true));
+        builder.default_llm_client = Some(Arc::new(MockLlmClient::default()));
+        let service = EphemeralSessionService::new(builder, 10);
+        let result = service
+            .create_session(CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "video-alias".to_string(),
+                prompt: "defer client replacement".to_string().into(),
+                system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions::default()),
+                labels: None,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        let durable = service
+            .live_session_llm_identity(&result.session_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let client_for = |model: &str| {
+            meerkat_client::LlmClientAdapter::try_for_provider_identity(
+                Arc::new(MockLlmClient::default()),
+                model.to_string(),
+                durable.provider,
+            )
+            .map_err(|err| err.to_string())
+        };
+
+        let refused = service
+            .set_session_client(&result.session_id, Arc::new(client_for("another-model")?))
+            .await;
+        match refused {
+            Err(SessionError::Agent(
+                meerkat_core::error::AgentError::ClientModelChangeRequiresHotSwap {
+                    durable_model,
+                    requested_model,
+                    ..
+                },
+            )) => {
+                assert_eq!(durable_model, "video-alias");
+                assert_eq!(requested_model, "another-model");
+            }
+            other => {
+                return Err(format!(
+                    "expected the typed hot-swap refusal, got {other:?}"
+                ));
+            }
+        }
+        assert_eq!(
+            service
+                .live_session_llm_identity(&result.session_id)
+                .await
+                .map_err(|err| err.to_string())?,
+            durable
+        );
+
+        service
+            .set_session_client(&result.session_id, Arc::new(client_for("video-alias")?))
+            .await
+            .map_err(|err| err.to_string())?;
+        assert_eq!(
+            service
+                .live_session_llm_identity(&result.session_id)
+                .await
+                .map_err(|err| err.to_string())?,
+            durable
+        );
+
+        Ok(())
+    }
+
     #[async_trait]
     impl ImageGenerationExecutor for FakeImageGenerationExecutor {
         async fn execute_image_generation(
