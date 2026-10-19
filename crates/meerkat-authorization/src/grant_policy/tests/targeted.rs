@@ -625,7 +625,7 @@ fn a_two_link_catalog_base_covers_the_controls_through_every_link() {
     let policy = fixture.mcp_policy();
     let catalog_read = |domains: &[&str]| ExecutionRestrictions {
         actions: ExactRestriction::exact([action("catalog-read")]),
-        resource_domains: ExactRestriction::exact(domains.iter().map(|name| domain(name))),
+        resource_domains: DomainRestriction::exact(domains.iter().map(|name| domain(name))),
         ..ExecutionRestrictions::unrestricted()
     };
     let root = fixture
