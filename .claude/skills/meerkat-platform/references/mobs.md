@@ -178,60 +178,7 @@ member session that moved under a current fence is refused as
 and is never retargeted: re-capture the scope. `recover_bounded_work_at_scope`
 reads only the scope's session and returns a `ScopedWorkState` (`Absent` is
 never retry permission). A member with no session binding has no scope
-(`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`). Since 0.9.4 a
-scope also names the mob incarnation it was captured at (version 2; a stored
-version-1 scope decodes as `ScopeIncarnation::Legacy`, which only a mob whose
-incarnation came from a pre-0.9.4 store honours; 0.9.3 refuses version 2). A
-scope from another incarnation of the mob (destroyed and created again under
-the same id) is refused first, with nothing admitted, as
-`MobError::IncarnationMismatch` (`require_scope_incarnation` and the scoped
-submit), and `recover_bounded_work_at_scope` answers
-`ScopedRecoveryUnresolved::IncarnationNotHosted` without reading a session.
-
-Mob incarnation and provenance (since 0.9.4): a mob keeps its
-`MobIncarnationId` across resume. Its create mints it once and stores it with
-`MobCreated`; only a destroy and a create under the same id start a new
-incarnation, so a mob operator grant still reaches the mob after it resumes. A
-mob created before 0.9.4 gets its incarnation at its first resume by 0.9.4,
-recorded with the provenance `Unrecorded`. The grant functions
-(`grant_manage_mob`, `grant_spawn_profile_in_mob`,
-`grant_spawn_profiles_in_mob`, `mint_mob_operator_authority_from_facts`) take
-the witness `LiveMobIncarnation` (`MobHandle::live_incarnation`), never an id
-decoded from input. `MobIncarnationId` serializes as a lowercase hyphenated
-UUID (`Display`, `FromStr`, `Ord`). Opening a SQLite mob store migrates it to
-schema 12 (the creation record), which 0.9.3 refuses as a future schema: keep
-a copy of the mob stores from before the upgrade to roll back. A store whose
-creation record and log disagree is not resumed
-(`MobError::IncarnationInconsistent`, kind `IncarnationInconsistency`), and
-one that holds a finished destroy whose files remain answers
-`IncarnationDestroyed` (was `Internal`). Failure classes: `IncarnationDestroyed`
-and `IncarnationMismatch` are `TargetMissing`, `IncarnationInconsistent` is
-`Internal`, `ProvenanceUnavailable` is `RuntimeRejected`. `MobProvenance`
-(`Member`, `Host`, `Session`, `Ambiguous` or `Unrecorded`) is recorded once at
-create: `MobHandle::provenance`, `MobStorage::creation_provenance` and
-`creation_incarnation` (no runtime needed), `MobBuilder::with_provenance`
-(default `Host`). A `MobMcpState` create for a caller session (the agent mob
-tools, council seating) records that session's provenance from every hosted
-roster and is refused with `ProvenanceUnavailable`, creating nothing, while
-that lookup cannot be complete: before the mob set is restored (a host that
-inserts handles itself calls `declare_mob_set_restored`), while a handle is
-being inserted, or when a held child mob's stored roster cannot be read.
-Insert a mob's handle before its members run turns. Lookups:
-`MobHandle::member_of_session`, `MobStorage::stored_member_of_session` and
-`stored_members_by_session`, `MobMcpState::session_member_matches`.
-
-Unresumable stores at restore (since 0.9.4): one persisted mob whose resume is
-refused no longer fails `MobMcpState`'s whole restore (0.9.3 then failed every
-mob verb and brought no mob back). That mob is left unrestored with its store
-kept as found (`MobMcpState::unrestored_mobs`, not in `mob_list`), a lookup or
-create of its id answers its refusal (`IncarnationInconsistent` and
-`IncarnationDestroyed` keep their variants, any other refusal is `Internal`
-with its message), and the other mobs restore. Its stored roster still counts
-for provenance, so a create by a session it names is refused with
-`ProvenanceUnavailable`. An empty store whose creation record is not finalized
-is kept the same way (`IncarnationInconsistent`, `RecordWithoutCreation`;
-`MobStorage::unfinalized_creation_mob` reads it). A transport or persistence
-fault, or a store that names no mob, still fails the restore.
+(`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`).
 
 Retire at scope (since 0.9.4): `retire_at_scope(&scope)` retires exactly the
 incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree

@@ -195,19 +195,6 @@ delta. `stop_reason` is optional: observation-only rows omit it. Rows
 committed from a live channel carry `realtime_origin` (its channel and
 `provider_item_ids`).
 
-Rows wait behind a running turn of the member, so the persisted transcript
-can lag the conversation. Since 0.9.4 the rows a channel already holds when a
-member turn ends all commit at that boundary (up to 64 rows or about a second
-at a time) before a member turn queued behind them starts; before, they
-drained one row per turn. WebSocket and WebRTC channels queue waiting rows off
-the media path and forward each observation as it arrives, so voice and input
-keep flowing while a member turn runs instead of pausing until it ends, and a
-frame can reach the client before its row commits. A row the session
-refuses closes the channel with `projection_error` (`row`, `item_id`,
-`unapplied_rows`); 16 MiB of waiting rows closes it with
-`projection_backlog_full`. Rows still queued at a close commit after it, in
-order.
-
 ### SDK calls
 
 - Python: `client.live_open(session_id, turning_mode=None, transport=None,
