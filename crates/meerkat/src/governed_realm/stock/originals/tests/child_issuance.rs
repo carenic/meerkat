@@ -818,7 +818,8 @@ fn a_further_grant_lower_bound_survives_a_wall_rollback() {
 }
 
 /// The records owner, refusing as the host sets it after preparation: 1
-/// refuses to rebuild (`ReprepareRequired`), 2 denies, 0 is [`Records`].
+/// refuses to rebuild (`ReprepareRequired`), 2 denies, 3 refuses malformed
+/// facts, 0 is [`Records`].
 struct ChurnedRecords(std::sync::atomic::AtomicU8);
 impl OperationPolicyOwner for ChurnedRecords {
     fn authorize_operation(
@@ -832,14 +833,15 @@ impl OperationPolicyOwner for ChurnedRecords {
         match self.0.load(Ordering::SeqCst) {
             1 => Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into()),
             2 => Err(OperationRefused::new(OperationRefusalKind::Denied).into()),
+            3 => Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into()),
             _ => Records.authorize_operation(association, binding, purpose, now_ms),
         }
     }
 }
 
 /// Each refusal mode of [`ChurnedRecords`] with what the fence and the child
-/// issuance must answer for it.
-const LEAF_REFUSALS: [(u8, HelperAdmissionRefusal, HelperChildIssuanceRefusal); 2] = [
+/// issuance must answer for it: only a refusal to rebuild is unavailable.
+const LEAF_REFUSALS: [(u8, HelperAdmissionRefusal, HelperChildIssuanceRefusal); 3] = [
     (
         1,
         HelperAdmissionRefusal::Unavailable,
@@ -847,6 +849,11 @@ const LEAF_REFUSALS: [(u8, HelperAdmissionRefusal, HelperChildIssuanceRefusal); 
     ),
     (
         2,
+        HelperAdmissionRefusal::Denied,
+        HelperChildIssuanceRefusal::Denied,
+    ),
+    (
+        3,
         HelperAdmissionRefusal::Denied,
         HelperChildIssuanceRefusal::Denied,
     ),
@@ -862,7 +869,7 @@ fn setup_request() -> CreateWorkItemRequest {
 /// A refusal to rebuild at the prepared effect leaf is no denial: the
 /// prepared fence commits nothing and the prepared child issuance appends
 /// nothing, both unavailable, and each succeeds once the owners answer
-/// again. A denial stays a denial on both.
+/// again. A denial and malformed facts stay denials on both.
 #[tokio::test]
 async fn a_rebuild_refusal_at_the_prepared_effect_leaf_is_unavailable() {
     let owner = Arc::new(ChurnedRecords(std::sync::atomic::AtomicU8::new(0)));
@@ -933,8 +940,8 @@ async fn a_rebuild_refusal_at_the_prepared_effect_leaf_is_unavailable() {
 
 /// The dispatch paths answer the same when the dispatch's own work owners
 /// refuse under their exclusion: unavailable for a refusal to rebuild,
-/// denied for a denial, at the fence and at the child issuance; both
-/// succeed once the owners answer again.
+/// denied for a denial or malformed facts, at the fence and at the child
+/// issuance; both succeed once the owners answer again.
 #[tokio::test]
 async fn a_rebuild_refusal_at_the_dispatch_effect_leaf_is_unavailable() {
     use meerkat_core::authorization::{ToolAuthorizationFacts, ToolAuthorizationTarget};

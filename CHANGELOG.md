@@ -69,16 +69,18 @@ them.
   `debug` event `meerkat::authz::owner_change_wait` (operation id,
   `waited_ms`, `settled`) marks each wait.
 - The same bounded wait covers the other operations that rebuild after a
-  `ReprepareRequired` refusal. A compaction summary no longer fails its
-  compaction with a refusal. A governed tool dispatch waits at its prepared
+  `ReprepareRequired` refusal. A governed tool dispatch waits at its prepared
   entry and again at its body entry, each with its own deadline and free
   rebuilds, inside the tool's timeout; the review check point runs on the
   decision prepared after the wait, so a reviewed tool whose decision changed
   meanwhile still refuses as a changed context and no review is reused. The
   `web_search` tool's helper model request asks again under the same
-  delegate operation. The debug event names the site (`model_request`,
-  `compaction_summary`, `tool_dispatch`, `tool_entry`,
-  `web_search_delegate`).
+  delegate operation. A compaction summary waits within the same bounds,
+  and past them the refusal still fails its compaction. When the body
+  entry waits out a change after recording its `Entry` record, it records
+  another for the decision checked after the wait. The debug event names
+  the site (`model_request`, `compaction_summary`, `tool_dispatch`,
+  `tool_entry`, `web_search_delegate`).
 - A governed helper admission fence and a helper child issuance answer
   `Unavailable` instead of `Denied` when their check refuses to rebuild
   (`ReprepareRequired`), on the prepared path and on the dispatch path alike:

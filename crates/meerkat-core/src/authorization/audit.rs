@@ -99,7 +99,12 @@ pub enum OperationObservation {
 pub enum OperationEntryBoundary {
     /// A tool call's staging on its dispatch chain: the session's root
     /// dispatch, or an adapter on the way to the owning tool
-    /// ([`crate::ToolDispatchContext::observe_tool_entry`]).
+    /// ([`crate::ToolDispatchContext::observe_tool_entry`]). The root
+    /// staging records its entry between its first and final checks. When
+    /// the final check refuses while an owner change is in progress, and the
+    /// staging waits that change out and stages again, the operation records
+    /// this boundary twice, the second time for the decision checked after
+    /// the wait.
     ToolDispatch,
     /// The call-level execution policy gate's staging of a tool call
     /// ([`crate::ExecutionPolicyGatedDispatcher`]).
