@@ -353,6 +353,8 @@ path-classifier-selftest:
 	@bash scripts/tests/live_gate_selftest.sh
 	@node scripts/ci-action-pins-selftest.mjs
 	@node scripts/buildbuddy-edge-changes-selftest.mjs
+	@node scripts/rust-source-text-selftest.mjs
+	@node scripts/precommit-build-hook-selftest.mjs
 
 cargo-agent-gate: rust-lane-doctor
 	@echo "$(GREEN)Running Cargo agent changed-path gate...$(NC)"

@@ -412,7 +412,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   is planned as the whole workspace (without looking for evidence): the
   explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
-  parity, lock consistency, `make ci-lanes-selftest`,
+  parity, lock consistency, generated BUILD freshness
+  (`node scripts/generate-bazel-rust-builds.mjs --check`),
+  `make ci-lanes-selftest`,
   `make path-classifier-selftest`, the ripgrep tombstone scans
   (`legacy-surface-gate`, `session-control-gate`, `deprecated-backend-gate`;
   ripgrep is installed first, and each scan refuses to run without it), and
@@ -768,7 +770,7 @@ Installed via `make install-hooks`. Two stages:
 
 **On commit** (`pre-commit`):
 - `repo-cargo fmt --all`
-- `node scripts/generate-bazel-rust-builds.mjs` (regenerates Bazel rust build metadata)
+- `node scripts/precommit-build-hook.mjs` (runs `scripts/generate-bazel-rust-builds.mjs` to regenerate Bazel rust build metadata when the staged changes, deletions included, touch Cargo metadata, a Rust source under `crates/` or `tests/`, or a generator input; about 5 s. It refuses the commit while a Rust file under `crates/` or `tests/` is not in the index, since the generator would read it from disk)
 - `scripts/sync-meerkat-dogma-skill-docs.sh` (syncs dogma docs into the skill)
 
 **On push** (`pre-push`), sized to finish in a few minutes warm (the CI it
