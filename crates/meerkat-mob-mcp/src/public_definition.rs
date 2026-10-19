@@ -121,6 +121,11 @@ pub fn decode_public_profile(input: MobProfileInput) -> Result<Profile, String> 
 }
 
 fn decode_profile(input: MobProfileInput) -> Result<Profile, String> {
+    if let Some(bundle) = input.tools.bundles.first() {
+        return Err(format!(
+            "tools.bundles names tool bundle '{bundle}', but this host offers no tool bundles to opt into"
+        ));
+    }
     Ok(Profile {
         model_fallback: input.model_fallback,
         model: input.model,
@@ -148,6 +153,7 @@ fn decode_profile(input: MobProfileInput) -> Result<Profile, String> {
             mcp: input.tools.mcp,
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
+            bundles: Vec::new(),
         },
         peer_description: input.peer_description,
         external_addressable: input.external_addressable,

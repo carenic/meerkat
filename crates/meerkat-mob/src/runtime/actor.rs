@@ -14065,6 +14065,8 @@ impl MobActor {
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
             incarnation: self.incarnation,
+            registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
+            realm_profile_store: self.realm_profile_store.clone(),
         }
     }
 

@@ -284,6 +284,7 @@ fn profile_from_wire(profile: WireMobProfile) -> Result<Profile, meerkat_core::S
             mcp: tools.mcp,
             mcp_servers: vec![],
             rust_bundles: Vec::new(),
+            bundles: Vec::new(),
         },
         peer_description: profile.peer_description,
         external_addressable: profile.external_addressable,

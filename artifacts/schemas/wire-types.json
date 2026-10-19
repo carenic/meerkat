@@ -116132,6 +116132,13 @@
             "default": false,
             "type": "boolean"
           },
+          "bundles": {
+            "description": "Host tool bundles this profile opts into. Only an inline profile of a\nchild mob (one a member creates with `mob_create`) may name them, and\nonly bundles the host offers to child mobs; any other name, an empty\nname or a repeated one is refused as an argument error. The opt-in is\nkept with the definition. Each build mounts the opted bundles the host\nstill offers and withholds the rest.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "comms": {
             "default": false,
             "type": "boolean"

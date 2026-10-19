@@ -3621,6 +3621,7 @@ class MobSupervisorSpecInput:
 class MobToolConfigInput:
     """Request payload for MobToolConfigInput."""
     builtins: Optional[bool] = None
+    bundles: Optional[list[str]] = None
     comms: Optional[bool] = None
     deny: Optional[list[str]] = None
     image_generation: Optional[bool] = None

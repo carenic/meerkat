@@ -474,8 +474,9 @@ pub use handle::{
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
     SpawnMemberSpec, SpawnResult, SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission,
-    SupervisorRotationReport, WorkAdmissionStage, WorkBoundedTurnResult, WorkDeliveryReceipt,
-    WorkTurnHandle, mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
+    SupervisorRotationReport, WithheldToolBundle, WorkAdmissionStage, WorkBoundedTurnResult,
+    WorkDeliveryReceipt, WorkTurnHandle, mob_error_wire_code, profile_to_wire,
+    stored_realm_profile_to_wire,
 };
 pub(crate) use handle::{
     CanonicalOpsOwnerContext, ExactTurnCompletionSender, FlowOperationCustody, MemberSpawnReceipt,

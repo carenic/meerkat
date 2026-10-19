@@ -2715,6 +2715,7 @@ export interface MobSupervisorSpecInput {
 
 export interface MobToolConfigInput {
   builtins?: boolean;
+  bundles?: string[];
   comms?: boolean;
   deny?: string[];
   image_generation?: boolean;

@@ -520,7 +520,12 @@ pub struct DeclaredToolRestriction {
     pub deny: ToolNameSet,
     /// The tool names the declaring configuration owns, by source: the mob
     /// operator and agent mob tools, the exposed names of the MCP servers it
-    /// declares, and its tool bundles.
+    /// declares, and its tool bundles. A bundle the configuration opted into
+    /// but this build withheld is listed as
+    /// [`ToolVocabularySource::WithheldBundle`] with no names: its tools
+    /// cannot be known, so while one is listed a deny name in no vocabulary
+    /// is deferred to the execution gate, as for
+    /// [`Self::deferred_mcp_servers`].
     pub vocabulary: std::collections::BTreeMap<ToolVocabularySource, ToolNameSet>,
     /// Declared MCP servers that map no tool names, so their tools cannot be
     /// known before they connect. While any is declared, a deny name in no
@@ -543,6 +548,10 @@ pub enum ToolVocabularySource {
     McpServer(String),
     /// A host tool bundle.
     Bundle(String),
+    /// A host tool bundle the configuration opted into that this build
+    /// withheld, because the host does not offer it to this build. It names
+    /// no tools.
+    WithheldBundle(String),
 }
 
 impl std::fmt::Display for ToolVocabularySource {
@@ -553,6 +562,7 @@ impl std::fmt::Display for ToolVocabularySource {
             Self::AgentMob => f.write_str("agent mob tools"),
             Self::McpServer(server) => write!(f, "MCP server '{server}'"),
             Self::Bundle(bundle) => write!(f, "tool bundle '{bundle}'"),
+            Self::WithheldBundle(bundle) => write!(f, "withheld tool bundle '{bundle}'"),
         }
     }
 }

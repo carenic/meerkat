@@ -718,6 +718,19 @@ pub(crate) fn resolve_profile_bundle_tools(
         .collect()
 }
 
+/// The bundles `profile` opted into (`tools.bundles`) that `is_registered`
+/// does not know, so every build of the profile withholds them. A name the
+/// profile also lists in its strict `rust_bundles` is not withheld: its
+/// absence fails the build instead.
+pub(crate) fn withheld_profile_bundles<'a>(
+    profile: &'a crate::profile::Profile,
+    is_registered: impl Fn(&str) -> bool + 'a,
+) -> impl Iterator<Item = &'a String> + 'a {
+    profile.tools.bundles.iter().filter(move |bundle| {
+        !is_registered(bundle.as_str()) && !profile.tools.rust_bundles.contains(bundle)
+    })
+}
+
 /// Record a build's resolved bundle tools as bundle vocabularies on its
 /// declared tool restriction, so the profile's deny list may name them.
 pub(crate) fn attach_declared_bundle_tools(

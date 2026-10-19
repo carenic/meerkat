@@ -8072,6 +8072,8 @@ impl MobBuilder {
                 ownership: super::admission_close::MobOwnership::new(),
                 admission_closed_rx: tokio::sync::watch::channel(None).1,
                 incarnation: wiring.incarnation,
+                registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
+                realm_profile_store: storage.realm_profiles.clone(),
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
             if let Some(hook) = before_activation {
@@ -10291,6 +10293,8 @@ impl MobBuilder {
                 ownership: Arc::clone(&ownership),
                 admission_closed_rx,
                 incarnation,
+                registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
+                realm_profile_store: realm_profile_store.clone(),
             };
             if let Some(hook) = before_activation {
                 hook(handle.read_handle()).await?;

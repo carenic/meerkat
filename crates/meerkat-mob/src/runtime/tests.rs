@@ -7501,6 +7501,7 @@ fn sample_definition() -> MobDefinition {
                 mcp: vec![],
                 mcp_servers: vec![],
                 rust_bundles: vec![],
+                bundles: Vec::new(),
             },
             peer_description: "The lead".into(),
             external_addressable: true,
@@ -82646,6 +82647,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::RuntimeOwnerConflict => "runtime_owner_conflict".to_string(),
         MobError::ToolBundleUnavailable { bundle } => format!("tool_bundle_unavailable:{bundle}"),
+        MobError::ToolBundleNotOffered {
+            profile, bundle, ..
+        } => format!("tool_bundle_not_offered:{profile}:{bundle}"),
         MobError::Internal(reason) => format!("internal:{reason}"),
         MobError::ScopeDenied(denial) => format!("scope_denied:{:?}", denial.required),
         MobError::FlowStepDispatchRejected { kind, .. } => {

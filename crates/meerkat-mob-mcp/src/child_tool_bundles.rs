@@ -21,12 +21,16 @@ use meerkat_mob::{MobBuilder, MobDefinition};
 
 /// Whether the host supplies a bundle to child mob members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChildToolBundleAvailability {
     /// Registered for the host only; never offered to child mobs.
     #[default]
     HostOnly,
     /// Supplied to every inline profile of a child mob.
     ChildAvailable,
+    /// Offered to child mobs: supplied to no profile, and mounted only for an
+    /// inline child profile that names it in its `tools.bundles` opt-in.
+    ChildOffered,
 }
 
 /// The host's bundle registrations as seen by child mob creation.

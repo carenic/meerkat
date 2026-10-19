@@ -1335,6 +1335,21 @@ pub enum MobError {
         correlation_id: String,
         interaction_id: String,
     },
+
+    /// A mob create names, in the `tools.bundles` opt-in of `profile`, a
+    /// tool bundle the host does not offer to that create. Only a child mob's
+    /// inline profiles may opt in, and only to the bundles the host offers to
+    /// child mobs (`offered`, empty for any other create). Nothing of the mob
+    /// exists yet.
+    #[error(
+        "profile '{profile}' opts into tool bundle '{bundle}', which is not offered here; offered bundles: [{}]",
+        offered.join(", ")
+    )]
+    ToolBundleNotOffered {
+        profile: ProfileName,
+        bundle: String,
+        offered: Vec<String>,
+    },
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared

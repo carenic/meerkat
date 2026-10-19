@@ -1420,6 +1420,18 @@ pub fn stored_realm_profile_to_wire(
     }
 }
 
+/// A tool bundle a profile opted into (`tools.bundles`) that this mob does not
+/// register, so every build of that profile's members withholds it: the host
+/// no longer offers the bundle. See [`MobHandle::withheld_tool_bundles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WithheldToolBundle {
+    /// The profile whose opt-in names the bundle.
+    pub profile: ProfileName,
+    /// The withheld bundle.
+    pub bundle: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MobMemberListEntry {
     /// Canonical member identity.
@@ -2161,6 +2173,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::AgentEventCursorRejected { .. }
         | MobError::RuntimeOwnerConflict
         | MobError::ToolBundleUnavailable { .. }
+        | MobError::ToolBundleNotOffered { .. }
         | MobError::HeldProvisionUnsupported { .. }
         | MobError::DeliveryScopeUnavailable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
@@ -5519,6 +5532,12 @@ pub struct MobHandle {
     /// The incarnation this mob's runtime minted when it started; see
     /// [`MobHandle::incarnation`].
     pub(super) incarnation: meerkat_core::service::MobIncarnationId,
+    /// The tool bundle names this incarnation's builder registered: the
+    /// ceiling every member build reads a profile's opt-ins against.
+    pub(super) registered_tool_bundles: Arc<BTreeSet<String>>,
+    /// The realm profile store member builds read realm-referenced roles
+    /// from.
+    pub(super) realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -8159,6 +8178,39 @@ impl MobHandle {
     /// Access the mob definition.
     pub fn definition(&self) -> &MobDefinition {
         &self.definition
+    }
+
+    /// The tool bundles this mob's profiles opted into (`tools.bundles`)
+    /// that this incarnation does not register, so their members' builds
+    /// withhold them: the host no longer offers them.
+    ///
+    /// Computed from the current definition and this incarnation's
+    /// registrations, the same inputs every member build reads; a
+    /// realm-referenced role is read from the realm profile store as a build
+    /// reads it. Nothing is stored.
+    pub async fn withheld_tool_bundles(&self) -> Result<Vec<WithheldToolBundle>, MobError> {
+        let mut withheld = Vec::new();
+        for role in self.definition.profiles.keys() {
+            let Some(profile) = crate::build::current_role_profile(
+                &self.definition,
+                role,
+                self.realm_profile_store.as_ref(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            withheld.extend(
+                super::tools::withheld_profile_bundles(&profile, |bundle| {
+                    self.registered_tool_bundles.contains(bundle)
+                })
+                .map(|bundle| WithheldToolBundle {
+                    profile: role.clone(),
+                    bundle: bundle.clone(),
+                }),
+            );
+        }
+        Ok(withheld)
     }
 
     /// Resolve the execution profile currently carried by one live member.
