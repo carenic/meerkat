@@ -1025,7 +1025,9 @@ async fn exercise_search(controller_server: &Server, helper_server: &Server, cas
         assert_refusal_feedback(
             &bodies[2],
             SECOND_SEARCH_CALL,
-            ToolError::AuthorizationRefused { refusal: denied() },
+            ToolError::AuthorizationRefused {
+                refusal: denied_before_dispatch(),
+            },
         );
         assert_eq!(helper_server.receiver.bodies.lock().unwrap().len(), 1);
         assert_eq!(owner.helper_seen.load(Ordering::SeqCst), 1);

@@ -99,6 +99,14 @@ fn denied() -> OperationRefused {
     OperationRefused::new(OperationRefusalKind::Denied)
 }
 
+/// The model's payload for the denial the fenced entry met before the
+/// tool's code ran: the closed kind with `tool_invoked: false`.
+fn denied_before_dispatch_payload() -> Value {
+    let mut payload = ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload();
+    payload["data"]["tool_invoked"] = Value::Bool(false);
+    payload
+}
+
 fn evidence(value: &str) -> HistoricalEvidenceRef {
     HistoricalEvidenceRef {
         resource: ResourceRef {
@@ -720,7 +728,7 @@ fn assert_saved_transcript(saved: &Session, session_id: &SessionId) {
     assert!(refused.is_error);
     assert_eq!(
         serde_json::from_str::<Value>(&refused.text_content()).unwrap(),
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        denied_before_dispatch_payload()
     );
     let permitted = results
         .iter()
@@ -787,10 +795,7 @@ fn assert_wire_sibling_feedback(body: &Value) {
     assert_eq!(refused["is_error"], true);
     let refused_text = wire_text(&refused["content"]);
     let diagnostic: Value = serde_json::from_str(&refused_text).expect("typed safe refusal JSON");
-    assert_eq!(
-        diagnostic,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
-    );
+    assert_eq!(diagnostic, denied_before_dispatch_payload());
     assert!(!refused_text.contains("synthetic-e1"));
     assert_ne!(allowed["is_error"], true);
     assert_eq!(wire_text(&allowed["content"]), "record-7 value");
@@ -1357,7 +1362,7 @@ fn assert_public_notifications(
             if expected_error {
                 assert_eq!(
                     serde_json::from_str::<Value>(&text).unwrap(),
-                    ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+                    denied_before_dispatch_payload()
                 );
             } else {
                 assert_eq!(text, "record-7 value");

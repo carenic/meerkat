@@ -554,7 +554,10 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
     assert!(refusal.is_error);
     assert_eq!(
         serde_json::from_str::<Value>(&refusal.text_content()).unwrap(),
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     let allowed = tool_feedback(saved.messages(), PERMITTED_CALL).unwrap();
     assert!(!allowed.is_error);

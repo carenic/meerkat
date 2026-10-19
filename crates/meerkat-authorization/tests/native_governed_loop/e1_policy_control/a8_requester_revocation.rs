@@ -793,7 +793,10 @@ async fn exercise_a8(server: &Server, barrier: &Arc<EntryBarrier>) {
     let refused_payload: Value = serde_json::from_str(&wire_text(&refused["content"])).unwrap();
     assert_eq!(
         refused_payload,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     assert_eq!(
         wire_text(&result_in(&bodies[3], LAST_CALL)["content"]),

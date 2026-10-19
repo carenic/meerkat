@@ -932,8 +932,9 @@ async fn a_stock_prompt_loads_reads_and_has_its_write_refused() {
     realm.close(vec![session]).await;
 }
 
-/// The exact typed feedback the model receives for the refused delete.
-const DELETE_REFUSAL: &str = r#"{"error":"operation_refused","message":"operation unavailable under current authorization"}"#;
+/// The exact typed feedback the model receives for the refused delete: the
+/// owner denied it before the tool ran, which the payload says.
+const DELETE_REFUSAL: &str = r#"{"data":{"kind":"denied","tool_invoked":false},"error":"operation_refused","message":"operation unavailable under current authorization"}"#;
 
 /// Another agent with its own valid controller and worker grants, whose
 /// worker grant does not cover the records installation, is refused that
@@ -1623,10 +1624,7 @@ async fn a_bundle_operation_runs_beside_its_refused_sibling_and_after_reopen() {
     );
     let delete = model.feedback(1, "delete");
     assert!(delete.is_error, "{}", delete.text_content());
-    assert_eq!(
-        delete.text_content(),
-        r#"{"error":"operation_refused","message":"operation unavailable under current authorization"}"#
-    );
+    assert_eq!(delete.text_content(), DELETE_REFUSAL);
     let read = model.feedback(1, "read");
     assert!(!read.is_error, "{}", read.text_content());
     assert_eq!(read.text_content(), ENTRY);
