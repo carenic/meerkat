@@ -76,12 +76,17 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
     `RestartRequired`);
   - a session transcript that holds a tool-configuration notice 0.9.4 wrote
     (a tool-scope, deferred-catalog or failed-closed notice; see
-    [Tool configuration events](#tool-configuration-events)).
+    [Tool configuration events](#tool-configuration-events));
+  - a session that recorded a failed realtime response (realtime sidecar
+    event schema 4; 0.9.3 refuses it with "unsupported realtime event schema
+    4"; see [Realtime responses that fail](#realtime-responses-that-fail)).
 - **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
   fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
   downloads its own matching `rkat-rpc` only when you supply none, so this
   happens when it runs a binary you supply: `MEERKAT_BIN_PATH`, an explicit
   path, or an `rkat-rpc` on `PATH` (for example one Homebrew upgraded).
+  SDKs older than 0.9.4 also do not know the `turn_failed` live observation
+  or the `assistant_turn_failed` transcript event.
 - **Upgrade every process that shares a runtime store together:** stop them
   all, back up the state root, then start 0.9.4 on all of them (steps 1, 2
   and 5 of [How to upgrade](#how-to-upgrade)).
@@ -148,6 +153,13 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   wildcard arm), and `ToolConfig` and the wire `MobToolConfigInput` gain
   `bundles` (set it in struct literals, or build `ToolConfig` with
   `..ToolConfig::default()`).
+- **A member unregister a Shutdown left pending can be followed:**
+  `MemberShutdownOutcome::UnregisterPending` carries a `settlement`
+  (`MemberUnregisterSettlement`) and is `#[non_exhaustive]`; match it with
+  `{ stage, .. }`. `settlement.try_state()` reads where the unregister stands
+  and `settle_within(deadline)` waits for it, also after the actor exited
+  (`MemberUnregisterState`: `Settled`, `Pending`, `Failed`, or `HandedOver`
+  when a later owner took the registration over).
 
 #### Tool configuration events
 
@@ -193,6 +205,30 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   `LlmDoneOutcome::success(stop_reason)` or `success_with_detail(..)` and match
   it with `Success { stop_reason, .. }`; `AgentError::ContentFiltered` gains
   `stop` and `detail`, and `AgentErrorReason` gains `ContentFiltered`.
+
+#### Realtime responses that fail
+
+- **A realtime response the provider ends without completing it** (OpenAI
+  `response.done` with status `failed` or `in_progress`, or `incomplete` for
+  a reason other than `max_output_tokens` or `content_filter`) now arrives as
+  the `turn_failed` live observation with its typed `failure.status`. 0.9.3
+  reported it as a completed turn and committed its partial text as an
+  ordinary reply, and a failed response without usage closed the channel.
+- It is not terminal: the channel stays open, nothing of the response is
+  committed (the transcript records `assistant_turn_failed`), a WebRTC peer
+  stops its queued audio, and Meerkat neither cancels nor retries it. Usage
+  the provider reported is charged; otherwise the session event stream
+  carries `turn_usage_accounting_unmeasured`.
+- **Do:** route on `failure.status` (`failed`, `incomplete`, `in_progress`,
+  or `{"unknown": {"debug": ...}}`), treat the provider's `reason`, `code`
+  and `message` as diagnostics, and decide in the client whether to ask
+  again. Upgrade the SDKs with the server.
+- **Do (Rust):** `RealtimeSessionEvent` gains
+  `TurnFailed { response_id, failure, accounting }`,
+  `RealtimeTranscriptEvent` gains `AssistantTurnFailed { response_id }` and
+  `RealtimeTranscriptStopReasonKind` gains `Failed`; all are exhaustive, so
+  add the arms. `LiveProjectionSink` gains the required method
+  `signal_turn_failed(session_id, response_id, failure, accounting)`.
 
 #### Changing the model of a running session
 
@@ -343,8 +379,22 @@ last.
 - **Public GPT Live:** a delegation result held behind the user's unanswered
   question first sends a finished notice, so the voice model no longer says
   the work is still in progress.
+- **Session forks:** a child of `session/fork_at` or `session/fork_replace`
+  now inherits its source's build state and can run a turn. A source with
+  session metadata but no build state is refused before anything is
+  committed (`INVALID_PARAMS`, data kind `fork_source_build_state_missing`).
+  A child forked by 0.9.3 that never ran a turn still fails `turn/start`
+  with "missing session build state": fork its source again.
 - **`@rkat/sdk`:** a Node process that calls `MeerkatClient.close()` exits as
   soon as it has nothing else to do, instead of about 5 seconds later.
+- **SDK clients and a child that exits:** the TypeScript and Python clients
+  settle on the `rkat-rpc` child's exit, not on its output pipes closing, so
+  requests to a child that exited by itself fail within about a second
+  (`PROCESS_EXITED` in TypeScript, `CONNECTION_CLOSED` in Python) and
+  `close()` returns once the child has exited.
+- **Published crates:** `cargo test` in an unpacked published Meerkat crate
+  passes (`meerkat`, `meerkat-runtime` and `meerkat-mob` with the features
+  their README prints), and `rkat` builds without its default features.
 
 ### Upgrade checklist
 
@@ -367,6 +417,8 @@ last.
    final outcome.
 10. Read tool configuration changes by `settled` (accepting `persisted` on
     rows stored before 0.9.4).
+11. Realtime clients: handle the `turn_failed` observation, and add the new
+    arms and `signal_turn_failed` in Rust.
 
 ## Upgrading to 0.8.51
 

@@ -533,6 +533,31 @@ demand (`.github/workflows/nightly.yml`) on GitHub-hosted runners:
   (seam-inventory, rmat-audit, machine authority), SDK suites, wasm-check,
   minimal-feature, feature matrix, and audit
 
+### Published crates standalone
+
+Since 0.9.4 every crate the release publishes passes its own tests in its
+unpacked package. `.github/workflows/published-crates-standalone.yml` runs
+daily, after the nightly chains, and on dispatch
+(`gh workflow run published-crates-standalone.yml --ref <branch>`). It
+packages every release crate and unpacks the packages into a synthetic
+workspace. Per crate, without sibling feature unification, it runs plain
+`cargo test` with the feature set the crate's
+`[package.metadata.meerkat.standalone-tests]` publishes (the crate's README
+prints the command), checks that `cargo test --no-run` compiles with the
+default features, and compares each test target's test names with the
+workspace's, minus the files and tests `ci/standalone-workspace-only.toml`
+declares workspace-only. The `fmt-governance` job of pull-request CI runs the
+static half (`make published-crates-standalone-selftest` and
+`make check-published-crates-standalone-guard`). Publication does not wait for
+the census yet.
+
+`rkat`'s docs-examples test parses
+`crates/meerkat-cli/tests/fixtures/doc_examples.txt`, which the package
+carries, instead of reading `docs/`. The repository test
+`doc_examples_fixture` fails until that file lists exactly the fenced `rkat`
+invocations in `docs/**/*.mdx`: after adding or changing one, refresh it with
+`UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture`.
+
 ## Release Validation
 
 The tag release workflow requires successful exact-`main` CI for the release

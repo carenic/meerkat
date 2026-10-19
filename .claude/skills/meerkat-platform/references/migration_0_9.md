@@ -211,13 +211,15 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   state root, then start 0.9.4 on all of them together.
 - 0.9.3 also cannot read back a session event log that holds a
   content-filtered `run_failed` event, a transcript holding a tool-scope,
-  deferred-catalog or failed-closed notice that 0.9.4 wrote, or restore a
-  grant owner whose journal holds an owner-scoped resource-domain restriction
-  (`RestartRequired`).
+  deferred-catalog or failed-closed notice that 0.9.4 wrote, or a session
+  that recorded a failed realtime response (realtime sidecar event schema 4),
+  or restore a grant owner whose journal holds an owner-scoped
+  resource-domain restriction (`RestartRequired`).
 - Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
-  every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. It runs a
-  binary you supply (`MEERKAT_BIN_PATH`, an explicit path, or `rkat-rpc` on
-  `PATH`) before it downloads its own matching one.
+  every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds, and does not
+  know the `turn_failed` live observation. It runs a binary you supply
+  (`MEERKAT_BIN_PATH`, an explicit path, or `rkat-rpc` on `PATH`) before it
+  downloads its own matching one.
 
 ### Breaking changes
 
@@ -259,6 +261,18 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
   gain `bundles`; `ChildToolBundleAvailability` and
   `ChildMcpServerRegistrationError` are non-exhaustive.
+- Mob Shutdown: `MemberShutdownOutcome::UnregisterPending` carries a
+  `settlement` (`MemberUnregisterSettlement`: `try_state()`,
+  `settle_within(deadline)`; states `Settled`, `Pending`, `Failed`,
+  `HandedOver`) and is non-exhaustive; match it with `{ stage, .. }`.
+- Realtime: a response the provider ends without completing it arrives as the
+  non-terminal `turn_failed` live observation (route on `failure.status`;
+  nothing of it is committed, the transcript records `assistant_turn_failed`,
+  no retry); 0.9.3 committed its partial text as a reply. Rust:
+  `RealtimeSessionEvent::TurnFailed`,
+  `RealtimeTranscriptEvent::AssistantTurnFailed` and
+  `RealtimeTranscriptStopReasonKind::Failed` are new arms of exhaustive enums,
+  and `LiveProjectionSink` gains the required `signal_turn_failed`.
 - Rust: `LlmDoneOutcome::Success` is non-exhaustive (build it with
   `LlmDoneOutcome::success(..)` / `success_with_detail(..)`);
   `AgentError::ContentFiltered` gains `stop` and `detail`; `AgentErrorReason`
@@ -321,8 +335,14 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   refusal with no known kind reads as `operation_authorization_unavailable`.
 - Fixed: the SQLite session store lays out a whole-blob session compacted more
   than `history_retained_rewrites` times; `@rkat/sdk` `close()` no longer
-  keeps Node alive for 5 seconds; public GPT Live sends a finished notice for
-  a delegation result held behind the user's question.
+  keeps Node alive for 5 seconds, and both SDK clients settle on the
+  `rkat-rpc` child's exit; public GPT Live sends a finished notice for a
+  delegation result held behind the user's question.
+- Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn
+  (it inherits its source's build state); a child 0.9.3 forked that never ran
+  a turn still fails, so fork its source again. Published crates pass
+  `cargo test` in their unpacked packages, and `rkat` builds without default
+  features.
 
 ### Checklist
 
@@ -335,3 +355,5 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 5. Use `hot_swap_llm_identity` for model changes; update custom compactors.
 6. Governed hosts: use `bind_host_outcome` for host-reported outcomes, and
    treat a `ContextChanged` review retirement as not final.
+7. Realtime clients: handle `turn_failed`; Rust: add the new arms and
+   `signal_turn_failed`.
