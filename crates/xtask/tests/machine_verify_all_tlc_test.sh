@@ -357,6 +357,28 @@ if run_part audits-a; then
   TLC_WORKERS="${tlc_workers}" "${mob_operator_grant_audit}" "${MOB_OPERATOR_GRANT_AUDIT_MAX_STEPS:-5}" --mutants
 fi
 
+# The member generation high-water (resume recovers each identity's highest
+# generation from the whole log, every reset epoch included, then seals the
+# window; minting reads it) is empty in the MobMachine ci sweep, whose
+# AgentIdentityValues are {}, so next_generation_above_highwater holds there
+# only vacuously. A hand-written audit over the same generated model gives
+# one identity generations 0..2 and explores the high-water recovery, the
+# seal and the roster recovery that leaves the identity below its high-water,
+# under every generated invariant plus two action properties (the seal
+# closes recovery; recovery never lowers). It requires its four witnesses
+# reached and refuses three seeded defects (--mutants): a mint helper that
+# ignores the high-water, a recovery without its seal guard, and a recovery
+# without its not-lowered guard. 4 steps reach every witness.
+generation_highwater_audit="${workspace_root}/specs/machines/mob_machine/generation_highwater_audit.sh"
+if [[ ! -x "${generation_highwater_audit}" ]]; then
+  echo "error: generation high-water audit runner is missing from workspace runfiles: ${generation_highwater_audit}" >&2
+  exit 1
+fi
+if run_part audits-c; then
+  echo "running bounded generation high-water TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${generation_highwater_audit}" "${GENERATION_HIGHWATER_AUDIT_MAX_STEPS:-4}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -413,7 +435,9 @@ run_machine_verify() {
 # not yet hosted; the other audits' hosted runs took 1.5-3.1x their local
 # ones, so expect 100-200 s): about 500-600 s (208 s for the shard locally);
 # audits-c = run-start hold (239 s), live media health (155 s),
-# live-context causal-tail batch with --mutants (112 s): 506 s.
+# live-context causal-tail batch with --mutants (112 s): 506 s; plus the
+# generation high-water audit with --mutants (30 s on a local 4-worker run,
+# twelve small runs, not yet hosted; expect 50-100 s).
 # Two shards ran 592 s and 812 s, past the pull-request lane target. A new
 # audit joins the lightest shard. Shard of the two audits the `all` lane runs
 # concurrently with machine-verify below:

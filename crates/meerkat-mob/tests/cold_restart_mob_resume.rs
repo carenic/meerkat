@@ -1182,6 +1182,104 @@ async fn mob_cold_restart_resume_autonomous_lead_durable_runtime_store() {
     run_cold_restart_scenario(true, MobRuntimeMode::AutonomousHost).await;
 }
 
+async fn member_generation(handle: &MobHandle, identity: &AgentIdentity, label: &str) -> u64 {
+    handle
+        .get_member(identity)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: read the member: {error}"))
+        .unwrap_or_else(|| panic!("{label}: member is on the roster"))
+        .generation
+        .get()
+}
+
+/// A member generation never repeats within a mob incarnation, across a reset
+/// and a restart too. Resume replays only the events after the last
+/// `MobReset`, so before the generation high-water came from the whole log a
+/// worker re-spawned after a reset and a cold restart started again at
+/// generation 0: the generation, runtime id and member address its pre-reset
+/// incarnation already had. A worker re-spawned after a reset without a
+/// restart is the control: it continues its generation in-process. The
+/// resume then replays that continued generation as the control's first one
+/// after the reset, which the replay used to refuse, so the mob could not
+/// resume at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn mob_reset_then_cold_restart_respawn_continues_the_member_generation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.id = MobId::from("reset-generation-mob");
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+
+    // ---------------- Lifetime 1: spawn, reset, control respawn ----------
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+
+    let worker = AgentIdentity::from("w-1");
+    let control = AgentIdentity::from("w-control");
+    for identity in [&worker, &control] {
+        handle_1
+            .spawn_spec(SpawnMemberSpec::new("worker", identity.clone()))
+            .await
+            .expect("spawn before the reset");
+    }
+    let worker_before = member_generation(&handle_1, &worker, "worker before the reset").await;
+    handle_1.reset().await.expect("reset the mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", control.clone()))
+        .await
+        .expect("re-spawn the control member without a restart");
+    let control_after = member_generation(&handle_1, &control, "control after the reset").await;
+    assert_eq!(
+        control_after,
+        worker_before + 1,
+        "in-process, a member re-spawned after a reset continues its generation"
+    );
+
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    drop(handle_1);
+    drop(service_1);
+
+    // ---------------- Lifetime 2: resume, re-spawn the worker -------------
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store.clone());
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume mob after the reset and a cold restart");
+    handle_2
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("re-spawn the worker after the restart");
+    let worker_after = member_generation(&handle_2, &worker, "worker after the restart").await;
+    assert_eq!(
+        worker_after,
+        worker_before + 1,
+        "after a reset and a cold restart the worker mints the generation the \
+         machine that never restarted mints, never its pre-reset one"
+    );
+
+    handle_2.shutdown().await.expect("final shutdown");
+}
+
 /// An explicitly resumed member may adopt its archived+Retired session after a
 /// full host restart. Revival crosses the store-owned Retired terminal through
 /// the exact machine lease while preserving the content-only body, bridge

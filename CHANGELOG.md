@@ -35,6 +35,61 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- MobMachine records each member identity's generation high-water across mob
+  resets: `MobMachineState` (meerkat-machine-schema and meerkat-mob) and the
+  kernel `State` (meerkat-machine-kernels) gain the fields
+  `identity_generation_highwater` and `identity_generation_highwater_sealed`,
+  so code that builds either struct literally must set them.
+  `MobMachineSignal` (meerkat-machine-schema and meerkat-mob) and the kernel
+  `Signal` and `SignalKind` gain the variants
+  `RecoverIdentityGenerationHighwater` and `SealIdentityGenerationHighwater`,
+  appended last. The kernel `generated::mob::TransitionId` gains
+  `RecoverIdentityGenerationHighwaterRunning`,
+  `RecoverIdentityGenerationHighwaterStopped`,
+  `RecoverIdentityGenerationHighwaterCompleted`,
+  `RecoverIdentityGenerationHighwaterDestroyed`,
+  `SealIdentityGenerationHighwaterRunning`,
+  `SealIdentityGenerationHighwaterStopped`,
+  `SealIdentityGenerationHighwaterCompleted` and
+  `SealIdentityGenerationHighwaterDestroyed`. Codegen orders transitions, so
+  these sit mid-enum and the implicit discriminants and `PartialOrd` positions
+  of every later `TransitionId::*` variant move. Exhaustive matches must add
+  the arms; match generated machine enums by name.
+
+### Fixed
+
+- A mob that was reset and then re-spawned a member under an identity it had
+  before the reset resumes after a restart. Resume replays the events after
+  the last `MobReset`, and that replay required each identity's first
+  generation there to be 0, so a re-spawn that continued the identity's
+  generation failed the resume with an internal error. The replay now
+  accepts any ascending generation (`RecoverRosterMember`,
+  `RecoverRosterMemberReset` and `RecoverCommittedPlacedSpawn`), and a stored
+  `MemberReset` must ascend from its previous generation instead of being its
+  exact successor. Identity member target resolution follows the same rule.
+- A mob member re-spawned after a mob reset and a restart no longer reuses a
+  generation its pre-reset incarnation already had. Resume seeds the MobMachine
+  only from the events after the last `MobReset`, so an identity that epoch had
+  not seen started again at generation 0, with the runtime id and member
+  address of its pre-reset incarnation; without the restart it got the next
+  generation. Resume now first recovers every identity's highest generation
+  from the whole event log, every reset epoch included, into
+  `identity_generation_highwater`, then seals that window; a sealed machine
+  refuses the recovery signal, and a recovery never lowers a recorded value.
+  Minting (every spawn opener and membership commit, and
+  `ComputeRespawnGeneration`) reads one past the larger of the retained
+  generation and the high-water, and the shell no longer decides that an
+  identity is fresh: every spawn takes its generation from the machine. A
+  store whose last epoch already reused a generation still resumes, and that
+  identity's next spawn goes above the high-water. The invariant
+  `next_generation_above_highwater` is model-checked by a bounded TLC audit
+  (`specs/machines/mob_machine/generation_highwater_audit.sh`, lane shard
+  audits-c). It also reaches both replay histories above, refuses three
+  seeded defects, and checks that restoring the exact-successor replay rule
+  makes those histories unreachable.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

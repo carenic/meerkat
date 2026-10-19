@@ -5949,7 +5949,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_reset_requires_old_history_exact_successor_and_new_fence() {
+    fn recovered_reset_requires_old_history_ascent_and_new_fence() {
         let identity = AgentIdentity::from("reset-history");
         let runtime_v0 = AgentRuntimeId::from("reset-history:0");
         let runtime_v1 = AgentRuntimeId::from("reset-history:1");
@@ -5998,9 +5998,9 @@ mod tests {
                 FenceToken(8),
             ),
             (
-                "skipped successor",
+                "repeated generation",
                 Generation(0),
-                Generation(2),
+                Generation(0),
                 FenceToken(8),
             ),
             ("reused fence", Generation(0), Generation(1), FenceToken(7)),
@@ -6019,6 +6019,25 @@ mod tests {
                 "{label} must leave the old incarnation current"
             );
         }
+
+        // A mint above the high-water after a reused generation leaves a gap,
+        // and the replay accepts any ascending generation.
+        let mut skipped =
+            MobMachineAuthority::recover_from_state(base.clone()).expect("recover gap base");
+        skipped
+            .apply_signal(MobMachineSignal::RecoverRosterMemberReset {
+                agent_identity: identity.clone(),
+                previous_agent_runtime_id: runtime_v0.clone(),
+                previous_generation: Generation(0),
+                agent_runtime_id: AgentRuntimeId::from("reset-history:2"),
+                fence_token: FenceToken(8),
+                generation: Generation(2),
+            })
+            .expect("an ascending reset replay may skip generations");
+        assert_eq!(
+            skipped.state().identity_runtime_generations.get(&identity),
+            Some(&Generation(2))
+        );
 
         let mut authority =
             MobMachineAuthority::recover_from_state(base).expect("recover valid base");

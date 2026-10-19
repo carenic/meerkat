@@ -7679,6 +7679,86 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
     assert_ne!(resumed.incarnation(), recreated.incarnation());
 }
 
+/// Create seals the generation high-water window of a fresh machine. Resume
+/// first recovers every identity's high-water from the whole log, the epochs
+/// before the last reset included, and then seals it, so a member re-spawned
+/// after a reset and a restart continues its generation and a running
+/// machine never accepts the recovery signal.
+#[tokio::test]
+async fn create_and_resume_seal_the_generation_highwater_window() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let created_state = created
+        .query_machine_state()
+        .await
+        .expect("query the created machine");
+    assert!(
+        created_state.identity_generation_highwater_sealed,
+        "create seals a fresh machine"
+    );
+    assert!(created_state.identity_generation_highwater.is_empty());
+
+    let worker = AgentIdentity::from("w-1");
+    let worker_dsl = crate::machines::mob_machine::AgentIdentity::from_domain(&worker);
+    created
+        .spawn(ProfileName::from("worker"), worker.clone(), None)
+        .await
+        .expect("spawn before the reset");
+    created.reset().await.expect("reset the mob");
+    created.shutdown().await.expect("stop the first runtime");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    let resumed_state = resumed
+        .query_machine_state()
+        .await
+        .expect("query the resumed machine");
+    assert!(
+        resumed_state.identity_generation_highwater_sealed,
+        "resume seals once it has recovered the high-water"
+    );
+    assert!(
+        !resumed_state
+            .identity_runtime_generations
+            .contains_key(&worker_dsl),
+        "the last reset epoch names no worker"
+    );
+    assert_eq!(
+        resumed_state
+            .identity_generation_highwater
+            .get(&worker_dsl)
+            .map(|generation| generation.0),
+        Some(0),
+        "the high-water names the worker's pre-reset generation"
+    );
+
+    resumed
+        .spawn(ProfileName::from("worker"), worker.clone(), None)
+        .await
+        .expect("re-spawn the worker after the restart");
+    let respawned = resumed
+        .get_member(&worker)
+        .await
+        .expect("read the worker")
+        .expect("the worker is on the roster");
+    assert_eq!(
+        respawned.generation.get(),
+        1,
+        "the worker continues its generation, never its pre-reset 0"
+    );
+}
+
 fn sample_definition_with_external_backend() -> MobDefinition {
     let mut def = sample_definition();
     def.backend.external = Some(crate::definition::ExternalBackendConfig {
@@ -79820,6 +79900,8 @@ struct MobRuntimeParitySnapshotSummary {
     identity_to_runtime: BTreeMap<String, String>,
     identity_runtime_generations: BTreeMap<String, u64>,
     identity_runtime_fence_tokens: BTreeMap<String, u64>,
+    identity_generation_highwater: BTreeMap<String, u64>,
+    identity_generation_highwater_sealed: bool,
     member_peer_ids: BTreeMap<String, String>,
     member_peer_endpoints: BTreeMap<String, String>,
     member_prior_peer_endpoints: BTreeMap<String, BTreeSet<String>>,
@@ -80946,6 +81028,18 @@ async fn mob_runtime_parity_snapshot_summary(
                 .collect()
         })
         .unwrap_or_default();
+    let identity_generation_highwater = dsl_t2
+        .as_ref()
+        .map(|snap| {
+            snap.identity_generation_highwater
+                .iter()
+                .map(|(key, generation)| (format!("{key:?}"), generation.0))
+                .collect()
+        })
+        .unwrap_or_default();
+    let identity_generation_highwater_sealed = dsl_t2
+        .as_ref()
+        .is_some_and(|snap| snap.identity_generation_highwater_sealed);
     let host_binding_generation_highwater = dsl_t2
         .as_ref()
         .map(|snap| {
@@ -81494,6 +81588,8 @@ async fn mob_runtime_parity_snapshot_summary(
         pending_recipient_trust,
         host_binding_generations,
         host_binding_generation_highwater,
+        identity_generation_highwater,
+        identity_generation_highwater_sealed,
         confirmed_host_binding_revocations,
         replacement_host_bind_endpoints,
         replacement_host_binding_generations,
@@ -82278,6 +82374,12 @@ fn mob_runtime_parity_field_value(
         )),
         "host_binding_generation_highwater" => Some(MobRuntimeParityExprValue::Map(
             snapshot.host_binding_generation_highwater.clone(),
+        )),
+        "identity_generation_highwater" => Some(MobRuntimeParityExprValue::Map(
+            snapshot.identity_generation_highwater.clone(),
+        )),
+        "identity_generation_highwater_sealed" => Some(MobRuntimeParityExprValue::Bool(
+            snapshot.identity_generation_highwater_sealed,
         )),
         "replacement_host_bind_endpoints" => Some(MobRuntimeParityExprValue::Map(
             snapshot

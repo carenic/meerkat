@@ -15,6 +15,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `runtime_fence_tokens`: `Map<AgentRuntimeId, FenceToken>`
 - `identity_runtime_generations`: `Map<AgentIdentity, Generation>`
 - `identity_runtime_fence_tokens`: `Map<AgentIdentity, FenceToken>`
+- `identity_generation_highwater`: `Map<AgentIdentity, Generation>`
+- `identity_generation_highwater_sealed`: `Bool`
 - `active_run_count`: `u64`
 - `flow_authority_schema_version`: `u64`
 - `run_status`: `Map<RunId, FlowRunStatus>`
@@ -597,6 +599,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `OperationPeerTrusted`
 - `PeerInputAdmitted`
 - `CreateRun`
+- `RecoverIdentityGenerationHighwater`(agent_identity: AgentIdentity, generation: Generation)
+- `SealIdentityGenerationHighwater`
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -849,6 +853,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `placed_spawn_committed_attempt_is_complete`
 - `placed_spawn_attempt_is_not_both_pending_and_committed`
 - `identity_runtime_history_is_coherent`
+- `next_generation_above_highwater`
 - `current_runtime_binding_has_history`
 - `pending_respawn_topology_has_no_current_runtime`
 - `member_peer_endpoint_material_is_coherent`
@@ -4304,7 +4309,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `host_binding_generation_observed`
   - `identity_not_recovered`
   - `runtime_not_recovered`
-  - `generation_is_next`
+  - `generation_ascends`
   - `pending_attempt_absent`
   - `committed_attempt_absent`
   - `cleanup_absent`
@@ -4354,7 +4359,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `identity_not_recovered`
   - `runtime_not_recovered`
-  - `generation_is_next`
+  - `generation_ascends`
 - To: `Running`
 
 ### `RecoverRosterMemberAddressabilityRunning`
@@ -4492,7 +4497,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `previous_runtime_recovered`
   - `identity_recovered`
   - `previous_generation_matches_history`
-  - `generation_is_exact_successor`
+  - `generation_ascends`
   - `fence_token_changes`
   - `replacement_runtime_not_recovered`
   - `previous_runtime_session_ingress_detach_closed`
@@ -9256,6 +9261,66 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `binding_generation_positive`
   - `binding_generation_not_regressed`
+- To: `Destroyed`
+
+### `RecoverIdentityGenerationHighwaterRunning`
+- From: `Running`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Running`
+
+### `RecoverIdentityGenerationHighwaterStopped`
+- From: `Stopped`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Stopped`
+
+### `RecoverIdentityGenerationHighwaterCompleted`
+- From: `Completed`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Completed`
+
+### `RecoverIdentityGenerationHighwaterDestroyed`
+- From: `Destroyed`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Destroyed`
+
+### `SealIdentityGenerationHighwaterRunning`
+- From: `Running`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Running`
+
+### `SealIdentityGenerationHighwaterStopped`
+- From: `Stopped`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Stopped`
+
+### `SealIdentityGenerationHighwaterCompleted`
+- From: `Completed`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Completed`
+
+### `SealIdentityGenerationHighwaterDestroyed`
+- From: `Destroyed`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
 - To: `Destroyed`
 
 ### `RecoverConfirmedHostBindingRevocationRunning`

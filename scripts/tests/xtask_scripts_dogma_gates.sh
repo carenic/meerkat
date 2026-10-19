@@ -340,6 +340,9 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # and with --mutants each seeded defect's property or invariant violated.
 # mob_operator_grant_audit.sh requires each of its seven reachability
 # witnesses violated, and with --mutants each seeded defect's property.
+# generation_highwater_audit.sh requires each of its six reachability
+# witnesses violated, and with --mutants each seeded defect's property or
+# invariant; its exact-successor mutant needs the success line above.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -411,6 +414,15 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessResolveCleared is violated."' \
   'echo "Error: Action property AuditRebindDropsTheOtherScope is violated."' \
   'echo "Error: Invariant mob_operator_scopes_are_bound_to_an_incarnation is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRecorded is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRaised is violated."' \
+  'echo "Error: Invariant NotAuditWitnessSealedWithHighwater is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetainedBelowHighwater is violated."' \
+  'echo "Error: Invariant NotAuditWitnessFirstRecoveredAboveZero is violated."' \
+  'echo "Error: Invariant NotAuditWitnessResetGap is violated."' \
+  'echo "Error: Invariant next_generation_above_highwater is violated."' \
+  'echo "Error: Action property AuditSealClosesRecovery is violated."' \
+  'echo "Error: Action property AuditHighwaterNeverLowers is violated."' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"
