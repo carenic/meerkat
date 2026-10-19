@@ -156,7 +156,10 @@ them.
   policy. A controller with `reactivate_inherited` gets the typed refusal cause
   `member_host_unsupported` from it; under the other policies the controller
   sends no field and a 0.9.3 member host forks a participant as before, without
-  re-activation.
+  re-activation. Upgrade member hosts before their controller: until then a
+  0.9.3 member host forks participants, council participants included, without
+  the policy, and a participant whose source has activated host instructions
+  fails its first turn.
 
 ### Added
 
