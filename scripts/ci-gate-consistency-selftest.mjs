@@ -17,7 +17,8 @@
 //
 // The workflow is read as text, like the other CI selftests. A job-level
 // if: or needs: this reader cannot parse, an expression it does not model,
-// or a changes output that is not the planner's fails the selftest.
+// or a changes output that is not the planner's fails the selftest. Comment
+// and blank lines end no block, as in YAML.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -78,6 +79,7 @@ function readJobs(text) {
   let job = null;
   for (let index = start + 1; index < lines.length; index += 1) {
     const line = lines[index];
+    if (/^\s*#/.test(line)) continue;
     if (/^\S/.test(line)) break;
     const header = line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
     if (header) {
@@ -120,12 +122,19 @@ function readJobs(text) {
       continue;
     }
     if (/^ {4}outputs:\s*$/.test(line)) {
+      // Read like a needs: list: comment and blank lines are skipped, and
+      // every other line deeper than the key must be one of the planner's
+      // outputs.
       job.outputs = new Map();
-      for (let next = index + 1; next < lines.length && /^ {6}\S/.test(lines[next]); next += 1) {
+      let next = index + 1;
+      for (; next < lines.length; next += 1) {
+        if (lines[next].trim() === "" || /^\s*#/.test(lines[next])) continue;
+        if (lines[next].search(/\S/) <= 4) break;
         const output = lines[next].match(/^ {6}([a-z0-9_]+): \$\{\{ steps\.plan\.outputs\.([a-z0-9_]+) \}\}\s*$/);
         assert.ok(output, `${job.name}: output ${lines[next].trim()} is not one of the planner's (line ${next + 1})`);
         job.outputs.set(output[1], output[2]);
       }
+      index = next - 1;
     }
   }
   const names = new Set(jobs.map((one) => one.name));
@@ -146,7 +155,9 @@ function readStep(text, jobName, stepName) {
   const jobAt = lines.indexOf(`  ${jobName}:`);
   assert.ok(jobAt >= 0, `ci.yml has a job ${jobName}`);
   let at = -1;
-  for (let index = jobAt + 1; index < lines.length && !/^ {2}\S/.test(lines[index]); index += 1) {
+  for (let index = jobAt + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
+    if (/^ {0,2}\S/.test(lines[index])) break;
     if (lines[index].trim() === `- name: ${stepName}`) {
       at = index;
       break;
@@ -157,6 +168,7 @@ function readStep(text, jobName, stepName) {
   const env = {};
   let run = null;
   for (let index = at + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (/^\s+env:\s*$/.test(lines[index])) {
@@ -414,6 +426,36 @@ assert.throws(() => readStep(knownStep("          A: >-\n            folded\n"),
 assert.throws(() => readStep(knownStep("          A: |\n          B: two\n"), "gate", "Check"), /env A is a block scalar/);
 assert.throws(() => readStep(knownStep("          A: one\n            two\n"), "gate", "Check"), /env line two is not an entry/);
 assert.throws(() => readStep(knownStep("          A: one\n          lower: two\n"), "gate", "Check"), /cannot read env entry lower: two/);
+// A comment or blank line ends no block: not the jobs: map (a column-0
+// comment), a job, its outputs:, its steps or a step.
+const knownMap = [
+  "jobs:",
+  "  changes:",
+  "    outputs:",
+  "      a: ${{ steps.plan.outputs.a }}",
+  "",
+  "    # b is the planner's too",
+  "      b: ${{ steps.plan.outputs.b }}",
+  "    runs-on: x",
+  "# the gate",
+  "  gate:",
+  "  # its steps",
+  "    needs: [changes]",
+  "    steps:",
+  "      - name: Check",
+  "      # its env",
+  "        env:",
+  "          A: one",
+  "        run: |",
+  "          true",
+  "",
+].join("\n");
+assert.deepEqual(
+  readJobs(knownMap).map((job) => [job.name, job.needs, [...(job.outputs ?? [])]]),
+  [["changes", [], [["a", "a"], ["b", "b"]]], ["gate", ["changes"], []]],
+);
+assert.deepEqual(readStep(knownMap, "gate", "Check").env, { A: "one" });
+assert.throws(() => readJobs("jobs:\n  changes:\n    outputs:\n      a: ${{ steps.other.outputs.a }}\n"), /output a: \$\{\{ steps\.other\.outputs\.a \}\} is not one of the planner's/);
 
 const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
 const jobs = readJobs(workflow);

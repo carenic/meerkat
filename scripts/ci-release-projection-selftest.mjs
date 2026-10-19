@@ -816,6 +816,20 @@ process.stdout.write(JSON.stringify(fixture[path]));
   assert.equal(budget.outputs.exec_path_seconds, "1081", "1046 s of the row, 30 s of classification, 5 s of stagger");
   assert.equal(budget.outputs.budget_verdict, "exec_over_budget");
 
+  // The readers of the pin below, on known inputs: a comment or blank line
+  // ends neither the on: map nor a step's env:.
+  assert.deepEqual(
+    workflowEvents("on:\n  push:\n    branches:\n      - main\n# merge queue\n\n  merge_group: {}\njobs:\n"),
+    ["push", "merge_group"],
+    "a trigger after a comment or blank line inside on: is read",
+  );
+  assert.throws(() => workflowEvents("on:\n  'merge_group': {}\njobs:\n"), /on: map has a line this selftest cannot read/);
+  assert.deepEqual(
+    extractStepEnv("      - name: Probe\n        env:\n          A: one\n        # B follows\n          B: two\n        run: |\n          true\n", "Probe"),
+    { A: "one", B: "two" },
+    "an env entry after a comment inside a step's env: is read",
+  );
+
   // Which runs the budget binds is ci.yml's ENFORCE_BUDGET expression,
   // evaluated here for each event: the budget keeps pull-request feedback
   // fast, and a push or a dispatch is a full validation run that only
@@ -897,7 +911,8 @@ process.stdout.write(JSON.stringify(fixture[path]));
   rmSync(scratch, { recursive: true, force: true });
 }
 
-// The `env:` entries of the named step, as written.
+// The `env:` entries of the named step, as written. A comment line ends
+// neither the step nor its env:.
 function extractStepEnv(text, name) {
   const lines = text.split("\n");
   const at = lines.findIndex((line) => line.trim() === `- name: ${name}`);
@@ -906,6 +921,7 @@ function extractStepEnv(text, name) {
   const env = {};
   let envIndent = -1;
   for (let index = at + 1; index < lines.length; index += 1) {
+    if (/^\s*#/.test(lines[index])) continue;
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (envIndent < 0) {
@@ -926,15 +942,22 @@ function extractStepLiteralEnv(text, name) {
   return env;
 }
 
-// The events ci.yml runs on: the keys of its top-level on: map.
+// The events ci.yml runs on: the keys of its top-level on: map. A comment or
+// blank line does not end the map, and every other line at the keys' indent
+// must be a key.
 function workflowEvents(text) {
   const lines = text.split("\n");
   const at = lines.indexOf("on:");
   assert.ok(at >= 0, "ci.yml has an on: map");
   const events = [];
-  for (let index = at + 1; index < lines.length && !/^\S/.test(lines[index]); index += 1) {
-    const key = lines[index].match(/^ {2}([a-z_]+):/);
-    if (key) events.push(key[1]);
+  for (let index = at + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.trim() === "" || /^\s*#/.test(line)) continue;
+    if (/^\S/.test(line)) break;
+    if (line.search(/\S/) !== 2) continue;
+    const key = line.match(/^ {2}([a-z_]+):(?:\s|$)/);
+    assert.ok(key, `ci.yml's on: map has a line this selftest cannot read: ${line.trim()} (line ${index + 1})`);
+    events.push(key[1]);
   }
   return events;
 }
