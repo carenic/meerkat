@@ -35,8 +35,25 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-runtime`: `AuthenticatedOriginalSource::retained_original` is
+  replaced by `retained_custody`, which returns `RetainedCustody`
+  (`Retained`, `AdmissionPending` or `NotRetained`; non-exhaustive) instead of
+  `Option<WorkAuthorityBasis>`. An implementor answers `AdmissionPending` only
+  for a submission candidate that it will promote or withdraw itself, within
+  its own bound; it withdraws any candidate it cannot settle, and a withdrawn
+  candidate answers `NotRetained` from then on (see the method
+  documentation). A candidate the implementor has not enrolled in such a
+  settlement answers `NotRetained`, the earlier `None`.
+
 ### Added
 
+- `meerkat-core`: `ControllerReadinessFailure::OriginalAdmissionPending`: an
+  original that an input or operation relies on is still its source owner's
+  submission candidate, whose admission the owner has not settled yet.
+- `meerkat-runtime`: `RetainedCustody`, a source owner's custody of one
+  original: retained with its mandate, admission pending, or not retained.
 - `LocalGrantAuthority::resolve_lineage_observed`,
   `resolve_controller_lineage_observed` and
   `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
@@ -66,6 +83,17 @@ them.
 
 ### Fixed
 
+- Work that names an original whose admission its source owner has not
+  settled yet is no longer refused as malformed or denied
+  (`meerkat-runtime`). Native admission of input that names such a
+  contributor, `require_source_original_live` and a retained resume report
+  `ControllerReadinessUnavailable` with `OriginalAdmissionPending`; operation
+  authorization of work that names it, the further originals of a helper
+  admission or child issuance, and the controller-grant mutation check report
+  it unavailable, and none of them waits. A retained resume therefore stays
+  retryable until the owner settles the original, instead of being refused
+  for good. A cancelled original is still refused, and the controller-grant
+  mutation check no longer counts such a contributor as unreferenced.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved

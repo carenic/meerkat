@@ -984,14 +984,14 @@ impl crate::meerkat_machine::AuthenticatedOriginalSource for NoOriginals {
         Ok(None)
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
         _: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
     ) -> Result<
-        Option<meerkat_authorization_contracts::work_association::WorkAuthorityBasis>,
+        crate::meerkat_machine::RetainedCustody,
         meerkat_core::authorization::ControllerReadinessFailure,
     > {
-        Ok(None)
+        Ok(crate::meerkat_machine::RetainedCustody::NotRetained)
     }
 }

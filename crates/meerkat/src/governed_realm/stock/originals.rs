@@ -5,10 +5,14 @@
 //! input that names it. A candidate authenticates only its own submission
 //! (its own occurrence) and is never a retained original or a contributor of
 //! other work. Exact native acceptance promotes it
-//! ([`PendingOriginal::admit`]); a refused or abandoned submission drops it.
-//! Only admitted originals serve as contributors and as retained custody
-//! ([`AuthenticatedOriginalSource::retained_original`]) for every operation
-//! of work that names them.
+//! ([`PendingOriginal::admit`]); a refused or abandoned submission, or a
+//! promotion that cannot publish, drops it. Only admitted originals serve as
+//! contributors and as retained custody
+//! ([`AuthenticatedOriginalSource::retained_custody`]) for every operation
+//! of work that names them. While its [`PendingOriginal`] is held, a
+//! candidate reads as `AdmissionPending`: the ledger settles it within that
+//! one submission, by promoting it or by dropping it, and a dropped
+//! candidate reads as `NotRetained` from then on.
 //!
 //! Custody changes share the grant authority's publication: every promotion,
 //! cleanup and release publishes before the ledger changes (publication, then
@@ -30,14 +34,14 @@ use meerkat_authorization::publication::{
 use meerkat_authorization_contracts::constraints::ResourceDomain;
 use meerkat_authorization_contracts::evidence::HistoricalEvidenceRef;
 use meerkat_authorization_contracts::work_association::{
-    OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
+    OriginalWorkRef, QualifiedIngressNamespace,
 };
 use meerkat_core::PrincipalRef;
 use meerkat_core::authorization::ControllerReadinessFailure;
 use meerkat_core::connection::RealmId;
 use meerkat_runtime::input_authority::NativeIngressContext;
 use meerkat_runtime::meerkat_machine::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition, RetainedCustody,
 };
 
 /// Why a custody change did not happen.
@@ -365,20 +369,34 @@ impl AuthenticatedOriginalSource for StockOriginalLedger {
             .map(|entry| entry.original.clone()))
     }
 
-    /// The mandate of an admitted original only.
-    fn retained_original(
+    /// The mandate of an admitted original; a candidate of it is pending
+    /// until its [`PendingOriginal`] promotes or drops it, within the one
+    /// submission that holds it.
+    fn retained_custody(
         &self,
         namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
-        Ok(self
-            .lock()
+    ) -> Result<RetainedCustody, ControllerReadinessFailure> {
+        let held = self.lock();
+        let mut pending = false;
+        for entry in held
             .iter()
-            .find(|entry| {
-                entry.custody == Custody::Admitted
-                    && entry.names(&namespace.realm, &namespace.ingress, original)
-            })
-            .map(|entry| entry.original.authority_basis.clone()))
+            .filter(|entry| entry.names(&namespace.realm, &namespace.ingress, original))
+        {
+            match entry.custody {
+                Custody::Admitted => {
+                    return Ok(RetainedCustody::Retained(
+                        entry.original.authority_basis.clone(),
+                    ));
+                }
+                Custody::Candidate => pending = true,
+            }
+        }
+        Ok(if pending {
+            RetainedCustody::AdmissionPending
+        } else {
+            RetainedCustody::NotRetained
+        })
     }
 
     /// Cancelled once this process cancelled the original, whatever became

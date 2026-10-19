@@ -61,6 +61,9 @@ struct Originals {
     cancelled: Mutex<std::collections::HashMap<EvidenceId, HistoricalEvidenceRef>>,
     /// Originals whose retained custody the source owner cannot read now.
     unreadable: Mutex<std::collections::HashSet<EvidenceId>>,
+    /// Contributors that are still the source owner's candidates: it has not
+    /// settled their admission yet.
+    pending: Mutex<std::collections::HashSet<EvidenceId>>,
 }
 impl AuthenticatedOriginalSource for Originals {
     fn authenticated_original(
@@ -87,11 +90,11 @@ impl AuthenticatedOriginalSource for Originals {
             .cloned())
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
+    ) -> Result<RetainedCustody, ControllerReadinessFailure> {
         if self
             .unreadable
             .lock()
@@ -106,14 +109,24 @@ impl AuthenticatedOriginalSource for Originals {
             .expect("fixture")
             .contains(&original.work)
         {
-            return Ok(None);
+            return Ok(RetainedCustody::NotRetained);
+        }
+        if self
+            .pending
+            .lock()
+            .expect("fixture")
+            .contains(&original.work)
+        {
+            return Ok(RetainedCustody::AdmissionPending);
         }
         Ok(self
             .contributors
             .lock()
             .expect("fixture")
             .get(&original.work)
-            .map(|custody| custody.authority_basis.clone()))
+            .map_or(RetainedCustody::NotRetained, |custody| {
+                RetainedCustody::Retained(custody.authority_basis.clone())
+            }))
     }
 
     fn original_disposition(
@@ -175,6 +188,63 @@ impl AdmittedWorkPolicyOwner for Mandates {
     > {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
+}
+
+/// RED-6 (R6): a source original whose admission its owner has not settled
+/// yet is not yet current, never refused; it is current again once the owner
+/// promotes it. CONTROL-cancelled (R6): cancelled while pending, it is
+/// refused.
+#[test]
+fn a_pending_source_original_is_not_yet_current() {
+    let f = fixture();
+    let source = f.claims.contributing_work[1].clone();
+    let current = || {
+        require_source_original_live(
+            &f.grants,
+            f.originals.as_ref(),
+            &f.claims.ingress_namespace,
+            &source,
+            &f.claims.logical_executor,
+            None,
+        )
+    };
+    assert!(current().is_ok(), "control: held and active");
+    f.originals
+        .pending
+        .lock()
+        .expect("fixture")
+        .insert(source.work.clone());
+    let not_yet = current();
+    assert!(
+        matches!(
+            not_yet,
+            Err(NativeAdmissionError::Readiness(
+                ControllerReadinessFailure::OriginalAdmissionPending
+            ))
+        ),
+        "{not_yet:?}"
+    );
+    f.originals
+        .cancelled
+        .lock()
+        .expect("fixture")
+        .insert(source.work.clone(), fixture_evidence(&f, "cancel-source"));
+    assert_eq!(
+        refusal(current()),
+        Some(OperationRefusalKind::Denied),
+        "a cancellation wins over a pending admission"
+    );
+    f.originals
+        .cancelled
+        .lock()
+        .expect("fixture")
+        .remove(&source.work);
+    f.originals
+        .pending
+        .lock()
+        .expect("fixture")
+        .remove(&source.work);
+    assert!(current().is_ok(), "current once promoted");
 }
 
 struct Fixture {
@@ -259,6 +329,7 @@ fn fixture() -> Fixture {
         released: Mutex::new(std::collections::HashSet::new()),
         cancelled: Mutex::new(std::collections::HashMap::new()),
         unreadable: Mutex::new(std::collections::HashSet::new()),
+        pending: Mutex::new(std::collections::HashSet::new()),
     });
     let mandates = Arc::new(Mandates(Mutex::new(Ok(()))));
     let invocation = ScopedInvocation::from_policy(mandates.clone());
@@ -2223,11 +2294,11 @@ impl AuthenticatedOriginalSource for InterferingOriginals {
             .authenticated_original(ingress, namespace, original)
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         namespace: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
+    ) -> Result<RetainedCustody, ControllerReadinessFailure> {
         match self.pending.lock().expect("interference").take() {
             Some(ContributorInterference::HoldOwnerChange { begin, held }) => {
                 begin.send(()).expect("start the owner change");
@@ -2237,7 +2308,7 @@ impl AuthenticatedOriginalSource for InterferingOriginals {
             Some(ContributorInterference::Poison(publication)) => publication.poison(),
             None => {}
         }
-        self.inner.retained_original(namespace, original)
+        self.inner.retained_custody(namespace, original)
     }
 
     fn original_disposition(
