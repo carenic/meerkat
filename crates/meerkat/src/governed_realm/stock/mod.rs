@@ -71,12 +71,12 @@ use meerkat_authorization_contracts::protocol::ContractRequirements;
 use meerkat_authorization_contracts::resource::ResourceRef;
 use meerkat_authorization_contracts::work_association::{
     GrantLineageRef, InputAuthorityAssociation, InputAuthorityAssociationCandidate,
-    OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
+    NativeWorkTarget, OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
 };
 use meerkat_core::connection::RealmId;
 use meerkat_core::{
-    ControllerModelClient, OperationAuthorizationError, OperationRefusalKind, OperationRefused,
-    PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
+    ControllerModelClient, ControllerModelSelection, OperationAuthorizationError,
+    OperationRefusalKind, OperationRefused, PrincipalKind, PrincipalRef, SessionId, TrustDomainId,
 };
 use meerkat_runtime::input::{ExternalEventInput, Input, InputOrigin};
 use meerkat_runtime::meerkat_machine::{
@@ -797,9 +797,10 @@ impl StockGovernance {
     /// `host-outcome-events` and idempotency key
     /// `rkat-host-outcome-<event>`, in the composition's `cli-prompts`
     /// ingress namespace. The review and consent of its operations state
-    /// that requester. A turn's identity includes its requester, so an
-    /// outcome never shares a turn with a queued operator prompt: each
-    /// outcome runs its own turn.
+    /// that requester, and its operations are reviewed under the operator's
+    /// review tiers, the same as an operator prompt's. A turn's identity
+    /// includes its requester, so an outcome never shares a turn with a
+    /// queued operator prompt: each outcome runs its own turn.
     ///
     /// The event carries only the outcome that process retained, nothing
     /// from another source. The stock rules cannot verify that the command
@@ -917,82 +918,40 @@ impl StockGovernance {
                     .await?
             }
         };
-        let event = uuid::Uuid::now_v7();
-        let id = |value: String| {
-            EvidenceId::new(value).map_err(|error| StockGovernanceError::Binding(error.to_string()))
-        };
-        let labels = requesting.labels();
-        let occurrence = id(format!("{}-{event}", labels.occurrence))?;
-        let namespace = QualifiedIngressNamespace {
-            realm: self.realm.clone(),
-            ingress: self.ingress_domain(),
-            occurrence_scope: occurrence.clone(),
-        };
-        let (requester, authentication) = match requesting {
-            Requesting::Operator => (
-                self.principals.operator.clone(),
-                self.evidence("operator-authentication", process_id(), event)?,
-            ),
-            // Nothing about the operator is authenticated here: the process
-            // observes itself, its own ingress.
-            Requesting::Ingress => (
-                self.principals.ingress_actor.clone(),
-                self.evidence("host-outcome-authentication", process_id(), event)?,
-            ),
-            Requesting::Caller(caller) => {
-                (caller.requester().clone(), caller.authentication().clone())
-            }
-        };
-        let root_event = self.evidence(labels.root_events, event.to_string(), event)?;
-        let original = OriginalWorkRef {
-            authority: self.principals.ingress_actor.clone(),
-            work: occurrence.clone(),
-        };
+        let claims = StockOriginalClaims::new(
+            &self.principals,
+            &self.realm,
+            &requesting,
+            destination.target(),
+            authority_basis.clone(),
+            controller_grant,
+            controller.selection().clone(),
+            uuid::Uuid::now_v7(),
+        )?;
         let pending = self
             .ledger
             .record_candidate(
-                &namespace,
-                &requester,
+                &claims.namespace,
+                &claims.requester,
                 AuthenticatedOriginal {
-                    original_work: original.clone(),
-                    occurrence_scope: occurrence,
-                    original_authentication: authentication.clone(),
-                    root_event: root_event.clone(),
+                    original_work: claims.original.clone(),
+                    occurrence_scope: claims.namespace.occurrence_scope.clone(),
+                    original_authentication: claims.authentication.clone(),
+                    root_event: claims.root_event.clone(),
                     contributing_work: Vec::new(),
                     target: destination.target().clone(),
-                    authority_basis: authority_basis.clone(),
+                    authority_basis,
                 },
             )
             .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
-        let association = InputAuthorityAssociation::new(InputAuthorityAssociationCandidate {
-            requester: requester.clone(),
-            ingress_actor: self.principals.ingress_actor.clone(),
-            represented_subject: None,
-            original_authentication: authentication.clone(),
-            logical_executor: self.principals.executor.clone(),
-            target: destination.target().clone(),
-            original_work: original,
-            root_event,
-            contributing_work: Vec::new(),
-            authority_basis,
-            controller_grant_lineage: vec![controller_grant],
-            controller_model: Some(controller.selection().clone()),
-            // The grants and current policy narrow; the claims do not widen.
-            controller_ceiling: ExecutionRestrictions::unrestricted(),
-            admitted_ceiling: ExecutionRestrictions::unrestricted(),
-            source_observations: Vec::new(),
-            ingress_namespace: namespace,
-            contract: ContractRequirements::local_governed_v1(),
-        })
-        .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
         let input = bind_scoped_original(
             input,
-            association,
-            IdempotencyKey::new(format!("{}-{event}", labels.key)),
-            requester,
+            claims.association,
+            IdempotencyKey::new(claims.key),
+            claims.requester,
             self.principals.ingress_actor.clone(),
             self.realm.clone(),
-            authentication,
+            claims.authentication,
             controller,
         )
         .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
@@ -1113,22 +1072,150 @@ impl StockGovernance {
         resource_id: String,
         event: uuid::Uuid,
     ) -> Result<HistoricalEvidenceRef, StockGovernanceError> {
-        let mut digest = [0_u8; 32];
-        digest[..16].copy_from_slice(event.as_bytes());
-        digest[16..].copy_from_slice(process_uuid().as_bytes());
-        Ok(HistoricalEvidenceRef {
-            resource: ResourceRef {
-                domain: ResourceDomain {
-                    authority: self.principals.ingress_actor.clone(),
-                    namespace: namespace.into(),
-                },
-                resource_id,
+        process_evidence(
+            &self.principals.ingress_actor,
+            namespace,
+            resource_id,
+            event,
+        )
+    }
+}
+
+/// This process's observation `event` in the evidence `namespace` of its
+/// stock ingress `ingress_actor`.
+fn process_evidence(
+    ingress_actor: &PrincipalRef,
+    namespace: &str,
+    resource_id: String,
+    event: uuid::Uuid,
+) -> Result<HistoricalEvidenceRef, StockGovernanceError> {
+    let mut digest = [0_u8; 32];
+    digest[..16].copy_from_slice(event.as_bytes());
+    digest[16..].copy_from_slice(process_uuid().as_bytes());
+    Ok(HistoricalEvidenceRef {
+        resource: ResourceRef {
+            domain: ResourceDomain {
+                authority: ingress_actor.clone(),
+                namespace: namespace.into(),
             },
-            revision: EvidenceId::new(format!("process-{}", process_uuid()))
-                .map_err(|error| StockGovernanceError::Binding(error.to_string()))?,
-            // An identity of this observation, not a content digest: the
-            // final input's replay digest binds its content.
-            digest: EvidenceDigest::from_array(digest),
+            resource_id,
+        },
+        revision: EvidenceId::new(format!("process-{}", process_uuid()))
+            .map_err(|error| StockGovernanceError::Binding(error.to_string()))?,
+        // An identity of this observation, not a content digest: the
+        // final input's replay digest binds its content.
+        digest: EvidenceDigest::from_array(digest),
+    })
+}
+
+/// The claims of one original the stock composition binds: its requester
+/// and how it was authenticated, its occurrence and root event, the key of
+/// its event and the association its input carries. The one builder of
+/// [`StockGovernance::bind_original`], so what is read from these claims
+/// is exactly what a binding records.
+struct StockOriginalClaims {
+    requester: PrincipalRef,
+    authentication: HistoricalEvidenceRef,
+    namespace: QualifiedIngressNamespace,
+    original: OriginalWorkRef,
+    root_event: HistoricalEvidenceRef,
+    /// The event's idempotency key.
+    key: String,
+    association: InputAuthorityAssociation,
+}
+
+impl StockOriginalClaims {
+    /// The claims of the original of `requesting` for event `event`, at
+    /// the session destination `target` of the stock composition of
+    /// `principals` in `realm`, under `authority_basis`, with the
+    /// controller grant `controller_grant` and the actual controller
+    /// selection `controller`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        principals: &StockPrincipals,
+        realm: &RealmId,
+        requesting: &Requesting<'_>,
+        target: &NativeWorkTarget,
+        authority_basis: WorkAuthorityBasis,
+        controller_grant: GrantLineageRef,
+        controller: ControllerModelSelection,
+        event: uuid::Uuid,
+    ) -> Result<Self, StockGovernanceError> {
+        let labels = requesting.labels();
+        let occurrence = EvidenceId::new(format!("{}-{event}", labels.occurrence))
+            .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
+        let namespace = QualifiedIngressNamespace {
+            realm: realm.clone(),
+            ingress: ResourceDomain {
+                authority: principals.ingress_actor.clone(),
+                namespace: PROMPT_NAMESPACE.into(),
+            },
+            occurrence_scope: occurrence.clone(),
+        };
+        let (requester, authentication) = match requesting {
+            Requesting::Operator => (
+                principals.operator.clone(),
+                process_evidence(
+                    &principals.ingress_actor,
+                    "operator-authentication",
+                    process_id(),
+                    event,
+                )?,
+            ),
+            // Nothing about the operator is authenticated here: the process
+            // observes itself, its own ingress.
+            Requesting::Ingress => (
+                principals.ingress_actor.clone(),
+                process_evidence(
+                    &principals.ingress_actor,
+                    "host-outcome-authentication",
+                    process_id(),
+                    event,
+                )?,
+            ),
+            Requesting::Caller(caller) => {
+                (caller.requester().clone(), caller.authentication().clone())
+            }
+        };
+        let root_event = process_evidence(
+            &principals.ingress_actor,
+            labels.root_events,
+            event.to_string(),
+            event,
+        )?;
+        let original = OriginalWorkRef {
+            authority: principals.ingress_actor.clone(),
+            work: occurrence,
+        };
+        let association = InputAuthorityAssociation::new(InputAuthorityAssociationCandidate {
+            requester: requester.clone(),
+            ingress_actor: principals.ingress_actor.clone(),
+            represented_subject: None,
+            original_authentication: authentication.clone(),
+            logical_executor: principals.executor.clone(),
+            target: target.clone(),
+            original_work: original.clone(),
+            root_event: root_event.clone(),
+            contributing_work: Vec::new(),
+            authority_basis,
+            controller_grant_lineage: vec![controller_grant],
+            controller_model: Some(controller),
+            // The grants and current policy narrow; the claims do not widen.
+            controller_ceiling: ExecutionRestrictions::unrestricted(),
+            admitted_ceiling: ExecutionRestrictions::unrestricted(),
+            source_observations: Vec::new(),
+            ingress_namespace: namespace.clone(),
+            contract: ContractRequirements::local_governed_v1(),
+        })
+        .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
+        Ok(Self {
+            requester,
+            authentication,
+            namespace,
+            original,
+            root_event,
+            key: format!("{}-{event}", labels.key),
+            association,
         })
     }
 }

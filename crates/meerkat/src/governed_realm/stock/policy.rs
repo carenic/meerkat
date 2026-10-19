@@ -1187,6 +1187,23 @@ mod tests {
         )
     }
 
+    /// The review text of work the stock ingress requested itself, with
+    /// `bounds`.
+    fn host_mandate(bounds: &str) -> String {
+        format!(
+            "The requester of this work is the stock ingress {} itself, a runtime host in the \
+             process of the local operator {}: it submitted an event it reports as the outcome \
+             of an administrative command run through that process, for one of the operator's \
+             own sessions, invoking the realm agent {} in realm stock-realm. No person requested \
+             this work, and it is not the operator's consent to this operation. It runs under \
+             the operator's grant-lineage mandate, which with the work's admitted ceiling bounds \
+             this operation to: {bounds}",
+            json(&ingress()),
+            json(&operator()),
+            json(&executor()),
+        )
+    }
+
     fn association(
         session: &SessionId,
         change: impl FnOnce(&mut InputAuthorityAssociationCandidate),
@@ -3513,26 +3530,11 @@ mod tests {
         assert_eq!(owner.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// The review text of work the stock ingress requested itself, with
-    /// `bounds`.
-    fn host_mandate(bounds: &str) -> String {
-        format!(
-            "The requester of this work is the stock ingress {} itself, a runtime host in the \
-             process of the local operator {}: it submitted an event it reports as the outcome \
-             of an administrative command run through that process, for one of the operator's \
-             own sessions, invoking the realm agent {} in realm stock-realm. No person requested \
-             this work, and it is not the operator's consent to this operation. It runs under \
-             the operator's grant-lineage mandate, which with the work's admitted ceiling bounds \
-             this operation to: {bounds}",
-            json(&ingress()),
-            json(&operator()),
-            json(&executor()),
-        )
-    }
-
     /// The stock ingress reporting its own administrative outcome is
     /// admitted in the local-operator posture, under the operator's grant
     /// lineage, and its review states that no person requested the work.
+    /// The association is the one the stock binding itself builds for the
+    /// outcome ([`super::super::StockOriginalClaims`]), never a copy.
     #[test]
     fn the_ingress_reporting_its_own_outcome_is_admitted_and_reviewed_as_the_host() {
         let session = SessionId::new();
@@ -3543,12 +3545,25 @@ mod tests {
             "stock-grant",
             ExecutionRestrictions::unrestricted(),
         );
-        let reported = association(&session, |c| {
-            c.requester = ingress();
-            c.authority_basis = WorkAuthorityBasis::GrantLineage {
-                lineage: vec![lineage],
-            };
-        });
+        let target = StockSessionDestination::for_session(&operator(), &session, 1)
+            .unwrap()
+            .target()
+            .clone();
+        let reported = super::super::StockOriginalClaims::new(
+            &principals(),
+            &realm(),
+            &super::super::Requesting::Ingress,
+            &target,
+            WorkAuthorityBasis::GrantLineage {
+                lineage: vec![lineage.clone()],
+            },
+            lineage,
+            controller_selection(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("the binding's own claims")
+        .association;
+        assert!(reported.candidate().requester == ingress());
         policy
             .authorize_invocation(&ingress_context(ingress()), &reported)
             .expect("the ingress reports its own outcome");
