@@ -820,7 +820,13 @@ Handle `SessionControlError::Authorization` by its typed variant. `Refused`
 returns local feedback without appending the content. `Unavailable` means no
 usable authorization was established. `ObservationUnavailable` is a separate
 audit failure and does not prove that an earlier effect never happened. A raw
-`append_system_context` call supplies no authenticated receipt in governed mode.
+`append_system_context` call supplies no authenticated receipt, so in a governed
+session it answers authorization unavailable. Meerkat's own raw appenders do the
+same there: JSON-RPC `session/inject_context` (rkat-rpc's typed append, which
+its durable delivery also uses) and the mob operator's
+`mob/append_system_context` (`MobMcpState::mob_append_system_context`).
+LiveResponses outcomes use the authenticated append when a native work
+authorization host is installed.
 
 The Session retains protected control observations with its existing commit.
 They do not enter model context or public history, and they cannot authorize a
