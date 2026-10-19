@@ -21,7 +21,10 @@ recovery modes for retries.
 and the Web SDK package of main's current commit, which must already carry
 VERSION, are built, attested and uploaded, and nothing is published. The tag
 run of exactly that commit then publishes those artifacts instead of
-rebuilding them. Dispatch it as soon as the release commit lands on main.
+rebuilding them. Dispatch it as soon as the release commit lands on main. It
+builds with the backend the tag run selects (auto reads the repository's
+MEERKAT_RELEASE_BUILDBUDDY, never the local MEERKAT_BUILDBUDDY), and
+release.yml refuses a prebuild on any other backend.
 
 Environment equivalents:
   VERSION or RELEASE_TAG     Release tag, for example v0.6.1.
@@ -35,10 +38,12 @@ Environment equivalents:
   SEMVER_EVIDENCE_RUN_ID     Exact failed tag-run id with a completed semver measurement.
   SEMVER_EVIDENCE_JOB_ID     Exact failed semver job id from that run.
   RELEASE_WORKFLOW_DRY_RUN   true/false to print the gh command without dispatching.
-  MEERKAT_BUILDBUDDY         When RELEASE_BACKEND=auto, true selects buildbuddy
-                              and false/0 selects github-hosted. If unset, auto
-                              honors MEERKAT_RELEASE_BUILDBUDDY=true only for
-                              the lukacf GitHub account.
+  MEERKAT_BUILDBUDDY         When RELEASE_BACKEND=auto (prebuild mode excepted),
+                              true selects buildbuddy and false/0 selects
+                              github-hosted. If unset, auto selects buildbuddy
+                              only for the lukacf GitHub account, and only while
+                              the repository's MEERKAT_RELEASE_BUILDBUDDY is true
+                              or 1 (any case), as release.yml does.
 EOF
 }
 
@@ -145,8 +150,10 @@ repo_release_buildbuddy_enabled() {
     gh api repos/lukacf/meerkat/actions/variables/MEERKAT_RELEASE_BUILDBUDDY \
       --jq '.value' 2>/dev/null || true
   )"
-  case "${value}" in
-    1|true|TRUE|yes|YES|on|ON|buildbuddy)
+  # release.yml selects BuildBuddy when the variable is 'true' or '1', and
+  # GitHub's expression comparisons ignore case.
+  case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+    1|true)
       return 0
       ;;
     *)
@@ -157,7 +164,10 @@ repo_release_buildbuddy_enabled() {
 
 case "${backend}" in
   auto)
-    if [[ -n "${MEERKAT_BUILDBUDDY+x}" ]]; then
+    # A prebuild must build with its tag run's backend, which the repository
+    # variable selects (release.yml refuses any other), so a local
+    # MEERKAT_BUILDBUDDY does not choose it.
+    if [[ "${mode}" != "prebuild" && -n "${MEERKAT_BUILDBUDDY+x}" ]]; then
       if meerkat_buildbuddy_enabled; then
         backend="buildbuddy"
       else

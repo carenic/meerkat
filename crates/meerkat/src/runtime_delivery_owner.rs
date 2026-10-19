@@ -55,6 +55,53 @@ use crate::{
 /// Rows read per projection or application page.
 const DELIVERY_PAGE: usize = 256;
 
+/// The longest gap, in wakes, between two retries of a job projection that
+/// keeps failing.
+const PROJECTION_RETRY_MAX_WAKES: u32 = 64;
+
+/// The retry schedule of a job projection that failed (the projector
+/// skipped an entry, which stays pending in the outbox). The retry is owed
+/// to later wakes and never driven by itself: the first one joins the next
+/// wake, and while the projection keeps failing each further retry waits
+/// for twice as many wakes, up to [`PROJECTION_RETRY_MAX_WAKES`]. A busy
+/// runtime's stream of unrelated wakes (it settles a run on every loop
+/// iteration) therefore does not retry it on every one. A job commit or a
+/// reconcile still projects at once, and a projection that skips nothing
+/// clears the schedule.
+#[derive(Debug, Default)]
+struct ProjectionRetry {
+    /// Wakes left until the next retry; `None` when none is owed.
+    wakes_left: Option<u32>,
+    /// Projections that failed since the last one that skipped nothing.
+    failures: u32,
+}
+
+impl ProjectionRetry {
+    /// A projection skipped an entry: owe a retry after the next gap.
+    fn failed(&mut self) {
+        let gap = 1_u32
+            .checked_shl(self.failures)
+            .map_or(PROJECTION_RETRY_MAX_WAKES, |gap| {
+                gap.min(PROJECTION_RETRY_MAX_WAKES)
+            });
+        self.failures = self.failures.saturating_add(1);
+        self.wakes_left = Some(gap);
+    }
+
+    /// One wake arrived: whether the owed retry joins it.
+    fn due_on_wake(&mut self) -> bool {
+        let Some(left) = self.wakes_left.as_mut() else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        if *left > 0 {
+            return false;
+        }
+        self.wakes_left = None;
+        true
+    }
+}
+
 /// Default sweep of the store watch on a shared store: the bound on how long
 /// a missed file notification, a dead peer's released claim or a released
 /// cold-delivery lock can delay a delivery. The same 5 s the mob event bus
@@ -712,6 +759,9 @@ struct Wake {
     source_change: bool,
     /// The shared store's watch ticked: answer with cheap reads.
     store_tick: bool,
+    /// A failed job projection's retry is due on this wake (see
+    /// `ProjectionRetry`).
+    retry_projection: bool,
 }
 
 async fn run_owner(mut owner: OwnerLoop) {
@@ -726,6 +776,7 @@ async fn run_owner(mut owner: OwnerLoop) {
     // A reconcile read that failed during a round of owed continuations:
     // owed to the first wake after the round, like any failed reconcile.
     let mut reconcile_owed = false;
+    let mut projection_retry = ProjectionRetry::default();
     loop {
         // A retired owner starts no pass, whichever signal woke it.
         if owner.stop.as_ref().is_some_and(|stop| *stop.borrow()) {
@@ -792,6 +843,7 @@ async fn run_owner(mut owner: OwnerLoop) {
             || wake.inbox_commit
             || (wake.retry_blocked
                 && (!blocked.is_empty() || owner.awaiting.values().any(|wait| wait.via_address)))
+            || wake.retry_projection
             || owner.owed_round.is_some()
             || !due.is_empty();
         let mut reconcile_failed = false;
@@ -802,11 +854,16 @@ async fn run_owner(mut owner: OwnerLoop) {
                 cross_process_wake_unavailable: owner.store_watch.unavailable_reason(),
                 ..RuntimeDeliveryPass::default()
             };
-            let Some(failed) = run_pass(&mut owner, wake, due, &mut blocked, &mut pass).await
+            let Some(outcome) = run_pass(&mut owner, wake, due, &mut blocked, &mut pass).await
             else {
                 return;
             };
-            reconcile_failed = failed;
+            reconcile_failed = outcome.reconcile_failed;
+            match outcome.projection_skipped {
+                Some(true) => projection_retry.failed(),
+                Some(false) => projection_retry = ProjectionRetry::default(),
+                None => {}
+            }
             pass.blocked_sessions = blocked.values().flatten().cloned().collect();
             pass.blocked_runtimes = blocked.keys().cloned().collect();
             pass.applies_cold_deliveries = owner.cold.applies_cold_deliveries();
@@ -903,6 +960,9 @@ async fn run_owner(mut owner: OwnerLoop) {
                 }
             }
         }
+        // A wake arrived: a failed projection's retry owed to it joins the
+        // pass it starts.
+        wake.retry_projection = projection_retry.due_on_wake();
     }
 }
 
@@ -915,17 +975,28 @@ async fn optional_changed<T>(
     }
 }
 
-/// One pass. Returns `None` when the host is gone, otherwise whether a
-/// reconcile read failed and must be repeated on the next wake.
+/// What a pass leaves owed to later wakes.
+struct PassOutcome {
+    /// A reconcile read failed and is repeated on the next wake.
+    reconcile_failed: bool,
+    /// Whether the job projection ran and skipped an entry; `None` when it
+    /// did not run or the outbox could not be read.
+    projection_skipped: Option<bool>,
+}
+
+/// One pass. Returns `None` when the host is gone, otherwise what it leaves
+/// owed to later wakes.
 async fn run_pass(
     owner: &mut OwnerLoop,
     wake: Wake,
     due: Vec<LogicalRuntimeId>,
     blocked: &mut HashMap<LogicalRuntimeId, Option<SessionId>>,
     pass: &mut RuntimeDeliveryPass,
-) -> Option<bool> {
+) -> Option<PassOutcome> {
     let mut reconcile_failed = false;
-    if wake.reconcile || wake.job_commit {
+    let mut projection_skipped = None;
+    if wake.reconcile || wake.job_commit || wake.retry_projection {
+        let mut skipped_any = Some(false);
         loop {
             match owner.projector.project_pending(DELIVERY_PAGE).await {
                 Ok(projection) => {
@@ -936,18 +1007,23 @@ async fn run_pass(
                             skipped.job_id, skipped.delivery_sequence, skipped.error
                         ));
                     }
+                    if !projection.skipped.is_empty() {
+                        skipped_any = Some(true);
+                    }
                     if projection.projected.is_empty() {
                         break;
                     }
                 }
                 Err(error) => {
                     reconcile_failed = true;
+                    skipped_any = None;
                     pass.failures
                         .push(format!("job outbox could not be read: {error}"));
                     break;
                 }
             }
         }
+        projection_skipped = skipped_any;
     }
     // One page of the round of owed continuations in progress (see
     // `OwedRound`), before the inbox is collected, so the rows it commits
@@ -1116,7 +1192,10 @@ async fn run_pass(
             }
         }
     }
-    Some(reconcile_failed)
+    Some(PassOutcome {
+        reconcile_failed,
+        projection_skipped,
+    })
 }
 
 enum ServingSession {

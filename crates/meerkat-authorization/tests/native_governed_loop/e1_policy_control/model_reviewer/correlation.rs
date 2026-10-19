@@ -553,7 +553,7 @@ async fn exercise(
         .unwrap();
     let mut bounds = ceiling("read");
     bounds.actions = ExactRestriction::exact([action("read"), action("delete"), action("infer")]);
-    bounds.resource_domains = ExactRestriction::exact([domain(), input_domain()]);
+    bounds.resource_domains = DomainRestriction::exact([domain(), input_domain()]);
     let operation = grants
         .issue_root(
             &principal("grant-owner"),

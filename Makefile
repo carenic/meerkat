@@ -317,6 +317,8 @@ rust-lane-doctor:
 ci-lanes-selftest:
 	@echo "$(GREEN)Self-testing the CI lane classifier (fail-closed contracts)...$(NC)"
 	@node scripts/ci-cargo-lanes-selftest.mjs
+	@echo "$(GREEN)Checking that the exact-profile lanes' inputs cover every case they select...$(NC)"
+	@node scripts/ci-guard-lane-inputs-selftest.mjs
 	@echo "$(GREEN)Self-testing release-projection evidence reuse (classifier, plan, evidence, gate)...$(NC)"
 	@scripts/test-release-projection-only.sh
 	@node scripts/ci-release-projection-selftest.mjs
@@ -327,6 +329,7 @@ ci-lanes-selftest:
 	@node scripts/ci-non-rust-readers-selftest.mjs
 	@scripts/test-ci-non-rust-readers.sh
 	@scripts/test-ci-clippy-sccache-wrapper.sh
+	@scripts/test-setup-sccache-ci.sh
 	@echo "$(GREEN)Checking that CI runs what the pre-push hook no longer runs...$(NC)"
 	@scripts/test-pre-push-ratchets.sh
 

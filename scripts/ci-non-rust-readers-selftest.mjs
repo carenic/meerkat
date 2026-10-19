@@ -106,8 +106,8 @@ const has = (rows, pkg, target) => rows.some((row) => row.package === pkg && row
 
 // Cross-crate inputs select the reader, not only the owning crate.
 {
-  const rows = pathSpecific(["crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_valid_v1.json"]);
-  assert.ok(has(rows, "meerkat-contracts", "lib"), "meerkat-contracts embeds meerkat-core's policy fixtures");
+  const rows = pathSpecific(["crates/meerkat-machine-kernels/src/generated/meerkat.rs"]);
+  assert.ok(has(rows, "meerkat-machine-codegen", "test:runtime_schema_parity"), "meerkat-machine-codegen's parity test embeds meerkat-machine-kernels' generated kernel");
   const specs = pathSpecific(["specs/machines/meerkat_machine/model.tla"]);
   assert.ok(has(specs, "meerkat-runtime", "test:core_apply_terminal_truth"));
   assert.ok(has(specs, "xtask", "lib"));

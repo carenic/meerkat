@@ -37,7 +37,16 @@ source "${root}/scripts/build-backend-env"
 
 cargo_bin="${CARGO:-${root}/scripts/repo-cargo}"
 
+# The workspace-wide verified floor of .cargo/config.toml, the stack the
+# pre-push hook's lanes run on.
 use_standard_rust_test_stack() {
+  export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
+}
+
+# --all-features compiles the facade's GPT Live tests, 22 of which overflow
+# 8 MiB in a debug build and pass at 32 MiB (GPT_LIVE_TEST_STACK in
+# scripts/ci-cargo-lanes.mjs).
+use_gpt_live_test_stack() {
   export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
 }
 
@@ -211,7 +220,7 @@ case "${lane}" in
     if meerkat_buildbuddy_enabled; then
       exec "${root}/scripts/buildbuddy-dev" test-all
     fi
-    use_standard_rust_test_stack
+    use_gpt_live_test_stack
     export_mcp_test_server_fixture
     exec "${cargo_bin}" nextest run --workspace --profile fast --show-progress none --status-level none --final-status-level fail --all-features
     ;;
@@ -246,6 +255,11 @@ case "${lane}" in
     # macOS relink/signature races. Use the same compiler fingerprint while
     # prebuilding or Cargo will rebuild the graph inside the scenario timeout.
     export CARGO_INCREMENTAL=0
+    # The harness's own test threads keep the 16 MiB they got with the
+    # isolated behaviour budgets (cc21e332), which recorded no measurement;
+    # this lane was not measured at the 8 MiB floor. Its nested scenarios take
+    # their stack from the harness (scenario_env in
+    # tests/integration/src/e2e_lanes.rs), not from this value.
     export RUST_MIN_STACK=$((16 * 1024 * 1024))
     prebuild_e2e_system_harness
     prebuild_e2e_system_other_tests

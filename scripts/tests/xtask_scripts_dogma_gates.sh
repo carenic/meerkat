@@ -418,17 +418,21 @@ chmod +x "$tlc_env_tmp/tlc"
 capture="$tlc_env_tmp/captured"
 jdk_capture="$tlc_env_tmp/captured-jdk"
 true_bin="$(type -P true)"
-if PATH="$tlc_env_tmp:$PATH" \
+# show_tail <label> <output>: the end of a failed run's output, so a failure
+# names its cause in the log.
+show_tail() { printf '%s\n' "$2" | tail -n 12 | sed "s/^/    $1| /"; }
+if witness_out="$(PATH="$tlc_env_tmp:$PATH" \
     TLC_JAVA_OPTIONS_CAPTURE="$capture" \
     TLC_JDK_JAVA_OPTIONS_CAPTURE="$jdk_capture" \
     JAVA_TOOL_OPTIONS='-Dmeerkat.sentinel=true' \
-    bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" >/dev/null 2>&1 \
+    bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" 2>&1)" \
   && grep -Fqw -- '-Dmeerkat.sentinel=true' "$capture" \
   && [ "$(tr ' ' '\n' < "$capture" | grep -Fxc -- '-Xss256m')" -eq 1 ] \
   && [ "$(tr ' ' '\n' < "$capture" | grep -Fxc -- '-XX:+UseParallelGC')" -eq 1 ]; then
   ok "direct TLC witness preserves caller JVM options and adds canonical stack/GC defaults"
 else
   bad "direct TLC witness did not merge caller JVM options with canonical stack/GC defaults"
+  show_tail witness "$witness_out"
 fi
 
 # The launcher sizes TLC's main thread (module parse, initial states) from
@@ -440,11 +444,11 @@ else
   bad "direct TLC witness leaves the launcher main thread on the default stack (JDK_JAVA_OPTIONS lacks -Xss256m)"
 fi
 
-if PATH="$tlc_env_tmp:$PATH" \
+if witness_out="$(PATH="$tlc_env_tmp:$PATH" \
     TLC_JAVA_OPTIONS_CAPTURE="$capture" \
     TLC_JDK_JAVA_OPTIONS_CAPTURE="$jdk_capture" \
     JAVA_TOOL_OPTIONS='-Dmeerkat.sentinel=true -Xss8m -XX:+UseParallelGC' \
-    bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" >/dev/null 2>&1 \
+    bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" 2>&1)" \
   && [ "$(tr ' ' '\n' < "$capture" | grep -Fxc -- '-Xss8m')" -eq 1 ] \
   && ! grep -Fqw -- '-Xss256m' "$capture" \
   && [ "$(tr ' ' '\n' < "$capture" | grep -Fxc -- '-XX:+UseParallelGC')" -eq 1 ] \
@@ -453,11 +457,15 @@ if PATH="$tlc_env_tmp:$PATH" \
   ok "direct TLC witness preserves explicit stack policy on both JVM layers without duplicating defaults"
 else
   bad "direct TLC witness replaced explicit stack policy, duplicated JVM defaults, or left the launcher layer inconsistent"
+  show_tail witness "$witness_out"
 fi
 
 # The lane runs as parts (Bazel runs each as its own target): every hand
 # audit runs in exactly one audit shard, the machine-verify part runs none,
-# and the shards together run exactly the audits of the whole lane.
+# and the shards together run exactly the audits of the whole lane. Every
+# part runs and keeps its output whatever the others do: a failed part fails
+# this check by name, and no later check reads an output its failure left
+# unset (one such read ended in "a_out: unbound variable").
 lane_part_output() {
   PATH="$tlc_env_tmp:$PATH" \
     TLC_JAVA_OPTIONS_CAPTURE="$capture" \
@@ -465,11 +473,13 @@ lane_part_output() {
     bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" "$@" 2>&1
 }
 audit_lines() { grep -E '^running bounded .* TLC audit$' | sort; }
-if all_out="$(lane_part_output)" \
-  && a_out="$(lane_part_output --part audits-a)" \
-  && b_out="$(lane_part_output --part audits-b)" \
-  && c_out="$(lane_part_output --part audits-c)" \
-  && mv_out="$(lane_part_output --part machine-verify)" \
+failed_parts=""
+all_out="$(lane_part_output)" || failed_parts+=" all"
+a_out="$(lane_part_output --part audits-a)" || failed_parts+=" audits-a"
+b_out="$(lane_part_output --part audits-b)" || failed_parts+=" audits-b"
+c_out="$(lane_part_output --part audits-c)" || failed_parts+=" audits-c"
+mv_out="$(lane_part_output --part machine-verify)" || failed_parts+=" machine-verify"
+if [ -z "$failed_parts" ] \
   && [ -n "$(printf '%s\n' "$a_out" | audit_lines)" ] \
   && [ -n "$(printf '%s\n' "$b_out" | audit_lines)" ] \
   && [ -n "$(printf '%s\n' "$c_out" | audit_lines)" ] \
@@ -480,7 +490,16 @@ if all_out="$(lane_part_output)" \
   && [ "$( (printf '%s\n' "$a_out"; printf '%s\n' "$b_out"; printf '%s\n' "$c_out") | audit_lines)" = "$(printf '%s\n' "$all_out" | audit_lines)" ]; then
   ok "TLC lane parts: each hand audit runs in exactly one shard, machine-verify runs none, and the shards cover the whole lane"
 else
-  bad "TLC lane parts drop, duplicate, or misplace a hand audit, or the machine-verify part runs one"
+  bad "TLC lane parts drop, duplicate, or misplace a hand audit, or the machine-verify part runs one${failed_parts:+ (failed parts:${failed_parts})}"
+  for part in $failed_parts; do
+    case "$part" in
+      all) show_tail all "$all_out" ;;
+      audits-a) show_tail audits-a "$a_out" ;;
+      audits-b) show_tail audits-b "$b_out" ;;
+      audits-c) show_tail audits-c "$c_out" ;;
+      machine-verify) show_tail machine-verify "$mv_out" ;;
+    esac
+  done
 fi
 
 # tlc_run_cap.sh: the per-run watchdog must never outlive a run that ended
@@ -510,7 +529,7 @@ for _ in $(seq 1 30); do
   cap_probe specs/machines/meerkat_machine/tlc_run_cap.sh || { cap_runs_ok=false; break; }
 done
 # Force the ordering that used to orphan the sleep: a copy of the script
-# whose watchdog pauses before starting its sleep, so the caller's TERM
+# whose watchdog pauses before starting its sleep, so the caller's kill
 # always lands while the sleep is not yet running.
 cap_window_ok=false
 if python3 - specs/machines/meerkat_machine/tlc_run_cap.sh "$cap_fake_bin/tlc_run_cap.sh" <<'PY'
@@ -532,10 +551,61 @@ cap_script=specs/machines/meerkat_machine/tlc_run_cap.sh
 if [ "$cap_runs_ok" = true ] && [ "$cap_window_ok" = true ] \
   && grep -Fq 'set -m' "$cap_script" \
   && grep -Fq ') </dev/null >/dev/null 2>&1 &' "$cap_script" \
-  && grep -Fq 'kill -TERM -- "-${watchdog_pgid}"' "$cap_script"; then
-  ok "tlc_run_cap: the watchdog is a process group with null stdio; instant runs inside captures return at once, even when TERM lands before its sleep starts"
+  && grep -Fq 'kill -KILL -- "-${watchdog_pgid}"' "$cap_script" \
+  && grep -Fq 'kill -KILL -- "-${tlc_run_cap_watchdog_pgid}"' "$cap_script" \
+  && ! grep -Eq 'kill -TERM -- "-\$' "$cap_script"; then
+  ok "tlc_run_cap: the watchdog is a process group with null stdio, ended with SIGKILL; instant runs inside captures return at once, even when the kill lands before its sleep starts"
 else
-  bad "tlc_run_cap: an instant run inside a capture hung or failed (or did when TERM landed before the sleep), or the watchdog is no longer an isolated process group"
+  bad "tlc_run_cap: an instant run inside a capture hung or failed (or did when the kill landed before the sleep), or the watchdog is no longer an isolated process group ended with SIGKILL"
+fi
+
+# The watchdog is a forked copy of the caller's shell, ended by the caller
+# as soon as TLC exits. Until bash resets the traps the fork inherited, a
+# TERM runs the caller's EXIT trap in it, and an audit's trap removes its
+# work directory: a TERM sent right after an instant run deleted the log the
+# audit was about to read, so the lane failed now and then (more often under
+# load). Here a watchdog-shaped subshell, launched as the script launches
+# its watchdog, is ended at once with the signal the script uses, 300 times,
+# inside a shell whose EXIT trap removes its work directory; the directory
+# must survive every time (TERM loses it in a few percent of runs, SIGKILL
+# never). The probe reads the signal from exactly one kill line, and each
+# run is bounded: a signal this shell cannot send would otherwise leave the
+# run waiting out the subshell's sleep, 300 times.
+watchdog_signals="$(sed -n 's/^  kill -\([A-Z]*\) -- "-\${watchdog_pgid}".*/\1/p' "$cap_script")"
+watchdog_signal_lines="$(printf '%s' "$watchdog_signals" | grep -c . || true)"
+watchdog_signal=""
+if [ "$watchdog_signal_lines" = 1 ]; then
+  watchdog_signal="$watchdog_signals"
+fi
+trap_probe_dir="$(mktemp -d)"
+trap_runs_ok=true
+if [ -z "$watchdog_signal" ]; then
+  trap_runs_ok=false
+else
+  for _ in $(seq 1 300); do
+    trap_work="$(mktemp -d "$trap_probe_dir/work.XXXXXX")"
+    if ! timeout 10 bash -c '
+        trap "rm -rf \"$1\"" EXIT
+        set -m
+        ( sleep 120 ) </dev/null >/dev/null 2>&1 &
+        pgid=$!
+        set +m
+        kill -"$2" -- "-${pgid}" 2>/dev/null || true
+        wait "${pgid}" 2>/dev/null || true
+        [ -d "$1" ]
+      ' _ "$trap_work" "$watchdog_signal"; then
+      trap_runs_ok=false
+      break
+    fi
+  done
+fi
+rm -rf "$trap_probe_dir"
+if [ "$trap_runs_ok" = true ]; then
+  ok "tlc_run_cap: ending the watchdog with SIG${watchdog_signal} never runs the caller's EXIT trap (an audit's work directory survives 300 immediate ends)"
+elif [ "$watchdog_signal_lines" != 1 ]; then
+  bad "tlc_run_cap: the trap probe reads the watchdog's signal from exactly one kill line; tlc_run_cap.sh has ${watchdog_signal_lines}"
+else
+  bad "tlc_run_cap: ending the watchdog with SIG${watchdog_signal} ran the caller's EXIT trap and deleted an audit's work directory, or a run did not finish within 10 s"
 fi
 
 # The audit shards never execute xtask, so the PR lane runs them without an
