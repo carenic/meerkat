@@ -781,16 +781,34 @@ elif name == "xwin-tag-restore":
         "      id: sdk-cache\n      if: ${{ inputs.save-sdk-cache == 'true' && !startsWith(github.ref, 'refs/tags/') }}\n",
         "      id: sdk-cache\n",
     )
-elif name == "sccache-pull-request-writes":
-    # The pre-review sccache setup wrote the bucket from pull requests.
+elif name in (
+    "sccache-pull-request-writes",
+    "sccache-dispatch-writes-any-ref",
+    "sccache-dispatch-ref-name-prefix",
+    "sccache-dispatch-ref-name-slash",
+    "sccache-release-dispatch-reads",
+):
+    # The select step's RW_MODE replaced by a wrong rule: the pre-review
+    # setup wrote the bucket from pull requests; a dispatch on any ref
+    # writing it; a prefix on the ref's short name, which also takes
+    # rel-next and released; the release prefixes on the short name, which
+    # also take a tag named rel/next; and the rule before a release-branch
+    # dispatch wrote it.
+    rules = {
+        "sccache-pull-request-writes": "github.event_name != 'workflow_dispatch'",
+        "sccache-dispatch-writes-any-ref": "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
+        "sccache-dispatch-ref-name-prefix": "(github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'rel')))",
+        "sccache-dispatch-ref-name-slash": "(github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (startsWith(github.ref_name, 'rel/') || startsWith(github.ref_name, 'release/'))))",
+        "sccache-release-dispatch-reads": "(github.event_name == 'push' || github.event_name == 'schedule')",
+    }
     path = root / ".github/actions/setup-sccache-ci/action.yml"
     text = path.read_text()
     step = text.index("    - name: Select the sccache backend\n")
-    needle = "        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'READ_WRITE' || 'READ_ONLY' }}\n"
+    needle = "        RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (startsWith(github.ref, 'refs/heads/rel/') || startsWith(github.ref, 'refs/heads/release/')))) && 'READ_WRITE' || 'READ_ONLY' }}\n"
     at = text.index(needle, step)
     path.write_text(
         text[:at]
-        + "        RW_MODE: ${{ github.event_name != 'workflow_dispatch' && 'READ_WRITE' || 'READ_ONLY' }}\n"
+        + "        RW_MODE: ${{ " + rules[name] + " && 'READ_WRITE' || 'READ_ONLY' }}\n"
         + text[at + len(needle):]
     )
 elif name == "sccache-action-install":
@@ -1196,7 +1214,19 @@ expect_tree_fail_named xwin-tag-restore "${TEST_ROOT}/xwin-tag-restore" \
   "job \`build_binaries_windows_cross\` (in \`.github/actions/build-windows-cross\`) restores \`xwin-sdk-*-cargo-xwin-0.23.1\` on a tag push; a release job restores no cache" release-caches
 mutate_tree sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes"
 expect_tree_fail_named sccache-pull-request-writes "${TEST_ROOT}/sccache-pull-request-writes" \
-  ".github/actions/setup-sccache-ci gives a pull_request run sccache mode READ_WRITE, not READ_ONLY" release-caches
+  ".github/actions/setup-sccache-ci gives a pull_request run on refs/pull/1/merge sccache mode READ_WRITE, not READ_ONLY" release-caches
+mutate_tree sccache-dispatch-writes-any-ref "${TEST_ROOT}/sccache-dispatch-writes-any-ref"
+expect_tree_fail_named sccache-dispatch-writes-any-ref "${TEST_ROOT}/sccache-dispatch-writes-any-ref" \
+  ".github/actions/setup-sccache-ci gives a workflow_dispatch run on refs/heads/main sccache mode READ_WRITE, not READ_ONLY" release-caches
+mutate_tree sccache-dispatch-ref-name-prefix "${TEST_ROOT}/sccache-dispatch-ref-name-prefix"
+expect_tree_fail_named sccache-dispatch-ref-name-prefix "${TEST_ROOT}/sccache-dispatch-ref-name-prefix" \
+  ".github/actions/setup-sccache-ci gives a workflow_dispatch run on refs/heads/rel-next sccache mode READ_WRITE, not READ_ONLY" release-caches
+mutate_tree sccache-release-dispatch-reads "${TEST_ROOT}/sccache-release-dispatch-reads"
+expect_tree_fail_named sccache-release-dispatch-reads "${TEST_ROOT}/sccache-release-dispatch-reads" \
+  ".github/actions/setup-sccache-ci gives a workflow_dispatch run on refs/heads/rel/next sccache mode READ_ONLY, not READ_WRITE" release-caches
+mutate_tree sccache-dispatch-ref-name-slash "${TEST_ROOT}/sccache-dispatch-ref-name-slash"
+expect_tree_fail_named sccache-dispatch-ref-name-slash "${TEST_ROOT}/sccache-dispatch-ref-name-slash" \
+  ".github/actions/setup-sccache-ci gives a workflow_dispatch run on refs/tags/rel/next sccache mode READ_WRITE, not READ_ONLY" release-caches
 mutate_tree sccache-action-install "${TEST_ROOT}/sccache-action-install"
 expect_tree_fail_named sccache-action-install "${TEST_ROOT}/sccache-action-install" \
   ".github/actions/setup-sccache-ci installs sccache through sccache-action, which exports the job's Actions cache token to the run steps after it" release-caches
