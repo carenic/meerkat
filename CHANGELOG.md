@@ -67,7 +67,10 @@ them.
   `promptFeedback.blockReason` or candidate `finishReason` with the safety
   categories marked `blocked`). Nothing in core reads it; each text field is
   capped at 4 KiB, and an unknown provider or a malformed detail decodes as
-  absent. With `GeminiStopStage` and `ContentFilteredStop`, and
+  absent. The provider adapters read this evidence best-effort as well: a
+  `stop_details`, safety rating or refusal value of an unexpected shape reads
+  as absent and never turns the stop that carries it into a stream parse
+  error. With `GeminiStopStage` and `ContentFilteredStop`, and
   `LlmStreamResult::stop_detail`.
 - `meerkat-llm-core`: `classify_web_search_stop` and `WebSearchStop`, one
   classification of a native web-search call's stop reason for every

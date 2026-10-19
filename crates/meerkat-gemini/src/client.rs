@@ -2365,7 +2365,7 @@ impl GeminiClient {
                                                     GeminiStopStage::Candidate,
                                                     reason,
                                                     gemini_blocked_categories(
-                                                        cand.safety_ratings.as_deref(),
+                                                        cand.safety_ratings.as_ref(),
                                                     ),
                                                 ),
                                             )
@@ -2424,18 +2424,24 @@ fn gemini_prompt_block(
         ProviderStopDetail::gemini(
             GeminiStopStage::Prompt,
             reason,
-            gemini_blocked_categories(feedback.safety_ratings.as_deref()),
+            gemini_blocked_categories(feedback.safety_ratings.as_ref()),
         )
     })
 }
 
-/// The categories of the safety ratings Gemini marked `blocked`.
-fn gemini_blocked_categories(ratings: Option<&[SafetyRating]>) -> Vec<String> {
+/// The categories of the safety ratings Gemini marked `blocked`. Ratings are
+/// evidence of the block, read best-effort so that their shape never fails
+/// the chunk that carries it: a rating counts only when its `blocked` is
+/// JSON `true`, only a string `category` is kept, and any other shape is
+/// skipped.
+fn gemini_blocked_categories(ratings: Option<&Value>) -> Vec<String> {
     ratings
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|rating| rating.blocked)
-        .filter_map(|rating| rating.category.clone())
+        .filter(|rating| rating.get("blocked") == Some(&Value::Bool(true)))
+        .filter_map(|rating| rating.get("category").and_then(Value::as_str))
+        .map(str::to_string)
         .collect()
 }
 
@@ -2577,17 +2583,8 @@ struct CodeAssistGenerateContentResponse {
 #[serde(rename_all = "camelCase")]
 struct PromptFeedback {
     block_reason: Option<String>,
-    safety_ratings: Option<Vec<SafetyRating>>,
-}
-
-/// One Gemini safety rating: only the category and whether it blocked are
-/// read, as stop-detail evidence.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SafetyRating {
-    category: Option<String>,
-    #[serde(default)]
-    blocked: bool,
+    /// Raw evidence, read by [`gemini_blocked_categories`].
+    safety_ratings: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2596,7 +2593,8 @@ struct Candidate {
     content: Option<CandidateContent>,
     finish_reason: Option<String>,
     grounding_metadata: Option<Value>,
-    safety_ratings: Option<Vec<SafetyRating>>,
+    /// Raw evidence, read by [`gemini_blocked_categories`].
+    safety_ratings: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4658,6 +4656,44 @@ mod tests {
                 "details must differ: {expected:?}"
             );
             seen.push(expected);
+        }
+    }
+
+    /// #1888: safety ratings are evidence, read best-effort, so a rating
+    /// whose shape the adapter does not expect never fails the blocked
+    /// chunk: the block still ends as a content filter with its raw reason.
+    /// A rating counts only when `blocked` is JSON `true`, and only a string
+    /// category is kept.
+    #[tokio::test]
+    async fn malformed_safety_ratings_never_fail_a_block() {
+        let ratings = r#"[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","blocked":"yes"},{"category":7,"blocked":true},"not a rating",{"category":"HARM_CATEGORY_HARASSMENT","blocked":true}]"#;
+        let kept = vec!["HARM_CATEGORY_HARASSMENT".to_string()];
+        let cases = [
+            (
+                format!(
+                    "data: {{\"promptFeedback\":{{\"blockReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}}}\n"
+                ),
+                ProviderStopDetail::gemini(GeminiStopStage::Prompt, "SAFETY", kept.clone()),
+            ),
+            (
+                format!(
+                    "data: {{\"candidates\":[{{\"finishReason\":\"SAFETY\",\"safetyRatings\":{ratings}}}]}}\n"
+                ),
+                ProviderStopDetail::gemini(GeminiStopStage::Candidate, "SAFETY", kept),
+            ),
+            (
+                "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\",\"safetyRatings\":\"none\"}}\n"
+                    .to_string(),
+                ProviderStopDetail::gemini(GeminiStopStage::Prompt, "SAFETY", Vec::new()),
+            ),
+        ];
+        for (payload, expected) in cases {
+            let events = gemini_stream_events(payload).await;
+            assert_eq!(
+                done_success(&events),
+                Some((StopReason::ContentFilter, Some(expected.clone()))),
+                "{expected:?}: {events:?}"
+            );
         }
     }
 

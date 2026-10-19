@@ -1175,7 +1175,7 @@ impl OpenAiCompatibleClient {
                                             meta: None,
                                         };
                                     }
-                                    if let Some(refusal) = delta.refusal {
+                                    if let Some(Value::String(refusal)) = delta.refusal {
                                         refusal_text.push_str(&refusal);
                                     }
                                     if let Some(tool_calls) = delta.tool_calls {
@@ -1525,9 +1525,10 @@ struct ChatChoice {
 struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
-    /// The model's refusal, streamed instead of content.
+    /// The model's refusal, streamed instead of content, as raw evidence: a
+    /// value that is not a string reads as no text.
     #[serde(default)]
-    refusal: Option<String>,
+    refusal: Option<Value>,
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
@@ -2837,6 +2838,34 @@ mod tests {
                 ),
                 other => panic!("{label}: expected a refusal, got {other:?}"),
             }
+        }
+    }
+
+    /// #1888: a `delta.refusal` that is not a string never fails the chunk
+    /// that carries it: it reads as no text, and the rest of the refusal
+    /// still ends the response as a refusal.
+    #[tokio::test]
+    async fn chat_completions_malformed_refusal_piece_never_fails_the_stream() {
+        let events = collect_chat_stream_events(concat!(
+            "data: {\"choices\":[{\"delta\":{\"refusal\":7}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"refusal\":\"I can't help with that.\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .await;
+        assert_eq!(done_count(&events), 1, "{events:?}");
+        match observed_done_outcome(&events) {
+            Some(LlmDoneOutcome::Success {
+                stop_reason: StopReason::Refusal,
+                stop_detail,
+                ..
+            }) => assert_eq!(
+                stop_detail.as_deref(),
+                Some(&ProviderStopDetail::openai(
+                    "refusal",
+                    Some("I can't help with that.".to_string())
+                ))
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

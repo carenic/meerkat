@@ -3004,7 +3004,7 @@ impl OpenAiClient {
                             }
                         }
                         else if event.event_type == "response.refusal.done" {
-                            if let Some(refusal) = &event.refusal {
+                            if let Some(Value::String(refusal)) = &event.refusal {
                                 streamed_refusal.clone_from(refusal);
                                 saw_terminal_fallback_output = true;
                             }
@@ -3528,8 +3528,9 @@ struct ResponsesStreamEvent {
     event_type: String,
     /// Text delta for streaming events
     delta: Option<String>,
-    /// The full refusal text of `response.refusal.done`.
-    refusal: Option<String>,
+    /// The full refusal text of `response.refusal.done`, as raw evidence: a
+    /// value that is not a string reads as no text.
+    refusal: Option<Value>,
     /// Call ID for function call events
     call_id: Option<String>,
     /// Function name for function call events
@@ -7816,6 +7817,29 @@ mod tests {
                 Some(ProviderStopDetail::openai(
                     "refusal",
                     Some(refusal.to_string())
+                ))
+            )
+        );
+    }
+
+    /// #1888: a `response.refusal.done` whose refusal is not a string never
+    /// fails the stream. The refusal it closes still ends the response as a
+    /// refusal, with the text its deltas streamed.
+    #[tokio::test]
+    async fn responses_malformed_refusal_done_still_ends_as_a_refusal() {
+        let events = responses_stream_events(&[
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"I can't help with that."}"#,
+            r#"data: {"type":"response.refusal.done","item_id":"msg_1","output_index":0,"content_index":0,"refusal":7}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ])
+        .await;
+        assert_eq!(
+            responses_done(&events),
+            (
+                StopReason::Refusal,
+                Some(ProviderStopDetail::openai(
+                    "refusal",
+                    Some("I can't help with that.".to_string())
                 ))
             )
         );

@@ -2710,17 +2710,35 @@ struct AnthropicEvent {
     usage: Option<AnthropicUsage>,
     /// Error object for streaming error events
     error: Option<Value>,
-    /// `stop_details` sent beside the delta rather than inside it.
-    stop_details: Option<AnthropicStopDetails>,
+    /// `stop_details` sent beside the delta rather than inside it, as raw
+    /// evidence ([`AnthropicStopDetails::from_evidence`]).
+    stop_details: Option<Value>,
 }
 
 /// Anthropic `stop_details`: on a `refusal` stop, the policy category that
 /// triggered it and a human-readable explanation (both null when the refusal
 /// maps to no named category); null for every other stop.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct AnthropicStopDetails {
     category: Option<String>,
     explanation: Option<String>,
+}
+
+impl AnthropicStopDetails {
+    /// Read `stop_details` best-effort. It is evidence of the stop, so its
+    /// shape never fails the frame that carries the stop reason: an object
+    /// yields its string `category` and `explanation` (any other value of
+    /// either reads as absent), and any other shape reads as no detail.
+    fn from_evidence(value: Value) -> Option<Self> {
+        let Value::Object(fields) = value else {
+            return None;
+        };
+        let text = |name: &str| fields.get(name).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            category: text("category"),
+            explanation: text("explanation"),
+        })
+    }
 }
 
 /// Where a refusal's `stop_details` rode, in precedence order. When more
@@ -2735,14 +2753,15 @@ enum StopDetailsPosition {
     OnMessageStop,
 }
 
-/// Hold `details` read at `position` unless `stop_details` from a position
-/// that ranks before it, or from the same position earlier, is held.
+/// Hold the `stop_details` read at `position` unless details from a position
+/// that ranks before it, or from the same position earlier, are held. A
+/// value that reads as no detail leaves what is held alone.
 fn offer_stop_details(
     held: &mut Option<(StopDetailsPosition, AnthropicStopDetails)>,
     position: StopDetailsPosition,
-    details: Option<AnthropicStopDetails>,
+    details: Option<Value>,
 ) {
-    let Some(details) = details else {
+    let Some(details) = details.and_then(AnthropicStopDetails::from_evidence) else {
         return;
     };
     if held.as_ref().is_none_or(|(rank, _)| position < *rank) {
@@ -2758,8 +2777,9 @@ struct AnthropicDelta {
     partial_json: Option<String>,
     stop_reason: Option<String>,
     /// `stop_details` of the stop (Anthropic documents it on the message;
-    /// a stream carries it with the stop's `message_delta`).
-    stop_details: Option<AnthropicStopDetails>,
+    /// a stream carries it with the stop's `message_delta`), as raw evidence
+    /// ([`AnthropicStopDetails::from_evidence`]).
+    stop_details: Option<Value>,
     /// Thinking content for thinking_delta events
     thinking: Option<String>,
     /// Signature for signature_delta events (arrives separately before content_block_stop)
@@ -5949,6 +5969,35 @@ mod tests {
         assert_eq!(
             refusal_detail_of(&[REFUSAL_START, BARE_REFUSAL_DELTA]).await,
             None
+        );
+    }
+
+    /// #1888: `stop_details` is evidence, read best-effort, so a shape the
+    /// adapter does not expect never fails the refusal's `message_delta`. A
+    /// category that is not a string reads as absent and the explanation
+    /// stays; a `stop_details` that is not an object reads as no detail, and
+    /// a later position may still supply one.
+    #[tokio::test]
+    async fn refusal_with_malformed_stop_details_still_ends_as_a_refusal() {
+        let numeric_category = refusal_delta_with_details_inside(
+            r#"{"type":"refusal","category":7,"explanation":"This request was declined."}"#,
+        );
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &numeric_category, BARE_MESSAGE_STOP]).await,
+            Some(ProviderStopDetail::anthropic(
+                None,
+                Some("This request was declined.".to_string())
+            ))
+        );
+        let not_an_object = refusal_delta_with_details_inside(r#""declined""#);
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &not_an_object, BARE_MESSAGE_STOP]).await,
+            None
+        );
+        let late = message_stop_with_details(&refusal_details_json("cyber"));
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &not_an_object, &late]).await,
+            Some(expected_refusal_detail("cyber"))
         );
     }
 
