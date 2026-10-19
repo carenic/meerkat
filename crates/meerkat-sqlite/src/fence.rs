@@ -11,17 +11,35 @@
 //! bytes. Stores built on this crate get this for free — which is also why
 //! no store may roll its own opener.
 //!
-//! Lock files live next to the database as `<file>.mfence`. They are
-//! advisory OS locks (flock on unix, `LockFileEx` on Windows), cheap to take
-//! per operation, and correct across processes as well as between handles in
-//! one process.
+//! The one connection kept open across operations is a kept reader (the
+//! runtime store's delivery-generation reader). It holds the presence lock
+//! ([`KeptConnectionPresence`]) shared for its whole life, from before its
+//! connection opens until after it closes, and still takes an
+//! [`OperationGuard`] for each of its reads. Maintenance takes the presence
+//! lock exclusively after the fence lock, so it touches no bytes while a kept
+//! connection is open.
+//!
+//! Lock files live next to the database as `<file>.mfence` (the fence lock)
+//! and `<file>.mpresence` (the presence lock). They are advisory OS locks
+//! (flock on unix, `LockFileEx` on Windows), cheap to take per operation, and
+//! correct across processes as well as between handles in one process.
+//!
+//! Lock order: a kept reader holds its presence lock for its whole life and
+//! takes the fence lock for each read by try only, never waiting for it;
+//! maintenance takes the fence lock, then waits for the presence lock. Once
+//! maintenance holds the fence lock a kept reader's next read is refused and
+//! the reader closes, and an idle one closes at its owner's idle bound, so
+//! the wait ends; neither side waits for a lock while holding one the other
+//! waits for.
 //!
 //! Fail-open rule: a medium where the lock file cannot be created (read-only
 //! snapshot mounts, for example) is a medium where no fence can be held
 //! either, so guard acquisition degrades to a no-op there. If the lock file
 //! exists and is exclusively held, acquisition fails with the typed
 //! [`SqliteStoreError::MaintenanceFenceHeld`] — storage is under offline
-//! maintenance and the operation must not proceed.
+//! maintenance and the operation must not proceed. Presence fails closed
+//! instead: where the presence lock cannot be held, no connection is kept
+//! and the reader opens one per read.
 //!
 //! The [`ConnectionProfile::Maintenance`](crate::profile::ConnectionProfile)
 //! profile is the fence *holder's* profile; maintenance work runs under the
@@ -62,11 +80,23 @@ fn process_holds_exclusive(lock_path: &Path) -> bool {
 /// Suffix appended to a database file name to form its fence lock file.
 pub const FENCE_LOCK_SUFFIX: &str = "mfence";
 
+/// Suffix appended to a database file name to form its presence lock file.
+pub const PRESENCE_LOCK_SUFFIX: &str = "mpresence";
+
 /// The fence lock file for a database path: `<file>.mfence`.
 pub fn fence_lock_path(db_path: &Path) -> PathBuf {
+    sibling_lock_path(db_path, FENCE_LOCK_SUFFIX)
+}
+
+/// The presence lock file for a database path: `<file>.mpresence`.
+pub fn presence_lock_path(db_path: &Path) -> PathBuf {
+    sibling_lock_path(db_path, PRESENCE_LOCK_SUFFIX)
+}
+
+fn sibling_lock_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut name = db_path.file_name().unwrap_or_default().to_os_string();
     name.push(".");
-    name.push(FENCE_LOCK_SUFFIX);
+    name.push(suffix);
     db_path.with_file_name(name)
 }
 
@@ -203,63 +233,163 @@ impl OperationGuard {
     }
 }
 
+/// Shared presence of a connection kept open across reads of one database
+/// file (a kept reader).
+///
+/// The reader takes it before its connection opens and drops it after the
+/// connection closes: in the reader, declare the connection before the
+/// presence, so the close (and any checkpoint it runs) finishes before the
+/// lock goes. Between reads the reader holds no [`OperationGuard`]; each read
+/// takes one, and a refused guard
+/// ([`SqliteStoreError::MaintenanceFenceHeld`]) closes the connection and
+/// drops this presence. [`ExclusiveFence`] takes the presence lock
+/// exclusively after the fence lock (the module documents the lock order).
+#[derive(Debug)]
+pub struct KeptConnectionPresence {
+    _lock: File,
+}
+
+impl KeptConnectionPresence {
+    /// Take shared presence for a connection to be kept open on `db_path`.
+    ///
+    /// `None` means no connection may be kept now; the caller opens one per
+    /// read instead:
+    /// - this process holds the exclusive fence of `db_path`: the holder
+    ///   registry has the database's `.mfence` path, canonicalized as the
+    ///   registry keys it. The holder's own reads pass their guards through
+    ///   the registry and keep nothing, so the holder never waits on itself;
+    /// - maintenance holds the presence lock;
+    /// - the database file is refused (see
+    ///   [`validate_database_file`](crate::profile::validate_database_file)),
+    ///   or the presence lock file cannot be created or locked (a read-only
+    ///   medium, a filesystem without locks): presence that cannot be held
+    ///   is never assumed;
+    /// - `db_path` is in-memory or has no file name.
+    pub fn acquire(db_path: &Path) -> Option<Self> {
+        if db_path.file_name().is_none() || db_path.as_os_str() == ":memory:" {
+            return None;
+        }
+        if process_holds_exclusive(&fence_lock_path(db_path)) {
+            return None;
+        }
+        // Refuse an unsafe database file before planting its presence
+        // sibling, as `OperationGuard::for_database` does for the fence.
+        crate::profile::validate_database_file(db_path).ok()?;
+        let file = open_lock_file(&presence_lock_path(db_path))?;
+        file.try_lock_shared().ok()?;
+        Some(Self { _lock: file })
+    }
+}
+
 /// The exclusive side of the maintenance fence for one database file.
 ///
-/// Acquiring it waits for outstanding [`OperationGuard`]s to drain (bounded
-/// by `deadline`); holding it makes every subsequent guarded operation fail
-/// typed. The Phase 6 migration machinery composes one of these per database
-/// file it intends to touch, across both candidate roots.
+/// It holds the fence lock and the presence lock. Acquiring it waits for
+/// outstanding [`OperationGuard`]s to drain and for kept connections
+/// ([`KeptConnectionPresence`]) to close, both bounded by one `deadline`;
+/// holding it makes every subsequent guarded operation fail typed and keeps
+/// any connection from being kept. The Phase 6 migration machinery composes
+/// one of these per database file it intends to touch, across both candidate
+/// roots.
 #[derive(Debug)]
 pub struct ExclusiveFence {
     _lock: File,
+    _presence: File,
     lock_path: PathBuf,
 }
 
 impl ExclusiveFence {
-    /// Try to take the fence without waiting.
+    /// Try to take the fence without waiting: both locks, or neither.
     pub fn try_acquire(db_path: &Path) -> Result<Option<Self>, SqliteStoreError> {
         let lock_path = fence_lock_path(db_path);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        match file.try_lock() {
-            Ok(()) => {
-                if let Ok(mut held) = held_exclusive_locks().lock() {
-                    held.insert(registry_key(&lock_path));
-                }
-                Ok(Some(Self {
-                    _lock: file,
-                    lock_path,
-                }))
-            }
-            Err(err) if is_would_block(&err) => Ok(None),
-            Err(err) => Err(SqliteStoreError::Io(std::io::Error::other(err))),
-        }
+        let Some(fence) = try_lock_exclusive(&lock_path)? else {
+            return Ok(None);
+        };
+        // Dropping `fence` on either early return releases the fence lock.
+        let Some(presence) = try_lock_exclusive(&presence_lock_path(db_path))? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::held(fence, presence, lock_path)))
     }
 
     /// Take the fence, waiting up to `deadline` for in-flight operations to
-    /// drain.
+    /// drain and kept connections to close.
+    ///
+    /// The fence lock comes first: from then on every guarded operation is
+    /// refused, a kept reader's next read included, and the reader closes.
+    /// The presence lock follows within the same deadline; a reader that
+    /// reads nothing closes at its owner's idle bound, so a caller that can
+    /// meet a kept reader passes a deadline longer than that bound plus one
+    /// read. Past the deadline both locks are released and the fence fails
+    /// typed ([`SqliteStoreError::MaintenanceFenceHeld`]).
+    ///
+    /// Blocks the calling thread (bounded by `deadline`); async callers
+    /// should run it in `spawn_blocking`, or a kept reader on the blocked
+    /// runtime cannot close.
     pub fn acquire(db_path: &Path, deadline: Duration) -> Result<Self, SqliteStoreError> {
         let started = Instant::now();
-        loop {
-            if let Some(fence) = Self::try_acquire(db_path)? {
-                return Ok(fence);
+        let lock_path = fence_lock_path(db_path);
+        let fence = loop {
+            if let Some(fence) = try_lock_exclusive(&lock_path)? {
+                break fence;
             }
             if started.elapsed() >= deadline {
                 return Err(SqliteStoreError::MaintenanceFenceHeld {
                     path: db_path.to_path_buf(),
                 });
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(FENCE_POLL);
+        };
+        let presence_path = presence_lock_path(db_path);
+        loop {
+            if let Some(presence) = try_lock_exclusive(&presence_path)? {
+                return Ok(Self::held(fence, presence, lock_path));
+            }
+            if started.elapsed() >= deadline {
+                // Dropping `fence` releases the fence lock.
+                return Err(SqliteStoreError::MaintenanceFenceHeld {
+                    path: db_path.to_path_buf(),
+                });
+            }
+            std::thread::sleep(FENCE_POLL);
+        }
+    }
+
+    /// Record both held locks in the holder registry (see
+    /// `held_exclusive_locks`): only a fence that holds both admits its
+    /// holder's own operations.
+    fn held(fence: File, presence: File, lock_path: PathBuf) -> Self {
+        if let Ok(mut held) = held_exclusive_locks().lock() {
+            held.insert(registry_key(&lock_path));
+        }
+        Self {
+            _lock: fence,
+            _presence: presence,
+            lock_path,
         }
     }
 
     /// The lock file this fence holds.
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+}
+
+/// How often [`ExclusiveFence::acquire`] retries a held lock.
+const FENCE_POLL: Duration = Duration::from_millis(25);
+
+/// Take `lock_path` exclusively without waiting; `None` while another holder
+/// has it.
+fn try_lock_exclusive(lock_path: &Path) -> Result<Option<File>, SqliteStoreError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(err) if is_would_block(&err) => Ok(None),
+        Err(err) => Err(SqliteStoreError::Io(std::io::Error::other(err))),
     }
 }
 
@@ -398,5 +528,114 @@ mod tests {
             fence_lock_path(Path::new("/a/b/sessions.sqlite3")),
             PathBuf::from("/a/b/sessions.sqlite3.mfence")
         );
+        assert_eq!(
+            presence_lock_path(Path::new("/a/b/sessions.sqlite3")),
+            PathBuf::from("/a/b/sessions.sqlite3.mpresence")
+        );
+    }
+
+    /// A kept connection's presence keeps the fence from being taken, and a
+    /// refused attempt leaves no lock behind: guarded operations go on.
+    #[test]
+    fn kept_presence_refuses_the_fence_and_a_refused_fence_holds_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        let presence = KeptConnectionPresence::acquire(&db).expect("presence");
+        assert!(
+            ExclusiveFence::try_acquire(&db).expect("io").is_none(),
+            "the fence must not be taken while a connection is kept"
+        );
+        OperationGuard::for_database(&db).expect("a refused try holds no fence lock");
+        let err = ExclusiveFence::acquire(&db, Duration::from_millis(200))
+            .expect_err("a kept connection outlives the deadline");
+        assert!(matches!(err, SqliteStoreError::MaintenanceFenceHeld { .. }));
+        OperationGuard::for_database(&db).expect("an expired wait holds no fence lock");
+        drop(presence);
+        let fence = ExclusiveFence::try_acquire(&db)
+            .expect("io")
+            .expect("taken once the kept connection closed");
+        drop(fence);
+    }
+
+    /// While maintenance holds the fence lock and waits for the presence
+    /// lock, a kept reader's next read is refused typed at once, and the
+    /// fence completes when the reader closes.
+    #[test]
+    fn a_waiting_fence_refuses_the_kept_readers_next_read_and_completes_when_it_closes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        let presence = KeptConnectionPresence::acquire(&db).expect("presence");
+        let waiting = {
+            let db = db.clone();
+            std::thread::spawn(move || ExclusiveFence::acquire(&db, Duration::from_secs(10)))
+        };
+        // The fence lock is taken first; the reader's next guard is refused.
+        let started = Instant::now();
+        loop {
+            match OperationGuard::for_database(&db) {
+                Err(SqliteStoreError::MaintenanceFenceHeld { .. }) => break,
+                Ok(guard) => drop(guard),
+                Err(other) => panic!("unexpected guard error: {other}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the waiting fence never took its fence lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the fence waits for the kept reader"
+        );
+        drop(presence);
+        let fence = waiting
+            .join()
+            .expect("thread")
+            .expect("fence after the reader closed");
+        assert!(
+            KeptConnectionPresence::acquire(&db).is_none(),
+            "no connection is kept while the fence is held"
+        );
+        drop(fence);
+        KeptConnectionPresence::acquire(&db).expect("presence after release");
+    }
+
+    /// No connection is kept while maintenance holds the database, whether
+    /// this process holds the fence (the holder registry) or another does.
+    #[test]
+    fn presence_is_refused_while_the_fence_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        let own = ExclusiveFence::try_acquire(&db)
+            .expect("io")
+            .expect("own fence");
+        assert!(KeptConnectionPresence::acquire(&db).is_none());
+        // The holder's own reads still pass their guards (self-admission).
+        OperationGuard::for_database(&db).expect("holder self-admission");
+        drop(own);
+
+        // Another holder: a raw exclusive presence lock without the registry.
+        let foreign = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(presence_lock_path(&db))
+            .expect("open presence lock file");
+        foreign.try_lock().expect("foreign exclusive presence lock");
+        assert!(KeptConnectionPresence::acquire(&db).is_none());
+        drop(foreign);
+        KeptConnectionPresence::acquire(&db).expect("presence after release");
+    }
+
+    /// A database file that is refused gets no presence sibling planted.
+    #[test]
+    fn presence_plants_nothing_next_to_a_refused_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        std::fs::create_dir(&db).expect("a directory where the database belongs");
+        assert!(KeptConnectionPresence::acquire(&db).is_none());
+        assert!(!presence_lock_path(&db).exists());
+        assert!(KeptConnectionPresence::acquire(Path::new(":memory:")).is_none());
     }
 }

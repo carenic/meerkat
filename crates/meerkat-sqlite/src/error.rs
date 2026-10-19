@@ -288,7 +288,8 @@ pub enum SqliteStoreError {
     /// The exclusive maintenance fence is held for this database: storage is
     /// under offline maintenance and the operation must not proceed. (Also
     /// returned by [`crate::fence::ExclusiveFence::acquire`] when in-flight
-    /// operations did not drain within the deadline.)
+    /// operations did not drain, or a kept connection did not close, within
+    /// the deadline: see [`crate::fence::KeptConnectionPresence`].)
     #[error("maintenance fence is held for `{path}`; storage is under offline maintenance")]
     MaintenanceFenceHeld { path: PathBuf },
 

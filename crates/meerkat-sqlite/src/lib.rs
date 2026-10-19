@@ -32,8 +32,9 @@
 //!   first in `main`.
 //! - [`fence`]: the per-operation maintenance-fence guards. Store operations
 //!   take a shared guard; offline migration takes the exclusive side and
-//!   waits for in-flight operations to drain. Stores built on this crate hold
-//!   no bespoke opener, which is what makes them fence-aware for free.
+//!   waits for in-flight operations to drain and for kept connections (which
+//!   hold the presence lock) to close. Stores built on this crate hold no
+//!   bespoke opener, which is what makes them fence-aware for free.
 //! - [`watch`]: the cross-process change watch over a database file and its
 //!   sidecars (coalesced notification ticks plus a bounded sweep; a hint,
 //!   never permission or custody).
@@ -66,7 +67,9 @@ pub use error::{
     BridgeEligibility, CurrentCatalogUnavailability, SqliteErrorClass, SqliteStoreError,
     classify_sqlite_error, is_busy_or_locked,
 };
-pub use fence::{ExclusiveFence, OperationGuard, fence_lock_path};
+pub use fence::{
+    ExclusiveFence, KeptConnectionPresence, OperationGuard, fence_lock_path, presence_lock_path,
+};
 pub use json_column::JsonColumnBytes;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

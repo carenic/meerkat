@@ -204,6 +204,12 @@ them.
   `--json`, a line of the text report, and the warning finding
   `sqlite-lock-profile` when a lock is on. The disk diagnosis
   (`DiskStorageMigrator`) fills it; other diagnosers leave it out.
+- `meerkat-sqlite`: `KeptConnectionPresence`, the presence lock
+  (`<file>.mpresence`, `presence_lock_path`) a connection kept open between
+  operations holds shared for its whole life. `ExclusiveFence` now holds the
+  presence lock as well: `try_acquire` takes both locks or neither, and
+  `acquire` takes the fence lock, then waits for the presence lock within the
+  same deadline, so maintenance waits for kept connections to close.
 
 ### Changed
 
