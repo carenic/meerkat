@@ -22496,6 +22496,112 @@ ORDER BY runtime_id";
             );
         }
 
+        /// The 0.9.3 sessions carrying every tool-config and MCP notice shape,
+        /// as meerkat-core 0.9.3 serialized them: meerkat-core's cross-version
+        /// fixture, written by its checked-in generator at tag v0.9.3.
+        const V0_9_3_NOTICE_SESSIONS_FIXTURE: &str =
+            "../../crates/meerkat-core/tests/fixtures/v0_9_3_tool_config_notice_sessions.json";
+
+        /// A standalone WholeBlob body as 0.9.3 wrote it, carrying tool-config
+        /// (boundary-applied, deferred-catalog, failed-closed, external-tool)
+        /// or MCP notice rows, keeps every row byte-identical when the
+        /// conversion seeds it: the co-located store's physical rows and the
+        /// loaded transcript are the 0.9.3 rows.
+        #[tokio::test]
+        async fn standalone_conversion_seeds_0_9_3_notice_rows_byte_identical() {
+            let fixture: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join(V0_9_3_NOTICE_SESSIONS_FIXTURE),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fixture["written_by"], "meerkat-core 0.9.3 (tag v0.9.3)");
+            let cases = fixture["cases"].as_array().unwrap();
+            assert!(
+                cases.iter().any(|case| case["case"] == "all_notices"),
+                "the fixture carries every notice shape in one transcript"
+            );
+
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let whole_blob = SqliteRuntimeStore::new_whole_blob(&path).unwrap();
+            let mut expected = Vec::new();
+            for case in cases {
+                let name = case["case"].as_str().unwrap().to_owned();
+                let body = case["session_document"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+                let rows = case["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                let session = deserialize_persisted_session(&body).unwrap();
+                whole_blob
+                    .commit_session_snapshot(
+                        &LogicalRuntimeId::for_session(session.id()),
+                        SerializedSessionSnapshot {
+                            session_snapshot: body.into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                expected.push((name, session.id().clone(), rows));
+            }
+            drop(whole_blob);
+
+            let session_store = meta_093_co_located_session_store(&path);
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("0.9.3 bodies carrying notice rows convert");
+            assert_eq!(
+                (report.seeded_count(), report.derived_count()),
+                (cases.len(), 0)
+            );
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            for (name, session_id, rows) in &expected {
+                let stored = conn
+                    .prepare(
+                        "SELECT message_json FROM session_strand_messages
+                         WHERE session_id = ?1 ORDER BY seq",
+                    )
+                    .unwrap()
+                    .query_map(params![session_id.to_string()], |row| {
+                        row.get::<_, JsonColumnBytes>(0)
+                            .map(JsonColumnBytes::into_bytes)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    stored,
+                    rows.iter()
+                        .map(|row| row.as_bytes().to_vec())
+                        .collect::<Vec<_>>(),
+                    "{name}: the seeded physical rows are not the 0.9.3 rows"
+                );
+                let loaded = session_store
+                    .load(session_id)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{name}: the seeded session does not load"));
+                assert_eq!(
+                    loaded
+                        .messages()
+                        .iter()
+                        .map(|message| serde_json::to_string(message).unwrap())
+                        .collect::<Vec<_>>(),
+                    *rows,
+                    "{name}: the loaded transcript does not re-serialize to the 0.9.3 rows"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn receiptless_snapshot_retry_converges_by_target_not_physical_route() {
             let dir = TempDir::new().unwrap();
