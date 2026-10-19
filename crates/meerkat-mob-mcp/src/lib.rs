@@ -7370,6 +7370,11 @@ struct LocalSessionService {
     counter: std::sync::atomic::AtomicU64,
     archive_delay_ms: std::sync::atomic::AtomicU64,
     archive_failures: Arc<InMemoryArchiveFailureControl>,
+    /// The spawner restrictions this service handed to the build of each
+    /// session it created, kept past archive so a successor can keep them.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
 }
 
 impl LocalSessionService {
@@ -7388,6 +7393,7 @@ impl LocalSessionService {
             counter: std::sync::atomic::AtomicU64::new(0),
             archive_delay_ms: std::sync::atomic::AtomicU64::new(0),
             archive_failures,
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -7526,6 +7532,14 @@ impl LocalSessionService {
                     next_event_seq: std::sync::Mutex::new(1),
                 },
             );
+            self.tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(
+                    sid.clone(),
+                    meerkat_core::PredecessorToolRestrictions::from_build_request(build.as_ref())
+                        .map_err(|error| error.to_string()),
+                );
             witness
         };
         commit_live_actor_materialization_or_discard(
@@ -7879,6 +7893,26 @@ impl SessionServiceHistoryExt for LocalSessionService {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MobSessionService for LocalSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        // Only sessions this service created have a record.
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &meerkat_core::SessionId,
@@ -10701,6 +10735,11 @@ mod tests {
 
     struct MockSessionSvc {
         sessions: RwLock<HashMap<SessionId, MockSessionActor>>,
+        /// The spawner restrictions handed to the build of each session
+        /// this mock created.
+        tool_restrictions: std::sync::Mutex<
+            HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+        >,
         actor_registry: meerkat_session::LiveSessionActorRegistry,
         persisted_sessions: RwLock<HashMap<SessionId, Session>>,
         archive_failures: RwLock<HashMap<SessionId, String>>,
@@ -10740,6 +10779,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 sessions: RwLock::new(HashMap::new()),
+                tool_restrictions: std::sync::Mutex::new(HashMap::new()),
                 actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
                 persisted_sessions: RwLock::new(HashMap::new()),
                 archive_failures: RwLock::new(HashMap::new()),
@@ -10826,8 +10866,15 @@ mod tests {
         async fn cold_restart(&self) -> Self {
             let persisted_sessions = self.persisted_sessions.read().await.clone();
             let archive_failures = self.archive_failures.read().await.clone();
+            // The owner's restriction records are durable beside its sessions.
+            let tool_restrictions = self
+                .tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             Self {
                 sessions: RwLock::new(HashMap::new()),
+                tool_restrictions: std::sync::Mutex::new(tool_restrictions),
                 actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
                 persisted_sessions: RwLock::new(persisted_sessions),
                 archive_failures: RwLock::new(archive_failures),
@@ -10856,6 +10903,9 @@ mod tests {
         ) -> Result<RunResult, SessionError> {
             self.session_activations.fetch_add(1, Ordering::Relaxed);
             let build = req.build;
+            let tool_restrictions =
+                meerkat_core::PredecessorToolRestrictions::from_build_request(build.as_ref())
+                    .map_err(|error| error.to_string());
             let mut persisted_session = build
                 .as_ref()
                 .and_then(|build| build.resume_session.clone())
@@ -11023,6 +11073,10 @@ mod tests {
                 &actor_witness,
             )
             .await?;
+            self.tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(sid.clone(), tool_restrictions);
             self.persisted_sessions
                 .write()
                 .await
@@ -11363,6 +11417,25 @@ mod tests {
 
     #[async_trait]
     impl MobSessionService for MockSessionSvc {
+        async fn predecessor_tool_restrictions(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+            self.tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| SessionError::NotFound {
+                    id: session_id.clone(),
+                })?
+                .map_err(|reason| {
+                    SessionError::Unsupported(format!(
+                        "inherited tool restriction evidence for session {session_id}: {reason}"
+                    ))
+                })
+        }
+
         async fn subscribe_session_activity(
             &self,
             _session_id: &meerkat_core::SessionId,

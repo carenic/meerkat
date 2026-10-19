@@ -18977,6 +18977,95 @@ mod tests {
         }
     }
 
+    /// The restrictions a session owner reads back from a factory-built
+    /// session are the ones the factory resolved: a resumed session with no
+    /// fresh overrides keeps its recorded launch policy and inherited ceiling,
+    /// and a fresh default build is known unrestricted.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_resumed_build_keeps_recorded_restrictions_without_fresh_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let deny = meerkat_core::ops::ToolAccessPolicy::DenyList(["shell"].into_iter().collect());
+        let base_build = |session: Session, bindings| {
+            let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+            build.provider = Some(Provider::Anthropic);
+            build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+            build.resume_session = Some(session);
+            build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            build
+        };
+
+        // A first build records a launch policy and an inherited ceiling.
+        let session = Session::new();
+        let first_runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = first_runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("bindings");
+        let (ceiling, _) = inherited_visibility_authority(
+            meerkat_core::tool_scope::ToolFilter::Deny(
+                ["parent_shell".to_string()].into_iter().collect(),
+            ),
+            &["parent_shell"],
+        );
+        let mut first = base_build(session, bindings);
+        first.tool_access_policy = Some(deny.clone());
+        first.initial_tool_visibility_state = Some(ceiling);
+        let first = factory
+            .build_agent(first, &Config::default())
+            .await
+            .unwrap();
+        let recorded =
+            meerkat_core::PredecessorToolRestrictions::from_committed_session(first.session())
+                .expect("the first build records its restrictions");
+        assert_eq!(recorded.launch_policy(), Some(deny.clone()));
+        let recorded_ceiling = recorded
+            .inherited_visibility()
+            .expect("a recorded ceiling")
+            .filter()
+            .clone();
+
+        // Resuming it with no fresh overrides keeps both.
+        let resumed_session = first.session().clone();
+        let second_runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = second_runtime
+            .prepare_bindings(resumed_session.id().clone())
+            .await
+            .expect("bindings");
+        let resumed = factory
+            .build_agent(base_build(resumed_session, bindings), &Config::default())
+            .await
+            .unwrap();
+        let kept =
+            meerkat_core::PredecessorToolRestrictions::from_committed_session(resumed.session())
+                .expect("the resumed build records its restrictions");
+        assert_eq!(kept.launch_policy(), Some(deny));
+        assert_eq!(
+            kept.inherited_visibility()
+                .map(|authority| authority.filter().clone()),
+            Some(recorded_ceiling)
+        );
+
+        // A fresh default build is known unrestricted.
+        let fresh_session = Session::new();
+        let fresh_runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = fresh_runtime
+            .prepare_bindings(fresh_session.id().clone())
+            .await
+            .expect("bindings");
+        let fresh = factory
+            .build_agent(base_build(fresh_session, bindings), &Config::default())
+            .await
+            .unwrap();
+        let fresh =
+            meerkat_core::PredecessorToolRestrictions::from_committed_session(fresh.session())
+                .expect("a fresh build records explicit unrestricted evidence");
+        assert_eq!(fresh.launch_policy(), None);
+        assert!(fresh.inherited_visibility().is_none());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn factory_initial_visibility_handoff_applies_for_fresh_session() {

@@ -653,6 +653,32 @@ pub fn agent_mob_tools_state(
     state
 }
 
+/// [`agent_mob_tools_state`] over the in-memory (ephemeral) session service
+/// instead of the persistent one, with the service's own runtime machine.
+pub fn agent_mob_tools_state_ephemeral(
+    root: &std::path::Path,
+    client: Arc<dyn LlmClient>,
+    configure: impl FnOnce(MobMcpState) -> MobMcpState,
+) -> Arc<MobMcpState> {
+    let (builder, _store, _project_root) = fixture_builder(root, client);
+    let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
+    let service = Arc::new(meerkat::surface::build_embedded_service_from_builder(
+        builder, 32,
+    ));
+    let runtime = meerkat_mob::MobSessionService::acquire_runtime_adapter(service.as_ref(), None)
+        .expect("acquire the ephemeral service's runtime machine");
+    let state = Arc::new(configure(
+        MobMcpState::new_with_runtime_adapter(service, runtime, MobControlPrincipal::Owner)
+            .expect("mob state"),
+    ));
+    *mob_tools_slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+        meerkat_mob_mcp::AgentMobToolSurfaceFactory::new(Arc::clone(&state)),
+    ));
+    state
+}
+
 impl CouncilFixture {
     /// Build a fixture with an explicitly rooted durable realm custody.
     pub fn new(script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static) -> Self {

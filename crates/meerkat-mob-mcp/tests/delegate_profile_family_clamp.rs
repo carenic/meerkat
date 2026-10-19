@@ -342,26 +342,47 @@ struct ParentMob {
     _temp: tempfile::TempDir,
 }
 
+/// Which session service the parent's mob runs on.
+enum Composition {
+    Persistent,
+    Ephemeral,
+}
+
 impl ParentMob {
     async fn new(
         mob_id: MobId,
+        script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
+    ) -> Self {
+        let definition = parent_definition(&mob_id);
+        Self::new_on(Composition::Persistent, mob_id, definition, script).await
+    }
+
+    async fn new_on(
+        composition: Composition,
+        mob_id: MobId,
+        definition: MobDefinition,
         script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
     ) -> Self {
         let temp = tempfile::tempdir().expect("temp dir");
         let host_calls = Arc::new(Mutex::new(Vec::new()));
         let host: Arc<dyn meerkat_core::AgentToolDispatcher> =
             Arc::new(HostNote(Arc::clone(&host_calls)));
-        let state = support::agent_mob_tools_state(
-            temp.path(),
-            Arc::new(ScriptedCouncilClient::new(script)),
-            |state| {
-                let provider: meerkat_mob::ExternalToolsProvider =
-                    Arc::new(move || Some(Arc::clone(&host)));
-                state.with_external_tools_provider(Some(provider))
-            },
-        );
+        let configure = move |state: MobMcpState| {
+            let provider: meerkat_mob::ExternalToolsProvider =
+                Arc::new(move || Some(Arc::clone(&host)));
+            state.with_external_tools_provider(Some(provider))
+        };
+        let client = Arc::new(ScriptedCouncilClient::new(script));
+        let state = match composition {
+            Composition::Persistent => {
+                support::agent_mob_tools_state(temp.path(), client, configure)
+            }
+            Composition::Ephemeral => {
+                support::agent_mob_tools_state_ephemeral(temp.path(), client, configure)
+            }
+        };
         state
-            .mob_create_definition(parent_definition(&mob_id))
+            .mob_create_definition(definition)
             .await
             .expect("create the mob");
         state
@@ -728,5 +749,190 @@ async fn a_tooling_absent_spawn_member_spawns_the_definition_profile_as_before()
         .member(&AgentIdentity::from("worker"))
         .await
         .expect("the worker is a member of the mob");
+    mob.teardown().await;
+}
+
+/// The parent creates a mob whose `worker` profile mounts `worker_tools`, and
+/// spawns its `worker` member with `spawn_tooling` (absent for a role-based
+/// spawn). Returns the parent's mob, what the sessions saw, and the created
+/// mob.
+async fn spawn_worker_in_a_created_mob(
+    composition: Composition,
+    parent_deny: &[&str],
+    worker_tools: serde_json::Value,
+    spawn_tooling: Option<serde_json::Value>,
+) -> (ParentMob, Observed, MobId) {
+    let probe = shell_probe();
+    let observed = Observed::default();
+    let child_mob_id = fresh_mob_id();
+    let child = child_mob_id.to_string();
+    let parent_mob_id = fresh_mob_id();
+    let mut definition = parent_definition(&parent_mob_id);
+    if let Some(ProfileBinding::Inline(profile)) = definition
+        .profiles
+        .get_mut(&ProfileName::from("participant"))
+    {
+        profile.tools.deny = parent_deny.iter().map(|name| (*name).to_string()).collect();
+    }
+    let mob = ParentMob::new_on(
+        composition,
+        parent_mob_id,
+        definition,
+        script(
+            observed.clone(),
+            probe,
+            move |results| {
+                if results.contains_key("call-create") {
+                    let mut args = serde_json::json!({
+                        "mob_id": child,
+                        "profile": "worker",
+                        "member_id": "worker",
+                        "runtime_mode": "turn_driven",
+                    });
+                    if let Some(tooling) = &spawn_tooling {
+                        args["tooling"] = tooling.clone();
+                    }
+                    ScriptedTurn::ToolCall {
+                        id: "call-spawn".to_string(),
+                        name: "mob_spawn_member".to_string(),
+                        args,
+                    }
+                } else {
+                    ScriptedTurn::ToolCall {
+                        id: "call-create".to_string(),
+                        name: "mob_create".to_string(),
+                        args: serde_json::json!({ "definition": {
+                            "id": child,
+                            "profiles": { "worker": {
+                                "model": "claude-haiku-4-5-20251001",
+                                "tools": worker_tools.clone()
+                            } }
+                        } }),
+                    }
+                }
+            },
+            HelperTurn::Probe,
+        ),
+    )
+    .await;
+    mob.parent_turn(PROBE)
+        .await
+        .expect("the parent's spawn turn");
+    let parent = seen(&observed.parent, "parent's probe");
+    for call in ["call-create", "call-spawn"] {
+        assert!(
+            !parent[call].contains("\"error\":\""),
+            "the parent's {call} succeeded: {}",
+            parent[call]
+        );
+    }
+    (mob, observed, child_mob_id)
+}
+
+/// Respawn the worker, run one turn on the successor, and check the
+/// successor's shell call is still refused like its predecessor's was.
+async fn assert_respawn_keeps_the_worker_refused(
+    mob: ParentMob,
+    observed: Observed,
+    child_mob_id: MobId,
+) {
+    let probe = shell_probe();
+    mob.worker_turn(&child_mob_id).await;
+    mob.state
+        .mob_respawn(&child_mob_id, AgentIdentity::from("worker"), None)
+        .await
+        .expect("respawn the worker");
+    mob.worker_turn(&child_mob_id).await;
+    let worker = observed.worker.lock().unwrap().clone();
+    assert_eq!(worker.len(), 2, "both worker turns reached their answers");
+    assert_refused_at_dispatch(&worker[0]["call-worker-probe"], &probe, "worker");
+    assert_refused_at_dispatch(&worker[1]["call-worker-probe"], &probe, "respawned worker");
+    let _ = mob.state.mob_destroy(&child_mob_id).await;
+    mob.teardown().await;
+}
+
+/// A worker spawned with profile tooling is capped by its parent's visible
+/// tools; its respawned successor keeps that ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_respawned_profile_tooling_worker_keeps_its_ceiling() {
+    respawned_profile_tooling_worker_keeps_its_ceiling(Composition::Persistent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ephemeral_respawned_profile_tooling_worker_keeps_its_ceiling() {
+    respawned_profile_tooling_worker_keeps_its_ceiling(Composition::Ephemeral).await;
+}
+
+async fn respawned_profile_tooling_worker_keeps_its_ceiling(composition: Composition) {
+    let (mob, observed, child) = spawn_worker_in_a_created_mob(
+        composition,
+        &[],
+        serde_json::json!({ "comms": true }),
+        Some(inline_tooling(&["shell"])),
+    )
+    .await;
+    assert_respawn_keeps_the_worker_refused(mob, observed, child).await;
+}
+
+/// A worker inherits its spawner's deny list as its launch policy; its
+/// respawned successor keeps that policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_respawned_worker_keeps_its_inherited_deny() {
+    respawned_worker_keeps_its_inherited_deny(Composition::Persistent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ephemeral_respawned_worker_keeps_its_inherited_deny() {
+    respawned_worker_keeps_its_inherited_deny(Composition::Ephemeral).await;
+}
+
+async fn respawned_worker_keeps_its_inherited_deny(composition: Composition) {
+    let (mob, observed, child) = spawn_worker_in_a_created_mob(
+        composition,
+        &["shell"],
+        serde_json::json!({ "comms": true, "shell": true }),
+        None,
+    )
+    .await;
+    assert_respawn_keeps_the_worker_refused(mob, observed, child).await;
+}
+
+/// A worker whose spawner restricted nothing is known unrestricted: its
+/// respawned successor keeps running the tools its own profile mounts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_respawned_unrestricted_worker_keeps_its_own_tools() {
+    respawned_unrestricted_worker_keeps_its_own_tools(Composition::Persistent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ephemeral_respawned_unrestricted_worker_keeps_its_own_tools() {
+    respawned_unrestricted_worker_keeps_its_own_tools(Composition::Ephemeral).await;
+}
+
+async fn respawned_unrestricted_worker_keeps_its_own_tools(composition: Composition) {
+    let probe = shell_probe();
+    let (mob, observed, child) = spawn_worker_in_a_created_mob(
+        composition,
+        &[],
+        serde_json::json!({ "comms": true, "shell": true }),
+        None,
+    )
+    .await;
+    mob.worker_turn(&child).await;
+    mob.state
+        .mob_respawn(&child, AgentIdentity::from("worker"), None)
+        .await
+        .expect("respawn the worker");
+    mob.worker_turn(&child).await;
+    let worker = observed.worker.lock().unwrap().clone();
+    assert_eq!(worker.len(), 2, "both worker turns reached their answers");
+    for (turn, who) in worker.iter().zip(["worker", "respawned worker"]) {
+        assert!(
+            turn["call-worker-probe"].contains(probe.executed_marker),
+            "the {who} runs its own profile's shell: {}",
+            turn["call-worker-probe"]
+        );
+    }
+    let _ = mob.state.mob_destroy(&child).await;
     mob.teardown().await;
 }

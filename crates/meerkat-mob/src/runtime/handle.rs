@@ -2283,7 +2283,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::MemberReloadTimedOut { .. }
         | MobError::HeldSpawnUnsupported { .. }
         | MobError::HeldSpawnAborted { .. }
-        | MobError::HeldSpawnExpired { .. } => {
+        | MobError::HeldSpawnExpired { .. }
+        | MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         MobError::RuntimeEffectRefused { kind, .. } => match kind {

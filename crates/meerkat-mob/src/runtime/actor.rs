@@ -6367,6 +6367,52 @@ enum SpawnEnqueueOrigin {
     },
 }
 
+/// Compose the predecessor's spawner restrictions into its successor's spec,
+/// after customization: the successor keeps every inherited restriction and
+/// narrows it with its own, never widening, and keeps the predecessor's auth
+/// binding unless its own spec names one.
+fn keep_predecessor_restrictions(
+    agent_identity: &AgentIdentity,
+    spec: &mut super::handle::SpawnMemberSpec,
+    retained: &meerkat_core::PredecessorToolRestrictions,
+) -> Result<(), MobError> {
+    let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+        agent_identity: agent_identity.to_string(),
+        reason,
+    };
+    // `Inherit` at this seam is host authority, so it adds no restriction.
+    let own_policy = spec
+        .tool_access_policy
+        .take()
+        .filter(|policy| !matches!(policy, meerkat_core::ops::ToolAccessPolicy::Inherit));
+    spec.tool_access_policy = match (own_policy, retained.launch_policy()) {
+        (None, retained) => retained,
+        (own, None) => own,
+        (Some(own), Some(retained)) => Some(
+            own.conjoin(retained)
+                .map_err(|error| refuse(error.to_string()))?,
+        ),
+    };
+    spec.inherited_tool_filter = match (
+        spec.inherited_tool_filter.take(),
+        retained.inherited_visibility(),
+    ) {
+        (None, retained) => retained.cloned(),
+        (own, None) => own,
+        (Some(own), Some(retained)) => Some(
+            retained
+                .narrowed_with(&own)
+                .map_err(|error| refuse(error.to_string()))?,
+        ),
+    };
+    // The successor resolves its credentials through the binding its
+    // predecessor's session recorded, unless its own spec names one.
+    if spec.auth_binding.is_none() {
+        spec.auth_binding = retained.auth_binding().cloned();
+    }
+    Ok(())
+}
+
 struct RespawnSnapshot {
     profile_name: ProfileName,
     runtime_mode: crate::MobRuntimeMode,
@@ -30200,9 +30246,9 @@ impl MobActor {
         // MeerkatMachine) carries large debug poll frames. Run it on its own
         // task so those frames start at the worker loop rather than beneath
         // the actor run loop and restore frames: inline, the sum overflowed
-        // the 2 MiB worker-stack canary
-        // `mob_cold_restart_partial_resume_respawns_wired_member` once #1416
-        // widened the generated machine types. Binding preparation is
+        // the 2 MiB worker-stack canary (now
+        // `mob_cold_restart_resume_respawns_a_wired_member_whose_session_survived`)
+        // once #1416 widened the generated machine types. Binding preparation is
         // idempotent, so a late completion after a cancelled restore is
         // harmless (see `relieve_caller_stack`). Do not move this back inline:
         // that re-stacks the registration chain beneath the actor frames.
@@ -44930,6 +44976,56 @@ impl MobActor {
         }
     }
 
+    /// The spawner restrictions of the member being respawned, as its
+    /// session's owner states them, or `None` when the member's journaled
+    /// record proves it never had local session authority in this
+    /// generation. Missing, unsupported or changed evidence refuses the
+    /// respawn before anything is retired, keeping the member.
+    async fn retained_predecessor_restrictions(
+        &self,
+        agent_identity: &AgentIdentity,
+        snapshot: &RespawnSnapshot,
+    ) -> Result<Option<meerkat_core::PredecessorToolRestrictions>, MobError> {
+        let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+            agent_identity: agent_identity.to_string(),
+            reason,
+        };
+        let current_local_session = |entry: Option<&RosterEntry>| {
+            entry
+                .filter(|entry| {
+                    entry.agent_runtime_id == snapshot.old_runtime_id
+                        && entry.fence_token == snapshot.old_fence_token
+                })
+                .map(RosterEntry::local_session)
+        };
+        let Some(local_session) =
+            current_local_session(self.roster.read().await.get(agent_identity))
+        else {
+            return Err(refuse(
+                "the member changed before its restrictions were read".to_string(),
+            ));
+        };
+        let session_id = match local_session {
+            crate::roster::MemberLocalSession::NeverBound => return Ok(None),
+            crate::roster::MemberLocalSession::Bound(session_id) => session_id,
+        };
+        let restrictions = self
+            .session_service
+            .predecessor_tool_restrictions(&session_id)
+            .await
+            .map_err(|error| refuse(error.to_string()))?;
+        // The read awaited: the member must still be the same incarnation,
+        // bound to the same session.
+        if current_local_session(self.roster.read().await.get(agent_identity))
+            != Some(crate::roster::MemberLocalSession::Bound(session_id))
+        {
+            return Err(refuse(
+                "the member changed while its restrictions were read".to_string(),
+            ));
+        }
+        Ok(Some(restrictions))
+    }
+
     async fn handle_respawn(
         &mut self,
         agent_identity: AgentIdentity,
@@ -45043,6 +45139,19 @@ impl MobActor {
             cleanup_retry = snapshot.cleanup_retry,
             "MobActor::handle_respawn captured snapshot"
         );
+                // The spawner restrictions the successor must keep, pinned
+                // before anything is retired. Placed members are owned by
+                // their hosting member and are not read here; a member that
+                // never had a local session carries no session restrictions,
+                // and its successor keeps the launch policy its own spec
+                // inherits.
+                let retained_restrictions = match placed_host {
+                    Some(_) => None,
+                    None => self
+                        .retained_predecessor_restrictions(&agent_identity, &snapshot)
+                        .await
+                        .map_err(MobRespawnError::from)?,
+                };
 
                 let original_identity = AgentIdentity::from(agent_identity.as_str());
                 let mut replacement_spec = match successor_spec {
@@ -45143,6 +45252,15 @@ impl MobActor {
             return Err(MobRespawnError::from(MobError::Internal(format!(
                 "spawn customizer cannot re-place respawn of '{original_identity}'"
             ))));
+                }
+
+                if let Some(retained) = &retained_restrictions {
+                    keep_predecessor_restrictions(
+                        &agent_identity,
+                        &mut replacement_spec,
+                        retained,
+                    )
+                    .map_err(MobRespawnError::from)?;
                 }
 
                 Ok::<_, MobRespawnError>((

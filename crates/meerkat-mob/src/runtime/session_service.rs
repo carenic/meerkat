@@ -1935,6 +1935,21 @@ pub trait MobSessionService:
         )))
     }
 
+    /// The tool restrictions a session inherited from its spawner (launch
+    /// tool access policy and visibility ceiling), as the session's owner
+    /// knows them, so a successor that replaces it can keep them.
+    ///
+    /// Services that cannot state them report an error; they must never
+    /// answer "unrestricted" for a session whose evidence they lack.
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "inherited tool restriction evidence is unavailable for session {session_id}"
+        )))
+    }
+
     /// Observe session-document visibility without requiring its contents.
     ///
     /// This is a raw backend observation for MobMachine's shutdown input, not
@@ -2315,6 +2330,18 @@ where
             .await;
         #[cfg(target_arch = "wasm32")]
         let _ = session_id;
+    }
+
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        // The owner's record of the build handoff it installed; never waits
+        // on the session's running turn.
+        meerkat_session::EphemeralSessionService::<B>::predecessor_tool_restrictions(
+            self, session_id,
+        )
+        .await
     }
 
     async fn observe_member_status_view(
@@ -3650,6 +3677,25 @@ where
         session_id: &SessionId,
     ) -> Result<Option<meerkat_core::PersistedSessionMetadataView>, SessionError> {
         self.load_authoritative_session_metadata(session_id).await
+    }
+
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        // The committed body, read without reconciling or reviving anything.
+        let Some(session) = self.observe_authoritative_session_body(session_id).await? else {
+            return Err(SessionError::NotFound {
+                id: session_id.clone(),
+            });
+        };
+        meerkat_core::PredecessorToolRestrictions::from_committed_session(&session).map_err(
+            |error| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {error}"
+                ))
+            },
+        )
     }
 
     async fn session_known_to_archive_authority(

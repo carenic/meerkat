@@ -420,6 +420,27 @@ them.
   `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
   it with `{ stage, .. }`. The settlement follows the exact registration's
   runtime unregister after Shutdown returns.
+- `meerkat_mob::MobSessionService` gains `predecessor_tool_restrictions`. Its
+  default reports `Unsupported`. The persistent and ephemeral session
+  services, and the CLI, RPC and in-memory mob services, answer it from the
+  session owner's own evidence; a custom session service that wraps one of
+  them delegates it, or the respawns of its members are refused (see Fixed).
+  `meerkat_mob::MobError` gains `RespawnPredecessorRestrictionsUnavailable`,
+  appended last. Core gains `PredecessorToolRestrictions`,
+  `InheritedVisibilityEvidence`, `PredecessorRestrictionsError`,
+  `InheritedVisibilityConflict` and
+  `InheritedToolVisibilityAuthority::narrowed_with`. A missing recorded
+  witness is reported as
+  `PredecessorRestrictionsError::MissingInheritedWitnesses`.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: respawn no longer
+  repairs a member whose session was lost (for example, a Broken member after
+  a cold restart whose session store no longer has it): its spawn-time
+  restrictions can no longer be established, so the respawn is refused with
+  `RespawnPredecessorRestrictionsUnavailable` before anything is retired, and
+  the Broken member is kept. Retiring it and spawning a fresh member are
+  separate, ordinary operations under the current authorization, policy and
+  inherited ceilings; they do not recover the lost restrictions and do not
+  acknowledge the member as unrestricted.
 
 ### Security
 
@@ -1475,6 +1496,20 @@ them.
   registration whose runtime loop is still attached keeps its fence until
   that loop hands it back, and the discard waits for that handoff, as
   before.
+- `meerkat-mob`: a respawned local member keeps the restrictions it was
+  spawned under. `MobHandle::respawn` and the `mob_respawn` tool built the
+  successor from the member's profile alone, so a member spawned under its
+  spawner's tool ceiling, deny list or launch policy came back without them.
+  The successor now keeps the predecessor's launch tool access policy and
+  inherited visibility ceiling, as its session recorded them, intersected with
+  the successor's own and never widened, and resolves its credentials through
+  the auth binding the predecessor's session recorded unless its own spec
+  names one. A respawn whose predecessor's restrictions cannot be established,
+  or whose member changes while they are read, is refused before anything is
+  retired, and the member is kept. A peer-only member whose generation was
+  never bound to a local session carries no session restrictions; its
+  successor keeps the launch policy and ceiling its own spec inherits. Placed
+  members are unchanged.
 
 ## [0.9.3] - 2026-10-18
 

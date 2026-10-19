@@ -1370,6 +1370,16 @@ pub enum MobError {
         bundle: String,
         offered: Vec<String>,
     },
+
+    /// A respawn was refused before anything was retired: the restrictions
+    /// the member inherited from its spawner (launch tool access policy and
+    /// visibility ceiling) could not be established for its successor, or
+    /// the member changed while they were read. The member keeps running.
+    #[error("respawn of member {agent_identity} refused: {reason}")]
+    RespawnPredecessorRestrictionsUnavailable {
+        agent_identity: String,
+        reason: String,
+    },
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared
@@ -2450,6 +2460,10 @@ mod tests {
             MobError::MemberReloadRefused {
                 session_id: meerkat_core::types::SessionId::new(),
                 reason: "durable authority unreadable".to_string(),
+            },
+            MobError::RespawnPredecessorRestrictionsUnavailable {
+                agent_identity: "worker".to_string(),
+                reason: "no inherited tool restriction evidence".to_string(),
             },
             MobError::MemberReloadTimedOut {
                 session_id: meerkat_core::types::SessionId::new(),
