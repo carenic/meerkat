@@ -1572,24 +1572,42 @@ describe("Typed Events", () => {
     }
   });
 
-  it("reads settled and falls back to the persisted of rkat-rpc 0.9.3 and earlier", () => {
-    const pending = { kind: "external_tool_delta", phase: "pending" };
-    for (const [fields, settled] of [
-      [{ settled: true }, true],
-      [{ settled: false }, false],
-      [{ persisted: true }, true],
-      [{ persisted: false }, false],
-      [{ settled: false, persisted: true }, false],
+  it("derives settled from status_info, as rkat-rpc does, over the stored bit", () => {
+    // Payloads stored by rkat-rpc 0.9.3 and earlier are served back with their
+    // `persisted`, which was false for changes that had already applied; only a
+    // status this SDK does not know falls back to the stored bit.
+    const boundary = { kind: "boundary_applied", base_changed: true, visible_changed: true, revision: 2 };
+    const catalog = {
+      kind: "deferred_catalog_delta", added_hidden_count: 1, removed_hidden_count: 0, pending_source_count: 0,
+    };
+    const failedClosed = { kind: "warning_failed_closed", error: "scope refused" };
+    const delta = (phase) => ({ kind: "external_tool_delta", phase });
+    for (const [statusInfo, fields, settled] of [
+      [boundary, { persisted: false }, true],
+      [catalog, { persisted: false }, true],
+      [failedClosed, { persisted: false }, true],
+      [boundary, { settled: true }, true],
+      [delta("pending"), { persisted: true }, false],
+      [delta("draining"), { settled: true }, false],
+      [delta("applied"), { persisted: false }, true],
+      [delta("forced"), { settled: false }, true],
+      [delta("failed"), { persisted: false }, true],
+      [delta("pending"), { settled: false, persisted: true }, false],
+      [{ kind: "a_later_kind" }, { settled: true }, true],
+      [{ kind: "a_later_kind" }, { persisted: false }, false],
+      [{ kind: "a_later_kind" }, { settled: false, persisted: true }, false],
+      [delta("a_later_phase"), { persisted: true }, true],
     ]) {
+      const label = JSON.stringify([statusInfo, fields]);
       const event = parseEvent({ type: "tool_config_changed", payload: {
-        operation: "add", target: "filesystem", status_info: pending, ...fields,
+        operation: "add", target: "filesystem", status_info: statusInfo, ...fields,
       } });
-      assert.equal(event.type, "tool_config_changed", JSON.stringify(fields));
-      assert.equal(event.payload.settled, settled, JSON.stringify(fields));
-      assert.equal(Object.hasOwn(event.payload, "persisted"), false);
+      assert.equal(event.type, "tool_config_changed", label);
+      assert.equal(event.payload.settled, settled, label);
+      assert.equal(Object.hasOwn(event.payload, "persisted"), false, label);
     }
     const raw = { type: "tool_config_changed", payload: {
-      operation: "add", target: "filesystem", status_info: pending,
+      operation: "add", target: "filesystem", status_info: boundary,
     } };
     const missing = parseEvent(raw);
     assert.equal(missing.type, "malformed_event");

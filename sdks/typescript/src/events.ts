@@ -679,8 +679,10 @@ export interface ToolConfigChangedPayload {
   readonly status_info?: ToolConfigChangeStatus;
   /**
    * Whether the change is a settled lifecycle fact rather than a pending or
-   * draining step. It says nothing about configuration: whether a change was
-   * written there is the `persisted` of the `mcp/add` / `mcp/remove` response.
+   * draining step. It is derived from `status_info` the way rkat-rpc derives
+   * it, so payloads stored by 0.9.3 and earlier read correctly. It says
+   * nothing about configuration: whether a change was written there is the
+   * `persisted` of the `mcp/add` / `mcp/remove` response.
    */
   readonly settled?: boolean;
   readonly applied_at_turn?: number;
@@ -1245,6 +1247,38 @@ function parseContentBlocks(raw: unknown, legacyText?: unknown): readonly Conten
     return [{ type: "text", text: legacyText }];
   }
   return [];
+}
+
+/**
+ * A tool config payload's lifecycle fact, derived like rkat-rpc derives it.
+ *
+ * Tool-scope, deferred-catalog and failed-closed changes are settled, and an
+ * external tool delta is settled unless it is pending or draining. Only a
+ * status this SDK does not know falls back to the stored bit: `settled` from
+ * rkat-rpc 0.9.4 and later, or the `persisted` that 0.9.3 and earlier stored
+ * (served back unchanged), which was `false` for tool-scope, deferred-catalog
+ * and failed-closed changes that had already applied.
+ */
+function toolConfigSettled(payloadRaw: Record<string, unknown>): boolean {
+  const stored = requireBooleanField(payloadRaw, hasOwn(payloadRaw, "settled") ? "settled" : "persisted");
+  const status = payloadRaw.status_info;
+  if (isPlainRecord(status)) {
+    switch (status.kind) {
+      case "boundary_applied":
+      case "deferred_catalog_delta":
+      case "warning_failed_closed":
+        return true;
+      case "external_tool_delta":
+        if (status.phase === "applied" || status.phase === "forced" || status.phase === "failed") {
+          return true;
+        }
+        if (status.phase === "pending" || status.phase === "draining") {
+          return false;
+        }
+        break;
+    }
+  }
+  return stored;
 }
 
 function parseToolConfigChangeStatus(raw: unknown): ToolConfigChangeStatus | undefined {
@@ -1874,8 +1908,7 @@ export function parseCoreEvent(raw: Record<string, unknown>): AgentEvent {
           ...(statusInfo != null ? { status_info: statusInfo } : {}),
           operation: requireOneOf(requireStringField(payloadRaw, "operation"), "operation", ["add", "remove", "reload"] as const),
           target: requireStringField(payloadRaw, "target"),
-          // rkat-rpc 0.9.3 and earlier wrote the same bit as `persisted`.
-          settled: requireBooleanField(payloadRaw, hasOwn(payloadRaw, "settled") ? "settled" : "persisted"),
+          settled: toolConfigSettled(payloadRaw),
           ...(appliedAtTurn != null ? { applied_at_turn: appliedAtTurn } : {}),
         },
       };

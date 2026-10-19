@@ -3542,7 +3542,8 @@ export interface ToolConfigChangedPayload {
   deferred_catalog_delta?: DeferredCatalogDelta | null;
   domain?: ToolConfigChangeDomain | null;
   operation: ToolConfigChangeOperation;
-  settled: boolean;
+  persisted?: boolean;
+  settled?: boolean;
   status_info: ToolConfigChangeStatus;
   target: string;
 }
@@ -6910,6 +6911,7 @@ export interface SystemNoticeBlockMcp {
   detail?: string | null;
   operation?: ToolConfigChangeOperation | null;
   pending_sources?: string[];
+  persisted?: boolean;
   phase?: ExternalToolDeltaPhase | null;
   server_id?: string | null;
   settled?: boolean;

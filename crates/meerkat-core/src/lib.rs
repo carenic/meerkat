@@ -276,9 +276,9 @@ pub use event::{
     ExternalToolDeltaPhase, InteractionFailureReason, LiveChannelCloseReason, ScopedAgentEvent,
     SkillResolutionFailureReason, StreamScopeFrame, StreamTruncationReason, StructuredOutputOrigin,
     ToolCallArguments, ToolCallArgumentsError, ToolConfigChangeOperation, ToolConfigChangeStatus,
-    ToolConfigChangedPayload, TurnErrorMetadata, VerboseEventConfig, agent_event_type,
-    compare_event_envelopes, format_verbose_event, format_verbose_event_with_config,
-    turn_usage_summary, usage_summary,
+    ToolConfigChangedPayload, ToolConfigLifecycleBit, TurnErrorMetadata, VerboseEventConfig,
+    agent_event_type, compare_event_envelopes, format_verbose_event,
+    format_verbose_event_with_config, turn_usage_summary, usage_summary,
 };
 pub use event_injector::{EventInjector, EventInjectorError};
 pub use event_tap::{

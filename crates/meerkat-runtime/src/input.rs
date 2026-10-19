@@ -2557,7 +2557,7 @@ mod tests {
             server_id: Some("server".to_string()),
             operation: None,
             phase: None,
-            settled,
+            lifecycle_bit: meerkat_core::event::ToolConfigLifecycleBit::Settled(settled),
             detail: None,
             confinement_refusal: None,
             pending_sources: Vec::new(),

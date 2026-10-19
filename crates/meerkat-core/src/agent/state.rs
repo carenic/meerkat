@@ -5550,7 +5550,7 @@ where
                     server_id: None,
                     operation: None,
                     phase: Some(crate::event::ExternalToolDeltaPhase::Pending),
-                    settled: false,
+                    lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(false),
                     detail: Some(body),
                     confinement_refusal: None,
                     pending_sources: pending_servers,
