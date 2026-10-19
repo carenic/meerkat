@@ -402,14 +402,16 @@ graph.
 - Nightly, `cargo.yml` and the dense Mob topology workflow still install
   sccache through `mozilla-actions/sccache-action` (with a pinned
   `version`), by design: they use its GitHub Actions cache backend, which
-  needs the token the action exports.
+  needs the token the action exports. A failed install there leaves the job
+  without sccache too: the step continues on error, and the next one sets
+  an empty `RUSTC_WRAPPER` with a warning.
 - A CI lane downloads the pinned sccache release with the job's own token
   first (`gh release download`) and from the anonymous release URL only
   when that fails. A lane that cannot download it either way (every try
-  answered 403, say) runs without sccache, with a warning that names both
-  causes: it compiles cold, and a pull request's gate still holds it to the
-  lane execution budget. A download whose sha256 does not match the pin
-  still fails the lane.
+  answered 403, say), or whose sccache server does not start, runs without
+  sccache, with a warning that names the cause: it compiles cold, and a
+  pull request's gate still holds it to the lane execution budget. A
+  download whose sha256 does not match the pin still fails the lane.
 - A release job whose checkout can be an older tag runs its setup action
   from `.release-tooling`, a sparse checkout of the workflow's own commit,
   but a local action that action calls in turn (`uses: ./.github/actions/...`)

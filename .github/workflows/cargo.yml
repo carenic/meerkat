@@ -83,6 +83,10 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   # Cache-service hiccups must degrade to plain compiles, never fail a job.
   SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  # A failed sccache install never fails a job either: each Setup sccache
+  # step continues on error (so does the action's post step, which reads
+  # the stats), and the step after it then sets an empty RUSTC_WRAPPER,
+  # which Cargo reads as no wrapper.
 
 jobs:
   changes:
@@ -173,9 +177,18 @@ jobs:
           fi
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -277,9 +290,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -307,9 +329,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -392,9 +423,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -515,9 +555,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -556,9 +605,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -591,9 +649,18 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -763,9 +830,18 @@ jobs:
           java-version: 21
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
@@ -801,9 +877,18 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -852,9 +937,18 @@ jobs:
           wasm-pack --version
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -908,9 +1002,18 @@ jobs:
           wasm-pack --version
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -945,9 +1048,18 @@ jobs:
           node-version: "22"
 
       - name: Setup sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
+
+      - name: Compile without sccache when its install failed
+        if: ${{ steps.sccache.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
         uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1

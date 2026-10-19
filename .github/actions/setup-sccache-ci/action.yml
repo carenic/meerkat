@@ -174,19 +174,38 @@ runs:
         # for some of them and that server silently runs ReadOnly for the
         # whole lane. Stagger the start and restart until the server reports
         # ReadWrite (a read-write GCS backend only; a read-only one is meant
-        # to come up ReadOnly, and the local fallback has no probe).
+        # to come up ReadOnly, and the local fallback has no probe). A server
+        # that does not start in any attempt leaves the lane without sccache
+        # instead of failing it, and the stats lines below are only reported.
+        started=false
+        start_output=""
         for attempt in 1 2 3 4 5 6; do
           sccache --stop-server >/dev/null 2>&1 || true
           if [[ -n "${SCCACHE_ERROR_LOG:-}" ]]; then : > "${SCCACHE_ERROR_LOG}"; fi
           sleep "$((RANDOM % 10 + attempt))"
-          sccache --start-server
+          started=false
+          if start_output="$(sccache --start-server 2>&1)"; then
+            started=true
+          fi
+          printf '%s\n' "${start_output}"
+          if [[ "${started}" != true ]]; then
+            echo "sccache server did not start (attempt ${attempt})"
+            continue
+          fi
           if [[ "${BACKEND}" == "gcs" && "${RW_MODE}" == "READ_WRITE" && -n "${SCCACHE_ERROR_LOG:-}" ]] && grep -q 'server has setup with ReadOnly' "${SCCACHE_ERROR_LOG}"; then
             echo "sccache server came up ReadOnly (bucket write probe rate-limited); restarting (attempt ${attempt})"
             continue
           fi
           break
         done
-        sccache --show-stats | grep -E 'Cache location|Compile requests'
+        if [[ "${started}" != true ]]; then
+          cause="$(printf '%s\n' "${start_output}" | tail -n 1)"
+          cause="${cause//%/%25}"
+          echo "::warning::the sccache server did not start (${cause:-no message}); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
+          exit 0
+        fi
+        sccache --show-stats | grep -E 'Cache location|Compile requests' || true
         if [[ "${BACKEND}" == "gcs" && -n "${SCCACHE_ERROR_LOG:-}" ]]; then
-          grep -E 'server has setup with' "${SCCACHE_ERROR_LOG}" | tail -1
+          grep -E 'server has setup with' "${SCCACHE_ERROR_LOG}" | tail -1 || true
         fi

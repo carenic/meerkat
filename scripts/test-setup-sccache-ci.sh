@@ -13,6 +13,8 @@
 # - an archive whose sha256 does not match the pin, tampered or truncated and
 #   from either path, still fails the lane before the binary reaches PATH or
 #   runs;
+# - a server that does not start leaves the lane without sccache too, and the
+#   stats lines the start step prints never fail it;
 # - every later step of the action runs only once sccache is installed.
 set -euo pipefail
 
@@ -39,6 +41,10 @@ install = steps[at]
 (out / "version").write_text(install.env.get("SCCACHE_VERSION", "") + "\n", encoding="utf-8")
 (out / "install-id").write_text(install.fields.get("id", "") + "\n", encoding="utf-8")
 (out / "install-token").write_text(install.env.get("GH_TOKEN", "") + "\n", encoding="utf-8")
+if "Start the sccache server" not in names:
+    sys.exit(f"{contract.SCCACHE_ACTION} has no `Start the sccache server` step (steps: {names})")
+start = steps[names.index("Start the sccache server")]
+(out / "start.sh").write_text(start.raw_run, encoding="utf-8")
 with (out / "later-steps.tsv").open("w", encoding="utf-8") as handle:
     for step in steps[at + 1 :]:
         handle.write(f"{step.name}\t{step.condition or ''}\n")
@@ -238,6 +244,99 @@ fails_closed gh-tampered
 
 run_step curl-truncated none 403 "" serve "$TEST_ROOT/truncated.tar.gz"
 fails_closed curl-truncated
+
+# The server start, run with a stand-in sccache and a sleep that returns at
+# once: a server that never starts leaves the lane without sccache instead of
+# failing it, a server that starts on a later attempt is used, a read-write
+# GCS server that comes up ReadOnly is restarted, and stats output in another
+# format fails nothing.
+mkdir -p "$TEST_ROOT/start-bin"
+cat > "$TEST_ROOT/start-bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$TEST_ROOT/start-bin/sccache" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  --stop-server)
+    exit 0
+    ;;
+  --start-server)
+    starts=$(( $(cat "$STUB_STARTS" 2>/dev/null || echo 0) + 1 ))
+    echo "$starts" > "$STUB_STARTS"
+    case "$STUB_SCCACHE_MODE" in
+      never)
+        echo "sccache: error: Server startup failed: cache storage failed to read" >&2
+        exit 2
+        ;;
+      second)
+        if (( starts == 1 )); then
+          echo "sccache: error: Server startup failed: Address in use" >&2
+          exit 2
+        fi
+        ;;
+      readonly-once)
+        if (( starts == 1 )); then mode=ReadOnly; else mode=ReadWrite; fi
+        echo "INFO server has setup with ${mode}" >> "$SCCACHE_ERROR_LOG"
+        ;;
+    esac
+    echo "sccache: Starting the server..."
+    ;;
+  --show-stats)
+    if [[ "$STUB_SCCACHE_MODE" == other-stats ]]; then
+      echo "stats in a format this step does not read"
+    else
+      printf 'Compile requests                      0\nCache location                  Local disk\n'
+    fi
+    ;;
+esac
+EOF
+chmod +x "$TEST_ROOT/start-bin/sleep" "$TEST_ROOT/start-bin/sccache"
+
+run_start() {
+  local label="$1" mode="$2" backend="$3" rw_mode="$4"
+  case_dir="$TEST_ROOT/start-$label"
+  mkdir -p "$case_dir"
+  : > "$case_dir/github-env"
+  : > "$case_dir/sccache.log"
+  local rc=0
+  env -i PATH="$TEST_ROOT/start-bin:$PATH" GITHUB_ENV="$case_dir/github-env" \
+    BACKEND="$backend" RW_MODE="$rw_mode" SCCACHE_ERROR_LOG="$case_dir/sccache.log" \
+    STUB_SCCACHE_MODE="$mode" STUB_STARTS="$case_dir/starts" \
+    bash --noprofile --norc -eo pipefail "$TEST_ROOT/start.sh" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  echo "$rc" > "$case_dir/rc"
+}
+starts_are() { [[ "$(cat "$case_dir/starts" 2> /dev/null)" == "$1" ]]; }
+warns_no_server() {
+  has_line stdout "::warning::the sccache server did not start (sccache: error: Server startup failed: cache storage failed to read); this job compiles without sccache"
+}
+restarted_readonly() { grep -q '^sccache server came up ReadOnly' "$case_dir/stdout"; }
+ends_read_write() { has_line stdout "INFO server has setup with ReadWrite"; }
+
+run_start never never local READ_ONLY
+check "start never: a server that never starts does not fail the lane" exit_is 0
+check "start never: every attempt was made" starts_are 6
+check "start never: the warning names the cause" warns_no_server
+check "start never: it empties RUSTC_WRAPPER for the later steps" has_line github-env "RUSTC_WRAPPER="
+
+run_start second second local READ_ONLY
+check "start second: a server that starts on the second attempt is used" exit_is 0
+check "start second: two attempts" starts_are 2
+check "start second: RUSTC_WRAPPER is left to the job" lacks_prefix github-env "RUSTC_WRAPPER="
+check "start second: no warning" no_warning
+
+run_start readonly-once readonly-once gcs READ_WRITE
+check "start readonly: a read-write server that came up ReadOnly is restarted" restarted_readonly
+check "start readonly: two attempts" starts_are 2
+check "start readonly: it ends ReadWrite" ends_read_write
+check "start readonly: the step succeeds" exit_is 0
+
+run_start other-stats other-stats local READ_ONLY
+check "start other-stats: stats in another format fail nothing" exit_is 0
+check "start other-stats: no warning" no_warning
+check "start other-stats: RUSTC_WRAPPER is left to the job" lacks_prefix github-env "RUSTC_WRAPPER="
 
 # The token is the job's own, and every later step (authentication, backend
 # selection, server start) runs only once sccache is installed.
