@@ -125,8 +125,11 @@ durability fail-stop (`DurabilityFailStop`), a lost actor task (`ActorLost`)
 or a composition dispatch failure (`DispatchFailed`), besides `IdleClose`,
 `LastOwnerReleased` and `StandDown`. While a Shutdown drains, a request the
 close does not refuse gets the retryable `MobError::ShutdownInProgress`
-(wire `SESSION_BUSY`); `ActorCommandChannelClosed` means the actor has exited
-or is exiting. `MobError` is `#[non_exhaustive]`.
+(wire `SESSION_BUSY`); `stop()` returns it at once. `ActorCommandChannelClosed`
+means the actor has exited or is exiting, and a command sent while it exits
+fails instead of waiting. A failed Shutdown keeps admission closed for the
+actor's life, with Stop, Shutdown and Destroy available. `MobError` is
+`#[non_exhaustive]`.
 
 Shutdown report: `shutdown_with_report(ShutdownOptions)`
 (`ShutdownOptions::default().with_deadline(deadline)` bounds its waits)
