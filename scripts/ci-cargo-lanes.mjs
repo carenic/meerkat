@@ -2272,10 +2272,11 @@ function plan(args) {
   // request that changes a crate it builds on, or plans the whole workspace,
   // leaves the wasm build and the browser suites to the push, like the
   // meerkat-mob chain's lanes. It keeps the Web SDK's type and unit tests,
-  // which need no wasm. The push builds the wasm whenever the lane runs.
+  // which need no wasm. The push builds the wasm whenever the lane runs, and
+  // a release projection builds none: it reuses its parent's run.
   const wasmClosureChanged =
     result.mode === "workspace" || [...seeds].some((name) => name !== "meerkat-web-runtime" && wasmBuild?.has(name));
-  result.example_web_wasm = !deferToPush || (result.example_web && !wasmClosureChanged);
+  result.example_web_wasm = !releaseProjection && (!deferToPush || (result.example_web && !wasmClosureChanged));
   deferred.example_web_wasm = deferToPush && result.example_web && !result.example_web_wasm;
 
   if (result.rust_changed) {

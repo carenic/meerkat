@@ -2874,8 +2874,8 @@ jobs:
           # so consistently, or nothing below can be trusted either.
           if [[ "${RELEASE_PROJECTION}" == "true" ]]; then
             echo "release projection: lanes reuse CI run ${RELEASE_EVIDENCE_RUN_ID} attempt ${RELEASE_EVIDENCE_RUN_ATTEMPT} of ${RELEASE_EVIDENCE_COMMIT} (verified next)"
-            if [[ "${MODE}" != "release-projection" || "${RUST_CHANGED}" != "false" || "${EXAMPLE_WEB}" != "false" || "${GENERATED_CONTRACT}" != "true" || "${BAZEL_GRAPH}" != "true" ]]; then
-              echo "::error::an inconsistent release-projection plan (mode=${MODE} rust_changed=${RUST_CHANGED} example_web=${EXAMPLE_WEB} generated_contract=${GENERATED_CONTRACT} bazel_graph=${BAZEL_GRAPH})."
+            if [[ "${MODE}" != "release-projection" || "${RUST_CHANGED}" != "false" || "${EXAMPLE_WEB}" != "false" || "${EXAMPLE_WEB_WASM}" != "false" || "${GENERATED_CONTRACT}" != "true" || "${BAZEL_GRAPH}" != "true" ]]; then
+              echo "::error::an inconsistent release-projection plan (mode=${MODE} rust_changed=${RUST_CHANGED} example_web=${EXAMPLE_WEB} example_web_wasm=${EXAMPLE_WEB_WASM} generated_contract=${GENERATED_CONTRACT} bazel_graph=${BAZEL_GRAPH})."
               failed=1
             fi
             if ! [[ "${RELEASE_EVIDENCE_COMMIT}" =~ ^[0-9a-f]{40}$ && "${RELEASE_EVIDENCE_RUN_ID}" =~ ^[1-9][0-9]*$ && "${RELEASE_EVIDENCE_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ ]]; then

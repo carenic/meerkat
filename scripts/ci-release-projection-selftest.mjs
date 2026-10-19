@@ -174,8 +174,8 @@ try {
   );
   assert.ok(projectionPlan.unit_packages.includes("rkat"), "rkat's unit row runs its bin's fenced docs example test");
   assert.deepEqual(
-    Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web"].map((key) => [key, projectionPlan[key]])),
-    { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false },
+    Object.fromEntries(["generated_contract", "bazel_graph", "machine_authority", "machine_posters", "wasm", "sdk_host", "examples_browser", "example_web", "example_web_wasm"].map((key) => [key, projectionPlan[key]])),
+    { generated_contract: true, bazel_graph: true, machine_authority: false, machine_posters: false, wasm: false, sdk_host: false, examples_browser: false, example_web: false, example_web_wasm: false },
     "a release projection runs the generation ratchets and the Bazel graph check only",
   );
   assert.deepEqual(projectionPlan.release_projection, {
@@ -208,6 +208,7 @@ try {
     "generated_contract=true",
     "bazel_graph=true",
     "example_web=false",
+    "example_web_wasm=false",
   ]) {
     assert.ok(github.stdout.split("\n").includes(line), `github output carries ${line}`);
   }
@@ -602,6 +603,11 @@ if (args[0] === "api") {
   ]) {
     assert.equal(gate(change).status, 1, `the gate refuses ${label}`);
   }
+  // A projection reuses its parent's wasm build: a plan that builds it is
+  // inconsistent, even when its WASM timer lane ran and passed.
+  const wasmProjection = gate({ EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "success" });
+  assert.equal(wasmProjection.status, 1, "the gate refuses a projection plan that builds the web wasm");
+  assert.match(wasmProjection.stdout, /an inconsistent release-projection plan \(.*example_web_wasm=true/);
   // An ordinary plan: a pull request passes without the lanes it left to
   // the push and names them; the push must run them, and the gate refuses a
   // push plan that left any.
