@@ -158,6 +158,16 @@ denial. Since 0.9.4:
   `tool_entry`, `tool_policy_entry` or `web_search_delegate`),
   `operation_id`, `waited_ms` and `settled`. Each refused attempt keeps its
   own audit record.
+- What the model sees (0.9.4): an `operation_refused` tool result carries
+  `data` with exactly the closed refusal kind and whether the tool ran:
+  `{"kind": "reprepare_required", "tool_invoked": false}` (kinds
+  `reprepare_required`, `denied`, `malformed_facts`; `tool_invoked` is
+  `false` or `"unknown"` and always present). The kind carries no policy,
+  owner or audit detail, and neither field is a permission: a new call is a
+  new operation with fresh admission. A mob member upcall still carries the
+  bare kind, so its receiver reads `"unknown"`, and an upcall refusal whose
+  data is absent or names no known kind now decodes as
+  `operation_authorization_unavailable`, not `operation_refused`.
 
 ### Serving a governed realm over JSON-RPC
 
@@ -437,9 +447,36 @@ of this.
   change in progress as a waiting hint, never a permission;
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners. `meerkat_core::authorization::OwnerChangeChurn` is the bounded wait
-  (`OWNER_CHANGE_WAIT_BOUND` 2 s, `OWNER_CHANGE_FREE_REBUILDS` 3); a tool that
-  waits inside its body bounds the wait by
+  (`OWNER_CHANGE_WAIT_BOUND` 2 s, `OWNER_CHANGE_FREE_REBUILDS` 3);
+  `wait_for_settled_change` takes the wait's trace site and operation, records
+  the debug event and reports the wait to the host's refusal observer. A
+  delegate operation of a tool call (such as the `web_search` helper's model
+  request) takes that call's waiting state from
+  `ToolDispatchContext::owner_change_churn` and bounds its wait by
   `ToolDispatchContext::remaining_tool_time`.
+- Refusal observer (0.9.4): `meerkat_core::authorization::OperationRefusalObserver`,
+  installed with `AgentBuilder::with_operation_refusal_observer` or
+  `AgentFactory::with_operation_refusal_observer`, receives each refusal
+  disposition the agent decides for a governed operation as an
+  `OperationRefusalObservation`: session, run, operation, surface
+  (`ModelRequest`, `ToolCall { tool_use_id }`, `Compaction`), outcome
+  (`Refused { kind, dispatch }` or `AuthorityUnavailable`) and disposition
+  (`WaitedForOwnerChange { waited_ms, settled }`, `Rebuilt`,
+  `ControllerFeedback`, `ToolResult`, `CompactionSkipped`, `RunFailed`). It is
+  a host-only diagnostic at decision time, not exactly-once across a crash,
+  called synchronously and never blocking; nothing of it enters the event
+  stream, a wire type or a model context. Review outcomes and exact-control
+  refusals (MCP attachments, tool applications, context controls) are not
+  observed.
+- Whether the tool ran (0.9.4): `RefusalDispatch` (`NotDispatched`,
+  `Unknown`; non-exhaustive) and `OperationRefused::dispatch`. The fenced
+  dispatch (and a retained consent attempt) certifies `NotDispatched` for a
+  refusal it meets before it invokes the dispatcher, and the execution policy
+  gate for one before its inner dispatcher; every other refusal is `Unknown`,
+  which makes no claim. A dispatcher layer that runs tool code of its own
+  before delegating forwards `OperationRefused::new(refusal.kind())`.
+  `OperationRefused` equality now includes the dispatch fact, so compare
+  `kind()` and `dispatch()` instead of `OperationRefused::new(kind)`.
 - Audit types (0.9.4): `AuditObservation` is `#[non_exhaustive]`,
   `AuditObservation::Refused` gains `read: Option<AuditRefusalRead>` and
   `AuditPolicyRead` gains `publication_instance` (see "Audit and security

@@ -155,6 +155,24 @@ Map typed errors before rendering text:
   `Unavailable` rather than `Denied` when their check refuses to rebuild. A
   poisoned publication, failed durable grant custody and a clock failure still
   answer `Unavailable`. See [Owner changes in progress](#owner-changes-in-progress).
+- The model-facing `operation_refused` payload carries `data` with exactly the
+  closed kind and whether the tool ran (0.9.4):
+  `{"kind": "reprepare_required", "tool_invoked": false}`, with kinds
+  `reprepare_required`, `denied` and `malformed_facts` and `tool_invoked`
+  `false` or `"unknown"` (always present, so its absence never reads as not
+  invoked). Neither field is a permission; the message, `Display`, `Debug` and
+  tracing stay uniform. `OperationRefused::dispatch` returns the
+  `RefusalDispatch` behind `tool_invoked`: `NotDispatched` only when the fenced
+  dispatch, a retained consent attempt or the execution policy gate met the
+  refusal before invoking the tool code it guards, otherwise `Unknown`. A
+  dispatcher layer that runs tool code of its own before delegating forwards
+  `OperationRefused::new(refusal.kind())`. `OperationRefused` equality now
+  includes that fact: compare `kind()` and `dispatch()` rather than a value
+  built with `OperationRefused::new(kind)`. A mob member upcall keeps carrying
+  the bare kind (a 0.9.3 peer decodes it as before; the receiving model reads
+  `"unknown"`), and an upcall refusal whose data is absent or names no known
+  kind decodes as `operation_authorization_unavailable`, since it is no verdict
+  the peer gave.
 - `OperationAuthorizationError::Unavailable` means the authorization owner
   could not supply authority. Preserve `operation_authorization_unavailable`;
   this is not a policy denial or reviewer verdict. Repair the owner for that
@@ -248,7 +266,26 @@ it for the local owners, and the native run and audit wrappers forward it.
 waits inside its body bounds it by `ToolDispatchContext::remaining_tool_time`.
 Each wait is one `debug` event of target `meerkat::authz::owner_change_wait`
 with `site`, `operation_id`, `waited_ms` and `settled`, and each refused attempt
-keeps its own audit record.
+keeps its own audit record. A delegate operation of a tool call takes that call's
+waiting state from `ToolDispatchContext::owner_change_churn`, so its waits report
+as the call's.
+
+To see what Core did with each refusal, install an `OperationRefusalObserver`
+with `AgentBuilder::with_operation_refusal_observer` or
+`AgentFactory::with_operation_refusal_observer` (0.9.4). It receives an
+`OperationRefusalObservation` per decided disposition: the session, the run and
+the refused operation; the surface (the model request, a tool call by its
+tool-use id, or a compaction summary); the outcome (the closed kind with its
+`RefusalDispatch`, read from the same value the model payload renders, or owners
+that could not decide); and the disposition (waited for an owner change, with how
+long and whether it settled; rebuilt; sent to the controller; returned as the
+tool result; skipped the compaction; failed the run). It is a diagnostic at
+decision time, not exactly-once across a crash: an operation reported as waiting
+or rebuilding may still fail afterwards. It is called synchronously on the
+deciding task and must not block, so hand observations to your own channel.
+Nothing of it enters the event stream, a wire type or any model context. Review
+outcomes and exact-control refusals (MCP attachments, tool applications, context
+controls) are not observed.
 
 ### SDK error compatibility
 

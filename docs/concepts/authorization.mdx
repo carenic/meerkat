@@ -103,6 +103,10 @@ tool call. It does not by itself fail the run, cancel allowed sibling actions,
 or put the session into a security hold. The agent may choose another permitted
 action within its existing budgets. An unchanged denied operation is not
 automatically retried, and a governed refusal never falls back to trusted execution.
+Since 0.9.4 the feedback names only the closed refusal kind (`reprepare_required`,
+`denied` or `malformed_facts`) and whether the tool ran (`tool_invoked`: `false`,
+or `"unknown"` when nothing certifies it). Neither is a permission: a new call is
+a new operation with fresh admission.
 
 Infrastructure failure is different:
 

@@ -736,6 +736,11 @@ bounds.
   reports such a change as a waiting hint, never a permission;
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners, and the native run and audit wrappers forward it.
+  `OwnerChangeChurn::wait_for_settled_change` takes the wait's trace site and
+  operation: it records the debug event below and reports the wait to the
+  host's operation refusal observer. `ToolDispatchContext::owner_change_churn`
+  gives a delegate operation of a tool call, such as the `web_search` helper's
+  model request, the waiting state that reports as that call's.
 - The runtime waits at a model request (one deadline per model call, set at its
   first wait to 2 s or to the remaining run budget if less; the budget is
   checked after every wait), at a governed tool dispatch's prepared entry, body
@@ -761,6 +766,58 @@ bounds.
   `compaction_summary`, `tool_dispatch`, `tool_entry`, `tool_policy_entry` or
   `web_search_delegate`), `operation_id`, `waited_ms` and `settled`. Each
   refused attempt keeps its own audit record.
+
+## Observe refusal dispositions
+
+Since 0.9.4 the Rust host that composed an agent can see each refusal disposition
+the agent decides for a governed operation. Install a
+`meerkat_core::authorization::OperationRefusalObserver` with
+`AgentBuilder::with_operation_refusal_observer` or the facade's
+`AgentFactory::with_operation_refusal_observer`. Its `observe` receives an
+`OperationRefusalObservation` with `session_id()`, `run_id()`, `operation_id()`,
+`surface()` (`OperationRefusalSurface::ModelRequest`, `ToolCall { tool_use_id }`
+for the call or a delegate operation of it, `Compaction`), `outcome()`
+(`OperationRefusalOutcome::Refused { kind, dispatch }`, read from the same value
+the model payload renders, or `AuthorityUnavailable`) and `disposition()`
+(`OperationRefusalDisposition::WaitedForOwnerChange { waited_ms, settled }`,
+`Rebuilt`, `ControllerFeedback`, `ToolResult`, `CompactionSkipped`, `RunFailed`).
+The surface, outcome and disposition enums are `#[non_exhaustive]`.
+
+The contract: an observation is a diagnostic emitted when Core decides the
+disposition, before any effect of it is durable, so it is not exactly-once across
+a crash and an operation reported as waiting or rebuilding may still fail. It is
+called synchronously on the deciding task and must not block; hand it to your own
+channel. Core holds no lock shared with another operation while calling it. A
+panicking observer is a host bug and the panic propagates. Nothing of it enters
+the agent event stream, a wire type, a config type or any model context. Review
+outcomes, a consent attempt refused before it resolved its candidate, and
+exact-control refusals (MCP attachments, tool applications, context controls) are
+not observed.
+
+`OperationRefused::dispatch` returns a `RefusalDispatch` (`NotDispatched`,
+`Unknown`; non-exhaustive): whether the tool code that the certifying core
+component guards ran. The fenced dispatch (and the retained consent attempt)
+certifies `NotDispatched` for every operation refusal it meets before it invokes
+the dispatcher, and the execution policy gate for every one it meets before it
+invokes its inner dispatcher. Every other refusal, one a dispatcher returns
+included, is `Unknown`, which makes no claim. A dispatcher layer that runs tool
+code of its own before delegating to a certifying component forwards
+`OperationRefused::new(refusal.kind())`. `OperationRefused` equality compares both
+facts, so a certified refusal no longer equals `OperationRefused::new(kind)` of
+the same kind: compare `kind()` and `dispatch()`.
+
+The model-facing `operation_refused` payload renders the same value as `data`:
+`{"kind": "reprepare_required", "tool_invoked": false}`, with `kind` one of
+`reprepare_required`, `denied` and `malformed_facts`, and `tool_invoked` `false`
+(certified) or `"unknown"`, always present. The kind carries no policy detail,
+owner data or audit content, and neither field is a permission: a typed reason
+never grants replay after entry, and a new call is a new operation with fresh
+admission. The message, `Display`, `Debug` and tracing stay uniform. A mob member
+upcall keeps carrying the bare kind, so a 0.9.3 peer decodes it as before; whether
+the tool ran does not cross it, and the receiving side's model reads `"unknown"`.
+An upcall refusal whose data is absent or names no known kind decodes as
+`operation_authorization_unavailable` instead of `operation_refused` with
+`malformed_facts`: it is no verdict the peer gave.
 
 ## Read where a refusal was decided
 
