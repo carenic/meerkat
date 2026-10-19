@@ -131,7 +131,8 @@ them.
   derives from the model window, or shrink the System rows). A history
   crossing still bypasses the cadence while the last rewrite got the history
   under the threshold, and when the request no longer fits the model window
-  and the history added since that rewrite covers the overage. The
+  and the history added since that rewrite covers the overage; a model that
+  declares no context window has no overage, so there it waits. The
   request-byte crossing keeps its bypass.
 
 ### Fixed

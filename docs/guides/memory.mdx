@@ -106,6 +106,9 @@ The decision flow:
     derives from the model window, or shrink the System rows. Such a crossing
     bypasses the cadence again only when the request no longer fits the model
     window and the history added since that rewrite is at least the overage.
+    A model that declares no context window has no overage, so there such a
+    crossing always waits for the cadence, however much the history grew, and
+    only a request-byte crossing still bypasses it.
 
     A request-byte crossing keeps its bypass. With an exact provider cap the
     rebuilt request must shrink and fit that cap, or the turn fails as

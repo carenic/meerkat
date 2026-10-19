@@ -3767,9 +3767,14 @@ where
                                 }
                                 Ok(None) => {
                                     // The transcript is unchanged: it is
-                                    // what this rewrite left.
+                                    // what this rewrite left. Measured here,
+                                    // not copied from the context, which
+                                    // reports 0 for a transcript it could
+                                    // not measure.
                                     self.compaction_cadence.last_rewrite_history_tokens =
-                                        Some(ctx.estimated_history_tokens);
+                                        crate::agent::compact::estimated_history_tokens(
+                                            &compacted_session.messages_for_model_boundary(),
+                                        );
                                     let error =
                                         crate::agent::compact::CompactionError::InvalidRebuild(
                                             "compactor produced a no-op transcript rewrite"

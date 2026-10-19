@@ -28,8 +28,9 @@ pub struct SessionCompactionCadence {
     /// rewrite rejected as a no-op. A failed attempt leaves it as it was.
     ///
     /// The evidence for [`CompactionContext::last_rewrite_history_tokens`].
-    /// `None` before the first rewrite, and for a session last written by a
-    /// binary before 0.9.4, which neither writes nor reads it.
+    /// `None` before the first rewrite, when the transcript the last rewrite
+    /// left could not be measured, and for a session last written by a binary
+    /// before 0.9.4, which neither writes nor reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_rewrite_history_tokens: Option<u64>,
 }
@@ -92,7 +93,8 @@ pub struct CompactionContext {
     /// Current session-scoped pre-LLM boundary index.
     pub session_boundary_index: u64,
     /// Estimated history tokens, in the unit of `estimated_history_tokens`,
-    /// that the last compaction rewrite left, or `None` before the first.
+    /// that the last compaction rewrite left, or `None` before the first and
+    /// when what it left could not be measured.
     ///
     /// A rewrite always keeps the System rows, the in-flight request and the
     /// recent turns, and adds a summary. When what it left is still at or

@@ -534,7 +534,12 @@ impl Compactor for DefaultCompactor {
         // nothing. Such a crossing waits for the cadence like the forecast,
         // unless the request no longer fits the model window and what arrived
         // since that rewrite is at least the overage: that growth is the only
-        // content a rewrite can still remove.
+        // content a rewrite can still remove. Without a request budget fact
+        // (a model that declares no context window, or a request the budget
+        // could not measure) there is no overage, so the escape never applies:
+        // with the floor over the threshold every history crossing waits for
+        // the cadence however large the growth, and only the request-byte
+        // crossing still bypasses it.
         //
         // The byte crossing keeps its bypass. On the exact path the rebuilt
         // request must shrink and fit its cap, or the turn fails as
