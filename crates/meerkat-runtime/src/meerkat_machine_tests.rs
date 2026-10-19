@@ -1490,6 +1490,9 @@ fn named_type_id(name: &str) -> NamedTypeId {
     NamedTypeId::parse(name).expect("valid named type")
 }
 
+/// The ("dev", "default_openai") key, shared by many tests here. A test that
+/// releases a lease or holds the login lifecycle lock never uses it: it takes
+/// `oauth_target_with_binding` with a binding of its own.
 #[cfg(not(target_arch = "wasm32"))]
 fn oauth_target() -> meerkat_core::AuthCredentialIdentity {
     oauth_target_with_binding("default_openai")

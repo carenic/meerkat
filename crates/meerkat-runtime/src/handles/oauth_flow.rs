@@ -2033,6 +2033,9 @@ pub(crate) mod tests {
         })
     }
 
+    /// The ("dev", "default_openai") key, shared by many tests here. A test
+    /// that releases a lease or holds the login lifecycle lock never uses it:
+    /// it takes `target_with_binding` with a binding of its own.
     fn target() -> AuthCredentialIdentity {
         target_with_binding("default_openai")
     }
