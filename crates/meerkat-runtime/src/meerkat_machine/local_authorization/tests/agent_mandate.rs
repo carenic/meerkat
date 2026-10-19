@@ -106,7 +106,7 @@ struct WithoutPolicy {
 impl NativeWorkAuthorizationHost for WithoutPolicy {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -144,7 +144,7 @@ struct PerAgentHost {
 impl NativeWorkAuthorizationHost for PerAgentHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -510,6 +510,73 @@ async fn the_generic_host_without_a_provider_refuses_configured_servers() {
     assert_eq!(
         authority.authorize_configured(&server("sentinel")),
         Err(McpAttachmentRefusal::Unavailable)
+    );
+}
+
+/// The configured provider is asked for the exact registration whose
+/// servers are staged: the registration current when the bindings are
+/// prepared and, after the session registers again, the new registration,
+/// which shares the session id but is not the ended one.
+#[tokio::test]
+async fn the_configured_provider_is_asked_for_the_exact_registration() {
+    type Asked = std::sync::Mutex<Vec<crate::meerkat_machine::RuntimeSessionRegistrationWitness>>;
+    let asked: Arc<Asked> = Arc::default();
+    let recorder = Arc::clone(&asked);
+    let (mut configuration, _, _) = super::configuration();
+    configuration.configured_mcp_attachment = Some(Arc::new(
+        move |registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
+              _agent: crate::meerkat_machine::SessionAgentBinding|
+              -> Option<Arc<dyn ConfiguredMcpAttachmentAuthority>> {
+            recorder.lock().expect("asked").push(registration.clone());
+            None
+        },
+    ));
+    let machine = MeerkatMachine::ephemeral()
+        .with_local_grant_authorization(configuration)
+        .expect("exclusive setup");
+    let session = SessionId::new();
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let first = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the first registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&first),
+        "the provider is asked for the registration whose servers are staged"
+    );
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("unregister");
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register again");
+    let second = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the second registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(first.session_id(), second.session_id(), "the same session");
+    assert_ne!(
+        first, second,
+        "a later registration of the same session is a different registration"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&second),
+        "the provider is asked for the new registration, never the ended one"
     );
 }
 
@@ -937,7 +1004,7 @@ struct MutatingPolicyHost {
 impl NativeWorkAuthorizationHost for MutatingPolicyHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -1061,7 +1128,7 @@ struct InterferingInstallationHost {
 impl NativeWorkAuthorizationHost for InterferingInstallationHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(

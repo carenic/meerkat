@@ -42,6 +42,19 @@ them.
   drained observer's change watches that were still running when the drain
   stopped them (see Fixed). Code that builds the report with a struct
   literal sets it.
+- `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` or
+  `RefUnwindSafe`: it now carries the member's exact
+  `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
+  which is neither. A host that moves an identity into `catch_unwind` wraps
+  it in `std::panic::AssertUnwindSafe`.
+- Not measured by the gate (a parameter type change): `meerkat-runtime`:
+  `ConfiguredMcpAttachmentProvider::configured` and
+  `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
+  session's exact `RuntimeSessionRegistrationWitness` instead of its
+  `SessionId`, so a provider decides for one exact registration, not for
+  whichever registration of that session asks. Read the id with
+  `registration.session_id()`; a closure provider is
+  `Fn(&RuntimeSessionRegistrationWitness, SessionAgentBinding) -> Option<..>`.
 
 ### Added
 
@@ -71,6 +84,14 @@ them.
   check that `preflight_schema_eligibility` runs and returns the ledger
   version it verified (`None` for a fresh domain), read in the same snapshot
   as the check.
+- `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
+  member's exact runtime registration, so every
+  `MemberRuntimeRegistrationHook` call names the registration it is made
+  for: the one a new member's provision prepared, or the current one of a
+  member whose actor is recovered. A host binds what it decides to that
+  registration instead of to an identity it derives from the member's
+  session id or labels; a later registration of the same session is a
+  different registration.
 
 ### Changed
 

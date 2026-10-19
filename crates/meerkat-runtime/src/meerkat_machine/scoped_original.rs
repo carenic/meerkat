@@ -857,7 +857,7 @@ impl NativeWorkAuthorizationHost for WithConfiguredMcpAttachment {
 
     fn configured_mcp_attachment_for_agent(
         &self,
-        session_id: &meerkat_core::SessionId,
+        registration: &super::RuntimeSessionRegistrationWitness,
         agent: super::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         match &self.per_agent {
@@ -868,7 +868,7 @@ impl NativeWorkAuthorizationHost for WithConfiguredMcpAttachment {
                 },
                 agent,
             ),
-            None => self.configured_mcp_attachment(session_id),
+            None => self.configured_mcp_attachment(registration.session_id()),
         }
     }
 
