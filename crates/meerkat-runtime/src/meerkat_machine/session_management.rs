@@ -2314,49 +2314,6 @@ impl MeerkatMachine {
 
     #[cfg(target_arch = "wasm32")]
     #[inline(never)]
-    #[allow(dead_code)]
-    fn register_storeless_session_inner_sync(
-        &self,
-        session_id: SessionId,
-    ) -> Result<bool, RuntimeDriverError> {
-        tracing::debug!(%session_id, "MeerkatMachine::register_storeless_session_inner_sync start");
-        {
-            tracing::debug!(%session_id, "MeerkatMachine::register_storeless_session_inner_sync attempting existing check lock");
-            let mut sessions = self.sessions.try_write().map_err(|_| {
-                tracing::warn!(
-                    %session_id,
-                    "storeless session map busy while checking existing registration"
-                );
-                RuntimeDriverError::Internal(format!(
-                    "storeless session map busy while registering {session_id}"
-                ))
-            })?;
-            tracing::debug!(%session_id, "MeerkatMachine::register_storeless_session_inner_sync locked existing check");
-            if let Some(existing) = sessions.get_mut(&session_id) {
-                tracing::debug!(
-                    %session_id,
-                    "MeerkatMachine::register_session_inner found existing session"
-                );
-                if let Some(error) = existing.registration_blocked_by_unregister(&session_id) {
-                    return Err(error);
-                }
-                // Reusing the registration as it is hands it to this caller.
-                existing.stamp_adoption(self.next_registration_use());
-                if existing.clear_dead_attachment() {
-                    existing.stage_generated_executor_exit_observation().map_err(|reason| {
-                        RuntimeDriverError::Internal(format!(
-                            "generated MeerkatMachine rejected executor-exit observation: {reason}"
-                        ))
-                    })?;
-                }
-                return Ok(false);
-            }
-        }
-        self.register_storeless_session_inner_sync_build_step(session_id, None)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    #[inline(never)]
     pub(super) fn register_storeless_session_inner_sync_build_step(
         &self,
         session_id: SessionId,
@@ -2521,34 +2478,6 @@ impl MeerkatMachine {
             Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
         >,
     ) -> Result<bool, RuntimeDriverError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut sessions = self.sessions.try_write().map_err(|_| {
-                RuntimeDriverError::Internal(format!(
-                    "storeless session map busy while registering {session_id}"
-                ))
-            })?;
-            if let Some(existing) = sessions.get_mut(&session_id) {
-                tracing::debug!(
-                    %session_id,
-                    "MeerkatMachine::register_session_inner found existing session"
-                );
-                if let Some(error) = existing.registration_blocked_by_unregister(&session_id) {
-                    return Err(error);
-                }
-                // Reusing the registration as it is hands it to this caller.
-                existing.stamp_adoption(self.next_registration_use());
-                if existing.clear_dead_attachment() {
-                    existing.stage_generated_executor_exit_observation().map_err(|reason| {
-                        RuntimeDriverError::Internal(format!(
-                            "generated MeerkatMachine rejected executor-exit observation: {reason}"
-                        ))
-                    })?;
-                }
-                return Ok(false);
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
         {
             let mut sessions = self.sessions.write().await;
             if let Some(existing) = sessions.get_mut(&session_id) {
@@ -2668,41 +2597,6 @@ impl MeerkatMachine {
             composition_signal_dispatcher: None,
             composition_materialization_claim_id: None,
         };
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut sessions = self.sessions.try_write().map_err(|_| {
-                RuntimeDriverError::Internal(format!(
-                    "storeless session map busy while inserting {session_id}"
-                ))
-            })?;
-            if let Some(existing) = sessions.get_mut(&session_id) {
-                if let Some(error) = existing.registration_blocked_by_unregister(&session_id) {
-                    return Err(error);
-                }
-                // Reusing the registration as it is hands it to this caller.
-                existing.stamp_adoption(self.next_registration_use());
-                if existing.clear_dead_attachment() {
-                    existing
-                        .stage_generated_executor_exit_observation()
-                        .map_err(|reason| {
-                            RuntimeDriverError::Internal(format!(
-                                "generated MeerkatMachine rejected executor-exit observation: {reason}"
-                            ))
-                        })?;
-                }
-                Ok(false)
-            } else {
-                if let Some(displaced) = sessions.insert(session_id, session_entry) {
-                    displaced.agent_binding.retire();
-                }
-                tracing::debug!(
-                    %runtime_id,
-                    "MeerkatMachine::register_session_inner inserted storeless session"
-                );
-                Ok(true)
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
         {
             let mut sessions = self.sessions.write().await;
             // Defensive: the caller holds this session's registration

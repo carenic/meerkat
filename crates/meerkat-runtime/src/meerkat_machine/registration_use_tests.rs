@@ -190,10 +190,10 @@ const REUSE_BRANCH_ANCHOR: &str = "existing.registration_blocked_by_unregister(&
 const REUSE_STAMP: &str = "existing.stamp_adoption(self.next_registration_use());";
 
 /// The reuse branches session_management.rs has. The count includes the
-/// wasm32 forms (no native test reaches them), the two insert-race re-checks
-/// the registration transaction keeps unreachable, and the copies inside code
-/// no target compiles. A new reuse branch must stamp, and raises this.
-const REUSE_BRANCHES: usize = 10;
+/// wasm32 forms (no native test reaches them) and the two insert-race
+/// re-checks the registration transaction keeps unreachable. A new reuse
+/// branch must stamp, and raises this.
+const REUSE_BRANCHES: usize = 7;
 
 fn trimmed_line<'a>(lines: &[&'a str], index: usize) -> &'a str {
     match lines.get(index) {
