@@ -1093,6 +1093,11 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
             retire_runtime_path_witness(),
             destroy_runtime_path_witness(),
             stop_holds_and_resume_releases_member_run_starts_witness(),
+            retire_at_scope_current_then_retire_witness(),
+            retire_at_scope_no_current_incarnation_witness(),
+            retire_at_scope_stale_fence_token_witness(),
+            retire_at_scope_stale_session_binding_witness(),
+            retire_at_scope_mob_not_running_witness(),
         ],
         deep_domain_cardinality: 3,
         deep_domain_overrides: std::collections::BTreeMap::new(),
@@ -2431,6 +2436,25 @@ fn seam_retire_input() -> CompositionWitnessInput {
     )
 }
 
+/// A scoped retire of `agentidentity_1` naming the given runtime id, fence
+/// and session.
+fn seam_retire_at_scope_input(
+    agent_runtime_id: &str,
+    fence_token: u64,
+    session_id: &str,
+) -> CompositionWitnessInput {
+    witness_input(
+        "mob",
+        "RetireAtScope",
+        vec![
+            witness_field("agent_identity", Expr::String("agentidentity_1".into())),
+            witness_field("agent_runtime_id", Expr::String(agent_runtime_id.into())),
+            witness_field("fence_token", Expr::U64(fence_token)),
+            witness_field("session_id", Expr::String(session_id.into())),
+        ],
+    )
+}
+
 fn seam_destroy_mob_signal() -> CompositionWitnessInput {
     witness_input(
         "mob",
@@ -2620,6 +2644,182 @@ fn destroy_runtime_path_witness() -> CompositionWitness {
         // DestroyMob 1 + Destroy 1); steps ~16 (4 injects + 8 transitions + 4
         // route deliveries).
         state_limits: meerkat_mob_seam_witness_limits(22, 4, 13),
+    }
+}
+
+/// A scope captured at spawn names the current incarnation: RetireAtScope
+/// answers Current, and the Retire input it admits then retires that
+/// incarnation through the runtime.
+fn retire_at_scope_current_then_retire_witness() -> CompositionWitness {
+    let order = |earlier: &str, later: &str| CompositionWitnessTransitionOrder {
+        earlier: witness_transition("mob", earlier),
+        later: witness_transition("mob", later),
+    };
+    CompositionWitness {
+        name: witness_id("retire_at_scope_current_then_retire"),
+        preload_inputs: vec![
+            witness_input("meerkat", "Initialize", vec![]),
+            seam_runtime_session_registration_input(),
+            seam_authorize_spawn_profile_input(),
+            seam_begin_spawn_exec_input(),
+            seam_commit_spawn_membership_input(),
+            seam_retire_at_scope_input("agentruntimeid_1", 1, "sessionid_1"),
+            seam_retire_input(),
+        ],
+        expected_routes: vec![
+            route_id("retire_request_reaches_meerkat"),
+            route_id("runtime_retired_reaches_mob"),
+        ],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("meerkat", "Initialize"),
+            witness_transition("meerkat", "RegisterSessionIdle"),
+            witness_transition("mob", "AuthorizeSpawnProfileRunning"),
+            witness_transition("mob", "BeginSpawnExecFresh"),
+            witness_transition("mob", "CommitSpawnMembershipFresh"),
+            witness_transition("meerkat", "PrepareBindingsIdle"),
+            witness_transition("mob", "ObserveRuntimeReady"),
+            witness_transition("mob", "RetireAtScopeCurrentRunning"),
+            witness_transition("mob", "RetireRunningReleasing"),
+            witness_transition("meerkat", "RetireRequestedFromIdle"),
+            witness_transition("mob", "ObserveRuntimeRetired"),
+        ],
+        expected_transition_order: vec![
+            order("CommitSpawnMembershipFresh", "RetireAtScopeCurrentRunning"),
+            order("RetireAtScopeCurrentRunning", "RetireRunningReleasing"),
+        ],
+        // retire_runtime_path plus one inject, one transition and its one
+        // RetireAtScopeResolved effect.
+        state_limits: meerkat_mob_seam_witness_limits(23, 4, 17),
+    }
+}
+
+/// Before any member is spawned, no incarnation of the identity is current.
+fn retire_at_scope_no_current_incarnation_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("retire_at_scope_no_current_incarnation"),
+        preload_inputs: vec![seam_retire_at_scope_input(
+            "agentruntimeid_1",
+            1,
+            "sessionid_1",
+        )],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![witness_transition(
+            "mob",
+            "RetireAtScopeNoCurrentIncarnationRunning",
+        )],
+        expected_transition_order: vec![],
+        state_limits: meerkat_mob_seam_witness_limits(6, 0, 2),
+    }
+}
+
+/// The spawned incarnation's fence is 1; a scope naming fence 2 names an
+/// incarnation that is not current.
+fn retire_at_scope_stale_fence_token_witness() -> CompositionWitness {
+    retire_at_scope_refused_after_spawn_witness(
+        "retire_at_scope_stale_fence_token",
+        seam_retire_at_scope_input("agentruntimeid_1", 2, "sessionid_1"),
+        "RetireAtScopeStaleFenceTokenRunning",
+    )
+}
+
+/// The spawned incarnation is bound to sessionid_1; a scope naming its
+/// runtime and fence but sessionid_2 names a session it does not hold.
+fn retire_at_scope_stale_session_binding_witness() -> CompositionWitness {
+    retire_at_scope_refused_after_spawn_witness(
+        "retire_at_scope_stale_session_binding",
+        seam_retire_at_scope_input("agentruntimeid_1", 1, "sessionid_2"),
+        "RetireAtScopeStaleSessionBindingRunning",
+    )
+}
+
+/// Spawns `agentidentity_1` (runtime agentruntimeid_1, fence 1, sessionid_1)
+/// through the binding round trip, then answers `scope` with the `refusal`
+/// arm. A scripted witness steps only through its expected transitions, so
+/// every arm on the spawn path is listed.
+fn retire_at_scope_refused_after_spawn_witness(
+    name: &str,
+    scope: CompositionWitnessInput,
+    refusal: &str,
+) -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id(name),
+        preload_inputs: vec![
+            witness_input("meerkat", "Initialize", vec![]),
+            seam_runtime_session_registration_input(),
+            seam_authorize_spawn_profile_input(),
+            seam_begin_spawn_exec_input(),
+            seam_commit_spawn_membership_input(),
+            scope,
+        ],
+        expected_routes: vec![
+            route_id("binding_request_reaches_meerkat"),
+            route_id("runtime_bound_reaches_mob"),
+        ],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("meerkat", "Initialize"),
+            witness_transition("meerkat", "RegisterSessionIdle"),
+            witness_transition("mob", "AuthorizeSpawnProfileRunning"),
+            witness_transition("mob", "BeginSpawnExecFresh"),
+            witness_transition("mob", "CommitSpawnMembershipFresh"),
+            witness_transition("meerkat", "PrepareBindingsIdle"),
+            witness_transition("mob", "ObserveRuntimeReady"),
+            witness_transition("mob", refusal),
+        ],
+        expected_transition_order: vec![witness_transition_order(
+            "mob",
+            "ObserveRuntimeReady",
+            "mob",
+            refusal,
+        )],
+        // basic_round_trip's spawn half plus the refusal: 15 steps (5 injects,
+        // 8 transitions, 2 route deliveries) and 7 effects (Authorize 1 +
+        // Commit 4 + PrepareBindings 1 + RetireAtScopeResolved 1).
+        state_limits: meerkat_mob_seam_witness_limits(19, 3, 11),
+    }
+}
+/// A completed mob retires nothing: after the Complete quiesce and
+/// MarkCompleted, RetireAtScope answers MobNotRunning.
+fn retire_at_scope_mob_not_running_witness() -> CompositionWitness {
+    let order = |earlier: &str, later: &str| CompositionWitnessTransitionOrder {
+        earlier: witness_transition("mob", earlier),
+        later: witness_transition("mob", later),
+    };
+    CompositionWitness {
+        name: witness_id("retire_at_scope_mob_not_running"),
+        preload_inputs: vec![
+            witness_input(
+                "mob",
+                "BeginPlacedCompletionLifecycleQuiesce",
+                vec![witness_field(
+                    "intent",
+                    named_variant("PlacedCompletionLifecycleIntentKind", "Complete"),
+                )],
+            ),
+            witness_input("mob", "MarkCompleted", vec![]),
+            seam_retire_at_scope_input("agentruntimeid_1", 1, "sessionid_1"),
+        ],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("mob", "BeginPlacedCompletionLifecycleQuiesceFresh"),
+            witness_transition("mob", "MarkCompleted"),
+            witness_transition("mob", "RetireAtScopeMobNotRunningCompleted"),
+        ],
+        expected_transition_order: vec![
+            order(
+                "BeginPlacedCompletionLifecycleQuiesceFresh",
+                "MarkCompleted",
+            ),
+            order("MarkCompleted", "RetireAtScopeMobNotRunningCompleted"),
+        ],
+        state_limits: meerkat_mob_seam_witness_limits(12, 0, 12),
     }
 }
 

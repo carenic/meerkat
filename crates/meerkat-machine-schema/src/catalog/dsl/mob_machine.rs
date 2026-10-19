@@ -1683,6 +1683,12 @@ macro_rules! mob_catalog_machine_dsl {
             BeginExplicitResumeCleanup { attempt: ResumeAttemptId },
             SettleExplicitResumeCleanup { attempt: ResumeAttemptId },
             FinishExplicitResume { attempt: ResumeAttemptId },
+            // The scoped form of Retire. The caller names the member
+            // incarnation its delivery scope captured: runtime id, the
+            // identity's fence and the session. A classifier with
+            // `update {}`; the actor applies it in the same command as the
+            // step it guards.
+            RetireAtScope { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId },
         }
 
         surface_only [
@@ -2126,6 +2132,7 @@ macro_rules! mob_catalog_machine_dsl {
             GrantRevoked { principal: PrincipalId, revoked: Set<Enum<ControlScope>>, remaining: Set<Enum<ControlScope>> },
             ExplicitResumeMemberOutcomeClassified { attempt: ResumeAttemptId, agent_identity: AgentIdentity, binding: ResumeMemberBinding, disposition: Enum<ResumeMemberOutcomeDisposition> },
             ExplicitResumeFinished { attempt: ResumeAttemptId, cancelled: bool },
+            RetireAtScopeResolved { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, verdict: Enum<RetireAtScopeVerdictKind>, expected_fence_token: Option<FenceToken>, actual_fence_token: Option<FenceToken>, current_session_id: Option<SessionId> },
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -2824,6 +2831,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition AuthorizeExternalAgentEventSubscription => local seam SurfaceResultAlignment,
         disposition GrantRecorded => local seam SurfaceResultAlignment,
         disposition GrantRevoked => local seam SurfaceResultAlignment,
+        disposition RetireAtScopeResolved => local seam SurfaceResultAlignment,
 
         // =====================================================================
         // Invariants
@@ -8079,6 +8087,11 @@ macro_rules! mob_catalog_machine_dsl {
             guard "releasing_absent" { releasing == None }
             guard "session_absent" { session_id == None }
             guard "binding_absent" { self.member_session_bindings.get_cloned(agent_identity) == None }
+            // A peer-only start carries no session. A releasing retirement in
+            // flight has already removed the binding, but still records its
+            // session for the pending ingress detach; replaying a peer-only
+            // start over it would drop that correlation.
+            guard "retirement_session_absent" { self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == false }
             guard "retiring_peer_endpoint_consistent" { retiring_peer_endpoint == None || self.member_peer_endpoints.contains_key(agent_identity) == false || self.member_peer_endpoints.get_cloned(agent_identity) == retiring_peer_endpoint }
             update {
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
@@ -8499,17 +8512,17 @@ macro_rules! mob_catalog_machine_dsl {
 
         // A delayed final for generation N must never clear generation N+1's
         // identity, profile, session, placement, or wiring authority. Only
-        // stale runtime-keyed bookkeeping is safe to prune.
+        // stale runtime-keyed bookkeeping is safe to prune. A mapped identity
+        // belongs to RecoverRosterMemberRetiredRunning (its current runtime)
+        // or RecoverRosterMemberRetiredStaleGeneration (another runtime); a
+        // record that names the current runtime with another generation is
+        // inconsistent and matches no arm, instead of pruning the current
+        // runtime's state.
         transition RecoverRosterMemberRetiredStaleIncarnation {
             on signal RecoverRosterMemberRetired { agent_identity, agent_runtime_id, generation }
             guard { self.lifecycle_phase == Phase::Running }
-            guard "identity_or_generation_advanced" {
-                self.identity_runtime_generations.get_copied(agent_identity) != Some(generation)
-                || (
-                    self.identity_to_runtime.contains_key(agent_identity)
-                    && self.identity_to_runtime.get_cloned(agent_identity) != Some(agent_runtime_id)
-                )
-            }
+            guard "identity_unmapped" { self.identity_to_runtime.contains_key(agent_identity) == false }
+            guard "generation_advanced" { self.identity_runtime_generations.get_copied(agent_identity) != Some(generation) }
             update {
                 self.live_runtime_ids.remove(agent_runtime_id);
                 self.externally_addressable_runtime_ids.remove(agent_runtime_id);
@@ -22204,6 +22217,122 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
         }
 
+        // A scoped retire admits only the incarnation its scope names. The
+        // incarnation is current while the identity maps to the scope's
+        // runtime id and the identity's fence is the scope's. The
+        // per-identity fence survives the runtime-retired observation, so a
+        // Retiring incarnation stays current until the archive unmaps it.
+        // Its session is current while it is the identity's binding, or
+        // while a Retiring incarnation holds it as the session its
+        // retirement is releasing. The four Running/Stopped verdicts are
+        // total and mutually exclusive over (mapped, runtime and fence,
+        // session); no verdict depends on declaration order.
+        transition RetireAtScopeCurrent {
+            per_phase [Running, Stopped]
+            on input RetireAtScope { agent_identity, agent_runtime_id, fence_token, session_id }
+            guard "identity_mapped" { self.identity_to_runtime.contains_key(agent_identity) }
+            guard "scope_runtime_current" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "scope_fence_current" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token) }
+            guard "scope_session_current" {
+                self.member_session_bindings.get_cloned(agent_identity) == Some(session_id)
+                || (self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring)
+                    && self.runtime_retire_pending_sessions.get_cloned(agent_runtime_id) == Some(session_id))
+            }
+            update {}
+            to Running
+            emit RetireAtScopeResolved {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                verdict: RetireAtScopeVerdictKind::Current,
+                expected_fence_token: None,
+                actual_fence_token: None,
+                current_session_id: None
+            }
+        }
+
+        // No incarnation of the identity is current. The machine does not
+        // own retirement settlement, so the actor answers Ok only once the
+        // roster and the retirement saga agree that the identity is gone.
+        transition RetireAtScopeNoCurrentIncarnation {
+            per_phase [Running, Stopped]
+            on input RetireAtScope { agent_identity, agent_runtime_id, fence_token, session_id }
+            guard "identity_unmapped" { !self.identity_to_runtime.contains_key(agent_identity) }
+            update {}
+            to Running
+            emit RetireAtScopeResolved {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                verdict: RetireAtScopeVerdictKind::NoCurrentIncarnation,
+                expected_fence_token: None,
+                actual_fence_token: None,
+                current_session_id: None
+            }
+        }
+
+        // Another incarnation of the identity is current: its runtime id or
+        // its fence moved (respawn, reset).
+        transition RetireAtScopeStaleFenceToken {
+            per_phase [Running, Stopped]
+            on input RetireAtScope { agent_identity, agent_runtime_id, fence_token, session_id }
+            guard "identity_mapped" { self.identity_to_runtime.contains_key(agent_identity) }
+            guard "scope_incarnation_stale" {
+                self.identity_to_runtime.get_cloned(agent_identity) != Some(agent_runtime_id)
+                || self.identity_runtime_fence_tokens.get_copied(agent_identity) != Some(fence_token)
+            }
+            update {}
+            to Running
+            emit RetireAtScopeResolved {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                verdict: RetireAtScopeVerdictKind::StaleFenceToken,
+                expected_fence_token: self.identity_runtime_fence_tokens.get_copied(agent_identity),
+                actual_fence_token: Some(fence_token),
+                current_session_id: None
+            }
+        }
+
+        // The scope names the current incarnation, but its session is
+        // neither the member's binding nor the session the incarnation's
+        // retirement is releasing.
+        transition RetireAtScopeStaleSessionBinding {
+            per_phase [Running, Stopped]
+            on input RetireAtScope { agent_identity, agent_runtime_id, fence_token, session_id }
+            guard "identity_mapped" { self.identity_to_runtime.contains_key(agent_identity) }
+            guard "scope_runtime_current" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "scope_fence_current" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token) }
+            guard "scope_session_not_bound" { self.member_session_bindings.get_cloned(agent_identity) != Some(session_id) }
+            guard "scope_session_not_releasing" {
+                self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring)
+                || self.runtime_retire_pending_sessions.get_cloned(agent_runtime_id) != Some(session_id)
+            }
+            update {}
+            to Running
+            emit RetireAtScopeResolved {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                verdict: RetireAtScopeVerdictKind::StaleSessionBinding,
+                expected_fence_token: None,
+                actual_fence_token: None,
+                current_session_id: self.member_session_bindings.get_cloned(agent_identity)
+            }
+        }
+
+        // A completed or destroyed mob retires nothing.
+        transition RetireAtScopeMobNotRunning {
+            per_phase [Completed, Destroyed]
+            on input RetireAtScope { agent_identity, agent_runtime_id, fence_token, session_id }
+            update {}
+            to Completed
+            emit RetireAtScopeResolved {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                verdict: RetireAtScopeVerdictKind::MobNotRunning,
+                expected_fence_token: None,
+                actual_fence_token: None,
+                current_session_id: None
+            }
+        }
+
     }
         }
 
@@ -24303,6 +24432,25 @@ pub enum CancelAllWorkRejectReasonKind {
     MobNotRunning,
     MemberNotFound,
     StaleFenceToken,
+}
+
+/// Generated verdict of [`MobMachineInput::RetireAtScope`] for the member
+/// incarnation a delivery scope names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RetireAtScopeVerdictKind {
+    /// The scope names the identity's current incarnation and a session it
+    /// holds; the scoped retire continues as the unscoped retire does.
+    #[default]
+    Current,
+    /// The identity maps to no incarnation.
+    NoCurrentIncarnation,
+    /// Another incarnation of the identity is current.
+    StaleFenceToken,
+    /// The incarnation is current, but the scope's session is not one it
+    /// holds.
+    StaleSessionBinding,
+    /// The mob is completed or destroyed.
+    MobNotRunning,
 }
 
 /// Typed public rejection class for generated agent event subscription

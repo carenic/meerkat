@@ -511,6 +511,11 @@ pub enum MobMachineRuntimeInternalReason {
     MemberOperatorAdmissionAuthority,
     /// Attempt-fenced internal stages driven by the public Resume operation.
     ExplicitResumeAuthority,
+    /// A scoped retire names one member incarnation through its delivery
+    /// scope. The actor drives this classifier in the same command as the
+    /// step it guards, so MobMachine alone decides whether the scope's
+    /// incarnation is current, gone, or replaced.
+    RetireAtScopeAuthority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1343,6 +1348,10 @@ const MOB_MACHINE_RUNTIME_INTERNAL_CLASSIFICATIONS:
     MobMachineRuntimeInternalClassificationRecord {
         input: MobMachineCatalogInput::FinishExplicitResume,
         reason: MobMachineRuntimeInternalReason::ExplicitResumeAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::RetireAtScope,
+        reason: MobMachineRuntimeInternalReason::RetireAtScopeAuthority,
     },
 ];
 

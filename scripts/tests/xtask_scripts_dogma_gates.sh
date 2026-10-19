@@ -345,9 +345,11 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # invariant; its exact-successor mutant needs the success line above.
 # member_lifecycle_audit.sh requires a final distinct-state count at or
 # above its floor, a coverage block in which each of its covered actions
-# generated a state, its three state witnesses and two step witnesses
-# violated, and with --mutants its unguarded mutant's property violated and
-# its plain-ordering mutant's evaluation error.
+# generated a state, its five state witnesses and three step witnesses
+# violated, and with --mutants its unguarded mutant's property violated, its
+# plain-ordering mutant's evaluation error, its two replay mutants' generated
+# invariants violated, and its two RetireAtScope mutants' invariants
+# violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -433,11 +435,18 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessRetiring is violated."' \
   'echo "Error: Invariant NotAuditWitnessArchived is violated."' \
   'echo "Error: Action property NotAuditWitnessSuccessor is violated."' \
+  'echo "Error: Action property NotAuditWitnessStaleIncarnation is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetiringScopeCurrent is violated."' \
+  'echo "Error: Invariant NotAuditWitnessCurrentRuntimeGone is violated."' \
+  'echo "Error: Invariant AuditRetireAtScopeCoherent is violated."' \
+  'echo "Error: Invariant AuditRetireAtScopeExactlyOne is violated."' \
+  'echo "Error: Invariant pending_session_ingress_detach_has_session_correlation is violated."' \
+  'echo "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated."' \
   'echo "Error: Action property AuditObservationMonotonic is violated."' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \
-  'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning ObserveMemberProgressChangedOpenRunning ObserveMemberProgressChangedIdleRunning ObserveMemberProgressUnchangedIdleRunning ObserveMemberProgressUnchangedOpenHealthyRunning ObserveMemberProgressUnchangedOpenDegradedRunning ObserveMemberProgressUnchangedOpenWedgedRunning ObserveMemberProgressStaleRunning RetireRunningReleasing RetireRunningPreservingBinding RetireRunningNoBinding RetireStoppedReleasing RetireStoppedPreservingBinding RetireStoppedNoBinding RetireAbsentRunning RetireAbsentStopped RetireMember SessionIngressDetachedForMobDestroyRunning ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped ObserveMemberRetirementArchivedAlreadyCleared ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared ObserveMemberRetirementArchivedAlreadyClearedStopped ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
+  'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning ObserveMemberProgressChangedOpenRunning ObserveMemberProgressChangedIdleRunning ObserveMemberProgressUnchangedIdleRunning ObserveMemberProgressUnchangedOpenHealthyRunning ObserveMemberProgressUnchangedOpenDegradedRunning ObserveMemberProgressUnchangedOpenWedgedRunning ObserveMemberProgressStaleRunning RetireRunningReleasing RetireRunningPreservingBinding RetireRunningNoBinding RetireStoppedReleasing RetireStoppedPreservingBinding RetireStoppedNoBinding RetireAbsentRunning RetireAbsentStopped RetireMember SessionIngressDetachedForMobDestroyRunning ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped ObserveMemberRetirementArchivedAlreadyCleared ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared ObserveMemberRetirementArchivedAlreadyClearedStopped ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped BeginPlacedCompletionLifecycleQuiesceFresh MarkCompleted DestroyMob RetireAtScopeCurrentRunning RetireAtScopeCurrentStopped RetireAtScopeNoCurrentIncarnationRunning RetireAtScopeNoCurrentIncarnationStopped RetireAtScopeStaleFenceTokenRunning RetireAtScopeStaleFenceTokenStopped RetireAtScopeStaleSessionBindingRunning RetireAtScopeStaleSessionBindingStopped RetireAtScopeMobNotRunningCompleted RetireAtScopeMobNotRunningDestroyed RecoverRosterMemberResetRunning RecoverMemberSessionBindingReplacingRunning RecoverMemberSessionBindingAlreadyCurrentRunning RetireMemberPeerOnly SessionIngressDetachedForMobDestroyStopped RecoverRosterMemberRetiringRunning RecoverRosterMemberRetiringReplay RecoverRosterMemberRetiredRunning RecoverRosterMemberRetiredCurrentAlreadyAbsent RecoverRosterMemberRetiredStaleGeneration RecoverRosterMemberRetiredStaleIncarnation RecoverRosterMemberRetirementStartedReleasing RecoverRosterMemberRetirementStartedReleasingAlreadyApplied RecoverRosterMemberRetirementStartedPreservingBinding RecoverRosterMemberRetirementStartedPeerOnly RecoverRosterMemberAddressabilityRunning ObserveMemberRetirementArchivedLivePreservingTopology ObserveMemberRetirementArchivedRetiredPreservingTopology; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"

@@ -130,6 +130,23 @@ them.
   `SealIdentityGenerationHighwaterDestroyed`, also appended last, so no
   existing variant's discriminant moves. Exhaustive matches must add the
   arms.
+- MobMachine classifies a member delivery scope: `MobMachineInput`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineInputVariant` (meerkat-machine-schema), and the kernel `Input`
+  and `InputKind` gain the variant `RetireAtScope`; `MobMachineEffect`
+  (meerkat-machine-schema and meerkat-mob), its variant enum
+  `MobMachineEffectVariant` (meerkat-machine-schema), and the kernel `Effect`
+  and `EffectKind` gain `RetireAtScopeResolved`. The kernel
+  `generated::mob::TransitionId` gains `RetireAtScopeCurrentRunning`,
+  `RetireAtScopeCurrentStopped`, `RetireAtScopeNoCurrentIncarnationRunning`,
+  `RetireAtScopeNoCurrentIncarnationStopped`,
+  `RetireAtScopeStaleFenceTokenRunning`, `RetireAtScopeStaleFenceTokenStopped`,
+  `RetireAtScopeStaleSessionBindingRunning`,
+  `RetireAtScopeStaleSessionBindingStopped`,
+  `RetireAtScopeMobNotRunningCompleted` and
+  `RetireAtScopeMobNotRunningDestroyed`. Every new variant is appended last,
+  so no existing variant's discriminant moves. Exhaustive matches must add
+  the arms.
 
 ### Added
 
@@ -204,6 +221,21 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat-machine-schema`: MobMachine decides whether a member delivery
+  scope still names its member's current incarnation. The runtime-internal
+  input `RetireAtScope` names an identity, a runtime id, the identity's fence
+  and a session, and answers without a state change through the effect
+  `RetireAtScopeResolved` and its `RetireAtScopeVerdictKind`: `Current` when
+  the identity maps to that runtime id, its fence is the scope's, and the
+  session is the member's binding or the session its retirement is
+  releasing; `NoCurrentIncarnation` when the identity maps to no
+  incarnation; `StaleFenceToken` when another incarnation is current;
+  `StaleSessionBinding` when the incarnation is current but the session is
+  not one it holds; and `MobNotRunning` in a completed or destroyed mob. The
+  verdicts are total and mutually exclusive. The member lifecycle TLC audit
+  checks both in every state its domains reach and for every scope they can
+  name, and that a Current verdict admits a Retire of that incarnation; five
+  `meerkat_mob_seam` witnesses reach each verdict.
 
 ### Changed
 
@@ -392,15 +424,39 @@ them.
   branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
   action-level `\/`. The Rust kernel already applied this order; only the
   models of MobMachine and the two compositions that embed it change.
-  A bounded TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`,
-  lane shard audits-b) now model-checks the member lifecycle around those
-  guards, which no generated profile checks to the end: roster recovery,
-  session binding, progress observations, the local retire arms, the runtime
-  retirement and archive observations, stop and resume, and the recovery of
-  an archived identity's next incarnation. Every one of those arms must
-  fire, a member's recorded observation time never decreases, and the audit
-  fails when a progress arm loses its guard or the guard is rendered as a
-  plain `<=` again.
+  A TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`, lane
+  shard audits-b) now model-checks the member lifecycle around those guards,
+  over the whole reachable space of its domains, which no generated profile
+  checks to the end: roster recovery and
+  reset, session binding (fresh, replacing, already current), progress
+  observations, the local retire arms and the RetireMember signal, the
+  runtime retirement and archive observations, the resume path's replay
+  arms, stop and resume, and the recovery of an archived identity's next
+  incarnation. Every one of those arms must fire, a member's recorded
+  observation time never decreases, and the audit fails when a progress arm
+  loses its guard or the guard is rendered as a plain `<=` again.
+- MobMachine closes two latent gaps in its roster replay arms
+  (`meerkat-machine-schema`, `meerkat-mob`); no shell path feeds either
+  sequence.
+  - A replayed peer-only retirement start is refused for a runtime whose
+    retirement already records a session. Replayed over a releasing
+    retirement in flight, whose binding is already gone, the start removed
+    the recorded session while that session's ingress detach was still
+    pending, which broke the generated invariant that every pending detach
+    keeps its session. The resume path replays at most one start per
+    incarnation into freshly recovered state.
+  - A replayed Retired record that names the identity's current runtime
+    with another generation now matches no arm. The stale-incarnation arm
+    took it and pruned that runtime's state while the identity still mapped
+    to it, which broke the generated invariant that an identity held for a
+    respawn maps to no runtime or to a Retiring one. A consistent record
+    cannot carry that pairing: a runtime id names its generation. The arm
+    now takes only an identity that maps to no runtime and whose recorded
+    generation differs, so it no longer overlaps the current-runtime and
+    remapped-identity arms, which keep taking every record they took
+    before.
+  The member lifecycle audit, which now drives every replay arm, fails on
+  either gap.
 
 ## [0.9.3] - 2026-10-18
 

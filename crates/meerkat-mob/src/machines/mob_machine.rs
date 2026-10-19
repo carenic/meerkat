@@ -21,7 +21,7 @@ pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
     FlowRunReducerCommandKind, LoopIterationReducerCommandKind, MemberAdmissionVerdictKind,
     MemberHealthClass, MemberProgressEventKind, MobLifecycleJournalKind,
     PlacedCompletionLifecycleIntentKind, PolicyDecision, ResumeMemberOutcomeDisposition,
-    SpawnExecPhase, StepFaultDispositionKind, StepOutputFaultKind,
+    RetireAtScopeVerdictKind, SpawnExecPhase, StepFaultDispositionKind, StepOutputFaultKind,
     SupervisorEscalationFailureCause, TurnTimeoutDisposition, WorkContentAttribution,
 };
 
@@ -6575,6 +6575,80 @@ mod tests {
                 .member_kickoff_cancelled
                 .contains(&identity),
             "new-generation replay must clear the prior kickoff terminal"
+        );
+    }
+
+    #[test]
+    fn retired_replay_for_another_generation_never_prunes_the_current_runtime() {
+        let mut seeded = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("retired-replay-current-runtime");
+        let runtime = AgentRuntimeId::from("retired-replay-current-runtime:0");
+        seed_live_member(&mut seeded, &identity, &runtime);
+
+        // The identity still maps to its generation-zero runtime, which is no
+        // longer live. A Retired record naming that runtime with another
+        // generation is inconsistent (a runtime id names its generation) and
+        // matches no arm.
+        let mut current = seeded.state().clone();
+        current.live_runtime_ids.remove(&runtime);
+        let mut authority = MobMachineAuthority::recover_from_state(current)
+            .expect("recover a current incarnation whose runtime is gone");
+        let before = authority.state().clone();
+        assert!(
+            authority
+                .apply_signal(MobMachineSignal::RecoverRosterMemberRetired {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime.clone(),
+                    generation: Generation(1),
+                    preserve_machine_topology: false,
+                    preservation_started: false,
+                })
+                .is_err(),
+            "a Retired record with another generation must not settle the current runtime"
+        );
+        assert_eq!(authority.state(), &before);
+
+        // Control: a delayed final of an older generation, for an identity
+        // that maps to no runtime, still takes the stale-incarnation arm. It
+        // prunes the stale runtime's bookkeeping and keeps the identity's
+        // history.
+        let mut retired = seeded.state().clone();
+        retired.identity_to_runtime.remove(&identity);
+        retired.member_session_bindings.remove(&identity);
+        retired
+            .identity_runtime_generations
+            .insert(identity.clone(), Generation(1));
+        let mut authority = MobMachineAuthority::recover_from_state(retired)
+            .expect("recover an identity whose later incarnation retired");
+        assert!(authority.state().live_runtime_ids.contains(&runtime));
+        assert!(
+            authority
+                .state()
+                .runtime_fence_tokens
+                .contains_key(&runtime)
+        );
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMemberRetired {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime.clone(),
+                generation: Generation(0),
+                preserve_machine_topology: false,
+                preservation_started: false,
+            })
+            .expect("a delayed final of an older generation prunes its runtime");
+        assert!(!authority.state().live_runtime_ids.contains(&runtime));
+        assert!(
+            !authority
+                .state()
+                .runtime_fence_tokens
+                .contains_key(&runtime)
+        );
+        assert_eq!(
+            authority
+                .state()
+                .identity_runtime_generations
+                .get(&identity),
+            Some(&Generation(1))
         );
     }
 

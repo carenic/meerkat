@@ -1,54 +1,68 @@
 #!/usr/bin/env bash
-# Bounded TLC audit of the MobMachine member lifecycle.
+# TLC audit of the MobMachine member lifecycle.
 #
-# usage: member_lifecycle_audit.sh <max-steps> [--mutants] [extra tlc args...]
+# usage: member_lifecycle_audit.sh [--mutants] [extra tlc args...]
 #
-# Derives the TLC config from the generated ci.cfg next to this script (every
+# Derives the TLC configs from the generated ci.cfg next to this script (every
 # generated constant and invariant, unchanged), then adds the audit's finite
 # model values (one identity, two runtime ids, two fence tokens, generations
-# 0..1, two sessions, the audit's strings), its action property and its step
-# bound, and checks them over the whole bounded space with TLC coverage. The
-# safety run must finish without an error, reach at least min_distinct_states
-# distinct states (so a guard that silently disables arms fails the lane
-# instead of shrinking the space), and fire every action of covered_actions
-# (TLC coverage: each generated at least one successor state). It then reruns
-# the same space once per reachability witness, with that witness's negation
-# as an extra invariant (a state goal) or action property (a step goal), and
+# 0..1, two sessions, the audit's strings) and its VIEW, which leaves out the
+# two counters no guard, other variable's update or invariant of the
+# generated model reads (model_step_count and topology_epoch). The runner
+# first checks that the model still reads neither counter anywhere else, and
+# fails otherwise. With the counters left out the reachable space is finite,
+# so each run explores all of it, with no step bound. It checks two runs over
+# their whole space with TLC coverage:
+# - the lifecycle run (AuditSpec) with its action property and the two
+#   invariants that check the reasons of its not-covered list;
+# - the scope run (AuditScopeSpec) with its two RetireAtScope invariants.
+# Each run must finish without an error, reach at least its floor of distinct
+# states (so a guard that silently disables arms fails the lane instead of
+# shrinking the space), and fire every action of its covered list (TLC
+# coverage: each generated at least one successor state). It then reruns a
+# space once per reachability witness, with that witness's negation as an
+# extra invariant (a state goal) or action property (a step goal), and
 # requires TLC to report exactly that violation, so the properties are not
-# vacuous. With --mutants it then seeds two defects into a copy of the
+# vacuous. With --mutants it then seeds six defects into a copy of the
 # generated model and requires TLC to refuse each: a progress arm without its
-# observation_monotonic guard (AuditObservationMonotonic), and the same guard
+# observation_monotonic guard (AuditObservationMonotonic); the same guard
 # rendered as a plain `<=` between option records, which TLC cannot evaluate
-# (the renderer now writes it through OptionLe). An anchor this script
+# (the renderer now writes it through OptionLe); the peer-only retirement
+# start replay without its retirement_session_absent guard, which then drops
+# a releasing retirement's session while its ingress detach is pending (the
+# generated pending_session_ingress_detach_has_session_correlation); the
+# stale-incarnation Retired replay with its old guard, which also takes a
+# record naming the identity's current runtime with another generation and
+# then prunes the Retiring runtime of an identity held for a respawn (the
+# generated pending_respawn_topology_has_no_current_runtime); the
+# RetireAtScope Current arm without its runtime and fence guards
+# (AuditRetireAtScopeCoherent); and the StaleFenceToken arm without its
+# mapped guard, which then overlaps NoCurrentIncarnation
+# (AuditRetireAtScopeExactlyOne). An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
 # INCOMPLETE.
 set -euo pipefail
 
-usage="usage: member_lifecycle_audit.sh <max-steps> [--mutants] [extra tlc args...]"
-max_steps="${1:?${usage}}"
-shift
 run_mutants=false
 if [[ "${1:-}" == "--mutants" ]]; then
   run_mutants=true
   shift
 fi
-# The lane's bound: every covered action fires and every witness is reached
-# within 6 steps. The distinct-state floor is 90% of the 38738 states the
-# first green run found there; a deeper bound only grows the space, so the
-# floor holds there too.
-lane_bound=6
-states_at_lane_bound=38738
-min_distinct_states=$(( states_at_lane_bound * 9 / 10 ))
-if ! [[ "${max_steps}" =~ ^[0-9]+$ ]] || (( max_steps < lane_bound )); then
-  echo "error: max-steps must be an integer >= ${lane_bound} (every covered action and witness needs ${lane_bound} steps)" >&2
-  exit 2
-fi
+# Each run's distinct-state floor is 90% of the whole space its first green
+# run found, so a guard that silently disables arms fails the lane.
+lifecycle_states=59607
+min_distinct_states=$(( lifecycle_states * 9 / 10 ))
+scope_states=3223
+min_scope_distinct_states=$(( scope_states * 9 / 10 ))
 
-# Every arm the audit's domains can enable; each must fire.
+# Every lifecycle-run arm the audit's domains can enable; each must fire.
 covered_actions=(
   RecoverRosterMemberRunning
+  RecoverRosterMemberResetRunning
   RecoverMemberSessionBindingFreshRunning
+  RecoverMemberSessionBindingReplacingRunning
+  RecoverMemberSessionBindingAlreadyCurrentRunning
   ObserveMemberProgressChangedOpenRunning
   ObserveMemberProgressChangedIdleRunning
   ObserveMemberProgressUnchangedIdleRunning
@@ -65,7 +79,20 @@ covered_actions=(
   RetireAbsentRunning
   RetireAbsentStopped
   RetireMember
+  RetireMemberPeerOnly
   SessionIngressDetachedForMobDestroyRunning
+  SessionIngressDetachedForMobDestroyStopped
+  RecoverRosterMemberRetiringRunning
+  RecoverRosterMemberRetiringReplay
+  RecoverRosterMemberRetiredRunning
+  RecoverRosterMemberRetiredCurrentAlreadyAbsent
+  RecoverRosterMemberRetiredStaleGeneration
+  RecoverRosterMemberRetiredStaleIncarnation
+  RecoverRosterMemberRetirementStartedReleasing
+  RecoverRosterMemberRetirementStartedReleasingAlreadyApplied
+  RecoverRosterMemberRetirementStartedPreservingBinding
+  RecoverRosterMemberRetirementStartedPeerOnly
+  RecoverRosterMemberAddressabilityRunning
   ObserveRuntimeRetired
   ObserveRuntimeRetiredStopped
   ObserveMemberRetirementArchivedLive
@@ -76,9 +103,29 @@ covered_actions=(
   ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared
   ObserveMemberRetirementArchivedAlreadyClearedStopped
   ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped
+  ObserveMemberRetirementArchivedLivePreservingTopology
+  ObserveMemberRetirementArchivedRetiredPreservingTopology
   BeginPlacedCompletionLifecycleQuiesceFreshStop
   StopRunning
   ResumeStopped
+)
+
+# Every RetireAtScope verdict arm, and the completion and destruction arms
+# that reach the not-running verdict; each must fire in the scope run.
+scope_covered_actions=(
+  BeginPlacedCompletionLifecycleQuiesceFresh
+  MarkCompleted
+  DestroyMob
+  RetireAtScopeCurrentRunning
+  RetireAtScopeCurrentStopped
+  RetireAtScopeNoCurrentIncarnationRunning
+  RetireAtScopeNoCurrentIncarnationStopped
+  RetireAtScopeStaleFenceTokenRunning
+  RetireAtScopeStaleFenceTokenStopped
+  RetireAtScopeStaleSessionBindingRunning
+  RetireAtScopeStaleSessionBindingStopped
+  RetireAtScopeMobNotRunningCompleted
+  RetireAtScopeMobNotRunningDestroyed
 )
 
 spec_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,11 +147,56 @@ replace_exact_line() {
   mv "${file}.next" "${file}"
 }
 
-# usage: write_cfg <file> <extra invariant lines> <extra property lines>
+# The VIEW leaves out model_step_count and topology_epoch, so the generated
+# model must read them nowhere but in their own updates, Init, the UNCHANGED
+# frames and the generated profiles' state constraints (which the audit does
+# not use). Prints their positions in the `vars` tuple.
+view_counter_positions() {
+  MODEL="${spec_dir}/model.tla" python3 - <<'PY'
+import os, re, sys
+lines = open(os.environ["MODEL"]).read().split("\n")
+allowed = {
+    "model_step_count": [
+        r"VARIABLES ",
+        r"vars == << ",
+        r"    /\\ model_step_count = 0$",
+        r"    /\\ model_step_count' = model_step_count \+ 1$",
+        r"CiStateConstraint == ",
+        r"DeepStateConstraint == ",
+    ],
+    "topology_epoch": [
+        r"VARIABLES ",
+        r"vars == << ",
+        r"    /\\ topology_epoch = 0$",
+        r"    /\\ topology_epoch' = ",
+        r"UnchangedFrame_[0-9a-f]+ == UNCHANGED << ",
+    ],
+}
+for name, patterns in allowed.items():
+    word = re.compile(r"\b" + name + r"\b")
+    for number, line in enumerate(lines, 1):
+        if word.search(line) and not any(re.match(p, line) for p in patterns):
+            sys.exit(f"error: the audit's VIEW leaves out {name}, but model.tla line {number} reads it: {line[:160]}")
+tuples = [line for line in lines if line.startswith("vars == << ") and line.endswith(" >>")]
+if len(tuples) != 1:
+    sys.exit("error: expected one `vars == << ... >>` tuple in model.tla")
+names = [name.strip() for name in tuples[0][len("vars == << "):-len(" >>")].split(",")]
+for name in allowed:
+    if names.count(name) != 1:
+        sys.exit(f"error: expected {name} once in the vars tuple of model.tla")
+print(names.index("model_step_count") + 1, names.index("topology_epoch") + 1)
+PY
+}
+view_positions="$(view_counter_positions)"
+step_index="${view_positions% *}"
+epoch_index="${view_positions#* }"
+
+# usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
+# where <run> is lifecycle (AuditSpec and its action property) or scope
+# (AuditScopeSpec and its two invariants).
 write_cfg() {
-  local cfg="$1" invariants="$2" properties="$3"
+  local run="$1" cfg="$2" invariants="$3" properties="$4"
   cp "${ci_cfg}" "${cfg}"
-  replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
   replace_exact_line "  AgentIdentityValues = {}" '  AgentIdentityValues = {"agentidentity_1"}' "${cfg}"
   replace_exact_line "  AgentRuntimeIdValues = {}" '  AgentRuntimeIdValues = {"agentruntimeid_1", "agentruntimeid_2"}' "${cfg}"
   replace_exact_line "  FenceTokenValues = {1}" "  FenceTokenValues = {1, 2}" "${cfg}"
@@ -113,11 +205,34 @@ write_cfg() {
   replace_exact_line "  SessionIdValues = {}" '  SessionIdValues = {"sessionid_1", "sessionid_2"}' "${cfg}"
   replace_exact_line "  StringValues = {}" '  StringValues = {"profile_1", "token_1", "token_2"}' "${cfg}"
   replace_exact_line "CONSTANTS" "CONSTANTS
-  AuditMaxSteps = ${max_steps}" "${cfg}"
-  replace_exact_line "INVARIANTS" "PROPERTIES
+  AuditStepIndex = ${step_index}
+  AuditEpochIndex = ${epoch_index}" "${cfg}"
+  case "${run}" in
+    lifecycle)
+      replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
+      replace_exact_line "INVARIANTS" "PROPERTIES
   AuditObservationMonotonic${properties}
-INVARIANTS${invariants}" "${cfg}"
-  replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
+INVARIANTS
+  AuditPlacementAbsent
+  AuditRetiringRuntimeMapped${invariants}" "${cfg}"
+      ;;
+    scope)
+      replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditScopeSpec" "${cfg}"
+      replace_exact_line "INVARIANTS" "INVARIANTS
+  AuditRetireAtScopeCoherent
+  AuditRetireAtScopeExactlyOne${invariants}" "${cfg}"
+      if [[ -n "${properties}" ]]; then
+        echo "error: the scope run takes no action properties" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "error: unknown audit run '${run}'" >&2
+      exit 1
+      ;;
+  esac
+  replace_exact_line "CONSTRAINTS" "VIEW AuditView" "${cfg}"
+  replace_exact_line "  CiStateConstraint" "" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
 
@@ -149,63 +264,81 @@ run_tlc() {
   return "${status}"
 }
 
-safety_cfg="${work_dir}/safety.cfg"
-write_cfg "${safety_cfg}" "" ""
-safety_status=0
-run_tlc safety "${safety_cfg}" -coverage 1 "$@" || safety_status=$?
-safety_log="${work_dir}/safety.log"
-cat "${safety_log}"
-if [[ "${safety_status}" != "0" ]] \
-  || ! grep -q "Model checking completed. No error has been found." "${safety_log}"; then
-  echo "error: member lifecycle audit failed (tlc exit ${safety_status}, bound ${max_steps})" >&2
-  exit 1
-fi
-
-distinct="$(sed -nE 's/^[0-9]+ states generated, ([0-9]+) distinct states found, 0 states left on queue\.$/\1/p' \
-  "${safety_log}" | tail -1)"
-if [[ -z "${distinct}" ]]; then
-  echo "error: the safety run reported no final distinct-state count" >&2
-  exit 1
-fi
-if (( distinct < min_distinct_states )); then
-  echo "error: ${distinct} distinct states at bound ${max_steps}, below the floor ${min_distinct_states} (90% of ${states_at_lane_bound} at bound ${lane_bound})" >&2
-  exit 1
-fi
-echo "distinct states: ${distinct} (floor ${min_distinct_states})"
-
-# TLC prints a coverage block every minute and one at the end; read the last.
-# An action's line is
-# `<Action line L, col C to line L, col C of module model>: D:T`, with D the
-# new distinct states it found and T the successor states it generated; an
-# action that fires only into known states has D = 0, so T counts.
-coverage="${work_dir}/coverage.txt"
-awk '/^The coverage statistics at / { block = ""; next } { block = block $0 "\n" } END { printf "%s", block }' \
-  "${safety_log}" > "${coverage}"
-for action in "${covered_actions[@]}"; do
-  generated="$(awk -v head="<${action} line " '
-    index($0, head) == 1 && $0 ~ / of module model>: [0-9]+:[0-9]+$/ {
-      split($NF, counts, ":"); total += counts[2]; found = 1
-    }
-    END { if (found) print total }' "${coverage}")"
-  if [[ -z "${generated}" || "${generated}" == "0" ]]; then
-    echo "error: ${action} never fired at bound ${max_steps} (coverage '${generated:-absent}')" >&2
+# usage: check_space <run> <floor> <states of its first green run> <covered action...>
+# runs <run> over its whole space with coverage and checks the outcome, the
+# distinct-state floor and the covered actions.
+check_space() {
+  local run="$1" floor="$2" whole_space="$3"
+  shift 3
+  local cfg="${work_dir}/${run}.cfg"
+  write_cfg "${run}" "${cfg}" "" ""
+  local status=0
+  run_tlc "${run}" "${cfg}" -coverage 1 ${tlc_args[@]+"${tlc_args[@]}"} || status=$?
+  local log="${work_dir}/${run}.log"
+  cat "${log}"
+  if [[ "${status}" != "0" ]] \
+    || ! grep -q "Model checking completed. No error has been found." "${log}"; then
+    echo "error: member lifecycle audit ${run} run failed (tlc exit ${status})" >&2
     exit 1
   fi
-  echo "covered ${action}: ${generated} successor states"
-done
 
-# Each witness is <kind>:<name>: a state goal's negation joins the
+  local distinct
+  distinct="$(sed -nE 's/^[0-9]+ states generated, ([0-9]+) distinct states found, 0 states left on queue\.$/\1/p' \
+    "${log}" | tail -1)"
+  if [[ -z "${distinct}" ]]; then
+    echo "error: the ${run} run reported no final distinct-state count" >&2
+    exit 1
+  fi
+  if (( distinct < floor )); then
+    echo "error: ${run} run: ${distinct} distinct states, below the floor ${floor} (90% of ${whole_space})" >&2
+    exit 1
+  fi
+  echo "${run} distinct states: ${distinct} (floor ${floor})"
+
+  # TLC prints a coverage block every minute and one at the end; read the
+  # last. An action's line is
+  # `<Action line L, col C to line L, col C of module model>: D:T`, with D the
+  # new distinct states it found and T the successor states it generated; an
+  # action that fires only into known states has D = 0, so T counts.
+  local coverage="${work_dir}/${run}-coverage.txt"
+  awk '/^The coverage statistics at / { block = ""; next } { block = block $0 "\n" } END { printf "%s", block }' \
+    "${log}" > "${coverage}"
+  local action generated
+  for action in "$@"; do
+    generated="$(awk -v head="<${action} line " '
+      index($0, head) == 1 && $0 ~ / of module model>: [0-9]+:[0-9]+$/ {
+        split($NF, counts, ":"); total += counts[2]; found = 1
+      }
+      END { if (found) print total }' "${coverage}")"
+    if [[ -z "${generated}" || "${generated}" == "0" ]]; then
+      echo "error: ${run} run: ${action} never fired (coverage '${generated:-absent}')" >&2
+      exit 1
+    fi
+    echo "covered ${action}: ${generated} successor states"
+  done
+}
+
+tlc_args=("$@")
+check_space lifecycle "${min_distinct_states}" "${lifecycle_states}" "${covered_actions[@]}"
+check_space scope "${min_scope_distinct_states}" "${scope_states}" "${scope_covered_actions[@]}"
+
+# Each witness is <run>:<kind>:<name>: a state goal's negation joins the
 # invariants, a step goal's negation ([][~step]_vars) joins the properties.
-for witness in "Invariant:Bound" "Action property:ObservationAdvances" \
-  "Invariant:Retiring" "Invariant:Archived" "Action property:Successor"; do
-  kind="${witness%%:*}"
-  name="${witness#*:}"
+for witness in "lifecycle:Invariant:Bound" "lifecycle:Action property:ObservationAdvances" \
+  "lifecycle:Invariant:Retiring" "lifecycle:Invariant:Archived" \
+  "lifecycle:Action property:Successor" "lifecycle:Action property:StaleIncarnation" \
+  "scope:Invariant:RetiringScopeCurrent" \
+  "scope:Invariant:CurrentRuntimeGone"; do
+  run="${witness%%:*}"
+  rest="${witness#*:}"
+  kind="${rest%%:*}"
+  name="${rest#*:}"
   cfg="${work_dir}/witness-${name}.cfg"
   if [[ "${kind}" == "Invariant" ]]; then
-    write_cfg "${cfg}" "
+    write_cfg "${run}" "${cfg}" "
   NotAuditWitness${name}" ""
   else
-    write_cfg "${cfg}" "" "
+    write_cfg "${run}" "${cfg}" "" "
   NotAuditWitness${name}"
   fi
   status=0
@@ -213,7 +346,7 @@ for witness in "Invariant:Bound" "Action property:ObservationAdvances" \
   log="${work_dir}/witness-${name}.log"
   if ! grep -q "Error: ${kind} NotAuditWitness${name} is violated" "${log}"; then
     cat "${log}"
-    echo "error: witness ${name} is not reachable at bound ${max_steps} (tlc exit ${status})" >&2
+    echo "error: witness ${name} is not reachable (tlc exit ${status})" >&2
     exit 1
   fi
   depth="$(grep -cE '^State [0-9]+:' "${log}" || true)"
@@ -221,17 +354,18 @@ for witness in "Invariant:Bound" "Action property:ObservationAdvances" \
 done
 
 if [[ "${run_mutants}" == "true" ]]; then
-  # usage: mutate <name> <expected refusal regex>; reads a python edit on
-  # stdin that rewrites model.tla in place and must find each anchor it names.
+  # usage: mutate <run> <name> <expected refusal regex>; reads a python edit
+  # on stdin that rewrites model.tla in place and must find each anchor it
+  # names.
   mutate() {
-    local name="$1" refusal="$2"
-    shift 2
+    local run="$1" name="$2" refusal="$3"
+    shift 3
     local dir="${work_dir}/mutant-${name}"
     mkdir -p "${dir}"
     cp "${spec_dir}"/*.tla "${dir}/"
     MODEL="${dir}/model.tla" python3 -
     local cfg="${work_dir}/mutant-${name}.cfg"
-    write_cfg "${cfg}" "" ""
+    write_cfg "${run}" "${cfg}" "" ""
     local status=0
     (cd "${dir}" && run_tlc "mutant-${name}" "${cfg}" "$@") || status=$?
     local log="${work_dir}/mutant-${name}.log"
@@ -243,7 +377,7 @@ if [[ "${run_mutants}" == "true" ]]; then
     echo "mutant ${name} refused by $(grep -oE "${refusal}" "${log}" | head -1)"
   }
 
-  mutate observation_unguarded "Error: Action property AuditObservationMonotonic is violated" "$@" <<'PY'
+  mutate lifecycle observation_unguarded "Error: Action property AuditObservationMonotonic is violated" "$@" <<'PY'
 import os, re
 path = os.environ["MODEL"]
 text = open(path).read()
@@ -259,7 +393,7 @@ text = text[: block.start()] + "\n".join(lines) + text[block.end():]
 open(path, "w").write(text)
 PY
 
-  mutate plain_option_ordering "The first argument of <= should be an integer" "$@" <<'PY'
+  mutate lifecycle plain_option_ordering "The first argument of <= should be an integer" "$@" <<'PY'
 import os, re
 path = os.environ["MODEL"]
 text = open(path).read()
@@ -273,5 +407,81 @@ body = body[: match.start()] + plain + body[match.end():]
 text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY
+
+  mutate lifecycle peer_only_replay_unguarded "Error: Invariant pending_session_ingress_detach_has_session_correlation is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^RecoverRosterMemberRetirementStartedPeerOnly\(.*?\n\n", text, re.S | re.M)
+assert block, "RecoverRosterMemberRetirementStartedPeerOnly not found"
+lines = block.group(0).split("\n")
+guard = [i for i, line in enumerate(lines)
+         if line == "    /\\ ((agent_runtime_id \\in DOMAIN runtime_retire_pending_sessions) = FALSE)"]
+assert len(guard) == 1, "expected one retirement_session_absent guard in RecoverRosterMemberRetirementStartedPeerOnly"
+del lines[guard[0]]
+text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle stale_incarnation_old_guard "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^RecoverRosterMemberRetiredStaleIncarnation\(.*?\n\n", text, re.S | re.M)
+assert block, "RecoverRosterMemberRetiredStaleIncarnation not found"
+lines = block.group(0).split("\n")
+unmapped = [i for i, line in enumerate(lines)
+            if line == "    /\\ ((agent_identity \\in DOMAIN identity_to_runtime) = FALSE)"]
+assert len(unmapped) == 1, "expected one identity_unmapped guard in RecoverRosterMemberRetiredStaleIncarnation"
+advanced = [i for i, line in enumerate(lines)
+            if line.startswith("    /\\ (") and line.endswith(" # Some(generation))")]
+assert len(advanced) == 1, "expected one generation_advanced guard in RecoverRosterMemberRetiredStaleIncarnation"
+# The guard before the partition: the recorded generation differs, or the
+# identity maps to another runtime.
+generation_differs = lines[advanced[0]][len("    /\\ "):]
+old_guard = [
+    "    /\\ \\/ " + generation_differs,
+    "       \\/ /\\ (agent_identity \\in DOMAIN identity_to_runtime)",
+    "          /\\ identity_to_runtime[agent_identity] # agent_runtime_id",
+]
+first = min(unmapped[0], advanced[0])
+for index in sorted([unmapped[0], advanced[0]], reverse=True):
+    del lines[index]
+lines[first:first] = old_guard
+text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate scope retire_at_scope_unguarded "Error: Invariant AuditRetireAtScopeCoherent is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^RetireAtScopeCurrentRunning\(.*?\n\n", text, re.S | re.M)
+assert block, "RetireAtScopeCurrentRunning not found"
+lines = block.group(0).split("\n")
+guards = [i for i, line in enumerate(lines)
+          if line.startswith("    /\\ ")
+          and ("= Some(agent_runtime_id))" in line or "= Some(fence_token))" in line)]
+assert len(guards) == 2, "expected the runtime and fence guards in RetireAtScopeCurrentRunning"
+for index in reversed(guards):
+    del lines[index]
+text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate scope verdict_overlap "Error: Invariant AuditRetireAtScopeExactlyOne is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^RetireAtScopeStaleFenceTokenRunning\(.*?\n\n", text, re.S | re.M)
+assert block, "RetireAtScopeStaleFenceTokenRunning not found"
+lines = block.group(0).split("\n")
+mapped = [i for i, line in enumerate(lines)
+          if line == "    /\\ (agent_identity \\in DOMAIN identity_to_runtime)"]
+assert len(mapped) == 1, "expected one mapped guard in RetireAtScopeStaleFenceTokenRunning"
+del lines[mapped[0]]
+text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
 fi
-echo "member lifecycle audit passed at model_step_count <= ${max_steps}"
+echo "member lifecycle audit passed over the whole reachable space of its domains"

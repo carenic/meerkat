@@ -4308,6 +4308,36 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `SealIdentityGenerationHighwaterDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RetireAtScopeCurrentRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeCurrentStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeNoCurrentIncarnationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeNoCurrentIncarnationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeStaleFenceTokenRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeStaleFenceTokenStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeStaleSessionBindingRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeStaleSessionBindingStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeMobNotRunningCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeMobNotRunningDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -4752,6 +4782,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ExplicitResumeFinished`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireAtScopeResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

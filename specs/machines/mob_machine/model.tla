@@ -4,7 +4,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 \* Generated semantic machine model for MobMachine.
 
 \* RustU64Max is the TLA boundary for Expr::U64Max; production generated Rust renders u64::MAX.
-CONSTANTS AdaptiveDecisionKindValues, AdaptiveLayerAdmissionKindValues, AdaptiveLayerDispositionKindValues, AdaptiveLayerIdValues, AdaptiveLayerPhaseValues, AdaptiveLayerSetupFaultKindValues, AdaptiveRunIdValues, AdaptiveRunPhaseValues, AdaptiveStopReasonValues, AgentIdentityValues, AgentRuntimeIdValues, AutonomousShutdownMemberActionKindValues, BooleanValues, BranchIdValues, CancelAllWorkRejectReasonKindValues, CollectionPolicyKindValues, ControlScopeValues, CoordinationResourceRefValues, DependencyModeValues, EventSubscriptionRejectReasonKindValues, ExternalMemberRebindCapabilityValues, ExternalPeerEdgeValues, ExternalPeerKeyValues, ExternalRouteObligationValues, FenceTokenValues, FlowFrameReducerCommandKindValues, FlowNodeFailurePolicyValues, FlowNodeIdValues, FlowNodeKindValues, FlowRunPublicResultClassKindValues, FlowRunReducerCommandKindValues, FlowRunStatusValues, FlowStepDispatchKindValues, FrameIdValues, FrameScopeValues, FrameStatusValues, GenerationValues, HostBindPhaseValues, HostBindingGenerationTombstoneValues, HostIdValues, IdentityAuthorityConditionValues, IdentityExternalCeremonyConditionValues, IdentityExternalTrustConditionValues, IdentityInitialDeliveryConditionValues, IdentityLeaseConditionValues, IdentityReceiptConditionValues, IdentityReconcileDecisionValues, IdentityReplacementConditionValues, IdentityResourceConditionValues, IdentitySessionConditionValues, InputIdValues, KickoffIntentValues, KickoffPhaseValues, LiveWsEndpointUrlValues, LoopIdValues, LoopInstanceIdValues, LoopIterationReducerCommandKindValues, LoopIterationStageValues, LoopStatusValues, MemberAdmissionVerdictKindValues, MemberHealthClassValues, MemberLifecycleKindValues, MemberLiveMaterializationObservationKindValues, MemberOperatorRejectKindValues, MemberPeerEndpointValues, MemberProgressEventKindValues, MemberRevivalVerdictKindValues, MemberSessionDisposalValues, MemberWaitClassificationKindValues, MobBridgeRejectionCauseValues, MobBridgeRejectionRecoveryValues, MobCoordinationEventKindValues, MobCoordinationResourceClaimKindValues, MobCoordinationResourceClaimStatusValues, MobCoordinationWorkIntentStatusValues, MobCreateMobAdmissionKindValues, MobCurrentMobAdmissionKindValues, MobFlowDelegationEdgeAdmissionKindValues, MobFlowDelegationEdgeModeKindValues, MobFlowDelegationEdgeRuleVerdictKindValues, MobFrameSeedDispositionValues, MobIdValues, MobLifecycleJournalKindValues, MobMemberOperationEligibilityKindValues, MobMemberStateValues, MobPendingSupervisorAcceptanceKindValues, MobProfileMutationAdmissionKindValues, MobRemoteMemberRuntimeObservedStateValues, MobRemoteMemberRuntimeTerminalityValues, MobSpawnManyFailureCauseKindValues, MobSpawnManyFailureObservationKindValues, MobSpawnMemberAdmissionKindValues, MobSpawnToolAdmissionKindValues, MobToolCallerProvenanceValues, NatValues, NodeRunStatusValues, OpaquePrincipalTokenValues, PeerAddressValues, PeerIdValues, PeerSigningKeyValues, PlacedCarrierCleanupObligationValues, PlacedCompletionLifecycleIntentKindValues, PlacedCompletionObligationValues, PlacedKickoffClosureKindValues, PlacedKickoffObligationValues, PlacedKickoffOutcomeKindValues, PlacedSpawnIdValues, PolicyDecisionValues, PrincipalIdValues, RemoteTurnObligationValues, ResourceClaimIdValues, RespawnTopologyPeerIdValues, RespawnTopologyRestoreResultKindValues, ResumeAttemptIdValues, ResumeMemberBindingValues, ResumeMemberOutcomeDispositionValues, RouteInstallObligationValues, RunIdValues, SessionIdValues, SetOfAgentIdentityValues, SetOfAgentRuntimeIdValues, SetOfControlScopeValues, SetOfCoordinationResourceRefValues, SetOfExternalPeerEdgeValues, SetOfExternalRouteObligationValues, SetOfFlowNodeIdValues, SetOfFrameIdValues, SetOfHostBindingGenerationTombstoneValues, SetOfHostIdValues, SetOfLoopInstanceIdValues, SetOfMemberPeerEndpointValues, SetOfPeerIdValues, SetOfPlacedCarrierCleanupObligationValues, SetOfPlacedCompletionObligationValues, SetOfPlacedKickoffObligationValues, SetOfRemoteTurnObligationValues, SetOfRouteInstallObligationValues, SetOfStepIdValues, SetOfStringValues, SetOfWiringEdgeValues, SpawnExecPhaseValues, SpawnPolicyRuntimeModeValues, StepFaultDispositionKindValues, StepIdValues, StepOutputFaultKindValues, StepRunStatusValues, StringValues, SubmitWorkRejectReasonKindValues, SupervisorEscalationFailureCauseValues, SupervisorProtocolVersionValues, TurnTimeoutDispositionValues, U32Values, WiringEdgeValues, WiringLifecycleKindValues, WorkContentAttributionValues, WorkIdValues, WorkIntentIdValues, WorkOriginValues, RustU64Max
+CONSTANTS AdaptiveDecisionKindValues, AdaptiveLayerAdmissionKindValues, AdaptiveLayerDispositionKindValues, AdaptiveLayerIdValues, AdaptiveLayerPhaseValues, AdaptiveLayerSetupFaultKindValues, AdaptiveRunIdValues, AdaptiveRunPhaseValues, AdaptiveStopReasonValues, AgentIdentityValues, AgentRuntimeIdValues, AutonomousShutdownMemberActionKindValues, BooleanValues, BranchIdValues, CancelAllWorkRejectReasonKindValues, CollectionPolicyKindValues, ControlScopeValues, CoordinationResourceRefValues, DependencyModeValues, EventSubscriptionRejectReasonKindValues, ExternalMemberRebindCapabilityValues, ExternalPeerEdgeValues, ExternalPeerKeyValues, ExternalRouteObligationValues, FenceTokenValues, FlowFrameReducerCommandKindValues, FlowNodeFailurePolicyValues, FlowNodeIdValues, FlowNodeKindValues, FlowRunPublicResultClassKindValues, FlowRunReducerCommandKindValues, FlowRunStatusValues, FlowStepDispatchKindValues, FrameIdValues, FrameScopeValues, FrameStatusValues, GenerationValues, HostBindPhaseValues, HostBindingGenerationTombstoneValues, HostIdValues, IdentityAuthorityConditionValues, IdentityExternalCeremonyConditionValues, IdentityExternalTrustConditionValues, IdentityInitialDeliveryConditionValues, IdentityLeaseConditionValues, IdentityReceiptConditionValues, IdentityReconcileDecisionValues, IdentityReplacementConditionValues, IdentityResourceConditionValues, IdentitySessionConditionValues, InputIdValues, KickoffIntentValues, KickoffPhaseValues, LiveWsEndpointUrlValues, LoopIdValues, LoopInstanceIdValues, LoopIterationReducerCommandKindValues, LoopIterationStageValues, LoopStatusValues, MemberAdmissionVerdictKindValues, MemberHealthClassValues, MemberLifecycleKindValues, MemberLiveMaterializationObservationKindValues, MemberOperatorRejectKindValues, MemberPeerEndpointValues, MemberProgressEventKindValues, MemberRevivalVerdictKindValues, MemberSessionDisposalValues, MemberWaitClassificationKindValues, MobBridgeRejectionCauseValues, MobBridgeRejectionRecoveryValues, MobCoordinationEventKindValues, MobCoordinationResourceClaimKindValues, MobCoordinationResourceClaimStatusValues, MobCoordinationWorkIntentStatusValues, MobCreateMobAdmissionKindValues, MobCurrentMobAdmissionKindValues, MobFlowDelegationEdgeAdmissionKindValues, MobFlowDelegationEdgeModeKindValues, MobFlowDelegationEdgeRuleVerdictKindValues, MobFrameSeedDispositionValues, MobIdValues, MobLifecycleJournalKindValues, MobMemberOperationEligibilityKindValues, MobMemberStateValues, MobPendingSupervisorAcceptanceKindValues, MobProfileMutationAdmissionKindValues, MobRemoteMemberRuntimeObservedStateValues, MobRemoteMemberRuntimeTerminalityValues, MobSpawnManyFailureCauseKindValues, MobSpawnManyFailureObservationKindValues, MobSpawnMemberAdmissionKindValues, MobSpawnToolAdmissionKindValues, MobToolCallerProvenanceValues, NatValues, NodeRunStatusValues, OpaquePrincipalTokenValues, PeerAddressValues, PeerIdValues, PeerSigningKeyValues, PlacedCarrierCleanupObligationValues, PlacedCompletionLifecycleIntentKindValues, PlacedCompletionObligationValues, PlacedKickoffClosureKindValues, PlacedKickoffObligationValues, PlacedKickoffOutcomeKindValues, PlacedSpawnIdValues, PolicyDecisionValues, PrincipalIdValues, RemoteTurnObligationValues, ResourceClaimIdValues, RespawnTopologyPeerIdValues, RespawnTopologyRestoreResultKindValues, ResumeAttemptIdValues, ResumeMemberBindingValues, ResumeMemberOutcomeDispositionValues, RetireAtScopeVerdictKindValues, RouteInstallObligationValues, RunIdValues, SessionIdValues, SetOfAgentIdentityValues, SetOfAgentRuntimeIdValues, SetOfControlScopeValues, SetOfCoordinationResourceRefValues, SetOfExternalPeerEdgeValues, SetOfExternalRouteObligationValues, SetOfFlowNodeIdValues, SetOfFrameIdValues, SetOfHostBindingGenerationTombstoneValues, SetOfHostIdValues, SetOfLoopInstanceIdValues, SetOfMemberPeerEndpointValues, SetOfPeerIdValues, SetOfPlacedCarrierCleanupObligationValues, SetOfPlacedCompletionObligationValues, SetOfPlacedKickoffObligationValues, SetOfRemoteTurnObligationValues, SetOfRouteInstallObligationValues, SetOfStepIdValues, SetOfStringValues, SetOfWiringEdgeValues, SpawnExecPhaseValues, SpawnPolicyRuntimeModeValues, StepFaultDispositionKindValues, StepIdValues, StepOutputFaultKindValues, StepRunStatusValues, StringValues, SubmitWorkRejectReasonKindValues, SupervisorEscalationFailureCauseValues, SupervisorProtocolVersionValues, TurnTimeoutDispositionValues, U32Values, WiringEdgeValues, WiringLifecycleKindValues, WorkContentAttributionValues, WorkIdValues, WorkIntentIdValues, WorkOriginValues, RustU64Max
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -5287,6 +5287,7 @@ RecoverRosterMemberRetirementStartedPeerOnly(agent_identity, agent_runtime_id, g
     /\ (releasing = None)
     /\ (session_id = None)
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = None)
+    /\ ((agent_runtime_id \in DOMAIN runtime_retire_pending_sessions) = FALSE)
     /\ (IF (retiring_peer_endpoint = None) THEN TRUE ELSE (IF ((agent_identity \in DOMAIN member_peer_endpoints) = FALSE) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_peer_endpoints) THEN Some((IF agent_identity \in DOMAIN member_peer_endpoints THEN member_peer_endpoints[agent_identity] ELSE "None")) ELSE None) = retiring_peer_endpoint)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
@@ -5674,7 +5675,8 @@ RecoverRosterMemberRetiredStaleGeneration(agent_identity, agent_runtime_id) ==
 
 RecoverRosterMemberRetiredStaleIncarnation(agent_identity, agent_runtime_id, generation) ==
     /\ phase = "Running"
-    /\ (IF ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # Some(generation)) THEN TRUE ELSE ((agent_identity \in DOMAIN identity_to_runtime) /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) # Some(agent_runtime_id))))
+    /\ ((agent_identity \in DOMAIN identity_to_runtime) = FALSE)
+    /\ ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # Some(generation))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
@@ -18883,6 +18885,100 @@ SealIdentityGenerationHighwaterDestroyed ==
     /\ UnchangedFrame_2b6bcadf53d5da4e
 
 
+RetireAtScopeCurrentRunning(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Running"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
+    /\ ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = Some(session_id)) THEN TRUE ELSE (((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) = Some("Retiring")) /\ ((IF (agent_runtime_id \in DOMAIN runtime_retire_pending_sessions) THEN Some((IF agent_runtime_id \in DOMAIN runtime_retire_pending_sessions THEN runtime_retire_pending_sessions[agent_runtime_id] ELSE "None")) ELSE None) = Some(session_id))))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeCurrentStopped(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Stopped"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
+    /\ ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = Some(session_id)) THEN TRUE ELSE (((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) = Some("Retiring")) /\ ((IF (agent_runtime_id \in DOMAIN runtime_retire_pending_sessions) THEN Some((IF agent_runtime_id \in DOMAIN runtime_retire_pending_sessions THEN runtime_retire_pending_sessions[agent_runtime_id] ELSE "None")) ELSE None) = Some(session_id))))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeNoCurrentIncarnationRunning(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Running"
+    /\ ~((agent_identity \in DOMAIN identity_to_runtime))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeNoCurrentIncarnationStopped(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Stopped"
+    /\ ~((agent_identity \in DOMAIN identity_to_runtime))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeStaleFenceTokenRunning(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Running"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ (IF ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) # Some(agent_runtime_id)) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) # Some(fence_token)))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeStaleFenceTokenStopped(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Stopped"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ (IF ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) # Some(agent_runtime_id)) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) # Some(fence_token)))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeStaleSessionBindingRunning(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Running"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
+    /\ ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id))
+    /\ (IF ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring")) THEN TRUE ELSE ((IF (agent_runtime_id \in DOMAIN runtime_retire_pending_sessions) THEN Some((IF agent_runtime_id \in DOMAIN runtime_retire_pending_sessions THEN runtime_retire_pending_sessions[agent_runtime_id] ELSE "None")) ELSE None) # Some(session_id)))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeStaleSessionBindingStopped(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Stopped"
+    /\ (agent_identity \in DOMAIN identity_to_runtime)
+    /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
+    /\ ((IF (agent_identity \in DOMAIN identity_runtime_fence_tokens) THEN Some((IF agent_identity \in DOMAIN identity_runtime_fence_tokens THEN identity_runtime_fence_tokens[agent_identity] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id))
+    /\ (IF ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring")) THEN TRUE ELSE ((IF (agent_runtime_id \in DOMAIN runtime_retire_pending_sessions) THEN Some((IF agent_runtime_id \in DOMAIN runtime_retire_pending_sessions THEN runtime_retire_pending_sessions[agent_runtime_id] ELSE "None")) ELSE None) # Some(session_id)))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeMobNotRunningCompleted(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Completed"
+    /\ phase' = "Completed"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
+RetireAtScopeMobNotRunningDestroyed(agent_identity, agent_runtime_id, fence_token, session_id) ==
+    /\ phase = "Destroyed"
+    /\ phase' = "Destroyed"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_6442c4792a0a93bc
+
+
 Next ==
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityTerminalRunning(run_id, status)
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityNonTerminalRunning(run_id, status)
@@ -20310,6 +20406,16 @@ Next ==
     \/ SealIdentityGenerationHighwaterStopped
     \/ SealIdentityGenerationHighwaterCompleted
     \/ SealIdentityGenerationHighwaterDestroyed
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeCurrentRunning(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeCurrentStopped(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeNoCurrentIncarnationRunning(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeNoCurrentIncarnationStopped(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeStaleFenceTokenRunning(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeStaleFenceTokenStopped(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeStaleSessionBindingRunning(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeStaleSessionBindingStopped(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeMobNotRunningCompleted(agent_identity, agent_runtime_id, fence_token, session_id)
+    \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in SessionIdValues : RetireAtScopeMobNotRunningDestroyed(agent_identity, agent_runtime_id, fence_token, session_id)
     \/ TerminalStutter
 
 stopped_mob_holds_member_run_starts == (IF (phase # "Stopped") THEN TRUE ELSE (member_run_starts_held = TRUE))
