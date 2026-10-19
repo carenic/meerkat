@@ -31,10 +31,23 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   before Stop runs only after Resume. The result carries `stop_report` with
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
-  A spawn that finishes into a stopped mob leaves it stopped.
+  A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
+  member reloaded while the mob is stopped stays held until Resume, as does
+  one spawned into a stopped mob or held again after a failed Resume;
+  retire, Shutdown and destroy release the hold for the members they dispose
+  of, so a later registration of the same session is not held, and a mob
+  reopened in the same process holds its members only if it is restored
+  stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. Since 0.9.4 an admitted Shutdown closes the mob's
+  and reports each member. Since 0.9.4 a member reported
+  `UnregisterPending { stage, settlement, .. }` carries a
+  `MemberUnregisterSettlement` that keeps following its exact registration
+  after Shutdown returns (`try_state()`, `settle_within(deadline)`;
+  `HandedOver` when a later owner took the registration over), and a
+  durability-degraded member is unregistered after the reload-required
+  discard instead of staying registered until the process exits (details in
+  `references/mobs.md`). Since 0.9.4 an admitted Shutdown closes the mob's
   admission before any teardown (reason `Shutdown`). While it runs, a command
   the closed admission refuses (spawn, respawn, work, a flow run, wiring, a
   host bind, a live commit, resume, reset, reload, an owner lease) fails with
