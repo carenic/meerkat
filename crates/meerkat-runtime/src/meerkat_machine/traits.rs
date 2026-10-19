@@ -138,12 +138,25 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         input_id: &InputId,
     ) -> Result<Option<crate::completion::CompletionOutcome>, RuntimeDriverError> {
-        let driver = {
+        let target = {
             let sessions = self.sessions.read().await;
-            sessions.get(session_id).map(|entry| entry.driver.clone())
+            sessions
+                .get(session_id)
+                .map(|entry| (entry.driver.clone(), entry.durability_health.clone()))
         };
-        if let Some(driver) = driver {
-            let driver = driver.lock().await;
+        if let Some((driver, durability_health)) = target {
+            // A degraded session whose driver a commit past its deadline
+            // still holds cannot say yet whether the input is terminal: the
+            // typed refusal is retryable, and the input reads again after the
+            // session reloads.
+            let driver = super::lock_driver_live(&driver, durability_health.as_ref())
+                .await
+                .map_err(|required| RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "the terminal of input {input_id} is not known yet: {required}; read it again after the session reloads"
+                    ),
+                })?;
             if let Some(row) = driver.as_driver().stored_input_state(input_id) {
                 let outcome = driver.exact_input_terminal_completion_outcome(input_id)?;
                 let permitted = super::scoped_context::disclosure_permitted_with(

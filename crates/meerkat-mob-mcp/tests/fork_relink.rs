@@ -2619,6 +2619,32 @@ async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_i
     );
 }
 
+/// Closing a mob's admission if it is idle asks each member whether it has
+/// active inputs. Behind a member's boundary commit that the store never
+/// answers, that read answers busy once the member's session degrades at the
+/// store's deadline, so the close answers within the bound and leaves the
+/// busy mob open. Before, the read waited for the member's driver, which the
+/// commit holds, and so for the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_mob_if_idle_behind_a_commit_the_store_never_answers_answers_busy() {
+    let held = fork_child_whose_boundary_commit_hangs("hung-close-child").await;
+    let handle = held
+        .fixture
+        .state
+        .handle_for(&held.fixture.source_mob_id())
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(DEGRADED_DESTROY_BOUND, handle.close_if_idle())
+        .await
+        .expect("closing if idle answers while the store has not")
+        .expect("the mob answers the close");
+    assert!(
+        handle.admission_closed().borrow().is_none(),
+        "the member answers busy, so the mob stays open: {outcome:?}"
+    );
+    held.store.release();
+}
+
 /// Force-cancelling a member whose runtime needs a durability reload answers
 /// the typed `MemberReloadRequired`, naming the member, at once: it neither
 /// waits on the member session's gates nor fails untyped behind them. A

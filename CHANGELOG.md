@@ -400,6 +400,16 @@ them.
   gate. Waits that run only once the degraded holder has released the gate
   (the reload-required discard) or before any runtime loop exists keep
   waiting.
+- Reads of a session's runtime state that take no mutation gate (whether it
+  has active inputs, which a mob's close-if-idle and last-owner release ask;
+  a runtime wake; whether a run input awaits its boundary; a stopped run's
+  contributor terminal; an input's terminal completion) and a member's
+  tracked-input cancel waited behind a boundary commit or run
+  terminalization that holds the session's driver. Past its deadline such a
+  commit holds the driver until the store answers, so once the session
+  degrades they answer without it: the active-input read answers busy, the
+  contributor terminal is unknown, and the others refuse with the typed,
+  retryable `RecoveryRepairBlocked`.
 - A boundary commit whose store never answered (a stalled disk or a hung
   network filesystem, for example) kept the session's mutation gate for
   good, so every later wait for the gate waited for it, a mob destroy's

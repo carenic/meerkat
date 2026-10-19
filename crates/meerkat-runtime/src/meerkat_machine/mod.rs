@@ -2625,6 +2625,29 @@ fn degraded_gate_wait_refusal(required: DurabilityReloadRequired) -> RuntimeDriv
     }
 }
 
+/// Take a session's driver without M, or end once the session degrades. A
+/// boundary commit or run terminalization holds the driver together with M,
+/// and one past its commit deadline keeps both until the store answers, so a
+/// wait for the driver alone would wait for the store. The driver is polled
+/// first: a free driver is taken even on a degraded session, and a session
+/// without durable state waits as before.
+async fn lock_driver_live<'a, T>(
+    driver: &'a crate::tokio::sync::Mutex<T>,
+    durability_health: Option<&DurabilityHealthHandle>,
+) -> Result<crate::tokio::sync::MutexGuard<'a, T>, DurabilityReloadRequired> {
+    let Some(health) = durability_health else {
+        return Ok(driver.lock().await);
+    };
+    let degradation = health.subscribe_degradation();
+    let mut lock = std::pin::pin!(driver.lock());
+    let mut fired = std::pin::pin!(degradation.fired());
+    crate::tokio::select! {
+        biased;
+        guard = &mut lock => Ok(guard),
+        required = &mut fired => Err(required),
+    }
+}
+
 /// Settle a held session mutation gate: hand it back for a durability-ready
 /// entry, or detach the degraded entry and hard-cancel its exact run before
 /// refusing. Shared by the ready-gated caller and the process-owned task a

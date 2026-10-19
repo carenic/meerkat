@@ -248,6 +248,68 @@ async fn commit_past_its_deadline(
     (run, hold)
 }
 
+/// Reads of the session's driver that take no gate answer while a commit
+/// past its deadline holds the driver: the active-input read answers busy,
+/// and the wake, the uncommitted-run-input read and the input's terminal
+/// completion refuse typed. Before, each waited for the driver, and so for
+/// the store.
+#[tokio::test]
+async fn driver_reads_without_the_gate_answer_while_a_commit_past_its_deadline_holds_the_driver() {
+    let store = declaring_store();
+    let machine = machine_over(&store, HUNG_BUSY_WINDOW);
+    let (run, hold) = commit_past_its_deadline(&machine, &store).await;
+    let session_id = &run.session_id;
+
+    let busy = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.session_has_active_inputs(session_id),
+    )
+    .await
+    .expect("the active-input read answers");
+    assert!(busy, "the degraded session answers busy");
+    let woke = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.wake_runtime_if_active_inputs(session_id),
+    )
+    .await
+    .expect("the wake answers");
+    assert!(
+        matches!(woke, Err(RuntimeDriverError::RecoveryRepairBlocked { .. })),
+        "the wake refuses typed: {woke:?}"
+    );
+    let uncommitted = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.session_has_uncommitted_run_input(session_id),
+    )
+    .await
+    .expect("the uncommitted-run-input read answers");
+    assert!(
+        matches!(
+            uncommitted,
+            Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+        ),
+        "the uncommitted-run-input read refuses typed: {uncommitted:?}"
+    );
+    let terminal = tokio::time::timeout(
+        TYPED_END_BOUND,
+        crate::SessionServiceRuntimeExt::input_terminal_completion(
+            machine.as_ref(),
+            session_id,
+            &run.input_id,
+        ),
+    )
+    .await
+    .expect("the terminal read answers");
+    assert!(
+        matches!(
+            terminal,
+            Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+        ),
+        "the terminal read refuses typed: {terminal:?}"
+    );
+    hold.release(HeldStoreCommitRelease::Commit);
+}
+
 /// R-c1: a run's boundary commit that the store never answers. At the
 /// store's declared deadline the session degrades, a wait for its gate ends
 /// typed, the run's completion waiter fails as outcome-unknown, and the loop

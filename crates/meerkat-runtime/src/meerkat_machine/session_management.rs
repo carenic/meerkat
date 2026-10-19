@@ -1543,16 +1543,18 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
     ) -> Result<bool, RuntimeDriverError> {
-        let driver = {
+        let (driver, durability_health) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(session_id)
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            Arc::clone(&entry.driver)
+            (Arc::clone(&entry.driver), entry.durability_health.clone())
         };
-        let driver_guard = driver.lock().await;
+        let driver_guard = super::lock_driver_live(&driver, durability_health.as_ref())
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         // Only the session's current driver answers: while this waited for
         // the lock, the session may have been removed (NotReady) or given a
         // new driver (StaleAuthority), and the one held here would describe
@@ -12444,15 +12446,20 @@ Ok::<(), RuntimeDriverError>(())
     /// accepted inputs that are queued, held or running. Read-only; a session
     /// this machine does not host has none.
     pub async fn session_has_active_inputs(&self, session_id: &SessionId) -> bool {
-        let driver = {
+        let (driver, durability_health) = {
             let sessions = self.sessions.read().await;
             match sessions.get(session_id) {
-                Some(entry) => entry.driver.clone(),
+                Some(entry) => (entry.driver.clone(), entry.durability_health.clone()),
                 None => return false,
             }
         };
-        let driver = driver.lock().await;
-        !driver.as_driver().active_input_ids().is_empty()
+        // A degraded session whose driver a commit past its deadline still
+        // holds answers busy: its inputs are not known until the store
+        // answers.
+        match super::lock_driver_live(&driver, durability_health.as_ref()).await {
+            Ok(driver) => !driver.as_driver().active_input_ids().is_empty(),
+            Err(_) => true,
+        }
     }
 
     /// Wake the attached runtime loop when machine-owned input truth already
@@ -12464,18 +12471,24 @@ Ok::<(), RuntimeDriverError>(())
         &self,
         session_id: &SessionId,
     ) -> Result<bool, RuntimeDriverError> {
-        let (driver, wake_tx) = {
+        let (driver, wake_tx, durability_health) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(session_id)
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            (entry.driver.clone(), entry.wake_sender())
+            (
+                entry.driver.clone(),
+                entry.wake_sender(),
+                entry.durability_health.clone(),
+            )
         };
 
         let has_active_inputs = {
-            let driver = driver.lock().await;
+            let driver = super::lock_driver_live(&driver, durability_health.as_ref())
+                .await
+                .map_err(degraded_gate_wait_refusal)?;
             !driver.as_driver().active_input_ids().is_empty()
         };
         if !has_active_inputs {

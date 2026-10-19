@@ -17548,7 +17548,7 @@ impl MeerkatMachine {
             let authority = self
                 .lock_member_effect_authority(session_id, expected_member)
                 .await?;
-            let (driver, completions, mutation_gate, publication_handle) = {
+            let (driver, completions, mutation_gate, publication_handle, durability_health) = {
                 let sessions = self.sessions.read().await;
                 let entry =
                     sessions
@@ -17562,10 +17562,16 @@ impl MeerkatMachine {
                     entry.completions.clone(),
                     entry.mutation_gate.clone(),
                     entry.publication_handle(),
+                    entry.durability_health.clone(),
                 )
             };
             let action = {
-                let mut driver_guard = driver.lock().await;
+                // The member authority above is not M, so a commit past its
+                // deadline can still hold the driver: end typed once the
+                // session degrades instead of waiting for the store.
+                let mut driver_guard = super::lock_driver_live(&driver, durability_health.as_ref())
+                    .await
+                    .map_err(super::degraded_gate_wait_refusal)?;
                 let input_id = driver_guard
                     .as_driver()
                     .input_id_for_idempotency_key(idempotency_key);

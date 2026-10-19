@@ -391,14 +391,24 @@ impl MeerkatMachine {
         session_id: &SessionId,
         input_id: &meerkat_core::lifecycle::InputId,
     ) -> Option<crate::input_state::InputTerminalOutcome> {
-        let driver = {
+        let target = {
             let sessions = self.sessions.read().await;
-            sessions.get(session_id).map(|entry| entry.driver.clone())
+            sessions
+                .get(session_id)
+                .map(|entry| (entry.driver.clone(), entry.durability_health.clone()))
         };
-        if let Some(driver) = driver
-            && let Some(stored) = driver.lock().await.as_driver().stored_input_state(input_id)
-        {
-            return stored.seed.terminal_outcome;
+        if let Some((driver, durability_health)) = target {
+            match super::lock_driver_live(&driver, durability_health.as_ref()).await {
+                Ok(driver) => {
+                    if let Some(stored) = driver.as_driver().stored_input_state(input_id) {
+                        return stored.seed.terminal_outcome;
+                    }
+                }
+                // A degraded session whose driver a commit past its deadline
+                // still holds: the terminal is not known until the store
+                // answers, and the store read below would wait for it too.
+                Err(_) => return None,
+            }
         }
         let store = self.store.as_ref()?;
         match store
