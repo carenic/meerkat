@@ -51,6 +51,11 @@ them.
   that is not ready to admit a retained continuation, for a typed cause, to
   it: the continuation stays pending and is retried, as for `Failed`, and
   keeps the cause the runtime named.
+- `meerkat`: `BlockedDeliveryReason` gains `NotReady(ControllerReadinessFailure)`,
+  its first variant that carries data, so its variants no longer have defined
+  discriminants. The drain blocks a continuation row the runtime is not ready
+  to admit with it, and the delivery owner's pass failure line names the cause
+  (for example `NotReady(OriginalAdmissionPending)`).
 - `meerkat-contracts`: `WireControllerReadinessFailure` gains
   `OriginalAdmissionPending` (kind `original_admission_pending`), which
   `ControllerReadinessFailure::OriginalAdmissionPending` now maps to instead
@@ -65,11 +70,10 @@ them.
   submission candidate, whose admission the owner has not settled yet.
 - `meerkat-runtime`: `RetainedCustody`, a source owner's custody of one
   original: retained with its mandate, admission pending, or not retained.
-- `meerkat`: `JobOutboxProjectionError::NotReady` and
-  `BlockedDeliveryReason::NotReady` carry that cause for a continuation row
-  the runtime is not ready to admit, and the delivery owner's pass failure
-  line names it (for example `NotReady(OriginalAdmissionPending)`). Nothing is
-  stored; the cause is read again on every retry.
+- `meerkat`: `JobOutboxProjectionError::NotReady` carries that cause for a
+  continuation row the runtime is not ready to admit; the drain reports it as
+  `BlockedDeliveryReason::NotReady` (above). Nothing is stored; the cause is
+  read again on every retry.
 - `LocalGrantAuthority::resolve_lineage_observed`,
   `resolve_controller_lineage_observed` and
   `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
