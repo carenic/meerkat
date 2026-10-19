@@ -1490,6 +1490,9 @@ fn named_type_id(name: &str) -> NamedTypeId {
     NamedTypeId::parse(name).expect("valid named type")
 }
 
+/// The ("dev", "default_openai") key, shared by many tests here. A test that
+/// releases a lease or holds the login lifecycle lock never uses it: it takes
+/// `oauth_target_with_binding` with a binding of its own.
 #[cfg(not(target_arch = "wasm32"))]
 fn oauth_target() -> meerkat_core::AuthCredentialIdentity {
     oauth_target_with_binding("default_openai")
@@ -2012,7 +2015,7 @@ fn persistent_oauth_release_prunes_durable_payload_snapshot_for_sqlite_store() {
     let machine = MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
         .expect("persistent machine");
     let redirect_uri = "http://127.0.0.1/callback";
-    let target = oauth_target();
+    let target = oauth_target_with_binding("persistent_release_prune");
     let browser_provider = meerkat_auth_core::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt;
     let device_provider = meerkat_auth_core::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist;
     let state = machine

@@ -2021,6 +2021,9 @@ pub(crate) mod tests {
     use crate::runtime_state::RuntimeState;
     use crate::store::{RuntimeStore, RuntimeStoreError, SerializedSessionSnapshot};
 
+    /// A credential identity on its own lease key. The login lifecycle lock
+    /// is process-wide per lease key, so a test that releases a lease must
+    /// not share its key with the tests running beside it.
     fn target_with_binding(binding: &str) -> AuthCredentialIdentity {
         AuthCredentialIdentity::Binding(meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("dev").expect("valid realm"),
@@ -2030,6 +2033,9 @@ pub(crate) mod tests {
         })
     }
 
+    /// The ("dev", "default_openai") key, shared by many tests here. A test
+    /// that releases a lease or holds the login lifecycle lock never uses it:
+    /// it takes `target_with_binding` with a binding of its own.
     fn target() -> AuthCredentialIdentity {
         target_with_binding("default_openai")
     }
@@ -3665,7 +3671,7 @@ pub(crate) mod tests {
             lifecycle.clone(),
             &store_dyn,
         );
-        let target = target();
+        let target = target_with_binding("release_persist_retryable");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
         let redirect_uri = "http://127.0.0.1/callback";
@@ -3679,9 +3685,12 @@ pub(crate) mod tests {
             .expect("browser flow admitted");
 
         store.fail_oauth_persist();
+        let err = lifecycle
+            .release_lease(&lease_key)
+            .expect_err("release should fail closed when durable OAuth cleanup cannot persist");
         assert!(
-            lifecycle.release_lease(&lease_key).is_err(),
-            "release should fail closed when durable OAuth cleanup cannot persist"
+            err.reason.contains("injected oauth snapshot failure"),
+            "the release must fail on the durable cleanup, not on a busy lifecycle lock: {err:?}"
         );
         assert!(lifecycle.has_oauth_browser_flow_for_test(&target, &state));
 
@@ -3706,7 +3715,7 @@ pub(crate) mod tests {
             Arc::new(RuntimeAuthLeaseHandle::new()),
             &store_dyn,
         );
-        let target = target();
+        let target = target_with_binding("stale_release_persist");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
         let redirect_uri = "http://127.0.0.1/callback";
@@ -3724,9 +3733,12 @@ pub(crate) mod tests {
         );
 
         store.fail_oauth_persist();
+        let err = releasing_lifecycle.release_lease(&lease_key).expect_err(
+            "release should fail closed when stale durable OAuth cleanup cannot persist",
+        );
         assert!(
-            releasing_lifecycle.release_lease(&lease_key).is_err(),
-            "release should fail closed when stale durable OAuth cleanup cannot persist"
+            err.reason.contains("injected oauth snapshot failure"),
+            "the release must fail on the durable cleanup, not on a busy lifecycle lock: {err:?}"
         );
         assert_eq!(
             releasing_lifecycle.snapshot(&lease_key).phase,
@@ -3760,7 +3772,7 @@ pub(crate) mod tests {
             Arc::new(RuntimeAuthLeaseHandle::new()),
             &admitting_store,
         );
-        let target = target();
+        let target = target_with_binding("release_prunes_stale");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let browser_provider = OAuthProviderIdentity::OpenAiChatGpt;
         let redirect_uri = "http://127.0.0.1/callback";
@@ -4326,7 +4338,7 @@ pub(crate) mod tests {
         let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
         let authority =
             RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle.clone());
-        let target = target();
+        let target = target_with_binding("release_cancels_browser");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
         let redirect_uri = "http://127.0.0.1/callback";
@@ -4381,7 +4393,7 @@ pub(crate) mod tests {
         let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
         let authority =
             RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle.clone());
-        let target = target();
+        let target = target_with_binding("release_cancels_device");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
 
@@ -4417,7 +4429,7 @@ pub(crate) mod tests {
     #[test]
     fn post_release_oauth_observations_through_shell_dispatch_are_benign() {
         let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
-        let target = target();
+        let target = target_with_binding("release_shell_observations");
         let lease_key = LeaseKey::from_credential_identity(&target);
 
         lifecycle
@@ -4460,7 +4472,7 @@ pub(crate) mod tests {
         let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
         let authority =
             RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle.clone());
-        let target = target();
+        let target = target_with_binding("release_late_prune");
         let lease_key = LeaseKey::from_credential_identity(&target);
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
 
