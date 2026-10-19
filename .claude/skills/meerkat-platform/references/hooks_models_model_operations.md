@@ -142,14 +142,32 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
   estimated history or the forecast request reaches the threshold, or when
   request bytes reach 4/5 of min(`max_request_bytes`, provider cap). The input
   and forecast triggers wait `min_turns_between_compactions` model calls after
-  the previous attempt; the history and byte triggers do not.
+  the previous attempt; the byte trigger does not, and neither does the history
+  trigger while the last rewrite got the history under the threshold.
+- Since 0.9.4, when the last rewrite left the history at or above the
+  threshold (for example System rows larger than an explicit
+  `auto_compact_threshold`), a history crossing waits for the cadence instead
+  of paying for a summary at every model call, and a warning names the
+  remedies: raise `auto_compact_threshold` above that floor, omit it so it
+  derives from the model window, or shrink the System rows. Such a crossing
+  skips the cadence again only when the request no longer fits the model
+  window and the history added since that rewrite covers the overage (never
+  for a model that declares no window). 0.9.3 and earlier compacted again at
+  every model call.
 - Default threshold: 4/5 of min(context window, input ceiling) of the model the
   session was built with (800000 for 1M-token Claude models, 737600 for
   `gpt-6-astra`), or 100000 when the model declares no window. Mob profiles
   can set `auto_compact_threshold`.
-- The session's model (or the governed controller) writes the summary in one
-  call with no tools and no retries. The discarded history becomes one
-  `compaction_summary` user message starting "[Context compacted]"; system
+- The session's active model (after any model fallback) or the admitted
+  controller writes the summary in one call with no tools and no retries.
+  Since 0.9.4 its source is sized for that model: two bytes per token of its
+  context window left after `max_summary_tokens` (capped by a declared input
+  ceiling, less the prompt, at least 4 KiB); a model that declares no window
+  gets a quarter of the threshold, the 0.9.3 rule for every model. A larger
+  source is trimmed (tool results, then other context, then user requests,
+  each cut marked); if that still does not fit, only the newest user requests
+  that fit are sent, under a note that it carries the newest N of the M user
+  requests. The discarded history becomes one `compaction_summary` user message starting "[Context compacted]"; system
   prompts and up to `recent_turn_budget` recent complete turns stay. With a
   memory store attached, discarded messages are indexed for `memory_search`
   (summaries, injected context, tool results, notices and empty or
@@ -158,10 +176,20 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
   rewrites fails with `TranscriptRevisionRetired`.
 - Events: `compaction_started {input_tokens, estimated_history_tokens,
   message_count}`, `compaction_completed {summary_tokens, messages_before,
-  messages_after}`, `compaction_failed {reason}` (`reason.kind`: `llm_failed`,
+  messages_after, summary_source?, estimated_history_tokens_after?}`,
+  `compaction_failed {reason}` (`reason.kind`: `llm_failed`,
   `empty_summary`, `curator_failed`, `estimation_failed`,
   `memory_indexing_failed`, `transcript_rewrite_failed`,
   `projection_handoff_refused`).
+- `summary_source` (since 0.9.4) says who wrote the summary:
+  `{"kind": "provider_call", "source_bound": B}`, `{"kind": "host_curator"}`
+  or `{"kind": "mechanical_fallback"}`; only `provider_call` is a provider
+  request. B is `{"kind": "whole"}`, `{"kind": "trimmed", "through":
+  "tool_results" | "context" | "user_requests"}` (the last kind of text cut)
+  or `{"kind": "requests_only", "kept": N, "of": M}`.
+  `estimated_history_tokens_after` is the history estimate the rewrite left, in
+  the unit of `estimated_history_tokens`. Both are absent on completions
+  recorded before 0.9.4.
 - A failed compaction keeps the history and the run continues, but a provider
   policy stop ends the run, and a request still too large afterwards fails the
   turn with a non-retryable `RequestTooLarge` ("compaction is irreducible at
@@ -178,6 +206,12 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
   transcript, or the attempt fails with `CompactionError::InvalidRebuild`. On
   the facade `meerkat::AgentBuilder`, `compactor` makes `try_build` return a
   configuration error.
+  Since 0.9.4 a `Compactor` implements `prepare_for_summarization(messages,
+  budget: Option<SummarizationSourceBudget>)` with no default and returns a
+  `SummarizationSource` that states its bound; returning
+  `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+  keeps the 0.9.3 behaviour. `CompactionContext.last_rewrite_history_tokens`
+  feeds `should_compact`; `None` keeps the 0.9.3 decisions.
 - Anthropic server-side compaction is separate: `provider_params`
   `{"provider_tag": {"provider": "anthropic", "compaction": {"kind": "auto"}}}`.
 
