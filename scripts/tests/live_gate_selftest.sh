@@ -138,6 +138,9 @@ near_miss released "the product released held text chat" "$late" \
   "2026-10-19T06:21:39.000000Z  INFO meerkat_openai::public_live: public Live held text-chat context released token=7"
 near_miss no-answer "the provider never started the answer" '!(FNR > answer && /kind: "assistant_transcript_fragment"/)'
 near_miss no-turn "the provider started no turn" '!/kind: "turn_started"/'
+near_miss user-spoke "the user spoke after the answer started" "$late" "$(observed user_transcript_fragment)"
+near_miss user-spoke-unlowered "the provider transcribed user speech after the answer started" "$late" \
+  "2026-10-19T06:21:39.000000Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=9000.0 end_ms=9200.0"
 near_miss finished "the provider finished the answer" "$late" "$(observed turn_finished)"
 near_miss finished-unlowered "the provider finished the answer, observation not lowered" "$late" \
   "2026-10-19T06:21:39.000000Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:2 role=Assistant"
@@ -166,10 +169,12 @@ pinned "$public_live" '"public Live provider turn finished; queued for the trans
 pinned "$public_live" '"public Live sideband reflected output audio"'
 pinned "$public_live" "\"public Live text-chat context held: the model's response is audible\""
 pinned "$public_live" '"public Live held text-chat context released"'
+pinned "$public_live" '"public Live input transcript delta span"'
 broker=crates/meerkat-openai/src/gpt_live_broker.rs
 pinned "$broker" '.debug_struct("GptLiveBrokerObservation")'
 pinned "$broker" '.field("kind", &kind)'
-for kind in turn_started turn_finished assistant_transcript_fragment user_speech_over_assistant assistant_playback_restorable; do
+for kind in turn_started turn_finished assistant_transcript_fragment user_transcript_fragment user_speech_over_assistant \
+  assistant_playback_restorable; do
   pinned "$broker" "=> \"${kind}\","
 done
 pinned crates/meerkat-live/src/lib.rs 'pub const LIVE_CLOSE_TRACE_TARGET: &str = "meerkat::live_close";'

@@ -63,6 +63,9 @@ REFLECTED_OUTPUT_AUDIO = re.compile(r"public Live sideband reflected output audi
 TEXT_CHAT_HOLD = re.compile(r"public Live (?:text-chat context held|held text-chat context released)")
 # The channel closed or its observation stream ended.
 CHANNEL_END = re.compile(r"\bmeerkat::live_close: |experimental live adapter observation stream ended")
+# The provider transcribed user speech: a provider that yields to the user
+# goes quiet for a reason of its own.
+USER_TRANSCRIPT = re.compile(r"public Live input transcript delta span ")
 # The product's playback gate: user speech over the assistant ducks the
 # browser's playback, and a restorable playback lifts the duck.
 DUCK = "user_speech_over_assistant"
@@ -77,8 +80,8 @@ def provider_stalled(lines: list[str]) -> bool:
       flowing and no audible frame decoded (SPOKEN_OUTPUT_TIMEOUT);
     - the run holds or releases no text-chat context anywhere;
     - after the last turn the provider started, it sent assistant transcript
-      (the answer began), finished no turn, and its output audio kept
-      reaching the sideband;
+      (the answer began), transcribed no user speech, finished no turn, and
+      its output audio kept reaching the sideband;
     - the playback gate was open when that turn started (no duck, or the
       last duck restored) and never ducked or restored after it;
     - the channel did not close and its observation stream did not end
@@ -100,6 +103,8 @@ def provider_stalled(lines: list[str]) -> bool:
     after = lines[answer + 1 :]
     return (
         "assistant_transcript_fragment" in after_kinds
+        and "user_transcript_fragment" not in after_kinds
+        and not any(USER_TRANSCRIPT.search(line) for line in after)
         and "turn_finished" not in after_kinds
         and DUCK not in after_kinds
         and RESTORE not in after_kinds
