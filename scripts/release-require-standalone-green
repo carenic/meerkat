@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Require that the published crates' tests passed standalone at exactly the
-# release commit before any crate is published.
+# Check that the published crates' tests passed standalone at exactly a
+# given commit. No release job requires this yet: the release gate on it
+# returns once a nightly census run has passed and its duration is measured.
 #
-# Usage: release-require-standalone-green <release-commit-sha>
+# Usage: release-require-standalone-green <commit-sha>
 #
 # Succeeds once a run of .github/workflows/published-crates-standalone.yml in
 # this repository (GITHUB_REPOSITORY), on main, whose head is exactly
-# <release-commit-sha>, completed with conclusion success and a successful
+# <commit-sha>, completed with conclusion success and a successful
 # "Published crates standalone gate" job. A matching run that has not
 # completed is waited for, polling every MEERKAT_STANDALONE_POLL_SECONDS
 # (default 60), until MEERKAT_STANDALONE_WAIT_SECONDS (default 14400) have
 # passed since it started. No such run, a failed one, or an API failure
 # fails, naming the dispatch that produces the evidence:
 #   gh workflow run published-crates-standalone.yml --ref main
-# (run on main once the release commit is main's head).
+# (run on main once that commit is main's head).
 
 set -euo pipefail
 shopt -s inherit_errexit
@@ -46,7 +47,7 @@ log() {
 
 # id<TAB>status<TAB>conclusion ("none" before it concludes: read splits on
 # tabs and would drop an empty field)<TAB>started-epoch for every run of the
-# workflow at the release commit on main, newest first.
+# workflow at the commit on main, newest first.
 candidate_runs() {
   local listing
   listing="$(gh api \
@@ -105,7 +106,7 @@ while true; do
   done <<<"${runs}"
   if [[ "${pending}" -eq 0 ]]; then
     log "No successful published-crates-standalone.yml run at ${release_sha} on main."
-    log "Dispatch one on the release commit (main's head) and rerun this job:"
+    log "Dispatch one on main once that commit is main's head, then check again:"
     log "  gh workflow run published-crates-standalone.yml --ref main"
     exit 1
   fi

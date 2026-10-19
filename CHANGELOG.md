@@ -899,7 +899,11 @@ them.
   features, and passes with the features its
   `[package.metadata.meerkat.standalone-tests]` declares (meerkat,
   meerkat-runtime and meerkat-mob, whose packages now carry a README.md
-  that prints the command). Plain `cargo test` runs a binary's tests as
+  that prints the command). Those three also declare the 8 MiB test thread
+  stack the workspace runs them with, and their README command sets
+  `RUST_MIN_STACK=8388608`; no suite has been measured at Rust's 2 MiB
+  default, so the other 43 published crates' tests may need the same
+  setting. Plain `cargo test` runs a binary's tests as
   threads of one process, and three suites no longer collide there:
   meerkat's realtime pipeline tests take the process-wide open reservation
   one at a time, meerkat-rpc's callback-ownership tests give each case its
@@ -933,8 +937,8 @@ them.
   every test target's test names with the workspace's. Publication does not
   wait for it yet: the release gate on a passing run at the release commit
   returns once a nightly run has passed and its duration is measured.
-  `scripts/release-require-standalone-green` checks that a run passed at a
-  given commit.
+  `scripts/release-require-standalone-green` checks that a run on main passed
+  at a given commit.
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
   until Resume; a member spawned into a Stopped mob, or held again after a

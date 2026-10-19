@@ -316,7 +316,7 @@ repos:
         stages: [manual]
 
       - id: release-standalone-gate-contract
-        name: release crate publication requires the standalone census at the release commit
+        name: standalone census check passes only on a green main run at the given commit
         entry: scripts/test-release-require-standalone-green.sh
         language: script
         pass_filenames: false

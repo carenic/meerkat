@@ -323,6 +323,9 @@ ignored = ["which"]  # dev-dependency used in e2e tests
 # (scripts/published_crates_standalone.py) reads them from here.
 [package.metadata.meerkat.standalone-tests]
 features = ["local-authorization", "session-store", "session-compaction", "jsonl-store", "memory-store", "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "atif"]
+# The README's command sets this thread stack, the workspace's
+# (.cargo/config.toml [env]); the suite is not checked at Rust's 2 MiB default.
+min-stack = 8388608
 
 [lints]
 workspace = true

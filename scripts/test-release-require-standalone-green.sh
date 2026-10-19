@@ -2,9 +2,9 @@
 # Self-test for scripts/release-require-standalone-green with a stubbed `gh`
 # (no network).
 #
-# The release workflow publishes crates only after this check: it must accept
-# exactly a completed, successful published-crates-standalone.yml run on main
-# at the release commit whose gate job passed, wait for one still running,
+# The check must accept exactly a completed, successful
+# published-crates-standalone.yml run on main at the given commit whose gate
+# job passed, wait for one still running,
 # refuse every other run (another commit, another branch or repository, a
 # pull-request event, a failed run, a missing gate), and fail loudly when the
 # API fails instead of reporting "no evidence".
@@ -121,7 +121,7 @@ check() {
   printf '%s\n' "${output}"
 }
 
-# 1. A completed, successful run at the release commit whose gate passed.
+# 1. A completed, successful run at the given commit whose gate passed.
 reset
 runs "" "$(run_json 11 completed success)"
 jobs 11 success
