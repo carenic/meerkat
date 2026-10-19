@@ -49784,6 +49784,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
             format!("materialization_registration_owned:{session_id}")
         }
         RuntimeDriverError::Internal(reason) => format!("internal:{reason}"),
+        RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested } => {
+            format!("scoped_context_generation_not_advanced:{bound}:{requested}")
+        }
     }
 }
 

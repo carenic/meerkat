@@ -773,14 +773,7 @@ impl MobActor {
                 .member_revival_pending
                 .contains(&identity)
             && let Err(error) = self.apply_dsl_signal(
-                Self::member_revival_failure_signal(
-                    identity,
-                    format!(
-                        "machine-authorized revival of bridge session '{}' failed: {error}",
-                        work.session_id,
-                    ),
-                    &error,
-                ),
+                Self::member_revival_failure_signal(identity, &work.session_id, &error).0,
                 "resolve_warm_revival_failure",
             )
         {

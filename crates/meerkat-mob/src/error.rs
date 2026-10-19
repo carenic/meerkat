@@ -1408,6 +1408,39 @@ pub enum MobError {
         call: MemberRegistrationHookCall,
         reason: String,
     },
+
+    /// The member's runtime did not install, on the member's registration,
+    /// the destination its host selected. This is the runtime's answer, not
+    /// a host refusal: the cleanup of a refused restored registration never
+    /// settles it, so a restored member keeps its registration for a repair
+    /// that selects an advanced context generation. `error` is the runtime's
+    /// own verdict, unchanged: a selection whose context generation does not
+    /// advance past the one the registration is already bound at is
+    /// `RuntimeDriverError::ScopedContextGenerationNotAdvanced`.
+    #[error("member session {session_id} did not install its selected destination: {error}")]
+    MemberDestinationNotInstalled {
+        session_id: meerkat_core::types::SessionId,
+        error: meerkat_runtime::RuntimeDriverError,
+    },
+}
+
+/// The stable token of the runtime verdict a member's destination install
+/// got, for its wire data: only `scoped_context_generation_not_advanced` is
+/// repaired by selecting an advanced context generation.
+fn destination_install_refusal_cause(error: &meerkat_runtime::RuntimeDriverError) -> &'static str {
+    use meerkat_runtime::RuntimeDriverError as Verdict;
+    match error {
+        Verdict::ScopedContextGenerationNotAdvanced { .. } => {
+            "scoped_context_generation_not_advanced"
+        }
+        Verdict::ValidationFailed { .. } => "validation_failed",
+        Verdict::StaleAuthority { .. } => "stale_authority",
+        Verdict::NotFound { .. } => "not_found",
+        Verdict::NotReady { .. } => "not_ready",
+        Verdict::Destroyed => "destroyed",
+        Verdict::Internal(_) => "internal",
+        _ => "other",
+    }
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared
@@ -1682,6 +1715,25 @@ impl MobError {
                 "registration_removed": true,
                 "retryable": false,
             })),
+            // The runtime's answer, not a host refusal: the registration is
+            // kept, and the repair selects again with an advanced generation.
+            Self::MemberDestinationNotInstalled { session_id, error } => {
+                let generations = match error {
+                    meerkat_runtime::RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                        bound,
+                        requested,
+                    } => Some((*bound, *requested)),
+                    _ => None,
+                };
+                Some(serde_json::json!({
+                    "kind": "mob_member_destination_not_installed",
+                    "session_id": session_id.to_string(),
+                    "cause": destination_install_refusal_cause(error),
+                    "bound_generation": generations.map(|(bound, _)| bound),
+                    "requested_generation": generations.map(|(_, requested)| requested),
+                    "retryable": false,
+                }))
+            }
             Self::ForkMemberProvisionFailed {
                 member_id,
                 fork_session_id,
@@ -2078,7 +2130,8 @@ impl MobError {
             | Self::RuntimeEffectRefused { .. }
             // The host refused the restored member: only an explicit repair
             // brings it back.
-            | Self::MemberRegistrationRefused { .. } => MobFailureClass::RuntimeRejected,
+            | Self::MemberRegistrationRefused { .. }
+            | Self::MemberDestinationNotInstalled { .. } => MobFailureClass::RuntimeRejected,
             _ => MobFailureClass::MobRejected,
         }
     }
@@ -3067,5 +3120,49 @@ mod tests {
 
         assert_eq!(error.structured_data(), Some(expected));
         assert!(error.wire_detail().is_none());
+    }
+
+    #[test]
+    fn a_destination_the_runtime_did_not_install_projects_its_typed_data() {
+        let session_id = meerkat_core::SessionId::new();
+        let not_advanced = MobError::MemberDestinationNotInstalled {
+            session_id: session_id.clone(),
+            error: meerkat_runtime::RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                bound: 7,
+                requested: 7,
+            },
+        };
+        assert_eq!(
+            not_advanced.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_member_destination_not_installed",
+                "session_id": session_id.to_string(),
+                "cause": "scoped_context_generation_not_advanced",
+                "bound_generation": 7,
+                "requested_generation": 7,
+                "retryable": false,
+            }))
+        );
+        let other = MobError::MemberDestinationNotInstalled {
+            session_id: session_id.clone(),
+            error: meerkat_runtime::RuntimeDriverError::ValidationFailed {
+                reason: "a scoped destination requires the governed work host".to_string(),
+            },
+        };
+        assert_eq!(
+            other.structured_data(),
+            Some(serde_json::json!({
+                "kind": "mob_member_destination_not_installed",
+                "session_id": session_id.to_string(),
+                "cause": "validation_failed",
+                "bound_generation": null,
+                "requested_generation": null,
+                "retryable": false,
+            }))
+        );
+        assert_eq!(
+            not_advanced.failure_class(),
+            MobFailureClass::RuntimeRejected
+        );
     }
 }

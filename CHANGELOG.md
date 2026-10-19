@@ -69,12 +69,37 @@ them.
   `ensure_member_live` returns that refusal without asking the host again.
   A failure that is not the host's refusal keeps the restored registration
   for the repair to reuse, and a spawn that adopts a session registered
-  before it keeps that registration on a refusal.
+  before it keeps that registration on a refusal, as does the recovery of
+  an attached member's actor.
 - `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
   member_id, session_id, call, reason }`: a restored member's host refused
   its registration at `call` (see above). Its RPC error data has the kind
   `mob_member_registration_refused` with the refusing `hook_call`. Code that
   matches `MobError` exhaustively adds an arm.
+- `meerkat-mob`: `MobError` gains the variant `MemberDestinationNotInstalled {
+  session_id, error }`, appended last: the member's runtime did not install
+  the destination its host selected, and `error` is the runtime's own
+  verdict. It is the runtime's answer, not a host refusal: a restored member
+  keeps its registration. Such a failure was a `MobError::WiringError`
+  before. Its RPC error data has the kind
+  `mob_member_destination_not_installed` with the `session_id`, the runtime
+  verdict as a stable snake_case `cause` (for example
+  `scoped_context_generation_not_advanced` or `validation_failed`), the
+  `bound_generation` and `requested_generation` of a selection that does
+  not advance (null for any other cause) and `retryable: false`. A failed
+  revival's destination stays bound on the restored registration it keeps,
+  so a host's re-selection for that registration must advance
+  `context_generation`: a selection of the bound generation gets this
+  variant with the cause `scoped_context_generation_not_advanced`, and the
+  repair selects again with an advanced generation. Code that matches
+  `MobError` exhaustively adds an arm.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance past the bound one with the new
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound,
+  requested }`, appended last, instead of `RuntimeDriverError::Internal`.
+  `RuntimeDriverError` is `non_exhaustive`, so the variant itself breaks
+  no match.
 - `meerkat-contracts`: `MobMemberStatusResult` gains the field
   `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
   the wire unless a restored member's host refused its registration. Code

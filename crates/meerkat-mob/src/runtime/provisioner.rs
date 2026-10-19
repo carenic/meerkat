@@ -2275,6 +2275,10 @@ pub struct SessionBackend {
     // Optional host selection of each member's scoped destination; the
     // backend installs it on the member's exact registration.
     member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
+    // The routes of the surface gates this backend installed, shared by its
+    // clones, so a later transaction on a registration that kept its gate
+    // receives that gate's decision.
+    member_surface_gate_routes: super::registration_hook::MemberSurfaceGateRoutes,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -5712,6 +5716,7 @@ impl SessionBackend {
             disposal,
             settlement_ledger: None,
             member_runtime_registration_hook: None,
+            member_surface_gate_routes: Default::default(),
         }
     }
 
@@ -5733,7 +5738,13 @@ impl SessionBackend {
         self.runtime_adapter
             .as_ref()
             .zip(self.member_runtime_registration_hook.as_ref())
-            .map(|(machine, hook)| (Arc::clone(machine), Arc::clone(hook)))
+            .map(|(machine, hook)| {
+                (
+                    Arc::clone(machine),
+                    Arc::clone(hook),
+                    self.member_surface_gate_routes.clone(),
+                )
+            })
     }
 
     /// A cheap clone of this backend scoped to ONE provisioning attempt's
@@ -7960,7 +7971,7 @@ impl PreparedServiceActorTransaction {
                             .and_then(super::held_spawn::HeldProvisionBound::ended_failure)
                     };
                     let mut surface_check = None;
-                    if let Some((machine, hook)) = registration_composition {
+                    if let Some((machine, hook, gate_routes)) = registration_composition {
                         #[cfg(test)]
                         {
                             let hook = OWNED_CREATE_REGISTRATION_WITNESS_TEST_HOOKS
@@ -8023,6 +8034,7 @@ impl PreparedServiceActorTransaction {
                             Arc::clone(&hook),
                             &registration,
                             &identity,
+                            &gate_routes,
                             Some(transaction.surface_selection.clone()),
                             Some(refusals.clone()),
                         )
@@ -12906,6 +12918,7 @@ impl SessionBackend {
                         Arc::clone(hook),
                         &registration,
                         &identity,
+                        &backend.member_surface_gate_routes,
                         None,
                         None,
                     )

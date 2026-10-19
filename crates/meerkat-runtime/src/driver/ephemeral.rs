@@ -1455,15 +1455,30 @@ impl EphemeralRuntimeDriver {
             let mut authority = self.dsl.lock();
             let mut commit = || {
                 if let Some(input) = input.take() {
-                    applied = Some(mm_dsl::MeerkatMachineMutator::apply(&mut *authority, input));
+                    // The bound generation, read under the authority the
+                    // transition is decided under.
+                    let bound = authority.state().scoped_context_generation;
+                    applied = Some((
+                        bound,
+                        mm_dsl::MeerkatMachineMutator::apply(&mut *authority, input),
+                    ));
                 }
             };
             within(&mut commit)
         };
         match (applied, decided) {
-            (Some(applied), _) => {
+            (Some((bound, applied)), _) => {
                 let transition = applied.map_err(|err| {
-                    RuntimeDriverError::Internal(format!("DSL rejected BindScopedContext: {err:?}"))
+                    if generation <= bound {
+                        RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                            bound,
+                            requested: generation,
+                        }
+                    } else {
+                        RuntimeDriverError::Internal(format!(
+                            "DSL rejected BindScopedContext: {err:?}"
+                        ))
+                    }
                 })?;
                 self.absorb_dsl_effects(transition.effects());
                 Ok(())
@@ -5890,6 +5905,45 @@ mod tests {
         driver.with_dsl_state(|state| {
             assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
             assert_eq!(state.scoped_context_generation, 1);
+        });
+    }
+
+    /// A bind whose generation does not advance past the bound one is refused
+    /// with the typed answer naming both generations, and changes nothing.
+    #[test]
+    fn a_bind_that_does_not_advance_the_generation_is_refused_with_its_type() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("scoped-binding-generation"));
+        driver
+            .bind_scoped_context_within("binding-1".into(), "scope".into(), 3, |commit| {
+                commit();
+                Ok(())
+            })
+            .expect("the first binding commits");
+        for requested in [3, 2] {
+            let refused = driver.bind_scoped_context_within(
+                "binding-2".into(),
+                "scope".into(),
+                requested,
+                |commit| {
+                    commit();
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    refused,
+                    Err(RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                        bound: 3,
+                        requested: answered,
+                    }) if answered == requested
+                ),
+                "generation {requested} is refused with its type, got {refused:?}"
+            );
+        }
+        driver.with_dsl_state(|state| {
+            assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
+            assert_eq!(state.scoped_context_generation, 3);
         });
     }
 

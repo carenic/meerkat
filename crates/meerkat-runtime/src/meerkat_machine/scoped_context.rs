@@ -345,7 +345,9 @@ impl MeerkatMachine {
     ///
     /// `registration` must be this machine's exact current registration and
     /// `target` must name its runtime. The generation is the target's
-    /// `context_generation` and must advance; no run may be in flight. The
+    /// `context_generation` and must advance (a bind that does not is refused
+    /// with [`RuntimeDriverError::ScopedContextGenerationNotAdvanced`]); no
+    /// run may be in flight. The
     /// owner, runtime, context and audience form the document's stable scope:
     /// once bound, a rebind may only advance the generation of that same
     /// scope (no relabeling of the same session history). A replacement

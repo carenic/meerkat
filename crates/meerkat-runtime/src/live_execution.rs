@@ -1311,6 +1311,7 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             | E::ControllerInUse
             | E::NotFound { .. }
             | E::ValidationFailed { .. }
+            | E::ScopedContextGenerationNotAdvanced { .. }
             | E::InputIdempotencyConflict { .. }
             | E::RetainedResumeRefused { .. }
             | E::Destroyed

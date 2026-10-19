@@ -502,18 +502,14 @@ impl MobActor {
                     .member_revival_pending
                     .contains(&identity)
                 {
-                    let reason = format!(
-                        "machine-authorized revival of bridge session '{}' failed: {error}",
-                        work.rebuild.bridge_session_id
+                    let (signal, reason) = Self::member_revival_failure_signal(
+                        identity.clone(),
+                        &work.rebuild.bridge_session_id,
+                        &error,
                     );
-                    if let Err(error) = self.apply_dsl_signal(
-                        Self::member_revival_failure_signal(
-                            identity.clone(),
-                            reason.clone(),
-                            &error,
-                        ),
-                        "resolve_failed_explicit_resume_member",
-                    ) {
+                    if let Err(error) =
+                        self.apply_dsl_signal(signal, "resolve_failed_explicit_resume_member")
+                    {
                         self.retain_explicit_resume_error(error);
                     } else {
                         self.record_member_restore_failure(

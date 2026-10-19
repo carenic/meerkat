@@ -2258,6 +2258,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::WiringError(_) | MobError::RetirementTopologyIncomplete(_) => {
             mob_dsl::MobSpawnManyFailureObservationKind::WiringError
         }
+        // A destination install the runtime refused is the wiring failure
+        // it was before it was typed.
+        MobError::MemberDestinationNotInstalled { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::WiringError
+        }
         MobError::SupervisorRotationIncomplete { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SupervisorRotationIncomplete
         }

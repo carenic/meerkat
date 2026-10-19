@@ -152,12 +152,17 @@ async fn scoped_context_governs_admission_and_operations() {
         .bind_scoped_context(&registration, &target)
         .await
         .expect("bind the destination");
+    let refused = machine
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect_err("a rebind must advance the generation");
     assert!(
-        machine
-            .bind_scoped_context(&registration, &target)
-            .await
-            .is_err(),
-        "a rebind must advance the generation"
+        matches!(
+            refused,
+            RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }
+                if bound == target.context_generation && requested == target.context_generation
+        ),
+        "a rebind that does not advance the generation is refused with its type, got {refused:?}"
     );
     let mut foreign_runtime = target.clone();
     foreign_runtime.logical_runtime = EvidenceId::new("another-runtime").expect("id");

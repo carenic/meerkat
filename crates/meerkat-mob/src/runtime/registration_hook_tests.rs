@@ -20,6 +20,9 @@ struct SelectingHost {
     expected_seen: std::sync::Mutex<Vec<MemberRuntimeBuildIdentity>>,
     expected_calls: AtomicUsize,
     expected_generation: AtomicU64,
+    /// The context generation `select_destination` selects. A repair that
+    /// reuses a registration bound at it advances it.
+    selected_generation: AtomicU64,
     foreign_context: AtomicBool,
     surfaces: std::sync::Mutex<Vec<(String, usize)>>,
     refuse_surface: AtomicBool,
@@ -47,6 +50,7 @@ impl SelectingHost {
             expected_seen: Default::default(),
             expected_calls: AtomicUsize::new(0),
             expected_generation: AtomicU64::new(GENERATION),
+            selected_generation: AtomicU64::new(GENERATION),
             foreign_context: AtomicBool::new(false),
             surfaces: Default::default(),
             refuse_surface: AtomicBool::new(false),
@@ -111,7 +115,8 @@ impl crate::MemberRuntimeRegistrationHook for SelectingHost {
                 "the host's policy store is unavailable".into(),
             ));
         }
-        let mut selection = Self::selection(identity);
+        let mut selection =
+            Self::selection_at(identity, self.selected_generation.load(Ordering::SeqCst));
         if self.foreign_context.load(Ordering::SeqCst) {
             selection.context = EvidenceId::new("another-document").unwrap();
         }
@@ -376,7 +381,8 @@ async fn a_spawned_member_has_its_selected_destination_installed() {
 }
 
 /// A provision that installed its selection leaves the binding on the exact
-/// registration it prepared: a rebind of the same generation is refused.
+/// registration it prepared: a rebind of the same generation is refused, and
+/// the runtime's answer says so by its type.
 #[tokio::test]
 async fn a_provisioned_member_cannot_be_rebound_at_the_same_generation() {
     let (backend, _service, machine, host) = backend(false, false);
@@ -402,12 +408,19 @@ async fn a_provisioned_member_cannot_be_rebound_at_the_same_generation() {
         context_generation: GENERATION,
         audience: selection.audience,
     };
+    let refused = machine
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect_err("the selected destination is already bound at this generation");
     assert!(
-        machine
-            .bind_scoped_context(&registration, &target)
-            .await
-            .is_err(),
-        "the selected destination is already bound at this generation"
+        matches!(
+            refused,
+            meerkat_runtime::RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                bound: GENERATION,
+                requested: GENERATION,
+            }
+        ),
+        "a rebind at the bound generation is refused with the typed answer, got {refused:?}"
     );
     assert_bound_at(&machine, &id, GENERATION).await;
     machine.unregister_session(&id).await.unwrap();
@@ -1485,6 +1498,207 @@ async fn a_new_members_refusal_keeps_the_hosts_own_error() {
     removed(&machine, &id).await;
 }
 
+/// A restored registration keeps the surface gate an earlier revival
+/// installed when that revival failed after the gate decided (a build
+/// failure, not the host's refusal). The next revival's
+/// `prepare_member_surface` refusal is decided by that kept gate, and it
+/// reaches the revival that asks: the refused registration is removed and
+/// the refusal is typed.
+#[tokio::test]
+async fn a_prepared_surface_refusal_by_a_kept_gate_removes_the_restored_registration() {
+    let host = SelectingHost::new(false, false);
+    let member = restored_member(host.clone(), true).await;
+    member
+        .service
+        .set_create_session_failure(&member.session)
+        .await;
+
+    let first = member
+        .revive()
+        .await
+        .expect_err("the build fails after the host accepted every call");
+
+    assert!(
+        !matches!(first, MobError::MemberRegistrationRefused { .. }),
+        "a build failure is not the host's refusal, got {first:?}"
+    );
+    assert_eq!(
+        member.current().await.as_ref(),
+        Some(&member.restored),
+        "a failure that is not the host's refusal keeps the restored registration"
+    );
+    assert!(
+        member
+            .machine
+            .session_tool_surface_gate(&member.session)
+            .await
+            .is_some(),
+        "the kept registration keeps the gate the first revival installed"
+    );
+    assert_eq!(
+        host.prepared_surfaces.lock().unwrap().len(),
+        1,
+        "the first revival's gate asked the host once"
+    );
+    member
+        .service
+        .clear_create_session_failure(&member.session)
+        .await;
+    // The kept registration's destination stays bound at GENERATION, so the
+    // repair selects a later one.
+    host.selected_generation
+        .store(GENERATION + 1, Ordering::SeqCst);
+    host.refuse_prepared.store(true, Ordering::SeqCst);
+
+    let error = member
+        .revive()
+        .await
+        .expect_err("the host refused the prepared surface");
+
+    assert_eq!(
+        host.prepared_surfaces.lock().unwrap().len(),
+        2,
+        "the second revival asked the host about the prepared surface"
+    );
+    member.assert_refused_at(
+        &error,
+        crate::MemberRegistrationHookCall::PrepareMemberSurface,
+    );
+    assert!(
+        member.current().await.is_none(),
+        "the refused restored registration is removed"
+    );
+    assert!(
+        !member
+            .hooked
+            .has_session_ops_binding_for_test(&member.session),
+        "the refusal releases the restore's owner context"
+    );
+}
+
+/// A failure after the host accepted every call it was asked is not the
+/// host's refusal, even when its text reads like one: the restored
+/// registration and the owner context the restore bound to it stay for an
+/// explicit repair, and the caller gets the failure itself, untyped.
+#[tokio::test]
+async fn a_failure_whose_text_reads_like_a_refusal_keeps_the_restored_registration() {
+    let host = SelectingHost::new(false, false);
+    let member = restored_member(host.clone(), true).await;
+    member
+        .service
+        .set_create_session_failure_detail(
+            &member.session,
+            "the member's session store refused the session",
+        )
+        .await;
+
+    let error = member
+        .revive()
+        .await
+        .expect_err("the build fails after the host accepted every call");
+
+    assert!(
+        error.to_string().contains("refused"),
+        "the failure reads like a refusal: {error}"
+    );
+    assert!(
+        !matches!(error, MobError::MemberRegistrationRefused { .. }),
+        "a failure the host did not return is not its refusal, got {error:?}"
+    );
+    assert_eq!(
+        host.prepared_surfaces.lock().unwrap().len(),
+        1,
+        "the host accepted the prepared surface"
+    );
+    assert_eq!(
+        member.current().await.as_ref(),
+        Some(&member.restored),
+        "the restored registration stays current"
+    );
+    assert!(
+        member
+            .hooked
+            .has_session_ops_binding_for_test(&member.session),
+        "the restore's owner context is kept"
+    );
+    member
+        .machine
+        .unregister_session(&member.session)
+        .await
+        .unwrap();
+}
+
+/// A repair that reuses a restored registration whose earlier revival failed
+/// after its destination was installed selects a later context generation.
+/// A re-selection of the bound generation is refused, before anything is
+/// built, with the runtime's typed answer, and the registration stays for
+/// the repair; an advancing re-selection reuses it.
+#[tokio::test]
+async fn a_repair_of_a_kept_registration_must_advance_its_context_generation() {
+    let host = SelectingHost::new(false, false);
+    let member = restored_member(host.clone(), true).await;
+    member
+        .service
+        .set_create_session_failure(&member.session)
+        .await;
+    member
+        .revive()
+        .await
+        .expect_err("the build fails after the destination is installed");
+    member
+        .service
+        .clear_create_session_failure(&member.session)
+        .await;
+
+    let error = member
+        .revive()
+        .await
+        .expect_err("the bound generation cannot be selected again");
+
+    assert!(
+        matches!(
+            &error,
+            MobError::MemberDestinationNotInstalled {
+                session_id,
+                error: meerkat_runtime::RuntimeDriverError::ScopedContextGenerationNotAdvanced {
+                    bound: GENERATION,
+                    requested: GENERATION,
+                },
+            } if session_id == &member.session
+        ),
+        "the repair gets the runtime's typed answer, got {error:?}"
+    );
+    assert_eq!(
+        host.prepared_surfaces.lock().unwrap().len(),
+        1,
+        "the refused re-selection built nothing"
+    );
+    assert_eq!(
+        member.current().await.as_ref(),
+        Some(&member.restored),
+        "the restored registration stays for the repair"
+    );
+    assert!(
+        member
+            .hooked
+            .has_session_ops_binding_for_test(&member.session)
+    );
+
+    host.selected_generation
+        .store(GENERATION + 1, Ordering::SeqCst);
+    member
+        .revive()
+        .await
+        .expect("an advancing re-selection reuses the restored registration");
+
+    assert_eq!(
+        member.current().await.as_ref(),
+        Some(&member.restored),
+        "the repair revived the member on the restored registration"
+    );
+    assert_bound_at(&member.machine, &member.session, GENERATION + 1).await;
+}
+
 /// A hooked member, a cold restart, and the mob resumed over the same durable
 /// state with `second_boot` as its host. A mob running at the crash restores
 /// the member at boot, asking `second_boot`. A stopped one prepares the
@@ -1557,6 +1771,21 @@ impl RebootedMob {
                 }
             ),
             "expected the typed select_destination refusal, got {error:?}"
+        );
+    }
+
+    /// The typed refusal carries the host's own reason, as the revival it
+    /// refused answered it, not that answer nested in itself.
+    #[track_caller]
+    fn assert_host_reason(error: &MobError) {
+        let host_reason =
+            MobError::WiringError("host deliberately refused the member".into()).to_string();
+        assert!(
+            matches!(
+                error,
+                MobError::MemberRegistrationRefused { reason, .. } if reason == &host_reason
+            ),
+            "expected the host's own reason {host_reason:?}, got {error:?}"
         );
     }
 
@@ -1638,6 +1867,7 @@ async fn an_explicit_resume_refused_by_the_host_leaves_the_member_broken_with_th
         .await
         .expect_err("the member stays refused");
     RebootedMob::assert_refused(&again);
+    RebootedMob::assert_host_reason(&again);
     let _ = rebooted.resumed.stop().await;
 }
 
@@ -1739,6 +1969,12 @@ async fn a_member_its_host_refuses_to_revive_stays_broken_with_the_typed_refusal
         host.seen.lock().unwrap().len(),
         asked + 1,
         "a repeat ask is answered without asking the host"
+    );
+    RebootedMob::assert_host_reason(&first);
+    assert_eq!(
+        again.to_string(),
+        first.to_string(),
+        "the repeat answers exactly the first refusal"
     );
     let _ = mob.handle.stop().await;
 }

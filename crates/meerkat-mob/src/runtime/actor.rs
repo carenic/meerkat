@@ -10912,26 +10912,37 @@ impl MobActor {
         Ok(())
     }
 
-    /// The signal that records a failed revival of `agent_identity`. A host
-    /// refusal of the member's registration keeps its typed code: the member
-    /// stays Broken with it until an explicit repair.
+    /// The signal that records a failed revival of `agent_identity`'s
+    /// session `session_id`, with the reason it records. A host refusal of
+    /// the member's registration keeps its typed code and the host's own
+    /// reason, so every later answer repeats the first: the member stays
+    /// Broken with it until an explicit repair.
     pub(super) fn member_revival_failure_signal(
         agent_identity: mob_dsl::AgentIdentity,
-        reason: String,
+        session_id: &SessionId,
         error: &MobError,
-    ) -> mob_dsl::MobMachineSignal {
+    ) -> (mob_dsl::MobMachineSignal, String) {
         match error {
-            MobError::MemberRegistrationRefused { call, .. } => {
+            MobError::MemberRegistrationRefused { call, reason, .. } => (
                 mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
                     agent_identity,
                     refusal_code: call.as_code().to_string(),
+                    reason: reason.clone(),
+                },
+                reason.clone(),
+            ),
+            _ => {
+                let reason = format!(
+                    "machine-authorized revival of bridge session '{session_id}' failed: {error}"
+                );
+                (
+                    mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
+                        agent_identity,
+                        reason: reason.clone(),
+                    },
                     reason,
-                }
+                )
             }
-            _ => mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
-                agent_identity,
-                reason,
-            },
         }
     }
 
