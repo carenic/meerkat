@@ -1264,6 +1264,13 @@ pub(super) enum MobCommand {
         observed_tx: oneshot::Sender<Result<MobState, MobError>>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
+    /// Test-only: an actor-owned member-live task that ends only once
+    /// `release_rx` resolves, so a Shutdown's inline drain joins it until then.
+    #[cfg(test)]
+    SpawnHeldLiveMutationForTest {
+        release_rx: oneshot::Receiver<()>,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
     #[cfg(test)]
     ParkActorForObservationTest {
         entered_tx: oneshot::Sender<()>,
@@ -1898,6 +1905,8 @@ impl MobCommand {
                 ShutdownAnswerClass::CallerRequest
             }
             #[cfg(test)]
+            Self::SpawnHeldLiveMutationForTest { .. } => ShutdownAnswerClass::CallerRequest,
+            #[cfg(test)]
             Self::SpawnLiveMutationSendingCompletionForTest { .. } => {
                 ShutdownAnswerClass::CallerRequest
             }
@@ -2105,6 +2114,8 @@ impl MobCommand {
             Self::SpawnLiveMutationAwaitingActorForTest { .. } => {
                 "SpawnLiveMutationAwaitingActorForTest"
             }
+            #[cfg(test)]
+            Self::SpawnHeldLiveMutationForTest { .. } => "SpawnHeldLiveMutationForTest",
             #[cfg(test)]
             Self::HonourCompletionForTest { .. } => "HonourCompletionForTest",
             #[cfg(test)]

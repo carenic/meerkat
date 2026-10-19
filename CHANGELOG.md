@@ -39,8 +39,9 @@ them.
 
 - Behaviour-only (not measured by the gate): an admitted `MobHandle::shutdown`
   or `MobHandle::shutdown_with_report` closes the mob's admission before its
-  teardown (see Fixed). While that Shutdown is parked on its members' stops or
-  on its runtime teardown, a command the Closing state refuses is refused with
+  teardown (see Fixed). From the Shutdown's admission (while it drains its own
+  work, and while it is parked on its members' stops or on its runtime
+  teardown), a command the Closing state refuses is refused with
   `MobError::AdmissionClosed` (reason `MobAdmissionCloseReason::Shutdown`): a
   spawn, respawn, work submission or flow run got
   `MobError::ActorCommandChannelClosed` there, and the other refused commands

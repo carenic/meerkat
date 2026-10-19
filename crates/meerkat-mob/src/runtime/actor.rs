@@ -7890,8 +7890,9 @@ pub(super) enum MemberLiveMutationTarget {
 }
 
 pub(super) enum MemberLiveMutationCompletion {
-    /// Test-only task that awaited this actor's reply (see
-    /// `MobCommand::SpawnLiveMutationAwaitingActorForTest`); it owns no effect.
+    /// Test-only task that awaited this actor's reply or a test's release
+    /// (see `MobCommand::SpawnLiveMutationAwaitingActorForTest` and
+    /// `MobCommand::SpawnHeldLiveMutationForTest`); it owns no effect.
     #[cfg(test)]
     AwaitedActorForTest,
     Open {
@@ -18644,6 +18645,13 @@ impl MobActor {
         );
     }
 
+    /// Once admission has closed, what a refused command's
+    /// `MobError::AdmissionClosed` carries: the mob id and the close reason.
+    fn admission_closed_refusal(&self) -> Option<(MobId, MobAdmissionCloseReason)> {
+        self.admission_closed
+            .map(|reason| (self.definition.id.clone(), reason))
+    }
+
     fn shutdown_in_progress(&self) -> bool {
         self.pending_shutdown_teardown.is_some()
             || self
@@ -19043,9 +19051,17 @@ impl MobActor {
         if result.is_ok() {
             let mut retained = std::mem::take(&mut self.retained_actor_completions);
             let mut received = 0;
+            let closed = self.admission_closed_refusal();
             let tail = Box::pin(self.shutdown_actor_owned_background_work());
-            Self::serve_refusals_while(command_rx, &mut joined, &mut retained, &mut received, tail)
-                .await;
+            Self::serve_refusals_while(
+                command_rx,
+                &mut joined,
+                &mut retained,
+                &mut received,
+                closed.as_ref(),
+                tail,
+            )
+            .await;
             self.retained_actor_completions = retained;
             self.public_owner_release_backlog =
                 self.public_owner_release_backlog.saturating_sub(received);
@@ -22685,17 +22701,22 @@ impl MobActor {
     /// Safe to call repeatedly; all task sets and optional handles are drained.
     /// Run `work` (a Shutdown step that joins actor-owned tasks) while still
     /// answering every command that reaches the actor: a Shutdown joins this
-    /// one, a caller request is refused typed as `ActorCommandChannelClosed`
-    /// (the answer it gets a moment later anyway), and an actor completion is
-    /// retained in `retained` for the actor to process after the step. A joined task may have sent this
-    /// actor a command and await its reply; served this way, it can never wait
-    /// on the actor that is joining it (in production the actor otherwise wedged in an
-    /// inline Shutdown join until SIGKILL).
+    /// one, a caller request is refused typed, and an actor completion is
+    /// retained in `retained` for the actor to process after the step. A
+    /// command the Closing state refuses gets `AdmissionClosed` with the
+    /// `closed` reason (the Shutdown closed admission before this step), the
+    /// answer it gets once the Shutdown parks; any other caller request gets
+    /// `ActorCommandChannelClosed` (the answer it gets a moment later anyway).
+    /// A joined task may have sent this actor a command and await its reply;
+    /// served this way, it can never wait on the actor that is joining it (in
+    /// production the actor otherwise wedged in an inline Shutdown join until
+    /// SIGKILL).
     async fn serve_refusals_while<F>(
         command_rx: &mut mpsc::Receiver<RoutedMobCommand>,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
         received: &mut usize,
+        closed: Option<&(MobId, MobAdmissionCloseReason)>,
         work: F,
     ) -> F::Output
     where
@@ -22711,14 +22732,14 @@ impl MobActor {
                     // before the step ended is retained, not left behind.
                     while let Ok(routed) = command_rx.try_recv() {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed);
                     }
                     return output;
                 }
                 routed = command_rx.recv(), if channel_open => match routed {
                     Some(routed) => {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed);
                     }
                     None => channel_open = false,
                 },
@@ -22727,18 +22748,29 @@ impl MobActor {
     }
 
     /// One command reaching the actor while a Shutdown step joins its work:
-    /// a Shutdown joins it, a caller request is refused typed, an actor
-    /// completion is retained for processing (never refused).
+    /// a Shutdown joins it, a caller request is refused typed (with the close
+    /// reason when the Closing state refuses it), an actor completion is
+    /// retained for processing (never refused).
     fn answer_while_shutting_down(
         routed: RoutedMobCommand,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
+        closed: Option<&(MobId, MobAdmissionCloseReason)>,
     ) {
         match routed.cmd {
             MobCommand::Shutdown { reply_tx, .. } => joined.push(LifecycleReplyTx::Unit(reply_tx)),
             cmd => match cmd.shutdown_answer_class() {
                 super::state::ShutdownAnswerClass::CallerRequest => {
-                    cmd.reject_with_error(MobError::ActorCommandChannelClosed);
+                    let error = match closed {
+                        Some((mob_id, reason)) if cmd.refused_while_admission_closed() => {
+                            MobError::AdmissionClosed {
+                                mob_id: mob_id.clone(),
+                                reason: *reason,
+                            }
+                        }
+                        _ => MobError::ActorCommandChannelClosed,
+                    };
+                    cmd.reject_with_error(error);
                 }
                 super::state::ShutdownAnswerClass::ActorCompletion => {
                     retained.push_back(RoutedMobCommand {
@@ -27495,6 +27527,17 @@ impl MobActor {
                     let _ = reply_tx.send(Ok(()));
                 }
                 #[cfg(test)]
+                MobCommand::SpawnHeldLiveMutationForTest {
+                    release_rx,
+                    reply_tx,
+                } => {
+                    self.member_live_mutation_tasks.spawn(async move {
+                        let _ = release_rx.await;
+                        MemberLiveMutationCompletion::AwaitedActorForTest
+                    });
+                    let _ = reply_tx.send(Ok(()));
+                }
+                #[cfg(test)]
                 MobCommand::ParkActorForObservationTest {
                     entered_tx,
                     release_rx,
@@ -28469,11 +28512,13 @@ impl MobActor {
                     let mut joined = Vec::new();
                     let mut retained = std::mem::take(&mut self.retained_actor_completions);
                     let mut received = 0;
+                    let closed = self.admission_closed_refusal();
                     let drained = Self::serve_refusals_while(
                         command_rx,
                         &mut joined,
                         &mut retained,
                         &mut received,
+                        closed.as_ref(),
                         Box::pin(async {
                             self.drain_wiring_io_for_lifecycle().await;
                             self.drain_member_effects_for_lifecycle().await?;

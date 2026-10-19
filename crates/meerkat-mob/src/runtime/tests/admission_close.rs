@@ -843,6 +843,58 @@ async fn a_dispatch_failure_closes_admission() {
     }
 }
 
+/// While the admitted Shutdown still joins actor work inline (here a held
+/// member-live task), a command the Closing state refuses is answered with
+/// the close reason, the answer it gets once the Shutdown parks, not as a
+/// closed channel: the actor is alive, and its Shutdown can still fail.
+#[tokio::test]
+async fn a_spawn_during_the_shutdown_drain_is_refused_with_the_close_reason() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-shutdown-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let spawned = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::SpawnHeldLiveMutationForTest {
+            release_rx,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue the held task");
+    tokio::time::timeout(STEP, spawned)
+        .await
+        .expect("the held task is spawned")
+        .expect("spawn reply")
+        .expect("spawn the held task");
+    let mut admitted = handle.lifecycle_observations.shutdown_admitted.subscribe();
+
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(STEP, admitted.wait_for(|admitted| *admitted))
+        .await
+        .expect("the Shutdown is admitted")
+        .expect("the observation outlives the test");
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn_spec(worker_spec("d67-shutdown-drain-late")),
+    )
+    .await
+    .expect("the actor answers a spawn while it drains");
+    match late {
+        Ok(_) => panic!("a shutting-down mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "the Shutdown still joins the held task"
+    );
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect("the Shutdown finishes");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {
