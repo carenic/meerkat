@@ -5221,7 +5221,10 @@ impl MeerkatMachine {
                 None
             };
 
-            let should_wake = {
+            // The commit outcome deadline is read here, once, before any
+            // boundary commit of this loop can hold the driver lock: the
+            // loop's deadline path takes neither the driver lock nor M.
+            let (should_wake, commit_deadline) = {
                 let mut driver_guard = driver.lock().await;
                 driver_guard.sync_control_projection_from_dsl_authority();
                 if repaired_dead_attachment {
@@ -5230,8 +5233,14 @@ impl MeerkatMachine {
                         "runtime driver registration was repaired by generated executor authority; publishing attachment"
                     );
                 }
-                !driver_guard.as_driver().active_input_ids().is_empty()
+                (
+                    !driver_guard.as_driver().active_input_ids().is_empty(),
+                    driver_guard.runtime_loop_commit_deadline(),
+                )
             };
+            #[cfg(any(test, feature = "test-support"))]
+            let commit_deadline = commit_deadline
+                .map(|commit_deadline| self.runtime_commit_deadline_for_test(commit_deadline));
 
             // Wire persistence before startup recovery. Lifecycle revival is
             // deliberately persisted only by the later exact commit: a failed
@@ -5319,6 +5328,7 @@ impl MeerkatMachine {
                     Arc::downgrade(self),
                     session_id.clone(),
                     turn_finalization_boundary_already_held,
+                    commit_deadline,
                 ),
             );
             // Take both startup capabilities before the next await. Dropping

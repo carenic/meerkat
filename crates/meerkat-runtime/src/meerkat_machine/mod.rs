@@ -7396,6 +7396,35 @@ impl MeerkatMachine {
         parked_rx
     }
 
+    /// Measure the commit outcome declarations of the runtime loops this
+    /// machine starts from now on in busy windows of `window` (test support).
+    /// A store declares its deadline as a sum of busy windows, so this
+    /// shortens each window and keeps the declaration; it does not override
+    /// the deadline.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_runtime_commit_busy_window_for_test(&self, window: std::time::Duration) {
+        *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn runtime_commit_deadline_for_test(
+        &self,
+        commit_deadline: crate::runtime_loop::RuntimeLoopCommitDeadline,
+    ) -> crate::runtime_loop::RuntimeLoopCommitDeadline {
+        let window = *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match window {
+            Some(window) => commit_deadline.with_busy_window(window),
+            None => commit_deadline,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn note_mutation_gate_wait_for_test(&self, session_id: &SessionId, gate: &SessionMutationGate) {
         if gate.try_lock().is_ok() {
@@ -10382,6 +10411,10 @@ pub struct MeerkatMachineShared {
     #[cfg(any(test, feature = "test-support"))]
     test_mutation_gate_wait_observer:
         StdMutex<Option<(SessionId, crate::tokio::sync::oneshot::Sender<()>)>>,
+    /// Test seam: the busy window this machine's runtime loops measure their
+    /// stores' commit outcome declarations in.
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_commit_busy_window: StdMutex<Option<std::time::Duration>>,
     /// Test probe: how many ready-gated waiters left on the degradation
     /// signal and handed the degraded settlement to a process-owned task.
     #[cfg(test)]
@@ -12175,6 +12208,8 @@ impl MeerkatMachine {
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -12413,6 +12448,8 @@ impl MeerkatMachine {
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
@@ -13179,6 +13216,9 @@ mod terminal_receipt_tests;
 
 #[cfg(test)]
 mod durability_gate_wait_tests;
+
+#[cfg(test)]
+mod commit_deadline_tests;
 
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;

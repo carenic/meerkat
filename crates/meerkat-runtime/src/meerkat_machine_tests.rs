@@ -4461,13 +4461,13 @@ async fn completion_waiter_fails_closed_when_runtime_finalization_fails() {
     .expect_err("a rejected durable boundary must not publish a terminal outcome");
 
     match completion_error {
-        crate::completion::CompletionWaitError::AuthorityUnavailable(detail) => {
+        crate::completion::CompletionWaitError::BoundaryRolledBack { detail, .. } => {
             assert!(
                 detail.contains("synthetic atomic_apply failure"),
-                "mechanical waiter failure must retain the durable commit cause: {detail}"
+                "the typed waiter failure must retain the durable commit cause: {detail}"
             );
         }
-        other => panic!("expected authority-unavailable waiter failure, got {other:?}"),
+        other => panic!("expected a rolled-back boundary waiter failure, got {other:?}"),
     }
 }
 
@@ -4620,10 +4620,10 @@ async fn directed_machine_terminal_commit_failure_fails_waiter_without_publicati
     assert!(
         matches!(
             completion_error,
-            crate::completion::CompletionWaitError::AuthorityUnavailable(ref detail)
+            crate::completion::CompletionWaitError::BoundaryRolledBack { ref detail, .. }
                 if detail.contains("atomic_apply_with_machine_lifecycle")
         ),
-        "mechanical waiter failure must retain the rejected atomic seam: {completion_error:?}"
+        "the typed waiter failure must retain the rejected atomic seam: {completion_error:?}"
     );
 
     let events = publisher
@@ -4737,10 +4737,10 @@ async fn nondirected_machine_terminal_commit_failure_fails_waiter_without_termin
     assert!(
         matches!(
             completion_error,
-            crate::completion::CompletionWaitError::AuthorityUnavailable(ref detail)
+            crate::completion::CompletionWaitError::BoundaryRolledBack { ref detail, .. }
                 if detail.contains("atomic_apply_with_machine_lifecycle")
         ),
-        "mechanical waiter failure must retain the rejected atomic seam: {completion_error:?}"
+        "the typed waiter failure must retain the rejected atomic seam: {completion_error:?}"
     );
 }
 
@@ -34712,8 +34712,70 @@ fn machine_terminal_receipt(
     }
 }
 
-struct RuntimeCommitAtomicityStore {
+/// A store commit held until the test releases it: it reports that it was
+/// entered, then commits or fails as released (a dropped release fails it).
+pub(super) struct HeldStoreCommit {
+    /// The input whose commit this hold takes; other commits pass.
+    input_id: InputId,
+    entered: Arc<Notify>,
+    release: tokio::sync::oneshot::Receiver<HeldStoreCommitRelease>,
+}
+
+/// How a held store commit ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeldStoreCommitRelease {
+    /// The commit reaches the inner store.
+    Commit,
+    /// The commit fails with a store write error and commits nothing.
+    Fail,
+}
+
+/// The test's end of a [`HeldStoreCommit`].
+pub(super) struct HeldStoreCommitControl {
+    pub(super) entered: Arc<Notify>,
+    release: tokio::sync::oneshot::Sender<HeldStoreCommitRelease>,
+}
+
+impl HeldStoreCommitControl {
+    pub(super) fn release(self, release: HeldStoreCommitRelease) {
+        let _ = self.release.send(release);
+    }
+}
+
+impl HeldStoreCommit {
+    fn armed(input_id: &InputId) -> (Self, HeldStoreCommitControl) {
+        let entered = Arc::new(Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                input_id: input_id.clone(),
+                entered: Arc::clone(&entered),
+                release: release_rx,
+            },
+            HeldStoreCommitControl {
+                entered,
+                release: release_tx,
+            },
+        )
+    }
+
+    async fn wait(self) -> HeldStoreCommitRelease {
+        self.entered.notify_one();
+        self.release.await.unwrap_or(HeldStoreCommitRelease::Fail)
+    }
+}
+
+pub(super) struct RuntimeCommitAtomicityStore {
     inner: Arc<crate::store::InMemoryRuntimeStore>,
+    /// The commit outcome deadline this store declares; `None` forwards the
+    /// inner store's declaration.
+    declared_commit_outcome_deadline: std::sync::Mutex<Option<Duration>>,
+    /// Holds the next success boundary commit before it commits.
+    success_boundary_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
+    /// Holds the next machine lifecycle commit before it commits.
+    machine_lifecycle_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
+    /// How long every success boundary commit takes before it commits.
+    success_boundary_delay: std::sync::Mutex<Option<Duration>>,
     fail_atomic_apply: AtomicBool,
     unsupported_atomic_machine_lifecycle: AtomicBool,
     fail_commit_machine_lifecycle: AtomicBool,
@@ -34743,9 +34805,13 @@ struct RuntimeCommitAtomicityStore {
 }
 
 impl RuntimeCommitAtomicityStore {
-    fn pass_through(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
+    pub(super) fn pass_through(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
         Self {
             inner,
+            declared_commit_outcome_deadline: std::sync::Mutex::new(None),
+            success_boundary_hold: std::sync::Mutex::new(None),
+            machine_lifecycle_hold: std::sync::Mutex::new(None),
+            success_boundary_delay: std::sync::Mutex::new(None),
             fail_atomic_apply: AtomicBool::new(false),
             unsupported_atomic_machine_lifecycle: AtomicBool::new(false),
             fail_commit_machine_lifecycle: AtomicBool::new(false),
@@ -34869,6 +34935,50 @@ impl RuntimeCommitAtomicityStore {
         store
     }
 
+    /// Declare `deadline` as this store's commit outcome deadline.
+    pub(super) fn declare_commit_outcome_deadline(&self, deadline: Duration) {
+        *self
+            .declared_commit_outcome_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(deadline);
+    }
+
+    /// Hold the next success boundary commit of `input_id`'s run until the
+    /// returned control releases it.
+    pub(super) fn hold_next_success_boundary_commit(
+        &self,
+        input_id: &InputId,
+    ) -> HeldStoreCommitControl {
+        let (hold, control) = HeldStoreCommit::armed(input_id);
+        *self
+            .success_boundary_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        control
+    }
+
+    /// Hold the next machine lifecycle commit that persists `input_id` until
+    /// the returned control releases it.
+    pub(super) fn hold_next_machine_lifecycle_commit(
+        &self,
+        input_id: &InputId,
+    ) -> HeldStoreCommitControl {
+        let (hold, control) = HeldStoreCommit::armed(input_id);
+        *self
+            .machine_lifecycle_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        control
+    }
+
+    /// Make every success boundary commit take `delay` before it commits.
+    pub(super) fn delay_success_boundary_commits(&self, delay: Duration) {
+        *self
+            .success_boundary_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(delay);
+    }
+
     fn arm_block_initialize_ops_after_selection(&self, entered: Arc<Notify>, release: Arc<Notify>) {
         *self
             .block_initialize_ops_after_selection
@@ -34943,6 +35053,14 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         RuntimeStore::session_boundary_authority_read_cost(self.inner.as_ref())
     }
 
+    fn commit_outcome_deadline(&self) -> Option<Duration> {
+        let declared = *self
+            .declared_commit_outcome_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        declared.or_else(|| RuntimeStore::commit_outcome_deadline(self.inner.as_ref()))
+    }
+
     async fn commit_prepared_session_boundary(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -34952,6 +35070,34 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         use crate::store::PreparedRuntimeSessionCommitKind;
 
         let kind = request.kind();
+        if matches!(kind, PreparedRuntimeSessionCommitKind::Success) {
+            let delay = *self
+                .success_boundary_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let hold = {
+                let mut slot = self
+                    .success_boundary_hold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let targets_this_run = slot.as_ref().is_some_and(|hold| {
+                    request.receipt().is_some_and(|receipt| {
+                        receipt.contributing_input_ids.contains(&hold.input_id)
+                    })
+                });
+                if targets_this_run { slot.take() } else { None }
+            };
+            if let Some(hold) = hold
+                && hold.wait().await == HeldStoreCommitRelease::Fail
+            {
+                return Err(crate::store::RuntimeStoreError::WriteFailed(
+                    "synthetic held boundary commit failure".into(),
+                ));
+            }
+        }
         if request.session().is_some() {
             self.session_snapshot_commits.fetch_add(1, Ordering::SeqCst);
         }
@@ -35379,6 +35525,29 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         {
             return Err(crate::store::RuntimeStoreError::WriteFailed(
                 "synthetic commit_machine_lifecycle failure".into(),
+            ));
+        }
+        let hold = {
+            let mut slot = self
+                .machine_lifecycle_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let persists_the_input = slot.as_ref().is_some_and(|hold| {
+                input_states
+                    .iter()
+                    .any(|record| record.as_stored().state.input_id == hold.input_id)
+            });
+            if persists_the_input {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hold) = hold
+            && hold.wait().await == HeldStoreCommitRelease::Fail
+        {
+            return Err(crate::store::RuntimeStoreError::WriteFailed(
+                "synthetic held commit_machine_lifecycle failure".into(),
             ));
         }
         let unregister_progress = commit.snapshot().unregister_progress().map(|progress| {

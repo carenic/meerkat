@@ -1019,6 +1019,184 @@ async fn finalize_publish_and_resolve_runtime_terminals(
     result
 }
 
+/// How long a runtime loop waits for an owned boundary commit or run
+/// terminalization of a persistent session before it stops waiting: the
+/// store's declared commit outcome deadline, with the session durability
+/// health that a missed deadline degrades. Read once when the loop starts,
+/// before any of its commits can hold the session driver lock.
+#[derive(Clone)]
+pub(crate) struct RuntimeLoopCommitDeadline {
+    deadline: std::time::Duration,
+    durability_health: crate::meerkat_machine::DurabilityHealthHandle,
+}
+
+impl RuntimeLoopCommitDeadline {
+    pub(crate) fn new(
+        deadline: std::time::Duration,
+        durability_health: crate::meerkat_machine::DurabilityHealthHandle,
+    ) -> Self {
+        Self {
+            deadline,
+            durability_health,
+        }
+    }
+
+    /// The same declaration measured in busy windows of `window` instead of
+    /// [`crate::store::COMMIT_BUSY_WINDOW`] (test support). Every declaration
+    /// is a sum of busy windows, so this shortens each of them; it does not
+    /// replace the store's declaration.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_busy_window(self, window: std::time::Duration) -> Self {
+        let scale = window.as_secs_f64() / crate::store::COMMIT_BUSY_WINDOW.as_secs_f64();
+        Self {
+            deadline: self.deadline.mul_f64(scale),
+            ..self
+        }
+    }
+}
+
+/// What the runtime loop learned from an owned commit or terminalization
+/// child.
+enum OwnedRuntimeLoopChildWait<T> {
+    /// The child reported its outcome and handed M back.
+    Settled(crate::tokio::sync::OwnedMutexGuard<()>, T),
+    /// The store reported no durable outcome within its declared deadline.
+    /// The loop stopped waiting and marked the session reload-required; the
+    /// child keeps running, keeps M, and settles its carrier when the store
+    /// answers.
+    PastDeadline,
+}
+
+#[derive(Clone, Copy)]
+enum OwnedRuntimeLoopChild {
+    Commit,
+    Terminalization,
+}
+
+impl OwnedRuntimeLoopChild {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Terminalization => "terminalization",
+        }
+    }
+
+    fn deadline_operation(self) -> &'static str {
+        match self {
+            Self::Commit => "runtime_commit_deadline",
+            Self::Terminalization => "runtime_terminalization_deadline",
+        }
+    }
+
+    fn mark_past_deadline(self, teardown_slot: &RuntimeLoopTeardownSlot, run_id: &RunId) -> bool {
+        match self {
+            Self::Commit => teardown_slot.mark_owned_commit_past_deadline(run_id),
+            Self::Terminalization => teardown_slot.mark_owned_terminalization_past_deadline(run_id),
+        }
+    }
+
+    fn settled<T, E: std::fmt::Display>(
+        self,
+        joined: Result<(crate::tokio::sync::OwnedMutexGuard<()>, T), E>,
+    ) -> Result<OwnedRuntimeLoopChildWait<T>, crate::RuntimeDriverError> {
+        joined
+            .map(|(guard, outcome)| OwnedRuntimeLoopChildWait::Settled(guard, outcome))
+            .map_err(|error| {
+                crate::RuntimeDriverError::Internal(format!(
+                    "owned runtime-loop {} task ended before publishing its outcome: {error}",
+                    self.name()
+                ))
+            })
+    }
+}
+
+/// Wait for an owned commit or terminalization child, within the runtime
+/// loop's commit outcome deadline when the session has one.
+///
+/// The child is never aborted: it owns M and the payload, and a store may
+/// commit on a blocking worker that dropping an await cannot stop. Past the
+/// deadline this moves the run's carrier to its past-deadline state, marks
+/// the session reload-required, and detaches the child, so the session's
+/// other work ends typed instead of waiting behind a store that never
+/// answers. It takes neither M nor the session driver lock.
+async fn wait_for_owned_runtime_loop_child<T>(
+    task: tokio::task::JoinHandle<(crate::tokio::sync::OwnedMutexGuard<()>, T)>,
+    commit_deadline: Option<&RuntimeLoopCommitDeadline>,
+    child: OwnedRuntimeLoopChild,
+    teardown_slot: &RuntimeLoopTeardownSlot,
+    run_id: &RunId,
+) -> Result<OwnedRuntimeLoopChildWait<T>, crate::RuntimeDriverError> {
+    let Some(commit_deadline) = commit_deadline else {
+        return child.settled(task.await);
+    };
+    let mut task = std::pin::pin!(task);
+    let warn_after = commit_deadline.deadline / 2;
+    if let Ok(joined) = tokio::time::timeout(warn_after, task.as_mut()).await {
+        return child.settled(joined);
+    }
+    tracing::warn!(
+        %run_id,
+        waited = ?warn_after,
+        deadline = ?commit_deadline.deadline,
+        "runtime {} has not reported its durable outcome yet",
+        child.name()
+    );
+    if let Ok(joined) = tokio::time::timeout(
+        commit_deadline.deadline.saturating_sub(warn_after),
+        task.as_mut(),
+    )
+    .await
+    {
+        return child.settled(joined);
+    }
+    if !child.mark_past_deadline(teardown_slot, run_id) {
+        // The child settled its carrier as the deadline passed: the outcome
+        // is known, and the child is about to hand M back.
+        return child.settled(task.await);
+    }
+    commit_deadline.durability_health.mark_reload_required(
+        child.deadline_operation(),
+        format!(
+            "run {run_id}: the store reported no durable outcome within {:?}; the {} may still land",
+            commit_deadline.deadline,
+            child.name()
+        ),
+    );
+    // Returning drops the join handle, which detaches the child: it keeps M
+    // and the payload until the store answers, then settles its carrier.
+    Ok(OwnedRuntimeLoopChildWait::PastDeadline)
+}
+
+/// The typed, retryable refusal of a reload while a run's commit or
+/// terminalization is past its outcome deadline and the store has not
+/// answered yet.
+fn past_deadline_reload_refusal(child: &str, run_id: &RunId) -> crate::RuntimeDriverError {
+    crate::RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: format!(
+            "runtime {child} of run {run_id} has not reported its durable outcome; retry the reload after it does"
+        ),
+    }
+}
+
+/// Fail the process-local completion waiters of a run whose commit or
+/// terminalization passed its outcome deadline. The inputs stay durably
+/// admitted; the reload tells their outcome.
+async fn fail_durable_outcome_unknown_waiters(
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    input_ids: &[InputId],
+    run_id: &RunId,
+) {
+    if let Some(completions) = completions {
+        completions.lock().await.fail_inputs(
+            input_ids.iter().cloned(),
+            crate::completion::CompletionWaitError::DurableOutcomeUnknown {
+                run_id: run_id.clone(),
+            },
+        );
+    }
+}
+
 enum OwnedRuntimeLoopCommitOutcome {
     Committed(Option<crate::store::PreparedRuntimeSessionCommitResult>),
     Rejected(String),
@@ -1049,13 +1227,10 @@ async fn commit_runtime_loop_output_owned(
     terminal: Option<CoreApplyTerminal>,
     machine_terminal_error: Option<meerkat_core::TurnErrorMetadata>,
     retain_nondirected_carrier: bool,
-) -> Result<
-    (
-        crate::tokio::sync::OwnedMutexGuard<()>,
-        OwnedRuntimeLoopCommitOutcome,
-    ),
-    crate::RuntimeDriverError,
-> {
+    commit_deadline: Option<&RuntimeLoopCommitDeadline>,
+) -> Result<OwnedRuntimeLoopChildWait<OwnedRuntimeLoopCommitOutcome>, crate::RuntimeDriverError> {
+    let waiting_slot = std::sync::Arc::clone(&teardown_slot);
+    let waiting_run_id = run_id.clone();
     let task = tokio::spawn(async move {
         if let Err(error) = teardown_slot.stage_owned_commit_in_flight(&run_id) {
             return (
@@ -1161,11 +1336,14 @@ async fn commit_runtime_loop_output_owned(
         (authority_guard, outcome)
     });
 
-    task.await.map_err(|error| {
-        crate::RuntimeDriverError::Internal(format!(
-            "owned runtime-loop commit task ended before publishing its outcome: {error}"
-        ))
-    })
+    wait_for_owned_runtime_loop_child(
+        task,
+        commit_deadline,
+        OwnedRuntimeLoopChild::Commit,
+        &waiting_slot,
+        &waiting_run_id,
+    )
+    .await
 }
 
 enum OwnedRuntimeLoopTerminalization {
@@ -1201,13 +1379,13 @@ async fn realize_runtime_loop_terminal_owned(
     nondirected_completion_input_ids: Vec<InputId>,
     has_directed_inputs: bool,
     terminalization: OwnedRuntimeLoopTerminalization,
+    commit_deadline: Option<&RuntimeLoopCommitDeadline>,
 ) -> Result<
-    (
-        crate::tokio::sync::OwnedMutexGuard<()>,
-        OwnedRuntimeLoopTerminalizationOutcome,
-    ),
+    OwnedRuntimeLoopChildWait<OwnedRuntimeLoopTerminalizationOutcome>,
     crate::RuntimeDriverError,
 > {
+    let waiting_slot = std::sync::Arc::clone(&teardown_slot);
+    let waiting_run_id = run_id.clone();
     let task = tokio::spawn(async move {
         if let Err(error) = teardown_slot.stage_owned_terminalization_in_flight(&run_id) {
             return (
@@ -1313,11 +1491,14 @@ async fn realize_runtime_loop_terminal_owned(
         (authority_guard, outcome)
     });
 
-    task.await.map_err(|error| {
-        crate::RuntimeDriverError::Internal(format!(
-            "owned runtime-loop terminalization task ended before publishing its outcome: {error}"
-        ))
-    })
+    wait_for_owned_runtime_loop_child(
+        task,
+        commit_deadline,
+        OwnedRuntimeLoopChild::Terminalization,
+        &waiting_slot,
+        &waiting_run_id,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2160,6 +2341,11 @@ async fn recover_committed_runtime_projections_before_teardown(
                 ),
             });
         }
+        // Not reached while the session is reload-required: the teardown
+        // authority above goes through the durability-ready gate.
+        Some(OwnedCommitCleanupState::InFlightPastDeadline { run_id }) => {
+            return Err(past_deadline_reload_refusal("commit", &run_id));
+        }
         Some(OwnedCommitCleanupState::RejectedAbortPending { run_id }) => {
             executor
                 .abort_rejected_run_projections()
@@ -2182,6 +2368,9 @@ async fn recover_committed_runtime_projections_before_teardown(
                     "runtime teardown observed owned terminalization {run_id} after acquiring its driver authority"
                 ),
             });
+        }
+        Some(OwnedTerminalizationState::InFlightPastDeadline { run_id }) => {
+            return Err(past_deadline_reload_refusal("terminalization", &run_id));
         }
         Some(OwnedTerminalizationState::PersistedDirectedDrainPending { run_id }) => Some(run_id),
         None => None,
@@ -2746,14 +2935,34 @@ enum PendingNondirectedRunTerminalPhase {
 
 #[derive(Clone, PartialEq, Eq)]
 enum OwnedCommitCleanupState {
-    InFlight { run_id: RunId },
-    RejectedAbortPending { run_id: RunId },
+    InFlight {
+        run_id: RunId,
+    },
+    /// The runtime loop stopped waiting for this run's commit at the store's
+    /// declared outcome deadline and marked the session reload-required. The
+    /// child still holds M and the payload; whether the commit lands is
+    /// unknown until the store answers.
+    InFlightPastDeadline {
+        run_id: RunId,
+    },
+    RejectedAbortPending {
+        run_id: RunId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedTerminalizationState {
-    InFlight { run_id: RunId },
-    PersistedDirectedDrainPending { run_id: RunId },
+    InFlight {
+        run_id: RunId,
+    },
+    /// As [`OwnedCommitCleanupState::InFlightPastDeadline`], for the run's
+    /// terminalization.
+    InFlightPastDeadline {
+        run_id: RunId,
+    },
+    PersistedDirectedDrainPending {
+        run_id: RunId,
+    },
 }
 
 impl RuntimeLoopTeardownSlot {
@@ -2813,6 +3022,7 @@ impl RuntimeLoopTeardownSlot {
         if let Some(current) = state.as_ref() {
             let current_run_id = match current {
                 OwnedCommitCleanupState::InFlight { run_id }
+                | OwnedCommitCleanupState::InFlightPastDeadline { run_id }
                 | OwnedCommitCleanupState::RejectedAbortPending { run_id } => run_id,
             };
             return Err(crate::RuntimeDriverError::RecoveryCorruption {
@@ -2837,7 +3047,10 @@ impl RuntimeLoopTeardownSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(
             state.as_ref(),
-            Some(OwnedCommitCleanupState::InFlight { run_id: current }) if current == run_id
+            Some(
+                OwnedCommitCleanupState::InFlight { run_id: current }
+                    | OwnedCommitCleanupState::InFlightPastDeadline { run_id: current }
+            ) if current == run_id
         ) {
             return Err(crate::RuntimeDriverError::RecoveryCorruption {
                 reason: format!(
@@ -2859,18 +3072,49 @@ impl RuntimeLoopTeardownSlot {
             .owned_commit_cleanup_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.as_ref() {
+            Some(OwnedCommitCleanupState::InFlight { run_id: current }) if current == run_id => {}
+            Some(OwnedCommitCleanupState::InFlightPastDeadline { run_id: current })
+                if current == run_id =>
+            {
+                // The loop gave up on this run at the deadline and failed its
+                // waiters as outcome-unknown, and the reload cold-installs
+                // durable truth. Clear the run's non-directed carrier in the
+                // same step, while this carrier's lock is held: the
+                // reload-required discard reads this carrier first and must
+                // never find the other one alone.
+                self.clear_pending_nondirected_run_terminal(run_id);
+            }
+            _ => {
+                return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                    reason: format!(
+                        "successful runtime commit {run_id} lost its in-flight cleanup carrier"
+                    ),
+                });
+            }
+        }
+        *state = None;
+        Ok(())
+    }
+
+    /// Record that the loop stopped waiting for `run_id`'s commit at the
+    /// store's declared outcome deadline. `false` when the child already
+    /// settled the carrier, so its outcome is known after all.
+    fn mark_owned_commit_past_deadline(&self, run_id: &RunId) -> bool {
+        let mut state = self
+            .owned_commit_cleanup_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(
             state.as_ref(),
             Some(OwnedCommitCleanupState::InFlight { run_id: current }) if current == run_id
         ) {
-            return Err(crate::RuntimeDriverError::RecoveryCorruption {
-                reason: format!(
-                    "successful runtime commit {run_id} lost its in-flight cleanup carrier"
-                ),
-            });
+            return false;
         }
-        *state = None;
-        Ok(())
+        *state = Some(OwnedCommitCleanupState::InFlightPastDeadline {
+            run_id: run_id.clone(),
+        });
+        true
     }
 
     fn complete_rejected_commit_abort(&self, run_id: &RunId) {
@@ -2895,6 +3139,19 @@ impl RuntimeLoopTeardownSlot {
             .clone()
     }
 
+    /// Whether this slot's owned commit or terminalization is past its
+    /// outcome deadline (test support).
+    #[cfg(test)]
+    pub(crate) fn owned_child_past_deadline_for_test(&self) -> bool {
+        matches!(
+            self.owned_commit_cleanup_state(),
+            Some(OwnedCommitCleanupState::InFlightPastDeadline { .. })
+        ) || matches!(
+            self.owned_terminalization_state(),
+            Some(OwnedTerminalizationState::InFlightPastDeadline { .. })
+        )
+    }
+
     fn stage_owned_terminalization_in_flight(
         &self,
         run_id: &RunId,
@@ -2906,6 +3163,7 @@ impl RuntimeLoopTeardownSlot {
         if let Some(current) = state.as_ref() {
             let current_run_id = match current {
                 OwnedTerminalizationState::InFlight { run_id }
+                | OwnedTerminalizationState::InFlightPastDeadline { run_id }
                 | OwnedTerminalizationState::PersistedDirectedDrainPending { run_id } => run_id,
             };
             return Err(crate::RuntimeDriverError::RecoveryCorruption {
@@ -2928,18 +3186,46 @@ impl RuntimeLoopTeardownSlot {
             .owned_terminalization_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.as_ref() {
+            Some(OwnedTerminalizationState::InFlight { run_id: current }) if current == run_id => {}
+            Some(OwnedTerminalizationState::InFlightPastDeadline { run_id: current })
+                if current == run_id =>
+            {
+                // As for a commit past its deadline: the reload reads durable
+                // truth, so the run's non-directed carrier goes in the same
+                // step.
+                self.clear_pending_nondirected_run_terminal(run_id);
+            }
+            _ => {
+                return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                    reason: format!(
+                        "runtime run {run_id} lost its owned terminalization cleanup carrier"
+                    ),
+                });
+            }
+        }
+        *state = None;
+        Ok(())
+    }
+
+    /// Record that the loop stopped waiting for `run_id`'s terminalization at
+    /// the store's declared outcome deadline. `false` when the child already
+    /// settled the carrier.
+    fn mark_owned_terminalization_past_deadline(&self, run_id: &RunId) -> bool {
+        let mut state = self
+            .owned_terminalization_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(
             state.as_ref(),
             Some(OwnedTerminalizationState::InFlight { run_id: current }) if current == run_id
         ) {
-            return Err(crate::RuntimeDriverError::RecoveryCorruption {
-                reason: format!(
-                    "runtime run {run_id} lost its owned terminalization cleanup carrier"
-                ),
-            });
+            return false;
         }
-        *state = None;
-        Ok(())
+        *state = Some(OwnedTerminalizationState::InFlightPastDeadline {
+            run_id: run_id.clone(),
+        });
+        true
     }
 
     fn mark_owned_terminalization_directed_drain_pending(
@@ -2950,15 +3236,25 @@ impl RuntimeLoopTeardownSlot {
             .owned_terminalization_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(
-            state.as_ref(),
-            Some(OwnedTerminalizationState::InFlight { run_id: current }) if current == run_id
-        ) {
-            return Err(crate::RuntimeDriverError::RecoveryCorruption {
-                reason: format!(
-                    "runtime run {run_id} lost its in-flight terminalization before directed drain handoff"
-                ),
-            });
+        match state.as_ref() {
+            Some(OwnedTerminalizationState::InFlight { run_id: current }) if current == run_id => {}
+            Some(OwnedTerminalizationState::InFlightPastDeadline { run_id: current })
+                if current == run_id =>
+            {
+                // No loop is left to drain the run's directed terminals: the
+                // next runtime loop's startup drains the persisted outboxes,
+                // so the run's carriers go now.
+                self.clear_pending_nondirected_run_terminal(run_id);
+                *state = None;
+                return Ok(());
+            }
+            _ => {
+                return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                    reason: format!(
+                        "runtime run {run_id} lost its in-flight terminalization before directed drain handoff"
+                    ),
+                });
+            }
         }
         *state = Some(OwnedTerminalizationState::PersistedDirectedDrainPending {
             run_id: run_id.clone(),
@@ -3426,14 +3722,23 @@ impl RuntimeLoopTeardownSlot {
                         ),
                     });
                 }
+                Some(OwnedCommitCleanupState::InFlightPastDeadline { run_id }) => {
+                    return Err(past_deadline_reload_refusal("commit", &run_id));
+                }
                 None => {}
             }
-            if let Some(state) = self.owned_terminalization_state() {
-                return Err(crate::RuntimeDriverError::RecoveryCorruption {
-                    reason: format!(
-                        "durability-reload discard observed ambiguous terminalization carrier: {state:?}"
-                    ),
-                });
+            match self.owned_terminalization_state() {
+                Some(OwnedTerminalizationState::InFlightPastDeadline { run_id }) => {
+                    return Err(past_deadline_reload_refusal("terminalization", &run_id));
+                }
+                Some(state) => {
+                    return Err(crate::RuntimeDriverError::RecoveryCorruption {
+                        reason: format!(
+                            "durability-reload discard observed ambiguous terminalization carrier: {state:?}"
+                        ),
+                    });
+                }
+                None => {}
             }
             if let Some(pending) = self.pending_nondirected_run_terminal() {
                 return Err(crate::RuntimeDriverError::RecoveryCorruption {
@@ -4843,6 +5148,8 @@ pub(crate) fn admitted_input_to_primitive(
 struct RuntimeLoopAuthorityBinding {
     machine: std::sync::Weak<crate::meerkat_machine::MeerkatMachine>,
     session_id: meerkat_core::types::SessionId,
+    /// The session's commit outcome deadline, read when the loop started.
+    commit_deadline: Option<RuntimeLoopCommitDeadline>,
     #[cfg(test)]
     detached_test_gate: Option<std::sync::Arc<crate::tokio::sync::Mutex<()>>>,
 }
@@ -4887,9 +5194,19 @@ impl RuntimeLoopAuthorityBinding {
         Self {
             machine,
             session_id,
+            commit_deadline: None,
             #[cfg(test)]
             detached_test_gate: None,
         }
+    }
+
+    fn with_commit_deadline(mut self, commit_deadline: Option<RuntimeLoopCommitDeadline>) -> Self {
+        self.commit_deadline = commit_deadline;
+        self
+    }
+
+    fn commit_deadline(&self) -> Option<&RuntimeLoopCommitDeadline> {
+        self.commit_deadline.as_ref()
     }
 
     #[cfg(test)]
@@ -4897,6 +5214,7 @@ impl RuntimeLoopAuthorityBinding {
         Self {
             machine: std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
             session_id: meerkat_core::types::SessionId::new(),
+            commit_deadline: None,
             detached_test_gate: Some(std::sync::Arc::new(crate::tokio::sync::Mutex::new(()))),
         }
     }
@@ -5480,6 +5798,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
     machine_weak: std::sync::Weak<crate::meerkat_machine::MeerkatMachine>,
     session_id: meerkat_core::types::SessionId,
     startup_turn_finalization_boundary_already_held: bool,
+    commit_deadline: Option<RuntimeLoopCommitDeadline>,
 ) -> SpawnedRuntimeLoop {
     #[cfg(test)]
     let authority_binding = if machine_weak.strong_count() == 0 {
@@ -5490,6 +5809,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
     #[cfg(not(test))]
     let authority_binding =
         RuntimeLoopAuthorityBinding::new(machine_weak.clone(), session_id.clone());
+    let authority_binding = authority_binding.with_commit_deadline(commit_deadline);
     #[cfg(test)]
     let detached_test_startup = machine_weak.strong_count() == 0;
     let teardown_slot = RuntimeLoopTeardownSlot::pending_with_recovery(
@@ -7171,10 +7491,26 @@ async fn process_queue(
                                     contributor_disposition:
                                         crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                                 },
+                                authority_binding.commit_deadline(),
                             )
                             .await
                             {
-                                Ok(outcome) => outcome,
+                                Ok(OwnedRuntimeLoopChildWait::Settled(guard, outcome)) => {
+                                    (guard, outcome)
+                                }
+                                Ok(OwnedRuntimeLoopChildWait::PastDeadline) => {
+                                    tracing::error!(
+                                        %run_id,
+                                        "primitive-rejection terminalization passed its durable outcome deadline; the session needs a reload"
+                                    );
+                                    fail_durable_outcome_unknown_waiters(
+                                        completions,
+                                        &input_ids,
+                                        &run_id,
+                                    )
+                                    .await;
+                                    return true;
+                                }
                                 Err(error) => {
                                     tracing::error!(
                                         %run_id,
@@ -7314,10 +7650,26 @@ async fn process_queue(
                                 contributor_disposition:
                                     crate::meerkat_machine::FailedRunContributorDisposition::Replayed,
                             },
+                            authority_binding.commit_deadline(),
                         )
                         .await
                         {
-                            Ok(outcome) => outcome,
+                            Ok(OwnedRuntimeLoopChildWait::Settled(guard, outcome)) => {
+                                (guard, outcome)
+                            }
+                            Ok(OwnedRuntimeLoopChildWait::PastDeadline) => {
+                                tracing::error!(
+                                    %run_id,
+                                    "turn-state failure terminalization passed its durable outcome deadline; the session needs a reload"
+                                );
+                                fail_durable_outcome_unknown_waiters(
+                                    completions,
+                                    &input_ids,
+                                    &run_id,
+                                )
+                                .await;
+                                return true;
+                            }
                             Err(terminalization_error) => {
                                 tracing::error!(
                                     %run_id,
@@ -7638,10 +7990,32 @@ async fn process_queue(
                                 terminal.clone(),
                                 machine_terminal_error.clone(),
                                 directed_interaction_ids.is_empty() && completions.is_some(),
+                                authority_binding.commit_deadline(),
                             )
                             .await
                             {
-                                Ok(outcome) => outcome,
+                                Ok(OwnedRuntimeLoopChildWait::Settled(guard, outcome)) => {
+                                    (guard, outcome)
+                                }
+                                Ok(OwnedRuntimeLoopChildWait::PastDeadline) => {
+                                    tracing::error!(
+                                        %run_id,
+                                        "runtime commit passed its durable outcome deadline; the session needs a reload"
+                                    );
+                                    fail_durable_outcome_unknown_waiters(
+                                        completions,
+                                        &input_ids,
+                                        &run_id,
+                                    )
+                                    .await;
+                                    // Fail closed without stopping the
+                                    // executor: its stop takes the post-stop
+                                    // fence through M, which the past-deadline
+                                    // child still holds. The reload-required
+                                    // discard runs that stop once the carrier
+                                    // has settled.
+                                    return true;
+                                }
                                 Err(error) => {
                                     tracing::error!(
                                         %run_id,
@@ -7701,15 +8075,16 @@ async fn process_queue(
                                 // the exact process-local waiters while their
                                 // input identities are still owned here; waiting
                                 // for the stop path would strand them forever.
-                                // This is mechanical delivery failure only: do
+                                // This is a typed delivery failure only: do
                                 // not mint an ephemeral terminal outcome while a
                                 // registration-authorized reload is required.
                                 if let Some(completions) = completions.as_ref() {
-                                    let mut completions = completions.lock().await;
-                                    fail_completion_waiters(
-                                        &mut completions,
-                                        &input_ids,
-                                        failure_detail.clone(),
+                                    completions.lock().await.fail_inputs(
+                                        input_ids.iter().cloned(),
+                                        crate::completion::CompletionWaitError::BoundaryRolledBack {
+                                            run_id: run_id.clone(),
+                                            detail: failure_detail.clone(),
+                                        },
                                     );
                                 }
                                 drop(terminal_authority_guard);
@@ -8219,10 +8594,26 @@ async fn process_queue(
                                 nondirected_input_ids.clone(),
                                 has_directed_inputs,
                                 terminalization,
+                                authority_binding.commit_deadline(),
                             )
                             .await
                             {
-                                Ok(outcome) => outcome,
+                                Ok(OwnedRuntimeLoopChildWait::Settled(guard, outcome)) => {
+                                    (guard, outcome)
+                                }
+                                Ok(OwnedRuntimeLoopChildWait::PastDeadline) => {
+                                    tracing::error!(
+                                        %run_id,
+                                        "runtime failure terminalization passed its durable outcome deadline; the session needs a reload"
+                                    );
+                                    fail_durable_outcome_unknown_waiters(
+                                        completions,
+                                        &input_ids,
+                                        &run_id,
+                                    )
+                                    .await;
+                                    return true;
+                                }
                                 Err(error) => {
                                     tracing::error!(
                                         %run_id,
@@ -9432,6 +9823,7 @@ mod tests {
             std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
             SessionId::new(),
             false,
+            None,
         );
 
         effect_tx
@@ -9478,6 +9870,7 @@ mod tests {
             std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
             SessionId::new(),
             false,
+            None,
         );
 
         drop(effect_tx);
@@ -9521,6 +9914,7 @@ mod tests {
             std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
             SessionId::new(),
             false,
+            None,
         );
 
         drop(wake_tx);
@@ -14137,6 +14531,7 @@ mod tests {
             std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
             SessionId::new(),
             false,
+            None,
         );
 
         // Paused-time window: the bounded ladder polls at 0, 25, 75, 175 and

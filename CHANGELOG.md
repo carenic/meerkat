@@ -110,6 +110,12 @@ them.
   verdict before the host is asked, as it already refused the operator.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
+- `meerkat-runtime`: `CompletionWaitError` is `#[non_exhaustive]` and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (see Changed). A match on it outside the crate needs a wildcard arm.
+  `wait_failure_observation()` maps both new variants to
+  `AuthorityUnavailable`, as it maps `AuthorityUnavailable(_)`, and
+  `is_boundary_rolled_back()` and `is_durable_outcome_unknown()` name them.
 
 ### Added
 
@@ -184,6 +190,16 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `RuntimeStore::commit_outcome_deadline` declares the longest a boundary
+  commit or run terminalization through the store may legitimately take
+  before it reports its durable outcome (see Changed). The backend declares
+  it through the new `RuntimeSessionAuthorityOps::commit_outcome_deadline`,
+  so a pure decorator forwards it. A composed store whose commit runs
+  lock-acquiring transactions of its own declares its inner store's
+  declaration plus the busy timeout of each such transaction. The default is
+  `DEFAULT_COMMIT_OUTCOME_DEADLINE`, two `COMMIT_BUSY_WINDOW`s of 60 s.
+  `SqliteRuntimeStore` declares the same from the shared SQLite busy timeout,
+  and `InMemoryRuntimeStore` declares none.
 
 ### Changed
 
@@ -237,6 +253,20 @@ them.
   `rkat mob force-cancel`. Reload the member with
   `MobHandle::reload_member_registration`, then cancel again. This was a
   0.9.3 known limitation.
+- A persistent session's boundary commit or run terminalization that reports
+  no durable outcome within its store's declared deadline (120 s for the
+  SQLite store) now marks the session reload-required. The runtime loop
+  stops waiting and leaves the commit running; it keeps the session's
+  mutation gate until the store answers. The run's completion waiters fail
+  with `CompletionWaitError::DurableOutcomeUnknown`, and a run whose boundary
+  commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
+  where they got `AuthorityUnavailable` with a message. In both cases the
+  input stays durably admitted: read it after the reload instead of
+  resubmitting it. A reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
+  replaces the registration from durable truth. A mob member's tracked turn
+  stays pending on either failure, as on `AuthorityUnavailable`, and a
+  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
 
 ### Fixed
 
@@ -369,6 +399,12 @@ them.
   gate. Waits that run only once the degraded holder has released the gate
   (the reload-required discard) or before any runtime loop exists keep
   waiting.
+- A boundary commit whose store never answered (a stalled disk or a hung
+  network filesystem, for example) kept the session's mutation gate for
+  good, so every later wait for the gate waited for it, a mob destroy's
+  retirement of the member and a force cancel of it included. The commit's
+  declared deadline now degrades the session (see Changed), those waits end
+  typed, and a reload replaces the registration once the store has answered.
 
 ## [0.9.3] - 2026-10-18
 

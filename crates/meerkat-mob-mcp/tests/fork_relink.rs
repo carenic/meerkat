@@ -2313,6 +2313,15 @@ async fn fork_child_whose_boundary_commit_is_held_to_fail(child: &str) -> GatedC
 }
 
 async fn fork_child_at_its_gated_turn(child: &str) -> GatedChild {
+    fork_child_at_its_gated_turn_measured_in(child, None).await
+}
+
+/// As [`fork_child_at_its_gated_turn`], with the fixture's runtime measuring
+/// its store's commit outcome deadline in busy windows of `busy_window`.
+async fn fork_child_at_its_gated_turn_measured_in(
+    child: &str,
+    busy_window: Option<Duration>,
+) -> GatedChild {
     let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
     let gate = TurnGate::new();
     let turn_gate = Arc::clone(&gate);
@@ -2326,6 +2335,12 @@ async fn fork_child_at_its_gated_turn(child: &str) -> GatedChild {
         },
         store.clone(),
     );
+    if let Some(busy_window) = busy_window {
+        meerkat_mob::MobSessionService::acquire_runtime_adapter(fixture.service.as_ref(), None)
+            .expect("acquire runtime authority")
+            .expect("the service derives its runtime")
+            .set_runtime_commit_busy_window_for_test(busy_window);
+    }
     fixture.seed_source_mob(&["forker"]).await;
     let owner = forker_session(&fixture).await;
     let handle = fixture
@@ -2535,6 +2550,72 @@ async fn a_boundary_commit_that_fails_during_the_destroy_detach_is_reloaded_and_
                 stored.seed.terminal_outcome.clone()
             ))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The busy window the hung-commit destroy test measures its store's
+/// declaration in: the deadline is two of them.
+const HUNG_COMMIT_BUSY_WINDOW: Duration = Duration::from_secs(1);
+
+/// A forked child whose terminal boundary commit waits at the store, which
+/// never answers until the test releases it.
+async fn fork_child_whose_boundary_commit_hangs(child: &str) -> GatedChild {
+    let gated =
+        fork_child_at_its_gated_turn_measured_in(child, Some(HUNG_COMMIT_BUSY_WINDOW)).await;
+    gated
+        .store
+        .arm(meerkat_runtime::LogicalRuntimeId::for_session(
+            &gated.child_session,
+        ));
+    gated.gate.open();
+    gated.store.entered().await;
+    gated
+}
+
+/// A member whose boundary commit the store never answers no longer keeps a
+/// destroy waiting. At the store's declared deadline the member's session
+/// degrades, so the destroy's retirement of it ends typed, and the destroy
+/// answers incomplete, naming the member, while the store still has not
+/// answered. Once the store answers, the same destroy reloads the member and
+/// completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destroy_behind_a_commit_the_store_never_answers_is_incomplete_until_it_answers() {
+    let held = fork_child_whose_boundary_commit_hangs("hung-commit-child").await;
+    let mob_id = held.fixture.source_mob_id();
+    let refused = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the destroy answers while the store has not");
+    let report = match refused {
+        Err(meerkat_mob_mcp::MobMcpDestroyError::Incomplete { report }) => report,
+        other => panic!("a destroy behind the hung commit is incomplete: {other:?}"),
+    };
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains(held.child.as_str())),
+        "the report names the member: {report:?}"
+    );
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_ok(),
+        "the mob stays for a retry"
+    );
+
+    held.store.release();
+    let report = tokio::time::timeout(
+        DEGRADED_DESTROY_BOUND,
+        held.fixture.state.mob_destroy(&mob_id),
+    )
+    .await
+    .expect("the retried destroy finishes")
+    .expect("the retried destroy reloads the member and completes");
+    assert_eq!(report.reloaded_members, vec![held.child.clone()]);
+    assert!(
+        held.fixture.state.handle_for(&mob_id).await.is_err(),
+        "the destroyed mob is gone"
     );
 }
 

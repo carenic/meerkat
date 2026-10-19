@@ -207,6 +207,12 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
         self.inner.session_boundary_authority_read_cost()
     }
 
+    /// The SQLite store's declaration, so a held commit passes a deadline as
+    /// one in a production store would.
+    fn commit_outcome_deadline(&self) -> Option<std::time::Duration> {
+        Some(meerkat_runtime::store::DEFAULT_COMMIT_OUTCOME_DEADLINE)
+    }
+
     async fn commit_prepared_session_boundary(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
