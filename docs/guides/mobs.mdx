@@ -229,37 +229,6 @@ such as a typo, fails the member's build with `DeclaredToolUnknown`, unless the
 profile declares an MCP server that maps no `tool_names`; then the name is
 checked only at call time.
 
-### Host tool bundles in child mobs
-
-A child mob (one a member creates with the agent `mob_create` tool, or the
-implicit mob that `delegate` helpers run in) cannot name host-only fields such
-as `rust_bundles`. The host decides which of its registered Rust tool bundles
-child members get: `ChildAvailable` supplies a bundle to every inline profile
-of a child mob, and `HostOnly` (the default) to none.
-
-Since 0.9.4 a host can register a bundle as `ChildOffered`. It is supplied to
-no profile; an inline child profile mounts it only by naming it in
-`tools.bundles`, as in this excerpt of a `mob_create` definition:
-
-```json
-{ "profiles": { "researcher": { "tools": { "comms": true, "bundles": ["web_research"] } } } }
-```
-
-A name the host does not offer is refused with `MobError::ToolBundleNotOffered`,
-which lists the offered names (an argument error for the agent tool, invalid
-params on `mob/create`). An empty or repeated name is an argument error, and
-only a child mob's inline profiles can opt in. The opt-in persists with the
-definition, and the host's offer is its ceiling at every build, a resume
-included: a member whose host no longer offers an opted bundle is built
-without it, and `MobHandle::withheld_tool_bundles` reports it. While a bundle
-is withheld, `tools.deny` names that match no known tool are checked only at
-call time. An opted bundle makes the profile non-portable, so a placed member
-is refused. An MCP server cannot be registered as `ChildOffered`. Hosts that
-compose definitions themselves (`MobBuilder`, or a realm profile they store)
-may set `bundles` as the lenient form of `rust_bundles`. A binary older than
-0.9.4 ignores `bundles`, so after a downgrade those members run without the
-bundle.
-
 ### Profile model and provider fields
 
 Beyond `model`, a profile can pin provider identity and per-member behavior:
@@ -1286,7 +1255,7 @@ request; it never silently strips the field and launches a weaker member.
 
 The typed non-portable causes cover:
 
-- Rust tool bundles, per-spawn external tools, mob-default external tools, and a default LLM client override
+- Rust tool bundles (`rust_bundles`, and since 0.9.4 bundles a profile opts into with `tools.bundles`), per-spawn external tools, mob-default external tools, and a default LLM client override
 - an in-process compaction curator override
 - a host-surface MCP allow-list, an inherited tool filter, and WorkGraph tools
 - non-empty shell environment, MCP stdio environment, or MCP HTTP headers

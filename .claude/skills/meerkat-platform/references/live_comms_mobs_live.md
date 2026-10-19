@@ -239,6 +239,12 @@ may say the work just finished but must not state or guess the outcome until
 the result arrives. The notice waits while the voice is speaking and is
 dropped if the result reaches the session first.
 
+Known limitation: public GPT Live delegates through the client for the
+whole session, and the provider's delegation events carry no typed reason,
+so a question the user starts while the voice is still speaking (before the
+cue for a delegated result is sent) can go to the executor even when it asks
+about the conversation itself.
+
 ## Live channels on mob members
 
 Each member has its own session, so live channels are per member. Give the

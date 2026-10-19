@@ -656,20 +656,6 @@ delegation-result acknowledgement: a delayed readout retains its output identity
 Applications must keep transcript grouping, playback evidence, and backend task
 completion separate; see [OpenAI's session guidance](https://developers.openai.com/api/docs/guides/live-conversations).
 
-Meerkat holds a finished delegation's result while the user's latest utterance
-is unanswered, so the model answers that first, and a channel delivers one
-result at a time. Since 0.9.4 a held result first sends a notice on the
-instructions lane, bound to its delegation: the work has finished and its
-result has not reached the model yet. The model may say the work has just
-finished but must not state, guess or imply the outcome until the result
-arrives. The notice carries no result content and promises no timing, and
-later "still running" lines stop naming that delegation. While the model is
-speaking, the notice waits until its response ends or the user takes the
-floor, and it is withdrawn unsent if the result reaches the session first.
-0.9.3 and earlier gave the model only the in-progress instruction, so a user
-asking whether the work was done heard "not yet" while the finished result
-waited behind that question.
-
 On open and reopen, the selected canonical dialogue is supplied in native
 `session.input` at provider session creation. User text and visible assistant
 text retain their order and roles; executor System rows, SystemNotice rows, tool
