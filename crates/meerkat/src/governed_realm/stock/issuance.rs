@@ -58,8 +58,8 @@ use meerkat_authorization::mcp_installation::{
 };
 use meerkat_authorization::publication::LocalAuthorizationPublication;
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, ExactRestriction, ExecutionRestrictions, LifetimeBound, LifetimeRestriction,
-    ProcessorRef, ResourceDomain, SetBound, UnresolvedConstraint,
+    ActionRef, DomainRestriction, ExactRestriction, ExecutionRestrictions, LifetimeBound,
+    LifetimeRestriction, ProcessorRef, ResourceDomain, SetBound, UnresolvedConstraint,
 };
 use meerkat_authorization_contracts::evidence::EvidenceId;
 use meerkat_authorization_contracts::grant_mutation::ControllerCustodyRefusal;
@@ -347,7 +347,7 @@ pub fn stock_grant_restrictions(
             }
             (
                 ExactRestriction::exact([action(STOCK_FEATURE, "infer")]),
-                ExactRestriction::exact(
+                DomainRestriction::exact(
                     routes
                         .iter()
                         .map(|route| domain(operator, route.as_str().to_string())),
@@ -356,7 +356,7 @@ pub fn stock_grant_restrictions(
         }
         StockGrantTarget::Catalog => (
             ExactRestriction::exact([action(STOCK_FEATURE, "catalog-read")]),
-            ExactRestriction::exact([domain(operator, CATALOG_NAMESPACE.to_string())]),
+            DomainRestriction::exact([domain(operator, CATALOG_NAMESPACE.to_string())]),
         ),
         StockGrantTarget::ToolBundleOperation { bundle, operation } => {
             if bundle.is_empty() || operation.is_empty() {
@@ -366,7 +366,7 @@ pub fn stock_grant_restrictions(
             }
             (
                 ExactRestriction::exact([action(TOOL_BUNDLE_FEATURE, operation)]),
-                ExactRestriction::exact([domain(operator, tool_bundle_namespace(bundle))]),
+                DomainRestriction::exact([domain(operator, tool_bundle_namespace(bundle))]),
             )
         }
         StockGrantTarget::Mcp { server, operations } => {
@@ -392,7 +392,7 @@ pub fn stock_grant_restrictions(
             };
             (
                 actions,
-                ExactRestriction::exact([
+                DomainRestriction::exact([
                     domain(operator, format!("mcp-server/{server}")),
                     mcp_connector_domain(operator, server, connector),
                 ]),
@@ -425,7 +425,7 @@ pub fn stock_grant_restrictions(
             actions.extend(operations.iter().map(|op| action(MCP_FEATURE, op)));
             (
                 ExactRestriction::exact(actions),
-                ExactRestriction::exact([
+                DomainRestriction::exact([
                     domain(operator, format!("mcp-server/{server}")),
                     mcp_connector_domain(operator, server, connector),
                 ]),
@@ -544,15 +544,6 @@ impl AgentGrantRefs {
             self.operation.as_ref()
         } else {
             self.mcp.get(server)
-        }
-    }
-
-    /// The lineage selected for the tool catalog, the same way.
-    pub fn catalog_lineage(&self) -> Option<&GrantLineageRef> {
-        if self.legacy_only() {
-            self.operation.as_ref()
-        } else {
-            self.catalog.as_ref()
         }
     }
 

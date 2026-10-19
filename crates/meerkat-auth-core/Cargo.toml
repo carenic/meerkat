@@ -27,7 +27,6 @@ indexmap = "2"
 base64 = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true }
-webbrowser = "1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

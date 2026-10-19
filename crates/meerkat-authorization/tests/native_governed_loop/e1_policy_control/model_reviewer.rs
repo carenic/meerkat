@@ -834,7 +834,7 @@ async fn exercise_review(controller_server: &Server, review_server: &Server, cas
     let mut operations = ceiling("read");
     operations.actions =
         ExactRestriction::exact([action("read"), action("delete"), action("infer")]);
-    operations.resource_domains = ExactRestriction::exact([domain(), input_domain()]);
+    operations.resource_domains = DomainRestriction::exact([domain(), input_domain()]);
     let operation = grants
         .issue_root(
             &principal("grant-owner"),

@@ -61,7 +61,9 @@ It is 51,999 bytes with SHA-256
 `3a1ba2e6ff8889c913dc0801c540c81a38bae7b54269259d8e370d1275a12c8a`;
 the adjacent `.provenance.json` marks it synthetic and binds the producer
 version, classification, session identity, and expected checkpoint facts.
-The `meerkat-core` package excludes both files.
+The `meerkat-core` package excludes both files. meerkat-runtime's migration
+test embeds its own byte-identical copy (its `tests/fixtures/`, so the test
+builds from the meerkat-runtime package) and pins the same SHA-256.
 
 This artifact pins the production-relevant
 `RecoveryMigration` + `authority_base.kind = legacy` stamp shape. It carries

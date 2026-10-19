@@ -234,7 +234,7 @@ impl Fixture {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions,
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         servers.iter().map(|name| domain(&format!("mcp-{name}"))),
                     ),
                     lifetime,
@@ -553,7 +553,7 @@ fn catalog_controls_resolve_the_targeted_base() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action("catalog-read")]),
-                    resource_domains: ExactRestriction::exact([domain(domain_name)]),
+                    resource_domains: DomainRestriction::exact([domain(domain_name)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -603,6 +603,100 @@ fn catalog_controls_resolve_the_targeted_base() {
     assert!(is_denied(&refusal(
         &context,
         &catalog_call(CatalogOperation::Load)
+    )));
+}
+
+/// A two-link catalog base (the operator's root to an intermediary, then the
+/// intermediary's child to the executor) is a whole root-to-leaf chain like
+/// any lineage: it covers the catalog controls only while every link covers
+/// the catalog read. A child narrowed away from the catalog denies them, so
+/// does the child alone without its root, and a revoked root denies them
+/// through its unrevoked child.
+#[test]
+fn a_two_link_catalog_base_covers_the_controls_through_every_link() {
+    use meerkat_core::tool_execution::CatalogOperation;
+    let fixture = Fixture::new();
+    let alpha = fixture.server_grant(
+        "alpha-any",
+        &[],
+        &["alpha"],
+        LifetimeRestriction::unrestricted(),
+    );
+    let policy = fixture.mcp_policy();
+    let catalog_read = |domains: &[&str]| ExecutionRestrictions {
+        actions: ExactRestriction::exact([action("catalog-read")]),
+        resource_domains: DomainRestriction::exact(domains.iter().map(|name| domain(name))),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    let root = fixture
+        .grants
+        .issue_root(
+            &who("root"),
+            id("catalog-root"),
+            who("first"),
+            Some(who("subject")),
+            catalog_read(&["tool-catalog", "elsewhere"]),
+        )
+        .expect("catalog root");
+    let child = fixture
+        .grants
+        .issue_child(
+            &who("first"),
+            &root,
+            id("catalog-child"),
+            who("executor"),
+            catalog_read(&["tool-catalog"]),
+        )
+        .expect("catalog child");
+    let narrowed = fixture
+        .grants
+        .issue_child(
+            &who("first"),
+            &root,
+            id("narrowed-child"),
+            who("executor"),
+            catalog_read(&["elsewhere"]),
+        )
+        .expect("narrowed child");
+    let with_base = |work: &str, base: Vec<GrantLineageRef>| {
+        fixture.original_with(
+            work,
+            fixture.targeted_with(Some(base), vec![("alpha", alpha.clone())]),
+        )
+    };
+    let denies_both = |association: &InputAuthorityAssociation| {
+        let context = fixture.context(&policy, association);
+        [CatalogOperation::Search, CatalogOperation::Load]
+            .into_iter()
+            .all(|operation| is_denied(&refusal(&context, &catalog_call(operation))))
+    };
+
+    // Both links cover the catalog read: both controls are allowed.
+    let chained = with_base("catalog-chain", vec![root.clone(), child.clone()]);
+    let context = fixture.context(&policy, &chained);
+    assert!(allowed(&context, &catalog_call(CatalogOperation::Search)));
+    assert!(allowed(&context, &catalog_call(CatalogOperation::Load)));
+
+    // The child narrowed the root away from the catalog.
+    assert!(denies_both(&with_base(
+        "catalog-narrowed",
+        vec![root.clone(), narrowed]
+    )));
+
+    // The child alone is not the chain the grant owner issued.
+    assert!(denies_both(&with_base(
+        "catalog-child-only",
+        vec![child.clone()]
+    )));
+
+    // Revoking the root denies the controls through the unrevoked child.
+    fixture
+        .grants
+        .revoke(&who("root"), &root, &mut NoController)
+        .expect("revoke the catalog root");
+    assert!(denies_both(&with_base(
+        "catalog-revoked-root",
+        vec![root, child]
     )));
 }
 
@@ -743,7 +837,7 @@ fn a_bundle_operation_resolves_only_its_own_exact_lineage() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action(operation)]),
-                    resource_domains: ExactRestriction::exact([domain("bundle-mail")]),
+                    resource_domains: DomainRestriction::exact([domain("bundle-mail")]),
                     lifetime,
                     ..ExecutionRestrictions::unrestricted()
                 },
@@ -1026,7 +1120,7 @@ fn peer_and_memory_operations_resolve_only_their_own_exact_lineage() {
                 Some(who("subject")),
                 ExecutionRestrictions {
                     actions: ExactRestriction::exact([action(operation)]),
-                    resource_domains: ExactRestriction::exact([domain(namespace)]),
+                    resource_domains: DomainRestriction::exact([domain(namespace)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )

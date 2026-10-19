@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, DelegationDepth, ExactRestriction, ExecutionRestrictions,
-    LifetimeRestriction, ProcessorRef, ResourceDomain, UnresolvedConstraint,
+    ActionRef, AudienceRef, DelegationDepth, DomainRestriction, ExactRestriction,
+    ExecutionRestrictions, LifetimeRestriction, ProcessorRef, ResourceDomain, UnresolvedConstraint,
 };
 use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -560,7 +560,7 @@ fn concurrent_publication_rebuilds_once_and_never_spins_or_retags() {
 #[test]
 fn admitted_and_current_ceilings_each_constrain_every_implicit_target() {
     let mut admitted = ExecutionRestrictions::unrestricted();
-    admitted.resource_domains = ExactRestriction::exact([domain("public")]);
+    admitted.resource_domains = DomainRestriction::exact([domain("public")]);
     let fixture = Fixture::new(admitted);
     let binding = read_binding();
     fixture
@@ -592,7 +592,7 @@ fn unresolved_restrictions_cannot_be_dropped_during_compilation() {
             }
             1 => {
                 state.restrictions.resource_domains =
-                    ExactRestriction::unresolved(UnresolvedConstraint::Unknown);
+                    DomainRestriction::unresolved(UnresolvedConstraint::Unknown);
             }
             2 => {
                 state.restrictions.processors =

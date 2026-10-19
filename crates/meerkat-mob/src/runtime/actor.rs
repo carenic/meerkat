@@ -28835,6 +28835,24 @@ impl MobActor {
         true
     }
 
+    /// Close the command channel, then receive until it is empty.
+    ///
+    /// A sender that reserved capacity before the close still writes its
+    /// command, and only receiving after the close waits for that
+    /// reservation. A bare drop drains once and leaves such a command, with
+    /// its reply sender, in the channel for as long as any handle lives, so
+    /// its caller waits for a reply that never comes. Each command received
+    /// here is dropped: its caller sees its reply channel close.
+    ///
+    /// Every reservation of this channel must be written in the poll that
+    /// takes it. This waits for every outstanding reservation, so a holder
+    /// that awaited the actor between reserve and send would hang the
+    /// actor's exit.
+    async fn close_and_drain_commands(mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
+        command_rx.close();
+        while command_rx.recv().await.is_some() {}
+    }
+
     /// Main actor loop: process commands sequentially until Shutdown.
     pub(super) async fn run(mut self, mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
         self.inline_step_watchdog
@@ -28846,6 +28864,8 @@ impl MobActor {
             .set_member_run_start_posture(self.member_run_start_posture());
         if !boxed_arm_future(|| self.prepare_actor_run()).await {
             self.inline_step_watchdog.stop();
+            drop(self);
+            Self::close_and_drain_commands(command_rx).await;
             return;
         }
         // Desired-state recovery is independent from the legacy roster
@@ -29192,7 +29212,7 @@ impl MobActor {
         // destructions happen before a crash-stop caller can construct a
         // same-process cold replacement.
         drop(self);
-        drop(command_rx);
+        Self::close_and_drain_commands(command_rx).await;
         #[cfg(any(test, feature = "test-support"))]
         if let Some(reply_tx) = crash_stop_reply_tx {
             let _ = reply_tx.send(Ok(()));

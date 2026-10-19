@@ -4,7 +4,7 @@
 use std::fmt;
 
 pub const SESSION_VERSION: u32 = 4;
-pub const STORED_INPUT_STATE_VERSION: u32 = 6;
+pub const STORED_INPUT_STATE_VERSION: u32 = 7;
 pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub fn restore_stored_input_state_version(
         SessionPersistenceVersionField::StoredInputState,
         observed,
         STORED_INPUT_STATE_VERSION,
-        &[3, 4, 5, 6],
+        &[3, 4, 5, 6, 7],
     )
 }
 
