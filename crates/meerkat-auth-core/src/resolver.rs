@@ -3257,10 +3257,34 @@ mod tests {
         let env = ResolverEnvironment::testing()
             .with_auth_lease_handle(generated_auth_lease_handle_for_test(owner.clone()));
         let audit = LeaseAudit(Arc::default());
+        // A second, separately registered Dispatch kept alive with the
+        // capture: with only one registered, tracing computes a callsite's
+        // interest from the reaching thread's current default, so a thread
+        // with no subscriber caches it as never for every thread.
+        let _anchor = tracing::Dispatch::new(LeaseAudit(Arc::default()));
+        let audit_dispatch = tracing::Dispatch::new(audit.clone());
+        // The window, forced: while the capture is registered, a thread with
+        // no subscriber reaches the shared audit callsite and rebuilds the
+        // interest cache, as a concurrent test can in a shared `cargo test`
+        // process.
+        std::thread::spawn(|| {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+                let uncaptured = meerkat_runtime::RuntimeAuthLeaseHandle::new();
+                let key = LeaseKey::new(
+                    meerkat_core::connection::RealmId::parse("uncaptured-audit").unwrap(),
+                    meerkat_core::connection::BindingId::parse("default").unwrap(),
+                    None,
+                );
+                uncaptured.acquire_lease(&key, u64::MAX).unwrap();
+                tracing::callsite::rebuild_interest_cache();
+            });
+        })
+        .join()
+        .unwrap();
 
         // Fresh valid lease authorizes the cached credential: reuse, no re-run.
         let reused = resolve_command_credential_via_lease(&env, &binding, &runner)
-            .with_subscriber(audit.clone())
+            .with_subscriber(audit_dispatch.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -3287,7 +3311,7 @@ mod tests {
             "cached resolution must not release credentials, drain OAuth, or enter administrative custody"
         );
         resolve_command_credential_via_lease(&env, &binding, &runner)
-            .with_subscriber(audit.clone())
+            .with_subscriber(audit_dispatch.clone())
             .await
             .unwrap();
         assert_eq!(
