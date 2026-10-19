@@ -2592,30 +2592,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecoverHostBindingGenerationHighwaterDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `RecoverIdentityGenerationHighwaterRunning`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `RecoverIdentityGenerationHighwaterStopped`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `RecoverIdentityGenerationHighwaterCompleted`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `RecoverIdentityGenerationHighwaterDestroyed`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `SealIdentityGenerationHighwaterRunning`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `SealIdentityGenerationHighwaterStopped`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `SealIdentityGenerationHighwaterCompleted`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `SealIdentityGenerationHighwaterDestroyed`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
 - `RecoverConfirmedHostBindingRevocationRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -4306,6 +4282,30 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RecordLoopUntilConditionMetCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

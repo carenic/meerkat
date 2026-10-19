@@ -53,10 +53,9 @@ them.
   `SealIdentityGenerationHighwaterRunning`,
   `SealIdentityGenerationHighwaterStopped`,
   `SealIdentityGenerationHighwaterCompleted` and
-  `SealIdentityGenerationHighwaterDestroyed`. Codegen orders transitions, so
-  these sit mid-enum and the implicit discriminants and `PartialOrd` positions
-  of every later `TransitionId::*` variant move. Exhaustive matches must add
-  the arms; match generated machine enums by name.
+  `SealIdentityGenerationHighwaterDestroyed`, also appended last, so no
+  existing variant's discriminant moves. Exhaustive matches must add the
+  arms.
 
 ### Fixed
 

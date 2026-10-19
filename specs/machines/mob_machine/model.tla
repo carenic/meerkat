@@ -11960,82 +11960,6 @@ RecoverHostBindingGenerationHighwaterDestroyed(host_id, binding_generation) ==
     /\ UnchangedFrame_9dc62d042ea54e87
 
 
-RecoverIdentityGenerationHighwaterRunning(agent_identity, generation) ==
-    /\ phase = "Running"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
-    /\ UnchangedFrame_3952d097e75a8f47
-
-
-RecoverIdentityGenerationHighwaterStopped(agent_identity, generation) ==
-    /\ phase = "Stopped"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
-    /\ phase' = "Stopped"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
-    /\ UnchangedFrame_3952d097e75a8f47
-
-
-RecoverIdentityGenerationHighwaterCompleted(agent_identity, generation) ==
-    /\ phase = "Completed"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
-    /\ phase' = "Completed"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
-    /\ UnchangedFrame_3952d097e75a8f47
-
-
-RecoverIdentityGenerationHighwaterDestroyed(agent_identity, generation) ==
-    /\ phase = "Destroyed"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
-    /\ phase' = "Destroyed"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
-    /\ UnchangedFrame_3952d097e75a8f47
-
-
-SealIdentityGenerationHighwaterRunning ==
-    /\ phase = "Running"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater_sealed' = TRUE
-    /\ UnchangedFrame_2b6bcadf53d5da4e
-
-
-SealIdentityGenerationHighwaterStopped ==
-    /\ phase = "Stopped"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ phase' = "Stopped"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater_sealed' = TRUE
-    /\ UnchangedFrame_2b6bcadf53d5da4e
-
-
-SealIdentityGenerationHighwaterCompleted ==
-    /\ phase = "Completed"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ phase' = "Completed"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater_sealed' = TRUE
-    /\ UnchangedFrame_2b6bcadf53d5da4e
-
-
-SealIdentityGenerationHighwaterDestroyed ==
-    /\ phase = "Destroyed"
-    /\ (identity_generation_highwater_sealed = FALSE)
-    /\ phase' = "Destroyed"
-    /\ model_step_count' = model_step_count + 1
-    /\ identity_generation_highwater_sealed' = TRUE
-    /\ UnchangedFrame_2b6bcadf53d5da4e
-
-
 RecoverConfirmedHostBindingRevocationRunning(host_id, binding_generation) ==
     /\ phase = "Running"
     /\ (binding_generation > 0)
@@ -18878,6 +18802,82 @@ RecordLoopUntilConditionMetCompleted(loop_instance_id, iteration) ==
     /\ UnchangedFrame_d40d07c4a3dc7962
 
 
+RecoverIdentityGenerationHighwaterRunning(agent_identity, generation) ==
+    /\ phase = "Running"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
+    /\ UnchangedFrame_3952d097e75a8f47
+
+
+RecoverIdentityGenerationHighwaterStopped(agent_identity, generation) ==
+    /\ phase = "Stopped"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
+    /\ UnchangedFrame_3952d097e75a8f47
+
+
+RecoverIdentityGenerationHighwaterCompleted(agent_identity, generation) ==
+    /\ phase = "Completed"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
+    /\ phase' = "Completed"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
+    /\ UnchangedFrame_3952d097e75a8f47
+
+
+RecoverIdentityGenerationHighwaterDestroyed(agent_identity, generation) ==
+    /\ phase = "Destroyed"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ ((IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (agent_identity \in DOMAIN identity_generation_highwater)) /\ (IF ((agent_identity \in DOMAIN identity_generation_highwater) = FALSE) THEN TRUE ELSE (generation >= (identity_generation_highwater)[agent_identity])))
+    /\ phase' = "Destroyed"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater' = MapSet(identity_generation_highwater, agent_identity, generation)
+    /\ UnchangedFrame_3952d097e75a8f47
+
+
+SealIdentityGenerationHighwaterRunning ==
+    /\ phase = "Running"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater_sealed' = TRUE
+    /\ UnchangedFrame_2b6bcadf53d5da4e
+
+
+SealIdentityGenerationHighwaterStopped ==
+    /\ phase = "Stopped"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater_sealed' = TRUE
+    /\ UnchangedFrame_2b6bcadf53d5da4e
+
+
+SealIdentityGenerationHighwaterCompleted ==
+    /\ phase = "Completed"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ phase' = "Completed"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater_sealed' = TRUE
+    /\ UnchangedFrame_2b6bcadf53d5da4e
+
+
+SealIdentityGenerationHighwaterDestroyed ==
+    /\ phase = "Destroyed"
+    /\ (identity_generation_highwater_sealed = FALSE)
+    /\ phase' = "Destroyed"
+    /\ model_step_count' = model_step_count + 1
+    /\ identity_generation_highwater_sealed' = TRUE
+    /\ UnchangedFrame_2b6bcadf53d5da4e
+
+
 Next ==
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityTerminalRunning(run_id, status)
     \/ (phase = "Running") /\ \E run_id \in RunIdValues : \E status \in FlowRunStatusValues : ClassifyFlowRunTerminalityNonTerminalRunning(run_id, status)
@@ -19733,14 +19733,6 @@ Next ==
     \/ (phase = "Stopped") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverHostBindingGenerationHighwaterStopped(host_id, binding_generation)
     \/ (phase = "Completed") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverHostBindingGenerationHighwaterCompleted(host_id, binding_generation)
     \/ (phase = "Destroyed") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverHostBindingGenerationHighwaterDestroyed(host_id, binding_generation)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterRunning(agent_identity, generation)
-    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterStopped(agent_identity, generation)
-    \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterCompleted(agent_identity, generation)
-    \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterDestroyed(agent_identity, generation)
-    \/ SealIdentityGenerationHighwaterRunning
-    \/ SealIdentityGenerationHighwaterStopped
-    \/ SealIdentityGenerationHighwaterCompleted
-    \/ SealIdentityGenerationHighwaterDestroyed
     \/ (phase = "Running") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverConfirmedHostBindingRevocationRunning(host_id, binding_generation)
     \/ (phase = "Stopped") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverConfirmedHostBindingRevocationStopped(host_id, binding_generation)
     \/ (phase = "Completed") /\ \E host_id \in HostIdValues : \E binding_generation \in 0..2 : RecoverConfirmedHostBindingRevocationCompleted(host_id, binding_generation)
@@ -20305,6 +20297,14 @@ Next ==
     \/ (phase = "Completed") /\ \E loop_instance_id \in LoopInstanceIdValues : \E iteration \in 0..2 : RecordLoopUntilConditionFailedCompleted(loop_instance_id, iteration)
     \/ (phase = "Stopped") /\ \E loop_instance_id \in LoopInstanceIdValues : \E iteration \in 0..2 : RecordLoopUntilConditionMetStopped(loop_instance_id, iteration)
     \/ (phase = "Completed") /\ \E loop_instance_id \in LoopInstanceIdValues : \E iteration \in 0..2 : RecordLoopUntilConditionMetCompleted(loop_instance_id, iteration)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterRunning(agent_identity, generation)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterStopped(agent_identity, generation)
+    \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterCompleted(agent_identity, generation)
+    \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E generation \in GenerationValues : RecoverIdentityGenerationHighwaterDestroyed(agent_identity, generation)
+    \/ SealIdentityGenerationHighwaterRunning
+    \/ SealIdentityGenerationHighwaterStopped
+    \/ SealIdentityGenerationHighwaterCompleted
+    \/ SealIdentityGenerationHighwaterDestroyed
     \/ TerminalStutter
 
 stopped_mob_holds_member_run_starts == (IF (phase # "Stopped") THEN TRUE ELSE (member_run_starts_held = TRUE))

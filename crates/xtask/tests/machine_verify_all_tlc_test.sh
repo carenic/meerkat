@@ -363,12 +363,14 @@ fi
 # AgentIdentityValues are {}, so next_generation_above_highwater holds there
 # only vacuously. A hand-written audit over the same generated model gives
 # one identity generations 0..2 and explores the high-water recovery, the
-# seal and the roster recovery that leaves the identity below its high-water,
-# under every generated invariant plus two action properties (the seal
-# closes recovery; recovery never lowers). It requires its four witnesses
-# reached and refuses three seeded defects (--mutants): a mint helper that
-# ignores the high-water, a recovery without its seal guard, and a recovery
-# without its not-lowered guard. 4 steps reach every witness.
+# seal, and the roster and member reset recoveries, which replay any
+# ascending generation, under every generated invariant plus two action
+# properties (the seal closes recovery; recovery never lowers). It requires
+# its six witnesses reached and refuses four seeded defects (--mutants): a
+# mint helper that ignores the high-water, a recovery without its seal
+# guard, a recovery without its not-lowered guard, and the exact-successor
+# replay rule, which must leave both replay witnesses unreachable. 4 steps
+# reach every witness.
 generation_highwater_audit="${workspace_root}/specs/machines/mob_machine/generation_highwater_audit.sh"
 if [[ ! -x "${generation_highwater_audit}" ]]; then
   echo "error: generation high-water audit runner is missing from workspace runfiles: ${generation_highwater_audit}" >&2

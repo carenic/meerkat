@@ -9263,66 +9263,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `binding_generation_not_regressed`
 - To: `Destroyed`
 
-### `RecoverIdentityGenerationHighwaterRunning`
-- From: `Running`
-- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
-- Guards:
-  - `highwater_recovery_open`
-  - `highwater_not_lowered`
-- To: `Running`
-
-### `RecoverIdentityGenerationHighwaterStopped`
-- From: `Stopped`
-- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
-- Guards:
-  - `highwater_recovery_open`
-  - `highwater_not_lowered`
-- To: `Stopped`
-
-### `RecoverIdentityGenerationHighwaterCompleted`
-- From: `Completed`
-- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
-- Guards:
-  - `highwater_recovery_open`
-  - `highwater_not_lowered`
-- To: `Completed`
-
-### `RecoverIdentityGenerationHighwaterDestroyed`
-- From: `Destroyed`
-- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
-- Guards:
-  - `highwater_recovery_open`
-  - `highwater_not_lowered`
-- To: `Destroyed`
-
-### `SealIdentityGenerationHighwaterRunning`
-- From: `Running`
-- On: `SealIdentityGenerationHighwater`()
-- Guards:
-  - `highwater_recovery_open`
-- To: `Running`
-
-### `SealIdentityGenerationHighwaterStopped`
-- From: `Stopped`
-- On: `SealIdentityGenerationHighwater`()
-- Guards:
-  - `highwater_recovery_open`
-- To: `Stopped`
-
-### `SealIdentityGenerationHighwaterCompleted`
-- From: `Completed`
-- On: `SealIdentityGenerationHighwater`()
-- Guards:
-  - `highwater_recovery_open`
-- To: `Completed`
-
-### `SealIdentityGenerationHighwaterDestroyed`
-- From: `Destroyed`
-- On: `SealIdentityGenerationHighwater`()
-- Guards:
-  - `highwater_recovery_open`
-- To: `Destroyed`
-
 ### `RecoverConfirmedHostBindingRevocationRunning`
 - From: `Running`
 - On: `RecoverConfirmedHostBindingRevocation`(host_id, binding_generation)
@@ -15204,6 +15144,66 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `iteration_matches_last_completed`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Completed`
+
+### `RecoverIdentityGenerationHighwaterRunning`
+- From: `Running`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Running`
+
+### `RecoverIdentityGenerationHighwaterStopped`
+- From: `Stopped`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Stopped`
+
+### `RecoverIdentityGenerationHighwaterCompleted`
+- From: `Completed`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Completed`
+
+### `RecoverIdentityGenerationHighwaterDestroyed`
+- From: `Destroyed`
+- On: `RecoverIdentityGenerationHighwater`(agent_identity, generation)
+- Guards:
+  - `highwater_recovery_open`
+  - `highwater_not_lowered`
+- To: `Destroyed`
+
+### `SealIdentityGenerationHighwaterRunning`
+- From: `Running`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Running`
+
+### `SealIdentityGenerationHighwaterStopped`
+- From: `Stopped`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Stopped`
+
+### `SealIdentityGenerationHighwaterCompleted`
+- From: `Completed`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Completed`
+
+### `SealIdentityGenerationHighwaterDestroyed`
+- From: `Destroyed`
+- On: `SealIdentityGenerationHighwater`()
+- Guards:
+  - `highwater_recovery_open`
+- To: `Destroyed`
 
 ## Coverage
 ### Code Anchors

@@ -25112,178 +25112,6 @@ control_mob_RecoverHostBindingGenerationHighwaterDestroyed(arg_host_id, arg_bind
        /\ model_step_count' = model_step_count + 1
 
 
-control_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Running"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ control_mob_phase' = "Running"
-       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_e21ce1af2a77c9d6
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterRunning", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Running"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Stopped"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ control_mob_phase' = "Stopped"
-       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_e21ce1af2a77c9d6
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterStopped", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Stopped"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Completed"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ control_mob_phase' = "Completed"
-       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_e21ce1af2a77c9d6
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterCompleted", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Completed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Destroyed"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ control_mob_phase' = "Destroyed"
-       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_e21ce1af2a77c9d6
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterDestroyed", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Destroyed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_SealIdentityGenerationHighwaterRunning ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Running"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ control_mob_phase' = "Running"
-       /\ control_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_da528bb4ef574d3b
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterRunning", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Running"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_SealIdentityGenerationHighwaterStopped ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Stopped"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ control_mob_phase' = "Stopped"
-       /\ control_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_da528bb4ef574d3b
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterStopped", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Stopped"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_SealIdentityGenerationHighwaterCompleted ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Completed"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ control_mob_phase' = "Completed"
-       /\ control_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_da528bb4ef574d3b
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterCompleted", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Completed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-control_mob_SealIdentityGenerationHighwaterDestroyed ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "control_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("control_mob_authority")
-       /\ control_mob_phase = "Destroyed"
-       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
-       /\ control_mob_phase' = "Destroyed"
-       /\ control_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_da528bb4ef574d3b
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterDestroyed", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Destroyed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
 control_mob_RecoverConfirmedHostBindingRevocationRunning(arg_host_id, arg_binding_generation) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "control_mob"
@@ -40453,6 +40281,178 @@ control_mob_RecordLoopUntilConditionMetCompleted(arg_loop_instance_id, arg_itera
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "control_mob", variant |-> "EmitRunLifecycleNotice", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "RecordLoopUntilConditionMetCompleted"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecordLoopUntilConditionMetCompleted", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Completed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Running"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ control_mob_phase' = "Running"
+       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_e21ce1af2a77c9d6
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterRunning", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Stopped"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ control_mob_phase' = "Stopped"
+       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_e21ce1af2a77c9d6
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterStopped", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Completed"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ control_mob_phase' = "Completed"
+       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_e21ce1af2a77c9d6
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterCompleted", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Completed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Destroyed"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ control_mob_phase' = "Destroyed"
+       /\ control_mob_identity_generation_highwater' = MapSet(control_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_e21ce1af2a77c9d6
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "RecoverIdentityGenerationHighwaterDestroyed", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Destroyed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_SealIdentityGenerationHighwaterRunning ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Running"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ control_mob_phase' = "Running"
+       /\ control_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_da528bb4ef574d3b
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterRunning", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_SealIdentityGenerationHighwaterStopped ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Stopped"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ control_mob_phase' = "Stopped"
+       /\ control_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_da528bb4ef574d3b
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterStopped", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_SealIdentityGenerationHighwaterCompleted ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Completed"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ control_mob_phase' = "Completed"
+       /\ control_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_da528bb4ef574d3b
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterCompleted", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Completed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+control_mob_SealIdentityGenerationHighwaterDestroyed ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "control_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("control_mob_authority")
+       /\ control_mob_phase = "Destroyed"
+       /\ (control_mob_identity_generation_highwater_sealed = FALSE)
+       /\ control_mob_phase' = "Destroyed"
+       /\ control_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_da528bb4ef574d3b
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "control_mob", transition |-> "SealIdentityGenerationHighwaterDestroyed", actor |-> "control_mob_authority", step |-> (model_step_count + 1), from_phase |-> control_mob_phase, to_phase |-> "Destroyed"]}
        /\ UnchangedFrame_5c73fa0d7ecc522a
        /\ model_step_count' = model_step_count + 1
 
@@ -64297,178 +64297,6 @@ layer_mob_RecoverHostBindingGenerationHighwaterDestroyed(arg_host_id, arg_bindin
        /\ model_step_count' = model_step_count + 1
 
 
-layer_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Running"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ layer_mob_phase' = "Running"
-       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_78bc045e1ced82fe
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterRunning", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Running"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Stopped"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ layer_mob_phase' = "Stopped"
-       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_78bc045e1ced82fe
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterStopped", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Stopped"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Completed"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ layer_mob_phase' = "Completed"
-       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_78bc045e1ced82fe
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterCompleted", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Completed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation) ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "RecoverIdentityGenerationHighwater"
-       /\ packet.payload.agent_identity = arg_agent_identity
-       /\ packet.payload.generation = arg_generation
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Destroyed"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
-       /\ layer_mob_phase' = "Destroyed"
-       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
-       /\ UnchangedFrame_78bc045e1ced82fe
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterDestroyed", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Destroyed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_SealIdentityGenerationHighwaterRunning ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Running"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ layer_mob_phase' = "Running"
-       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_915dbf479484cb41
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterRunning", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Running"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_SealIdentityGenerationHighwaterStopped ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Stopped"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ layer_mob_phase' = "Stopped"
-       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_915dbf479484cb41
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterStopped", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Stopped"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_SealIdentityGenerationHighwaterCompleted ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Completed"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ layer_mob_phase' = "Completed"
-       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_915dbf479484cb41
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterCompleted", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Completed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
-layer_mob_SealIdentityGenerationHighwaterDestroyed ==
-    /\ \E packet \in SeqElements(pending_inputs) :
-       /\ packet.machine = "layer_mob"
-       /\ packet.variant = "SealIdentityGenerationHighwater"
-       /\ ~HigherPriorityReady("layer_mob_authority")
-       /\ layer_mob_phase = "Destroyed"
-       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
-       /\ layer_mob_phase' = "Destroyed"
-       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
-       /\ UnchangedFrame_915dbf479484cb41
-       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
-       /\ observed_inputs' = observed_inputs
-       /\ pending_routes' = pending_routes
-       /\ delivered_routes' = delivered_routes
-       /\ emitted_effects' = emitted_effects
-       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterDestroyed", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Destroyed"]}
-       /\ UnchangedFrame_5c73fa0d7ecc522a
-       /\ model_step_count' = model_step_count + 1
-
-
 layer_mob_RecoverConfirmedHostBindingRevocationRunning(arg_host_id, arg_binding_generation) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "layer_mob"
@@ -79642,6 +79470,178 @@ layer_mob_RecordLoopUntilConditionMetCompleted(arg_loop_instance_id, arg_iterati
        /\ model_step_count' = model_step_count + 1
 
 
+layer_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Running"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ layer_mob_phase' = "Running"
+       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_78bc045e1ced82fe
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterRunning", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Stopped"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ layer_mob_phase' = "Stopped"
+       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_78bc045e1ced82fe
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterStopped", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Completed"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ layer_mob_phase' = "Completed"
+       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_78bc045e1ced82fe
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterCompleted", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Completed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "RecoverIdentityGenerationHighwater"
+       /\ packet.payload.agent_identity = arg_agent_identity
+       /\ packet.payload.generation = arg_generation
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Destroyed"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ ((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity])))
+       /\ layer_mob_phase' = "Destroyed"
+       /\ layer_mob_identity_generation_highwater' = MapSet(layer_mob_identity_generation_highwater, packet.payload.agent_identity, packet.payload.generation)
+       /\ UnchangedFrame_78bc045e1ced82fe
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "RecoverIdentityGenerationHighwaterDestroyed", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Destroyed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_SealIdentityGenerationHighwaterRunning ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Running"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ layer_mob_phase' = "Running"
+       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_915dbf479484cb41
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterRunning", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_SealIdentityGenerationHighwaterStopped ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Stopped"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ layer_mob_phase' = "Stopped"
+       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_915dbf479484cb41
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterStopped", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_SealIdentityGenerationHighwaterCompleted ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Completed"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ layer_mob_phase' = "Completed"
+       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_915dbf479484cb41
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterCompleted", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Completed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
+layer_mob_SealIdentityGenerationHighwaterDestroyed ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "layer_mob"
+       /\ packet.variant = "SealIdentityGenerationHighwater"
+       /\ ~HigherPriorityReady("layer_mob_authority")
+       /\ layer_mob_phase = "Destroyed"
+       /\ (layer_mob_identity_generation_highwater_sealed = FALSE)
+       /\ layer_mob_phase' = "Destroyed"
+       /\ layer_mob_identity_generation_highwater_sealed' = TRUE
+       /\ UnchangedFrame_915dbf479484cb41
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "layer_mob", transition |-> "SealIdentityGenerationHighwaterDestroyed", actor |-> "layer_mob_authority", step |-> (model_step_count + 1), from_phase |-> layer_mob_phase, to_phase |-> "Destroyed"]}
+       /\ UnchangedFrame_5c73fa0d7ecc522a
+       /\ model_step_count' = model_step_count + 1
+
+
 layer_mob_stopped_mob_holds_member_run_starts == (IF (layer_mob_phase # "Stopped") THEN TRUE ELSE (layer_mob_member_run_starts_held = TRUE))
 layer_mob_bindings_require_known_identity == (\A id \in DOMAIN layer_mob_member_session_bindings : (id \in DOMAIN layer_mob_identity_to_runtime))
 layer_mob_placed_spawn_pending_attempt_is_complete == ((\A id \in DOMAIN layer_mob_pending_placed_spawn_ids : ((id \in DOMAIN layer_mob_pending_placed_spawn_generations) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_fence_tokens) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_hosts) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_host_binding_generations) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_spec_digests) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_provision_operation_ids) /\ (id \in DOMAIN layer_mob_pending_placed_spawn_operation_owner_session_ids))) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_generations : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_fence_tokens : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_hosts : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_host_binding_generations : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_spec_digests : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_provision_operation_ids : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)) /\ (\A id \in DOMAIN layer_mob_pending_placed_spawn_operation_owner_session_ids : (id \in DOMAIN layer_mob_pending_placed_spawn_ids)))
@@ -80851,14 +80851,6 @@ EntryPacketAdmissible_control_mob(packet) ==
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (control_mob_phase = "Stopped") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (control_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (control_mob_phase = "Completed") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (control_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (control_mob_phase = "Destroyed") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN control_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (control_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Running") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Stopped") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Completed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Destroyed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Running") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Stopped") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Completed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Destroyed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (control_mob_phase = "Running") /\ ((packet.payload.binding_generation > 0))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (control_mob_phase = "Stopped") /\ ((packet.payload.binding_generation > 0))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (control_mob_phase = "Completed") /\ ((packet.payload.binding_generation > 0))
@@ -81423,6 +81415,14 @@ EntryPacketAdmissible_control_mob(packet) ==
     \/ /\ (packet.variant = "RecordLoopUntilConditionFailed") /\ (control_mob_phase = "Completed") /\ ((control_mob_placed_completion_lifecycle_quiescing = FALSE)) /\ (((packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase THEN control_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage THEN control_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration THEN control_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration))) /\ ((((packet.payload.loop_instance_id \in DOMAIN control_mob_loop_current_iteration) /\ (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_max_iterations)) /\ ((control_mob_loop_current_iteration)[packet.payload.loop_instance_id] < (control_mob_loop_max_iterations)[packet.payload.loop_instance_id])))
     \/ /\ (packet.variant = "RecordLoopUntilConditionMet") /\ (control_mob_phase = "Stopped") /\ (((packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase THEN control_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage THEN control_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration THEN control_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration)))
     \/ /\ (packet.variant = "RecordLoopUntilConditionMet") /\ (control_mob_phase = "Completed") /\ (((packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_phase THEN control_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_stage THEN control_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN control_mob_loop_last_completed_iteration THEN control_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration)))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Running") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Stopped") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Completed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (control_mob_phase = "Destroyed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN control_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (control_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Running") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Stopped") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Completed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (control_mob_phase = "Destroyed") /\ ((control_mob_identity_generation_highwater_sealed = FALSE))
 
 layer_mob__entry_packet__identity_reconcile_decision(intent, lease, replacement, external_binding_required, initial_delivery_required, session_creation_receipt, retirement_receipt, session, runtime, member, external_binding_receipt, external_trust, external_ceremony, initial_delivery_receipt, initial_delivery, wiring) == (IF (replacement = "AdmissionOpen") THEN "CloseMemberAdmission" ELSE (IF (replacement = "Draining") THEN "AwaitMemberDrain" ELSE (IF (replacement = "DrainBlocked") THEN "DrainBlocked" ELSE (IF (replacement = "CancelActive") THEN "CancelActiveMember" ELSE (IF (replacement = "Ready") THEN "RetireMemberMaterialization" ELSE (IF (intent = "Unavailable") THEN "Backoff" ELSE (IF (IF (intent = "Missing") THEN TRUE ELSE (intent = "Malformed")) THEN "RepairBlocked" ELSE (IF (lease = "Unavailable") THEN "Backoff" ELSE (IF (IF (lease = "Missing") THEN TRUE ELSE (lease = "HeldByExpiredIncarnation")) THEN "AcquireLease" ELSE (IF (lease = "Malformed") THEN "RepairBlocked" ELSE (IF (lease = "HeldByOtherLiveIncarnation") THEN "AwaitLease" ELSE (IF (intent = "Absent") THEN (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Matching") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (member = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (member = "Matching") THEN TRUE ELSE (member = "Divergent")) THEN "RetireMemberMaterialization" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Matching") THEN TRUE ELSE (runtime = "Divergent")) THEN "RetireRuntimeRegistration" ELSE (IF (session = "Unavailable") THEN "Backoff" ELSE (IF (IF (session = "Malformed") THEN TRUE ELSE (session = "AmbiguousDivergence")) THEN "RepairBlocked" ELSE (IF (IF (session = "Matching") THEN TRUE ELSE (IF (session = "RecoverableDivergence") THEN TRUE ELSE (session = "IrrecoverablyCorrupt"))) THEN "ReleaseSessionAuthority" ELSE (IF (retirement_receipt = "Unavailable") THEN "Backoff" ELSE (IF (retirement_receipt = "Missing") THEN "SealRetirementProven" ELSE (IF (retirement_receipt = "Matching") THEN "Tombstoned" ELSE "RepairBlocked"))))))))))))))) ELSE (IF (session = "Unavailable") THEN "Backoff" ELSE (IF (IF (session = "Malformed") THEN TRUE ELSE (IF (session = "IrrecoverablyCorrupt") THEN TRUE ELSE (IF (session = "AmbiguousDivergence") THEN TRUE ELSE ((session = "Missing") /\ (intent = "PresentRequireExisting"))))) THEN (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Matching") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (member = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (member = "Matching") THEN TRUE ELSE (member = "Divergent")) THEN "RetireMemberMaterialization" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Matching") THEN TRUE ELSE (runtime = "Divergent")) THEN "RetireRuntimeRegistration" ELSE (IF (session = "IrrecoverablyCorrupt") THEN "Quarantined" ELSE "RepairBlocked")))))))))) ELSE (IF (IF (session = "Missing") THEN TRUE ELSE (session = "RecoverableDivergence")) THEN (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (IF (session_creation_receipt = "Conflicting") THEN TRUE ELSE (IF (session_creation_receipt = "Malformed") THEN TRUE ELSE (session_creation_receipt = "NotRequired")))) THEN "RepairBlocked" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Matching") /\ (session = "Missing")) THEN "RepairBlocked" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (IF (session_creation_receipt = "Missing") THEN TRUE ELSE (session_creation_receipt = "Matching"))) THEN "EnsureSessionAuthority" ELSE (IF ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "NotRequired")) THEN "EnsureSessionAuthority" ELSE (IF ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE "RepairBlocked")))))) ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Unavailable")) THEN "Backoff" ELSE (IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Missing")) THEN "SealSessionCreationConsumed" ELSE (IF ~((IF ((intent = "PresentCreateIfAbsent") /\ (session_creation_receipt = "Matching")) THEN TRUE ELSE ((intent = "PresentRequireExisting") /\ (session_creation_receipt = "NotRequired")))) THEN "RepairBlocked" ELSE (IF (runtime = "Unavailable") THEN "Backoff" ELSE (IF (runtime = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (runtime = "Missing") THEN TRUE ELSE (runtime = "Divergent")) THEN "EnsureRuntimeRegistration" ELSE (IF (external_binding_required = TRUE) THEN (IF (external_binding_receipt = "Unavailable") THEN "Backoff" ELSE (IF (external_binding_receipt = "Missing") THEN "EnsureExternalBindingReceipt" ELSE (IF (IF (external_binding_receipt = "Conflicting") THEN TRUE ELSE (IF (external_binding_receipt = "Malformed") THEN TRUE ELSE (external_binding_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (external_trust = "Unavailable") THEN "Backoff" ELSE (IF (external_trust = "Absent") THEN (IF (external_ceremony = "FreshAvailable") THEN "EnsureExternalBinding" ELSE (IF (external_ceremony = "AwaitFresh") THEN "AwaitExternalBindingCeremony" ELSE (IF (external_ceremony = "TemporarilyUnavailable") THEN "Backoff" ELSE "RepairBlocked"))) ELSE (IF (IF (external_trust = "Contradictory") THEN TRUE ELSE (IF (external_trust = "Indeterminate") THEN TRUE ELSE (IF (external_trust = "Malformed") THEN TRUE ELSE (external_trust = "NotRequired")))) THEN "RepairBlocked" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (IF (member = "Malformed") THEN TRUE ELSE (member = "Divergent")) THEN "RepairBlocked" ELSE (IF (member = "Missing") THEN "EnsureMemberMaterialization" ELSE (IF (initial_delivery_required = TRUE) THEN (IF (initial_delivery_receipt = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery_receipt = "Missing") THEN "EnsureInitialDeliveryReceipt" ELSE (IF (IF (initial_delivery_receipt = "Conflicting") THEN TRUE ELSE (IF (initial_delivery_receipt = "Malformed") THEN TRUE ELSE (initial_delivery_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (initial_delivery = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery = "ProvenAbsent") THEN "EnsureInitialDelivery" ELSE (IF (initial_delivery = "AcceptedPendingExact") THEN "AwaitInitialDelivery" ELSE (IF (IF (initial_delivery = "ContentOnlyMatch") THEN TRUE ELSE (IF (initial_delivery = "OperationCollision") THEN TRUE ELSE (IF (initial_delivery = "Contradictory") THEN TRUE ELSE (IF (initial_delivery = "Indeterminate") THEN TRUE ELSE (IF (initial_delivery = "Malformed") THEN TRUE ELSE (initial_delivery = "NotRequired")))))) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))) ELSE (IF (IF (initial_delivery_receipt # "NotRequired") THEN TRUE ELSE (initial_delivery # "NotRequired")) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))))))) ELSE (IF (IF (external_binding_receipt # "NotRequired") THEN TRUE ELSE (IF (external_trust # "NotRequired") THEN TRUE ELSE (external_ceremony # "NotRequired"))) THEN "RepairBlocked" ELSE (IF (member = "Unavailable") THEN "Backoff" ELSE (IF (IF (member = "Malformed") THEN TRUE ELSE (member = "Divergent")) THEN "RepairBlocked" ELSE (IF (member = "Missing") THEN "EnsureMemberMaterialization" ELSE (IF (initial_delivery_required = TRUE) THEN (IF (initial_delivery_receipt = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery_receipt = "Missing") THEN "EnsureInitialDeliveryReceipt" ELSE (IF (IF (initial_delivery_receipt = "Conflicting") THEN TRUE ELSE (IF (initial_delivery_receipt = "Malformed") THEN TRUE ELSE (initial_delivery_receipt = "NotRequired"))) THEN "RepairBlocked" ELSE (IF (initial_delivery = "Unavailable") THEN "Backoff" ELSE (IF (initial_delivery = "ProvenAbsent") THEN "EnsureInitialDelivery" ELSE (IF (initial_delivery = "AcceptedPendingExact") THEN "AwaitInitialDelivery" ELSE (IF (IF (initial_delivery = "ContentOnlyMatch") THEN TRUE ELSE (IF (initial_delivery = "OperationCollision") THEN TRUE ELSE (IF (initial_delivery = "Contradictory") THEN TRUE ELSE (IF (initial_delivery = "Indeterminate") THEN TRUE ELSE (IF (initial_delivery = "Malformed") THEN TRUE ELSE (initial_delivery = "NotRequired")))))) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))) ELSE (IF (IF (initial_delivery_receipt # "NotRequired") THEN TRUE ELSE (initial_delivery # "NotRequired")) THEN "RepairBlocked" ELSE (IF (retirement_receipt # "NotRequired") THEN "RepairBlocked" ELSE (IF (wiring = "Unavailable") THEN "Backoff" ELSE (IF (wiring = "Malformed") THEN "RepairBlocked" ELSE (IF (IF (wiring = "Missing") THEN TRUE ELSE (wiring = "Divergent")) THEN "ReconcileWiring" ELSE "Converged"))))))))))))))))))))))))))))))))
 
@@ -82578,14 +82578,6 @@ EntryPacketAdmissible_layer_mob(packet) ==
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (layer_mob_phase = "Stopped") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (layer_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (layer_mob_phase = "Completed") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (layer_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
     \/ /\ (packet.variant = "RecoverHostBindingGenerationHighwater") /\ (layer_mob_phase = "Destroyed") /\ ((packet.payload.binding_generation > 0)) /\ (((IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater)) /\ (IF ((packet.payload.host_id \in DOMAIN layer_mob_host_binding_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.binding_generation >= (layer_mob_host_binding_generation_highwater)[packet.payload.host_id]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Running") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Stopped") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Completed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Destroyed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Running") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Stopped") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Completed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
-    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Destroyed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (layer_mob_phase = "Running") /\ ((packet.payload.binding_generation > 0))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (layer_mob_phase = "Stopped") /\ ((packet.payload.binding_generation > 0))
     \/ /\ (packet.variant = "RecoverConfirmedHostBindingRevocation") /\ (layer_mob_phase = "Completed") /\ ((packet.payload.binding_generation > 0))
@@ -83150,6 +83142,14 @@ EntryPacketAdmissible_layer_mob(packet) ==
     \/ /\ (packet.variant = "RecordLoopUntilConditionFailed") /\ (layer_mob_phase = "Completed") /\ ((layer_mob_placed_completion_lifecycle_quiescing = FALSE)) /\ (((packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase THEN layer_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage THEN layer_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration THEN layer_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration))) /\ ((((packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_current_iteration) /\ (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_max_iterations)) /\ ((layer_mob_loop_current_iteration)[packet.payload.loop_instance_id] < (layer_mob_loop_max_iterations)[packet.payload.loop_instance_id])))
     \/ /\ (packet.variant = "RecordLoopUntilConditionMet") /\ (layer_mob_phase = "Stopped") /\ (((packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase THEN layer_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage THEN layer_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration THEN layer_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration)))
     \/ /\ (packet.variant = "RecordLoopUntilConditionMet") /\ (layer_mob_phase = "Completed") /\ (((packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) = TRUE)) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_phase THEN layer_mob_loop_phase[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("Running"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_stage THEN layer_mob_loop_stage[packet.payload.loop_instance_id] ELSE "None")) ELSE None) = Some("AwaitingUntilEvaluation"))) /\ (((IF (packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration) THEN Some((IF packet.payload.loop_instance_id \in DOMAIN layer_mob_loop_last_completed_iteration THEN layer_mob_loop_last_completed_iteration[packet.payload.loop_instance_id] ELSE 0)) ELSE None) = Some(packet.payload.iteration)))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Running") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Stopped") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Completed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "RecoverIdentityGenerationHighwater") /\ (layer_mob_phase = "Destroyed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE)) /\ (((IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater)) /\ (IF ((packet.payload.agent_identity \in DOMAIN layer_mob_identity_generation_highwater) = FALSE) THEN TRUE ELSE (packet.payload.generation >= (layer_mob_identity_generation_highwater)[packet.payload.agent_identity]))))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Running") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Stopped") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Completed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
+    \/ /\ (packet.variant = "SealIdentityGenerationHighwater") /\ (layer_mob_phase = "Destroyed") /\ ((layer_mob_identity_generation_highwater_sealed = FALSE))
 
 EntryPacketAdmissible(packet) ==
     CASE
@@ -84074,14 +84074,6 @@ CoreNext ==
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverHostBindingGenerationHighwaterStopped(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverHostBindingGenerationHighwaterCompleted(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverHostBindingGenerationHighwaterDestroyed(arg_host_id, arg_binding_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation)
-    \/ control_mob_SealIdentityGenerationHighwaterRunning
-    \/ control_mob_SealIdentityGenerationHighwaterStopped
-    \/ control_mob_SealIdentityGenerationHighwaterCompleted
-    \/ control_mob_SealIdentityGenerationHighwaterDestroyed
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverConfirmedHostBindingRevocationRunning(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverConfirmedHostBindingRevocationStopped(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : control_mob_RecoverConfirmedHostBindingRevocationCompleted(arg_host_id, arg_binding_generation)
@@ -84646,6 +84638,14 @@ CoreNext ==
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : control_mob_RecordLoopUntilConditionFailedCompleted(arg_loop_instance_id, arg_iteration)
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : control_mob_RecordLoopUntilConditionMetStopped(arg_loop_instance_id, arg_iteration)
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : control_mob_RecordLoopUntilConditionMetCompleted(arg_loop_instance_id, arg_iteration)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : control_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation)
+    \/ control_mob_SealIdentityGenerationHighwaterRunning
+    \/ control_mob_SealIdentityGenerationHighwaterStopped
+    \/ control_mob_SealIdentityGenerationHighwaterCompleted
+    \/ control_mob_SealIdentityGenerationHighwaterDestroyed
     \/ \E arg_run_id \in RunIdValues : \E arg_status \in FlowRunStatusValues : layer_mob_ClassifyFlowRunTerminalityTerminalRunning(arg_run_id, arg_status)
     \/ \E arg_run_id \in RunIdValues : \E arg_status \in FlowRunStatusValues : layer_mob_ClassifyFlowRunTerminalityNonTerminalRunning(arg_run_id, arg_status)
     \/ \E arg_run_id \in RunIdValues : \E arg_step_id \in StepIdValues : \E arg_status \in StepRunStatusValues : layer_mob_ClassifyFlowStepTerminalityTerminalRunning(arg_run_id, arg_step_id, arg_status)
@@ -85500,14 +85500,6 @@ CoreNext ==
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverHostBindingGenerationHighwaterStopped(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverHostBindingGenerationHighwaterCompleted(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverHostBindingGenerationHighwaterDestroyed(arg_host_id, arg_binding_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation)
-    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation)
-    \/ layer_mob_SealIdentityGenerationHighwaterRunning
-    \/ layer_mob_SealIdentityGenerationHighwaterStopped
-    \/ layer_mob_SealIdentityGenerationHighwaterCompleted
-    \/ layer_mob_SealIdentityGenerationHighwaterDestroyed
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverConfirmedHostBindingRevocationRunning(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverConfirmedHostBindingRevocationStopped(arg_host_id, arg_binding_generation)
     \/ \E arg_host_id \in HostIdValues : \E arg_binding_generation \in 0..2 : layer_mob_RecoverConfirmedHostBindingRevocationCompleted(arg_host_id, arg_binding_generation)
@@ -86072,6 +86064,14 @@ CoreNext ==
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : layer_mob_RecordLoopUntilConditionFailedCompleted(arg_loop_instance_id, arg_iteration)
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : layer_mob_RecordLoopUntilConditionMetStopped(arg_loop_instance_id, arg_iteration)
     \/ \E arg_loop_instance_id \in LoopInstanceIdValues : \E arg_iteration \in 0..2 : layer_mob_RecordLoopUntilConditionMetCompleted(arg_loop_instance_id, arg_iteration)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterRunning(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterStopped(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterCompleted(arg_agent_identity, arg_generation)
+    \/ \E arg_agent_identity \in AgentIdentityValues : \E arg_generation \in GenerationValues : layer_mob_RecoverIdentityGenerationHighwaterDestroyed(arg_agent_identity, arg_generation)
+    \/ layer_mob_SealIdentityGenerationHighwaterRunning
+    \/ layer_mob_SealIdentityGenerationHighwaterStopped
+    \/ layer_mob_SealIdentityGenerationHighwaterCompleted
+    \/ layer_mob_SealIdentityGenerationHighwaterDestroyed
     \/ OwnerFeedback_control_mob_mob_destroying_session_ingress_SessionIngressDetachedForMobDestroy
     \/ OwnerFeedback_control_mob_mob_destroying_session_ingress_SessionIngressDetachFailedForMobDestroy
     \/ OwnerFeedback_layer_mob_mob_destroying_session_ingress_SessionIngressDetachedForMobDestroy

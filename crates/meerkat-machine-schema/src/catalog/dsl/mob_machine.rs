@@ -14582,35 +14582,6 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
         }
 
-        // Resume recovers each identity's generation high-water from the whole
-        // log before it seeds the last reset epoch, and only before the seal.
-        // It inserts or raises; a lower value is refused, never applied.
-        transition RecoverIdentityGenerationHighwater {
-            per_phase [Running, Stopped, Completed, Destroyed]
-            on signal RecoverIdentityGenerationHighwater { agent_identity, generation }
-            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
-            guard "highwater_not_lowered" {
-                self.identity_generation_highwater.contains_key(agent_identity) == false
-                || generation >= self.identity_generation_highwater.get_copied(agent_identity).get("value")
-            }
-            update {
-                self.identity_generation_highwater.insert(agent_identity, generation);
-            }
-            to Running
-        }
-
-        // Create and resume close the high-water recovery window once, before
-        // the actor runs; a sealed machine refuses the recovery signal.
-        transition SealIdentityGenerationHighwater {
-            per_phase [Running, Stopped, Completed, Destroyed]
-            on signal SealIdentityGenerationHighwater
-            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
-            update {
-                self.identity_generation_highwater_sealed = true;
-            }
-            to Running
-        }
-
         transition RecoverConfirmedHostBindingRevocation {
             per_phase [Running, Stopped, Completed, Destroyed]
             on signal RecoverConfirmedHostBindingRevocation { host_id, binding_generation }
@@ -22202,6 +22173,35 @@ macro_rules! mob_catalog_machine_dsl {
             }
             to Completed
             emit EmitRunLifecycleNotice
+        }
+
+        // Resume recovers each identity's generation high-water from the whole
+        // log before it seeds the last reset epoch, and only before the seal.
+        // It inserts or raises; a lower value is refused, never applied.
+        transition RecoverIdentityGenerationHighwater {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal RecoverIdentityGenerationHighwater { agent_identity, generation }
+            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
+            guard "highwater_not_lowered" {
+                self.identity_generation_highwater.contains_key(agent_identity) == false
+                || generation >= self.identity_generation_highwater.get_copied(agent_identity).get("value")
+            }
+            update {
+                self.identity_generation_highwater.insert(agent_identity, generation);
+            }
+            to Running
+        }
+
+        // Create and resume close the high-water recovery window once, before
+        // the actor runs; a sealed machine refuses the recovery signal.
+        transition SealIdentityGenerationHighwater {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal SealIdentityGenerationHighwater
+            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
+            update {
+                self.identity_generation_highwater_sealed = true;
+            }
+            to Running
         }
 
     }
