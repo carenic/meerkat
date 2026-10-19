@@ -843,6 +843,30 @@ async fn a_dispatch_failure_closes_admission() {
     }
 }
 
+/// A durable recovery that fail-stops before command admission exits the
+/// actor with admission closed for the fail-stop, so the mob grants no owner
+/// lease on the exited actor.
+#[tokio::test]
+async fn a_startup_fail_stop_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-startup-fail-stop");
+    crate::runtime::actor::fail_stop_next_actor_start_for_test(&definition.id);
+    let (handle, _service) = create_test_mob(definition).await;
+    let mut task = handle.actor_task_watch();
+
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DurabilityFailStop)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob fail-stopped at its start grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DurabilityFailStop),
+    }
+}
+
 /// While the admitted Shutdown still joins actor work inline (here a held
 /// member-live task), a command the Closing state refuses is answered with
 /// the close reason, the answer it gets once the Shutdown parks, not as a
@@ -893,6 +917,71 @@ async fn a_spawn_during_the_shutdown_drain_is_refused_with_the_close_reason() {
         .expect("the Shutdown returns")
         .expect("join")
         .expect("the Shutdown finishes");
+}
+
+/// A Shutdown that fails after its admission keeps the actor as the retry
+/// owner with admission closed: the Closing set stays refused, and a retried
+/// Shutdown is admitted and finishes.
+#[tokio::test]
+async fn a_failed_shutdown_keeps_admission_closed_and_its_retry_finishes() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-failed-shutdown");
+    let (handle, _service) = create_test_mob(definition).await;
+
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    let error = tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the failed Shutdown answers")
+        .expect_err("the Shutdown fails in its drain");
+    assert!(
+        error
+            .to_string()
+            .contains("test seam: the Shutdown's lifecycle drain fails"),
+        "unexpected Shutdown failure: {error}"
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn_spec(worker_spec("d67-failed-shutdown-late")),
+    )
+    .await
+    .expect("the live actor answers a spawn");
+    match late {
+        Ok(_) => panic!("a mob whose Shutdown failed admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob whose Shutdown failed grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+
+    tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the retried Shutdown answers")
+        .expect("the retried Shutdown is admitted and finishes");
+}
+
+/// After a failed Shutdown, Stop and Destroy stay available too.
+#[tokio::test]
+async fn stop_and_destroy_stay_available_after_a_failed_shutdown() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-failed-shutdown-teardown");
+    let (handle, _service) = create_test_mob(definition).await;
+
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the failed Shutdown answers")
+        .expect_err("the Shutdown fails in its drain");
+    tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop answers")
+        .expect("the Stop is admitted and finishes");
+    tokio::time::timeout(STEP, handle.destroy())
+        .await
+        .expect("the destroy answers")
+        .expect("the destroy is admitted and finishes");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

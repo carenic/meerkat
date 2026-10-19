@@ -49,6 +49,13 @@ them.
   waited for the Shutdown or ran. `MobHandle::acquire_owner` after the
   Shutdown's admission is refused the same way where it granted an owner
   lease.
+- Behaviour-only (not measured by the gate): a Shutdown that fails after its
+  admission keeps the actor alive as the retry owner with admission closed,
+  so the Closing set (spawn, work submission, flows, wiring, a host bind, a
+  live commit, resume, reset, reload, owner leases and identity realization)
+  stays refused with `MobError::AdmissionClosed` for the actor's life, where
+  the actor admitted all of it again before. Stop, Shutdown and Destroy stay
+  available.
 - Behaviour-only (not measured by the gate): once a destroy is admitted (its
   durable destroy marker is written), `MobHandle::acquire_owner` is refused
   with `MobError::AdmissionClosed` (reason

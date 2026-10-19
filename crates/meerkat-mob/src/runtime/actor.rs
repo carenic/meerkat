@@ -4227,6 +4227,26 @@ static FAIL_BOUNDARY_FLUSH_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync:
 pub(super) fn fail_next_boundary_flush_for_test(mob_id: &MobId) {
     arm_mob_seam_for_test(&FAIL_BOUNDARY_FLUSH_FOR_MOB, mob_id);
 }
+
+/// Test seam: this mob's next admitted Shutdown fails in its lifecycle drain,
+/// after its admission.
+#[cfg(test)]
+static FAIL_SHUTDOWN_DRAIN_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_SHUTDOWN_DRAIN_FOR_MOB, mob_id);
+}
+
+/// Test seam: this mob's next actor start fail-stops in its durable recovery,
+/// before command admission.
+#[cfg(test)]
+static FAIL_STOP_ACTOR_START_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, mob_id);
+}
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
@@ -28526,6 +28546,15 @@ impl MobActor {
                         }),
                     )
                     .await;
+                    #[cfg(test)]
+                    let drained =
+                        if take_mob_seam_for_test(&FAIL_SHUTDOWN_DRAIN_FOR_MOB, &self.definition.id) {
+                            Err(MobError::Internal(
+                                "test seam: the Shutdown's lifecycle drain fails".to_string(),
+                            ))
+                        } else {
+                            drained
+                        };
                     self.retained_actor_completions = retained;
                     self.public_owner_release_backlog =
                         self.public_owner_release_backlog.saturating_sub(received);
@@ -28879,6 +28908,15 @@ impl MobActor {
     /// phase drops the recovery frame before a deeply nested command handler
     /// is polled, without moving actor authority out of the serialized task.
     async fn prepare_actor_run(&mut self) -> bool {
+        #[cfg(test)]
+        if take_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, &self.definition.id) {
+            tracing::error!(
+                mob_id = %self.definition.id,
+                "test seam: durable recovery fail-stops before command admission"
+            );
+            self.quiesce_volatile_producers_after_fail_stop().await;
+            return false;
+        }
         if let Err(error) = self.restore_local_cleanup_composition_delivery().await {
             tracing::error!(
                 mob_id = %self.definition.id,
