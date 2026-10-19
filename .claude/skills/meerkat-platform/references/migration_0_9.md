@@ -293,9 +293,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `in_reply_to` fields on the comms notice block, `PeerContentIngested`,
   `CommsCommand::PeerMessage`, `InteractionContent::Message`,
   `MessageKind::Message` and `PeerInput`.
-- Mobs: a host's refusal of a restored member's registration removes the
-  registration and leaves the member Broken with
-  `MobError::MemberRegistrationRefused` until a repair; an uninstalled
+- Mobs: a host's refusal of a restored member's registration (also one the
+  boot recreates on a fresh session) removes the registration and leaves only
+  that member Broken with `MobError::MemberRegistrationRefused` until a
+  repair; Stop and Shutdown report a member needing a durability reload as
+  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing; an uninstalled
   destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
   `force_cancel_member` / `cancel_all_work` on a member needing a durability
@@ -382,6 +384,14 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   keeps Node alive for 5 seconds, and both SDK clients settle on the
   `rkat-rpc` child's exit; public GPT Live sends a finished notice for a
   delegation result held behind the user's question.
+- SQLite: release binaries build the bundled SQLite without its three
+  process-wide locks; a build outside the repository (`cargo install rkat`,
+  an embedding application) sets `LIBSQLITE3_FLAGS` itself (value in
+  `docs/guides/deploying.mdx`, "SQLite Lock Profile"), and an embedding
+  application calls `meerkat_sqlite::disable_memory_statistics_at_process_start()`
+  first in `main`. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
+  store connections hold `<file>.mpresence` presence locks, which maintenance
+  waits for.
 - Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
   it gets a build state derived from its source's, with the source's session
   configuration but without its `shell_env`, MCP attachments or mob operator

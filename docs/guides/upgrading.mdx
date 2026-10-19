@@ -179,6 +179,17 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   `MobMemberSnapshot::registration_refusal` and the wire
   `MobMemberStatusResult::registration_refusal` show it (set the field in
   struct literals). A refused member can be retired, respawned or destroyed.
+  A member `MobBuilder::resume` recreates on a fresh session is isolated the
+  same way when its host refuses it, and the other members resume; 0.9.3
+  failed the whole resume.
+- **Stop and Shutdown of a member whose registration needs a durability
+  reload** report its run and run starts as `ReloadRequired` (the new
+  `MemberStopRun::ReloadRequired` and `MemberRunStarts::ReloadRequired`, wire
+  `reload_required`) instead of failing or waiting on it, and a Shutdown holds
+  every member's run starts and reports the first failure in roster order.
+  Known limitation: in a multi-host mob, a remote member that needs a reload
+  still makes a Stop fail with `MobError::BridgeCommandRejected` (cause
+  `internal`); reload the member on its host, then retry.
 - **A runtime that did not install the destination its host selected** now
   answers `MobError::MemberDestinationNotInstalled` (RPC data kind
   `mob_member_destination_not_installed`, not retryable), where it answered
@@ -506,6 +517,25 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   requests to a child that exited by itself fail within about a second
   (`PROCESS_EXITED` in TypeScript, `CONNECTION_CLOSED` in Python) and
   `close()` returns once the child has exited.
+- **SQLite lock profile:** the release binaries are built with the bundled
+  SQLite's three process-wide locks off, so concurrent sessions in one host
+  no longer queue on each other. A build outside the repository
+  (`cargo install rkat`, an application that embeds Meerkat) does not get
+  that setting: **Do:** set `LIBSQLITE3_FLAGS` to the value in
+  [SQLite Lock Profile](/guides/deploying#sqlite-lock-profile) for that
+  build, and in an embedding application call
+  `meerkat_sqlite::disable_memory_statistics_at_process_start()` as the first
+  statement of `main`. `rkat storage doctor` reports the profile and warns
+  with `sqlite-lock-profile` when a lock is on.
+- **Presence locks:** a connection a store keeps open between operations
+  holds a presence lock (`<file>.mpresence` next to the database), and
+  maintenance such as `rkat storage migrate --apply` waits for kept
+  connections to close; `rkat storage doctor` lists the files as
+  `maintenance-fence-lock` findings.
+- **GPT Live transcript rows** the transport holds when a member turn ends
+  all commit at that turn's boundary, before the next queued member turn, so
+  the stored transcript no longer falls behind while member turns run back to
+  back.
 - **Published crates:** `cargo test` in an unpacked published Meerkat crate
   passes (`meerkat`, `meerkat-runtime` and `meerkat-mob` with the features
   and the 8 MiB test stack, `RUST_MIN_STACK=8388608`, that their README
