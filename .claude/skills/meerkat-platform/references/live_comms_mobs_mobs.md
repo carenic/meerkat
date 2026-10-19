@@ -188,6 +188,12 @@ hand out an owner lease on a stopped actor.
   accept an optional `placement`. Host-only fields such as `mcp_servers` and
   `rust_bundles` are refused, and managed hosts without a child tool policy
   refuse `mob_create` and `delegate` (`child_tool_policy_required`).
+- Since 0.9.4 a child mob's inline profile (a mob a member creates with
+  `mob_create`) can mount a tool bundle the host offers to child mobs by
+  naming it in `tools.bundles`. A name the host does not offer is refused
+  (`ToolBundleNotOffered`, which lists the offered names). The opt-in persists
+  with the definition; a member whose host no longer offers the bundle is
+  built without it (`MobHandle::withheld_tool_bundles` reports it).
 - `tooling` (any mode) needs a source identity for every tool the child
   keeps. Tools from a named Rust tool bundle get one automatically (0.8.52+);
   external tools a host mounts outside a bundle need `ToolDef.provenance` or
@@ -205,6 +211,7 @@ hand out an owner lease on a stopped actor.
 | `tools.comms = true` | Required for every spawned member |
 | `tools.read_only = true` | Only tools declared read-only may execute; tools stay listed, other calls are refused `access_denied` |
 | `tools.deny = [...]` | Named tools are hidden from members (0.8.52+) and refused by name; an unknown name fails the build (`DeclaredToolUnknown`) |
+| `tools.bundles = [...]` | 0.9.4+: host tool bundles a child mob's inline profile opts into; only bundles the host offers to child mobs |
 | `model_fallback` / top-level `[runtime] model_fallback` | Fallback model; precedence is profile, then mob runtime, then host config |
 | `resume_overrides = ["model", "provider", "provider_params"]` | Profile fields that win over a resumed member's durable session |
 | `external_addressable = true` | Required for `mob/member_send` and external `mob/submit_work` |
@@ -286,8 +293,8 @@ rkat --realm team mob hosts <MOB_ID> --json
   members also sets `listen_tcp` and `advertise_tcp` so hosts can reach it.
 - Spawn a placed member with `placement: "<HOST_ID>"` on `mob/spawn`,
   `mob/spawn_many`, `delegate` or `mob_spawn_member`. Placement needs a
-  portable spec: Rust tool bundles, WorkGraph tools, shell or MCP secrets in
-  env or headers are refused.
+  portable spec: Rust tool bundles (`tools.bundles` opt-ins too), WorkGraph
+  tools, shell or MCP secrets in env or headers are refused.
 - Also: `rkat mob revoke-host`, `member-history` and `route-installs`
   (pending external trust installs show as `outstanding_external`).
 - Since 0.9.4 a recorded placed lifecycle intent (such as a Reset) is not

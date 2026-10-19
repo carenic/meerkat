@@ -231,6 +231,14 @@ once the user has clearly finished. A Rust host replaces them with
 `PublicGptLiveOpenAuthorityConfig.session_instructions`, or keeps them and
 prepends its own knowledge with `session_instructions_preface`.
 
+Held results: Meerkat holds a finished delegation's result while the user's
+latest utterance is unanswered, and delivers one result at a time. Since
+0.9.4 a held result first sends the voice a notice that the work has finished
+but its result has not arrived, so it no longer answers "not yet". The voice
+may say the work just finished but must not state or guess the outcome until
+the result arrives. The notice waits while the voice is speaking and is
+dropped if the result reaches the session first.
+
 ## Live channels on mob members
 
 Each member has its own session, so live channels are per member. Give the

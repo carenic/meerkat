@@ -775,7 +775,16 @@ the spawning agent's visible tools. On a managed host
 agent-created child mobs and `delegate` helpers run under
 `MobMcpState::with_child_application_tool_policy`; without one, `mob_create`,
 `delegate` and spawns into child mobs are refused
-(`child_tool_policy_required`).
+(`child_tool_policy_required`). A host registers each Rust tool bundle for
+child mobs as `HostOnly` (default), `ChildAvailable` (supplied to every inline
+child profile) or, since 0.9.4, `ChildOffered`: supplied to no profile, and
+mounted only for an inline child profile that names it in `tools.bundles`.
+Any other name is refused with `MobError::ToolBundleNotOffered`, which lists
+the offered names; an MCP server cannot be `ChildOffered`
+(`ChildMcpServerRegistrationError::OfferNotSupported`). The opt-in persists
+with the definition and the offer is its ceiling at every build:
+`MobHandle::withheld_tool_bundles` reports opted bundles the host no longer
+offers, and the member is built without them.
 
 A realm profile store adds five profile-management tools for reusable,
 versioned member templates:
