@@ -151,8 +151,9 @@ Changed in 0.9.4 (event wire and SDK types):
   filtered the response) now carries `error_report.reason`
   `{"reason_type": "content_filtered", "stop": "refusal" | "content_filter",
   "detail": {...}}` instead of `null`; `detail` is the provider's own account,
-  tagged by `provider` (`anthropic`, `open_ai` or `gemini`), and is omitted when
-  the provider sent none. Python reads it as `AgentErrorReason` with
+  tagged by `provider` (`anthropic`, `open_ai` or `gemini`; fields per provider
+  in `references/providers_and_auth_models.md`, "Refusals and content
+  filters"), and is omitted when the provider sent none. Python reads it as `AgentErrorReason` with
   `reason_type == "content_filtered"`, `stop` and `detail`; TypeScript as
   `ContentFilteredAgentErrorReason` (`reasonType`, `stop`, `detail?`). SDKs
   before 0.9.4 read it as an unknown reason and keep it raw. A 0.9.3 binary
