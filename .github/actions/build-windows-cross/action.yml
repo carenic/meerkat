@@ -71,7 +71,7 @@ runs:
         curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors \
           -o "${RUNNER_TEMP}/${archive}" \
           "https://github.com/rust-cross/cargo-xwin/releases/download/v${XWIN_VERSION}/${archive}"
-        echo "${XWIN_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+        echo "${XWIN_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
         tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/xwin-bin" cargo-xwin
         cargo xwin --version
 

@@ -2659,12 +2659,12 @@ def _sccache_problems(root: Path) -> list[str]:
         for step in steps
         if re.fullmatch(r"v\d+\.\d+\.\d+", step.env.get("SCCACHE_VERSION", ""))
         and re.fullmatch(r"[0-9a-f]{64}", step.env.get("SCCACHE_SHA256", ""))
-        and re.search(r'^\s*echo "\$\{SCCACHE_SHA256\}  .*" \| sha256sum --check --strict$', step.run, re.M)
+        and re.search(r'^\s*echo "\$\{SCCACHE_SHA256\}  .*" \| sha256sum --check --strict -$', step.run, re.M)
     ]
     if not pinned:
         problems.append(
             f"{where} installs no sccache release checked against a pinned sha256"
-            " (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict)"
+            " (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict -)"
         )
     writes = [step for step in steps if "SCCACHE_GCS_RW_MODE=" in step.run]
     if not writes:
