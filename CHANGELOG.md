@@ -46,7 +46,9 @@ them.
   Unrestricted and exact bounds keep the earlier wire bytes in both
   directions. A 0.9.3 binary refuses to restore a grant owner whose journal
   holds an owner-scoped restriction (`RestartRequired`); a journal that holds
-  none stays readable by 0.9.3.
+  none stays readable by 0.9.3. An input row that carries an owner-scoped
+  restriction is written at stored input state 7 (below); a row stamped before
+  7 that carries one is rejected.
 - Stored input state is now version 7, assigned by the generated persistence
   version authority. A 0.9.4 binary writes every input row it stores at
   version 7, including a row it read at an older one; it still reads rows at
