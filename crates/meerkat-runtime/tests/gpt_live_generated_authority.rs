@@ -7492,8 +7492,8 @@ fn narration_follows_the_schedule_state_and_releases_each_kind_once() {
 
 /// #1820 A2: the session is told a delegation finished while its result
 /// waits (`FinishedPending`) only while the item's work is completed and its
-/// result is not released (another result holds the channel's one result
-/// slot), and never twice in a row.
+/// result has not been handed to delivery (here another result holds the
+/// channel's one result slot), and never twice in a row.
 #[test]
 fn finished_pending_is_authorized_only_for_completed_work_whose_result_waits() {
     let mut authority = opened_authority();
@@ -7557,9 +7557,194 @@ fn finished_pending_is_authorized_only_for_completed_work_whose_result_waits() {
         finished_pending(&mut authority, 2).is_err(),
         "never twice in a row"
     );
+    // A released result still waits until it is handed to
+    // delivery; this binding never authorizes a delivery.
+    finished_pending(&mut authority, 1)
+        .expect("a released result not yet handed to delivery still waits");
+}
+
+/// #1820: a result released while the bootstrap summary is not
+/// acknowledged waits on the result barrier before its delivery is
+/// authorized, so it has not reached the session either. `FinishedPending`
+/// is authorized until the result is handed to delivery and refused from
+/// then on. The result's `Completed` announcement still follows a finished
+/// notice.
+#[test]
+fn finished_pending_is_authorized_until_the_result_is_handed_to_delivery() {
+    let mut authority = opened_authority();
+    stage_bootstrap(&mut authority, 3);
+    activate_bootstrap(&mut authority);
+    admit_parallel_delegation(&mut authority, 1);
+    start_parallel_worker(&mut authority, 1);
+    record_parallel_terminal(
+        &mut authority,
+        1,
+        &channel_worker(1),
+        mm::LiveDelegationWorkerTerminalKind::Completed,
+    );
+    let release = apply(
+        &mut authority,
+        mm::MeerkatMachineInput::AuthorizeLiveDelegationResultRelease {
+            channel_id: CHANNEL.to_string(),
+            runtime_id: runtime_id(),
+            fence_token: fence(),
+            generation: generation(),
+            interaction_id: channel_interaction(1),
+            operation_id: channel_operation(1),
+            provider_turn_correlation: channel_provider_turn(1),
+        },
+    )
+    .expect("the result takes the channel's result slot");
+    let disposition = release
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            mm::MeerkatMachineEffect::LiveDelegationResultReleaseAuthorized {
+                disposition, ..
+            } => Some(*disposition),
+            _ => None,
+        })
+        .expect("the release names its disposition");
+    let deliver = |authority: &mut mm::MeerkatMachineAuthority| {
+        apply(
+            authority,
+            mm::MeerkatMachineInput::AuthorizeLiveDelegationResultDelivery {
+                channel_id: CHANNEL.to_string(),
+                runtime_id: runtime_id(),
+                fence_token: fence(),
+                generation: generation(),
+                interaction_id: channel_interaction(1),
+                operation_id: channel_operation(1),
+                provider_turn_correlation: channel_provider_turn(1),
+                result_digest: "bootstrap-held-result-digest".to_string(),
+                disposition,
+            },
+        )
+    };
     assert!(
-        finished_pending(&mut authority, 1).is_err(),
-        "a released result no longer waits"
+        deliver(&mut authority).is_err(),
+        "the result's delivery waits for the summary's acknowledgement"
+    );
+    narrate(
+        &mut authority,
+        1,
+        mm::LiveDelegationNarrationKind::FinishedPending,
+    )
+    .expect("a released result held at the bootstrap barrier has not reached the session");
+    authorize_bootstrap(&mut authority, 3);
+    resolve_bootstrap(
+        &mut authority,
+        3,
+        mm::LiveContextAppendObservation::Delivered,
+    )
+    .expect("the summary is acknowledged");
+    deliver(&mut authority).expect("the result follows the summary's acknowledgement");
+    narrate(
+        &mut authority,
+        1,
+        mm::LiveDelegationNarrationKind::Completed,
+    )
+    .expect("the result's Completed announcement follows its finished notice");
+    assert!(
+        narrate(
+            &mut authority,
+            1,
+            mm::LiveDelegationNarrationKind::FinishedPending
+        )
+        .is_err(),
+        "a result handed to delivery is never noted as waiting"
+    );
+}
+
+/// #1820: a completion recorded after the work's cancellation is
+/// a late terminal. Its schedule state is `Completed`, but its result never
+/// becomes eligible, so the session is never told a result is on its way.
+#[test]
+fn finished_pending_is_refused_for_a_completion_after_cancellation() {
+    let mut authority = opened_authority();
+    bind_only(&mut authority);
+    admit_parallel_delegation(&mut authority, 1);
+    start_parallel_worker(&mut authority, 1);
+    let next_interaction = "interaction-live-parallel-next";
+    apply(
+        &mut authority,
+        mm::MeerkatMachineInput::ObserveLiveProviderTurnStarted {
+            channel_id: CHANNEL.to_string(),
+            runtime_id: runtime_id(),
+            fence_token: fence(),
+            generation: generation(),
+            interaction_id: next_interaction.to_string(),
+            provider_turn_ref: "opaque-provider-turn-parallel-next".to_string(),
+        },
+    )
+    .expect("the next provider turn starts");
+    apply(
+        &mut authority,
+        mm::MeerkatMachineInput::SupersedeLiveInteraction {
+            session_id: SESSION.to_string(),
+            channel_id: CHANNEL.to_string(),
+            runtime_id: runtime_id(),
+            fence_token: fence(),
+            generation: generation(),
+            interaction_id: channel_interaction(1),
+            superseding_interaction_id: next_interaction.to_string(),
+            operation_id: channel_operation(1),
+            worker_identity: channel_worker(1),
+        },
+    )
+    .expect("the running worker of the completed turn is cancelled");
+    apply(
+        &mut authority,
+        mm::MeerkatMachineInput::ResolveLiveDelegationCancellation {
+            channel_id: CHANNEL.to_string(),
+            runtime_id: runtime_id(),
+            fence_token: fence(),
+            generation: generation(),
+            interaction_id: channel_interaction(1),
+            operation_id: channel_operation(1),
+            worker_identity: channel_worker(1),
+            outcome: mm::LiveDelegationCancellationOutcome::Cancelled,
+        },
+    )
+    .expect("the cancellation outcome is recorded");
+    let terminal = record_parallel_terminal(
+        &mut authority,
+        1,
+        &channel_worker(1),
+        mm::LiveDelegationWorkerTerminalKind::Completed,
+    );
+    assert!(terminal.effects().iter().any(|effect| matches!(
+        effect,
+        mm::MeerkatMachineEffect::LiveDelegationWorkerTerminalRecorded {
+            late: true,
+            result_eligible: false,
+            ..
+        }
+    )));
+    assert_eq!(
+        authority
+            .state()
+            .live_delegation_schedule_state_by_operation
+            .get(&channel_operation(1))
+            .copied(),
+        Some(mm::LiveDelegationScheduleState::Completed),
+        "the late completion still completes the schedule item"
+    );
+    assert!(
+        !authority
+            .state()
+            .live_abandoned_interactions
+            .contains(&channel_interaction(1)),
+        "the supersession abandons nothing, so only eligibility refuses"
+    );
+    assert!(
+        narrate(
+            &mut authority,
+            1,
+            mm::LiveDelegationNarrationKind::FinishedPending
+        )
+        .is_err(),
+        "a late completion has no result on its way"
     );
 }
 

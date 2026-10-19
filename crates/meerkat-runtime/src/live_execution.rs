@@ -3710,8 +3710,8 @@ impl LiveDelegationNarrationAuthority {
 
     /// Convert into the one-shot provider sideband finished-notice
     /// authority: this delegation's work finished while its result has not
-    /// been released. Only a `FinishedPending` authority converts; the
-    /// delegation reference must be the exact provider delegation this
+    /// been handed to delivery. Only a `FinishedPending` authority converts;
+    /// the delegation reference must be the exact provider delegation this
     /// operation was admitted for.
     #[cfg(feature = "live")]
     pub fn into_sideband_finished_notice_authority(

@@ -1693,8 +1693,9 @@ impl PublicLiveBrokerSession {
     }
 
     /// Tell the model that a delegation's work finished while the runtime
-    /// cannot release its result yet (#1820): the channel's one result slot
-    /// is held by another result, or another release guard refuses it for
+    /// cannot deliver its result yet (#1820): the channel's one result slot
+    /// is held by another result, the delivery waits for the channel's
+    /// summary acknowledgement, or another release guard refuses it for
     /// now. The notice is the finished notice of a result held behind the
     /// user's floor ([`delegation_finished_pending_notice_sections`]), bound
     /// to the delegation on the instructions lane, and handed to the sender

@@ -1872,9 +1872,11 @@ pub enum LiveDelegationScheduleState {
 /// delegation. A kind is released at most once per schedule pass.
 ///
 /// `FinishedPending` is not spoken: it tells the provider session that the
-/// delegation's work finished while its result has not been released (the
-/// channel's one result slot is held by another result, for example), so
-/// the session never keeps an in-progress instruction for finished work.
+/// delegation's work finished while its result has not been handed to
+/// delivery (the channel's one result slot is held by another result, or the
+/// delivery waits for the channel's bootstrap summary acknowledgement, for
+/// example), so the session never keeps an in-progress instruction for
+/// finished work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LiveDelegationNarrationKind {
     #[default]
@@ -29207,10 +29209,18 @@ macro_rules! meerkat_catalog_machine_dsl {
                             == Some(LiveDelegationScheduleState::Failed)
                         || self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
                             == Some(LiveDelegationScheduleState::Cancelled)))
+                // Finished work whose eligible result has not been handed to
+                // delivery: its release is refused, or released, its delivery
+                // waits (on the bootstrap barrier, for example). A late
+                // terminal's completion has no result on its way.
                 || (kind == LiveDelegationNarrationKind::FinishedPending
                     && self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
                         == Some(LiveDelegationScheduleState::Completed)
-                    && !self.live_result_released_operations.contains(operation_id))
+                    && self.live_delegation_result_eligible_operations.contains(operation_id)
+                    && !self.live_delegation_late_terminal_operations.contains(operation_id)
+                    && !self.live_result_delivery_channel_by_operation.contains_key(operation_id)
+                    && !self.live_result_delivery_digest_by_operation.contains_key(operation_id)
+                    && !self.live_result_delivery_observation_by_operation.contains_key(operation_id))
             }
             guard "narration_advances" {
                 self.live_delegation_last_narration_by_operation.get_copied(operation_id) != Some(kind)

@@ -1876,7 +1876,7 @@ pub trait ExperimentalGptLiveControlPlane: Send + Sync {
 
     /// Client-context capability only. Tell the provider session that one
     /// exact delegation's work finished while its result has not been
-    /// released, under the generated `FinishedPending` narration authority
+    /// delivered, under the generated `FinishedPending` narration authority
     /// (#1820). Quiet and bound to the delegation: it carries no text and
     /// no result, and it is not held behind the user's turn. Compositions
     /// without a provider session refuse it.
@@ -6632,7 +6632,7 @@ impl ExperimentalGptLiveWebrtcTransport {
     }
 
     /// Tell the provider session that one exact delegation's work finished
-    /// while its result has not been released (#1820). Unlike a narration it
+    /// while its result has not been delivered (#1820). Unlike a narration it
     /// is quiet, so it never waits for the user to stop speaking: the user
     /// asking whether the work is done is exactly when it matters.
     pub async fn note_delegation_finished(

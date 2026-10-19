@@ -116,8 +116,8 @@ them.
   kernels' generated copy and the runtime's copy
   (`meerkat_runtime::live_execution::LiveDelegationNarrationKind`). It is
   never spoken: the machine authorizes it for a delegation whose work has
-  finished while its result cannot be released yet (see Fixed). The enums
-  are exhaustive, so a `match` on one adds the arm.
+  finished with an eligible result not yet handed to delivery (see Fixed).
+  The enums are exhaustive, so a `match` on one adds the arm.
 - `meerkat-live`: the provider adapter carrier `LiveSidebandProviderCommand`
   gains `NoteDelegationFinishedContext { binding, attempt, delegation }`,
   which only `LiveSidebandCommand::note_delegation_finished` produces, from
@@ -264,9 +264,11 @@ them.
   "still running" lines stop naming that delegation, and the result's cue
   no longer tells the model that anything it said earlier was said before
   the work was done. A finished delegation whose result the runtime cannot
-  release yet (while another result holds the channel's one result slot,
-  for example) gets the same notice: the machine authorizes it once, as
-  the narration kind `FinishedPending`, and the broker sends it
+  deliver yet (while another result holds the channel's one result slot, or
+  while results wait for the provider to acknowledge a concurrent
+  historical summary) gets the same notice: the machine authorizes it
+  once, as the narration kind `FinishedPending`, until the result is handed
+  to delivery, and the broker sends it
   (`PublicLiveBrokerSession::append_delegation_finished_notice`) unless a
   result of that delegation has already reached the session. While the
   model is speaking, that notice waits until its response ends or the user

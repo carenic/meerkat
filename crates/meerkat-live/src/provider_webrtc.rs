@@ -742,8 +742,9 @@ impl LiveSidebandNarrationAuthority {
 }
 
 /// Non-forgeable authority for one finished-pending notice: an exact
-/// delegation's work has finished while its result has not been released
-/// (the channel's one result slot is held by another result, for example).
+/// delegation's work has finished while its result has not been delivered
+/// (the channel's one result slot is held by another result, or the delivery
+/// waits for the channel's summary acknowledgement, for example).
 /// It carries no text and is never spoken, and it is built only from the
 /// generated narration authority of that kind, bound to the delegation that
 /// authority was checked against.
@@ -1167,7 +1168,7 @@ impl LiveSidebandCommand {
 
     /// Tell the provider session that the delegation the authority was
     /// checked against finished its work while its result has not been
-    /// released. Consumes the generated finished-notice authority; the
+    /// delivered. Consumes the generated finished-notice authority; the
     /// command carries no text, no result, and is not spoken.
     pub fn note_delegation_finished(
         authority: LiveSidebandFinishedNoticeAuthority,

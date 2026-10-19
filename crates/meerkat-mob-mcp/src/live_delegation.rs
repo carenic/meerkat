@@ -1467,6 +1467,9 @@ impl<Authority> ExactDelegationResultProjection<Authority> {
 
 #[derive(Default)]
 struct RetainedDelegationResult {
+    /// The machine authorized this delegation's finished notice (#1820): it
+    /// is not asked again, whatever the notice's delivery.
+    finished_noted: bool,
     /// Steered continuations whose canonical commit did not confirm the
     /// steered text (a material conflict, or never committed); surfaced when
     /// the result is released.
@@ -5145,13 +5148,17 @@ impl ExperimentalLiveDelegationCoordinator {
     }
 
     /// Tell the provider session that `retained`'s work finished while its
-    /// result could not be released (#1820), under the machine's
-    /// `FinishedPending` narration authority: granted only while the work
-    /// is completed and its result unreleased, and at most once in a row.
-    /// Best effort: the result's own release is unaffected either way.
-    /// Returns whether the machine authorized it; once authorized it is not
-    /// asked again, whatever its delivery.
-    async fn note_finished_pending(&self, retained: &RetainedDelegation) -> bool {
+    /// result has not reached it (#1820): its release is refused, or its
+    /// delivery waits on the bootstrap barrier. Asked under the machine's
+    /// `FinishedPending` narration authority, granted only while the work is
+    /// completed with an eligible result not yet handed to delivery, and at
+    /// most once in a row. Best effort: the result's own release is
+    /// unaffected either way. Once the machine authorizes it, it is not asked
+    /// again, whatever its delivery.
+    async fn note_finished_pending(&self, retained: &RetainedDelegation) {
+        if retained.result.lock().await.finished_noted {
+            return;
+        }
         let subject = NarrationSubject::from_retained(retained);
         if let Err(skip) = self
             .runtime
@@ -5159,7 +5166,7 @@ impl ExperimentalLiveDelegationCoordinator {
             .await
         {
             tracing::debug!(%skip, "live delegation finished notice skipped");
-            return false;
+            return;
         }
         let authority = match self
             .runtime
@@ -5173,9 +5180,10 @@ impl ExperimentalLiveDelegationCoordinator {
             Ok(authority) => authority,
             Err(error) => {
                 tracing::debug!(%error, "live delegation finished notice was not authorized");
-                return false;
+                return;
             }
         };
+        retained.result.lock().await.finished_noted = true;
         match subject
             .control
             .note_delegation_finished(authority, subject.delegation.clone())
@@ -5184,13 +5192,11 @@ impl ExperimentalLiveDelegationCoordinator {
             Ok(_dispatch) => {
                 tracing::info!(
                     operation_id = %retained.operation.operation_id(),
-                    "live delegation finished while its result waits to be released; the session was told"
+                    "live delegation finished while its result waits to be delivered; the session was told"
                 );
-                true
             }
             Err(error) => {
                 tracing::debug!(%error, "live delegation finished notice was not delivered");
-                true
             }
         }
     }
@@ -5948,9 +5954,6 @@ impl ExperimentalLiveDelegationCoordinator {
                 .runtime
                 .subscribe_session_machine_commits(&session_id)
                 .await;
-            // Set once the session has been told this delegation's work
-            // finished while its result waits (#1820).
-            let mut finished_noted = false;
             loop {
                 if task_retained.result.lock().await.terminal_ineligible
                     || task_retained.close_signal.is_cancelled()
@@ -6007,9 +6010,7 @@ impl ExperimentalLiveDelegationCoordinator {
                 // (another result holds the channel's one result slot, for
                 // example): the session must not keep telling the voice the
                 // work is still running while the result waits.
-                if !finished_noted {
-                    finished_noted = coordinator.note_finished_pending(&task_retained).await;
-                }
+                coordinator.note_finished_pending(&task_retained).await;
                 tracing::debug!(%error, %task_operation_id, "owned live result release refused; waiting for the session machine to commit");
                 let advanced = match commits.as_mut() {
                     Some(receiver) => tokio::select! {
@@ -6380,6 +6381,21 @@ impl ExperimentalLiveDelegationCoordinator {
             let delivery = match existing_delivery {
                 Some(delivery) => delivery,
                 None => {
+                    // The release took the channel's result slot, but the
+                    // delivery authorization below waits on the bootstrap
+                    // barrier while the channel's summary is unacknowledged:
+                    // finished work whose result has not reached the session,
+                    // which is told first (#1820).
+                    if self
+                        .runtime
+                        .live_context_holds_results(
+                            retained.runtime_binding.session_id(),
+                            retained.runtime_binding.channel_id(),
+                        )
+                        .await
+                    {
+                        self.note_finished_pending(retained).await;
+                    }
                     let delivery = self
                         .runtime
                         .authorize_live_delegation_result_delivery(&release, &result_text)
@@ -9305,10 +9321,22 @@ mod tests {
         operation: ExactOperationIdentity<LiveUserTurnCorrelation>,
         exact_result: String,
         provider_binding: ProviderWebrtcBinding,
+        /// The channel's pending summary preparation, when the fixture has
+        /// one ([`held_result_fixture_with`]).
+        bootstrap: Option<meerkat_runtime::live_execution::LiveContextPreparationLease>,
     }
 
     #[cfg(feature = "experimental-gpt-live-gate0-harness")]
     async fn held_result_fixture(channel: &str) -> HeldResultFixture {
+        held_result_fixture_with(channel, false).await
+    }
+
+    /// [`held_result_fixture`], optionally with the channel's historical
+    /// summary still being prepared (`bootstrap_pending`): a result's
+    /// delivery authorization then waits on the result barrier until the
+    /// provider acknowledges the summary.
+    #[cfg(feature = "experimental-gpt-live-gate0-harness")]
+    async fn held_result_fixture_with(channel: &str, bootstrap_pending: bool) -> HeldResultFixture {
         use meerkat_core::service::{
             CreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy, SessionService,
         };
@@ -9368,10 +9396,19 @@ mod tests {
             .resolve_live_execution_profile_admission(&session_id, &channel_id, &execution_profile)
             .await
             .expect("admit exact client-context mode");
-        let stage = runtime
-            .stage_experimental_live_execution(&session_id, &channel_id, 0)
-            .await
-            .expect("stage exact experimental live execution");
+        let (stage, bootstrap) = if bootstrap_pending {
+            let (stage, lease) = runtime
+                .stage_experimental_live_execution_with_preparation(&session_id, &channel_id, 0)
+                .await
+                .expect("stage exact experimental live execution with its summary pending");
+            (stage, Some(lease))
+        } else {
+            let stage = runtime
+                .stage_experimental_live_execution(&session_id, &channel_id, 0)
+                .await
+                .expect("stage exact experimental live execution");
+            (stage, None)
+        };
         runtime
             .register_live_playback_owner(&stage, "test-exact-result-playback-owner")
             .await
@@ -9601,7 +9638,65 @@ mod tests {
             operation,
             exact_result,
             provider_binding,
+            bootstrap,
         }
+    }
+
+    /// #1820: a result whose release took the channel's result
+    /// slot but whose delivery waits on the bootstrap barrier (the channel's
+    /// historical summary is not acknowledged yet) has not reached the
+    /// session: the session is told its work finished, once, before the
+    /// release waits, and the result is not dispatched while it waits.
+    #[cfg(feature = "experimental-gpt-live-gate0-harness")]
+    #[tokio::test]
+    async fn a_result_held_at_the_bootstrap_barrier_tells_the_session_its_work_finished_once() {
+        let HeldResultFixture {
+            coordinator,
+            retained,
+            control,
+            provider_binding,
+            bootstrap,
+            ..
+        } = held_result_fixture_with("live:bootstrap-held-result", true).await;
+        assert!(bootstrap.is_some(), "the channel's summary is pending");
+        coordinator
+            .schedule_result_delivery(Arc::clone(&retained))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while control.finished_notes.lock().await.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a result held at the bootstrap barrier tells the session its work finished");
+        // The release keeps waiting on the barrier; nothing asks again.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            control.finished_notes.lock().await.clone(),
+            vec!["delegation:exact-result-projection".to_string()],
+            "the session is told once"
+        );
+        {
+            let result = retained.result.lock().await;
+            assert!(
+                result.release_authority.is_some(),
+                "the result's release took the channel's result slot"
+            );
+            assert!(
+                result.delivery_authority.is_none(),
+                "its delivery waits on the bootstrap barrier"
+            );
+        }
+        assert!(
+            control.releases.lock().await.is_empty(),
+            "the result is not dispatched while the barrier holds"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            coordinator.cancel_channel_binding(&provider_binding),
+        )
+        .await
+        .expect("closing the channel never waits on the held result");
     }
 
     /// Close never waits on a result that has not dispatched (soak c43aa3db
@@ -10332,6 +10427,22 @@ mod tests {
             control.finished_notes.lock().await.len(),
             1,
             "B's release sends no second finished notice"
+        );
+        // #1820: the finished notice does not swallow the Completed
+        // announcement B's release carries.
+        assert_eq!(
+            control.announced_releases.lock().await.clone(),
+            vec![(
+                "delegation:two-results-b".to_string(),
+                narration_text(
+                    LiveDelegationNarrationKind::Completed,
+                    "two results b",
+                    0,
+                    &[],
+                    false
+                ),
+            )],
+            "B's release carries its Completed announcement after its finished notice"
         );
         Ok(())
     }
