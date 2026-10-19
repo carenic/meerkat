@@ -700,9 +700,16 @@ async fn a_later_owners_executor_cold_reloads_a_degraded_registration_without_a_
 /// The no-handoff discard revalidates under the registration's mutation
 /// gate: a runtime-loop teardown slot that appears after the discard was
 /// admitted and the registration transaction released, and before the
-/// discard takes the gate (injected here: no public path attaches a loop to a
-/// durability-degraded registration), leaves the registration as it is, and
-/// the discard answers `NotCurrent` without discarding anything.
+/// discard takes the gate, leaves the registration as it is, and the discard
+/// answers `NotCurrent` without discarding anything. The interleaving is
+/// reachable: an executor registration checks durability when it claims the
+/// session, releases the registration transaction while it still holds the
+/// mutation gate, and attaches its loop without checking again, so a session
+/// that degrades in between can admit a discard that then waits on that
+/// gate. The seam injects that attach deterministically. This row exercises
+/// the first revalidation only: the second and third cannot be reached by an
+/// attach, since an attach needs a claim decided under the gate, and a claim
+/// decided after the degradation joins the discard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_no_handoff_discard_leaves_a_registration_a_loop_reached_before_the_fence() {
     let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());

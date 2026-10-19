@@ -155,9 +155,10 @@ them.
   no runtime-loop teardown slot), the discard now takes the fence itself and
   publishes the durability-ready cold successor, which the exact unregister
   then settles, and a later owner's executor registration cold-reloads such
-  a registration as it does one whose loop handed its executor back. A loop
-  attached without a teardown handoff can still hold the fence, so the
-  discard stays refused for it until it hands the fence back.
+  a registration as it does one whose loop handed its executor back. A
+  registration whose runtime loop is still attached keeps its fence until
+  that loop hands it back, and the discard waits for that handoff, as
+  before.
 
 ## [0.9.3] - 2026-10-18
 

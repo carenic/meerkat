@@ -2876,12 +2876,14 @@ pub(super) enum DegradedUnregisterStep {
     /// reasons it does not type apart: another owner still holds the
     /// registration's teardown (an unregister, stop-cleanup or unregister
     /// finalization coordinator), a user-interrupt dispatch on it has not
-    /// settled, a runtime loop is attached to it without a teardown handoff
-    /// (the no-handoff case: that loop may still hold the session's mutation
-    /// fence), or its cold recovery cannot run yet. The exact unregister then
-    /// joins that owner, waits within its own deadline, or is refused until
-    /// the repair too, and a settlement retries the discard on its next
-    /// call. A registration that no runtime loop holds (none was ever
+    /// settled, or its cold recovery cannot run yet. It also refuses an
+    /// attachment without a teardown slot, which only guards the invariant
+    /// that every attachment has one. The exact unregister then joins that
+    /// owner, waits within its own deadline, or is refused until the repair
+    /// too, and a settlement retries the discard on its next call. A
+    /// registration whose runtime loop is still attached keeps its fence
+    /// until that loop hands it back, and the discard waits for that
+    /// handoff. A registration that no runtime loop holds (none was ever
     /// attached, or its teardown completed) is not refused for a missing
     /// handoff: nothing retains its mutation fence, and the discard takes it.
     Unchanged,

@@ -7373,9 +7373,14 @@ impl MeerkatMachine {
 
     /// Install a fresh runtime-loop teardown slot on the current registration
     /// of `session_id`, as a runtime loop attached to it would, when it has
-    /// none. No public path attaches a loop to a durability-degraded
-    /// registration; tests use this to make one appear inside a discard's
-    /// window. `false` when the session is not registered or already has one.
+    /// none. A real loop can reach a durability-degraded registration this
+    /// way: an executor registration checks durability when it claims the
+    /// session, releases the registration transaction while it still holds
+    /// the mutation gate, and attaches its loop without checking again, so a
+    /// session that degrades in between gets a loop after a discard was
+    /// admitted. Tests use this to place that attach inside a discard's
+    /// window deterministically. `false` when the session is not registered
+    /// or already has one.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub async fn install_runtime_loop_teardown_slot_for_test(
@@ -13182,6 +13187,9 @@ mod durable_steer_tests;
 
 #[cfg(test)]
 mod terminal_receipt_tests;
+
+#[cfg(test)]
+mod registration_use_tests;
 
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;

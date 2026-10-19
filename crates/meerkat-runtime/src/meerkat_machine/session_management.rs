@@ -2705,6 +2705,10 @@ impl MeerkatMachine {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut sessions = self.sessions.write().await;
+            // Defensive: the caller holds this session's registration
+            // transaction, and every publication from an absent entry holds it
+            // too, so no registration can appear between the existence check
+            // above and this insert.
             if let Some(existing) = sessions.get_mut(&session_id) {
                 if let Some(error) = existing.registration_blocked_by_unregister(&session_id) {
                     return Err(error);
@@ -3323,6 +3327,10 @@ impl MeerkatMachine {
             );
             let owner_loss = self.reserve_consent_owner_loss(&session_entry._hosting_claim)?;
             let mut sessions = self.sessions.write().await;
+            // Defensive: the caller holds this session's registration
+            // transaction, and every publication from an absent entry holds it
+            // too, so no registration can appear between the existence check
+            // above and this insert.
             if let Some(existing) = sessions.get_mut(&session_id) {
                 tracing::debug!(
                     %session_id,
@@ -5057,6 +5065,10 @@ impl MeerkatMachine {
                 }
                 match entry.stage_generated_executor_registration_claim(&session_id) {
                     Ok(staged) => {
+                        // The entry was inserted above with a fresh use under
+                        // this same write guard, so no reader can tell this
+                        // stamp from that one; it keeps every claim stamping
+                        // if the insert and the claim are ever split.
                         entry.stamp_adoption(self.next_registration_use());
                         break ExistingExecutorClaim::Claimed {
                             gate: mutation_gate,
@@ -6277,9 +6289,10 @@ impl MeerkatMachine {
                 // runtime loop holds (no pending or committed attachment and
                 // no runtime-loop teardown slot: none was ever attached, or
                 // its teardown completed) has no handoff and nothing retains
-                // its M, so its discard takes M itself. A loop attached
-                // without a teardown slot could still hold M: refused until
-                // it hands M back.
+                // its M, so its discard takes M itself. An attachment always
+                // has its teardown slot (attaching sets both, and the slot is
+                // cleared only with the attachment), so an attachment without
+                // one does not occur: refusing it only guards that invariant.
                 let teardown_slot = entry.runtime_loop_teardown.clone();
                 if teardown_slot.is_none() && !entry.no_runtime_loop_holds_mutation_fence() {
                     return Err(RuntimeDriverError::RecoveryRepairBlocked {
