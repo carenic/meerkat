@@ -642,6 +642,8 @@ pub struct MobBuilder {
     /// The verifier of the created mob's callback claim token; see
     /// [`MobBuilder::with_callback_claim_verifier`].
     callback_claim_verifier: Option<crate::MobClaimVerifier>,
+    /// Who creates the mob; see [`MobBuilder::with_provenance`].
+    provenance: Option<crate::MobProvenance>,
 }
 
 enum BuilderMode {
@@ -7011,8 +7013,9 @@ struct RuntimeWiring {
     command_tx: mpsc::Sender<super::scope_gate::RoutedMobCommand>,
     command_rx: mpsc::Receiver<super::scope_gate::RoutedMobCommand>,
     composition_binding: super::composition::MobCompositionBinding,
-    /// The incarnation this runtime start mints, shared by the preview
-    /// handle, the launched handle and the actor.
+    /// The incarnation this runtime runs at, shared by the preview handle,
+    /// the launched handle and the actor: the one its create minted, read
+    /// back from the mob's creation record on resume.
     incarnation: meerkat_core::service::MobIncarnationId,
 }
 
@@ -7115,6 +7118,7 @@ impl MobBuilder {
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
             callback_claim_verifier: None,
+            provenance: None,
         }
     }
 
@@ -7198,6 +7202,7 @@ impl MobBuilder {
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
             callback_claim_verifier: None,
+            provenance: None,
         }
     }
 
@@ -7210,6 +7215,18 @@ impl MobBuilder {
     /// ignores it: a resumed mob keeps the verifier it has.
     pub fn with_callback_claim_verifier(mut self, verifier: crate::MobClaimVerifier) -> Self {
         self.callback_claim_verifier = Some(verifier);
+        self
+    }
+
+    /// Record `provenance`, who creates the mob, with its creation: `create`
+    /// writes it in the transaction of the mob's first event, and it is never
+    /// rewritten ([`MobHandle::provenance`]). A create without one records
+    /// [`crate::MobProvenance::Host`]: the host created the mob, with no
+    /// caller session. A host that creates mobs for caller sessions passes
+    /// the provenance it found for the caller. Resume ignores it: a resumed
+    /// mob keeps the provenance it was created with.
+    pub fn with_provenance(mut self, provenance: crate::MobProvenance) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -7514,6 +7531,7 @@ impl MobBuilder {
                 // Nor a restored destroy to admit.
                 start_destroy_admission: _,
                 callback_claim_verifier,
+                provenance,
             } = builder;
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
@@ -7632,18 +7650,28 @@ impl MobBuilder {
                     Some((storage.runtime_metadata.clone(), definition.id.clone()));
             }
 
+            // The incarnation this create starts, minted once here: the mob's
+            // creation record keeps it, and every resume of the mob reads it
+            // back instead of minting another.
+            let incarnation = meerkat_core::service::MobIncarnationId::mint();
+            let provenance = provenance.unwrap_or(crate::MobProvenance::Host);
             let created = Box::pin(async move {
-                // Emit MobCreated event first
+                // The mob's first event, MobCreated, and its creation record
+                // commit together.
                 let definition_for_event = (*definition).clone();
                 storage
                     .events
-                    .append(NewMobEvent {
-                        mob_id: definition.id.clone(),
-                        timestamp: None,
-                        kind: MobEventKind::MobCreated {
-                            definition: Box::new(definition_for_event),
+                    .append_creation(
+                        NewMobEvent {
+                            mob_id: definition.id.clone(),
+                            timestamp: None,
+                            kind: MobEventKind::MobCreated {
+                                definition: Box::new(definition_for_event),
+                            },
                         },
-                    })
+                        incarnation,
+                        &provenance,
+                    )
                     .await?;
                 if let Some(owner_bridge_event) = owner_bridge_event {
                     storage
@@ -7699,6 +7727,7 @@ impl MobBuilder {
 
                 let start_result = Self::start_runtime(
                     definition,
+                    incarnation,
                     Roster::new(),
                     dsl_authority,
                     storage.events.clone(),
@@ -7756,6 +7785,46 @@ impl MobBuilder {
         })
     }
 
+    /// The incarnation a resume runs at: the one the mob's creation record
+    /// names. A mob created before creation records existed (a store from
+    /// before 0.9.4) gets its one migrated incarnation here, recorded before
+    /// the resume continues: a failed recording fails the resume, so the mob
+    /// never runs without an incarnation.
+    #[cfg(feature = "runtime-adapter")]
+    async fn resumed_incarnation(
+        storage: &MobStorage,
+        mob_id: &crate::MobId,
+        creation: Option<crate::store::MobCreationRecord>,
+    ) -> Result<meerkat_core::service::MobIncarnationId, MobError> {
+        let record = match creation {
+            Some(record) => record,
+            None => {
+                storage
+                    .events
+                    .assign_legacy_incarnation(
+                        mob_id,
+                        meerkat_core::service::MobIncarnationId::mint(),
+                    )
+                    .await?
+            }
+        };
+        if record.is_finalized() {
+            return Err(MobError::IncarnationInconsistent {
+                mob_id: mob_id.clone(),
+                inconsistency: crate::IncarnationInconsistency::FinalizedRecordWithCreation,
+            });
+        }
+        if &record.mob_id != mob_id {
+            return Err(MobError::IncarnationInconsistent {
+                mob_id: mob_id.clone(),
+                inconsistency: crate::IncarnationInconsistency::RecordOfAnotherMob {
+                    record_mob_id: record.mob_id,
+                },
+            });
+        }
+        Ok(record.incarnation)
+    }
+
     /// Resume a mob from persisted events.
     ///
     /// Resume behavior:
@@ -7799,6 +7868,8 @@ impl MobBuilder {
             restored_member_run_start_holds,
             start_destroy_admission,
             callback_claim_verifier: _,
+            // A resumed mob keeps the provenance it was created with.
+            provenance: _,
         } = self;
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;
@@ -7851,11 +7922,26 @@ impl MobBuilder {
                     .map(|actual| actual.event_cursor()),
             });
         }
-        let definition = definition.ok_or_else(|| {
-            MobError::Internal(
-                "cannot resume mob: no MobCreated event found in storage".to_string(),
-            )
-        })?;
+        // The creation record names the incarnation the mob was created at.
+        // Without a MobCreated it is a finished destroy (finalized) or a
+        // store that disagrees with itself; neither is resumed.
+        let creation = storage.events.creation_record().await?;
+        let Some(definition) = definition else {
+            return Err(match creation {
+                Some(record) if record.is_finalized() => MobError::IncarnationDestroyed {
+                    mob_id: record.mob_id,
+                    incarnation: record.incarnation,
+                },
+                Some(record) => MobError::IncarnationInconsistent {
+                    mob_id: record.mob_id,
+                    inconsistency: crate::IncarnationInconsistency::RecordWithoutCreation,
+                },
+                None => MobError::Internal(
+                    "cannot resume mob: no MobCreated event found in storage".to_string(),
+                ),
+            });
+        };
+        let incarnation = Self::resumed_incarnation(&storage, &definition.id, creation).await?;
         MobSupervisorBridge::preflight_ingress_ownership(
             definition
                 .backend
@@ -8244,9 +8330,8 @@ impl MobBuilder {
                 command_tx: command_tx.clone(),
                 command_rx,
                 composition_binding,
-                // A resumed mob is a new incarnation: no grant from before
-                // this process names it.
-                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+                // The incarnation the mob was created at: a resume keeps it.
+                incarnation,
             };
             let per_spawn_external_tools: super::handle::PerSpawnExternalTools = Arc::default();
             let preview_handle = MobHandle {
@@ -10233,6 +10318,7 @@ impl MobBuilder {
     #[inline(never)]
     fn start_runtime(
         definition: Arc<MobDefinition>,
+        incarnation: meerkat_core::service::MobIncarnationId,
         initial_roster: Roster,
         mut dsl_authority: Box<crate::machines::mob_machine::MobMachineAuthority>,
         events: Arc<dyn MobEventStore>,
@@ -10324,7 +10410,7 @@ impl MobBuilder {
                 command_tx,
                 command_rx,
                 composition_binding,
-                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+                incarnation,
             };
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
             let explicit_resume_operations =

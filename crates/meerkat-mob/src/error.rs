@@ -206,6 +206,49 @@ impl std::fmt::Display for MobDefinitionProjectionMismatchKind {
     }
 }
 
+/// How a mob store's creation record and its event log disagree (see
+/// [`MobError::IncarnationInconsistent`]). The creation record names the
+/// incarnation the store's mob was created at; one record goes with each
+/// `MobCreated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IncarnationInconsistency {
+    /// A creation record that is not finalized, in a store whose log holds
+    /// no `MobCreated`.
+    RecordWithoutCreation,
+    /// The creation record names another mob than the store's `MobCreated`.
+    RecordOfAnotherMob { record_mob_id: MobId },
+    /// A finalized creation record (a finished destroy) next to a
+    /// `MobCreated` that no creation record names.
+    FinalizedRecordWithCreation,
+    /// More than one creation record in one store.
+    MultipleRecords { count: u64 },
+    /// A raw `MobCreated` append over a store that holds a creation record:
+    /// only the creation itself writes `MobCreated` with its record. Nothing
+    /// was written.
+    RawCreationOverRecord,
+}
+
+impl std::fmt::Display for IncarnationInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordWithoutCreation => {
+                f.write_str("its creation record has no MobCreated in the log")
+            }
+            Self::RecordOfAnotherMob { record_mob_id } => {
+                write!(f, "its creation record names mob '{record_mob_id}'")
+            }
+            Self::FinalizedRecordWithCreation => f.write_str(
+                "its creation record is finalized but the log holds a MobCreated it does not name",
+            ),
+            Self::MultipleRecords { count } => write!(f, "it holds {count} creation records"),
+            Self::RawCreationOverRecord => {
+                f.write_str("a raw MobCreated append would bypass its creation record")
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for MobMemberCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1335,6 +1378,46 @@ pub enum MobError {
         correlation_id: String,
         interaction_id: String,
     },
+
+    /// The mob's store holds a creation record and an event log that
+    /// disagree, so the mob is not resumed (or the write that would make
+    /// them disagree is refused). The store is left as it was.
+    #[error("mob '{mob_id}' has an inconsistent creation record: {inconsistency}")]
+    IncarnationInconsistent {
+        mob_id: MobId,
+        inconsistency: IncarnationInconsistency,
+    },
+
+    /// The mob's store holds a finished destroy of `incarnation` (its
+    /// creation record is finalized) whose files are not removed yet. The
+    /// mob is not resumed.
+    #[error("mob '{mob_id}' at incarnation {incarnation} was destroyed")]
+    IncarnationDestroyed {
+        mob_id: MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    },
+
+    /// A create by a caller session was refused because the hosted rosters
+    /// that could name that session could not all be read, so its provenance
+    /// is not known (see `meerkat_mob::MobProvenance`). `mob_id` names the
+    /// mob whose roster or creation record could not be read; it is `None`
+    /// while the host's mob set is not restored. Nothing was created; the
+    /// create can be retried once the named mob is readable (or destroyed)
+    /// and the mob set is restored.
+    #[error("{}", provenance_unavailable_message(mob_id.as_ref()))]
+    ProvenanceUnavailable { mob_id: Option<MobId> },
+}
+
+fn provenance_unavailable_message(mob_id: Option<&MobId>) -> String {
+    match mob_id {
+        Some(mob_id) => format!(
+            "the creator of this mob cannot be recorded: the roster of mob '{mob_id}' could not \
+             be read"
+        ),
+        None => "the creator of this mob cannot be recorded: the host's mob set is not restored \
+                 yet"
+        .to_string(),
+    }
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared
@@ -1499,6 +1582,13 @@ impl From<crate::store::MobStoreError> for MobError {
             crate::store::MobStoreError::FrameAtomicPersistenceUnavailable { operation } => {
                 Self::FrameAtomicPersistenceUnavailable { operation }
             }
+            crate::store::MobStoreError::IncarnationInconsistent {
+                mob_id,
+                inconsistency,
+            } => Self::IncarnationInconsistent {
+                mob_id,
+                inconsistency,
+            },
             other => Self::StorageError(Box::new(other)),
         }
     }

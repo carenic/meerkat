@@ -339,6 +339,51 @@ impl MobStorage {
                 == Some(crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Destroy))
     }
 
+    /// The incarnation this store's mob was created at, read without
+    /// building a runtime: the one its create recorded, or, for a mob created
+    /// before 0.9.4, the one its first 0.9.4 resume assigned. `None` for a
+    /// store with no creation record yet: an empty store, or a mob from
+    /// before 0.9.4 that no 0.9.4 runtime has resumed. A finished destroy
+    /// whose files are not removed yet still answers its incarnation.
+    pub async fn creation_incarnation(
+        &self,
+    ) -> Result<Option<meerkat_core::service::MobIncarnationId>, MobError> {
+        Ok(self
+            .events
+            .creation_record()
+            .await?
+            .map(|record| record.incarnation))
+    }
+
+    /// The provenance this store's mob was created with
+    /// ([`crate::MobProvenance`]), read without building a runtime, as
+    /// [`crate::MobHandle::provenance`] reads it for a running mob. A mob
+    /// from before 0.9.4 reads `Unrecorded` once its first 0.9.4 resume
+    /// recorded its incarnation; `None` before that, and for an empty store.
+    pub async fn creation_provenance(&self) -> Result<Option<crate::MobProvenance>, MobError> {
+        self.events
+            .creation_record()
+            .await?
+            .map(|record| record.provenance())
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// The member of this store's roster whose bridge session is
+    /// `session_id`, read from the stored events without building a
+    /// runtime: its identity and generation. `None` when no member of the
+    /// stored roster has that session.
+    pub async fn stored_member_of_session(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<Option<(crate::AgentIdentity, crate::Generation)>, MobError> {
+        let events = self.events.replay_all().await?;
+        let roster = crate::roster::Roster::project(&events);
+        Ok(roster
+            .find_by_bridge_session_id(session_id)
+            .map(|entry| (entry.agent_identity.clone(), entry.generation)))
+    }
+
     /// Read the canonical definition together with its sealed resume precondition.
     pub async fn created_definition_snapshot(
         &self,

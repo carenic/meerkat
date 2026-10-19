@@ -83,6 +83,7 @@ pub mod member_creation;
 mod mob_machine;
 mod portable_profile;
 pub mod profile;
+pub mod provenance;
 mod roster;
 pub mod run;
 pub mod runtime;
@@ -122,8 +123,8 @@ pub use definition::{
 pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    MemberProvisionFailureCause, MemberRuntimeDetachment, MobDefinitionProjectionMismatchKind,
-    MobError, MobFailureClass, RuntimeEffectKind,
+    IncarnationInconsistency, MemberProvisionFailureCause, MemberRuntimeDetachment,
+    MobDefinitionProjectionMismatchKind, MobError, MobFailureClass, RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, ForkJobTerminalEvent, MemberWireEdge, MobEvent, MobEventKind,
@@ -172,6 +173,7 @@ pub use mob_machine::{
     canonical_mob_machine_runtime_internal_input_variant_manifest,
     canonical_mob_machine_runtime_internal_manifest,
 };
+pub use provenance::MobProvenance;
 pub use storage::{
     MobDefinitionProjectionHealth, MobDefinitionRevision, MobDefinitionSnapshot, MobStorage,
 };

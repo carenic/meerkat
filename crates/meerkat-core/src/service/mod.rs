@@ -1203,15 +1203,15 @@ impl std::fmt::Display for OpaquePrincipalToken {
     }
 }
 
-/// One incarnation of a mob: a mob runtime from the moment it starts (a
-/// create, or a resume by a later process) until it stops for good. A mob
-/// destroyed and created again under the same id, or resumed by a later
-/// process, is a new incarnation.
+/// One incarnation of a mob: the mob one create started, from that create
+/// until its destroy. The create mints it with [`Self::mint`] (UUID v4, 122
+/// random bits) and records it with the mob's creation, and every resume,
+/// in this process or a later one, reads it back, so a restart keeps it. A
+/// mob destroyed and created again under the same id is a new incarnation.
 ///
 /// Mob operator grants name the incarnation they were minted for, so a grant
-/// never reaches a later mob under the same id. The mob runtime mints one
-/// with [`Self::mint`] when it starts (UUID v4, 122 random bits) and hands it
-/// out through its handles.
+/// never reaches a later mob under the same id. The mob runtime hands its
+/// incarnation out through its handles.
 ///
 /// The value is an identity, not a credential: it renders and serializes as
 /// its canonical form, a lowercase hyphenated UUID, and [`FromStr`] and
@@ -1227,7 +1227,9 @@ pub struct MobIncarnationId(uuid::Uuid);
 
 impl MobIncarnationId {
     /// A fresh incarnation, never handed out before. The mob runtime calls
-    /// this when a mob starts; any other caller gets a value no mob runs at.
+    /// this when it creates a mob, and once for a mob created before
+    /// incarnations were recorded, at its first resume; any other caller
+    /// gets a value no mob runs at.
     pub fn mint() -> Self {
         Self(uuid::Uuid::new_v4())
     }

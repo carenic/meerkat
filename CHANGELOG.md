@@ -161,6 +161,45 @@ them.
   stored data breaks. Grants stay unpersisted:
   `MobToolAuthorityContext` still leaves its incarnation bindings out when
   it serializes.
+- `meerkat_mob::MobError` gains the variants `IncarnationInconsistent`,
+  `IncarnationDestroyed` and `ProvenanceUnavailable`, and
+  `meerkat_mob::MobStoreError` gains `IncarnationInconsistent`, all appended
+  last. Exhaustive matches must add the arms. The kind of an
+  `IncarnationInconsistent` is the new `meerkat_mob::IncarnationInconsistency`
+  (see Added).
+- Behaviour-only (not measured by the gate): a mob keeps its
+  `meerkat_core::service::MobIncarnationId` across resume. Its create mints
+  it once and stores it with the mob's `MobCreated`, and every resume reads
+  it back, where each runtime start minted a new one. Only a destroy and a
+  create under the same id start a new incarnation, so a mob operator grant
+  bound to a mob still reaches it after it resumes (grants stay
+  unpersisted). A mob created before 0.9.4 gets its incarnation at its first
+  resume by a 0.9.4 binary, recorded as migrated with the provenance
+  `MobProvenance::Unrecorded`, and keeps it from then on.
+- Behaviour-only (not measured by the gate): 0.9.4 migrates a mob's SQLite
+  store to schema version 12 (a table for the mob's creation record: its
+  incarnation and provenance) when it opens it, and 0.9.3 refuses a store at
+  version 12 with its typed future-schema error. Downgrading after the
+  migration is not supported: keep a copy of the mob stores from before the
+  upgrade to roll back.
+- Behaviour-only (not measured by the gate): a mob store whose creation
+  record and event log disagree is not resumed
+  (`MobError::IncarnationInconsistent`), and a store that holds a finished
+  destroy whose files are not removed yet refuses its resume with
+  `MobError::IncarnationDestroyed`, where it failed with
+  `MobError::Internal`. A raw `MobCreated` append over a store that holds a
+  creation record is refused with `MobStoreError::IncarnationInconsistent`;
+  only a create writes `MobCreated`, with its record.
+- Behaviour-only (not measured by the gate): a `meerkat_mob_mcp::MobMcpState`
+  create for a caller session (`mob_create_definition_with_owner_bridge_session`,
+  the agent mob tools' creates and temporary council seating) records the
+  session's provenance from every hosted roster, and is refused with
+  `MobError::ProvenanceUnavailable` when that lookup cannot be complete:
+  while the state's mob set is not restored (a host that restores mobs by
+  inserting handles declares the set restored with `declare_mob_set_restored`),
+  when a host inserts a handle while the lookup runs, or naming a held child
+  mob whose stored roster or creation record cannot be read. Nothing is
+  created. A create with no caller session is not affected.
 
 ### Added
 
@@ -240,6 +279,21 @@ them.
   grant functions take (see Breaking).
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
+- `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,
+  `Session`, `Ambiguous` or `Unrecorded`), recorded once with its creation and
+  never rewritten. `MobHandle::provenance` reads it for a running mob, and
+  `MobStorage::creation_provenance` and `MobStorage::creation_incarnation`
+  read a stored mob's record without building a runtime.
+  `MobBuilder::with_provenance` sets it for a create (default `Host`).
+- `meerkat_mob::IncarnationInconsistency`: how a mob store's creation record
+  and its event log disagree.
+- `meerkat_mob::MobHandle::member_of_session` and
+  `meerkat_mob::MobStorage::stored_member_of_session`: the member whose
+  bridge session is a given session, in a running mob's roster or a stored
+  one.
+- `meerkat_mob_mcp::MobMcpState::session_member_matches` (with
+  `meerkat_mob_mcp::SessionMemberMatch`): every hosted roster, managed or
+  held, that names a session, read as one complete lookup.
 
 ### Changed
 

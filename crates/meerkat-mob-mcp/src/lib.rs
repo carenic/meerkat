@@ -380,12 +380,54 @@ impl OwedStorageCleanup {
     }
 }
 
-/// A mob a create built: its id and the incarnation its runtime minted, as
+/// A mob a create built: its id and the incarnation its create minted, as
 /// the witness its handle hands out.
 #[derive(Debug, Clone)]
 pub(crate) struct CreatedMob {
     pub(crate) mob_id: MobId,
     pub(crate) incarnation: meerkat_core::service::LiveMobIncarnation,
+}
+
+/// A hosted roster that names a session as one of its members' sessions
+/// ([`MobMcpState::session_member_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionMemberMatch {
+    /// The mob whose roster names the session.
+    pub mob_id: MobId,
+    /// The incarnation that mob runs at, or was created at for a held child
+    /// mob.
+    pub incarnation: meerkat_core::service::MobIncarnationId,
+    /// The member the session serves.
+    pub identity: AgentIdentity,
+    /// That member's generation.
+    pub generation: meerkat_mob::Generation,
+}
+
+/// The provenance a create by `session_id` records, from the complete
+/// lookup of the hosted rosters that name that session
+/// ([`MobMcpState::session_member_matches`]): the member when exactly one
+/// roster names it, the bare session when none does, and `Ambiguous` when
+/// several do, without picking one.
+fn session_creation_provenance(
+    session_id: &SessionId,
+    matches: Vec<SessionMemberMatch>,
+) -> meerkat_mob::MobProvenance {
+    match <[SessionMemberMatch; 1]>::try_from(matches) {
+        Ok([found]) => meerkat_mob::MobProvenance::Member {
+            parent_mob_id: found.mob_id,
+            parent_incarnation: found.incarnation,
+            creator_identity: found.identity,
+            creator_generation: found.generation,
+            owner_session: session_id.clone(),
+        },
+        Err(matches) if matches.is_empty() => meerkat_mob::MobProvenance::Session {
+            session_id: session_id.clone(),
+        },
+        Err(matches) => meerkat_mob::MobProvenance::Ambiguous {
+            matching_rosters: u32::try_from(matches.len()).unwrap_or(u32::MAX),
+        },
+    }
 }
 
 /// How a destroy request meets this state's record of the mobs it
@@ -1005,6 +1047,14 @@ pub struct MobMcpState {
     /// own restore done ([`MobMcpState::declare_mob_set_restored`]). A mob
     /// outside the set is then gone for good.
     mob_set_restored: std::sync::atomic::AtomicBool,
+    /// Set by the first handle a host inserts, under the managed set's write
+    /// lock and before the handle is visible. Only
+    /// [`MobMcpState::try_mob_insert_handle`] inserts a handle this state did
+    /// not build, so no insert skips it. Until it is set a state without a
+    /// persistent root hosts only mobs it created in this process, so a
+    /// lookup over its rosters is complete without a declared restore. It is
+    /// never cleared.
+    handles_inserted: std::sync::atomic::AtomicBool,
     /// Bumped whenever the managed-mob handle set gains or loses an entry.
     /// Interval-free observers (e.g. meta's agent-event stream reconcilers)
     /// await this instead of polling `mob_handles_snapshot` on a timer. The
@@ -1047,6 +1097,10 @@ pub struct MobMcpState {
     /// its admission and its action (see [`Self::pause_agent_call`]).
     #[cfg(test)]
     agent_call_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
+    /// Test seam: when set, a member lookup parks once between its first
+    /// completeness check and its scan of the hosted rosters.
+    #[cfg(test)]
+    member_lookup_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
     /// Stable per-process coordinator identity. It is the council claim id, so
     /// a later in-process recovery sweep RENEWS the claim this process already
     /// holds instead of colliding with itself, while a genuinely different
@@ -1190,6 +1244,7 @@ impl MobMcpState {
             #[cfg(test)]
             teardown_preflight_hold: std::sync::Mutex::new(None),
             mob_set_restored: std::sync::atomic::AtomicBool::new(false),
+            handles_inserted: std::sync::atomic::AtomicBool::new(false),
             mob_set_epoch: tokio::sync::watch::Sender::new(0),
             implicit_mob_locks: Mutex::new(HashMap::new()),
             workgraph_flow_custodies: Mutex::new(HashMap::new()),
@@ -1213,6 +1268,8 @@ impl MobMcpState {
             resume_insert_hold: std::sync::Mutex::new(None),
             #[cfg(test)]
             agent_call_hold: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            member_lookup_hold: std::sync::Mutex::new(None),
             coordinator_id: uuid::Uuid::new_v4().simple().to_string(),
             temporary_council_clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
             temporary_council_clock_changes: tokio::sync::watch::channel(0).0,
@@ -1842,6 +1899,151 @@ impl MobMcpState {
     pub(crate) fn mob_set_complete(&self) -> bool {
         self.mob_set_restored
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this state hosts every mob whose roster could name a session:
+    /// its mob set is complete ([`Self::mob_set_complete`]), or it has no
+    /// persistent root and no handle was ever inserted, so it hosts only the
+    /// mobs it created in this process and holds no child. The second arm
+    /// holds only while no host inserts a handle: every inserted handle goes
+    /// through [`Self::try_mob_insert_handle`], which sets the latch before
+    /// the handle is visible, and a lookup reads the answer again after its
+    /// scan.
+    fn member_lookup_complete(&self) -> bool {
+        self.mob_set_complete()
+            || (self.persistent_storage_root.is_none()
+                && !self
+                    .handles_inserted
+                    .load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Every hosted roster that names `session_id` as a member's session: each
+    /// managed mob's, read from its handle's own roster state, and each held
+    /// child mob's, read from its store without activation. It is one
+    /// complete lookup and never answers from part of the hosted set. It
+    /// refuses [`MobError::ProvenanceUnavailable`] naming no mob while the
+    /// hosted set may be incomplete: the mob set is not restored, and this
+    /// state has a persistent root or a host inserted a handle into it,
+    /// before the scan or while it ran (a host that inserts handles declares
+    /// its restore done with [`Self::declare_mob_set_restored`]). A held
+    /// child whose roster cannot be read, or whose roster names the session
+    /// but whose incarnation is not recorded yet (a store from before 0.9.4
+    /// that no 0.9.4 runtime has resumed), refuses it naming that child.
+    pub async fn session_member_matches(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionMemberMatch>, MobError> {
+        self.ensure_restored().await?;
+        if !self.member_lookup_complete() {
+            return Err(MobError::ProvenanceUnavailable { mob_id: None });
+        }
+        #[cfg(test)]
+        {
+            let hold = self
+                .member_lookup_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
+        }
+        let mut matches: BTreeMap<MobId, SessionMemberMatch> = BTreeMap::new();
+        // Held children first and then the managed set, under the transfer
+        // lock: a child moving from one set to the other is read in one of
+        // them, and a mob read in both counts once.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _transfer = self.held_child_transfer.lock().await;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let held = self
+                .held_child_mobs
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for held in held {
+                if let Some(found) = Self::held_child_member_of_session(&held, session_id).await? {
+                    matches.insert(held.mob_id.clone(), found);
+                }
+            }
+        }
+        let managed = self
+            .mobs
+            .read()
+            .await
+            .iter()
+            .map(|(mob_id, managed)| (mob_id.clone(), managed.handle.clone()))
+            .collect::<Vec<_>>();
+        for (mob_id, handle) in managed {
+            if let Some((identity, generation)) = handle.member_of_session(session_id).await {
+                matches.insert(
+                    mob_id.clone(),
+                    SessionMemberMatch {
+                        mob_id,
+                        incarnation: handle.incarnation(),
+                        identity,
+                        generation,
+                    },
+                );
+            }
+        }
+        // A handle inserted while the scan ran may hold a roster the scan did
+        // not read: the lookup is complete only if it still is now.
+        if !self.member_lookup_complete() {
+            return Err(MobError::ProvenanceUnavailable { mob_id: None });
+        }
+        Ok(matches.into_values().collect())
+    }
+
+    /// The member of a held child's stored roster whose session is
+    /// `session_id`, with the child's recorded incarnation. A read that
+    /// fails, or a match without a recorded incarnation, refuses with
+    /// [`MobError::ProvenanceUnavailable`] naming the child.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn held_child_member_of_session(
+        held: &HeldChildMob,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionMemberMatch>, MobError> {
+        let unavailable = |error: Option<&dyn std::fmt::Display>| {
+            match error {
+                Some(error) => tracing::warn!(
+                    mob_id = %held.mob_id,
+                    %error,
+                    "held child mob roster could not be read for a provenance lookup"
+                ),
+                None => tracing::warn!(
+                    mob_id = %held.mob_id,
+                    "held child mob roster names the session but has no recorded incarnation"
+                ),
+            }
+            MobError::ProvenanceUnavailable {
+                mob_id: Some(held.mob_id.clone()),
+            }
+        };
+        let storage = MobStorage::persistent(&held.storage_path)
+            .map_err(|error| unavailable(Some(&error)))?;
+        let Some((identity, generation)) = storage
+            .stored_member_of_session(session_id)
+            .await
+            .map_err(|error| unavailable(Some(&error)))?
+        else {
+            return Ok(None);
+        };
+        let incarnation = storage
+            .creation_incarnation()
+            .await
+            .map_err(|error| unavailable(Some(&error)))?
+            .ok_or_else(|| unavailable(None))?;
+        Ok(Some(SessionMemberMatch {
+            mob_id: held.mob_id.clone(),
+            incarnation,
+            identity,
+            generation,
+        }))
     }
 
     /// Every mob this state manages, with its raw handle, without console
@@ -4087,6 +4289,7 @@ impl MobMcpState {
                 child_tool_policy::ChildMobScope::default(),
                 member_external_tools,
             )
+            .with_provenance(meerkat_mob::MobProvenance::Host)
             .create()
             .await?;
         match self.mobs.write().await.entry(mob_id.clone()) {
@@ -4248,6 +4451,17 @@ impl MobMcpState {
         if self.destroy_cleanup_owed(&mob_id) {
             return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
+        // Who creates the mob, recorded with its creation: the host when no
+        // session calls, otherwise what the complete lookup of the hosted
+        // rosters finds for the caller session. A lookup that cannot be
+        // complete refuses the create before anything of the mob exists.
+        let provenance = match owner_bridge_session_authority.as_ref() {
+            None => meerkat_mob::MobProvenance::Host,
+            Some((owner_bridge_session_id, _, _)) => session_creation_provenance(
+                owner_bridge_session_id,
+                self.session_member_matches(owner_bridge_session_id).await?,
+            ),
+        };
         // The host admits or refuses the create before anything of the mob
         // exists, told what this path knows: the owner session and whether
         // this is that session's implicit delegation mob. Only the implicit
@@ -4304,7 +4518,7 @@ impl MobMcpState {
         if let Some(claim_verifier) = claim_verifier {
             builder = builder.with_callback_claim_verifier(claim_verifier);
         }
-        let handle = builder.create().await?;
+        let handle = builder.with_provenance(provenance).create().await?;
         let incarnation = handle.live_incarnation();
         #[cfg(test)]
         {
@@ -4391,6 +4605,10 @@ impl MobMcpState {
             if self.destroy_cleanup_owed(&mob_id) {
                 return Err(Self::owed_destroy_cleanup_error(&mob_id));
             }
+            // Latched before the handle is visible: a member lookup that
+            // could see the handle reads the latch set.
+            self.handles_inserted
+                .store(true, std::sync::atomic::Ordering::Release);
             mobs.insert(
                 mob_id.clone(),
                 ManagedMob {
@@ -15703,6 +15921,439 @@ mod tests {
             mob_store_files(root.path()),
             1,
             "the held child's storage remains"
+        );
+    }
+
+    /// A create by a member's session records that member as its creator,
+    /// with its mob and that mob's incarnation (`MobProvenance::Member`). The
+    /// record reads back unchanged from the child's store while the child is
+    /// held, and through its handle once it resumes.
+    #[tokio::test]
+    async fn a_member_session_create_records_member_provenance() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let parent = state
+            .mob_create_definition(explicit_definition("provenance-parent"))
+            .await
+            .expect("create the parent mob");
+        let worker = AgentIdentity::from("worker-1");
+        state
+            .mob_spawn(
+                &parent,
+                ProfileName::from("worker"),
+                worker.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn the creator");
+        let creator_session = state
+            .mob_resolve_bridge_session_id(&parent, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("creator bridge session");
+        let parent_handle = state.handle_for(&parent).await.expect("parent handle");
+        let (identity, generation) = parent_handle
+            .member_of_session(&creator_session)
+            .await
+            .expect("the parent roster names the creator's session");
+        assert_eq!(identity, worker);
+        let child = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("provenance-child"),
+                creator_session.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("the creator's session creates a child mob");
+        let expected = meerkat_mob::MobProvenance::Member {
+            parent_mob_id: parent.clone(),
+            parent_incarnation: parent_handle.incarnation(),
+            creator_identity: worker,
+            creator_generation: generation,
+            owner_session: creator_session.clone(),
+        };
+        assert_eq!(
+            state
+                .handle_for(&child)
+                .await
+                .expect("child handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            expected
+        );
+        for mob_id in [&parent, &child] {
+            state
+                .handle_for(mob_id)
+                .await
+                .expect("mob handle")
+                .shutdown()
+                .await
+                .expect("stop the mob");
+        }
+
+        // After a restart the child's owner (the creator's session) does not
+        // resolve: the child is held, and its record reads from its store.
+        let svc = Arc::new(svc.cold_restart().await);
+        svc.script_observation(
+            &creator_session,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let restored = restored_state(&svc, root.path());
+        assert_eq!(restored.held_child_mobs().await.len(), 1);
+        let held_path = restored
+            .held_child_mobs
+            .read()
+            .await
+            .get(&child)
+            .map(|held| held.storage_path.clone())
+            .expect("the child is held");
+        let held_store = MobStorage::persistent(&held_path).expect("open the held store");
+        assert_eq!(
+            held_store
+                .creation_provenance()
+                .await
+                .expect("read the held record"),
+            Some(expected.clone())
+        );
+        drop(held_store);
+
+        // Once the owner resolves, the child resumes with the same record.
+        svc.script_observation(
+            &creator_session,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
+        );
+        assert!(
+            restored
+                .scavenge_orphaned_bridge_session_scoped_mobs()
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            restored
+                .handle_for(&child)
+                .await
+                .expect("the resumed child")
+                .provenance()
+                .await
+                .expect("provenance"),
+            expected
+        );
+    }
+
+    /// A create with no caller session is the host's: it records `Host`,
+    /// whatever the hosted rosters hold.
+    #[tokio::test]
+    async fn a_host_create_records_host_provenance() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let mob_id = state
+            .mob_create_definition(explicit_definition("provenance-host"))
+            .await
+            .expect("host create");
+        assert_eq!(
+            state
+                .handle_for(&mob_id)
+                .await
+                .expect("handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            meerkat_mob::MobProvenance::Host
+        );
+    }
+
+    /// A create by a session that no hosted roster names records that
+    /// session (`MobProvenance::Session`): the lookup was complete, so the
+    /// fact is positive, never `Host`.
+    #[tokio::test]
+    async fn a_session_create_outside_every_roster_records_the_session() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let other = state
+            .mob_create_definition(explicit_definition("provenance-other"))
+            .await
+            .expect("another hosted mob");
+        state
+            .mob_spawn(
+                &other,
+                ProfileName::from("worker"),
+                AgentIdentity::from("worker-1"),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("a member whose session is not the caller");
+        let caller = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(caller.clone()))
+            .await;
+        assert!(
+            state
+                .session_member_matches(&caller)
+                .await
+                .expect("complete lookup")
+                .is_empty()
+        );
+        let mob_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("provenance-session"),
+                caller.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect("session create");
+        assert_eq!(
+            state
+                .handle_for(&mob_id)
+                .await
+                .expect("handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            meerkat_mob::MobProvenance::Session { session_id: caller }
+        );
+    }
+
+    /// Two hosted rosters naming the caller session record `Ambiguous` with
+    /// their count, and never pick one of them; one names the member, none
+    /// names the session.
+    #[test]
+    fn the_creation_provenance_never_picks_between_rosters() {
+        let session_id = SessionId::new();
+        let matched = |mob: &str| SessionMemberMatch {
+            mob_id: MobId::from(mob),
+            incarnation: meerkat_core::service::MobIncarnationId::mint(),
+            identity: AgentIdentity::from("worker-1"),
+            generation: meerkat_mob::Generation::INITIAL,
+        };
+        assert_eq!(
+            session_creation_provenance(&session_id, vec![matched("a"), matched("b")]),
+            meerkat_mob::MobProvenance::Ambiguous {
+                matching_rosters: 2
+            }
+        );
+        let one = matched("a");
+        assert_eq!(
+            session_creation_provenance(&session_id, vec![one.clone()]),
+            meerkat_mob::MobProvenance::Member {
+                parent_mob_id: one.mob_id,
+                parent_incarnation: one.incarnation,
+                creator_identity: one.identity,
+                creator_generation: one.generation,
+                owner_session: session_id.clone(),
+            }
+        );
+        assert_eq!(
+            session_creation_provenance(&session_id, Vec::new()),
+            meerkat_mob::MobProvenance::Session {
+                session_id: session_id.clone()
+            }
+        );
+    }
+
+    /// A session create whose lookup cannot be complete is refused before
+    /// anything of the mob exists: while a state that inserted handles has
+    /// not declared its mob set restored (no mob named), and while a held
+    /// child's roster cannot be read (that child named). A host create runs
+    /// no lookup and is not refused.
+    #[tokio::test]
+    async fn an_incomplete_lookup_refuses_the_create_and_names_the_blocking_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let host = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let inserted = host
+            .mob_create_definition(explicit_definition("provenance-inserted"))
+            .await
+            .expect("a mob the host restores by insertion");
+        state
+            .try_mob_insert_handle(
+                inserted.clone(),
+                host.handle_for(&inserted).await.expect("host handle"),
+            )
+            .await
+            .expect("insert the host's mob");
+        let caller = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(caller.clone()))
+            .await;
+        let refused = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("provenance-refused"),
+                caller.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect_err("an undeclared restore leaves the lookup incomplete");
+        assert!(
+            matches!(refused, MobError::ProvenanceUnavailable { mob_id: None }),
+            "{refused:?}"
+        );
+        assert!(
+            state
+                .handle_for(&MobId::from("provenance-refused"))
+                .await
+                .is_err(),
+            "nothing of the refused mob exists"
+        );
+        state
+            .mob_create_definition(explicit_definition("provenance-host-anyway"))
+            .await
+            .expect("a host create runs no lookup");
+        state.declare_mob_set_restored();
+        state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("provenance-refused"),
+                caller,
+                false,
+                false,
+            )
+            .await
+            .expect("the declared set completes the lookup");
+
+        // A held child whose store cannot be read blocks every session
+        // create, named.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, child, owner, _worker_session) = seat_child_worker_then_exit(
+            &Arc::new(MockSessionSvc::new()),
+            root.path(),
+            "held-unreadable",
+        )
+        .await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let restored = restored_state(&svc, root.path());
+        assert_eq!(restored.held_child_mobs().await.len(), 1);
+        let held_path = restored
+            .held_child_mobs
+            .read()
+            .await
+            .get(&child)
+            .map(|held| held.storage_path.clone())
+            .expect("the child is held");
+        std::fs::write(&held_path, b"not a mob store").expect("damage the held store");
+        let caller = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(caller.clone()))
+            .await;
+        let refused = restored
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("provenance-blocked"),
+                caller,
+                false,
+                false,
+            )
+            .await
+            .expect_err("an unreadable held roster leaves the lookup incomplete");
+        assert!(
+            matches!(&refused, MobError::ProvenanceUnavailable { mob_id: Some(blocking) } if blocking == &child),
+            "{refused:?}"
+        );
+        restored
+            .mob_create_definition(explicit_definition("provenance-host-held"))
+            .await
+            .expect("a host create is not blocked");
+    }
+
+    /// A handle a host inserts while a member lookup scans may hold a roster
+    /// the scan did not read: the lookup reads its completeness again after
+    /// the scan, and the create is refused even though the inserted roster
+    /// names the caller session.
+    #[tokio::test]
+    async fn a_handle_inserted_during_the_lookup_refuses_the_create() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let host = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let inserted = host
+            .mob_create_definition(explicit_definition("provenance-racing-insert"))
+            .await
+            .expect("the mob the host inserts");
+        let worker = AgentIdentity::from("worker-1");
+        host.mob_spawn(
+            &inserted,
+            ProfileName::from("worker"),
+            worker.clone(),
+            Some(MobRuntimeMode::TurnDriven),
+            None,
+            None,
+        )
+        .await
+        .expect("spawn the member whose session creates");
+        let caller = host
+            .mob_resolve_bridge_session_id(&inserted, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("member bridge session");
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody"),
+        );
+        let hold = Arc::new(InsertHold::default());
+        *state
+            .member_lookup_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        let creating = Arc::clone(&state);
+        let create_caller = caller.clone();
+        let create = tokio::spawn(async move {
+            creating
+                .mob_create_definition_with_owner_bridge_session(
+                    explicit_definition("provenance-during-insert"),
+                    create_caller,
+                    false,
+                    false,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lookup passed its first completeness check");
+        state
+            .try_mob_insert_handle(
+                inserted.clone(),
+                host.handle_for(&inserted).await.expect("host handle"),
+            )
+            .await
+            .expect("insert the host's mob while the lookup is parked");
+        hold.release.notify_one();
+        let refused = create
+            .await
+            .expect("the create task ends")
+            .expect_err("an insert during the lookup leaves it incomplete");
+        assert!(
+            matches!(refused, MobError::ProvenanceUnavailable { mob_id: None }),
+            "{refused:?}"
+        );
+        assert!(
+            state
+                .handle_for(&MobId::from("provenance-during-insert"))
+                .await
+                .is_err(),
+            "nothing of the refused mob exists"
         );
     }
 

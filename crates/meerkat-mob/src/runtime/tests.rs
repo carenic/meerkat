@@ -5936,6 +5936,7 @@ struct TerminalAppendGate {
 
 struct FaultInjectedMobEventStore {
     events: RwLock<Vec<MobEvent>>,
+    creation: RwLock<Option<crate::store::MobCreationRecord>>,
     event_tx: tokio::sync::broadcast::Sender<MobEvent>,
     external_deliveries: InMemoryMobEventStore,
     fail_on_kind: RwLock<HashSet<&'static str>>,
@@ -5978,7 +5979,33 @@ impl SqliteWriteThenErrorMobEventStore {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl private::MobEventStoreSealed for SqliteWriteThenErrorMobEventStore {}
+#[async_trait]
+impl private::MobEventStoreSealed for SqliteWriteThenErrorMobEventStore {
+    async fn creation_record(
+        &self,
+    ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+        private::MobEventStoreSealed::creation_record(&self.inner).await
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        provenance: &crate::MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        private::MobEventStoreSealed::append_creation(&self.inner, event, incarnation, provenance)
+            .await
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+        private::MobEventStoreSealed::assign_legacy_incarnation(&self.inner, mob_id, incarnation)
+            .await
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
@@ -6039,6 +6066,7 @@ impl FaultInjectedMobEventStore {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4096);
         Self {
             events: RwLock::new(Vec::new()),
+            creation: RwLock::new(None),
             event_tx,
             external_deliveries: InMemoryMobEventStore::new(),
             fail_on_kind: RwLock::new(HashSet::new()),
@@ -6198,7 +6226,54 @@ impl FaultInjectedMobEventStore {
     }
 }
 
-impl private::MobEventStoreSealed for FaultInjectedMobEventStore {}
+#[async_trait]
+impl private::MobEventStoreSealed for FaultInjectedMobEventStore {
+    async fn creation_record(
+        &self,
+    ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+        Ok(self.creation.read().await.clone())
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        provenance: &crate::MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        let kind_label = Self::kind_label(&event.kind);
+        if self.fail_on_kind.read().await.contains(kind_label) {
+            return Err(MobStoreError::Internal(format!(
+                "fault-injected append failure for {kind_label}"
+            )));
+        }
+        let mut events = self.events.write().await;
+        let mut creation = self.creation.write().await;
+        let stored = crate::store::append_creation_in_memory(
+            &mut events,
+            &mut creation,
+            event,
+            incarnation,
+            provenance,
+        )?;
+        let _ = self.event_tx.send(stored.clone());
+        Ok(stored)
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+        let events = self.events.read().await;
+        let mut creation = self.creation.write().await;
+        crate::store::assign_legacy_incarnation_in_memory(
+            &events,
+            &mut creation,
+            mob_id,
+            incarnation,
+        )
+    }
+}
 
 #[async_trait]
 impl MobEventStore for FaultInjectedMobEventStore {
@@ -6444,6 +6519,7 @@ impl MobEventStore for FaultInjectedMobEventStore {
             ));
         }
         self.events.write().await.clear();
+        crate::store::finalize_creation_in_memory(&mut *self.creation.write().await);
         self.external_deliveries.clear().await?;
         Ok(())
     }
@@ -7634,12 +7710,12 @@ fn generated_mob_operator_authority_with_spawn_profile(
     .expect("generated mob authority should grant a spawnable profile")
 }
 
-/// A mob runtime start mints one incarnation that every handle clone shares.
-/// A mob created again under the same id, or resumed after a shutdown, is
-/// another incarnation, so operator scope granted for the first never
-/// reaches it.
+/// A create mints the mob's incarnation once; every handle clone shares it,
+/// and a resume by a later runtime reads it back from the creation record, so
+/// operator scope granted for the mob still reaches it. A mob created again
+/// under the same id is another incarnation, which that scope never reaches.
 #[tokio::test]
-async fn each_mob_runtime_start_mints_a_new_incarnation() {
+async fn a_mob_keeps_its_incarnation_across_resume() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -7668,16 +7744,283 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
         .await
         .expect("stop the recreated runtime");
 
-    // The first mob resumed by a later runtime is another incarnation too.
+    // The first mob resumed by a later runtime keeps its incarnation, and
+    // the grant made before the restart still reaches it.
     let resumed_service = Arc::new(MockSessionService::new());
     let _ = resumed_service.enable_runtime_adapter();
-    let resumed = MobBuilder::for_resume(storage)
+    let resumed = MobBuilder::for_resume(storage.clone())
         .with_session_service(resumed_service)
         .resume()
         .await
         .expect("resume the mob");
-    assert_ne!(resumed.incarnation(), incarnation);
-    assert_ne!(resumed.incarnation(), recreated.incarnation());
+    assert_eq!(resumed.incarnation(), incarnation);
+    assert!(authority.can_manage_mob(mob_id.as_str(), resumed.incarnation()));
+    assert_eq!(
+        storage
+            .creation_incarnation()
+            .await
+            .expect("read the record"),
+        Some(incarnation)
+    );
+}
+
+/// The creation record of a persistent store, written with the mob's
+/// `MobCreated` and read back by every resume.
+async fn persistent_creation_record(
+    database: &std::path::Path,
+) -> Option<crate::store::MobCreationRecord> {
+    let storage = MobStorage::persistent(database).expect("reopen persistent mob storage");
+    crate::store::private::MobEventStoreSealed::creation_record(storage.events.as_ref())
+        .await
+        .expect("read the creation record")
+}
+
+async fn resume_persistent(database: &std::path::Path) -> Result<MobHandle, MobError> {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    MobBuilder::for_resume(MobStorage::persistent(database).expect("reopen persistent mob storage"))
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .resume()
+        .await
+}
+
+/// A mob created before creation records existed (a store a 0.9.3 binary
+/// wrote, migrated to the current ledger) gets one migrated incarnation at
+/// its first resume, recorded before the resume continues with an
+/// `Unrecorded` provenance, and every later resume reuses it.
+#[tokio::test]
+async fn a_legacy_store_gets_one_migrated_incarnation_at_its_first_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let created = MobBuilder::new(
+        sample_definition(),
+        MobStorage::persistent(&database).expect("open persistent mob storage"),
+    )
+    .with_session_service(service)
+    .allow_ephemeral_sessions(true)
+    .create()
+    .await
+    .expect("create mob");
+    let created_incarnation = created.incarnation();
+    created.shutdown().await.expect("stop the first runtime");
+    drop(created);
+    // The store as a 0.9.3 binary left it: the log, and no creation record.
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute("DELETE FROM mob_runtime_incarnations", [])
+        .expect("drop the creation record");
+    assert_eq!(persistent_creation_record(&database).await, None);
+
+    let first = resume_persistent(&database).await.expect("first resume");
+    let migrated = first.incarnation();
+    assert_ne!(
+        migrated, created_incarnation,
+        "the legacy store's incarnation is minted at its first resume"
+    );
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the first resume records the incarnation");
+    assert_eq!(record.incarnation, migrated);
+    assert_eq!(record.origin, crate::store::MobCreationOrigin::Migrated);
+    assert_eq!(
+        first.provenance().await.expect("provenance"),
+        crate::MobProvenance::Unrecorded
+    );
+    first.shutdown().await.expect("stop the first resume");
+    drop(first);
+
+    let second = resume_persistent(&database).await.expect("second resume");
+    assert_eq!(second.incarnation(), migrated, "a later resume reuses it");
+    assert_eq!(
+        second.provenance().await.expect("provenance"),
+        crate::MobProvenance::Unrecorded,
+        "a legacy store's provenance never changes"
+    );
+}
+
+/// A store whose creation record has no `MobCreated` disagrees with itself:
+/// its resume is refused, typed, and the store is left as it was.
+#[tokio::test]
+async fn a_creation_record_without_its_mob_created_refuses_the_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let created = MobBuilder::new(
+        sample_definition(),
+        MobStorage::persistent(&database).expect("open persistent mob storage"),
+    )
+    .with_session_service(service)
+    .allow_ephemeral_sessions(true)
+    .create()
+    .await
+    .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the runtime");
+    drop(created);
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute("DELETE FROM mob_events", [])
+        .expect("drop the log, not through the destroy's clear");
+
+    let error = match resume_persistent(&database).await {
+        Ok(_) => panic!("a record without its MobCreated is not resumed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            MobError::IncarnationInconsistent {
+                mob_id: refused,
+                inconsistency: crate::IncarnationInconsistency::RecordWithoutCreation,
+            } if refused == &mob_id
+        ),
+        "{error:?}"
+    );
+    assert!(
+        persistent_creation_record(&database)
+            .await
+            .is_some_and(|record| !record.is_finalized()),
+        "the refused resume leaves the record as it was"
+    );
+}
+
+/// The destroy's event clear finalizes the creation record in the same
+/// write: the store then holds a finished destroy of that incarnation, which
+/// is not resumed. A create in the kept store replaces the finalized record
+/// with its own incarnation, and a raw `MobCreated` append over a record is
+/// refused.
+#[tokio::test]
+async fn a_destroyed_store_keeps_a_finalized_record_until_a_create_replaces_it() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let storage = MobStorage::persistent(&database).expect("open persistent mob storage");
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    let destroyed = created.incarnation();
+    created.destroy().await.expect("destroy the mob");
+    drop(created);
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the destroy keeps the record");
+    assert_eq!(record.incarnation, destroyed);
+    assert!(record.is_finalized(), "the event clear finalized it");
+
+    let error = match resume_persistent(&database).await {
+        Ok(_) => panic!("a finished destroy is not resumed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            MobError::IncarnationDestroyed { mob_id: refused, incarnation }
+                if refused == &mob_id && *incarnation == destroyed
+        ),
+        "{error:?}"
+    );
+
+    let raw = storage
+        .events
+        .append(NewMobEvent {
+            mob_id: mob_id.clone(),
+            timestamp: None,
+            kind: MobEventKind::MobCreated {
+                definition: Box::new(sample_definition()),
+            },
+        })
+        .await
+        .expect_err("a raw MobCreated over a creation record is refused");
+    assert!(
+        matches!(
+            &raw,
+            MobStoreError::IncarnationInconsistent {
+                inconsistency: crate::IncarnationInconsistency::RawCreationOverRecord,
+                ..
+            }
+        ),
+        "{raw:?}"
+    );
+
+    let recreated = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("a create in the kept store");
+    assert_ne!(recreated.incarnation(), destroyed);
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the create's record");
+    assert_eq!(record.incarnation, recreated.incarnation());
+    assert!(!record.is_finalized());
+    assert_eq!(record.origin, crate::store::MobCreationOrigin::Created);
+}
+
+/// A create records who created the mob: the host unless the builder is
+/// told otherwise, and exactly the provenance it was given. The record never
+/// changes across a resume.
+#[tokio::test]
+async fn a_create_records_its_provenance_once() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let host = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create a host mob");
+    assert_eq!(
+        host.provenance().await.expect("provenance"),
+        crate::MobProvenance::Host
+    );
+    // Both mobs use this test's mob id: the first releases its supervisor
+    // name before the second claims it.
+    host.shutdown().await.expect("stop the host mob");
+
+    let session_service = Arc::new(MockSessionService::new());
+    let _ = session_service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let session_id = SessionId::new();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(session_service)
+        .with_provenance(crate::MobProvenance::Session {
+            session_id: session_id.clone(),
+        })
+        .create()
+        .await
+        .expect("create a session's mob");
+    let expected = crate::MobProvenance::Session { session_id };
+    assert_eq!(created.provenance().await.expect("provenance"), expected);
+    created.shutdown().await.expect("stop the runtime");
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .with_provenance(crate::MobProvenance::Host)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.provenance().await.expect("provenance"),
+        expected,
+        "a resume keeps the recorded provenance"
+    );
+    assert_eq!(
+        storage
+            .creation_provenance()
+            .await
+            .expect("read the record"),
+        Some(expected)
+    );
 }
 
 /// Create seals the generation high-water window of a fresh machine. Resume
@@ -82582,6 +82925,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "member_role_migration_rejected".to_string()
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
+        MobError::IncarnationInconsistent { .. } => "incarnation_inconsistent".to_string(),
+        MobError::IncarnationDestroyed { .. } => "incarnation_destroyed".to_string(),
+        MobError::ProvenanceUnavailable { .. } => "provenance_unavailable".to_string(),
         MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
             "identity_convergence_admission_closed".to_string()

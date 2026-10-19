@@ -1,13 +1,13 @@
 ---- MODULE mob_operator_grant_audit ----
 \* Hand-written bounded audit of incarnation-bound mob operator grants.
 \*
-\* Mob operator scope names a mob id and the incarnation the mob runtime
-\* minted when it started (`mob_operator_mob_incarnations`), so a grant for a
-\* destroyed mob never reaches a later mob created under the same id. A grant
-\* for a bound id at another incarnation rebinds it and drops the other scope
-\* held for the old incarnation; a grant at the bound incarnation keeps it. A
-\* restore refuses a scope that names an unbound mob. Resolving the create
-\* authority, present or absent, clears every scope and binding.
+\* Mob operator scope names a mob id and the incarnation the mob was created
+\* at, which its restarts keep (`mob_operator_mob_incarnations`), so a grant
+\* for a destroyed mob never reaches a later mob created under the same id. A
+\* grant for a bound id at another incarnation rebinds it and drops the other
+\* scope held for the old incarnation; a grant at the bound incarnation keeps
+\* it. A restore refuses a scope that names an unbound mob. Resolving the
+\* create authority, present or absent, clears every scope and binding.
 \*
 \* This audit keeps the generated MeerkatMachine model unchanged and
 \* explores, for two mob ids, two incarnations and one spawn profile: the
