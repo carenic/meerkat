@@ -11996,6 +11996,45 @@ Ok::<(), RuntimeDriverError>(())
         unregister_caller_wait_deadline()
     }
 
+    /// Hold the next live channel custody or playback-readiness read right
+    /// after it takes its machine snapshot. The first receiver resolves when
+    /// the read reaches the hold; sending on (or dropping) the returned sender
+    /// lets it go on. One-shot and inert unless armed: a test commits a
+    /// transition while the read holds its snapshot.
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    pub fn test_hold_next_live_custody_read(
+        &self,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let replaced = self
+            .test_live_custody_read_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((entered_tx, release_rx));
+        assert!(
+            replaced.is_none(),
+            "live custody read test hold already armed"
+        );
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    pub(crate) async fn run_live_custody_read_test_hold(&self) {
+        let hold = self
+            .test_live_custody_read_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((entered_tx, release_rx)) = hold {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     #[cfg(feature = "test-support")]
     async fn run_unregister_saga_test_hold(&self) {
         let hold = self

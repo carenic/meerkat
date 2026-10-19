@@ -904,6 +904,153 @@ pub enum ProviderMeta {
     },
 }
 
+/// The byte cap on each text field of a [`ProviderStopDetail`]. Longer text
+/// is cut at a character boundary and ends with
+/// [`PROVIDER_STOP_DETAIL_TRUNCATION_MARKER`].
+pub const PROVIDER_STOP_DETAIL_TEXT_CAP: usize = 4 * 1024;
+
+/// The marker that ends a [`ProviderStopDetail`] text cut at
+/// [`PROVIDER_STOP_DETAIL_TEXT_CAP`].
+pub const PROVIDER_STOP_DETAIL_TRUNCATION_MARKER: &str = " [truncated]";
+
+/// A provider's own account of why it refused or filtered a response, held
+/// as tagged provider data.
+///
+/// The meaning is the [`StopReason`] (and, for a failed run,
+/// [`ContentFilteredStop`]); this is evidence. Its fields are the provider's
+/// raw strings, tagged by provider, and nothing in the agent loop, retry,
+/// error classification or error codes reads them: provider crates build a
+/// detail with the constructors below and core only carries it to the
+/// caller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]
+/// bytes.
+#[non_exhaustive]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ProviderStopDetail {
+    /// Anthropic `stop_details` of a `refusal` stop.
+    #[non_exhaustive]
+    Anthropic {
+        /// The policy category that triggered the refusal (for example
+        /// `cyber`); absent when the refusal maps to no named category.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+        /// Anthropic's human-readable explanation, for display only: the
+        /// text is not stable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    /// OpenAI: what refused or filtered the response.
+    #[non_exhaustive]
+    OpenAi {
+        /// `refusal` for a refusal output, otherwise the raw filter reason
+        /// (`incomplete_details.reason`, a Chat `finish_reason` or a
+        /// realtime `status_details.reason`).
+        reason: String,
+        /// The model's refusal text, for a refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<String>,
+    },
+    /// Gemini: the raw reason a prompt or a candidate was blocked.
+    #[non_exhaustive]
+    Gemini {
+        /// Whether the prompt or a candidate was blocked.
+        stage: GeminiStopStage,
+        /// `promptFeedback.blockReason` for the prompt, the candidate's
+        /// `finishReason` otherwise.
+        reason: String,
+        /// The `safetyRatings` categories Gemini marked `blocked`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked_categories: Vec<String>,
+    },
+}
+
+impl ProviderStopDetail {
+    /// Anthropic `stop_details` of a refusal.
+    pub fn anthropic(category: Option<String>, explanation: Option<String>) -> Self {
+        Self::Anthropic {
+            category: category.map(cap_provider_stop_text),
+            explanation: explanation.map(cap_provider_stop_text),
+        }
+    }
+
+    /// An OpenAI refusal or filter: `reason` is `refusal` or the raw filter
+    /// reason, `refusal` the model's refusal text.
+    pub fn openai(reason: impl Into<String>, refusal: Option<String>) -> Self {
+        Self::OpenAi {
+            reason: cap_provider_stop_text(reason.into()),
+            refusal: refusal.map(cap_provider_stop_text),
+        }
+    }
+
+    /// A Gemini block of the prompt or of a candidate.
+    pub fn gemini(
+        stage: GeminiStopStage,
+        reason: impl Into<String>,
+        blocked_categories: Vec<String>,
+    ) -> Self {
+        Self::Gemini {
+            stage,
+            reason: cap_provider_stop_text(reason.into()),
+            blocked_categories: blocked_categories
+                .into_iter()
+                .map(cap_provider_stop_text)
+                .collect(),
+        }
+    }
+}
+
+/// Where Gemini blocked a response.
+#[non_exhaustive]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiStopStage {
+    /// The prompt itself (`promptFeedback.blockReason`, no candidate).
+    Prompt,
+    /// A generated candidate (its `finishReason`).
+    Candidate,
+}
+
+/// Cut `text` to [`PROVIDER_STOP_DETAIL_TEXT_CAP`] bytes at a character
+/// boundary, ending it with [`PROVIDER_STOP_DETAIL_TRUNCATION_MARKER`].
+fn cap_provider_stop_text(text: String) -> String {
+    if text.len() <= PROVIDER_STOP_DETAIL_TEXT_CAP {
+        return text;
+    }
+    let mut end = PROVIDER_STOP_DETAIL_TEXT_CAP - PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = String::with_capacity(end + PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len());
+    capped.push_str(&text[..end]);
+    capped.push_str(PROVIDER_STOP_DETAIL_TRUNCATION_MARKER);
+    capped
+}
+
+/// Decode an optional [`ProviderStopDetail`] leniently: an unknown provider
+/// tag or a malformed detail reads as `None`, so provider evidence never
+/// makes the record that carries it undecodable.
+pub fn deserialize_lenient_provider_stop_detail<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProviderStopDetail>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// [`deserialize_lenient_provider_stop_detail`] for a boxed detail.
+pub fn deserialize_lenient_boxed_provider_stop_detail<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<ProviderStopDetail>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_lenient_provider_stop_detail(deserializer).map(|detail| detail.map(Box::new))
+}
+
 /// Deserializes `Box<RawValue>` from a possibly-buffered serde value.
 ///
 /// `Message` uses internally-tagged serde representation, which buffers enum
@@ -3619,6 +3766,44 @@ pub enum StopReason {
     /// (Anthropic `model_context_window_exceeded`). The agent loop commits
     /// nothing of the turn and fails the run as context exceeded.
     ContextWindowExceeded,
+}
+
+/// The refusing stop a content-filtered run ended on: the closed pair of
+/// [`StopReason`]s that fail a run as
+/// [`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFilteredStop {
+    /// The model declined the response ([`StopReason::Refusal`]).
+    Refusal,
+    /// A provider content filter blocked it ([`StopReason::ContentFilter`]).
+    ContentFilter,
+}
+
+impl ContentFilteredStop {
+    /// The refusing stop `stop_reason` names, `None` for every other stop.
+    pub fn from_stop_reason(stop_reason: StopReason) -> Option<Self> {
+        match stop_reason {
+            StopReason::Refusal => Some(Self::Refusal),
+            StopReason::ContentFilter => Some(Self::ContentFilter),
+            StopReason::EndTurn
+            | StopReason::ToolUse
+            | StopReason::MaxTokens
+            | StopReason::StopSequence
+            | StopReason::Cancelled
+            | StopReason::PauseTurn
+            | StopReason::ContextWindowExceeded => None,
+        }
+    }
+
+    /// The stop reason this refusing stop is.
+    pub fn stop_reason(self) -> StopReason {
+        match self {
+            Self::Refusal => StopReason::Refusal,
+            Self::ContentFilter => StopReason::ContentFilter,
+        }
+    }
 }
 
 /// Security mode for tool execution (e.g. shell)

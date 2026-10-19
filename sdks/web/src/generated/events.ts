@@ -71,6 +71,10 @@ export type AgentErrorReason = {
   hook_id: HookId;
   reason: HookFailureReason;
   reason_type: "hook_launch_refused";
+} | {
+  detail?: ProviderStopDetail | null;
+  reason_type: "content_filtered";
+  stop: ContentFilteredStop;
 };
 
 export type AgentErrorReport = {
@@ -219,6 +223,15 @@ export interface CompactionRewriteRange {
   start: number;
 }
 
+export type CompactionSummarySource = {
+  kind: "provider_call";
+  source_bound: SummarizationSourceBound;
+} | {
+  kind: "host_curator";
+} | {
+  kind: "mechanical_fallback";
+};
+
 export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed" | "untrusted_configuration_source";
 
 export type ContentBlock = {
@@ -244,6 +257,8 @@ export type ContentBlock = {
   text: string;
   type: "skill_context";
 };
+
+export type ContentFilteredStop = "refusal" | "content_filter";
 
 export type ContentInput = string | ContentBlock[];
 
@@ -303,6 +318,8 @@ export type GeminiImageMetadata = {
   response_id?: string | null;
   target_model: string;
 };
+
+export type GeminiStopStage = "prompt" | "candidate";
 
 export type GeminiThinkingConfig = {
   include_thoughts?: boolean | null;
@@ -512,6 +529,21 @@ export type ProviderParamsOverride = {
   temperature?: number | null;
   thinking_budget_tokens?: number | null;
   top_p?: number | null;
+};
+
+export type ProviderStopDetail = {
+  category?: string | null;
+  explanation?: string | null;
+  provider: "anthropic";
+} | {
+  provider: "open_ai";
+  reason: string;
+  refusal?: string | null;
+} | {
+  blocked_categories?: string[];
+  provider: "gemini";
+  reason: string;
+  stage: GeminiStopStage;
 };
 
 export type ProviderTag = {
@@ -769,6 +801,19 @@ export interface StructuredProviderExtension {
   key: string;
   namespace: string;
 }
+
+export type SummarizationSourceBound = {
+  kind: "whole";
+} | {
+  kind: "trimmed";
+  through: SummarizationTrimStage;
+} | {
+  kept: number;
+  kind: "requests_only";
+  of: number;
+};
+
+export type SummarizationTrimStage = "tool_results" | "context" | "user_requests";
 
 export type SystemNoticeBlock = {
   content?: ContentBlock[];
@@ -1211,8 +1256,10 @@ export interface CompactionStartedEvent {
 }
 
 export interface CompactionCompletedEvent {
+  estimated_history_tokens_after?: number | null;
   messages_after: number;
   messages_before: number;
+  summary_source?: CompactionSummarySource | null;
   summary_tokens: number;
   type: "compaction_completed";
 }

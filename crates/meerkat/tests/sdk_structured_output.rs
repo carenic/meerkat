@@ -64,9 +64,7 @@ impl LlmClient for MockLlmClientWithStructuredOutput {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         } else {
@@ -78,9 +76,7 @@ impl LlmClient for MockLlmClientWithStructuredOutput {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -129,9 +125,7 @@ impl LlmClient for MockLlmClientWithNamedWrapper {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         } else {
@@ -142,9 +136,7 @@ impl LlmClient for MockLlmClientWithNamedWrapper {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -185,9 +177,7 @@ impl LlmClient for MockLlmClientWithRetry {
                     }),
                     Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                     }),
                 ]))
             }
@@ -200,9 +190,7 @@ impl LlmClient for MockLlmClientWithRetry {
                     }),
                     Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                     }),
                 ]))
             }
@@ -215,9 +203,7 @@ impl LlmClient for MockLlmClientWithRetry {
                     }),
                     Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                     }),
                 ]))
             }
@@ -503,9 +489,7 @@ impl LlmClient for RecordingScriptedLlmClient {
             }),
             Ok(normalized_anthropic_usage(request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
             }),
         ]))
     }

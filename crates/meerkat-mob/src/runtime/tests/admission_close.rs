@@ -450,6 +450,677 @@ async fn close_admission_closes_a_busy_mob_without_stopping_its_work() {
     );
 }
 
+/// After `shutdown()` the actor takes no more commands, so the mob grants no
+/// owner lease either: the admitted Shutdown closes admission with its own
+/// reason, which every handle observes.
+#[tokio::test]
+async fn shutdown_closes_admission_and_refuses_later_owners() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    handle.shutdown().await.expect("shutdown");
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    for acquirer in [&observer, &handle] {
+        match acquirer.acquire_owner() {
+            Ok(_) => panic!("a shut-down mob grants no owner"),
+            Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+        }
+    }
+}
+
+/// A Shutdown after an earlier close keeps the first reason (D67).
+#[tokio::test]
+async fn shutdown_keeps_an_earlier_close_reason() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    assert_eq!(
+        handle
+            .close_admission(MobAdmissionCloseReason::StandDown)
+            .await
+            .expect("close admission"),
+        None
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::StandDown)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a closed mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::StandDown),
+    }
+}
+
+/// Control: a Stop, the resumable pause, leaves admission open.
+#[tokio::test]
+async fn stop_leaves_admission_open() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle.stop().await.expect("stop");
+    actor_round_trip(&handle).await;
+    assert!(
+        handle.admission_closed().borrow().is_none(),
+        "a stopped mob keeps admission open"
+    );
+    let lease = match handle.acquire_owner() {
+        Ok(lease) => lease,
+        Err(error) => panic!("a stopped mob grants a foreground owner: {error}"),
+    };
+    assert!(lease.is_public_owner());
+}
+
+/// The admitted Shutdown closes admission before its teardown: while the
+/// teardown still waits on a held session, the mob grants no owner lease and
+/// refuses new work with the Shutdown reason.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn shutdown_closes_admission_before_its_teardown() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .expect("inline lead profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    let held_session = handle
+        .spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("d67-shutdown-held"),
+            None,
+        )
+        .await
+        .expect("spawn member")
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    let guard = service
+        .runtime_adapter
+        .hold_session_registration_transaction_for_test(&held_session)
+        .await;
+    let mut parked = handle
+        .lifecycle_observations
+        .shutdown_teardown_parked
+        .subscribe();
+    assert!(handle.admission_closed().borrow().is_none());
+
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_handle
+            .shutdown_with_report(
+                crate::runtime::ShutdownOptions::default()
+                    .with_deadline(Instant::now() + Duration::from_secs(3)),
+            )
+            .await
+    });
+    tokio::time::timeout(STEP, parked.wait_for(|parked| *parked))
+        .await
+        .expect("the shutdown parks on its teardown")
+        .expect("the probe outlives the test");
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown),
+        "admission closed before the teardown"
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a shutting-down mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn(
+            ProfileName::from("lead"),
+            AgentIdentity::from("d67-shutdown-late"),
+            None,
+        ),
+    )
+    .await
+    .expect("the actor answers a spawn during the teardown");
+    match late {
+        Ok(_) => panic!("a shutting-down mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "the teardown is still waiting on the held session"
+    );
+
+    drop(guard);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("shutdown returns")
+        .expect("join")
+        .expect("shutdown succeeds");
+}
+
+/// After `destroy()` the actor has exited, so the mob grants no owner lease
+/// either: the admitted destroy closed admission with its own reason.
+#[tokio::test]
+async fn destroy_closes_admission_and_refuses_later_owners() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    handle.destroy().await.expect("destroy");
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a destroyed mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+}
+
+/// The destroy closes admission when it is admitted (its durable marker),
+/// not when it finishes: a destroy left incomplete after its admission keeps
+/// admission closed.
+#[tokio::test]
+async fn an_incomplete_admitted_destroy_keeps_admission_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-destroy-incomplete");
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(
+            events.clone(),
+            Arc::new(InMemoryMobRuntimeMetadataStore::new()),
+        ),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    handle
+        .spawn_spec(worker_spec("d67-destroy-incomplete-worker"))
+        .await
+        .expect("spawn worker");
+    events.fail_appends_for("MemberRetired").await;
+
+    match handle.destroy().await {
+        Err(crate::runtime::handle::MobDestroyError::Incomplete { .. }) => {}
+        other => panic!("expected an incomplete destroy, got {other:?}"),
+    }
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob with an admitted destroy grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+}
+
+/// A mob restored with its durable destroy marker (a destroy admitted, then
+/// left incomplete, before the process stopped) starts with admission
+/// closed, before its handle escapes: nothing is spawned into it, and no
+/// owner lease is granted, while the destroy's retry has not finished, and
+/// that retry is still admitted. A current-thread runtime, so the restored
+/// actor task has not run when the handle is first read.
+#[tokio::test]
+async fn a_mob_restored_with_an_admitted_destroy_starts_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-destroy-restart");
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone()),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    handle
+        .spawn_spec(worker_spec("d67-destroy-restart-worker"))
+        .await
+        .expect("spawn worker");
+    events.fail_appends_for("MemberRetired").await;
+    match handle.destroy().await {
+        Err(crate::runtime::handle::MobDestroyError::Incomplete { .. }) => {}
+        other => panic!("expected an incomplete destroy, got {other:?}"),
+    }
+    crash_stop_and_release_routes(handle).await;
+
+    // The retirement append still fails, so the restored actor's automatic
+    // destroy retry stays incomplete and the actor stays up while the test
+    // reads it.
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events.clone(),
+        runtime_metadata,
+    ))
+    .with_session_service(service)
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("resume the destroying mob from its durable marker");
+    // Read before this test first yields: only what the builder did before
+    // it returned the handle.
+    let closed_at_return = *resumed.admission_closed().borrow();
+    let owner_at_return = resumed.acquire_owner().map(drop);
+    let late_spawn = resumed
+        .spawn_spec(worker_spec("d67-destroy-restart-late"))
+        .await;
+    match late_spawn {
+        Ok(_) => panic!("a restored destroying mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+    assert_eq!(
+        closed_at_return,
+        Some(MobAdmissionCloseReason::Destroyed),
+        "admission is closed before the restored handle escapes"
+    );
+    match owner_at_return {
+        Ok(()) => panic!("a restored destroying mob grants no owner, even before its actor runs"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Destroyed),
+    }
+    assert_eq!(
+        *resumed.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Destroyed)
+    );
+
+    // The destroy's own retry is still admitted: once the retirement append
+    // succeeds, it finishes the destroy and the actor exits.
+    let mut task = resumed.actor_task_watch();
+    events.allow_appends_for("MemberRetired").await;
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+}
+
+/// A durability fail-stop exits the actor, so the mob grants no owner lease
+/// either: admission closes with the fail-stop's own reason before the actor
+/// quiesces and closes its mailbox.
+#[tokio::test]
+async fn a_durability_fail_stop_closes_admission() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let definition = with_unique_mob_id(sample_definition(), "d67-durability-fail-stop");
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::with_events_and_runtime_metadata(
+            Arc::new(InMemoryMobEventStore::new()),
+            runtime_metadata.clone(),
+        ),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create mob");
+    let observer = handle.observer();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    runtime_metadata.lose_nth_compare_supervisor_completion_with_unreadable_reread(2);
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("an unreadable reconciliation fail-stops the actor");
+    assert!(
+        error
+            .to_string()
+            .contains("fail-stopping for cold recovery"),
+        "unexpected reconciliation error: {error}"
+    );
+    wait_for_actor_fail_stop(&handle).await;
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DurabilityFailStop)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a fail-stopped mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DurabilityFailStop),
+    }
+    drop(observer);
+    crash_stop_and_release_routes(handle).await;
+}
+
+/// A lost actor task (here, a panic in its loop) takes no further command,
+/// so the mob grants no owner lease either: the task's spawn wrapper closes
+/// admission with its own reason before it reports the task lost.
+#[tokio::test]
+async fn a_lost_actor_task_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-actor-lost");
+    let (handle, _service) = create_test_mob(definition).await;
+    let observer = handle.observer();
+    let mut task = handle.actor_task_watch();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    crate::runtime::actor::panic_actor_loop_for_test(handle.mob_id());
+    // Any wake takes the loop to its next turn, where the seam panics.
+    let _phase = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await;
+    assert_eq!(task.wait().await, crate::runtime::MobActorTaskWait::Lost);
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::ActorLost)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a lost actor grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::ActorLost),
+    }
+}
+
+/// A structural composition dispatch failure at a loop boundary stops the
+/// actor through its ordinary return, not as a lost task: admission closes
+/// with its own reason first, so the stopped mob grants no owner lease.
+#[tokio::test]
+async fn a_dispatch_failure_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-dispatch-failed");
+    let (handle, _service) = create_test_mob(definition).await;
+    let observer = handle.observer();
+    let mut task = handle.actor_task_watch();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    crate::runtime::actor::fail_next_boundary_flush_for_test(handle.mob_id());
+    // Any command takes the loop to its next boundary, where the flush fails.
+    let _phase = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await;
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DispatchFailed)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a mob stopped by a dispatch failure grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DispatchFailed),
+    }
+}
+
+/// A durable recovery that fail-stops before command admission exits the
+/// actor with admission closed for the fail-stop, so the mob grants no owner
+/// lease on the exited actor.
+#[tokio::test]
+async fn a_startup_fail_stop_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-startup-fail-stop");
+    crate::runtime::actor::fail_stop_next_actor_start_for_test(&definition.id);
+    let (handle, _service) = create_test_mob(definition).await;
+    let mut task = handle.actor_task_watch();
+
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DurabilityFailStop)
+    );
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob fail-stopped at its start grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DurabilityFailStop),
+    }
+}
+
+/// While the admitted Shutdown still joins actor work inline (here a held
+/// member-live task), a command the Closing state refuses is answered with
+/// the close reason, the answer it gets once the Shutdown parks, not as a
+/// closed channel: the actor is alive, and its Shutdown can still fail.
+#[tokio::test]
+async fn a_spawn_during_the_shutdown_drain_is_refused_with_the_close_reason() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-shutdown-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let spawned = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::SpawnHeldLiveMutationForTest {
+            release_rx,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue the held task");
+    tokio::time::timeout(STEP, spawned)
+        .await
+        .expect("the held task is spawned")
+        .expect("spawn reply")
+        .expect("spawn the held task");
+    let mut admitted = handle.lifecycle_observations.shutdown_admitted.subscribe();
+
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(STEP, admitted.wait_for(|admitted| *admitted))
+        .await
+        .expect("the Shutdown is admitted")
+        .expect("the observation outlives the test");
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn_spec(worker_spec("d67-shutdown-drain-late")),
+    )
+    .await
+    .expect("the actor answers a spawn while it drains");
+    match late {
+        Ok(_) => panic!("a shutting-down mob admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    assert!(
+        !shutdown.is_finished(),
+        "the Shutdown still joins the held task"
+    );
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect("the Shutdown finishes");
+}
+
+/// A Shutdown that fails after its admission keeps the actor as the retry
+/// owner with admission closed: the Closing set stays refused, and a retried
+/// Shutdown is admitted and finishes.
+#[tokio::test]
+async fn a_failed_shutdown_keeps_admission_closed_and_its_retry_finishes() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-failed-shutdown");
+    let (handle, _service) = create_test_mob(definition).await;
+
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    let error = tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the failed Shutdown answers")
+        .expect_err("the Shutdown fails in its drain");
+    assert!(
+        error
+            .to_string()
+            .contains("test seam: the Shutdown's lifecycle drain fails"),
+        "unexpected Shutdown failure: {error}"
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::Shutdown)
+    );
+    let late = tokio::time::timeout(
+        STEP,
+        handle.spawn_spec(worker_spec("d67-failed-shutdown-late")),
+    )
+    .await
+    .expect("the live actor answers a spawn");
+    match late {
+        Ok(_) => panic!("a mob whose Shutdown failed admits no new member"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+    match handle.acquire_owner() {
+        Ok(_) => panic!("a mob whose Shutdown failed grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::Shutdown),
+    }
+
+    tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the retried Shutdown answers")
+        .expect("the retried Shutdown is admitted and finishes");
+}
+
+/// After a failed Shutdown, Stop and Destroy stay available too.
+#[tokio::test]
+async fn stop_and_destroy_stay_available_after_a_failed_shutdown() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-failed-shutdown-teardown");
+    let (handle, _service) = create_test_mob(definition).await;
+
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    tokio::time::timeout(STEP, handle.shutdown())
+        .await
+        .expect("the failed Shutdown answers")
+        .expect_err("the Shutdown fails in its drain");
+    tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop answers")
+        .expect("the Stop is admitted and finishes");
+    tokio::time::timeout(STEP, handle.destroy())
+        .await
+        .expect("the destroy answers")
+        .expect("the destroy is admitted and finishes");
+}
+
+/// Hold the next Shutdown's drain on a member-live task it joins, until the
+/// returned sender is dropped.
+async fn hold_shutdown_drain(handle: &MobHandle) -> tokio::sync::oneshot::Sender<()> {
+    tokio::time::timeout(STEP, handle.hold_shutdown_drain_for_test())
+        .await
+        .expect("the held task is spawned")
+        .expect("spawn the held task")
+}
+
+/// Start a Shutdown and return once it is admitted, so it is draining.
+async fn start_shutdown(handle: &MobHandle) -> tokio::task::JoinHandle<Result<(), MobError>> {
+    let mut admitted = handle.lifecycle_observations.shutdown_admitted.subscribe();
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(STEP, admitted.wait_for(|admitted| *admitted))
+        .await
+        .expect("the Shutdown is admitted")
+        .expect("the observation outlives the test");
+    shutdown
+}
+
+fn assert_shutdown_in_progress<T>(result: Result<T, MobError>, expected: &MobId) {
+    match result {
+        Ok(_) => panic!("a draining Shutdown runs no other request"),
+        Err(MobError::ShutdownInProgress { mob_id }) => assert_eq!(&mob_id, expected),
+        Err(other) => panic!("expected ShutdownInProgress, got {other}"),
+    }
+}
+
+/// While a Shutdown drains its own work, `stop()` is refused at once with
+/// `ShutdownInProgress`: never a closed channel (the actor is alive) and
+/// never a wait for a lifecycle transition. Here the Shutdown then fails, so
+/// the retried Stop runs on the live actor.
+#[tokio::test]
+async fn a_stop_during_a_failing_shutdown_drain_is_refused_at_once_and_runs_on_retry() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-stop-failing-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let release_tx = hold_shutdown_drain(&handle).await;
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    let shutdown = start_shutdown(&handle).await;
+
+    let asked = tokio::time::Instant::now();
+    let refused = tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop is answered during the drain");
+    let waited = asked.elapsed();
+    assert_shutdown_in_progress(refused, handle.mob_id());
+    assert!(
+        waited < Duration::from_secs(1),
+        "stop() returned the refusal after {waited:?}"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the Shutdown still joins the held task"
+    );
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect_err("the Shutdown fails in its drain");
+    tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the retried Stop answers")
+        .expect("the retried Stop runs on the live actor");
+    assert_eq!(
+        handle
+            .status()
+            .await
+            .expect("the live actor reports its phase"),
+        MobState::Stopped
+    );
+}
+
+/// The same Stop during a Shutdown drain that then commits is refused the
+/// same way, and once the actor has exited a request finds its command
+/// channel closed.
+#[tokio::test]
+async fn a_stop_during_a_committing_shutdown_drain_is_refused_then_finds_the_actor_gone() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-stop-committing-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let release_tx = hold_shutdown_drain(&handle).await;
+    let mut task = handle.actor_task_watch();
+    let shutdown = start_shutdown(&handle).await;
+
+    let refused = tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop is answered during the drain");
+    assert_shutdown_in_progress(refused, handle.mob_id());
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect("the Shutdown finishes");
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    match tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("a Stop after the exit answers")
+    {
+        Ok(_) => panic!("an exited actor runs no Stop"),
+        Err(MobError::ActorCommandChannelClosed) => {}
+        Err(other) => panic!("expected a closed command channel after the exit, got {other}"),
+    }
+}
+
+/// A recovered placed Reset intent returns once the mob's admission is
+/// closed. The live actor refuses a Reset for the rest of its life, so no
+/// retry could run it; the durable intent stays recorded for the next start.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_recovered_placed_reset_intent_returns_once_admission_is_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-recovered-reset-closed");
+    let (handle, _service) = create_test_mob(definition).await;
+    tokio::time::timeout(
+        STEP,
+        handle.close_admission(MobAdmissionCloseReason::StandDown),
+    )
+    .await
+    .expect("the close answers")
+    .expect("the idle mob closes its admission");
+    tokio::time::timeout(
+        STEP,
+        crate::runtime::builder::drive_recovered_placed_lifecycle_intent(
+            handle.clone(),
+            crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Reset,
+        ),
+    )
+    .await
+    .expect("the recovered Reset intent returns once admission is closed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

@@ -31,7 +31,7 @@ use meerkat_authorization::publication::LocalAuthorizationPublication;
 use meerkat_authorization_contracts::constraints::{ExecutionRestrictions, ResourceDomain};
 use meerkat_authorization_contracts::evidence::EvidenceId;
 use meerkat_authorization_contracts::work_association::{
-    InputAuthorityAssociation, OriginalWorkRef, QualifiedIngressNamespace, WorkAuthorityBasis,
+    InputAuthorityAssociation, OriginalWorkRef, QualifiedIngressNamespace,
 };
 use meerkat_core::authorization::{ControllerReadinessFailure, PreparedAuthorizationBinding};
 use meerkat_core::mcp_attachment::McpAttachmentRefusal;
@@ -77,12 +77,12 @@ impl AuthenticatedOriginalSource for NoOriginals {
     ) -> Result<Option<AuthenticatedOriginal>, ControllerReadinessFailure> {
         Ok(None)
     }
-    fn retained_original(
+    fn retained_custody(
         &self,
         _: &QualifiedIngressNamespace,
         _: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
-        Ok(None)
+    ) -> Result<meerkat_runtime::meerkat_machine::RetainedCustody, ControllerReadinessFailure> {
+        Ok(meerkat_runtime::meerkat_machine::RetainedCustody::NotRetained)
     }
 }
 

@@ -546,6 +546,7 @@ fn native_helper_uses_u64_max(helper: &str) -> bool {
     matches!(
         helper,
         "mob_machine_next_respawn_generation"
+            | "mob_machine_next_minted_generation"
             | "mob_machine_u64_is_exact_successor"
             | "mob_machine_optional_u64_is_exact_successor"
     )
@@ -10312,6 +10313,46 @@ impl<'a> MachineTlaCompiler<'a> {
         pushln!(
             out,
             "         ELSE Some(arg_identity_runtime_generations[arg_agent_identity] + 1)"
+        );
+        // The generation a new incarnation mints: one past the larger of the
+        // retained generation and the recovered high-water, zero for an
+        // identity in neither map, and no successor past the Rust u64
+        // ceiling. Recovery replay keeps the operator above, which reads the
+        // retained map only.
+        writeln!(
+            out,
+            "{}(arg_identity_runtime_generations, arg_identity_generation_highwater, arg_agent_identity) ==",
+            prefix("mob_machine_next_minted_generation")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET retained == IF arg_agent_identity \\in DOMAIN arg_identity_runtime_generations"
+        );
+        pushln!(
+            out,
+            "                    THEN arg_identity_runtime_generations[arg_agent_identity] ELSE 0"
+        );
+        pushln!(
+            out,
+            "        highwater == IF arg_agent_identity \\in DOMAIN arg_identity_generation_highwater"
+        );
+        pushln!(
+            out,
+            "                     THEN arg_identity_generation_highwater[arg_agent_identity] ELSE 0"
+        );
+        pushln!(
+            out,
+            "        base == IF retained >= highwater THEN retained ELSE highwater"
+        );
+        pushln!(
+            out,
+            "    IN IF arg_agent_identity \\notin DOMAIN arg_identity_runtime_generations /\\ arg_agent_identity \\notin DOMAIN arg_identity_generation_highwater"
+        );
+        pushln!(out, "       THEN Some(0)");
+        pushln!(
+            out,
+            "       ELSE IF base = {TLA_RUST_U64_MAX_CONSTANT} THEN None ELSE Some(base + 1)"
         );
         // Supervisor epochs use the same non-wrapping u64 successor relation
         // in both plain and Option-valued recovered tuples. These operators

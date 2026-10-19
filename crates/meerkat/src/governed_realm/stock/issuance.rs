@@ -844,12 +844,14 @@ impl meerkat_runtime::meerkat_machine::AuthenticatedOriginalSource for NoRetaine
         Err(meerkat_core::authorization::ControllerReadinessFailure::PolicyUnavailable)
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
         _original: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
+    ) -> Result<
+        meerkat_runtime::meerkat_machine::RetainedCustody,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
         Err(meerkat_core::authorization::ControllerReadinessFailure::PolicyUnavailable)
     }
 }

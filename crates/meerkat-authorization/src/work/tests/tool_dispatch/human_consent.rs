@@ -17,7 +17,10 @@ use meerkat_core::approval::review::{
     BoundOperationReview, OperationReviewTier, OperationReviewer, ReviewCandidate,
     ReviewEntrySupport, ReviewVerdict, ReviewerFailure,
 };
-use meerkat_core::authorization::PolicyPublicationObservation;
+use meerkat_core::authorization::{
+    PolicyPublicationObservation, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+    ReviewOperationContextResolution, WorkAuthorization, WorkAuthorizationContext,
+};
 use meerkat_core::{
     ApprovalAssurance, ApprovalDecision, ApprovalError, ApprovalId, ApprovalListFilter,
     ApprovalPrincipalId, ApprovalRecord, ApprovalRisk, ApprovalService, ApprovalStatus,
@@ -32,8 +35,9 @@ const SIBLING_TOOL: &str = "read_record";
 /// Host-chosen validity of one consent request.
 const VALIDITY: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// R3 is never model-reviewed.
-struct NoReviewer;
+/// R3 is never model-reviewed; counts every review it is asked for.
+#[derive(Default)]
+struct NoReviewer(AtomicUsize);
 
 #[async_trait]
 impl OperationReviewer for NoReviewer {
@@ -41,7 +45,56 @@ impl OperationReviewer for NoReviewer {
         &self,
         _candidate: &ReviewCandidate<'_>,
     ) -> Result<ReviewVerdict, ReviewerFailure> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Err(ReviewerFailure::Unavailable)
+    }
+}
+
+/// `work`'s own owner, which publishes one completed owner change keeping
+/// every permission, tier and material right after the armed step: its
+/// first preparation, or its first review material read (immediately before
+/// any human presentation).
+struct ChurningWork {
+    inner: Arc<dyn WorkAuthorization>,
+    publication: LocalAuthorizationPublication,
+    after_prepare: AtomicBool,
+    after_material_read: AtomicBool,
+}
+
+impl ChurningWork {
+    fn republish_if(&self, armed: &AtomicBool) {
+        if armed.swap(false, Ordering::SeqCst) {
+            drop(
+                self.publication
+                    .begin_owner_change()
+                    .expect("owner publication"),
+            );
+        }
+    }
+}
+
+impl WorkAuthorization for ChurningWork {
+    fn review_operation_context(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<ReviewOperationContextResolution, meerkat_core::OperationAuthorizationError> {
+        let read = self.inner.review_operation_context(binding);
+        self.republish_if(&self.after_material_read);
+        read
+    }
+
+    fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
+        self.inner.controller_model_selection()
+    }
+
+    fn prepare(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<Arc<dyn PreparedOperationAuthorization>, meerkat_core::OperationAuthorizationError>
+    {
+        let prepared = self.inner.prepare(binding);
+        self.republish_if(&self.after_prepare);
+        prepared
     }
 }
 
@@ -185,6 +238,7 @@ struct ConsentWorld {
     work: ToolWork,
     approvals: ApprovalService,
     route: Arc<Route>,
+    reviewer: Arc<NoReviewer>,
     review: Arc<BoundOperationReview>,
     body: Arc<RecordingDispatcher>,
     leaf: Arc<ConsentLeaf>,
@@ -198,13 +252,10 @@ impl ConsentWorld {
         work.set_write_tier(OperationReviewTier::R3);
         let approvals = ApprovalService::new();
         let route = Arc::new(Route::default());
+        let reviewer = Arc::new(NoReviewer::default());
         let review = Arc::new(
-            BoundOperationReview::new(
-                Arc::new(NoReviewer),
-                approvals.clone(),
-                Duration::from_secs(30),
-            )
-            .with_human_consent(route.clone(), VALIDITY),
+            BoundOperationReview::new(reviewer.clone(), approvals.clone(), Duration::from_secs(30))
+                .with_human_consent(route.clone(), VALIDITY),
         );
         let body = Arc::new(RecordingDispatcher::default());
         let leaf = Arc::new(ConsentLeaf {
@@ -215,6 +266,7 @@ impl ConsentWorld {
             work,
             approvals,
             route,
+            reviewer,
             review,
             body,
             leaf,
@@ -272,6 +324,38 @@ impl ConsentWorld {
 
     async fn attempt(&self, approval_id: &ApprovalId) -> Result<ToolDispatchOutcome, ToolError> {
         dispatch_retained_consent_attempt(&self.leaf, &self.context(), approval_id).await
+    }
+
+    /// A fenced call under `self.work`'s owner wrapped to publish one
+    /// completed change right after its first preparation or its first
+    /// review material read.
+    async fn fenced_churning(
+        &self,
+        call: &Call,
+        after_prepare: bool,
+        after_material_read: bool,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        let churning = Arc::new(ChurningWork {
+            inner: self.work.context.authorization().clone(),
+            publication: self.work.publication.clone(),
+            after_prepare: AtomicBool::new(after_prepare),
+            after_material_read: AtomicBool::new(after_material_read),
+        });
+        let context = ToolDispatchContext::default()
+            .with_work_authorization(Some(WorkAuthorizationContext::new(
+                churning.clone(),
+                self.work.context.execution_scope().clone(),
+            )))
+            .with_operation_review(Some(self.review.clone()));
+        let plan = self.plan(call);
+        let result =
+            dispatch_tool_execution_plan_fenced(&self.leaf, call.view(), &context, &plan).await;
+        assert!(
+            !churning.after_prepare.load(Ordering::SeqCst)
+                && !churning.after_material_read.load(Ordering::SeqCst),
+            "every armed owner change was published"
+        );
+        result
     }
 
     fn bodies(&self) -> Vec<String> {
@@ -679,7 +763,7 @@ async fn missing_or_unavailable_human_routes_emit_no_approval_reference() {
         let mut w = ConsentWorld::new();
         let (code, kind) = if missing_route {
             w.review = Arc::new(BoundOperationReview::new(
-                Arc::new(NoReviewer),
+                w.reviewer.clone(),
                 w.approvals.clone(),
                 Duration::from_secs(30),
             ));
@@ -796,6 +880,119 @@ async fn the_fresh_retained_attempt_enters_exactly_once() {
             .consent
             .and_then(|consent| consent.consumed_at)
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn an_r3_call_without_a_route_under_owner_churn_settles_as_before() {
+    let mut w = ConsentWorld::new();
+    w.review = Arc::new(BoundOperationReview::new(
+        w.reviewer.clone(),
+        w.approvals.clone(),
+        Duration::from_secs(30),
+    ));
+
+    // A completed owner change right after the call's first preparation:
+    // the R3 call settles exactly as without it, and nothing reviews it.
+    let refused = w
+        .fenced_churning(&consented_call("churned"), true, false)
+        .await;
+    assert_human_consent_required(refused);
+    assert_eq!(
+        w.reviewer.0.load(Ordering::SeqCst),
+        0,
+        "never model-reviewed"
+    );
+    assert!(w.route.notices.lock().expect("notices").is_empty());
+    assert!(
+        w.approvals
+            .list(ApprovalListFilter::default())
+            .expect("approvals")
+            .is_empty()
+    );
+    assert!(w.bodies().is_empty(), "zero entry");
+}
+
+#[tokio::test]
+async fn an_owner_change_before_r3_presentation_is_never_presented_or_reviewed() {
+    let w = ConsentWorld::new();
+    *w.route.presented.lock().expect("presented") = Some(Vec::new());
+
+    // A completed owner change after the material read, before the human
+    // presentation's currentness check: nothing is presented or requested,
+    // and nothing reviews or requests the call again.
+    let refused = w
+        .fenced_churning(&consented_call("churned"), false, true)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::ContextChanged,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        w.reviewer.0.load(Ordering::SeqCst),
+        0,
+        "never model-reviewed"
+    );
+    let presented = w
+        .route
+        .presented
+        .lock()
+        .expect("presented")
+        .take()
+        .expect("recording enabled");
+    assert!(presented.is_empty(), "nothing presented");
+    assert!(w.route.notices.lock().expect("notices").is_empty());
+    assert!(
+        w.approvals
+            .list(ApprovalListFilter::default())
+            .expect("approvals")
+            .is_empty()
+    );
+    assert!(w.bodies().is_empty(), "zero entry");
+    assert_eq!(w.work.review_context_calls(), 1, "read once, never again");
+}
+
+#[tokio::test]
+async fn an_owner_change_before_a_consent_attempt_is_never_reviewed_again() {
+    let w = ConsentWorld::new();
+    let approval_id = w.request("consented").await;
+    w.approve(&approval_id);
+
+    // The decision the human approved goes stale before the attempt's entry
+    // staging: fresh consent is required, and nothing reviews it again.
+    w.work.republish();
+    let refused = w.attempt(&approval_id).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::ContextChanged,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(w.bodies().is_empty(), "zero entry");
+    assert_eq!(
+        w.reviewer.0.load(Ordering::SeqCst),
+        0,
+        "never model-reviewed"
+    );
+    let notices = w.notices(&approval_id);
+    assert!(!notices.contains(&ConsentNoticeKind::Used), "{notices:?}");
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|kind| **kind == ConsentNoticeKind::Requested)
+            .count(),
+        1,
+        "no second consent request: {notices:?}"
     );
 }
 

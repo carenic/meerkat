@@ -70,6 +70,12 @@ Value = Any
 AgentErrorClass = Literal['llm', 'operation_refused', 'store', 'tool', 'policy_indeterminate', 'mcp', 'session_not_found', 'budget', 'max_tokens', 'content_filtered', 'max_turns', 'cancelled', 'invalid_state', 'operation_not_found', 'depth_limit', 'concurrency_limit', 'config', 'internal', 'build', 'auth', 'callback_pending', 'skill', 'structured_output', 'invalid_output_schema', 'hook', 'terminal', 'no_pending_boundary']
 
 
+# The refusing stop a content-filtered run ended on: the closed pair of
+# [`StopReason`]s that fail a run as
+# [`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).
+ContentFilteredStop = Literal['refusal', 'content_filter']
+
+
 class HookFailureReasonTimeout(TypedDict, total=False):
     """The hook runtime did not complete within its configured timeout.
     """
@@ -135,6 +141,48 @@ LlmProviderErrorRetryability = Literal['retryable', 'non_retryable']
 
 
 ModelFallbackSkipReason = Literal['provider_boundary', 'auth_unavailable', 'context_fit', 'context_unknown', 'output_budget', 'tool_parity', 'modality_parity', 'request_unsupported', 'admission_unavailable'] | Literal['tool_choice_unsupported']
+
+
+# Where Gemini blocked a response.
+GeminiStopStage = Literal['prompt', 'candidate']
+
+
+class ProviderStopDetailAnthropic(TypedDict, total=False):
+    """Anthropic `stop_details` of a `refusal` stop.
+    """
+    category: NotRequired[Optional[str]]
+    explanation: NotRequired[Optional[str]]
+    provider: Required[Literal['anthropic']]
+
+
+class ProviderStopDetailOpenAi(TypedDict, total=False):
+    """OpenAI: what refused or filtered the response.
+    """
+    provider: Required[Literal['open_ai']]
+    reason: Required[str]
+    refusal: NotRequired[Optional[str]]
+
+
+class ProviderStopDetailGemini(TypedDict, total=False):
+    """Gemini: the raw reason a prompt or a candidate was blocked.
+    """
+    blocked_categories: NotRequired[list[str]]
+    provider: Required[Literal['gemini']]
+    reason: Required[str]
+    stage: Required[GeminiStopStage]
+
+
+# A provider's own account of why it refused or filtered a response, held
+# as tagged provider data.
+#
+# The meaning is the [`StopReason`] (and, for a failed run,
+# [`ContentFilteredStop`]); this is evidence. Its fields are the provider's
+# raw strings, tagged by provider, and nothing in the agent loop, retry,
+# error classification or error codes reads them: provider crates build a
+# detail with the constructors below and core only carries it to the
+# caller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]
+# bytes.
+ProviderStopDetail = ProviderStopDetailAnthropic | ProviderStopDetailOpenAi | ProviderStopDetailGemini
 
 
 # Closed machine-owned classifier for why a turn reached a terminal failure.
@@ -249,7 +297,17 @@ class AgentErrorReasonHookLaunchRefused(TypedDict, total=False):
     reason_type: Required[Literal['hook_launch_refused']]
 
 
-AgentErrorReason = AgentErrorReasonLlmRateLimited | AgentErrorReasonLlmContextExceeded | AgentErrorReasonLlmAuthError | AgentErrorReasonLlmInvalidModel | AgentErrorReasonLlmProviderError | AgentErrorReasonLlmNetworkTimeout | AgentErrorReasonLlmCallTimeout | AgentErrorReasonHookDenied | AgentErrorReasonHookTimeout | AgentErrorReasonHookExecutionFailed | AgentErrorReasonHookConfigInvalid | AgentErrorReasonStructuredOutputValidationFailed | AgentErrorReasonInvalidOutputSchema | AgentErrorReasonAuthReauthRequired | AgentErrorReasonCallbackPending | AgentErrorReasonTurnTerminalCause | AgentErrorReasonModelFallbackResumeHeld | AgentErrorReasonHookLaunchRefused
+class AgentErrorReasonContentFiltered(TypedDict, total=False):
+    """The provider refused or filtered the response: every
+    [`AgentError::ContentFiltered`] failure, with the provider's own
+    account when it gave one.
+    """
+    detail: NotRequired[Optional[ProviderStopDetail]]
+    reason_type: Required[Literal['content_filtered']]
+    stop: Required[ContentFilteredStop]
+
+
+AgentErrorReason = AgentErrorReasonLlmRateLimited | AgentErrorReasonLlmContextExceeded | AgentErrorReasonLlmAuthError | AgentErrorReasonLlmInvalidModel | AgentErrorReasonLlmProviderError | AgentErrorReasonLlmNetworkTimeout | AgentErrorReasonLlmCallTimeout | AgentErrorReasonHookDenied | AgentErrorReasonHookTimeout | AgentErrorReasonHookExecutionFailed | AgentErrorReasonHookConfigInvalid | AgentErrorReasonStructuredOutputValidationFailed | AgentErrorReasonInvalidOutputSchema | AgentErrorReasonAuthReauthRequired | AgentErrorReasonCallbackPending | AgentErrorReasonTurnTerminalCause | AgentErrorReasonModelFallbackResumeHeld | AgentErrorReasonHookLaunchRefused | AgentErrorReasonContentFiltered
 
 
 class AgentErrorReport(TypedDict, total=False):
@@ -449,6 +507,64 @@ class CompactionFailureReasonProjectionHandoffRefused(TypedDict, total=False):
 #
 # [`Display`]: std::fmt::Display
 CompactionFailureReason = CompactionFailureReasonLlmFailed | CompactionFailureReasonEmptySummary | CompactionFailureReasonCuratorFailed | CompactionFailureReasonEstimationFailed | CompactionFailureReasonMemoryIndexingFailed | CompactionFailureReasonTranscriptRewriteFailed | CompactionFailureReasonProjectionHandoffRefused
+
+
+# The kinds of text a summarization source is trimmed through, in order:
+# tool results first, user requests last.
+SummarizationTrimStage = Literal['tool_results', 'context', 'user_requests']
+
+
+class SummarizationSourceBoundWhole(TypedDict, total=False):
+    """Every message, nothing cut to fit the budget.
+    """
+    kind: Required[Literal['whole']]
+
+
+class SummarizationSourceBoundTrimmed(TypedDict, total=False):
+    """Every message, with the texts too large for the budget cut around an
+    omission marker the summarizing model sees.
+    """
+    kind: Required[Literal['trimmed']]
+    through: Required[SummarizationTrimStage]
+
+
+class SummarizationSourceBoundRequestsOnly(TypedDict, total=False):
+    """Only the newest `kept` of the history's `of` user requests; everything
+    else is omitted.
+    """
+    kept: Required[int]
+    kind: Required[Literal['requests_only']]
+    of: Required[int]
+
+
+# How much of the history being compacted a summarization source carries.
+SummarizationSourceBound = SummarizationSourceBoundWhole | SummarizationSourceBoundTrimmed | SummarizationSourceBoundRequestsOnly
+
+
+class CompactionSummarySourceProviderCall(TypedDict, total=False):
+    """The summarization LLM call: a real provider request.
+    """
+    kind: Required[Literal['provider_call']]
+    source_bound: Required[SummarizationSourceBound]
+
+
+class CompactionSummarySourceHostCurator(TypedDict, total=False):
+    """A configured host curator; no provider request was made.
+    """
+    kind: Required[Literal['host_curator']]
+
+
+class CompactionSummarySourceMechanicalFallback(TypedDict, total=False):
+    """The mechanical capacity fallback; no provider request backs the
+    summary. When the provider answered first and stopped at the model
+    context window, that call is still charged to the session, apart from
+    this outcome.
+    """
+    kind: Required[Literal['mechanical_fallback']]
+
+
+# Who produced a compaction summary.
+CompactionSummarySource = CompactionSummarySourceProviderCall | CompactionSummarySourceHostCurator | CompactionSummarySourceMechanicalFallback
 
 
 class SkillKey(TypedDict, total=False):
@@ -2033,8 +2149,10 @@ class AgentEventCompactionStarted(TypedDict, total=False):
 class AgentEventCompactionCompleted(TypedDict, total=False):
     """Context compaction completed successfully.
     """
+    estimated_history_tokens_after: NotRequired[Optional[int]]
     messages_after: Required[int]
     messages_before: Required[int]
+    summary_source: NotRequired[Optional[CompactionSummarySource]]
     summary_tokens: Required[int]
     type: Required[Literal['compaction_completed']]
 

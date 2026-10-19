@@ -77,13 +77,20 @@ impl std::fmt::Debug for OperationObservedOutcome {
 pub enum OperationObservation {
     /// The actual review owner started this attempt on this exact candidate.
     /// This is historical association, never a verdict or entry allowance.
+    /// One operation records two when the fenced dispatch reviews a decision
+    /// a completed owner publication change superseded once more: the
+    /// successor's `Prepared` record comes between them, and record order is
+    /// the join (no link field is recorded).
     ReviewAttemptStarted {
         attempt_ref: crate::approval::review::ReviewAttemptRef,
     },
     /// A synchronous entry attempt at the named boundary. Several boundaries
     /// can observe the entry of one operation (each staging point on a tool
     /// call's dispatch chain, then its effect), so each names itself; none
-    /// is proof that the physical effect ran.
+    /// is proof that the physical effect ran. One boundary can also observe
+    /// one operation twice: the fenced dispatch's root staging records its
+    /// entry before the review check point finds the retained model review
+    /// superseded, and the operation's second review attempt stages again.
     Entry(OperationEntryBoundary),
     Outcome(OperationObservedOutcome),
     Refused(OperationRefusalKind),
@@ -99,10 +106,20 @@ pub enum OperationObservation {
 pub enum OperationEntryBoundary {
     /// A tool call's staging on its dispatch chain: the session's root
     /// dispatch, or an adapter on the way to the owning tool
-    /// ([`crate::ToolDispatchContext::observe_tool_entry`]).
+    /// ([`crate::ToolDispatchContext::observe_tool_entry`]). The root
+    /// staging records its entry between its first and final checks. When
+    /// the final check refuses while an owner change is in progress, and the
+    /// staging waits that change out and stages again, the operation records
+    /// this boundary twice, the second time for the decision checked after
+    /// the wait.
     ToolDispatch,
     /// The call-level execution policy gate's staging of a tool call
-    /// ([`crate::ExecutionPolicyGatedDispatcher`]).
+    /// ([`crate::ExecutionPolicyGatedDispatcher`]), after the gate's own
+    /// awaits. Like the root staging, it records its entry between its first
+    /// and final checks: when the final check refuses while an owner change
+    /// is in progress, and the staging waits that change out and stages
+    /// again, the operation records this boundary twice, the second time for
+    /// the decision checked after the wait.
     ToolExecutionPolicy,
     /// The owning tool leaf's single consuming entry, immediately before
     /// its effect or transport handoff

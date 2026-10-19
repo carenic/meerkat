@@ -10,7 +10,7 @@
 use super::*;
 use crate::accept::AcceptOutcome;
 use crate::meerkat_machine::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, RetainedControllerOwner,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, RetainedControllerOwner, RetainedCustody,
     RetainedInvocationOwner, ScopedGrantComposition, ScopedMandateOwner,
 };
 use meerkat_authorization_contracts::work_association::{
@@ -19,10 +19,13 @@ use meerkat_authorization_contracts::work_association::{
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// The source owner's custody of the originals it admitted, by work.
+/// The source owner's custody of the originals it admitted, by work: the
+/// held originals, the cancelled ones, and the held ones whose admission it
+/// has not settled yet (its pending candidates).
 #[derive(Default)]
 struct Custody(
     Mutex<HashMap<EvidenceId, AuthenticatedOriginal>>,
+    Mutex<std::collections::HashSet<EvidenceId>>,
     Mutex<std::collections::HashSet<EvidenceId>>,
 );
 impl Custody {
@@ -62,18 +65,17 @@ impl AuthenticatedOriginalSource for Custody {
     > {
         Ok(self.0.lock().expect("fixture").get(&original.work).cloned())
     }
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
-        Ok(self
-            .0
-            .lock()
-            .expect("fixture")
-            .get(&original.work)
-            .map(|held| held.authority_basis.clone()))
+    ) -> Result<RetainedCustody, meerkat_core::authorization::ControllerReadinessFailure> {
+        let pending = self.2.lock().expect("fixture").contains(&original.work);
+        Ok(match self.0.lock().expect("fixture").get(&original.work) {
+            Some(_) if pending => RetainedCustody::AdmissionPending,
+            Some(held) => RetainedCustody::Retained(held.authority_basis.clone()),
+            None => RetainedCustody::NotRetained,
+        })
     }
     fn original_disposition(
         &self,
@@ -195,6 +197,22 @@ enum DuringWait {
     CancelOriginal,
     /// Revoke every grant lineage of the original's own basis.
     RevokeOwnBasis,
+    /// The owner keeps the original as a candidate whose admission it has
+    /// not settled (as an unresolved settlement leaves it).
+    PendOriginal,
+    /// The same for the named contributor.
+    PendContributor,
+    /// A pending original whose operations are cancelled.
+    PendCancelledOriginal,
+}
+
+/// How the owner settles a pending original between two resume attempts.
+#[derive(Clone, Copy)]
+enum Settle {
+    /// It verified the admission and promotes the candidate.
+    Promote,
+    /// Its own bound expired: it withdraws its custody for good.
+    Withdraw,
 }
 
 /// The contributor B the original A names; B is never staged.
@@ -253,6 +271,20 @@ async fn resume_full(
     own_basis: OwnBasis,
     during_wait: DuringWait,
 ) -> Result<AcceptOutcome, RuntimeDriverError> {
+    resume_settled(named, own_basis, during_wait, None).await.0
+}
+
+/// [`resume_full`], then, with `settle`, the owner settles every pending
+/// original and the same completion is resumed once more.
+async fn resume_settled(
+    named: Named,
+    own_basis: OwnBasis,
+    during_wait: DuringWait,
+    settle: Option<Settle>,
+) -> (
+    Result<AcceptOutcome, RuntimeDriverError>,
+    Option<Result<AcceptOutcome, RuntimeDriverError>>,
+) {
     use meerkat_authorization_contracts::work_association::{GrantTarget, TargetGrantLineage};
     let (configuration, mut prompt, _domain) = configuration();
     let grants = Arc::clone(&configuration.grants);
@@ -497,6 +529,7 @@ async fn resume_full(
         )
         .await
         .expect("commit");
+    let retry_identity = identity.clone();
     let request = inbox
         .retained_resume_request(&runtime, &delivery_id, 1, move |_stored| Ok(identity))
         .await
@@ -549,18 +582,57 @@ async fn resume_full(
                     .expect("the original's own lineage is revoked during the wait");
             }
         }
+        DuringWait::PendOriginal => {
+            custody
+                .2
+                .lock()
+                .expect("fixture")
+                .insert(claims.original_work.work.clone());
+        }
+        DuringWait::PendContributor => {
+            let (work, _) = contributor.as_ref().expect("a named contributor");
+            custody.2.lock().expect("fixture").insert(work.work.clone());
+        }
+        DuringWait::PendCancelledOriginal => {
+            for set in [&custody.1, &custody.2] {
+                set.lock()
+                    .expect("fixture")
+                    .insert(claims.original_work.work.clone());
+            }
+        }
     }
 
-    let resume = Input::Prompt(crate::input::PromptInput::continuation(
-        meerkat_core::InputId::new(),
-        "fork_off:job-1",
-        "the fork finished".into(),
-        meerkat_core::types::HandlingMode::Queue,
-    ));
-    machine
-        .accept_retained_resume(&session, resume, request)
+    let resume = || {
+        Input::Prompt(crate::input::PromptInput::continuation(
+            meerkat_core::InputId::new(),
+            "fork_off:job-1",
+            "the fork finished".into(),
+            meerkat_core::types::HandlingMode::Queue,
+        ))
+    };
+    let first = machine
+        .accept_retained_resume(&session, resume(), request)
         .await
-        .map(|(outcome, _)| outcome)
+        .map(|(outcome, _)| outcome);
+    let Some(settle) = settle else {
+        return (first, None);
+    };
+    let pending: Vec<EvidenceId> = custody.2.lock().expect("fixture").drain().collect();
+    if matches!(settle, Settle::Withdraw) {
+        let mut held = custody.0.lock().expect("fixture");
+        for work in &pending {
+            held.remove(work);
+        }
+    }
+    let request = inbox
+        .retained_resume_request(&runtime, &delivery_id, 1, move |_stored| Ok(retry_identity))
+        .await
+        .expect("the row is still at the head");
+    let again = machine
+        .accept_retained_resume(&session, resume(), request)
+        .await
+        .map(|(outcome, _)| outcome);
+    (first, Some(again))
 }
 
 /// The continuation is admitted while its original and any contributor it
@@ -610,6 +682,82 @@ async fn a_scoped_continuation_reacquires_its_original_after_the_wait() {
         denied(resume_after(true, DuringWait::RevokeContributorGrant).await),
         "a named contributor's grant revoked during the wait refuses the resume"
     );
+}
+
+fn pending_admission(result: &Result<AcceptOutcome, RuntimeDriverError>) -> bool {
+    matches!(
+        result,
+        Err(RuntimeDriverError::ControllerReadinessUnavailable {
+            reason:
+                meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending
+        })
+    )
+}
+
+fn denied_for_good(result: &Result<AcceptOutcome, RuntimeDriverError>) -> bool {
+    matches!(
+        result,
+        Err(RuntimeDriverError::RetainedResumeRefused {
+            reason: crate::retained_work::RetainedResumeRefusal::AuthorityDenied
+        })
+    )
+}
+
+/// RED-5: a continuation whose original, or a contributor it names, is still
+/// its owner's pending candidate is not ready, never refused: nothing is
+/// admitted, the carrying delivery stays retryable, and the same completion
+/// resumes once the owner promotes the candidate.
+#[tokio::test]
+async fn a_continuation_waits_while_its_originals_admission_is_pending() {
+    for (named, wait) in [
+        (Named::Nothing, DuringWait::PendOriginal),
+        (Named::SameExecutor, DuringWait::PendContributor),
+    ] {
+        let (first, again) =
+            resume_settled(named, OwnBasis::Fixture, wait, Some(Settle::Promote)).await;
+        assert!(
+            pending_admission(&first),
+            "not ready while pending: {first:?}"
+        );
+        let again = again.expect("resumed after the promotion");
+        assert!(
+            matches!(again, Ok(AcceptOutcome::Accepted { .. })),
+            "admitted once promoted: {again:?}"
+        );
+    }
+}
+
+/// CONTROL-stuck (runtime part): an owner that cannot settle a pending
+/// original withdraws it once its own bound expires. The next resume of the
+/// same completion is refused for good, never answered as pending again.
+#[tokio::test]
+async fn a_withdrawn_pending_original_refuses_its_continuation_for_good() {
+    let (first, again) = resume_settled(
+        Named::Nothing,
+        OwnBasis::Fixture,
+        DuringWait::PendOriginal,
+        Some(Settle::Withdraw),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "nothing is admitted while pending: {first:?}"
+    );
+    let again = again.expect("resumed after the withdrawal");
+    assert!(denied_for_good(&again), "{again:?}");
+}
+
+/// CONTROL-cancelled (R5): a pending original whose operations are cancelled
+/// is refused at once. A cancellation beats a pending admission.
+#[tokio::test]
+async fn a_cancelled_pending_original_refuses_its_continuation() {
+    let result = resume_full(
+        Named::Nothing,
+        OwnBasis::Fixture,
+        DuringWait::PendCancelledOriginal,
+    )
+    .await;
+    assert!(denied_for_good(&result), "{result:?}");
 }
 
 /// The retained resume resolves the original's single grant lineage, so

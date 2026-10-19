@@ -3272,6 +3272,53 @@ def test_parse_turn_completed_with_usage():
     assert event.usage.cache_creation_tokens is None
 
 
+def test_parse_run_failed_content_filtered_reason():
+    """A content-filtered failure keeps its typed stop and the provider's
+    tagged detail; a missing or malformed detail reads as absent, and an
+    unknown stop falls back to an unknown reason (#1888)."""
+    detail = {
+        "provider": "gemini",
+        "stage": "prompt",
+        "reason": "BLOCKLIST",
+        "blocked_categories": ["HARM_CATEGORY_HARASSMENT"],
+    }
+
+    def run_failed(reason):
+        return parse_event(
+            {
+                "type": "run_failed",
+                "session_id": "s1",
+                "error_report": {
+                    "class": "content_filtered",
+                    "message": "Content filtered on turn 1",
+                    "reason": reason,
+                },
+            }
+        )
+
+    event = run_failed(
+        {"reason_type": "content_filtered", "stop": "content_filter", "detail": detail}
+    )
+    assert isinstance(event, RunFailed)
+    assert event.error_report.reason.reason_type == "content_filtered"
+    assert event.error_report.reason.stop == "content_filter"
+    assert event.error_report.reason.detail == detail
+    assert event.error_report.reason["stop"] == "content_filter"
+
+    for raw_detail in (None, "not an object", {"stage": "prompt"}):
+        reason = {"reason_type": "content_filtered", "stop": "refusal"}
+        if raw_detail is not None:
+            reason["detail"] = raw_detail
+        event = run_failed(reason)
+        assert event.error_report.reason.reason_type == "content_filtered"
+        assert event.error_report.reason.stop == "refusal"
+        assert event.error_report.reason.detail is None
+
+    event = run_failed({"reason_type": "content_filtered", "stop": "a_future_stop"})
+    assert event.error_report.reason.reason_type == "unknown"
+    assert event.error_report.reason.raw_reason_type == "content_filtered"
+
+
 def test_parse_run_failed_preserves_policy_stop():
     from meerkat.generated.event_types import LlmProviderErrorKind
 
@@ -8747,3 +8794,108 @@ def test_generated_claim_token_fields_stay_out_of_repr():
     assert token not in repr(created)
     assert token not in repr(params)
     assert "m1" in repr(created)
+
+
+def test_parse_compaction_completed_summary_source():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.summary_source is None
+
+    trimmed = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "trimmed", "through": "tool_results"},
+        },
+    })
+    assert isinstance(trimmed, CompactionCompleted)
+    assert trimmed.summary_source == CompactionSummarySource(
+        kind="provider_call",
+        source_bound=SummarizationSourceBound(kind="trimmed", through="tool_results"),
+    )
+
+    requests_only = parse_event({
+        **base,
+        "summary_source": {
+            "kind": "provider_call",
+            "source_bound": {"kind": "requests_only", "kept": 3, "of": 40},
+        },
+    })
+    assert requests_only.summary_source.source_bound == SummarizationSourceBound(
+        kind="requests_only", kept=3, of=40,
+    )
+
+    curator = parse_event({**base, "summary_source": {"kind": "host_curator"}})
+    assert curator.summary_source == CompactionSummarySource(kind="host_curator")
+
+
+def test_parse_compaction_completed_estimated_history_tokens_after():
+    from meerkat.events import CompactionCompleted
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    legacy = parse_event(base)
+    assert isinstance(legacy, CompactionCompleted)
+    assert legacy.estimated_history_tokens_after is None
+    assert parse_event({**base, "estimated_history_tokens_after": None}) == legacy
+
+    reported = parse_event({**base, "estimated_history_tokens_after": 9_800})
+    assert isinstance(reported, CompactionCompleted)
+    assert reported.estimated_history_tokens_after == 9_800
+
+    for malformed in ("9800", -1, True, 1.5):
+        event = parse_event({**base, "estimated_history_tokens_after": malformed})
+        assert isinstance(event, UnknownEvent)
+        assert event.type == "malformed_event"
+
+
+def test_parse_compaction_completed_unknown_summary_source_kinds():
+    from meerkat.events import CompactionCompleted, CompactionSummarySource, SummarizationSourceBound
+
+    base = {
+        "type": "compaction_completed",
+        "summary_tokens": 7,
+        "messages_before": 40,
+        "messages_after": 3,
+    }
+    future_source = {"kind": "future_author", "detail": 1}
+    event = parse_event({**base, "summary_source": future_source})
+    assert isinstance(event, CompactionCompleted)
+    assert event.summary_source == CompactionSummarySource(
+        kind="unknown", raw_kind="future_author", raw=future_source,
+    )
+
+    future_bound = {"kind": "sampled", "ratio": 2}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_bound},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="sampled", raw=future_bound,
+    )
+
+    future_stage = {"kind": "trimmed", "through": "attachments"}
+    event = parse_event({
+        **base,
+        "summary_source": {"kind": "provider_call", "source_bound": future_stage},
+    })
+    assert event.summary_source.source_bound == SummarizationSourceBound(
+        kind="unknown", raw_kind="trimmed", raw=future_stage,
+    )
+
+    malformed = {**base, "summary_source": "provider_call"}
+    event = parse_event(malformed)
+    assert isinstance(event, UnknownEvent)
+    assert event.type == "malformed_event"

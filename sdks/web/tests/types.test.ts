@@ -66,6 +66,22 @@ const policyStopReason: AgentErrorReason = {
 };
 void policyStopReason;
 
+// #1888: a content-filtered failure names its typed stop and carries the
+// provider's tagged detail.
+const contentFilteredReason: AgentErrorReason = {
+  reason_type: 'content_filtered',
+  stop: 'content_filter',
+  detail: {
+    provider: 'gemini',
+    stage: 'prompt',
+    reason: 'BLOCKLIST',
+    blocked_categories: ['HARM_CATEGORY_HARASSMENT'],
+  },
+};
+void contentFilteredReason;
+const refusalReason: AgentErrorReason = { reason_type: 'content_filtered', stop: 'refusal' };
+void refusalReason;
+
 declare const typedRuntimeError: MeerkatError;
 const typedRuntimeErrorCode: string = typedRuntimeError.code;
 const typedRuntimeErrorData: unknown = typedRuntimeError.data;

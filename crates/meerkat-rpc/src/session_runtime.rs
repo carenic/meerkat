@@ -15594,9 +15594,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -15656,9 +15654,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -15815,9 +15811,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -16898,9 +16892,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -16952,9 +16944,7 @@ mod tests {
                     ),
                 });
                 yield Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 });
             })
         }
@@ -17010,9 +17000,7 @@ mod tests {
                         ),
                     }),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ]))
             } else {
@@ -20565,9 +20553,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -20750,9 +20736,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -20884,9 +20868,7 @@ mod tests {
                 meta: None,
             },
             meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
             },
         ])));
         build.output_schema = Some(meerkat_core::OutputSchema::from_json_value(
@@ -21100,9 +21082,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::ToolUse,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::ToolUse),
                     }),
                 ],
                 None => vec![
@@ -21112,9 +21092,7 @@ mod tests {
                     }),
                     Ok(usage),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             };

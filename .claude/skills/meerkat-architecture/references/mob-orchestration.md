@@ -135,7 +135,13 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
 - Admission close: once the last exported `MobHandle` clone drops and the
   mob is idle, admission closes (`MobAdmissionCloseReason::LastOwnerReleased`);
   `close_if_idle()` closes an idle mob and `close_admission(reason)` closes
-  unconditionally. Later mutating commands are refused with
+  unconditionally. An admitted `shutdown()` closes it too
+  (`MobAdmissionCloseReason::Shutdown`), before its teardown; a Stop leaves
+  it open. An admitted `destroy()` closes it with `Destroyed`, a durability
+  fail-stop with `DurabilityFailStop`, a lost actor task with `ActorLost`,
+  and a dispatch failure that stops the actor with `DispatchFailed`, so no
+  actor exit leaves it open. Later mutating commands and
+  `acquire_owner()` are refused with
   `MobError::AdmissionClosed`. Closing tears nothing down, so keep a
   `MobHandle` clone for as long as the mob must admit work.
 - `MobHandle::member(identity)` → `MemberHandle` — per-member handle. `MemberHandle::internal_turn(content)` is the in-process direct turn write (no peer comms, no handling-mode selection); it is distinct from `mob/turn_start` (RPC turn with overrides via the bridge session) and `mob/member_send` (peer delivery over comms into the member's inbox). Keep the three delivery paths separate.

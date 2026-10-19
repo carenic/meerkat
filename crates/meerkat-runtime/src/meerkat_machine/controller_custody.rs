@@ -275,7 +275,8 @@ impl NativeControllerGrantMutation<'_> {
     /// the source owner installed in this machine's scoped composition; a
     /// contributor it no longer holds can no longer authorize this work. Read
     /// only: it vetoes nothing and grants nothing. A torn, busy or undecodable
-    /// scope, or a source owner that cannot answer, is `Unavailable`, never
+    /// scope, a source owner that cannot answer, or a contributor whose
+    /// admission its owner has not settled yet is `Unavailable`, never
     /// "unreferenced".
     pub fn unfinished_work_references_grant(
         &self,
@@ -296,11 +297,19 @@ impl NativeControllerGrantMutation<'_> {
                 return Ok(true);
             }
             for contributor in &candidate.contributing_work {
-                let retained = originals
-                    .retained_original(&candidate.ingress_namespace, contributor)
-                    .map_err(|_| crate::input_authority::unavailable())?;
-                if retained.as_ref().is_some_and(in_basis) {
-                    return Ok(true);
+                use super::scoped_original::{CustodyClass, classify_custody};
+                match classify_custody(originals, &candidate.ingress_namespace, contributor)
+                    .map_err(|_| crate::input_authority::unavailable())?
+                {
+                    CustodyClass::Retained(basis) if in_basis(&basis) => return Ok(true),
+                    CustodyClass::Retained(_) => {}
+                    // The owner has not settled the contributor's admission
+                    // yet: it may still come to authorize this work, so the
+                    // answer is not "unreferenced".
+                    CustodyClass::Pending => return Err(crate::input_authority::unavailable()),
+                    // A cancelled or released contributor can no longer
+                    // authorize this work.
+                    CustodyClass::Cancelled | CustodyClass::NotRetained => {}
                 }
             }
             Ok(false)

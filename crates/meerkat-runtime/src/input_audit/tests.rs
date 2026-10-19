@@ -584,3 +584,113 @@ async fn mandatory_hook_withholding_persists_on_the_actual_row_at_the_current_ve
         serde_json::json!("future_hook_kind");
     assert!(serde_json::from_value::<StoredInputState>(unknown).is_err());
 }
+
+/// A refusal read and a policy read's publication instance persist on the
+/// actual row at the current stored input state version. A row stamped
+/// before v7 that carries either one is refused; without them it still
+/// reads.
+#[tokio::test]
+async fn publication_reads_persist_at_the_current_version_and_never_before_v7() {
+    use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
+    use crate::store::{InMemoryRuntimeStore, RuntimeStore};
+    use meerkat_authorization_contracts::audit::{
+        AuditPolicyRead, AuditPublicationMode, AuditRecipient, AuditRefusalBasis, AuditRefusalRead,
+        AuditTarget,
+    };
+    use meerkat_core::generated::session_persistence_version_authority::stored_input_state_version;
+
+    let store = InMemoryRuntimeStore::new();
+    let runtime = crate::identifiers::LogicalRuntimeId::new("audit-publication-reads");
+    let (audit, sink) = fixture();
+    let mut row = StoredInputState::new_accepted(input_id());
+    row.state.authorization_audit = audit.clone();
+    let target = Arc::new(AuditTarget::Publication {
+        recipient: AuditRecipient::Principal {
+            principal: principal("recipient"),
+        },
+        mode: AuditPublicationMode::Buffered,
+    });
+    let instance = uuid::Uuid::new_v4();
+    sink.append(AuthorizationAuditObservation {
+        observation: AuditObservation::Refused {
+            target: Arc::clone(&target),
+            reason: OperationRefusalKind::ReprepareRequired,
+            read: Some(AuditRefusalRead::new(
+                1,
+                AuditRefusalBasis::ChangeInProgress,
+                3,
+                Some(3),
+                instance,
+            )),
+        },
+        ..event(&sink)
+    })
+    .unwrap();
+    sink.append(AuthorizationAuditObservation {
+        observation: AuditObservation::Prepared {
+            target,
+            policy: AuditPolicyRead {
+                publication_sequence: 4,
+                observed_at_ms: 2,
+                operation_authorities: Vec::new(),
+                controller_lineages: Vec::new(),
+                publication_instance: Some(instance),
+            },
+        },
+        ..event(&sink)
+    })
+    .unwrap();
+    assert!(audit.has_publication_read());
+    let record = InputStatePersistenceRecord::from_machine_snapshot(row).unwrap();
+    store
+        .persist_input_states_atomically(&runtime, &[record])
+        .await
+        .unwrap();
+    let committed = store
+        .load_input_state(&runtime, &input_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = serde_json::to_value(&committed).unwrap();
+    assert_eq!(
+        stored["stored_input_state_version"],
+        stored_input_state_version()
+    );
+    let reread: StoredInputState = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reread).unwrap(), stored);
+
+    let mut older = stored;
+    older["stored_input_state_version"] = serde_json::json!(6);
+    let mut only_instance = older.clone();
+    only_instance["authorization_audit"][0]["observation"]["observation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("read")
+        .unwrap();
+    let mut only_read = older.clone();
+    only_read["authorization_audit"][1]["observation"]["observation"]["policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("publication_instance")
+        .unwrap();
+    let mut neither = only_instance.clone();
+    neither["authorization_audit"][1]["observation"]["observation"]["policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("publication_instance")
+        .unwrap();
+    for (row, carries) in [
+        (older, "both"),
+        (only_instance, "a publication instance"),
+        (only_read, "a refusal read"),
+    ] {
+        assert!(
+            serde_json::from_value::<StoredInputState>(row).is_err(),
+            "a v6 row cannot carry {carries}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<StoredInputState>(neither).is_ok(),
+        "a v6 row without either still reads"
+    );
+}

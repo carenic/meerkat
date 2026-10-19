@@ -3120,3 +3120,115 @@ mod tool_artifact_refusal {
         assert_eq!(error.to_string(), refusal.to_string());
     }
 }
+
+/// #1888: provider stop text is capped at a character boundary and
+/// ends with the truncation marker; shorter text is kept as it is.
+#[test]
+fn provider_stop_detail_text_is_capped_with_a_marker() {
+    let short = ProviderStopDetail::openai("refusal", Some("I can't help with that.".to_string()));
+    assert_eq!(
+        short,
+        ProviderStopDetail::OpenAi {
+            reason: "refusal".to_string(),
+            refusal: Some("I can't help with that.".to_string()),
+        }
+    );
+
+    // Multi-byte characters straddle the cap, so the cut must find a boundary.
+    let long = "\u{00e9}".repeat(PROVIDER_STOP_DETAIL_TEXT_CAP);
+    let ProviderStopDetail::Anthropic {
+        explanation: Some(explanation),
+        ..
+    } = ProviderStopDetail::anthropic(None, Some(long.clone()))
+    else {
+        panic!("anthropic detail keeps its explanation");
+    };
+    assert!(
+        explanation.len() <= PROVIDER_STOP_DETAIL_TEXT_CAP,
+        "{}",
+        explanation.len()
+    );
+    assert!(explanation.ends_with(PROVIDER_STOP_DETAIL_TRUNCATION_MARKER));
+    let kept = &explanation[..explanation.len() - PROVIDER_STOP_DETAIL_TRUNCATION_MARKER.len()];
+    assert!(long.starts_with(kept));
+    assert!(kept.len() > PROVIDER_STOP_DETAIL_TEXT_CAP / 2);
+
+    let exact = "a".repeat(PROVIDER_STOP_DETAIL_TEXT_CAP);
+    let ProviderStopDetail::OpenAi {
+        refusal: Some(refusal),
+        ..
+    } = ProviderStopDetail::openai("refusal", Some(exact.clone()))
+    else {
+        panic!("openai detail keeps its refusal");
+    };
+    assert_eq!(refusal, exact, "text at the cap is kept whole");
+}
+
+/// The detail's wire shape: tagged by provider, raw provider strings as data.
+#[test]
+fn provider_stop_detail_wire_shape_is_provider_tagged() {
+    let cases = [
+        (
+            ProviderStopDetail::anthropic(Some("cyber".to_string()), None),
+            json!({"provider": "anthropic", "category": "cyber"}),
+        ),
+        (
+            ProviderStopDetail::openai("content_filter", None),
+            json!({"provider": "open_ai", "reason": "content_filter"}),
+        ),
+        (
+            ProviderStopDetail::gemini(
+                GeminiStopStage::Prompt,
+                "BLOCKLIST",
+                vec!["HARM_CATEGORY_HARASSMENT".to_string()],
+            ),
+            json!({
+                "provider": "gemini",
+                "stage": "prompt",
+                "reason": "BLOCKLIST",
+                "blocked_categories": ["HARM_CATEGORY_HARASSMENT"]
+            }),
+        ),
+    ];
+    for (detail, wire) in cases {
+        assert_eq!(serde_json::to_value(&detail).unwrap(), wire);
+        let back: ProviderStopDetail = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, detail);
+    }
+}
+
+/// The closed pair of refusing stops, and nothing else.
+#[test]
+fn content_filtered_stop_names_only_the_refusing_stops() {
+    for stop_reason in [
+        StopReason::EndTurn,
+        StopReason::ToolUse,
+        StopReason::MaxTokens,
+        StopReason::StopSequence,
+        StopReason::Cancelled,
+        StopReason::PauseTurn,
+        StopReason::ContextWindowExceeded,
+    ] {
+        assert_eq!(
+            ContentFilteredStop::from_stop_reason(stop_reason),
+            None,
+            "{stop_reason:?}"
+        );
+    }
+    for (stop_reason, stop, wire) in [
+        (StopReason::Refusal, ContentFilteredStop::Refusal, "refusal"),
+        (
+            StopReason::ContentFilter,
+            ContentFilteredStop::ContentFilter,
+            "content_filter",
+        ),
+    ] {
+        assert_eq!(
+            ContentFilteredStop::from_stop_reason(stop_reason),
+            Some(stop)
+        );
+        assert_eq!(stop.stop_reason(), stop_reason);
+        assert_eq!(serde_json::to_value(stop).unwrap(), json!(wire));
+        assert_eq!(serde_json::to_value(stop_reason).unwrap(), json!(wire));
+    }
+}

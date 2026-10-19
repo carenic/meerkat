@@ -250,9 +250,7 @@ mod image_generation_substrate {
                         meta: None,
                     },
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::ToolUse),
                     },
                 ]
             } else {
@@ -262,9 +260,7 @@ mod image_generation_substrate {
                         meta: None,
                     },
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     },
                 ]
             };

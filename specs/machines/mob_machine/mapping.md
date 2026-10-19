@@ -4284,6 +4284,30 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecordLoopUntilConditionMetCompleted`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverIdentityGenerationHighwaterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealIdentityGenerationHighwaterDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -4751,6 +4775,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `identity_runtime_history_is_coherent`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `next_generation_above_highwater`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `current_runtime_binding_has_history`
