@@ -546,7 +546,7 @@ if (args[0] === "api") {
     WASM_TIMERS_RESULT: "skipped", BAZEL_GRAPH_RESULT: "success", RUST_CHANGED: "false", IS_MAIN_PUSH: "true",
     IS_PULL_REQUEST: "false", PLAN_EVENT: "push", CLOSURE_CHECK: "false", GOVERNED_JSONL: "false",
     MCP_CONFINEMENT_POSITIVE: "false", DEFERRED_TO_PUSH: "", READER_NOT_RUN: "",
-    SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false",
+    SDK_HOST: "false", BAZEL_GRAPH: "true", EXAMPLES_BROWSER: "false", EXAMPLE_WEB: "false", EXAMPLE_WEB_WASM: "false",
     MODE: "release-projection", REASON: "release projection", SHARD_COUNT: "0", UNIT_SHARD_COUNT: "6",
     UNIT_DEFERRED: "", UNIT_DEFERRED_COUNT: "0", PACKAGE_COUNT: "0", CLOSURE_COUNT: "0",
     GENERATED_CONTRACT: "true", RELEASE_PROJECTION: "true",
@@ -632,6 +632,22 @@ if (args[0] === "api") {
   assert.equal(notRunRun.status, 0, notRunRun.stdout);
   assert.match(notRunRun.stdout, /::notice::readers of changed files that need live-provider credentials run in no CI lane: integration-tests:test:gpt_live_public_e2e/);
   assert.equal(runGate(pushGate).status, 0, `the gate accepts a push that ran them: ${runGate(pushGate).stdout}`);
+  // The WASM timer lane runs with the example web suites' wasm build
+  // (example_web_wasm), which a pull request can leave to the push while the
+  // suites still run their Web SDK tests: the gate requires the lane exactly
+  // when its job runs (run 39233844462 refused the skipped lane).
+  const exampleWebGate = { ...pullRequestGate, EXAMPLE_WEB: "true", EXAMPLE_WEB_RESULT: "success" };
+  const deferredWasmRun = runGate({ ...exampleWebGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "skipped" });
+  assert.equal(deferredWasmRun.status, 0, `the gate accepts a pull request that left the wasm build to the push: ${deferredWasmRun.stdout}`);
+  const wasmRun = runGate({ ...exampleWebGate, EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "success" });
+  assert.equal(wasmRun.status, 0, `and one whose WASM timer lane ran: ${wasmRun.stdout}`);
+  for (const [label, env] of [
+    ["a pull request whose planned WASM timer lane did not run", { ...exampleWebGate, EXAMPLE_WEB_WASM: "true", WASM_TIMERS_RESULT: "skipped" }],
+    ["a pull request whose unplanned WASM timer lane failed", { ...exampleWebGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "failure" }],
+    ["a push whose WASM timer lane did not run", { ...pushGate, EXAMPLE_WEB_WASM: "false", WASM_TIMERS_RESULT: "skipped" }],
+  ]) {
+    assert.equal(runGate(env).status, 1, `the gate refuses ${label}`);
+  }
   // A push runs its unit rows in the packed main unit lane, not in a unit
   // lane of its own: the gate requires that lane instead.
   const unitOnMainGate = {

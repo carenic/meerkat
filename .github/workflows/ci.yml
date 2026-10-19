@@ -2550,7 +2550,8 @@ jobs:
     # Compile the Rust regression binaries independently of the example build
     # so both lanes retain the pull-request wall-clock budget. Selected with
     # the example web suites' wasm build (example_web_wasm): a pull request
-    # that changes a crate the web runtime builds on leaves both to the push,
+    # that changes a crate the web runtime builds on, or plans the whole
+    # workspace, leaves both to the push,
     # since this lane compiles the same closure for wasm32 (893 s cold at
     # opt-level 0 on pull request 39209102985).
     if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web_wasm == 'true' }}
@@ -2746,6 +2747,7 @@ jobs:
           BAZEL_GRAPH: ${{ needs.changes.outputs.bazel_graph }}
           EXAMPLES_BROWSER: ${{ needs.changes.outputs.examples_browser }}
           EXAMPLE_WEB: ${{ needs.changes.outputs.example_web }}
+          EXAMPLE_WEB_WASM: ${{ needs.changes.outputs.example_web_wasm }}
           MODE: ${{ needs.changes.outputs.mode }}
           REASON: ${{ needs.changes.outputs.reason }}
           SHARD_COUNT: ${{ needs.changes.outputs.shard_count }}
@@ -3025,9 +3027,16 @@ jobs:
           # runtime, its crates, or examples 031-033.
           if [[ ( "${IS_MAIN_PUSH}" == "true" && "${RELEASE_PROJECTION}" != "true" ) || "${EXAMPLE_WEB}" == "true" ]]; then
             require_ran "Example web suites" "${EXAMPLE_WEB_RESULT}"
-            require_ran "WASM timer ownership" "${WASM_TIMERS_RESULT}"
           else
             forbid_failure "Example web suites" "${EXAMPLE_WEB_RESULT}"
+          fi
+          # WASM timer ownership runs with the suites' wasm build
+          # (example_web_wasm), which a pull request that changes a crate the
+          # web runtime builds on, or plans the whole workspace, leaves to the
+          # push: it is required exactly when the job's condition selects it.
+          if [[ ( "${IS_MAIN_PUSH}" == "true" && "${RELEASE_PROJECTION}" != "true" ) || "${EXAMPLE_WEB_WASM}" == "true" ]]; then
+            require_ran "WASM timer ownership" "${WASM_TIMERS_RESULT}"
+          else
             forbid_failure "WASM timer ownership" "${WASM_TIMERS_RESULT}"
           fi
           # Bazel graph check: every main push, and pull requests with a
