@@ -10,6 +10,13 @@ import { promisify } from "node:util";
 import Ajv from "ajv";
 
 const exec = promisify(execFile);
+// The per-run timeout is a hang detector, not a speed check. A run normally
+// ends in about 5 s, but a busy runner has stretched the first runs of a job
+// past 15 s, the old limit. Only a run that never ends should reach this.
+const RUN_TIMEOUT_MS = 60_000;
+// The hang check below passes this through the same parameter, so it
+// exercises the kill without waiting a minute.
+const HANG_PROBE_TIMEOUT_MS = 3_000;
 const examples = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repo = resolve(examples, "..");
 const work = join(examples, ".work", `sdk-tests-${randomUUID()}`);
@@ -44,19 +51,20 @@ function alive(pid) {
   }
 }
 
-async function execute(command, args, extraEnv) {
+async function execute(command, args, extraEnv, timeout = RUN_TIMEOUT_MS) {
   try {
     const output = await exec(command, args, {
-      cwd: work, env: { ...env, ...extraEnv }, timeout: 15000,
+      cwd: work, env: { ...env, ...extraEnv }, timeout,
     });
-    return { ...output, code: 0, killed: false };
+    return { ...output, code: 0, killed: false, timeout };
   } catch (error) {
     if (typeof error.code !== "number" && !error.killed) throw error;
+    error.timeout = timeout;
     return error;
   }
 }
 
-async function runExample(example, mode = "success", extraEnv = {}) {
+async function runExample(example, mode = "success", extraEnv = {}, timeout = RUN_TIMEOUT_MS) {
   const log = join(work, `${example}-${mode}-${randomUUID()}.jsonl`);
   const ts = example.endsWith("-ts");
   const result = await execute(
@@ -74,29 +82,30 @@ async function runExample(example, mode = "success", extraEnv = {}) {
         ? join(work, "nonexistent-rpc")
         : join(examples, "tests/rpc_fixture.py"),
     },
+    timeout,
   );
   const records = existsSync(log)
     ? readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line))
     : [];
   const pids = records.filter((record) => record.pid).map((record) => record.pid);
+  const requests = records.filter((record) => record.method);
   // Cleanup is a safety net, never a passing outcome: the example must reap its peer.
   for (let attempt = 0; attempt < 40 && pids.some(alive); attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   const surviving = pids.filter(alive);
   for (const pid of surviving) process.kill(pid, "SIGKILL");
-  assert.equal(result.killed, false, `${example}/${mode} timed out: ${result.stderr}`);
+  assert.equal(result.killed, false, `${example}/${mode} timed out after the requests `
+    + `[${requests.map((request) => request.method).join(", ")}]: ${result.stderr}`);
   assert.deepEqual(surviving, [], `${example}/${mode} leaked its child`);
   if (mode !== "missing") assert.equal(pids.length, 1, "must execute the real fixture");
-  return {
-    ...result, records,
-    requests: records.filter((record) => record.method),
-  };
+  return { ...result, records, requests };
 }
 
 function successful(result) {
   assert.equal(result.code, 0, result.stderr);
   assert.equal(result.stderr, "");
+  assert.equal(result.timeout, RUN_TIMEOUT_MS, "a run gets the hang detector's timeout unless told otherwise");
 }
 
 describe("TypeScript SDK entrypoint lifecycle", { concurrency: 4 }, () => {
@@ -267,4 +276,21 @@ describe("022 REST subprocess", () => {
       }
     });
   }
+});
+
+describe("Run timeout", () => {
+  // The fixture's never-reply mode leaves initialize unanswered, and the SDK
+  // has no timeout of its own there, so only the per-run timeout ends the run.
+  // The request list tells it apart from a run killed while it was closing.
+  it("a run whose peer never replies is killed and reported as timed out",
+    { timeout: HANG_PROBE_TIMEOUT_MS + 30_000 }, async () => {
+      const started = Date.now();
+      await assert.rejects(
+        runExample("003-hello-meerkat-ts", "never-reply", {}, HANG_PROBE_TIMEOUT_MS),
+        /003-hello-meerkat-ts\/never-reply timed out after the requests \[initialize\]:/,
+      );
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed >= HANG_PROBE_TIMEOUT_MS && elapsed < HANG_PROBE_TIMEOUT_MS + 10_000,
+        `the run is killed at its timeout (${elapsed} ms)`);
+    });
 });
