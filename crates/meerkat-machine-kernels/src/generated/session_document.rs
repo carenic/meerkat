@@ -997,6 +997,8 @@ pub enum RealtimeTranscriptStopReasonKind {
     ToolUse,
     #[serde(rename = "Other")]
     Other,
+    #[serde(rename = "Failed")]
+    Failed,
 }
 impl RealtimeTranscriptStopReasonKind {
     pub fn as_str(&self) -> &'static str {
@@ -1004,6 +1006,7 @@ impl RealtimeTranscriptStopReasonKind {
             Self::Cancelled => "Cancelled",
             Self::ToolUse => "ToolUse",
             Self::Other => "Other",
+            Self::Failed => "Failed",
         }
     }
 }
@@ -1014,6 +1017,7 @@ impl std::convert::TryFrom<&str> for RealtimeTranscriptStopReasonKind {
             "Cancelled" => Ok(Self::Cancelled),
             "ToolUse" => Ok(Self::ToolUse),
             "Other" => Ok(Self::Other),
+            "Failed" => Ok(Self::Failed),
             other => Err(format!(
                 "invalid RealtimeTranscriptStopReasonKind value `{other}`"
             )),

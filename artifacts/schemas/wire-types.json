@@ -137144,6 +137144,23 @@
           "response_id"
         ],
         "type": "object"
+      },
+      {
+        "description": "The provider ended the response without completing it; the session\ndiscards everything the response staged (#1883).",
+        "properties": {
+          "response_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "assistant_turn_failed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "response_id"
+        ],
+        "type": "object"
       }
     ],
     "title": "RealtimeTranscriptEvent"
@@ -169301,6 +169318,23 @@
               "response_id"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider ended the response without completing it; the session\ndiscards everything the response staged (#1883).",
+            "properties": {
+              "response_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_turn_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -170185,6 +170219,70 @@
           }
         ]
       },
+      "WireLiveResponseFailure": {
+        "description": "Wire mirror of [`LiveResponseFailure`]: how a live response ended without\ncompleting. Route on `status`; `reason`, `code` and `message` repeat what\nthe provider said and are diagnostics only.",
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/$defs/WireLiveResponseFailureStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "WireLiveResponseFailureStatus": {
+        "description": "Wire mirror of [`LiveResponseFailureStatus`].\n\nThe known statuses serialize as plain strings (`\"failed\"`,\n`\"incomplete\"`, `\"in_progress\"`), so clients route on `failure.status`.",
+        "oneOf": [
+          {
+            "enum": [
+              "failed",
+              "incomplete",
+              "in_progress"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveResponseFailureStatus`] enum is `#[non_exhaustive]`.\nWhen a future status lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` (serialized as\n`{\"unknown\": {\"debug\": ...}}`) rather than silently coercing to\n`Failed`. SDK consumers treat it as an unrecognized status.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant: `Unknown` is the floor, not\nthe destination.**",
+            "properties": {
+              "unknown": {
+                "properties": {
+                  "debug": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "debug"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "unknown"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WireProvider": {
         "description": "Wire-safe projection of [`meerkat_core::Provider`].\n\n`WireProvider` pins each provider's canonical wire name with an explicit\n`#[serde(rename)]` (`\"openai\"`, `\"anthropic\"`, `\"gemini\"`, …). The core\n`Provider` enum now agrees (its `OpenAI` variant carries an explicit\n`#[serde(rename = \"openai\")]` so `rename_all = \"snake_case\"` can no longer\nmangle it into `\"open_a_i\"`); `WireProvider` exists as the dedicated wire\nmirror so SDK consumers get a stable, explicitly-named contract plus the\nfail-loud `Unknown` sentinel below, per the wire-mirror dogma used\nthroughout this module.",
         "oneOf": [
@@ -170820,6 +170918,39 @@
         "required": [
           "observation",
           "debug"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The provider ended a response without completing it (#1883). Not\nterminal: the channel stays open and the next turn proceeds. Nothing\nof the response is committed and it is not retried. `usage` is the\nresponse's usage when the provider sent one; absent means the\nprovider reported none.",
+        "properties": {
+          "failure": {
+            "$ref": "#/$defs/WireLiveResponseFailure"
+          },
+          "observation": {
+            "const": "turn_failed",
+            "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireTurnUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "failure"
         ],
         "type": "object"
       }

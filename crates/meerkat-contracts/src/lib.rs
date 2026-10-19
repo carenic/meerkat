@@ -518,6 +518,8 @@ pub use wire::{
     WireLiveProviderInputLatency,
     WireLiveProviderInputLatencyReading,
     WireLiveRefreshFailure,
+    WireLiveResponseFailure,
+    WireLiveResponseFailureStatus,
     WireLiveResponseModality,
     WireLiveSwapFailure,
     WireLiveTransportBootstrap,

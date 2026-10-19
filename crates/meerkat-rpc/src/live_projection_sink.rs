@@ -40,7 +40,9 @@ use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use meerkat_core::RealtimeTranscriptEvent;
-use meerkat_core::live_adapter::LiveAdapterErrorCode;
+use meerkat_core::live_adapter::{
+    LiveAdapterErrorCode, LiveResponseAccounting, LiveResponseFailure,
+};
 use meerkat_core::types::{AssistantBlock, ContentInput, SessionId, StopReason, Usage};
 use meerkat_live::{
     LiveAssistantOutputAddress, LiveChannelCloseFeedback, LiveChannelCloseObservation,
@@ -1058,6 +1060,47 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
             .map_err(|err| session_error_to_projection(err, session_id))
     }
 
+    async fn signal_turn_failed(
+        &self,
+        session_id: &SessionId,
+        response_id: Option<&str>,
+        failure: &LiveResponseFailure,
+        accounting: LiveResponseAccounting,
+    ) -> Result<(), LiveProjectionError> {
+        // #1883: nothing of a failed response is committed. The document
+        // discards everything it staged, the display-text buffer is dropped,
+        // and only the response's accounting is recorded.
+        if let Some(rid) = response_id.filter(|s| !s.is_empty()) {
+            let event = RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: rid.to_string(),
+            };
+            match self
+                .runtime
+                .append_realtime_transcript_event(session_id, event)
+                .await
+            {
+                Ok(_) => {}
+                Err(meerkat_core::SessionError::NotFound { .. })
+                | Err(meerkat_core::SessionError::Unsupported(_)) => {}
+                Err(err) => return Err(session_error_to_projection(err, session_id)),
+            }
+        }
+        let _discarded = self.drain_pending_turn(session_id, response_id);
+        tracing::warn!(
+            target: "meerkat_rpc::live_projection",
+            session_id = %session_id,
+            response_id,
+            status = ?failure.status,
+            reason = ?failure.reason,
+            code = ?failure.code,
+            "live response ended without completing; nothing of it is committed",
+        );
+        self.runtime
+            .record_live_turn_accounting(session_id, accounting)
+            .await
+            .map_err(|err| session_error_to_projection(err, session_id))
+    }
+
     async fn signal_terminal_error(
         &self,
         session_id: &SessionId,
@@ -1280,6 +1323,7 @@ mod tests {
         truncations: StdMutex<Vec<CapturedTruncation>>,
         interrupts: StdMutex<Vec<(SessionId, Option<String>)>>,
         completed: StdMutex<Vec<SessionId>>,
+        failed: StdMutex<Vec<(SessionId, Option<String>)>>,
         terminals: StdMutex<Vec<(SessionId, LiveAdapterErrorCode)>>,
         output_audio_degraded: StdMutex<Vec<(SessionId, u64)>>,
     }
@@ -1444,6 +1488,19 @@ mod tests {
             _response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             self.completed.lock().unwrap().push(session_id.clone());
+            Ok(())
+        }
+        async fn signal_turn_failed(
+            &self,
+            session_id: &SessionId,
+            response_id: Option<&str>,
+            _failure: &LiveResponseFailure,
+            _accounting: LiveResponseAccounting,
+        ) -> Result<(), LiveProjectionError> {
+            self.failed
+                .lock()
+                .unwrap()
+                .push((session_id.clone(), response_id.map(|s| s.to_string())));
             Ok(())
         }
         async fn signal_terminal_error(

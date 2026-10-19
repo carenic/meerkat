@@ -466,6 +466,79 @@ pub enum LiveAdapterObservation {
         code: LiveAdapterErrorCode,
         message: String,
     },
+    /// #1883: the provider ended a response without completing it (OpenAI
+    /// realtime: `response.done` with status `failed`, `in_progress`, or
+    /// `incomplete` for a reason that maps to no stop reason).
+    ///
+    /// Not a finished turn and not terminal for the channel: the next turn
+    /// proceeds, and Meerkat neither cancels nor retries the response. Sinks
+    /// discard everything the response staged (spoken transcript and display
+    /// text alike), so nothing of it is committed, and record its
+    /// `accounting`.
+    TurnFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        failure: LiveResponseFailure,
+        accounting: LiveResponseAccounting,
+    },
+}
+
+/// How a live provider response ended without completing (#1883).
+///
+/// A provider status Meerkat does not recognize is classified at the
+/// provider seam before it reaches this type. The enum is non-exhaustive so a
+/// later release can name a further status without breaking matches on it.
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LiveResponseFailureStatus {
+    /// The provider reported that the response failed.
+    Failed,
+    /// The provider reported the response incomplete for a reason that maps
+    /// to no stop reason.
+    Incomplete,
+    /// The provider ended the response while still reporting it in progress.
+    InProgress,
+}
+
+/// A live provider response that ended without completing (#1883).
+///
+/// Route on [`Self::status`]. `reason`, `code` and `message` repeat what the
+/// provider said and are diagnostics only.
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveResponseFailure {
+    pub status: LiveResponseFailureStatus,
+    /// The provider's reason for the status, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The provider's error code, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// The provider's error message, when it gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The provider accounting for one live response that committed nothing
+/// (#1883): its normalized usage, or the typed fact that the provider sent
+/// none. Absence is never a zero.
+///
+/// The set is closed by construction: the provider either reported usage
+/// for the response or it did not, so the enum is exhaustive.
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "accounting", rename_all = "snake_case")]
+pub enum LiveResponseAccounting {
+    /// The provider reported normalized usage for the response; it advances
+    /// session usage and the budget like any other turn.
+    Measured { usage: crate::types::TurnUsage },
+    /// The provider reported no usage for the response, so no accounting
+    /// axis advances for it.
+    Unmeasured {
+        unmeasured: crate::provider_evidence::UnmeasuredTurnUsageAccounting,
+    },
 }
 
 /// Serde helper: serialize `Vec<u8>` as a base64 (standard) string instead of

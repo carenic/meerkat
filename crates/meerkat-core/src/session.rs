@@ -17041,6 +17041,108 @@ mod tests {
         assert_eq!(session.usage.output_tokens, 22);
     }
 
+    /// The text of every assistant block the session committed, in order.
+    fn committed_assistant_texts(session: &Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.blocks.iter())
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_realtime_turn_discards_every_lane_and_records_no_completion() {
+        // #1883: a failed response commits nothing it staged, display or
+        // spoken; it leaves the in-flight set, so a later barge-in cannot
+        // target it; a completion that follows cannot resurrect it; and the
+        // next response commits normally.
+        let mut session = Session::new();
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_display".to_string(),
+                item_id: "item_failed_display".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "partial display text".to_string(),
+            });
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed_spoken".to_string(),
+                item_id: "item_failed_spoken".to_string(),
+                previous_item_id: Some("item_failed_display".to_string()),
+                content_index: 0,
+                delta: "partial speech".to_string(),
+            },
+        );
+        assert_eq!(
+            session.in_flight_realtime_assistant_response_ids(),
+            vec!["resp_failed".to_string()]
+        );
+
+        let failed = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".to_string(),
+            },
+        );
+        assert!(
+            failed.materialized_messages.is_empty(),
+            "a failed response commits nothing: {failed:?}"
+        );
+        assert!(
+            session
+                .in_flight_realtime_assistant_response_ids()
+                .is_empty(),
+            "a failed response is no longer in flight"
+        );
+        let late = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_failed".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert!(
+            late.materialized_messages.is_empty(),
+            "a completion after the failure cannot resurrect it: {late:?}"
+        );
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_next".to_string(),
+                delta_id: "delta_next".to_string(),
+                item_id: "item_next".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "next answer".to_string(),
+            },
+        );
+        let next = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_next".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: test_turn_usage(Usage::default()),
+            },
+        );
+        assert_eq!(next.materialized_messages.len(), 1, "{next:?}");
+        assert_eq!(
+            committed_assistant_texts(&session),
+            vec!["next answer".to_string()],
+            "only the next response is committed"
+        );
+    }
+
     #[test]
     fn round5_r55_mixed_response_barge_in_preserves_display_drops_spoken() {
         // R5-5 (Round-5 contract update): barge-in MUST filter staged items

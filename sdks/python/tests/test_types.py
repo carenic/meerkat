@@ -6939,6 +6939,7 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
         WireLiveAdapterObservationError,
         WireLiveAdapterObservationReady,
         WireLiveAdapterObservationStatusChanged,
+        WireLiveAdapterObservationTurnFailed,
         WireLiveAdapterObservationTurnInterrupted,
         WireLiveAdapterObservationUserContentCommitted,
     )
@@ -6952,6 +6953,30 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     assert WireLiveAdapterObservationStatusChanged in union_members
     assert WireLiveAdapterObservationTurnInterrupted in union_members
     assert WireLiveAdapterObservationUserContentCommitted in union_members
+    # #1883: a response that ended without completing is its own variant.
+    assert WireLiveAdapterObservationTurnFailed in union_members
+    failed_hints = get_type_hints(WireLiveAdapterObservationTurnFailed)
+    assert get_args(failed_hints["observation"]) == ("turn_failed",)
+    # #1883: the failure is typed by name, so a client routes on
+    # `failure.status`; an unrecognized status arrives as `unknown.debug`.
+    from meerkat import WireLiveResponseFailure, WireLiveResponseFailureStatus
+
+    assert failed_hints["failure"] is WireLiveResponseFailure
+    failure_hints = get_type_hints(WireLiveResponseFailure)
+    assert failure_hints["status"] == WireLiveResponseFailureStatus
+    status_members = get_args(WireLiveResponseFailureStatus)
+    known_statuses = {
+        value
+        for member in status_members
+        if get_origin(member) is Literal
+        for value in get_args(member)
+    }
+    assert known_statuses == {"failed", "incomplete", "in_progress"}
+    (unknown_status,) = [
+        member for member in status_members if get_origin(member) is not Literal
+    ]
+    unknown_payload = get_type_hints(unknown_status)["unknown"]
+    assert get_type_hints(unknown_payload)["debug"] is str
     # Sanity: each variant is tagged on `observation` with the snake_case
     # discriminator value.
     audio_hints = get_type_hints(WireLiveAdapterObservationAssistantAudioChunk)

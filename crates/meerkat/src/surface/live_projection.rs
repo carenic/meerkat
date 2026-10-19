@@ -28,7 +28,9 @@ use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use meerkat_core::RealtimeTranscriptEvent;
-use meerkat_core::live_adapter::LiveAdapterErrorCode;
+use meerkat_core::live_adapter::{
+    LiveAdapterErrorCode, LiveResponseAccounting, LiveResponseFailure,
+};
 use meerkat_core::service::SessionService as _;
 use meerkat_core::types::{AssistantBlock, ContentInput, SessionId, StopReason, Usage};
 use meerkat_live::{
@@ -915,6 +917,53 @@ impl<B: SessionAgentBuilder + 'static> LiveProjectionSink for ServiceLiveProject
             .map_err(|err| session_error_to_projection(err, session_id))
     }
 
+    async fn signal_turn_failed(
+        &self,
+        session_id: &SessionId,
+        response_id: Option<&str>,
+        failure: &LiveResponseFailure,
+        accounting: LiveResponseAccounting,
+    ) -> Result<(), LiveProjectionError> {
+        // #1883: nothing of a failed response is committed. The document
+        // discards everything it staged, the display-text buffer is dropped,
+        // and only the response's accounting is recorded.
+        if let Some(rid) = response_id.filter(|s| !s.is_empty()) {
+            let event = RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: rid.to_string(),
+            };
+            match self
+                .service
+                .append_realtime_transcript_event_with_machine(
+                    self.machine.as_ref(),
+                    session_id,
+                    event,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(
+                    meerkat_core::SessionError::NotFound { .. }
+                    | meerkat_core::SessionError::Unsupported(_),
+                ) => {}
+                Err(err) => return Err(session_error_to_projection(err, session_id)),
+            }
+        }
+        let _discarded = self.drain_pending_turn(session_id, response_id);
+        tracing::warn!(
+            target: "meerkat::surface::live_projection",
+            session_id = %session_id,
+            response_id,
+            status = ?failure.status,
+            reason = ?failure.reason,
+            code = ?failure.code,
+            "live response ended without completing; nothing of it is committed",
+        );
+        self.service
+            .record_live_turn_accounting(session_id, accounting)
+            .await
+            .map_err(|err| session_error_to_projection(err, session_id))
+    }
+
     async fn signal_terminal_error(
         &self,
         session_id: &SessionId,
@@ -967,6 +1016,264 @@ mod tests {
     use super::*;
     use meerkat_core::live_adapter::LiveAdapterObservation;
     use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
+
+    fn committed_assistant_texts(session: &meerkat_core::Session) -> Vec<String> {
+        session
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::types::Message::BlockAssistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.blocks.iter())
+            .filter_map(|block| match block {
+                AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #1883: a failed response commits nothing it staged (spoken transcript
+    /// or buffered display text) and records its usage; it leaves the
+    /// in-flight set, so a barge-in after it never targets it; an unmeasured
+    /// failure publishes the routed unmeasured fact and no turn terminal; the
+    /// next response commits normally.
+    #[tokio::test]
+    async fn failed_live_response_commits_nothing_and_records_its_accounting() {
+        let persistence = crate::PersistenceBundle::new(
+            Arc::new(crate::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .expect("construct runtime authority");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let factory = crate::AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        let (service, runtime) =
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
+        let service = Arc::new(service);
+        let session = crate::Session::new();
+        let session_id = session.id().clone();
+        let executor_service = Arc::clone(&service);
+        let executor_runtime = Arc::clone(&runtime);
+        Box::pin(crate::surface::materialize_session(
+            &service,
+            &runtime,
+            session,
+            crate::CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "gpt-realtime-2".to_string(),
+                prompt: ContentInput::Text(String::new()),
+                system_prompt: crate::SystemPromptOverride::Disable,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions::default()),
+                labels: None,
+            },
+            move |materialized_session_id| {
+                crate::surface::default_persistent_executor(
+                    executor_service,
+                    executor_runtime,
+                    materialized_session_id,
+                )
+            },
+        ))
+        .await
+        .expect("materialize live projection fixture session");
+
+        let projection = Arc::new(ServiceLiveProjection::new(
+            Arc::clone(&service),
+            Arc::clone(&runtime),
+        ));
+        let host = meerkat_live::LiveAdapterHost::new(
+            Arc::clone(&projection) as Arc<dyn LiveProjectionSink>
+        );
+        let channel_id = LiveChannelId::random_uuid();
+        let admission = runtime
+            .resolve_live_open_admission(
+                &session_id,
+                &channel_id,
+                &meerkat_core::SessionLlmIdentity {
+                    model: "gpt-realtime-2".to_string(),
+                    provider: meerkat_core::Provider::OpenAI,
+                    self_hosted_server_id: None,
+                    provider_params: None,
+                    auth_binding: None,
+                },
+            )
+            .await
+            .expect("machine admits the fixture channel");
+        host.open_channel_with_authority(
+            admission
+                .channel_open_authority()
+                .expect("generated host open handoff"),
+        )
+        .await
+        .expect("open live channel");
+        let mut events = service
+            .subscribe_session_events(&session_id)
+            .await
+            .expect("subscribe to session events");
+        let load = || async {
+            service
+                .load_authoritative_session(&session_id)
+                .await
+                .expect("session loads")
+                .expect("session exists")
+        };
+        let usage_before = load().await.total_usage();
+
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id: Some("item_failed".to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_failed".to_string()),
+                delta_id: Some("delta_failed".to_string()),
+                delta: "partial speech".to_string(),
+            },
+        )
+        .await
+        .expect("spoken delta applies");
+        projection
+            .append_assistant_text_final(
+                &session_id,
+                "partial display text",
+                LiveTranscriptIdentity::default(),
+                StopReason::EndTurn,
+                Usage::default(),
+                Some("resp_failed"),
+            )
+            .await
+            .expect("display final buffers");
+        assert_eq!(
+            load().await.in_flight_realtime_assistant_response_ids(),
+            vec!["resp_failed".to_string()]
+        );
+
+        let failure = meerkat_core::live_adapter::LiveResponseFailure {
+            status: meerkat_core::live_adapter::LiveResponseFailureStatus::Failed,
+            reason: None,
+            code: Some("server_error".to_string()),
+            message: Some("provider failed".to_string()),
+        };
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_failed".to_string()),
+                failure: failure.clone(),
+                accounting: LiveResponseAccounting::Measured {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                        Usage {
+                            input_tokens: 17,
+                            output_tokens: 23,
+                            ..Usage::default()
+                        },
+                    ),
+                },
+            },
+        )
+        .await
+        .expect("a failed response projects");
+        let after_failure = load().await;
+        assert!(
+            after_failure
+                .in_flight_realtime_assistant_response_ids()
+                .is_empty(),
+            "a failed response leaves the in-flight set a barge-in targets"
+        );
+        assert!(
+            committed_assistant_texts(&after_failure).is_empty(),
+            "nothing of the failed response is committed: {:?}",
+            after_failure.messages()
+        );
+        let usage_after = after_failure.total_usage();
+        assert_eq!(usage_after.input_tokens, usage_before.input_tokens + 17);
+        assert_eq!(usage_after.output_tokens, usage_before.output_tokens + 23);
+
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::TurnInterrupted { response_id: None },
+        )
+        .await
+        .expect("a barge-in after the failure applies");
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::TurnFailed {
+                response_id: Some("resp_unmeasured".to_string()),
+                failure,
+                accounting: LiveResponseAccounting::Unmeasured {
+                    unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                        meerkat_core::Provider::OpenAI,
+                        "gpt-realtime-2",
+                    ),
+                },
+            },
+        )
+        .await
+        .expect("an unmeasured failed response projects");
+        let unmeasured = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let envelope = futures::StreamExt::next(&mut events)
+                    .await
+                    .expect("session event stream stays open");
+                match envelope.payload {
+                    meerkat_core::AgentEvent::TurnUsageAccountingUnmeasured {
+                        unmeasured, ..
+                    } => break unmeasured,
+                    meerkat_core::AgentEvent::TurnCompleted { .. } => {
+                        panic!("a failed response publishes no turn terminal")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the unmeasured fact is published");
+        assert_eq!(unmeasured.model, "gpt-realtime-2");
+
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id: Some("item_next".to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_next".to_string()),
+                delta_id: Some("delta_next".to_string()),
+                delta: "next answer".to_string(),
+            },
+        )
+        .await
+        .expect("the next response stages");
+        host.apply_observation(
+            &channel_id,
+            &LiveAdapterObservation::TurnCompleted {
+                response_id: Some("resp_next".to_string()),
+                stop_reason: StopReason::EndTurn,
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::Other,
+                    "facade-turn-failed-test",
+                    Usage::default(),
+                ),
+            },
+        )
+        .await
+        .expect("the next response completes");
+        assert_eq!(
+            committed_assistant_texts(&load().await),
+            vec!["next answer".to_string()],
+            "only the next response is committed"
+        );
+    }
 
     /// `rkat mob host` and Meta's voice product apply live observations
     /// through [`ServiceLiveProjection`], not the RPC sink. Ordinary realtime

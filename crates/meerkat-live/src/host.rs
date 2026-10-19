@@ -48,7 +48,8 @@ use meerkat_core::ToolDispatchOutcome;
 use meerkat_core::ToolError;
 use meerkat_core::live_adapter::{
     LiveAdapter, LiveAdapterCommand, LiveAdapterError, LiveAdapterErrorCode,
-    LiveAdapterObservation, LiveAdapterStatus, LiveInputChunk, LiveToolResult,
+    LiveAdapterObservation, LiveAdapterStatus, LiveInputChunk, LiveResponseAccounting,
+    LiveResponseFailure, LiveToolResult,
 };
 use meerkat_core::types::{SessionId, StopReason, ToolCall, ToolName, ToolResult, Usage};
 use meerkat_core::{
@@ -469,6 +470,10 @@ pub enum ObservationOutcome {
     UserContentCommitted {
         observation: Box<LiveAdapterObservation>,
     },
+    /// #1883: a response that ended without completing was projected through
+    /// [`LiveProjectionSink::signal_turn_failed`]. Not terminal: the channel
+    /// stays open.
+    TurnFailureProjected,
 }
 
 /// Public-safe, channel-scoped address of one assistant output. `output_id`
@@ -938,6 +943,24 @@ pub trait LiveProjectionSink: Send + Sync {
         response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError>;
 
+    /// Project a response that ended without completing
+    /// ([`LiveAdapterObservation::TurnFailed`], #1883).
+    ///
+    /// Not terminal for the channel. The sink commits nothing of the
+    /// response: it discards what the response staged and drops its
+    /// `(SessionId, response_id)` display-text buffer, then records
+    /// `accounting` (the provider's usage, or the unmeasured fact).
+    ///
+    /// No default body: a sink that ignored this would keep the failed
+    /// response's buffer slot for the rest of the session.
+    async fn signal_turn_failed(
+        &self,
+        session_id: &SessionId,
+        response_id: Option<&str>,
+        failure: &LiveResponseFailure,
+        accounting: LiveResponseAccounting,
+    ) -> Result<(), LiveProjectionError>;
+
     /// Surface a terminal adapter error at the session level.
     async fn signal_terminal_error(
         &self,
@@ -1203,6 +1226,16 @@ impl LiveProjectionSink for NoOpProjectionSink {
         _stop_reason: StopReason,
         _usage: meerkat_core::TurnUsage,
         _response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn signal_turn_failed(
+        &self,
+        _session_id: &SessionId,
+        _response_id: Option<&str>,
+        _failure: &LiveResponseFailure,
+        _accounting: LiveResponseAccounting,
     ) -> Result<(), LiveProjectionError> {
         Ok(())
     }
@@ -1760,6 +1793,9 @@ pub enum ObservationRouting {
     /// close the channel for typed-input failures the client can retry.
     CommandRejection,
     Noop,
+    /// #1883: a response ended without completing. Routed to
+    /// [`LiveProjectionSink::signal_turn_failed`]; not terminal.
+    SignalTurnFailed,
 }
 
 /// Session-scoped tool executor used by [`LiveAdapterHost`].
@@ -3027,6 +3063,27 @@ impl LiveAdapterHost {
                 .map(|()| ObservationOutcome::InterruptSignalled)
                 .map_err(Into::into),
 
+            // #1883: a failed response is projected, never treated as a
+            // terminal error: no generated close, no provider cancel.
+            (
+                ObservationRouting::SignalTurnFailed,
+                LiveAdapterObservation::TurnFailed {
+                    response_id,
+                    failure,
+                    accounting,
+                },
+            ) => self
+                .projection_sink
+                .signal_turn_failed(
+                    &session_id,
+                    response_id.as_deref(),
+                    failure,
+                    accounting.clone(),
+                )
+                .await
+                .map(|()| ObservationOutcome::TurnFailureProjected)
+                .map_err(Into::into),
+
             (
                 ObservationRouting::TerminalError,
                 LiveAdapterObservation::Error { code, message },
@@ -3186,6 +3243,25 @@ impl LiveAdapterHost {
                         .iter()
                         .find_map(|(key, waiter)| {
                             (waiter.followup == LivePlaybackTerminalFollowup::TurnInterrupted
+                                && waiter.response_id.as_deref() == Some(response_id.as_str()))
+                            .then_some(key.clone())
+                        });
+                    if let Some(key) = key {
+                        settled = channel.playback_terminal_waiters.remove(&key);
+                    }
+                }
+                // #1883: a failed response is that response's provider
+                // terminal; a waiter for its completion or interruption
+                // would otherwise wait for an observation that never comes.
+                LiveAdapterObservation::TurnFailed {
+                    response_id: Some(response_id),
+                    ..
+                } => {
+                    let key = channel
+                        .playback_terminal_waiters
+                        .iter()
+                        .find_map(|(key, waiter)| {
+                            (waiter.followup != LivePlaybackTerminalFollowup::None
                                 && waiter.response_id.as_deref() == Some(response_id.as_str()))
                             .then_some(key.clone())
                         });
@@ -4040,6 +4116,7 @@ impl LiveAdapterHost {
             // (`Error` → terminal, `CommandRejected` → scoped) maps
             // 1:1 onto host outcomes.
             LiveAdapterObservation::CommandRejected { .. } => ObservationRouting::CommandRejection,
+            LiveAdapterObservation::TurnFailed { .. } => ObservationRouting::SignalTurnFailed,
             _ => ObservationRouting::Noop,
         }
     }
@@ -6666,6 +6743,129 @@ mod tests {
         prefix_task.await.unwrap().unwrap();
     }
 
+    fn turn_failed_observation(response_id: Option<&str>) -> LiveAdapterObservation {
+        LiveAdapterObservation::TurnFailed {
+            response_id: response_id.map(str::to_string),
+            failure: LiveResponseFailure {
+                status: meerkat_core::live_adapter::LiveResponseFailureStatus::Failed,
+                reason: None,
+                code: Some("server_error".to_string()),
+                message: Some("provider failed".to_string()),
+            },
+            accounting: LiveResponseAccounting::Unmeasured {
+                unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                    meerkat_core::Provider::OpenAI,
+                    "gpt-realtime-2",
+                ),
+            },
+        }
+    }
+
+    #[test]
+    fn turn_failed_routes_to_the_failure_signal_and_never_closes_the_channel() {
+        let observation = turn_failed_observation(Some("resp_failed"));
+        assert_eq!(
+            LiveAdapterHost::classify_observation(&observation),
+            ObservationRouting::SignalTurnFailed
+        );
+        assert!(!LiveAdapterHost::observation_requires_generated_close(
+            &observation
+        ));
+    }
+
+    #[tokio::test]
+    async fn turn_failed_projects_through_the_sink_and_the_channel_stays_open() {
+        let sink = Arc::new(RecordingProjectionSink::default());
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
+        let session_id = test_session_id();
+        let ch = host
+            .open_channel_with_generated_test_machine_authority(session_id.clone())
+            .await
+            .unwrap();
+        let outcome = host
+            .apply_observation(&ch, &turn_failed_observation(Some("resp_failed")))
+            .await
+            .expect("a failed response projects without a generated close");
+        assert_eq!(outcome, ObservationOutcome::TurnFailureProjected);
+        {
+            let failed = sink.turn_failed.lock().unwrap();
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].0, session_id);
+            assert_eq!(failed[0].1.as_deref(), Some("resp_failed"));
+            assert_eq!(failed[0].2.code.as_deref(), Some("server_error"));
+        }
+        assert!(sink.terminal_errors.lock().unwrap().is_empty());
+        assert!(sink.turn_completed.lock().unwrap().is_empty());
+
+        let next = host
+            .apply_observation(
+                &ch,
+                &LiveAdapterObservation::TurnCompleted {
+                    response_id: Some("resp_next".to_string()),
+                    stop_reason: StopReason::EndTurn,
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Other,
+                        "turn-failed-test",
+                        Usage::default(),
+                    ),
+                },
+            )
+            .await
+            .expect("the channel stays open after a failed response");
+        assert_eq!(next, ObservationOutcome::TranscriptAppended);
+    }
+
+    #[tokio::test]
+    async fn turn_failed_settles_the_failed_responses_playback_waiter() {
+        let sink = Arc::new(RecordingProjectionSink::default());
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
+        let ch = host
+            .open_channel_with_generated_test_machine_authority(test_session_id())
+            .await
+            .unwrap();
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
+            .await
+            .unwrap();
+        let interaction = meerkat_core::InteractionId::new();
+        let (_, prefix) = host
+            .send_playback_terminal_observed(
+                &ch,
+                LiveAdapterCommand::TruncateAssistantOutput {
+                    interaction_id: interaction,
+                    item_id: "item-failed".to_string(),
+                    content_index: 0,
+                    audio_played_ms: 250,
+                    reported_playback_prefix: Some("played prefix".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let prefix_task = tokio::spawn(prefix.settle());
+        host.apply_observation(
+            &ch,
+            &LiveAdapterObservation::AssistantTranscriptTruncated {
+                interaction_id: Some(interaction),
+                provider_item_id: Some("item-failed".to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("response-failed".to_string()),
+                text: Some("played prefix".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!prefix_task.is_finished());
+        host.apply_observation(&ch, &turn_failed_observation(Some("response-failed")))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), prefix_task)
+            .await
+            .expect("a failed response settles its playback waiter")
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn playback_terminal_projection_failure_fails_exact_settlement() {
         let sink = Arc::new(RecordingProjectionSink::default());
@@ -7057,6 +7257,14 @@ mod tests {
         >,
         terminal_errors: StdMutex<Vec<(SessionId, LiveAdapterErrorCode, String)>>,
         realtime_events: StdMutex<Vec<(SessionId, RealtimeTranscriptEvent)>>,
+        turn_failed: StdMutex<
+            Vec<(
+                SessionId,
+                Option<String>,
+                LiveResponseFailure,
+                LiveResponseAccounting,
+            )>,
+        >,
         reject_playback_terminal: AtomicBool,
     }
 
@@ -7250,6 +7458,22 @@ mod tests {
                 stop_reason,
                 usage,
                 response_id.map(|s| s.to_string()),
+            ));
+            Ok(())
+        }
+
+        async fn signal_turn_failed(
+            &self,
+            session_id: &SessionId,
+            response_id: Option<&str>,
+            failure: &LiveResponseFailure,
+            accounting: LiveResponseAccounting,
+        ) -> Result<(), LiveProjectionError> {
+            self.turn_failed.lock().unwrap().push((
+                session_id.clone(),
+                response_id.map(|s| s.to_string()),
+                failure.clone(),
+                accounting,
             ));
             Ok(())
         }

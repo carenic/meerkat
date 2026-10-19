@@ -5693,7 +5693,11 @@ class RealtimeTranscriptEventAssistantTurnInterrupted(TypedDict, total=False):
     response_id: Required[str]
     type: Required[Literal['assistant_turn_interrupted']]
 
-RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted
+class RealtimeTranscriptEventAssistantTurnFailed(TypedDict, total=False):
+    response_id: Required[str]
+    type: Required[Literal['assistant_turn_failed']]
+
+RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted | RealtimeTranscriptEventAssistantTurnFailed
 
 # Provider-neutral role for a realtime transcript item.
 RealtimeTranscriptRole = Literal['user', 'assistant']
@@ -5902,6 +5906,28 @@ class WireLiveAdapterErrorCodeUnknown(TypedDict, total=False):
 
 WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown
 
+# Wire mirror of [`LiveResponseFailureStatus`].
+#
+# The known statuses serialize as plain strings (`"failed"`,
+# `"incomplete"`, `"in_progress"`), so clients route on `failure.status`.
+class WireLiveResponseFailureStatusUnknownPayload(TypedDict, total=False):
+    debug: Required[str]
+
+class WireLiveResponseFailureStatusUnknown(TypedDict, total=False):
+    unknown: Required[WireLiveResponseFailureStatusUnknownPayload]
+
+WireLiveResponseFailureStatus = Literal['failed'] | Literal['incomplete'] | Literal['in_progress'] | WireLiveResponseFailureStatusUnknown
+
+# Wire mirror of [`LiveResponseFailure`]: how a live response ended without
+# completing. Route on `status`; `reason`, `code` and `message` repeat what
+# the provider said and are diagnostics only.
+class WireLiveResponseFailure(TypedDict, total=False):
+    code: NotRequired[Optional[str]]
+    message: NotRequired[Optional[str]]
+    reason: NotRequired[Optional[str]]
+    status: Required[WireLiveResponseFailureStatus]
+
+
 # Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].
 #
 # FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
@@ -6029,7 +6055,13 @@ class WireLiveAdapterObservationUnknown(TypedDict, total=False):
     debug: Required[str]
     observation: Required[Literal['unknown']]
 
-WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown
+class WireLiveAdapterObservationTurnFailed(TypedDict, total=False):
+    failure: Required[WireLiveResponseFailure]
+    observation: Required[Literal['turn_failed']]
+    response_id: NotRequired[Optional[str]]
+    usage: NotRequired[Optional[dict[str, Any]]]
+
+WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationUserContentCommitted | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown | WireLiveAdapterObservationTurnFailed
 
 @dataclass
 class RuntimeAcceptResult:
