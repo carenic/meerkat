@@ -19,7 +19,11 @@ The fake children here are tiny ``sh`` scripts written into ``tmp_path``.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import signal
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +31,7 @@ import pytest
 from meerkat import client as client_module
 from meerkat.client import MeerkatClient
 from meerkat.errors import MeerkatError
+from meerkat.generated.types import CONTRACT_VERSION
 from meerkat.streaming import STDERR_TAIL_LIMIT_BYTES, _StderrTail, _StdoutDispatcher
 
 REFUSAL_LINE = (
@@ -382,3 +387,171 @@ async def test_close_releases_the_stderr_drain_task(tmp_path: Path) -> None:
 
     assert client._stderr_tail is None
     assert drain._task is None
+
+
+# -- a child that exits while a descendant holds its pipes ----------------
+
+TWO_STDERR_LINES = "fixture: first stderr line\nfixture: last stderr line"
+LATE_STDERR_LINE = "late stderr line"
+
+# A descendant's script: 200 ms after the process that started it has exited
+# and been reaped, it writes one more line to the stderr it inherited and
+# exits, closing the stdout and stderr it held.
+_LATE_STDERR = (
+    "const parent = process.ppid;"
+    " const poll = setInterval(() => {"
+    " try { process.kill(parent, 0); } catch {"
+    " clearInterval(poll);"
+    f" setTimeout(() => process.stderr.write({json.dumps(LATE_STDERR_LINE + chr(10))}), 200);"
+    " } }, 10);"
+)
+
+
+def _write_node_rpc(
+    tmp_path: Path, *, holder: bool, exit_on_request: bool, late_stderr: bool = False
+) -> str:
+    """A fake rkat-rpc in Node that answers the handshake. With
+    ``exit_on_request`` it writes two stderr lines and exits with code 7,
+    without a reply, on the next request. With ``holder`` it first starts a
+    descendant that inherits its stdout and stderr, and records that
+    descendant's pid in ``holder.pid``. With ``late_stderr`` it starts a
+    descendant that holds them until 200 ms after the exit and writes one
+    more stderr line before it lets go."""
+    script = tmp_path / "fake-rkat-rpc.cjs"
+    lines = ["#!/usr/bin/env node"]
+    if late_stderr:
+        lines += [
+            'require("node:child_process").spawn(process.execPath,'
+            f' ["-e", {json.dumps(_LATE_STDERR)}], {{ stdio: ["ignore", "inherit", "inherit"] }}).unref();',
+        ]
+    if holder:
+        lines += [
+            'const holder = require("node:child_process").spawn(process.execPath,'
+            ' ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", "inherit", "inherit"] });',
+            f'require("node:fs").writeFileSync({json.dumps(str(tmp_path / "holder.pid"))}, String(holder.pid));',
+            "holder.unref();",
+        ]
+    lines += [
+        'const rl = require("node:readline").createInterface({ input: process.stdin });',
+        'rl.on("line", (line) => {',
+        "  const msg = JSON.parse(line);",
+    ]
+    if exit_on_request:
+        lines += [
+            '  if (msg.method !== "initialize" && msg.method !== "capabilities/get") {',
+            f"    process.stderr.write({json.dumps(TWO_STDERR_LINES + chr(10))}, () => process.exit(7));",
+            "    return;",
+            "  }",
+        ]
+    lines += [
+        '  const result = msg.method === "initialize"',
+        f"    ? {{ contract_version: {json.dumps(CONTRACT_VERSION)}, methods: [] }}",
+        "    : { capabilities: [] };",
+        '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }) + "\\n");',
+        "});",
+    ]
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return str(script)
+
+
+def _kill_holder(tmp_path: Path) -> None:
+    pid_file = tmp_path / "holder.pid"
+    if not pid_file.exists():
+        return
+    try:
+        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_requests_fail_once_the_child_exits_while_a_descendant_holds_its_pipes(
+    tmp_path: Path,
+) -> None:
+    """The child exits by itself while a process it started still holds its
+    stdout and stderr, so stdout never reaches EOF. The pending request, and
+    every later one, fail with CONNECTION_CLOSED and the stderr written so
+    far, about a second after the exit instead of never."""
+    client = MeerkatClient(_write_node_rpc(tmp_path, holder=True, exit_on_request=True))
+    try:
+        await client.connect()
+        started = time.monotonic()
+        with pytest.raises(MeerkatError) as pending:
+            await asyncio.wait_for(client.get_config(), timeout=5)
+        settle_secs = time.monotonic() - started
+        with pytest.raises(MeerkatError) as later:
+            await asyncio.wait_for(client.get_config(), timeout=5)
+        started = time.monotonic()
+        await asyncio.wait_for(client.close(), timeout=15)
+        close_secs = time.monotonic() - started
+    finally:
+        _kill_holder(tmp_path)
+
+    assert pending.value.code == "CONNECTION_CLOSED"
+    assert pending.value.details == {"stderr_tail": TWO_STDERR_LINES}
+    assert settle_secs < 3, f"settled {settle_secs:.2f} s after the request"
+    assert later.value.code == "CONNECTION_CLOSED"
+    assert close_secs < 1, f"close() took {close_secs:.2f} s"
+
+
+@pytest.mark.asyncio
+async def test_requests_fail_with_the_whole_stderr_tail_when_nothing_holds_the_pipes(
+    tmp_path: Path,
+) -> None:
+    """Without a descendant, stdout reaches EOF as the child exits and the
+    failure still comes from the read loop at once, with the whole tail."""
+    client = MeerkatClient(_write_node_rpc(tmp_path, holder=False, exit_on_request=True))
+    await client.connect()
+    started = time.monotonic()
+    with pytest.raises(MeerkatError) as pending:
+        await asyncio.wait_for(client.get_config(), timeout=5)
+    settle_secs = time.monotonic() - started
+    await client.close()
+
+    assert pending.value.code == "CONNECTION_CLOSED"
+    assert pending.value.details == {"stderr_tail": TWO_STDERR_LINES}
+    assert settle_secs < 0.5, f"settled {settle_secs:.2f} s after the request, not at EOF"
+
+
+@pytest.mark.asyncio
+async def test_requests_wait_briefly_for_a_descendant_to_release_the_pipes(
+    tmp_path: Path,
+) -> None:
+    """A descendant that holds the pipes for a moment after the child exits,
+    and writes to stderr before it lets go, is waited for: the failure comes
+    once the pipes close, with what it wrote in the tail."""
+    client = MeerkatClient(
+        _write_node_rpc(tmp_path, holder=False, exit_on_request=True, late_stderr=True)
+    )
+    await client.connect()
+    with pytest.raises(MeerkatError) as pending:
+        await asyncio.wait_for(client.get_config(), timeout=5)
+    await client.close()
+
+    assert pending.value.code == "CONNECTION_CLOSED"
+    assert pending.value.details == {"stderr_tail": f"{TWO_STDERR_LINES}\n{LATE_STDERR_LINE}"}
+
+
+@pytest.mark.asyncio
+async def test_close_returns_once_the_child_exits_while_a_descendant_holds_its_pipes(
+    tmp_path: Path,
+) -> None:
+    """``Process.wait()`` on Python 3.11 and 3.12, and on 3.13 and 3.14
+    before the fix for CPython issue 119710, also waits for the child's pipes
+    to close, so close() used to wait the full 5 s for a child that had
+    already exited. It returns once the child has exited, and lets go of the
+    pipes the descendant holds."""
+    client = MeerkatClient(_write_node_rpc(tmp_path, holder=True, exit_on_request=False))
+    try:
+        await client.connect()
+        transport = getattr(client, "_child_transport", None)
+        started = time.monotonic()
+        await asyncio.wait_for(client.close(), timeout=15)
+        close_secs = time.monotonic() - started
+    finally:
+        _kill_holder(tmp_path)
+
+    assert close_secs < 1, f"close() took {close_secs:.2f} s"
+    assert transport is not None and transport.is_closing()
+    assert client._child_transport is None

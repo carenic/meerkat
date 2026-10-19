@@ -349,6 +349,17 @@ them.
   child started can no longer keep the caller's process alive through the
   child's pipes. Pre-existing since 0.6.0; the protocol-error case since
   0.7.0.
+- Python SDK: requests waiting on an `rkat-rpc` child that exits by
+  itself, a crash for instance, now fail with `CONNECTION_CLOSED` and the
+  child's stderr tail at most about a second after the exit, even when a
+  process the child started still holds the child's output pipes; before,
+  they and every request sent after the exit waited for those pipes to
+  close, possibly forever. `MeerkatClient.close()` likewise returns once
+  the child has exited, and lets go of such pipes: on Python 3.11 and
+  3.12, and on 3.13 and 3.14 before the fix for CPython issue 119710,
+  `asyncio`'s `Process.wait()` returns only once the child's pipes have
+  closed, so `close()` waited 5 seconds for a child that had already
+  exited. Pre-existing since 0.3.0.
 
 ## [0.9.3] - 2026-10-18
 
