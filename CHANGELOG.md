@@ -42,7 +42,8 @@ them.
   kernel `State` (meerkat-machine-kernels) gain the fields
   `identity_generation_highwater` and `identity_generation_highwater_sealed`,
   so code that builds either struct literally must set them.
-  `MobMachineSignal` (meerkat-machine-schema and meerkat-mob) and the kernel
+  `MobMachineSignal` (meerkat-machine-schema and meerkat-mob), its variant
+  enum `MobMachineSignalVariant` (meerkat-machine-schema), and the kernel
   `Signal` and `SignalKind` gain the variants
   `RecoverIdentityGenerationHighwater` and `SealIdentityGenerationHighwater`,
   appended last. The kernel `generated::mob::TransitionId` gains
