@@ -224,7 +224,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   key at any level, a null `description` or `metadata` value, an unrecognized
   tag (`!custom`), nesting deeper than 64 levels, alias-heavy documents and a
   `...` end marker line. A block scalar ending the frontmatter keeps its final
-  line break. Extension values re-render (`'1.10'` becomes `"1.10"`).
+  line break. Extension values render through the new parser (`'1.10'`
+  becomes `"1.10"`; unquoted `1_000` becomes `1000`, `0755` becomes `755.0`):
+  quote values that must stay text.
 - Mobs: an admitted `MobHandle::shutdown` closes admission before teardown
   (`MobError::AdmissionClosed`, reason `shutdown`): spawn, respawn, work,
   flows, wiring, host binds, live commits, resume, reset, reload and owner
