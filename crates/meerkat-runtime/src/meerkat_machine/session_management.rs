@@ -284,6 +284,25 @@ struct UnregisterEntryIncarnationWitness {
     ops_lifecycle: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
     #[cfg(feature = "live")]
     live_lifecycle_gate: Arc<Mutex<()>>,
+    /// The entry's durability gate, whose degradation ends the saga's waits
+    /// for the mutation gate before its durable finalization.
+    durability_health: Option<super::DurabilityHealthHandle>,
+}
+
+/// How an unregister saga step waits for the exact session mutation gate.
+#[derive(Clone, Copy)]
+enum UnregisterGateWait {
+    /// Before the final `UnregisterSession` is staged: once the session
+    /// degrades, a holder that keeps the gate (for example the post-stop fence
+    /// an exited loop retains) ends the wait typed, so the saga releases its
+    /// coordinator for the reload-required discard instead of waiting for that
+    /// holder.
+    EndsOnDegradation,
+    /// Once the final `UnregisterSession` is staged: the saga waits for the
+    /// gate however long its holder keeps it, to roll the staged finalization
+    /// back or to finish its process-local half. Ending here would strand the
+    /// pending finalization, which the reload-required discard refuses.
+    UntilFree,
 }
 
 impl UnregisterEntryIncarnationWitness {
@@ -10098,6 +10117,7 @@ impl MeerkatMachine {
                     ops_lifecycle: Arc::clone(&entry.ops_lifecycle),
                     #[cfg(feature = "live")]
                     live_lifecycle_gate: Arc::clone(&entry.live_lifecycle_gate),
+                    durability_health: entry.durability_health.clone(),
                 },
             )
         };
@@ -10126,7 +10146,7 @@ impl MeerkatMachine {
                 &live_lifecycle_lease,
             )
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10134,7 +10154,7 @@ impl MeerkatMachine {
         let Some(gate_guard) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(session_id, &entry_incarnation)
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10595,7 +10615,7 @@ ControlFlow::Break(()) => return Ok(()),
                 &live_lifecycle_lease,
             )
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10603,7 +10623,7 @@ ControlFlow::Break(()) => return Ok(()),
         let Some(pre_cleanup_gate) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(session_id, &entry_incarnation)
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10721,7 +10741,7 @@ ControlFlow::Break(()) => return Ok(()),
                 &live_lifecycle_lease,
             )
         })
-        .await
+        .await?
         else {
             tracing::debug!(
                 %session_id,
@@ -10733,7 +10753,7 @@ ControlFlow::Break(()) => return Ok(()),
         let Some(_gate_guard) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(session_id, &entry_incarnation)
         })
-        .await
+        .await?
         else {
             tracing::debug!(
                 %session_id,
@@ -10874,7 +10894,7 @@ ControlFlow::Break(()) => return Ok(()),
                 &live_lifecycle_lease,
             )
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10882,7 +10902,7 @@ ControlFlow::Break(()) => return Ok(()),
         let Some(finalization_gate_guard) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(session_id, &entry_incarnation)
         })
-        .await
+        .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10976,7 +10996,7 @@ ControlFlow::Break(()) => return Ok(()),
                     &live_lifecycle_lease,
                 )
             })
-            .await
+            .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -10985,7 +11005,7 @@ ControlFlow::Break(()) => return Ok(()),
             crate::stack_relief::box_in_own_frame(|| {
                 self.lock_exact_unregister_sessions_for_write(session_id, &entry_incarnation)
             })
-            .await
+            .await?
         else {
             return Ok(ControlFlow::Break(()));
         };
@@ -11042,7 +11062,7 @@ ControlFlow::Break(()) => return Ok(()),
                 &live_lifecycle_lease,
             )
         })
-        .await
+        .await?
         else {
             return Ok(());
         };
@@ -11050,7 +11070,7 @@ ControlFlow::Break(()) => return Ok(()),
         let Some(final_stage_gate_guard) = crate::stack_relief::box_in_own_frame(|| {
             self.lock_exact_unregister_mutation_gate(session_id, &entry_incarnation)
         })
-        .await
+        .await?
         else {
             return Ok(());
         };
@@ -11191,9 +11211,12 @@ ControlFlow::Break(()) => return Ok(()),
                 RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
             ) {
                 let rollback_restored = {
+                    // The final UnregisterSession is staged: the rollback
+                    // waits for the gate until it is free (see
+                    // `UnregisterGateWait::UntilFree`).
                     #[cfg(feature = "live")]
                     let locked = crate::stack_relief::box_in_own_frame(|| {
-                        self.lock_exact_unregister_sessions_for_write(
+                        self.lock_staged_unregister_sessions_for_write(
                             session_id,
                             &entry_incarnation,
                             &live_lifecycle_lease,
@@ -11202,13 +11225,13 @@ ControlFlow::Break(()) => return Ok(()),
                     .await;
                     #[cfg(not(feature = "live"))]
                     let locked = crate::stack_relief::box_in_own_frame(|| {
-                        self.lock_exact_unregister_sessions_for_write(
+                        self.lock_staged_unregister_sessions_for_write(
                             session_id,
                             &entry_incarnation,
                         )
                     })
                     .await;
-                    if let Some((mut sessions, clear_gate)) = locked {
+                    if let Ok(Some((mut sessions, clear_gate))) = locked {
                         if let Some(entry) = sessions.get_mut(session_id)
                             && &entry.epoch_id == epoch_id
                             && Arc::ptr_eq(&entry.driver, &driver_handle)
@@ -11305,28 +11328,12 @@ Ok::<(), RuntimeDriverError>(())
         session_id: &SessionId,
         entry_incarnation: &UnregisterEntryIncarnationWitness,
         live_lifecycle_lease: &crate::member_live::MemberLiveLifecycleLease,
-    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, RuntimeDriverError> {
         if !live_lifecycle_lease.matches_gate(&entry_incarnation.live_lifecycle_gate) {
-            return None;
+            return Ok(None);
         }
-        loop {
-            let guard = Arc::clone(&entry_incarnation.mutation_gate)
-                .lock_owned()
-                .await;
-            let sessions = match self.sessions.try_read() {
-                Ok(sessions) => sessions,
-                Err(_) => {
-                    drop(guard);
-                    crate::tokio::task::yield_now().await;
-                    continue;
-                }
-            };
-            let entry = sessions.get(session_id)?;
-            if entry_incarnation.matches(entry) {
-                return Some(guard);
-            }
-            return None;
-        }
+        self.lock_exact_unregister_mutation_gate_inner(session_id, entry_incarnation)
+            .await
     }
 
     #[cfg(not(feature = "live"))]
@@ -11334,11 +11341,65 @@ Ok::<(), RuntimeDriverError>(())
         &self,
         session_id: &SessionId,
         entry_incarnation: &UnregisterEntryIncarnationWitness,
-    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, RuntimeDriverError> {
+        self.lock_exact_unregister_mutation_gate_inner(session_id, entry_incarnation)
+            .await
+    }
+
+    /// Take an unregister saga's exact mutation gate, waiting as `wait`
+    /// says. A free gate is taken first, so a degraded session whose gate
+    /// nobody holds is still unregistered.
+    async fn wait_for_unregister_mutation_gate(
+        &self,
+        session_id: &SessionId,
+        entry_incarnation: &UnregisterEntryIncarnationWitness,
+        wait: UnregisterGateWait,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
+        let health = match (wait, entry_incarnation.durability_health.as_ref()) {
+            (UnregisterGateWait::EndsOnDegradation, Some(health)) => health,
+            _ => {
+                return Ok(Arc::clone(&entry_incarnation.mutation_gate)
+                    .lock_owned()
+                    .await);
+            }
+        };
+        let degradation = health.subscribe_degradation();
+        #[cfg(any(test, feature = "test-support"))]
+        self.note_mutation_gate_wait_for_test(session_id, &entry_incarnation.mutation_gate);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = session_id;
+        let mut lock = std::pin::pin!(Arc::clone(&entry_incarnation.mutation_gate).lock_owned());
+        let mut fired = std::pin::pin!(degradation.fired());
+        crate::tokio::select! {
+            biased;
+            guard = &mut lock => Ok(guard),
+            required = &mut fired => Err(RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest: None,
+                reason: format!(
+                    "unregister cannot take the mutation gate of a durability-degraded session; \
+                     reload it first: {required}"
+                ),
+            }),
+        }
+    }
+
+    /// The saga's exact mutation gate before its durable finalization: `None`
+    /// once the entry is no longer this saga's incarnation, typed
+    /// `RecoveryRepairBlocked` once the session degrades while another holder
+    /// keeps the gate.
+    async fn lock_exact_unregister_mutation_gate_inner(
+        &self,
+        session_id: &SessionId,
+        entry_incarnation: &UnregisterEntryIncarnationWitness,
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, RuntimeDriverError> {
         loop {
-            let guard = Arc::clone(&entry_incarnation.mutation_gate)
-                .lock_owned()
-                .await;
+            let guard = self
+                .wait_for_unregister_mutation_gate(
+                    session_id,
+                    entry_incarnation,
+                    UnregisterGateWait::EndsOnDegradation,
+                )
+                .await?;
             let sessions = match self.sessions.try_read() {
                 Ok(sessions) => sessions,
                 Err(_) => {
@@ -11347,67 +11408,143 @@ Ok::<(), RuntimeDriverError>(())
                     continue;
                 }
             };
-            let entry = sessions.get(session_id)?;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
             if entry_incarnation.matches(entry) {
-                return Some(guard);
+                return Ok(Some(guard));
             }
-            return None;
+            return Ok(None);
         }
     }
 
+    /// The sessions writer plus the exact mutation gate, for a saga step
+    /// before its durable finalization (see [`UnregisterGateWait`]).
     #[cfg(feature = "live")]
     async fn lock_exact_unregister_sessions_for_write(
         &self,
         session_id: &SessionId,
         entry_incarnation: &UnregisterEntryIncarnationWitness,
         live_lifecycle_lease: &crate::member_live::MemberLiveLifecycleLease,
-    ) -> Option<(
-        crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
-        crate::tokio::sync::OwnedMutexGuard<()>,
-    )> {
+    ) -> Result<
+        Option<(
+            crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
+            crate::tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        RuntimeDriverError,
+    > {
         if !live_lifecycle_lease.matches_gate(&entry_incarnation.live_lifecycle_gate) {
-            return None;
+            return Ok(None);
         }
-        self.lock_exact_unregister_sessions_for_write_inner(session_id, entry_incarnation)
-            .await
+        self.lock_exact_unregister_sessions_for_write_inner(
+            session_id,
+            entry_incarnation,
+            UnregisterGateWait::EndsOnDegradation,
+        )
+        .await
     }
 
+    /// The sessions writer plus the exact mutation gate, for a saga step
+    /// before its durable finalization (see [`UnregisterGateWait`]).
     #[cfg(not(feature = "live"))]
     async fn lock_exact_unregister_sessions_for_write(
         &self,
         session_id: &SessionId,
         entry_incarnation: &UnregisterEntryIncarnationWitness,
-    ) -> Option<(
-        crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
-        crate::tokio::sync::OwnedMutexGuard<()>,
-    )> {
-        self.lock_exact_unregister_sessions_for_write_inner(session_id, entry_incarnation)
-            .await
+    ) -> Result<
+        Option<(
+            crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
+            crate::tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        RuntimeDriverError,
+    > {
+        self.lock_exact_unregister_sessions_for_write_inner(
+            session_id,
+            entry_incarnation,
+            UnregisterGateWait::EndsOnDegradation,
+        )
+        .await
+    }
+
+    /// The sessions writer plus the exact mutation gate once the final
+    /// `UnregisterSession` is staged: the saga waits for the gate as long as
+    /// it takes (see [`UnregisterGateWait`]).
+    #[cfg(feature = "live")]
+    async fn lock_staged_unregister_sessions_for_write(
+        &self,
+        session_id: &SessionId,
+        entry_incarnation: &UnregisterEntryIncarnationWitness,
+        live_lifecycle_lease: &crate::member_live::MemberLiveLifecycleLease,
+    ) -> Result<
+        Option<(
+            crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
+            crate::tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        RuntimeDriverError,
+    > {
+        if !live_lifecycle_lease.matches_gate(&entry_incarnation.live_lifecycle_gate) {
+            return Ok(None);
+        }
+        self.lock_exact_unregister_sessions_for_write_inner(
+            session_id,
+            entry_incarnation,
+            UnregisterGateWait::UntilFree,
+        )
+        .await
+    }
+
+    /// The sessions writer plus the exact mutation gate once the final
+    /// `UnregisterSession` is staged: the saga waits for the gate as long as
+    /// it takes (see [`UnregisterGateWait`]).
+    #[cfg(not(feature = "live"))]
+    async fn lock_staged_unregister_sessions_for_write(
+        &self,
+        session_id: &SessionId,
+        entry_incarnation: &UnregisterEntryIncarnationWitness,
+    ) -> Result<
+        Option<(
+            crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
+            crate::tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        RuntimeDriverError,
+    > {
+        self.lock_exact_unregister_sessions_for_write_inner(
+            session_id,
+            entry_incarnation,
+            UnregisterGateWait::UntilFree,
+        )
+        .await
     }
 
     async fn lock_exact_unregister_sessions_for_write_inner(
         &self,
         session_id: &SessionId,
         entry_incarnation: &UnregisterEntryIncarnationWitness,
-    ) -> Option<(
-        crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
-        crate::tokio::sync::OwnedMutexGuard<()>,
-    )> {
+        wait: UnregisterGateWait,
+    ) -> Result<
+        Option<(
+            crate::tokio::sync::RwLockWriteGuard<'_, HashMap<SessionId, RuntimeSessionEntry>>,
+            crate::tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        RuntimeDriverError,
+    > {
         loop {
             // Join the fair writer queue without retaining M. Once the map is
             // exclusively held, M is acquired only if immediately available.
             let sessions = self.sessions.write().await;
-            let entry = sessions.get(session_id)?;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
             if !entry_incarnation.matches(entry) {
-                return None;
+                return Ok(None);
             }
             match Arc::clone(&entry_incarnation.mutation_gate).try_lock_owned() {
-                Ok(mutation_guard) => return Some((sessions, mutation_guard)),
+                Ok(mutation_guard) => return Ok(Some((sessions, mutation_guard))),
                 Err(_) => {
                     drop(sessions);
-                    let mutation_guard = Arc::clone(&entry_incarnation.mutation_gate)
-                        .lock_owned()
-                        .await;
+                    let mutation_guard = self
+                        .wait_for_unregister_mutation_gate(session_id, entry_incarnation, wait)
+                        .await?;
                     drop(mutation_guard);
                 }
             }
@@ -11605,19 +11742,19 @@ Ok::<(), RuntimeDriverError>(())
         let (drain_task, rotation_task) = {
             #[cfg(feature = "live")]
             let Some((mut sessions, mutation_guard)) = self
-                .lock_exact_unregister_sessions_for_write(
+                .lock_staged_unregister_sessions_for_write(
                     session_id,
                     entry_incarnation,
                     live_lifecycle_lease,
                 )
-                .await
+                .await?
             else {
                 return Ok(());
             };
             #[cfg(not(feature = "live"))]
             let Some((mut sessions, mutation_guard)) = self
-                .lock_exact_unregister_sessions_for_write(session_id, entry_incarnation)
-                .await
+                .lock_staged_unregister_sessions_for_write(session_id, entry_incarnation)
+                .await?
             else {
                 return Ok(());
             };

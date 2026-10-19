@@ -2607,6 +2607,180 @@ impl RuntimeCleanupTaskSpawner {
     }
 }
 
+/// What a ready-gated caller found once it held the session mutation gate.
+enum DurabilityGateSettlement {
+    /// The exact entry is durability-ready: the gate is the caller's.
+    Ready(crate::tokio::sync::OwnedMutexGuard<()>),
+    /// The entry was replaced while the caller waited: look it up again.
+    Replaced,
+    /// The entry is gone or degraded (its degraded settlement has run).
+    Refused(RuntimeDriverError),
+}
+
+/// Settle a held session mutation gate: hand it back for a durability-ready
+/// entry, or detach the degraded entry and hard-cancel its exact run before
+/// refusing. Shared by the ready-gated caller and the process-owned task a
+/// waiter hands the settlement to when it leaves on the degradation signal.
+async fn settle_durability_gate(
+    shared: &MeerkatMachineShared,
+    session_id: &SessionId,
+    gate: &Arc<Mutex<()>>,
+    gate_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+) -> DurabilityGateSettlement {
+    let (reload_required, interrupt_handle, expected_run_id, detached_attachment, cleanup_spawner) = {
+        let mut sessions = shared.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return DurabilityGateSettlement::Refused(RuntimeDriverError::NotReady {
+                state: RuntimeState::Destroyed,
+            });
+        };
+        if !Arc::ptr_eq(&entry.mutation_gate, gate) {
+            return DurabilityGateSettlement::Replaced;
+        }
+        match entry.require_durability_ready() {
+            Ok(()) => return DurabilityGateSettlement::Ready(gate_guard),
+            Err(reload_required) => {
+                let interrupt_handle = entry.interrupt_handle();
+                let expected_run_id = entry
+                    .dsl_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .state()
+                    .current_run_id
+                    .as_ref()
+                    .and_then(crate::meerkat_machine::dsl_authority::current_run_id_from_dsl);
+                // Acquire process-owned execution before consuming the
+                // entry-local handle/attachment authority. A runtime
+                // setup failure leaves that authority installed for a
+                // later degraded retry instead of orphaning it.
+                let cleanup_spawner = match (&interrupt_handle, &expected_run_id) {
+                    (Some(_), Some(_)) => match MachineCleanupTaskSpawner::acquire() {
+                        Ok(cleanup_spawner) => Some(cleanup_spawner),
+                        Err(error) => {
+                            tracing::warn!(
+                                %session_id,
+                                operation = reload_required.operation(),
+                                reason = reload_required.reason(),
+                                %error,
+                                "could not acquire process-owned durability-degradation interrupt dispatcher; exact attachment retained for retry"
+                            );
+                            return DurabilityGateSettlement::Refused(
+                                RuntimeDriverError::RecoveryRepairBlocked {
+                                    evidence_digest: None,
+                                    reason: reload_required.to_string(),
+                                },
+                            );
+                        }
+                    },
+                    _ => None,
+                };
+                let detached_attachment = entry.take_runtime_loop_attachment();
+                // Consume every entry-local interrupt source under M.
+                // This is the dedup handoff: later degraded callers
+                // see no handle and cannot spawn a second callback for
+                // the same exact attachment/run.
+                entry.provisional_interrupt_handle = None;
+                (
+                    reload_required,
+                    interrupt_handle,
+                    expected_run_id,
+                    detached_attachment,
+                    cleanup_spawner,
+                )
+            }
+        }
+    };
+
+    // Dropping the exact attachment closes its wake/effect senders and
+    // detaches it from the entry before the async interrupt callback.
+    drop(detached_attachment);
+    // The entry is already detached and every ready-gated successor
+    // will observe ReloadRequired. Do not retain M across the external
+    // interrupt callback: actor cancellation may itself need to finish
+    // a machine-owned terminal callback.
+    drop(gate_guard);
+    if let (Some(interrupt_handle), Some(expected_run_id), Some(cleanup_spawner)) =
+        (interrupt_handle, expected_run_id, cleanup_spawner)
+    {
+        let reason = format!(
+            "durability reload required after `{}`: {}",
+            reload_required.operation(),
+            reload_required.reason()
+        );
+        let (ack_tx, ack_rx) = crate::tokio::sync::oneshot::channel();
+        cleanup_spawner.spawn(async move {
+            let mut first_ack = Some(ack_tx);
+            let mut retry_delay = std::time::Duration::from_millis(100);
+            loop {
+                let result = match std::panic::AssertUnwindSafe(
+                    interrupt_handle.hard_cancel_run_if_current(&expected_run_id, reason.clone()),
+                )
+                .catch_unwind()
+                .await
+                {
+                    Ok(Ok(delivered)) => Ok(delivered),
+                    Ok(Err(error)) => Err(format!(
+                        "exact durability-degradation interrupt failed: {error}"
+                    )),
+                    Err(payload) => Err(format!(
+                        "exact durability-degradation interrupt panicked: {}",
+                        meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
+                    )),
+                };
+                if let Some(ack_tx) = first_ack.take() {
+                    let _ = ack_tx.send(result.clone());
+                }
+                if result.is_ok() {
+                    break;
+                }
+                // ReloadRequired remains the durable shell authority
+                // while this exact handle/run pair retries
+                // process-owned. No successor can be admitted through
+                // the degraded entry.
+                crate::tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(5));
+            }
+        });
+        match crate::tokio::time::timeout(DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT, ack_rx)
+            .await
+        {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    %error,
+                    "exact durability-degradation interrupt failed; process-owned retry retained"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    %error,
+                    "exact durability-degradation interrupt task ended before acknowledgement"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %session_id,
+                    operation = reload_required.operation(),
+                    reason = reload_required.reason(),
+                    "exact durability-degradation interrupt exceeded acknowledgement budget; process-owned attempt retained"
+                );
+            }
+        }
+    }
+    DurabilityGateSettlement::Refused(RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: reload_required.to_string(),
+    })
+}
+
 impl MachineCleanupTaskSpawner {
     #[cfg(not(target_arch = "wasm32"))]
     fn acquire() -> Result<Self, RuntimeDriverError> {
@@ -6485,180 +6659,88 @@ impl MeerkatMachine {
     /// callback runs only after the session-map lock is released. Recovery and
     /// unregister paths that replace or tear down the entry intentionally use
     /// the lower-level gate above.
+    ///
+    /// A waiter parked behind a holder of the gate (for example a post-stop
+    /// fence the exited runtime loop retains after a failed boundary commit)
+    /// does not wait for it once the session degrades: it returns the typed
+    /// `RecoveryRepairBlocked` and hands the degraded settlement (detach and
+    /// exact hard-cancel) to a process-owned task that takes the gate when it
+    /// frees. The gate is polled first, so a free gate settles inline as
+    /// before.
     async fn lock_current_durability_ready_session_mutation_gate(
         &self,
         session_id: &SessionId,
     ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
         loop {
-            let gate = self.session_mutation_gate(session_id).await.ok_or(
-                RuntimeDriverError::NotReady {
-                    state: RuntimeState::Destroyed,
-                },
-            )?;
-            let gate_guard = Arc::clone(&gate).lock_owned().await;
-            let (
-                reload_required,
-                interrupt_handle,
-                expected_run_id,
-                detached_attachment,
-                cleanup_spawner,
-            ) = {
-                let mut sessions = self.sessions.write().await;
+            let (gate, degradation) = {
+                let sessions = self.sessions.read().await;
                 let entry = sessions
-                    .get_mut(session_id)
+                    .get(session_id)
                     .ok_or(RuntimeDriverError::NotReady {
                         state: RuntimeState::Destroyed,
                     })?;
-                if !Arc::ptr_eq(&entry.mutation_gate, &gate) {
-                    continue;
-                }
-                match entry.require_durability_ready() {
-                    Ok(()) => return Ok(gate_guard),
-                    Err(reload_required) => {
-                        let interrupt_handle = entry.interrupt_handle();
-                        let expected_run_id = entry
-                            .dsl_authority
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .state()
-                            .current_run_id
-                            .as_ref()
-                            .and_then(
-                                crate::meerkat_machine::dsl_authority::current_run_id_from_dsl,
-                            );
-                        // Acquire process-owned execution before consuming the
-                        // entry-local handle/attachment authority. A runtime
-                        // setup failure leaves that authority installed for a
-                        // later degraded retry instead of orphaning it.
-                        let cleanup_spawner = match (&interrupt_handle, &expected_run_id) {
-                            (Some(_), Some(_)) => match MachineCleanupTaskSpawner::acquire() {
-                                Ok(cleanup_spawner) => Some(cleanup_spawner),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %session_id,
-                                        operation = reload_required.operation(),
-                                        reason = reload_required.reason(),
-                                        %error,
-                                        "could not acquire process-owned durability-degradation interrupt dispatcher; exact attachment retained for retry"
-                                    );
-                                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                                        evidence_digest: None,
-                                        reason: reload_required.to_string(),
-                                    });
-                                }
-                            },
-                            _ => None,
-                        };
-                        let detached_attachment = entry.take_runtime_loop_attachment();
-                        // Consume every entry-local interrupt source under M.
-                        // This is the dedup handoff: later degraded callers
-                        // see no handle and cannot spawn a second callback for
-                        // the same exact attachment/run.
-                        entry.provisional_interrupt_handle = None;
-                        (
-                            reload_required,
-                            interrupt_handle,
-                            expected_run_id,
-                            detached_attachment,
-                            cleanup_spawner,
-                        )
+                (
+                    Arc::clone(&entry.mutation_gate),
+                    entry
+                        .durability_health
+                        .as_ref()
+                        .map(DurabilityHealthHandle::subscribe_degradation),
+                )
+            };
+            let gate_guard = match degradation {
+                None => Arc::clone(&gate).lock_owned().await,
+                Some(degradation) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.note_mutation_gate_wait_for_test(session_id, &gate);
+                    let mut lock = std::pin::pin!(Arc::clone(&gate).lock_owned());
+                    let mut fired = std::pin::pin!(degradation.fired());
+                    crate::tokio::select! {
+                        biased;
+                        guard = &mut lock => guard,
+                        required = &mut fired => {
+                            self.hand_off_degraded_gate_settlement(session_id, gate);
+                            return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                                evidence_digest: None,
+                                reason: required.to_string(),
+                            });
+                        }
                     }
                 }
             };
-
-            // Dropping the exact attachment closes its wake/effect senders and
-            // detaches it from the entry before the async interrupt callback.
-            drop(detached_attachment);
-            // The entry is already detached and every ready-gated successor
-            // will observe ReloadRequired. Do not retain M across the external
-            // interrupt callback: actor cancellation may itself need to finish
-            // a machine-owned terminal callback.
-            drop(gate_guard);
-            if let (Some(interrupt_handle), Some(expected_run_id), Some(cleanup_spawner)) =
-                (interrupt_handle, expected_run_id, cleanup_spawner)
-            {
-                let reason = format!(
-                    "durability reload required after `{}`: {}",
-                    reload_required.operation(),
-                    reload_required.reason()
-                );
-                let (ack_tx, ack_rx) = crate::tokio::sync::oneshot::channel();
-                cleanup_spawner.spawn(async move {
-                    let mut first_ack = Some(ack_tx);
-                    let mut retry_delay = std::time::Duration::from_millis(100);
-                    loop {
-                        let result = match std::panic::AssertUnwindSafe(
-                            interrupt_handle
-                                .hard_cancel_run_if_current(&expected_run_id, reason.clone()),
-                        )
-                        .catch_unwind()
-                        .await
-                        {
-                            Ok(Ok(delivered)) => Ok(delivered),
-                            Ok(Err(error)) => Err(format!(
-                                "exact durability-degradation interrupt failed: {error}"
-                            )),
-                            Err(payload) => Err(format!(
-                                "exact durability-degradation interrupt panicked: {}",
-                                meerkat_core::panic_payload::panic_payload_detail(payload.as_ref())
-                            )),
-                        };
-                        if let Some(ack_tx) = first_ack.take() {
-                            let _ = ack_tx.send(result.clone());
-                        }
-                        if result.is_ok() {
-                            break;
-                        }
-                        // ReloadRequired remains the durable shell authority
-                        // while this exact handle/run pair retries
-                        // process-owned. No successor can be admitted through
-                        // the degraded entry.
-                        crate::tokio::time::sleep(retry_delay).await;
-                        retry_delay = retry_delay
-                            .saturating_mul(2)
-                            .min(std::time::Duration::from_secs(5));
-                    }
-                });
-                match crate::tokio::time::timeout(
-                    DURABILITY_DEGRADATION_INTERRUPT_ACK_TIMEOUT,
-                    ack_rx,
-                )
-                .await
-                {
-                    Ok(Ok(Ok(_))) => {}
-                    Ok(Ok(Err(error))) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            %error,
-                            "exact durability-degradation interrupt failed; process-owned retry retained"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            %error,
-                            "exact durability-degradation interrupt task ended before acknowledgement"
-                        );
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            %session_id,
-                            operation = reload_required.operation(),
-                            reason = reload_required.reason(),
-                            "exact durability-degradation interrupt exceeded acknowledgement budget; process-owned attempt retained"
-                        );
-                    }
-                }
+            match settle_durability_gate(&self.shared, session_id, &gate, gate_guard).await {
+                DurabilityGateSettlement::Ready(guard) => return Ok(guard),
+                DurabilityGateSettlement::Replaced => continue,
+                DurabilityGateSettlement::Refused(error) => return Err(error),
             }
-            return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                evidence_digest: None,
-                reason: reload_required.to_string(),
-            });
         }
+    }
+
+    /// Run the degraded settlement for a waiter that left on the degradation
+    /// signal: a process-owned task takes the gate once its holder releases it
+    /// and settles exactly as a ready-gated caller would, with the same
+    /// detach and hard-cancel dedup. Without a cleanup runtime the next
+    /// ready-gated caller settles inline instead.
+    fn hand_off_degraded_gate_settlement(&self, session_id: &SessionId, gate: Arc<Mutex<()>>) {
+        #[cfg(test)]
+        self.test_degraded_gate_settlement_hand_offs
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let spawner = match MachineCleanupTaskSpawner::acquire() {
+            Ok(spawner) => spawner,
+            Err(error) => {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "could not hand off the durability-degraded gate settlement; the next ready-gated caller settles it"
+                );
+                return;
+            }
+        };
+        let shared = Arc::clone(&self.shared);
+        let session_id = session_id.clone();
+        drop(spawner.spawn(async move {
+            let gate_guard = Arc::clone(&gate).lock_owned().await;
+            let _ = settle_durability_gate(&shared, &session_id, &gate, gate_guard).await;
+        }));
     }
 
     /// Deterministically pause the runtime loop's next terminal run commit
@@ -7234,6 +7316,54 @@ impl MeerkatMachine {
                     "deterministic test fault",
                 )
             })
+    }
+
+    /// Report the next degradation-aware wait for `session_id`'s mutation
+    /// gate that finds the gate held: the receiver resolves once that waiter
+    /// has subscribed to the session's degradation and is about to park
+    /// behind the holder, so a test can degrade the session during the wait
+    /// instead of before it. Test support.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_mutation_gate_wait_observer_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> crate::tokio::sync::oneshot::Receiver<()> {
+        let (parked_tx, parked_rx) = crate::tokio::sync::oneshot::channel();
+        let replaced = self
+            .test_mutation_gate_wait_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((session_id, parked_tx));
+        assert!(
+            replaced.is_none(),
+            "mutation gate wait observer already armed"
+        );
+        parked_rx
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn note_mutation_gate_wait_for_test(&self, session_id: &SessionId, gate: &Mutex<()>) {
+        if gate.try_lock().is_ok() {
+            return;
+        }
+        let parked_tx = {
+            let mut observer = self
+                .test_mutation_gate_wait_observer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if observer
+                .as_ref()
+                .is_some_and(|(armed_session_id, _)| armed_session_id == session_id)
+            {
+                observer.take().map(|(_, parked_tx)| parked_tx)
+            } else {
+                None
+            }
+        };
+        if let Some(parked_tx) = parked_tx {
+            let _ = parked_tx.send(());
+        }
     }
 
     /// Persist the exact current operation registry using the registration's
@@ -10180,6 +10310,16 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot report of a degradation-aware wait for one session's mutation
+    /// gate that found the gate held: the waiter has subscribed to the
+    /// session's degradation and is about to park behind the holder.
+    #[cfg(any(test, feature = "test-support"))]
+    test_mutation_gate_wait_observer:
+        StdMutex<Option<(SessionId, crate::tokio::sync::oneshot::Sender<()>)>>,
+    /// Test probe: how many ready-gated waiters left on the degradation
+    /// signal and handed the degraded settlement to a process-owned task.
+    #[cfg(test)]
+    test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize,
     /// One-shot deterministic gate after a logical control command resolves
     /// its SessionId but before it acquires the current entry's mutation gate.
     /// Tests replace A with B in this window to prove the command captures no
@@ -11964,6 +12104,10 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(test)]
+                test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12198,6 +12342,10 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(test)]
+                test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12959,6 +13107,9 @@ mod durable_steer_tests;
 
 #[cfg(test)]
 mod terminal_receipt_tests;
+
+#[cfg(test)]
+mod durability_gate_wait_tests;
 
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;

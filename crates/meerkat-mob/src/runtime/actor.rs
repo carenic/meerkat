@@ -48606,6 +48606,42 @@ impl MobActor {
                 if let Err(error) =
                     boxed_arm_future(|| self.admit_member_retire_for_destroy(entry)).await
                 {
+                    // A boundary commit that fails while the ingress detach
+                    // waits for the session's mutation gate ends that wait
+                    // typed instead of leaving it behind the gate the exited
+                    // runtime loop keeps. Reload the degraded member and
+                    // retry its admission once: the retry takes the pending
+                    // detach the failed attempt recorded.
+                    #[cfg(feature = "runtime-adapter")]
+                    match boxed_arm_future(|| self.reload_member_if_durability_degraded(entry))
+                        .await
+                    {
+                        Ok(true) => {
+                            if !report.reloaded_members.contains(&entry.agent_identity) {
+                                report.reloaded_members.push(entry.agent_identity.clone());
+                            }
+                            if let Err(error) =
+                                boxed_arm_future(|| self.admit_member_retire_for_destroy(entry))
+                                    .await
+                            {
+                                report.push_error(format!(
+                                    "{}: destroy retire admission failed after the member's durability reload: {error}",
+                                    entry.agent_identity
+                                ));
+                                return Err(MobDestroyError::Incomplete { report });
+                            }
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(reload_error) => {
+                            report.push_error(format!(
+                                "{}: destroy retire admission failed: {error}",
+                                entry.agent_identity
+                            ));
+                            report.push_error(reload_error);
+                            return Err(MobDestroyError::Incomplete { report });
+                        }
+                    }
                     report.push_error(format!(
                         "{}: destroy retire admission failed: {error}",
                         entry.agent_identity
