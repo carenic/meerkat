@@ -973,6 +973,37 @@ for (const path of [
     assert.equal(web.example_web, true, `${path} runs the example web suites in the pull request`);
     if (!path.startsWith("sdks/")) assert.equal(web.wasm, true, `${path} runs wasm-check in the pull request`);
   }
+  // A pull request builds the web wasm only on a cached closure: a change to
+  // a crate the web runtime builds on, or a whole-workspace plan, compiles
+  // that closure cold (1181 s on pull request 39209102985), so the plan
+  // leaves the wasm build, the browser suites and the WASM timer lane to the
+  // push and keeps the Web SDK's type and unit tests. A change to the
+  // runtime itself, the SDK or the examples builds the wasm in the pull
+  // request; a push builds it whenever the lane runs.
+  for (const [paths, wasm] of [
+    [["crates/meerkat-contracts/src/lib.rs"], false],
+    [["crates/meerkat-core/src/lib.rs", "sdks/web/src/runtime.ts"], false],
+    [[".github/workflows/ci.yml"], false],
+    [["crates/meerkat-web-runtime/src/lib.rs"], true],
+    [["sdks/web/src/runtime.ts"], true],
+    [["examples/031-wasm-mini-diplomacy-sh/web/tests/regression.test.mjs"], true],
+  ]) {
+    const plan = planFor(paths, ["--event", "pull_request"]);
+    const label = paths.join(" + ");
+    assert.equal(plan.example_web, true, `${label} runs the example web lane in the pull request`);
+    assert.equal(plan.example_web_wasm, wasm, `${label} ${wasm ? "builds" : "leaves"} the web wasm in the pull request`);
+    assert.equal(plan.deferred_to_push.example_web_wasm, !wasm, `${label}: deferred_to_push ${wasm ? "keeps" : "names"} the web wasm`);
+    const summary = run(["--format", "github", "--event", "pull_request", "--", ...paths]).stdout;
+    assert.equal(
+      /^deferred_to_push=.*the web wasm build and browser suites/m.test(summary),
+      !wasm,
+      `${label}: the gate's deferral notice ${wasm ? "omits" : "names"} the web wasm`,
+    );
+    assert.match(summary, new RegExp(`^example_web_wasm=${wasm}$`, "m"), `${label}: GitHub output carries example_web_wasm`);
+  }
+  for (const path of ["crates/meerkat-core/src/lib.rs", "crates/meerkat-rpc/src/lib.rs", "sdks/web/src/runtime.ts"]) {
+    assert.equal(planFor([path]).example_web_wasm, true, `a push that changes ${path} builds the web wasm when the lane runs`);
+  }
   // wasm-check runs for every crate the wasm build compiles (the web
   // runtime's dependency closure in the cargo graph), the provider crates
   // included (#1108), and for no crate outside it.
@@ -1637,16 +1668,66 @@ for (const path of [
     });
   }
   // The feature-check rows are compile-only, but a row whose objects are not
-  // in sccache yet runs long: the rkat+6 matrix row hit the 30-minute timeout
-  // on main push run 39186529346 and on release-branch dispatches (projected
-  // 35-38 minutes cold). Both waves allow exactly 45 minutes: room for a cold
-  // row, and no more, so a hung row still fails early.
+  // in sccache yet runs long: the rkat+6 matrix row took 41m23s cold on
+  // dispatch 39211283488 and was cancelled at the old 45-minute cap on main
+  // push 39213218053 after its commands had run 44m29s. Both waves allow
+  // exactly 60 minutes: room for a cold row, and no more, so a hung row still
+  // fails early.
   for (const job of ["feature-check", "feature-check-rest"]) {
     const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: \d+$/.test(line));
     assert.equal(
       timeout,
-      "    timeout-minutes: 45",
-      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 45 (a cold feature row needs more than 30 minutes, and a longer cap only delays a hung row)`,
+      "    timeout-minutes: 60",
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 60 (a cold feature row takes up to 45 minutes, and a longer cap only delays a hung row)`,
+    );
+  }
+  // The integration suites and the example web suites compile cold on the
+  // first push or dispatch of a tree that changes meerkat-core: a pull
+  // request keeps its caps, a push or dispatch gets caps sized from the cold
+  // runs (the comments beside each job).
+  for (const [job, pullRequest, push] of [
+    ["integration", 30, 50],
+    ["example-web", 25, 35],
+  ]) {
+    const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: /.test(line));
+    assert.equal(
+      timeout,
+      `    timeout-minutes: \${{ github.event_name == 'pull_request' && ${pullRequest} || ${push} }}`,
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not ${pullRequest} minutes on a pull request and ${push} on a push or dispatch`,
+    );
+  }
+  // A pull request that leaves the web wasm to the push still runs the Web
+  // SDK's type and unit tests: every step after them that needs Rust, the
+  // wasm or a browser runs only when the plan builds the wasm.
+  {
+    const steps = [];
+    for (const line of jobLines(workflow, "example-web")) {
+      const name = /^      - name: (.*)$/.exec(line);
+      if (name) steps.push({ name: name[1], lines: [] });
+      else if (steps.length > 0) steps.at(-1).lines.push(line);
+    }
+    const wasmGate = "        if: ${{ needs.changes.outputs.example_web_wasm == 'true' }}";
+    const ungated = steps.filter((step) => !step.lines.includes(wasmGate)).map((step) => step.name);
+    assert.deepEqual(
+      ungated,
+      ["Checkout", "Setup Node", "Install the Web SDK", "Web SDK type and unit tests"],
+      "only the checkout, Node and the Web SDK's type and unit tests run without the wasm",
+    );
+    const unitTests = steps.find((step) => step.name === "Web SDK type and unit tests");
+    assert.ok(unitTests.lines.includes("        run: npm test"), "the Web SDK's type and unit tests run npm test");
+    assert.ok(
+      steps.some((step) => step.name === "Build the Web SDK wasm" && step.lines.includes("        run: npm run build:wasm")),
+      "the wasm build is its own gated step",
+    );
+    assert.ok(
+      workflow.includes("      example_web_wasm: ${{ steps.plan.outputs.example_web_wasm }}\n"),
+      "the classification job exports example_web_wasm",
+    );
+    assert.ok(
+      jobLines(workflow, "wasm-timers").includes(
+        "    if: ${{ (github.event_name == 'push' && needs.changes.outputs.release_projection != 'true') || needs.changes.outputs.example_web_wasm == 'true' }}",
+      ),
+      "the WASM timer lane, which compiles the same closure, runs with the web wasm build",
     );
   }
   const stagger = jobLines(workflow, "stagger").join("\n");

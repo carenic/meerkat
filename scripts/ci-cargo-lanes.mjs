@@ -1983,6 +1983,7 @@ function plan(args) {
     bazel_graph: false,
     examples_browser: false,
     example_web: false,
+    example_web_wasm: false,
     docs_only: false,
     release_projection: releaseProjection,
   };
@@ -2188,6 +2189,7 @@ function plan(args) {
     governed_jsonl: false,
     mcp_confinement_positive: false,
     reader_rows: [],
+    example_web_wasm: false,
   };
   result.reader_not_run = [];
 
@@ -2262,6 +2264,19 @@ function plan(args) {
   if (result.packages.some((name) => name === "meerkat-web-runtime" || wasmBuild?.has(name))) {
     result.wasm = true;
   }
+  // The example web suites build that closure for wasm32 at the release
+  // profile, and a change to any crate in it misses sccache from that crate
+  // up: the build step took 1181 s of pull request 39209102985's 1329 s lane
+  // after a meerkat-core change (114 s with the closure cached; the lane
+  // budget is 1080 s). The web runtime compiles meerkat-mob, so a pull
+  // request that changes a crate it builds on, or plans the whole workspace,
+  // leaves the wasm build and the browser suites to the push, like the
+  // meerkat-mob chain's lanes. It keeps the Web SDK's type and unit tests,
+  // which need no wasm. The push builds the wasm whenever the lane runs.
+  const wasmClosureChanged =
+    result.mode === "workspace" || [...seeds].some((name) => name !== "meerkat-web-runtime" && wasmBuild?.has(name));
+  result.example_web_wasm = !deferToPush || (result.example_web && !wasmClosureChanged);
+  deferred.example_web_wasm = deferToPush && result.example_web && !result.example_web_wasm;
 
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
@@ -2733,6 +2748,7 @@ function deferredSummary(deferred) {
   if (deferred.clippy_test_targets.length > 0) parts.push(`the test targets' Clippy of ${deferred.clippy_test_targets.join(", ")}`);
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");
+  if (deferred.example_web_wasm) parts.push("the web wasm build and browser suites");
   return parts.join("; ");
 }
 
@@ -2752,6 +2768,7 @@ function githubOutput(result) {
   scalar("bazel_graph", String(result.bazel_graph));
   scalar("examples_browser", String(result.examples_browser));
   scalar("example_web", String(result.example_web));
+  scalar("example_web_wasm", String(result.example_web_wasm));
   scalar("docs_only", String(result.docs_only));
   const projection = result.release_projection;
   scalar("release_projection", String(projection !== null));

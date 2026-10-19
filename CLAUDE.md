@@ -567,7 +567,14 @@ and its CI must be green before a release tag (`require_ci_green`):
   own inputs (`sdks/web/`, the runtime, the contracts, examples 031-033),
   and on a push also for every change whose closure reaches
   `meerkat-web-runtime`; `example-web` also runs the Web SDK's `npm test` (type
-  tests over the generated events, node unit suites).
+  tests over the generated events, node unit suites). A pull request that
+  changes a crate the web runtime builds on, or plans the whole workspace,
+  runs only that `npm test` and leaves the wasm build, the browser suites
+  and `wasm-timers` to the push (`example_web_wasm` false, named in
+  `deferred_to_push`): the cold wasm build of the runtime's closure alone
+  took about 20 minutes. On a push or dispatch `example-web` gets 35 minutes
+  and `integration` 50 (a pull request keeps 25 and 30), and `feature-check`
+  60: caps sized from cold runs after a meerkat-core change.
 - `push: main` only (no budget): `main-unit` over the whole workspace (the
   unit lane's rows verbatim, then the rest of the workspace in packed
   shards), `sdk-host`, and the push-only lanes above.
