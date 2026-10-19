@@ -305,6 +305,18 @@ them.
   (patterns without `..` and literals need it), and the exhaustively
   constructible `AuditPolicyRead` gains `publication_instance:
   Option<uuid::Uuid>` (struct literals need it).
+- Child tool bundle opt-in (see Added):
+  - `meerkat-mob-mcp`: `ChildToolBundleAvailability` gains `ChildOffered`
+    and is now `#[non_exhaustive]`; `ChildMcpServerRegistrationError` gains
+    `OfferNotSupported` and is now `#[non_exhaustive]`. A `match` over either
+    needs a wildcard arm.
+  - `meerkat-mob`: `ToolConfig` gains the field `bundles: Vec<String>`, and
+    `MobError` gains the variant `ToolBundleNotOffered`. Code that builds a
+    `ToolConfig` with a struct literal sets the field, or uses
+    `..ToolConfig::default()`.
+  - `meerkat-contracts`: `MobToolConfigInput` gains the field
+    `bundles: Vec<String>` (the public `tools.bundles`). Code that builds it
+    with a struct literal sets the field.
 
 ### Security
 
@@ -459,6 +471,33 @@ them.
   compare. Rows carry both at stored input state version 7; a row stamped
   before v7 that carries either is refused. Records written earlier read
   with neither.
+- Child-profile tool bundle opt-in. A host registers a bundle with
+  `ChildToolBundleAvailability::ChildOffered` to offer it to child mobs
+  without supplying it: an inline profile of a child mob, a mob a member
+  creates with `mob_create`, mounts it only by naming it in `tools.bundles`.
+  A name the host does not offer is refused with
+  `MobError::ToolBundleNotOffered`, which lists the offered names (an
+  argument error for the agent tool, invalid params on `mob/create`); an
+  empty or repeated name is an argument error; a create that is not a child
+  mob's, and a realm or spawn-time profile given as public profile input,
+  cannot opt in. The opt-in persists with the definition and the host's
+  offer is its ceiling at every build, a resume included: an opted bundle
+  the host no longer offers is withheld, never failing the member build, and
+  `MobHandle::withheld_tool_bundles` (`WithheldToolBundle`) reports it.
+  While any opted bundle is withheld, every deny name in no vocabulary is
+  checked only at call time (`ToolVocabularySource::WithheldBundle`), so a
+  typo is reported at build only once the bundle is mounted again. The
+  adaptive `LayerDecision` schema stays the released one and does not list
+  `tools.bundles`. A host may still set `bundles` where it names
+  `rust_bundles` itself, on a realm profile it stores or on a definition it
+  composes with `MobBuilder`, as the lenient twin of the strict
+  `rust_bundles`. Like a `rust_bundles` entry, an opted bundle makes a
+  profile non-portable, so a placed member is refused, and adaptive policy
+  evidence counts it. Registering an MCP server as `ChildOffered` is refused
+  with `ChildMcpServerRegistrationError::OfferNotSupported`: MCP descriptors
+  have no opt-in. A binary older than this release ignores the persisted
+  `bundles` key, so after a downgrade those members run without the bundle
+  and without the marker.
 
 ### Changed
 

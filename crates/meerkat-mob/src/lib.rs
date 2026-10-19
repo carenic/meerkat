@@ -320,10 +320,11 @@ pub use runtime::{
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
     SpawnMemberSpec, SpawnPolicy, SpawnResult, SpawnSource, SpawnSpec, SpawnSystemPromptOverride,
-    SpawnToolAdmission, SupervisorRotationReport, WorkBoundedTurnResult, WorkDeliveryReceipt,
-    WorkTurnHandle, materialize_nonpersistent_session_resume_verdict, mob_error_wire_code,
-    observe_live_durable_source_via_projection_visibility, observe_member_status_view_via_read,
-    profile_to_wire, render_bounded_delegation_task, stored_realm_profile_to_wire,
+    SpawnToolAdmission, SupervisorRotationReport, WithheldToolBundle, WorkBoundedTurnResult,
+    WorkDeliveryReceipt, WorkTurnHandle, materialize_nonpersistent_session_resume_verdict,
+    mob_error_wire_code, observe_live_durable_source_via_projection_visibility,
+    observe_member_status_view_via_read, profile_to_wire, render_bounded_delegation_task,
+    stored_realm_profile_to_wire,
 };
 pub use runtime::{CloseIfIdleOutcome, MobAdmissionCloseReason, MobBusy};
 #[cfg(feature = "openai-live")]

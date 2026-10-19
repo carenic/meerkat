@@ -84,3 +84,21 @@ fn conflicting_registration_and_profile_binding_refuse_without_replacement() {
             .all(|profile| profile.tools.mcp_servers.is_empty())
     );
 }
+
+/// An MCP descriptor has no profile opt-in, so registering one as offered is
+/// refused typed rather than silently never supplied.
+#[test]
+fn an_offered_mcp_server_registration_is_refused() {
+    let error = ChildMcpServers::new()
+        .register(
+            descriptor("offered", "http://127.0.0.1/offered-binding"),
+            ChildToolBundleAvailability::ChildOffered,
+        )
+        .err();
+    assert_eq!(
+        error,
+        Some(ChildMcpServerRegistrationError::OfferNotSupported {
+            name: "offered".to_string()
+        })
+    );
+}
