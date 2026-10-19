@@ -9989,6 +9989,16 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot hold armed by a test: the next live channel custody or
+    /// playback-readiness read waits here (entered, release) right after it
+    /// takes its machine snapshot.
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+    test_live_custody_read_hold: StdMutex<
+        Option<(
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// One-shot witness armed by a test: the next caller that waits on an
     /// unregister teardown saga reports the wait it dispatched on.
     #[cfg(feature = "test-support")]
@@ -11907,6 +11917,8 @@ impl MeerkatMachine {
                 test_executor_after_ensure_pause_release: crate::tokio::sync::Notify::new(),
                 #[cfg(feature = "test-support")]
                 test_unregister_saga_hold: StdMutex::new(None),
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+                test_live_custody_read_hold: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
@@ -12141,6 +12153,8 @@ impl MeerkatMachine {
                 test_executor_after_ensure_pause_release: crate::tokio::sync::Notify::new(),
                 #[cfg(feature = "test-support")]
                 test_unregister_saga_hold: StdMutex::new(None),
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
+                test_live_custody_read_hold: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
                 test_unregister_wait_witness: StdMutex::new(None),
                 #[cfg(feature = "test-support")]
@@ -12962,6 +12976,12 @@ mod durable_steer_tests;
 
 #[cfg(test)]
 mod terminal_receipt_tests;
+
+#[cfg(test)]
+mod input_transition_wait_tests;
+
+#[cfg(all(test, feature = "live"))]
+mod live_custody_read_tests;
 
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;

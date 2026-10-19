@@ -4437,6 +4437,42 @@ impl DriverEntry {
         }
     }
 
+    /// Committed input lifecycle steps of this driver; see
+    /// [`EphemeralRuntimeDriver::subscribe_input_transitions`]. A persistent
+    /// driver commits every input step through its inner driver.
+    pub(crate) fn subscribe_input_transitions(&self) -> crate::tokio::sync::watch::Receiver<u64> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.subscribe_input_transitions(),
+            DriverEntry::Persistent(d) => d.inner_ref().subscribe_input_transitions(),
+        }
+    }
+
+    /// See [`EphemeralRuntimeDriver::apply_without_run_for_test`].
+    #[cfg(test)]
+    pub(crate) fn apply_without_run_for_test(
+        &mut self,
+        input_id: &InputId,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.apply_without_run_for_test(input_id),
+            DriverEntry::Persistent(d) => d.inner_mut().apply_without_run_for_test(input_id),
+        }
+    }
+
+    /// Consume inputs at `AppliedPendingConsumption` through the generated
+    /// lifecycle, as a completed run's boundary does.
+    #[cfg(test)]
+    pub(crate) fn consume_inputs_for_test(
+        &mut self,
+        input_ids: &[InputId],
+        run_id: &RunId,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.consume_inputs(input_ids, run_id),
+            DriverEntry::Persistent(d) => d.inner_mut().consume_inputs(input_ids, run_id),
+        }
+    }
+
     /// Machine-owned per-run boundary counter — the single producer of the
     /// run-boundary receipt sequence (dogma K10).
     pub(crate) fn run_boundary_sequence(&self, run_id: &RunId) -> u64 {

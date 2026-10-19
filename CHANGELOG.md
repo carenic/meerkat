@@ -279,6 +279,14 @@ them.
   opt-in `turn_projection_cost` benchmarks (ignored timing tests in
   `meerkat-runtime` and `meerkat`) a snapshot read takes about 25% less time
   and a whole scripted turn with three tool calls about 23% less.
+- `meerkat-runtime`: `MeerkatMachine::cancel_input_if_present` and
+  `cancel_tracked_input_for_member_incarnation` no longer re-read an input
+  caught between lifecycle steps (neither queued nor terminal, with no run
+  yet) every 25 ms. They wait for that input's next committed lifecycle step
+  (its run association, a phase step or its terminal), which the runtime
+  driver signals at its single commit point, and re-read then; the
+  5-second settle bound remains only as a hang guard, and a cancellation
+  reads the input once more before it reports that bound (#1655).
 
 ### Fixed
 
@@ -440,6 +448,23 @@ them.
   the actor stopped with admission open, so `acquire_owner` still handed out
   owner leases and `admission_closed()` stayed `None`. With the closes above,
   no mob actor exit leaves admission open.
+- `meerkat-runtime`: in-memory runtime store execution custody no longer
+  refuses with `RuntimeStoreExecutionCustodyError::Busy` because its counter
+  lock was briefly held, for example while a claim released on another
+  thread (a dropped machine's ops worker) updated the counters. An acquire or
+  upgrade now waits for that update, so `Busy` means only a real governed or
+  shared conflict; a poisoned owner is still `Unavailable` (#1736).
+- `meerkat-runtime`: live channel custody and playback-readiness reads
+  (`MeerkatMachine::validate_live_channel_custody_by_pending_receipt`,
+  `validate_live_channel_custody_by_activation_receipt`,
+  `validate_live_playback_owner_readiness` and
+  `validate_live_active_playback_owner_readiness`, and the facade's
+  `validate_experimental_live_channel_custody*`) answer from one machine
+  snapshot. An activation, revocation or close that commits during the read
+  no longer fails it with `ValidationFailed` ("receipt is not current"): the
+  read answers the phase its snapshot holds, and the next read answers the
+  committed one. Four generated machine invariants pin the stage and
+  activation records every custody answer reads (#1606).
 
 ## [0.9.3] - 2026-10-18
 

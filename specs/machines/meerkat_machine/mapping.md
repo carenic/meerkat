@@ -8640,6 +8640,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `live_execution_phase_is_explicit_and_revocation_is_terminal`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `live_pending_phase_has_its_stage`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_active_pending_channel_has_its_activation`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_custody_receipts_have_mode_and_phase`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_activation_receipt_phase_is_active_or_revoked`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `live_bridge_operation_identity_is_complete_and_direct`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
