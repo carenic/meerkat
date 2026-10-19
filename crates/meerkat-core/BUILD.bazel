@@ -487,6 +487,7 @@ rust_test(
         "tests/fixtures/v0_8_10_recovery_migration_session.provenance.json",
         "tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt",
         "tests/fixtures/v0_9_3_session_persistence_version_authority.rs.txt",
+        "tests/fixtures/v0_9_3_tool_config_notice_sessions.json",
     ],
     srcs = [
         "tests/core_source_ratchets.rs",
@@ -2079,6 +2080,7 @@ rust_test(
         "jsonschema",
         "schema",
         "test-support",
+        "workspace-tests",
     ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS + [
@@ -2090,6 +2092,7 @@ rust_test(
         "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
         "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
         "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/hooks/run_override.json",
         "tests/fixtures/pre_retention_six_rewrite_session.json",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
         "tests/fixtures/v0_8_10_recovery_migration_session.provenance.json",
