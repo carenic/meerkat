@@ -230,6 +230,19 @@ impl Fixture {
     }
 }
 
+/// Wait until the spawned read reaches its hold. A read that ends first (an
+/// error before its snapshot) fails the test instead of leaving it waiting on
+/// the armed hold.
+async fn reach_hold<T: std::fmt::Debug>(
+    entered: tokio::sync::oneshot::Receiver<()>,
+    read: &mut tokio::task::JoinHandle<T>,
+) {
+    tokio::select! {
+        entered = entered => entered.expect("the read reaches its hold"),
+        ended = read => panic!("the read ended before its hold: {ended:?}"),
+    }
+}
+
 fn assert_active(custody: &LiveChannelCustodyProjection) {
     match custody.state() {
         LiveChannelCustodyState::Active(activation) => {
@@ -256,11 +269,11 @@ async fn a_close_under_a_pending_receipt_read_reads_the_snapshot_phase() {
     fixture.activate().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
-    let read = tokio::spawn({
+    let mut read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
         async move { fixture.custody_by_pending().await }
     });
-    entered.await.expect("the read reaches its hold");
+    reach_hold(entered, &mut read).await;
     fixture.close(Some(PENDING), None).await;
     release.send(()).expect("release the held read");
 
@@ -286,11 +299,11 @@ async fn a_close_under_an_activation_receipt_read_reads_the_snapshot_phase() {
     fixture.activate().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
-    let read = tokio::spawn({
+    let mut read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
         async move { fixture.custody_by_activation().await }
     });
-    entered.await.expect("the read reaches its hold");
+    reach_hold(entered, &mut read).await;
     fixture.close(None, Some(ACTIVATION)).await;
     release.send(()).expect("release the held read");
 
@@ -315,11 +328,11 @@ async fn an_activation_under_a_pending_receipt_read_reads_the_snapshot_phase() {
     fixture.stage().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
-    let read = tokio::spawn({
+    let mut read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
         async move { fixture.custody_by_pending().await }
     });
-    entered.await.expect("the read reaches its hold");
+    reach_hold(entered, &mut read).await;
     fixture.activate().await;
     release.send(()).expect("release the held read");
 
@@ -349,11 +362,11 @@ async fn a_close_under_a_readiness_read_reads_the_snapshot() {
     fixture.stage().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
-    let read = tokio::spawn({
+    let mut read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
         async move { fixture.readiness().await }
     });
-    entered.await.expect("the read reaches its hold");
+    reach_hold(entered, &mut read).await;
     fixture.close(Some(PENDING), None).await;
     release.send(()).expect("release the held read");
 
@@ -382,11 +395,11 @@ async fn a_close_under_an_active_readiness_read_reads_the_snapshot() {
     fixture.activate().await;
 
     let (entered, release) = fixture.machine.test_hold_next_live_custody_read();
-    let read = tokio::spawn({
+    let mut read = tokio::spawn({
         let fixture = Arc::clone(&fixture);
         async move { fixture.active_readiness().await }
     });
-    entered.await.expect("the read reaches its hold");
+    reach_hold(entered, &mut read).await;
     fixture.close(None, Some(ACTIVATION)).await;
     release.send(()).expect("release the held read");
 

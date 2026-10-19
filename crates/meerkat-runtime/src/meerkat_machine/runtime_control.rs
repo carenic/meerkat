@@ -7631,8 +7631,10 @@ impl MeerkatMachine {
                 reason: "opaque live pending receipt is not current".to_string(),
             });
         }
-        // Unreachable while `live_pending_phase_has_its_stage` holds; kept as
-        // typed fail-closed answers.
+        // The phase is Pending here, and `live_pending_phase_has_its_stage`
+        // gives a Pending channel all four stage records, so these four
+        // lookups cannot fail while it holds; kept as typed fail-closed
+        // answers.
         let runtime_id = state
             .live_experimental_staged_runtime_by_channel
             .get(channel)
@@ -7757,9 +7759,12 @@ impl MeerkatMachine {
                 reason: "opaque live activation receipt is not current".to_string(),
             });
         }
-        // Unreachable while `live_active_pending_channel_has_its_activation`
-        // and `live_execution_binding_is_complete_and_channel_scoped` hold;
-        // kept as typed fail-closed answers.
+        // The phase is Active and the activation receipt is bound here.
+        // `live_active_pending_channel_has_its_activation` gives such a
+        // channel its runtime binding, and
+        // `live_execution_binding_is_complete_and_channel_scoped` its fence and
+        // generation, so these three lookups cannot fail while both hold; kept
+        // as typed fail-closed answers.
         let runtime_id = state
             .live_execution_runtime_id_by_channel
             .get(channel)

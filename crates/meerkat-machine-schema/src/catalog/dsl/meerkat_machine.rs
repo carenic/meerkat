@@ -9263,20 +9263,33 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // The custody and readiness reads answer from one snapshot; these four
-        // make each of their arms total for a bound receipt (#1606).
+        // make each of their arms total for a bound receipt (#1606). A Pending
+        // channel has its whole stage: runtime, fence, generation and seed
+        // cursor.
         invariant live_pending_phase_has_its_stage {
             for_all(channel_id in self.live_execution_phase_by_channel.keys(),
                 self.live_execution_phase_by_channel.get_copied(channel_id)
                     != Some(LiveExecutionChannelPhase::Pending)
-                || self.live_experimental_staged_runtime_by_channel.contains_key(channel_id))
+                || (self.live_experimental_staged_runtime_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_fence_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_generation_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_seed_cursor_by_channel.contains_key(channel_id)))
         }
 
+        // An Active channel reached by its pending receipt has its activation
+        // and its execution binding; one reached by its activation receipt has
+        // its binding. The binding's fence and generation follow from
+        // live_execution_binding_is_complete_and_channel_scoped.
         invariant live_active_pending_channel_has_its_activation {
             for_all(channel_id in self.live_experimental_pending_receipt_by_channel.keys(),
                 self.live_execution_phase_by_channel.get_copied(channel_id)
                     != Some(LiveExecutionChannelPhase::Active)
                 || (self.live_activation_receipt_by_channel.contains_key(channel_id)
                     && self.live_execution_runtime_id_by_channel.contains_key(channel_id)))
+            && for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Active)
+                || self.live_execution_runtime_id_by_channel.contains_key(channel_id))
         }
 
         invariant live_custody_receipts_have_mode_and_phase {
