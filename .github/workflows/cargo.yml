@@ -187,7 +187,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -300,7 +300,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -339,7 +339,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -433,7 +433,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -565,7 +565,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -615,7 +615,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -659,7 +659,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -840,7 +840,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
@@ -887,7 +887,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
@@ -947,7 +947,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
@@ -1012,7 +1012,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Cache cargo
@@ -1058,7 +1058,7 @@ jobs:
         if: ${{ steps.sccache.outcome == 'failure' }}
         shell: bash
         run: |
-          echo "::warning::sccache-action did not install sccache v0.18.0 (see its Setup sccache step); this job compiles without sccache"
+          echo "::warning::sccache-action did not install sccache (see its Setup sccache step); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
 
       - name: Setup mold linker
