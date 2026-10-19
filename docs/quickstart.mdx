@@ -73,7 +73,7 @@ Each GitHub release has one archive per binary per target, plus
 them on your `PATH`:
 
 ```bash
-VERSION=<version>   # for example 0.8.51
+VERSION=<version>   # x.y.z, without the leading v
 TARGET=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu
 BASE=https://github.com/lukacf/meerkat/releases/download/v$VERSION
 curl -LO "$BASE/checksums.sha256"

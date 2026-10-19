@@ -336,6 +336,11 @@ session-cumulative account, not the last call's usage.
 - `compaction_completed.summary_tokens` is the output size of the compaction
   summary call and carries no provider/model attribution and no presented-input
   count, so compaction cost cannot be attributed from the event stream alone.
+  Since 0.9.4 its `summary_source.kind` says who wrote the summary: only
+  `provider_call` is backed by a provider request; `host_curator` and
+  `mechanical_fallback` summaries are not (a summary call that stopped at the
+  context window before the mechanical fallback is still charged to the
+  session).
 - A call whose turn fails after the provider answered (a denied hook, an
   exhausted budget) is charged but publishes no per-call row, and neither does
   a compaction summary call; `RunResult.request_usage` lists them.

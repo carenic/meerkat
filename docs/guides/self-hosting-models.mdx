@@ -385,6 +385,16 @@ Use vLLM when you want a private server with more deployment control.
   </Step>
 </Steps>
 
+## Refusals and Content Filters
+
+Since 0.9.4 a refusal from an OpenAI-compatible server ends the run the way an
+OpenAI refusal does: a streamed `delta.refusal` ends the response as a
+refusal, and a `finish_reason` of `content_filter` ends it as a content
+filter. The run fails as `content_filtered` with that stop and an
+`open_ai`-tagged detail, and the refusal text is never committed as an
+answer. See
+[Refusals and content filters](/concepts/providers#refusals-and-content-filters).
+
 ## Validation
 
 Run these after adding or editing self-hosted model config:

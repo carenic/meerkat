@@ -272,9 +272,10 @@ example after a logout in another process) is released the same way. No
   identity). A grant without it, including every grant issued before 0.9,
   admits nothing: reissue it. Loading deferred tools also needs
   `rkat realm grant <realm> --catalog`. `[[governance.review.rules]]` can raise
-  an `mcp_server` or `mcp_operation` target to R2 or R3. Known issue: sessions
-  a schedule creates in a governed realm are not bound to an agent yet, so
-  every configured MCP server is refused there.
+  an `mcp_server` or `mcp_operation` target to R2 or R3. Schedules run no
+  agent work in a governed realm yet: since 0.9.3 `rkat` and `rkat-rpc` refuse
+  every fire there as `schedule_mandate_unavailable` before a session is
+  created, and `rkat-rest` and `rkat-mcp` refuse to open a governed realm.
 
 ## Live attach and detach
 
@@ -298,22 +299,35 @@ example after a logout in another process) is released the same way. No
   session created before the server process started.
 - Live-added HTTP servers use stored OAuth credentials; without one the
   server waits for a host login, then is re-added automatically.
-- Governed runtimes: REST and `meerkat_mcp_add` refuse live adds (no
-  authenticated attachment control). The governed `rkat-rpc` stdio pipe
-  offers `mcp/add` for live attachment only (`persisted: true` is refused) and
-  decides it against the agent's grants.
+- Governed runtimes: stock `rkat-rest` and `rkat-mcp` refuse to open a
+  governed realm (`realm '<id>' is governed and cannot be opened as an
+  ordinary realm`). On a governed runtime, REST and `meerkat_mcp_add` refuse
+  live adds (no authenticated attachment control). The governed `rkat-rpc`
+  stdio pipe offers `mcp/add` for live attachment only (`persisted: true` is
+  refused) and decides it against the agent's grants.
 - RPC records each accepted add durably. After a host restart a resumed
   session re-stages a recorded server only while it is still installed in the
   realm config or `mcp.toml` (for example added with `persisted: true`), from
   that current definition. Otherwise it is refused (retired, rebound, account
   changed, or `renewal_required` when the record cannot prove its target) and
-  needs a fresh add. Outcomes arrive as `tool_config_changed`.
+  needs a fresh add. Outcomes arrive as `tool_config_changed` events. Since
+  0.9.4 their lifecycle bit is `settled` (events and notices stored by 0.9.3
+  and earlier keep `persisted`; readers accept either). The request and
+  response field `persisted` of `mcp/add|remove|reload` keeps its meaning:
+  whether the change is also written to the host's project `mcp.toml`.
 - (Rust host) `PersistentSessionService::attach_live_mcp_server` attaches to a
   governed member at its turn boundary. `try_attach_live_mcp_server` never
   waits: a held boundary (including a call from inside the member's own turn)
   returns `LiveMcpAttachError::Busy` and attaches nothing; `Busy` grants
   nothing and is not an instruction to retry. A member without a live
   attachment surface returns `Unsupported`.
+- (Rust host) Since 0.9.4 a `ConfiguredMcpAttachmentProvider` and
+  `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` receive
+  the exact `RuntimeSessionRegistrationWitness` instead of a `SessionId`, and
+  decide for that one registration: a later registration of the same session
+  is a different one. Read the id with `registration.session_id()`; a closure
+  provider is `Fn(&RuntimeSessionRegistrationWitness, SessionAgentBinding) ->
+  Option<..>`.
 
 ## Startup, readiness and deferred tools
 

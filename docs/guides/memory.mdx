@@ -49,7 +49,14 @@ At runtime, `AgentFactory::memory(true)` enables the semantic memory path
 `session-compaction` feature installs `DefaultCompactor` independently of that
 memory toggle. Low-level core embeddings can instead supply a `Compactor`;
 facade builds use the factory/config pipeline rather than direct
-`AgentBuilder::compactor` injection.
+`AgentBuilder::compactor` injection (on the facade builder it makes
+`try_build` fail). Since 0.9.4 a `Compactor` implements
+`prepare_for_summarization(messages, budget)` with no default: `budget` is the
+`SummarizationSourceBudget` of the model that writes the summary (`None` when
+it declares no context window), and the returned `SummarizationSource` states
+how much of the history it carries. Returning
+`SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+keeps the 0.9.3 behaviour.
 
 ```rust
 let factory = AgentFactory::new(store_path)
@@ -148,9 +155,10 @@ When compaction triggers:
   </Step>
   <Step title="Produce the summary">
     Without a curator, a provider-safe projection of the current history plus
-    the compaction prompt is sent to the LLM with no tools and
-    `max_summary_tokens` as the response limit. Media and reasoning are
-    projected for summarization. The source may take two bytes per token of
+    the compaction prompt is sent to the summarizing model (the session's
+    active model after any model fallback, or the admitted controller) with no
+    tools and `max_summary_tokens` as the response limit. Media and reasoning
+    are projected for summarization. The source may take two bytes per token of
     the summarizing model's context window left after `max_summary_tokens`,
     capped by the model's declared input ceiling, less the prompt, and never
     less than 4 KiB. For a model that declares no window it may take a quarter

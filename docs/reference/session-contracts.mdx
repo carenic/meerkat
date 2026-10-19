@@ -770,6 +770,19 @@ written by maintenance use the registered `*.pre-<version>-<timestamp>`
 naming that `rkat storage doctor` inventories and `rkat storage prune`
 owns.
 
+The eligibility check that runs at open, before a domain's atomic migration,
+reads the schema ledger and the catalog in one snapshot (since 0.9.4), so a
+domain another process creates at the same moment is seen whole or not at all.
+0.9.3 and earlier could refuse such an open once with "schema domain ... has no
+ledger row but already owns objects", most often when two processes made their
+first durable delivery write together. A durable delivery read decides which
+tables to read from the version its own check verified.
+
+Stored runtime input state is version 7 since 0.9.4, assigned by the generated
+persistence version authority: every input row a 0.9.4 binary writes is
+version 7, including a row it read at version 3 to 6. A 0.9.3 or older binary
+refuses a version 7 row before installing state and leaves the bytes in place.
+
 <Warning>
 Recent session-envelope upgrades are one-way once a newer binary writes the
 session. Before upgrading a durable realm, snapshot every durable store and
@@ -803,6 +816,16 @@ exists, the head representation is canonical**. A released 0.8.10 blob, if
 present, is consumed only by the one-time activation importer and is never a
 fallback authority for a current head. Sessions created in HeadCanonical mode
 may have no meaningful `sessions` blob row at all.
+
+Since 0.9.4 the store also lays out a whole-blob session whose transcript graph
+retired its oldest occurrences, which every session compacted more often than
+`history_retained_rewrites` (default 4) has. The realm's one-time migration of
+such a blob row, the standalone WholeBlob conversion's seeding and read-only
+head synthesis write or derive the rows the store keeps after retiring the same
+occurrences incrementally: the retired base as a
+`session_transcript_retirements` row and rewrite rows for the retained
+generations only, and the synthesized head is the head the migration writes.
+0.9.3 and earlier refused such a session typed; the in-memory store still does.
 
 <Warning>
 Downstream tooling that reads `sessions.session_json` via direct SQL sees
@@ -997,6 +1020,15 @@ one run and every input already bound to it. The exact-input
 `cancel_input_if_present` and the exact-run `hard_cancel_run_if_current` only
 interrupt the run, so a durable steer that joined it still follows the rules
 above and can take a follow-up turn.
+
+Since 0.9.4 `cancel_input_if_present` and
+`cancel_tracked_input_for_member_incarnation` do not poll an input caught
+between lifecycle steps (neither queued nor terminal, with no run yet). They
+wait for that input's next committed lifecycle step (its run association, a
+phase step or its terminal), which the runtime driver signals at its single
+commit point, and read the input again then. The 5-second settle bound is only
+a hang guard; a cancellation reads the input once more before it reports that
+bound. 0.9.3 and earlier re-read such an input every 25 ms.
 
 - Under the session mutation gate, the machine compares its current run with
   `expected_run_id` and records the stop (`StopCurrentRunForRun`). It then

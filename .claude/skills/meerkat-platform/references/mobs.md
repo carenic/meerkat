@@ -89,6 +89,7 @@ Primary crates:
 - `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event once its input has failed terminally, after the runtime's bounded retries; one a retry delivers records nothing; the mob keeps running. The event is recorded in process: a crash before the input's terminal loses it)
 - `.with_default_llm_client(client)` — override LLM client (primarily for testing)
 - `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
+- `.with_member_runtime_registration_hook(hook)` (`runtime-adapter`) - the host selects each member's destination and agent mandate. Since 0.9.4 `MemberRuntimeBuildIdentity::registration()` names the exact registration a call is for (a new member's prepared one, or a recovered member's current one): bind decisions to it, not to the session id or labels. The identity is no longer `UnwindSafe`; wrap it in `AssertUnwindSafe` to move it into `catch_unwind`
 - `.create().await`
 - `.resume().await`
 
@@ -103,6 +104,7 @@ Primary crates:
 - subscriptions: `subscribe_agent_events()`, `subscribe_all_agent_events()`, `subscribe_mob_events()`, `subscribe_mob_events_with_config()`
 - admission: `close_if_idle()`, `close_admission(reason)`, `admission_closed()`, `observer()`, `acquire_owner()`, `is_public_owner()`
 - delivery scope: `capture_member_delivery_scope(identity)`, `submit_work_with_mode_and_delivery_identity_bounded(&scope, ...)`, `recover_bounded_work_at_scope(&scope, ...)`
+- member history (0.9.4+): `member_binding_history()`, `member_binding_for_session(&session_id)`, `last_member_binding(&identity)`, `durable_identity_members()`, `identity_management(&identity)`; `read_handle()` has the same reads
 - held spawns (native, `runtime-adapter`): `spawn_held_within(spec, deadline)` / `spawn_held_until(spec, deadline)`; publish the `HeldSpawn` with `activate()` or abort it with `abort()`
 
 Admission close: every exported `MobHandle` clone shares one public-owner
@@ -114,7 +116,40 @@ live opens, wiring and host binds with `MobError::AdmissionClosed { mob_id,
 reason }`; stop, shutdown, destroy, retirement, cancellation and reads stay
 available, and admitted work is never stopped. Keep a `MobHandle` clone for
 as long as the mob must keep admitting work. `close_if_idle()` answers
-`Closed`, `AlreadyClosed(reason)` or `Busy(MobBusy)`.
+`Closed`, `AlreadyClosed(reason)` or `Busy(MobBusy)`. Since 0.9.4 every actor
+exit closes admission first, with a typed `MobAdmissionCloseReason` (an
+earlier close keeps its reason): an admitted Shutdown (`Shutdown`) or destroy
+(`Destroyed`; a mob restored with an unfinished destroy starts closed), a
+durability fail-stop (`DurabilityFailStop`), a lost actor task (`ActorLost`)
+or a composition dispatch failure (`DispatchFailed`), besides `IdleClose`,
+`LastOwnerReleased` and `StandDown`. While a Shutdown drains, a request the
+close does not refuse gets the retryable `MobError::ShutdownInProgress`
+(wire `SESSION_BUSY`); `ActorCommandChannelClosed` means the actor has exited
+or is exiting. `MobError` is `#[non_exhaustive]`.
+
+Shutdown report: `shutdown_with_report(ShutdownOptions)`
+(`ShutdownOptions::default().with_deadline(deadline)` bounds its waits)
+returns a `MobShutdownReport` with per-member `members`
+(`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
+every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,
+settlement, .. }` (`#[non_exhaustive]`) carries a `MemberUnregisterSettlement`
+that follows the member's exact runtime registration after Shutdown returns,
+also after the actor exited, and holds the mob's runtime only weakly.
+`try_state()` answers at once; `settle_within(deadline)` waits (dropping the
+future cancels only the wait; `Pending` at the deadline, and a later call
+continues), admitting the unregister itself when Shutdown's deadline passed
+first. `MemberUnregisterState` is `Settled`, `Pending`, `Failed(reason)` or
+`HandedOver`: terminal, a resumed mob or another caller took the
+registration over in place, and nothing was unregistered or discarded. A
+durability-degraded member goes through the runtime's reload-required discard
+first (stage `durability_reload_discard` while the runtime refuses its
+unregister until then), so it no longer stays registered until the process
+exits.
+
+Stop hold: Stop holds run starts for every local member until Resume. Since
+0.9.4 that includes a member reloaded while the mob is stopped, one spawned
+into a stopped mob and one held again after a failed Resume; retire, Shutdown
+and destroy release the hold for the members they dispose of.
 
 Delivery scope: a host that persists effect-bearing deliveries captures the
 member's `MemberDeliveryScope` (runtime incarnation, fence and session; it
@@ -125,6 +160,33 @@ and is never retargeted: re-capture the scope. `recover_bounded_work_at_scope`
 reads only the scope's session and returns a `ScopedWorkState` (`Absent` is
 never retry permission). A member with no session binding has no scope
 (`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`).
+
+Member binding history (since 0.9.4): `member_binding_history()` folds the
+mob's durable member journal and Core's identity intent rows, read in one
+store transaction, into a `MemberBindingHistory`. A `MemberBinding` carries
+identity, generation, session (`None` for a peer-only member), role,
+continuity intent, a `MemberBindingState` (`Live`; `Moved`: a binding
+recovery moved the membership to another session; `Retired`: retired or
+ended by a mob reset) and a `MemberIdentityManagement` (`CommandDriven`;
+`IntentManaged`: Core's identity reconciler drives the identity, so do not
+send it lifecycle commands too; `IntentUnreadable`: an intent row this build
+cannot read, do not drive it). `binding_for_session` spans mob resets;
+`last_binding`, `durable_identity_members` (live members spawned with
+`SpawnContinuityIntent::DurableIdentity`) and `durable_identity_bindings`
+(live or retired) see only spawns since the latest mob reset. A retired
+identity keeps its last binding, and its session is the one `ensure_member`
+with `MemberLaunchMode::Resume` can restore. The reads never enter the actor
+queue, need `ControlScope::List` (`MobError::ScopeDenied`), and fail rather
+than answer empty; a storage composition without the built-in identity and
+member store refuses with
+`MobStoreError::IdentityMemberAtomicPersistenceUnavailable`. Pruning never
+removes the events they read. Destroy clears the journal, so a mob created
+again under the same id starts a new history and `journal_cursor()` values
+can repeat. With no running mob, `MobStorage::read_member_binding_history(path)`
+(native builds) reads a persistent store with the same fold, read-only: it
+never creates or migrates the store and refuses with
+`MemberBindingHistoryReadError::StoreMissing` or `ForeignSchema` (`Read` for
+a failed read).
 
 Scratch `task_create` / `task_update` / `task_list` / `task_get` are separately
 enabled agent tools, not `MobHandle` methods. Durable shared commitments belong
@@ -333,7 +395,12 @@ held by another `MobMcpState`), it keeps the files and answers
 (JSON-RPC and MCP: internal-error data; REST session archive: HTTP 500). Drop
 those handles and retry as the same caller; the retry continues the owed
 cleanup and answers the canonical report. Creating, restoring or inserting a
-mob under that id is refused until the cleanup is done.
+mob under that id is refused until the cleanup is done. An admitted destroy
+closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`). A
+host that drains observers itself reads a `SqliteMobObserverDrainReport`;
+since 0.9.4 its `retained_registrations` counts change-watch notification
+registrations still running when the drain stopped them (a struct literal
+must set it).
 
 ## External members
 
@@ -760,7 +827,16 @@ the spawning agent's visible tools. On a managed host
 agent-created child mobs and `delegate` helpers run under
 `MobMcpState::with_child_application_tool_policy`; without one, `mob_create`,
 `delegate` and spawns into child mobs are refused
-(`child_tool_policy_required`).
+(`child_tool_policy_required`). A host registers each Rust tool bundle for
+child mobs as `HostOnly` (default), `ChildAvailable` (supplied to every inline
+child profile) or, since 0.9.4, `ChildOffered`: supplied to no profile, and
+mounted only for an inline child profile that names it in `tools.bundles`.
+Any other name is refused with `MobError::ToolBundleNotOffered`, which lists
+the offered names; an MCP server cannot be `ChildOffered`
+(`ChildMcpServerRegistrationError::OfferNotSupported`). The opt-in persists
+with the definition and the offer is its ceiling at every build:
+`MobHandle::withheld_tool_bundles` reports opted bundles the host no longer
+offers, and the member is built without them.
 
 A realm profile store adds five profile-management tools for reusable,
 versioned member templates:

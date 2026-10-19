@@ -423,6 +423,64 @@ Provider-native web search is enabled by default for catalog models that
 support it. Disable the relevant `provider_tools.<provider>` toggle in config
 or use `rkat run --no-web-search` for one run.
 
+## Refusals and Content Filters
+
+Since 0.9.4, when a provider refuses a response or its content filter blocks
+it, the response ends with a typed stop instead of answer text. Meerkat
+commits nothing of that turn and runs none of its tool calls, and the run
+fails with class `content_filtered`. The `run_failed` event's
+`error_report.reason` names the stop and carries the provider's own account
+when it sent one:
+
+```json
+{
+  "reason_type": "content_filtered",
+  "stop": "refusal",
+  "detail": {"provider": "open_ai", "reason": "refusal", "refusal": "I can't help with that."}
+}
+```
+
+`stop` is `refusal` or `content_filter`. `detail` is tagged by `provider` and
+omitted when the provider sent none:
+
+| `provider` | `detail` fields |
+|------------|-----------------|
+| `anthropic` | `category` (the policy category, for example `cyber`) and `explanation` (display text, not stable), from the refusal's `stop_details` |
+| `open_ai` | `reason` (`refusal`, or the raw filter reason of a Responses, Chat Completions or realtime turn) and `refusal` (the refusal text) |
+| `gemini` | `stage` (`prompt` or `candidate`), `reason` (`promptFeedback.blockReason` or the candidate's `finishReason`) and `blocked_categories` (the safety categories marked blocked) |
+
+Each text field is capped at 4 KiB. Evidence of an unexpected shape reads as
+absent and never turns the stop into a stream error. Branch on `stop`; use
+`detail` for display and diagnostics.
+
+- **OpenAI**: a Responses `refusal` output part, streamed
+  (`response.refusal.delta` / `.done`) or in the terminal response, and a Chat
+  Completions `delta.refusal` end the response as a refusal. The refusal wins
+  over text and tool calls in the same response, and its text travels only as
+  the detail. A Responses `incomplete_details.reason` or a Chat
+  `finish_reason` of `content_filter` ends it as a content filter.
+  OpenAI-compatible self-hosted servers are read the same way.
+- **Anthropic**: a `refusal` stop carries its `stop_details` wherever the
+  stream puts it (inside or beside the `message_delta` delta, or on
+  `message_stop`); the `message_delta` value wins. A refusal whose stream is
+  cut after the stop still ends as a refusal.
+- **Gemini**: a prompt blocked before any candidate
+  (`promptFeedback.blockReason`, every reason including `OTHER`) fails the
+  run after one provider call. It is not retried, because the same prompt is
+  blocked again. A candidate that finishes with `SAFETY`, `RECITATION`,
+  `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`,
+  `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION` or `LANGUAGE` is a content
+  filter; `OTHER`, `MALFORMED_FUNCTION_CALL` and unknown reasons are retried
+  as an incomplete response.
+
+The `web_search` fallback tool reads its native search call's stop the same
+way; see [Built-in tools](/reference/builtin-tools#web-search-fallback-tool).
+
+In 0.9.3 and earlier the reason was `null`, an OpenAI refusal could be
+committed as the answer, and a Gemini prompt block was retried as an
+incomplete response. A 0.9.3 binary cannot read a session event log that
+holds a 0.9.4 content-filtered `run_failed` line.
+
 ## Model Fallback
 
 Runtime model fallback is disabled by default. Operators must explicitly enable

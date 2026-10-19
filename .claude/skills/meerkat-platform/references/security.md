@@ -586,8 +586,22 @@ secret_env = ["SEARCH_API_KEY"]
   does not prove no effect happened.
 - Approval records (`approvals.json`) are the audit trail of approval and
   consent decisions, including approver, assurance and consumption.
+- Refusal reads (0.9.4): a `Refused` audit record carries an
+  `AuditRefusalRead` saying where the refusal was decided. Its `basis` is
+  `owner_answer` (the owners answered at one coherent publication, a prepared
+  decision's own validity window included), `publication_changed` (the
+  publication changed under the attempt and the change completed) or
+  `change_in_progress`; it also carries the observation time, the sequence the
+  attempt read, the live sequence when the publication changed, and the
+  publication instance. A `Prepared` record's policy read names its
+  publication instance too, since sequences of different instances do not
+  compare. Rows carry both at stored input state version 7; records written
+  earlier read with neither.
 - Events: `hook_launch_refused`, `hook_denied`, `operation_observation_failed`,
   `tool_config_changed` (with `confinement_refusal`), plus typed tool results.
+  Each bounded wait for an owner change in progress is a `debug` event of
+  target `meerkat::authz::owner_change_wait` (0.9.4; see
+  `references/security_governance.md`).
 
 ## Errors and refusals reference
 

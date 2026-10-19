@@ -1407,6 +1407,17 @@ The result is `WebSearchResult`: `status`, `query`, optional `provider` and
 `native_events`, optional `error`, and `checked_at`. Native events are evidence
 from the provider, not Meerkat-owned truth.
 
+`status` is `completed` when a provider-native search event was observed,
+`unavailable` when the stream showed none (the search is unverified; any
+answer is still included and `error` says so), and `failed` when the native
+search call stopped on a refusal, a content filter, a filled context window
+or a cancellation: `error` then names the stop and the result has no answer,
+evidence or native events. A call cut at its output cap (`max_tokens`) or
+paused by the provider's server-tool loop (`pause_turn`) keeps its status and
+answer, and `error` says the answer may be incomplete. This holds since
+0.9.4; 0.9.3 and earlier reported a refused search's text as a `completed`
+or `unavailable` answer.
+
 This tool is classified read-only. Visibility is controlled by
 `override_web_search`, independently from general builtins.
 
