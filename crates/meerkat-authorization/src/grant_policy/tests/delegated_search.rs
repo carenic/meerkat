@@ -446,7 +446,7 @@ async fn a_delegated_search_never_uses_the_controller_route_permission() {
             who("executor"),
             Some(who("subject")),
             ExecutionRestrictions {
-                resource_domains: ExactRestriction::exact([domain(&key)]),
+                resource_domains: DomainRestriction::exact([domain(&key)]),
                 ..ExecutionRestrictions::unrestricted()
             },
         )
@@ -676,7 +676,7 @@ fn bounds(within: ExecutionRestrictions) -> Vec<Bound> {
         (
             "another resource domain",
             ExecutionRestrictions {
-                resource_domains: ExactRestriction::exact([domain("elsewhere")]),
+                resource_domains: DomainRestriction::exact([domain("elsewhere")]),
                 ..within.clone()
             },
             100,
@@ -751,7 +751,7 @@ async fn a_selected_lineage_keeps_its_time_operation_and_data_restrictions() {
     };
     let within = |actions: &[&str], domains: &[&str]| ExecutionRestrictions {
         actions: ExactRestriction::exact(actions.iter().map(|name| action(name))),
-        resource_domains: ExactRestriction::exact(domains.iter().map(|name| domain(name))),
+        resource_domains: DomainRestriction::exact(domains.iter().map(|name| domain(name))),
         processors: ExactRestriction::exact([ProcessorRef::Principal {
             principal: who("executor"),
         }]),

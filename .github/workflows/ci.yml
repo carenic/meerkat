@@ -2084,7 +2084,10 @@ jobs:
     # of a whole-workspace plan took 119-1303 s).
     if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_first_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # A row whose objects are not in sccache yet runs long: the rkat+6 matrix
+    # row (402-1054 s warm) hit a 30-minute timeout on main push run
+    # 39186529346 and on release-branch dispatches.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.feature_check_matrix) }}
@@ -2157,7 +2160,7 @@ jobs:
     # a copy of that job, which scripts/ci-cargo-lanes-selftest.mjs checks.
     if: ${{ needs.changes.outputs.rust_changed == 'true' && needs.changes.outputs.feature_check_rest_count != '0' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.feature_check_rest_matrix) }}
@@ -3077,24 +3080,44 @@ jobs:
           CLASSIFICATION_JOB_NAME: Change classification
           ROOT_JOB_NAMES: Change classification,Format + governance
           STAGGER_JOB_NAME: Stagger the short rows
+          # Seconds to wait before each retry of a GitHub API request that
+          # answered with a server error (5xx). Any other failure, or a
+          # server error after the last retry, still fails a measurement the
+          # run enforces.
+          API_RETRY_DELAYS: 5 10 20
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import datetime
           import json
           import os
+          import re
           import subprocess
           import sys
+          import time
+
+          API_RETRY_DELAYS = [int(delay) for delay in os.environ.get("API_RETRY_DELAYS", "").split()]
+          SERVER_ERROR = re.compile(r"HTTP 5\d\d")
 
 
           def api(path):
-              out = subprocess.run(
-                  ["gh", "api", "--paginate", "--slurp", path],
-                  check=True,
-                  capture_output=True,
-                  text=True,
-              ).stdout
-              return json.loads(out)
+              delays = list(API_RETRY_DELAYS)
+              while True:
+                  result = subprocess.run(
+                      ["gh", "api", "--paginate", "--slurp", path],
+                      capture_output=True,
+                      text=True,
+                  )
+                  if result.returncode == 0:
+                      return json.loads(result.stdout)
+                  if delays and SERVER_ERROR.search(result.stderr):
+                      delay = delays.pop(0)
+                      print(f"GitHub API server error for {path} ({result.stderr.strip()}); retrying in {delay} s")
+                      time.sleep(delay)
+                      continue
+                  raise subprocess.CalledProcessError(
+                      result.returncode, result.args, output=result.stdout, stderr=result.stderr
+                  )
 
 
           def ts(value):

@@ -2468,7 +2468,7 @@ mod tests {
         tokens: &PersistedTokens,
         transition: &AuthLeaseTransition,
     ) -> PersistedTokens {
-        let key = default_test_token_key();
+        let key = transition.lease_key().to_token_key();
         meerkat_core::mark_tokens_lifecycle_published_for_transition(&key, tokens, transition)
             .expect("generated AuthMachine transition marks fixture tokens")
     }
@@ -2478,20 +2478,32 @@ mod tests {
         tokens: &PersistedTokens,
         generation: u64,
     ) -> PersistedTokens {
+        mark_lease_tokens_lifecycle_published_for_test(
+            &default_test_lease_key(),
+            tokens,
+            generation,
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mark_lease_tokens_lifecycle_published_for_test(
+        lease_key: &LeaseKey,
+        tokens: &PersistedTokens,
+        generation: u64,
+    ) -> PersistedTokens {
         let handle = meerkat_runtime::RuntimeAuthLeaseHandle::new();
-        let lease_key = default_test_lease_key();
         let expires_at = meerkat_core::persisted_token_expires_at_epoch_secs(tokens);
         let mut transition = handle
-            .acquire_lease(&lease_key, expires_at)
+            .acquire_lease(lease_key, expires_at)
             .expect("fixture AuthMachine accepts acquired lease");
         let target_generation = generation.max(1);
         while transition.generation() < target_generation {
             handle
-                .begin_refresh(&lease_key)
+                .begin_refresh(lease_key)
                 .expect("fixture AuthMachine accepts refresh start");
             transition = handle
                 .complete_refresh(
-                    &lease_key,
+                    lease_key,
                     expires_at,
                     fixture_refresh_observation_time(expires_at),
                 )
@@ -2625,6 +2637,20 @@ mod tests {
     }
 
     fn simple_secret_binding(source: CredentialSourceSpec, auth_method: &str) -> ValidatedBinding {
+        simple_secret_binding_in("dev", source, auth_method)
+    }
+
+    /// [`simple_secret_binding`] in `realm`. The lifecycle owner registry is
+    /// process wide and keyed by the binding's credential identity, so in one
+    /// `cargo test` process every test on the shared `dev` binding contends
+    /// for one exclusion (any resolution of it holds it). A test that
+    /// try-locks the exclusion, as `release_lease` does, takes a realm of its
+    /// own.
+    fn simple_secret_binding_in(
+        realm: &str,
+        source: CredentialSourceSpec,
+        auth_method: &str,
+    ) -> ValidatedBinding {
         let (provider, backend_kind) = match auth_method {
             "managed_chatgpt_oauth" | "external_chatgpt_tokens" => {
                 (Provider::OpenAI, "chatgpt_backend")
@@ -2649,7 +2675,7 @@ mod tests {
         };
         ProviderRuntimeCatalog::validate_binding(
             &AuthBindingRef {
-                realm: meerkat_core::connection::RealmId::parse("dev").unwrap(),
+                realm: meerkat_core::connection::RealmId::parse(realm).unwrap(),
                 binding: meerkat_core::connection::BindingId::parse("default").unwrap(),
                 profile: None,
                 origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -2789,7 +2815,23 @@ mod tests {
         }
 
         fn from_snapshot(snapshot: AuthLeaseSnapshot) -> Arc<Self> {
-            let lease_key = default_test_lease_key();
+            assert!(
+                !Self::releases(&snapshot),
+                "a released fixture try-locks the process-wide lifecycle exclusion, which \
+                 other tests hold for the shared default binding: give the test a binding \
+                 of its own and use from_snapshot_for"
+            );
+            Self::from_snapshot_for(default_test_lease_key(), snapshot)
+        }
+
+        /// Whether building `snapshot` ends in `release_lease`, which refuses
+        /// as busy while any holder has the lease's lifecycle exclusion.
+        fn releases(snapshot: &AuthLeaseSnapshot) -> bool {
+            (snapshot.credential_present || snapshot.phase.is_some())
+                && matches!(snapshot.phase, Some(AuthLeasePhase::Released) | None)
+        }
+
+        fn from_snapshot_for(lease_key: LeaseKey, snapshot: AuthLeaseSnapshot) -> Arc<Self> {
             let handle = Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new());
             let mut publication_transition = None;
             if snapshot.credential_present || snapshot.phase.is_some() {
@@ -3215,10 +3257,34 @@ mod tests {
         let env = ResolverEnvironment::testing()
             .with_auth_lease_handle(generated_auth_lease_handle_for_test(owner.clone()));
         let audit = LeaseAudit(Arc::default());
+        // A second, separately registered Dispatch kept alive with the
+        // capture: with only one registered, tracing computes a callsite's
+        // interest from the reaching thread's current default, so a thread
+        // with no subscriber caches it as never for every thread.
+        let _anchor = tracing::Dispatch::new(LeaseAudit(Arc::default()));
+        let audit_dispatch = tracing::Dispatch::new(audit.clone());
+        // The window, forced: while the capture is registered, a thread with
+        // no subscriber reaches the shared audit callsite and rebuilds the
+        // interest cache, as a concurrent test can in a shared `cargo test`
+        // process.
+        std::thread::spawn(|| {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+                let uncaptured = meerkat_runtime::RuntimeAuthLeaseHandle::new();
+                let key = LeaseKey::new(
+                    meerkat_core::connection::RealmId::parse("uncaptured-audit").unwrap(),
+                    meerkat_core::connection::BindingId::parse("default").unwrap(),
+                    None,
+                );
+                uncaptured.acquire_lease(&key, u64::MAX).unwrap();
+                tracing::callsite::rebuild_interest_cache();
+            });
+        })
+        .join()
+        .unwrap();
 
         // Fresh valid lease authorizes the cached credential: reuse, no re-run.
         let reused = resolve_command_credential_via_lease(&env, &binding, &runner)
-            .with_subscriber(audit.clone())
+            .with_subscriber(audit_dispatch.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -3245,7 +3311,7 @@ mod tests {
             "cached resolution must not release credentials, drain OAuth, or enter administrative custody"
         );
         resolve_command_credential_via_lease(&env, &binding, &runner)
-            .with_subscriber(audit.clone())
+            .with_subscriber(audit_dispatch.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -3669,21 +3735,33 @@ mod tests {
     #[tokio::test]
     async fn managed_store_oauth_released_lifecycle_rejects_valid_marked_token() {
         let store = Arc::new(EphemeralTokenStore::new());
-        let binding =
-            simple_secret_binding(CredentialSourceSpec::ManagedStore, "managed_chatgpt_oauth");
+        // Its own realm: building the released lease try-locks the lifecycle
+        // exclusion (see `simple_secret_binding_in`).
+        let binding = simple_secret_binding_in(
+            "released-lifecycle",
+            CredentialSourceSpec::ManagedStore,
+            "managed_chatgpt_oauth",
+        );
         let key = TokenKey::from_auth_binding(binding.auth_binding_ref());
+        let lease_key = LeaseKey::from_credential_identity(binding.credential_identity());
         let tokens = chatgpt_oauth_tokens("released-oauth-access");
         store
-            .save(&key, &mark_tokens_lifecycle_published_for_test(&tokens, 1))
+            .save(
+                &key,
+                &mark_lease_tokens_lifecycle_published_for_test(&lease_key, &tokens, 1),
+            )
             .await
             .unwrap();
-        let auth_lease = MutableAuthLeaseHandle::from_snapshot(AuthLeaseSnapshot {
-            phase: Some(AuthLeasePhase::Released),
-            expires_at: None,
-            credential_present: false,
-            generation: 1,
-            credential_published_at_millis: None,
-        });
+        let auth_lease = MutableAuthLeaseHandle::from_snapshot_for(
+            lease_key.clone(),
+            AuthLeaseSnapshot {
+                phase: Some(AuthLeasePhase::Released),
+                expires_at: None,
+                credential_present: false,
+                generation: 1,
+                credential_published_at_millis: None,
+            },
+        );
         let env = ResolverEnvironment::testing()
             .with_provider_auth_persistence(test_provider_auth_persistence(store))
             .with_auth_lease_handle(auth_lease.generated());
@@ -3696,7 +3774,7 @@ mod tests {
             err,
             ProviderAuthError::Auth(AuthError::LeaseAbsent)
         ));
-        assert_eq!(auth_lease.snapshot(&default_test_lease_key()).phase, None);
+        assert_eq!(auth_lease.snapshot(&lease_key).phase, None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -5301,7 +5379,11 @@ mod tests {
     mod retained_maintenance {
         use super::*;
 
+        /// A managed OpenAI OAuth binding in `realm`, published under its
+        /// lifecycle exclusion. A test that releases the lease takes a realm
+        /// of its own (see `simple_secret_binding_in`).
         async fn fixture(
+            realm: &str,
             present: bool,
         ) -> (
             ResolverEnvironment,
@@ -5310,8 +5392,11 @@ mod tests {
             GeneratedAuthLeaseHandle,
             PersistedTokens,
         ) {
-            let binding =
-                simple_secret_binding(CredentialSourceSpec::ManagedStore, "managed_chatgpt_oauth");
+            let binding = simple_secret_binding_in(
+                realm,
+                CredentialSourceSpec::ManagedStore,
+                "managed_chatgpt_oauth",
+            );
             let key = TokenKey::from_credential_identity(binding.credential_identity());
             let lease = LeaseKey::from_credential_identity(binding.credential_identity());
             let owner = generated_auth_lease_handle_for_test(Arc::new(
@@ -5357,20 +5442,11 @@ mod tests {
             GeneratedAuthLeaseHandle,
             PersistedTokens,
         ) {
-            let template =
-                simple_secret_binding(CredentialSourceSpec::ManagedStore, "managed_chatgpt_oauth");
-            let binding = ProviderRuntimeCatalog::validate_binding(
-                &AuthBindingRef {
-                    realm: meerkat_core::connection::RealmId::parse(realm).unwrap(),
-                    binding: meerkat_core::connection::BindingId::parse("default").unwrap(),
-                    profile: None,
-                    origin: meerkat_core::connection::BindingOrigin::Configured,
-                },
-                template.backend_profile().as_ref(),
-                template.auth_profile().as_ref(),
-                &BindingPolicy::default(),
-            )
-            .unwrap();
+            let binding = simple_secret_binding_in(
+                realm,
+                CredentialSourceSpec::ManagedStore,
+                "managed_chatgpt_oauth",
+            );
             let key = TokenKey::from_credential_identity(binding.credential_identity());
             let lease = LeaseKey::from_credential_identity(binding.credential_identity());
             let owner = generated_auth_lease_handle_for_test(Arc::new(
@@ -5588,7 +5664,7 @@ mod tests {
 
         #[tokio::test]
         async fn fresh_resolution_still_restores_an_absent_owner() {
-            let (env, binding, store, owner, marked) = fixture(false).await;
+            let (env, binding, store, owner, marked) = fixture("rm-fresh-restore", false).await;
             let lease = LeaseKey::from_credential_identity(binding.credential_identity());
             let key = TokenKey::from_credential_identity(binding.credential_identity());
             assert!(!owner.snapshot(&lease).credential_present);
@@ -5603,7 +5679,7 @@ mod tests {
         }
         #[tokio::test]
         async fn existing_maintenance_cannot_restore_absent_owner() {
-            let (env, binding, store, owner, marked) = fixture(false).await;
+            let (env, binding, store, owner, marked) = fixture("rm-existing-absent", false).await;
             let lease = LeaseKey::from_credential_identity(binding.credential_identity());
             let key = TokenKey::from_credential_identity(binding.credential_identity());
             let before = owner.snapshot(&lease);
@@ -5616,10 +5692,27 @@ mod tests {
             assert_eq!(store.load(&key).await.unwrap(), Some(marked));
         }
 
+        /// The flake window, forced: in one `cargo test` process another test
+        /// resolving the shared binding holds its lifecycle exclusion while
+        /// this test releases its own lease. `release_lease` try-locks, so
+        /// the release must not share that exclusion.
+        #[tokio::test]
+        async fn a_held_shared_binding_does_not_block_a_fixture_release() {
+            let (_env, binding, _store, owner, _) = fixture("rm-held-shared", true).await;
+            let lease = LeaseKey::from_credential_identity(binding.credential_identity());
+            let _shared =
+                meerkat_core::acquire_auth_login_lifecycle_guard(&default_test_lease_key()).await;
+            owner
+                .release_lease(&lease)
+                .expect("the fixture's own lease is not the shared binding's");
+            assert!(!owner.snapshot(&lease).credential_present);
+        }
+
         #[tokio::test]
         async fn existing_maintenance_rechecks_release_before_locked_rebase() {
             for changed_row in [false, true] {
-                let (env, binding, store, owner, original) = fixture(true).await;
+                let (env, binding, store, owner, original) =
+                    fixture("rm-recheck-release", true).await;
                 let lease = LeaseKey::from_credential_identity(binding.credential_identity());
                 let key = TokenKey::from_credential_identity(binding.credential_identity());
                 let mut previous =
@@ -5742,7 +5835,7 @@ mod tests {
         #[tokio::test]
         async fn absent_or_released_maintenance_preload_never_reads_the_store() {
             for released in [false, true] {
-                let (env, binding, store, owner, marked) = fixture(released).await;
+                let (env, binding, store, owner, marked) = fixture("rm-preload", released).await;
                 let lease = LeaseKey::from_credential_identity(binding.credential_identity());
                 let key = TokenKey::from_credential_identity(binding.credential_identity());
                 if released {
@@ -5774,7 +5867,9 @@ mod tests {
         }
 
         async fn assert_locked_newer_publication(replace_owner: bool) {
-            let (env, binding, store, owner, _) = fixture(true).await;
+            // The shared binding: the newer publication below is marked for it,
+            // and this helper only awaits the exclusion, never try-locks it.
+            let (env, binding, store, owner, _) = fixture("dev", true).await;
             let lease = LeaseKey::from_credential_identity(binding.credential_identity());
             let key = TokenKey::from_credential_identity(binding.credential_identity());
             assert_eq!(key, default_test_token_key());

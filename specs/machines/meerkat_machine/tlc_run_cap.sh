@@ -27,7 +27,7 @@ tlc_run_cap_reap() {
     kill -TERM "${tlc_run_cap_tlc_pid}" 2>/dev/null || true
   fi
   if [[ -n "${tlc_run_cap_watchdog_pgid}" ]]; then
-    kill -TERM -- "-${tlc_run_cap_watchdog_pgid}" 2>/dev/null || true
+    kill -KILL -- "-${tlc_run_cap_watchdog_pgid}" 2>/dev/null || true
   fi
   tlc_run_cap_tlc_pid=""
   tlc_run_cap_watchdog_pgid=""
@@ -46,7 +46,11 @@ tlc_run_capped() {
   # ending the group ends the sleep too: there is no moment at which the
   # sleep runs but cannot be named. Its stdio is /dev/null, so nothing it
   # leaves behind can hold a caller's pipe (for example a `$(...)` capture)
-  # open.
+  # open. It is ended with SIGKILL, never TERM: it is a forked copy of the
+  # caller's shell, and until bash resets the traps it inherited, a TERM runs
+  # the caller's EXIT trap in it. An audit's trap removes its work
+  # directory, so a TERM sent right after an instant run deleted the log the
+  # audit was about to read. SIGKILL runs nothing.
   local job_control_was_on=false
   [[ $- == *m* ]] && job_control_was_on=true
   set -m
@@ -61,7 +65,7 @@ tlc_run_capped() {
   tlc_run_cap_watchdog_pgid="${watchdog_pgid}"
   local status=0
   wait "${tlc_pid}" || status=$?
-  kill -TERM -- "-${watchdog_pgid}" 2>/dev/null || true
+  kill -KILL -- "-${watchdog_pgid}" 2>/dev/null || true
   wait "${watchdog_pgid}" 2>/dev/null || true
   tlc_run_cap_tlc_pid=""
   tlc_run_cap_watchdog_pgid=""

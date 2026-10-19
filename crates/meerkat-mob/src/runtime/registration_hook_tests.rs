@@ -866,7 +866,6 @@ fn agent_mandate(agent: &str) -> SessionAgentMandate {
         principal(agent),
         std::collections::BTreeMap::from([("configured".to_owned(), vec![lineage])]),
         None,
-        None,
     )
     .unwrap()
 }
