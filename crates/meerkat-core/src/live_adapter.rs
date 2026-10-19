@@ -485,11 +485,13 @@ pub enum LiveAdapterObservation {
 
 /// How a live provider response ended without completing (#1883).
 ///
-/// The set is closed: a provider status Meerkat does not recognize must be
-/// classified at the provider seam before it reaches this type.
+/// A provider status Meerkat does not recognize is classified at the
+/// provider seam before it reaches this type. The enum is non-exhaustive so a
+/// later release can name a further status without breaking matches on it.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LiveResponseFailureStatus {
     /// The provider reported that the response failed.
     Failed,
@@ -522,6 +524,9 @@ pub struct LiveResponseFailure {
 /// The provider accounting for one live response that committed nothing
 /// (#1883): its normalized usage, or the typed fact that the provider sent
 /// none. Absence is never a zero.
+///
+/// The set is closed by construction: the provider either reported usage
+/// for the response or it did not, so the enum is exhaustive.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "accounting", rename_all = "snake_case")]

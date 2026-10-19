@@ -1213,6 +1213,78 @@ mod tests {
         );
     }
 
+    /// #1883: a failed response discards what it staged and removes no
+    /// completion, so the row a playback snapshot already committed for it
+    /// stays, and the state restores both live and from its replay. A failed
+    /// response that also removed the completion would leave that row
+    /// without the completion it was materialized from, and restore would
+    /// refuse the state.
+    #[test]
+    fn a_failed_response_keeps_the_row_its_playback_snapshot_committed() {
+        let session_id = SessionId::new();
+        let channel_id = "snapshot-then-failure".to_string();
+        let interaction_id = crate::InteractionId::new();
+        let mut producer = SessionRealtimeTranscriptProjection::empty(&session_id);
+        for event in [
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_failed".to_string(),
+                delta_id: "delta_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "the first part, and then more".to_string(),
+            },
+            RealtimeTranscriptEvent::AssistantPlaybackTargetAdmitted {
+                channel_id: channel_id.clone(),
+                interaction_id,
+                response_id: "resp_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                content_index: 0,
+            },
+            RealtimeTranscriptEvent::AssistantPlaybackSnapshotCommitted {
+                channel_id: channel_id.clone(),
+                interaction_id,
+                response_id: "resp_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                content_index: 0,
+                text: "the first part".to_string(),
+                evidence: crate::LiveAssistantPlaybackEvidence::CallerConfirmedSnapshot(
+                    "the first part".to_string(),
+                ),
+            },
+            RealtimeTranscriptEvent::AssistantPlaybackTargetResolved {
+                channel_id,
+                interaction_id,
+                response_id: "resp_failed".to_string(),
+                item_id: "item_failed".to_string(),
+                content_index: 0,
+            },
+            RealtimeTranscriptEvent::AssistantTurnFailed {
+                response_id: "resp_failed".to_string(),
+            },
+        ] {
+            let _ = producer.apply_event(event).expect("apply");
+        }
+        let committed_row = |state: &SessionRealtimeTranscriptState| {
+            let state = serde_json::to_value(state).expect("serialize the transcript state");
+            let item = &state["items"]["item_failed"];
+            item["materialized"] == serde_json::json!(true)
+                && item["content_segments"]["0"] == serde_json::json!("the first part")
+        };
+        assert!(committed_row(producer.state()), "the snapshot row stays");
+        realtime_transcript_revision::restore_realtime_transcript_state(producer.state().clone())
+            .expect("the state with the failed response restores");
+        let suffix = producer.prepare_suffix().expect("prepare").expect("suffix");
+        let verified = verified_sequence(suffix.successor().clone(), suffix.events());
+        let restored =
+            SessionRealtimeTranscriptProjection::from_verified_sequence(&session_id, &verified)
+                .expect("the replay restores");
+        assert!(
+            committed_row(restored.state()),
+            "the replayed snapshot row stays"
+        );
+    }
+
     #[test]
     fn failed_turn_stamped_with_schema_v3_is_refused() {
         let session_id = SessionId::new();

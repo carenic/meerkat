@@ -6103,6 +6103,23 @@ export interface WireLiveAdapterErrorCodeUnknown {
 
 export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown;
 
+export interface WireLiveResponseFailureStatusUnknownPayload {
+  debug: string;
+}
+
+export interface WireLiveResponseFailureStatusUnknown {
+  unknown: WireLiveResponseFailureStatusUnknownPayload;
+}
+
+export type WireLiveResponseFailureStatus = "failed" | "incomplete" | "in_progress" | WireLiveResponseFailureStatusUnknown;
+
+export interface WireLiveResponseFailure {
+  code?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  status: WireLiveResponseFailureStatus;
+}
+
 export interface WireLiveAdapterObservationReady {
   observation: "ready";
 }
@@ -6222,7 +6239,7 @@ export interface WireLiveAdapterObservationUnknown {
 }
 
 export interface WireLiveAdapterObservationTurnFailed {
-  failure: Record<string, unknown>;
+  failure: WireLiveResponseFailure;
   observation: "turn_failed";
   response_id?: string | null;
   usage?: Record<string, unknown> | null;

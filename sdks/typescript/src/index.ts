@@ -523,6 +523,8 @@ export type {
   WireLiveAdapterObservationError,
   WireLiveAdapterObservationCommandRejected,
   WireLiveAdapterObservationTurnFailed,
+  WireLiveResponseFailure,
+  WireLiveResponseFailureStatus,
   WireLiveAdapterStatus,
   WireLiveAdapterErrorCode,
   WireLiveConfigRejectionReason,

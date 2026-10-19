@@ -71,6 +71,13 @@ them.
   the accounting is `record_live_turn_accounting` on the ephemeral and
   persistent session services and on the RPC `SessionRuntime`, backed by the
   provided `SessionAgent::record_external_turn_usage`.
+  `LiveResponseFailureStatus` and `WireLiveResponseFailureStatus` are
+  non-exhaustive, so a later release can name a further status; a status
+  without a wire name is sent as `{"unknown": {"debug": ...}}` rather than
+  coerced to `failed`. `LiveResponseAccounting` is exhaustive: the
+  provider either reported the response's usage or it did not. The Python and
+  TypeScript SDKs type `turn_failed.failure` as `WireLiveResponseFailure` and
+  export it and `WireLiveResponseFailureStatus` from their package roots.
 
 ### Fixed
 
@@ -88,7 +95,9 @@ them.
   nothing of the failed response: they record `AssistantTurnFailed`, which
   discards everything the response staged on every lane, and drop its
   display-text buffer, so a barge-in after the failure never targets it. A
-  playback terminal waiting on the failed response settles at the failure.
+  WebRTC peer stops playing the audio still queued for the failed response,
+  as it does for an interrupted one. A playback terminal waiting on the failed
+  response settles at the failure.
   The response's usage is charged to the session and the budget when the
   provider reported it; when it did not, the session event stream carries
   `turn_usage_accounting_unmeasured` and no counter advances. A failed

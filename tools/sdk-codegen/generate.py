@@ -931,6 +931,11 @@ def _promote_nested_schema_def(name: str) -> bool:
         # `item_id` / `response_id` / `content_index`) or the R5-9
         # `command_rejected` typed channel-survives error variant.
         "WireLiveAdapterObservation",
+        # #1883: promote the typed failure `turn_failed.failure` carries, so
+        # SDK clients route on `failure.status` by name instead of receiving
+        # an opaque `dict[str, Any]` / `Record<string, unknown>`.
+        "WireLiveResponseFailure",
+        "WireLiveResponseFailureStatus",
         "WireLiveAdapterStatus",
         "WireLiveCloseReason",
         "WireLiveDegradationReason",
@@ -3567,6 +3572,35 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
             return
         raise KeyError(f"schema for generated Python contract type {name} not found")
 
+    def append_python_typed_dict(name: str, root_schema: dict[str, Any], default_doc: str) -> None:
+        """Emit a closed wire struct as a named TypedDict.
+
+        For a struct carried inside a TypedDict observation: the client
+        receives it as a plain JSON object, so a dataclass would misdescribe it.
+        """
+        nonlocal types_content
+        if name in emitted_python_named_types:
+            return
+        schema = _lookup_named_schema(root_schema, name)
+        local_defs = set(schema.get("$defs", {}).keys())
+        schema_root = _schema_root_with_local_defs(root_schema, schema)
+        required = set(schema.get("required", []) or [])
+        doc = schema.get("description", default_doc)
+        doc_lines = str(doc).splitlines() or [""]
+        doc_block = "\n".join(f"# {line}" if line else "#" for line in doc_lines)
+        types_content += f"\n{doc_block}\nclass {name}(TypedDict, total=False):\n"
+        properties = schema.get("properties", {})
+        if not properties:
+            types_content += "    pass\n"
+        for field_name, field_schema in properties.items():
+            field_type, _ = _python_type_from_schema(schema_root, field_schema, local_defs)
+            wrapper = "Required" if field_name in required else "NotRequired"
+            types_content += (
+                f"    {_python_identifier(field_name)}: {wrapper}[{field_type}]\n"
+            )
+        types_content += "\n"
+        emitted_python_named_types.add(name)
+
     def append_python_alias(name: str, root_schema: dict[str, Any], default_doc: str) -> None:
         nonlocal types_content
         if name in emitted_python_named_types:
@@ -3692,6 +3726,7 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
                 "BridgeOutboundTaintTarget",
                 "WireFlowTurnOutcome",
                 "PeerDeliveryOutcome",
+                "WireLiveResponseFailureStatus",
             }
             else None
         )
@@ -4130,6 +4165,18 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         "WireLiveAdapterErrorCode",
         wire_schema,
         "Wire projection of LiveAdapterErrorCode (tagged on `code`).",
+    )
+    # #1883: typed `turn_failed.failure`, emitted before
+    # `WireLiveAdapterObservation` so its variant references them by name.
+    append_python_alias(
+        "WireLiveResponseFailureStatus",
+        wire_schema,
+        "How a live response ended without completing.",
+    )
+    append_python_typed_dict(
+        "WireLiveResponseFailure",
+        wire_schema,
+        "How a live response ended without completing; route on `status`.",
     )
     append_python_alias(
         "WireLiveAdapterObservation",
@@ -4606,6 +4653,7 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
                 "BridgeRejectionCause",
                 "WireFlowTurnOutcome",
                 "PeerDeliveryOutcome",
+                "WireLiveResponseFailureStatus",
             }
             else None
         )
@@ -4871,6 +4919,10 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     # `config_rejected` variant references the typed union by name.
     append_typescript_alias("WireLiveConfigRejectionReason", wire_schema)
     append_typescript_alias("WireLiveAdapterErrorCode", wire_schema)
+    # #1883: typed `turn_failed.failure`, emitted before
+    # `WireLiveAdapterObservation` so its variant references them by name.
+    append_typescript_alias("WireLiveResponseFailureStatus", wire_schema)
+    append_typescript_interface("WireLiveResponseFailure", wire_schema)
     append_typescript_alias("WireLiveAdapterObservation", wire_schema)
     append_typescript_interface("RuntimeAcceptResult", wire_schema)
     append_typescript_interface("WireInputStateHistoryEntry", wire_schema)

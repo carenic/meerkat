@@ -1953,8 +1953,8 @@ pub enum WireRealtimeTranscriptEvent {
     AssistantTurnInterrupted {
         response_id: String,
     },
-    /// #1883: the provider ended the response without completing it; the
-    /// session discards everything the response staged.
+    /// The provider ended the response without completing it; the session
+    /// discards everything the response staged (#1883).
     AssistantTurnFailed {
         response_id: String,
     },
@@ -2079,13 +2079,31 @@ impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
 }
 
 /// Wire mirror of [`LiveResponseFailureStatus`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// The known statuses serialize as plain strings (`"failed"`,
+/// `"incomplete"`, `"in_progress"`), so clients route on `failure.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WireLiveResponseFailureStatus {
     Failed,
     Incomplete,
     InProgress,
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveResponseFailureStatus`] enum is `#[non_exhaustive]`.
+    /// When a future status lands without an explicit arm in the wire `From`
+    /// impl, the conversion surfaces as `Unknown { debug }` (serialized as
+    /// `{"unknown": {"debug": ...}}`) rather than silently coercing to
+    /// `Failed`. SDK consumers treat it as an unrecognized status.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant: `Unknown` is the floor, not
+    /// the destination.**
+    Unknown {
+        debug: String,
+    },
 }
 
 impl From<LiveResponseFailureStatus> for WireLiveResponseFailureStatus {
@@ -2094,6 +2112,20 @@ impl From<LiveResponseFailureStatus> for WireLiveResponseFailureStatus {
             LiveResponseFailureStatus::Failed => Self::Failed,
             LiveResponseFailureStatus::Incomplete => Self::Incomplete,
             LiveResponseFailureStatus::InProgress => Self::InProgress,
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }`. When a new core
+            // variant lands, add an explicit arm above this comment.
+            other => {
+                debug_assert!(
+                    false,
+                    "WireLiveResponseFailureStatus::from saw an unmapped \
+                     LiveResponseFailureStatus variant; add an explicit arm in \
+                     crates/meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
+            }
         }
     }
 }
@@ -2310,7 +2342,7 @@ pub enum WireLiveAdapterObservation {
     Unknown {
         debug: String,
     },
-    /// #1883: the provider ended a response without completing it. Not
+    /// The provider ended a response without completing it (#1883). Not
     /// terminal: the channel stays open and the next turn proceeds. Nothing
     /// of the response is committed and it is not retried. `usage` is the
     /// response's usage when the provider sent one; absent means the
