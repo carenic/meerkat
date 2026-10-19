@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use ciborium::value::{CanonicalValue, Value};
+use ciborium::value::Value;
 
 use crate::types::Envelope;
 
@@ -31,31 +31,34 @@ impl EnvelopeFrame {
     /// build does not know: a newer sender may add an optional field to a
     /// signed kind. The typed `envelope` comes from the same bytes and drops
     /// such a field after this check, so it never reaches behaviour. A map
-    /// holding the same key twice, at any depth, is refused before
-    /// canonicalization; otherwise a frame could verify one entry while the
-    /// typed decode acts on the other. The bytes were already bounded by the
-    /// codec's payload limit, and the value decode keeps the nesting limit of
-    /// the codec's typed decode. A frame built locally has no received bytes
-    /// and does not verify.
+    /// keyed by anything but a text string, or holding the same key twice, at
+    /// any depth, is refused before canonicalization; otherwise a frame could
+    /// verify one entry while the typed decode acts on the other. The bytes
+    /// were already bounded by the codec's payload limit, and the value decode
+    /// keeps the nesting limit of the codec's typed decode. A frame built
+    /// locally has no received bytes and does not verify.
     pub fn verify_signature(&self) -> bool {
         let Ok(received) = ciborium::from_reader::<Value, _>(self.raw.as_ref().as_ref()) else {
             return false;
         };
-        if has_repeated_map_key(&received) {
+        if has_ambiguous_map_key(&received) {
             return false;
         }
         let Value::Map(entries) = received else {
             return false;
         };
-        let entry = |name: &str| {
-            entries.iter().find_map(|(key, value)| match key {
-                Value::Text(key) if key == name => Some(value.clone()),
-                _ => None,
-            })
-        };
-        let (Some(id), Some(from), Some(to), Some(kind)) =
-            (entry("id"), entry("from"), entry("to"), entry("kind"))
-        else {
+        let (mut id, mut from, mut to, mut kind) = (None, None, None, None);
+        for (key, value) in entries {
+            let slot = match key.as_text() {
+                Some("id") => &mut id,
+                Some("from") => &mut from,
+                Some("to") => &mut to,
+                Some("kind") => &mut kind,
+                _ => continue,
+            };
+            *slot = Some(value);
+        }
+        let (Some(id), Some(from), Some(to), Some(kind)) = (id, from, to, kind) else {
             return false;
         };
         let signable = crate::types::canonical_cbor_bytes(Value::Array(vec![id, from, to, kind]));
@@ -63,22 +66,32 @@ impl EnvelopeFrame {
     }
 }
 
-/// Whether any CBOR map in `value`, at any depth, holds the same key twice.
-fn has_repeated_map_key(value: &Value) -> bool {
+/// Whether any CBOR map in `value`, at any depth, has a key that is not a
+/// plain text string, or the same key twice.
+///
+/// The typed decode names a field by more than its text: it skips a key's
+/// tags, reads a byte string as the field's name and, inside a message kind,
+/// can read an integer as the field's position. Every map this protocol
+/// signs is keyed by text (struct fields, enum tags and JSON objects), so any
+/// other key is refused rather than compared.
+fn has_ambiguous_map_key(value: &Value) -> bool {
     match value {
-        Value::Array(items) => items.iter().any(has_repeated_map_key),
+        Value::Array(items) => items.iter().any(has_ambiguous_map_key),
         Value::Map(entries) => {
-            let mut keys = entries
-                .iter()
-                .map(|(key, _)| CanonicalValue::from(key.clone()))
-                .collect::<Vec<_>>();
-            keys.sort();
+            let mut keys = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                let Value::Text(key) = key else {
+                    return true;
+                };
+                if has_ambiguous_map_key(value) {
+                    return true;
+                }
+                keys.push(key.as_str());
+            }
+            keys.sort_unstable();
             keys.windows(2).any(|pair| pair[0] == pair[1])
-                || entries
-                    .iter()
-                    .any(|(key, value)| has_repeated_map_key(key) || has_repeated_map_key(value))
         }
-        Value::Tag(_, inner) => has_repeated_map_key(inner),
+        Value::Tag(_, inner) => has_ambiguous_map_key(inner),
         _ => false,
     }
 }
@@ -303,6 +316,30 @@ mod tests {
         Keypair::generate().public_key()
     }
 
+    /// The frame `entries` would make if the codec's typed decode were
+    /// skipped: only the received bytes, the sender's key and the signature in
+    /// `entries` decide whether it verifies.
+    fn forced_frame(sender: &Keypair, entries: Vec<(Value, Value)>) -> EnvelopeFrame {
+        let sig = entries
+            .iter()
+            .find(|(key, _)| key.as_text() == Some("sig"))
+            .and_then(|(_, sig)| sig.deserialized::<Signature>().ok())
+            .expect("the frame carries the sender's signature");
+        let bytes = frame_bytes(entries);
+        EnvelopeFrame {
+            envelope: Envelope {
+                id: Uuid::new_v4(),
+                from: sender.public_key(),
+                to: recipient(),
+                kind: MessageKind::Ack {
+                    in_reply_to: Uuid::new_v4(),
+                },
+                sig,
+            },
+            raw: Arc::new(Bytes::copy_from_slice(&bytes[4..])),
+        }
+    }
+
     #[test]
     fn a_signed_field_this_build_does_not_know_verifies_over_the_received_frame() {
         let sender = Keypair::generate();
@@ -491,10 +528,58 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_nested_past_the_codec_limit_is_refused_before_any_verification() {
+    fn a_second_kind_under_a_byte_string_or_tagged_key_is_refused_even_when_signed() {
         let sender = Keypair::generate();
+        let kind = message_kind(Vec::new());
+        let (_, entries) = signed_map(&sender, &recipient(), kind.clone(), kind);
+        assert!(
+            forced_frame(&sender, entries.clone()).verify_signature(),
+            "control: the frame as signed verifies"
+        );
+        let other = Value::Map(vec![
+            (text("type"), text("message")),
+            (text("body"), text("other")),
+        ]);
+        // The typed decode reads both keys as `kind`.
+        for key in [
+            Value::Bytes(b"kind".to_vec()),
+            Value::Tag(32, Box::new(text("kind"))),
+        ] {
+            let mut appended = entries.clone();
+            appended.push((key, other.clone()));
+            match decode_bytes(&frame_bytes(appended.clone())) {
+                Err(_) => {}
+                Ok(Some(frame)) => assert!(!frame.verify_signature()),
+                Ok(None) => panic!("a whole frame was written"),
+            }
+            // The typed decode refuses a repeated field today; the frame check
+            // refuses the key without it.
+            assert!(!forced_frame(&sender, appended).verify_signature());
+        }
+    }
+
+    #[test]
+    fn a_kind_keyed_by_anything_but_text_does_not_verify_even_when_signed() {
+        let sender = Keypair::generate();
+        // The sender signs both entries; the typed decode reads both as the
+        // unknown field `future` and ignores it.
+        let kind = message_kind(vec![
+            (text("future"), text("a")),
+            (Value::Bytes(b"future".to_vec()), text("b")),
+        ]);
+        let (_, entries) = signed_map(&sender, &recipient(), kind.clone(), kind);
+        let frame = decode_frame(entries);
+        assert!(
+            matches!(&frame.envelope.kind, MessageKind::Message { body, .. } if body == "hello"),
+            "the typed decode accepts the frame"
+        );
+        assert!(!frame.verify_signature());
+    }
+
+    /// A request signed by `sender` whose params nest `depth` arrays deep.
+    fn nested_request(sender: &Keypair, depth: usize) -> Vec<(Value, Value)> {
         let mut nested = Value::Integer(0.into());
-        for _ in 0..300 {
+        for _ in 0..depth {
             nested = Value::Array(vec![nested]);
         }
         let kind = Value::Map(vec![
@@ -502,24 +587,26 @@ mod tests {
             (text("intent"), text("probe")),
             (text("params"), nested),
         ]);
-        let (_, entries) = signed_map(&sender, &recipient(), kind.clone(), kind);
-        let bytes = frame_bytes(entries);
-        assert!(decode_bytes(&bytes).is_err(), "the codec refuses the frame");
-        let frame = EnvelopeFrame {
-            envelope: Envelope {
-                id: Uuid::new_v4(),
-                from: sender.public_key(),
-                to: recipient(),
-                kind: MessageKind::Ack {
-                    in_reply_to: Uuid::new_v4(),
-                },
-                sig: Signature::new([0u8; 64]),
-            },
-            raw: Arc::new(Bytes::copy_from_slice(&bytes[4..])),
-        };
+        signed_map(sender, &recipient(), kind.clone(), kind).1
+    }
+
+    #[test]
+    fn a_frame_nested_past_the_codec_limit_is_refused_before_any_verification() {
+        let sender = Keypair::generate();
+        // Control: at a depth both decodes accept, the request verifies through
+        // the codec and forced in as received bytes alike.
+        let shallow = nested_request(&sender, 200);
+        assert!(decode_frame(shallow.clone()).verify_signature());
+        assert!(forced_frame(&sender, shallow).verify_signature());
+
+        let deep = nested_request(&sender, 300);
         assert!(
-            !frame.verify_signature(),
-            "the value decode keeps the codec's nesting limit"
+            decode_bytes(&frame_bytes(deep.clone())).is_err(),
+            "the codec refuses the frame"
+        );
+        assert!(
+            !forced_frame(&sender, deep).verify_signature(),
+            "the value decode keeps the codec's nesting limit, so the sender's own signature does not verify it"
         );
     }
 

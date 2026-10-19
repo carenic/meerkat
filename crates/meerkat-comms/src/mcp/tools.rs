@@ -1953,10 +1953,7 @@ mod tests {
         assert_eq!(*handling_mode, HandlingMode::Queue);
     }
 
-    /// A reply names the delivery it answers: `reply_to_peer` stamps the
-    /// selected capability's id as `in_reply_to`, which the comms runtime
-    /// signs into the envelope. `send_message` answers nothing and stamps
-    /// nothing.
+    /// The comms runtime signs a message's `in_reply_to` into its envelope.
     #[tokio::test]
     async fn runtime_send_signs_the_peer_message_in_reply_to_onto_the_wire() {
         let (_ctx, peer_id, sender, receiver, finalizer) =
@@ -1991,6 +1988,10 @@ mod tests {
         );
     }
 
+    /// A reply names the delivery it answers: `reply_to_peer` stamps the
+    /// selected capability's id as `in_reply_to`, which the comms runtime
+    /// signs into the envelope. `send_message` answers nothing and stamps
+    /// nothing.
     #[tokio::test]
     async fn test_runtime_less_reply_to_peer_names_the_delivery_it_answers() {
         let (ctx, peer_id, _sender, receiver, finalizer) =

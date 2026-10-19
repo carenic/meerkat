@@ -67,11 +67,12 @@ behaviour. A sender may therefore add an optional field to a signed message
 kind without newer receivers refusing it (0.9.3 receivers still re-encode
 before checking). A field whose meaning a receiver must understand needs a
 new message kind instead: a receiver refuses a kind it does not know. An
-envelope whose encoding holds the same map key twice, at any depth, is
-refused. One check still uses the decoded envelope: a request's TCP callback
-endpoint is granted only when the envelope verifies as this build decodes it,
-so a request that carries a field this build does not know is delivered
-without its callback route.
+envelope whose encoding keys a map by anything but a text string, or holds
+the same map key twice, at any depth, is refused, so a new field must encode
+its maps with text keys. One check still uses the decoded envelope: a
+request's TCP callback endpoint is granted only when the envelope verifies as
+this build decodes it, so a request that carries a field this build does not
+know is delivered without its callback route.
 
 `send_request` and `send_response` are not general task-tracking tools. The
 agent-facing request intent vocabulary is closed to `checksum_token` and

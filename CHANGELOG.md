@@ -169,9 +169,9 @@ them.
   envelope as received, including message-kind fields it does not know, and
   drops such fields only after the check. A newer sender can add an optional
   field to a signed message kind without 0.9.4 receivers refusing the
-  message. An envelope whose encoding repeats a map key at any depth is
-  refused. A request carrying an unknown field keeps its delivery but not its
-  TCP callback route.
+  message. An envelope whose encoding repeats a map key, or keys a map by
+  anything but a text string, at any depth is refused. A request carrying an
+  unknown field keeps its delivery but not its TCP callback route.
 - `meerkat-core`: `ToolDispatchContext::peer_reply_deliveries` returns the
   running turn's reply capabilities as one typed list (the deliveries that
   started the turn and those that joined it at a model boundary, one per
