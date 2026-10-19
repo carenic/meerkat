@@ -85,6 +85,7 @@ impl RunlessTerminalConvergenceError {
             error @ (RuntimeDriverError::ControllerReadinessUnavailable { .. }
             | RuntimeDriverError::ControllerInUse
             | RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
+            | RuntimeDriverError::InputTerminalNotYetReadable { .. }
             | RuntimeDriverError::UnregisterInProgress { .. }
             | RuntimeDriverError::RuntimeStopInProgress { .. }
             | RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }

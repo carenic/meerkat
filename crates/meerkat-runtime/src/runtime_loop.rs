@@ -925,6 +925,7 @@ impl InteractionTerminalPublicationError {
             crate::RuntimeDriverError::ControllerReadinessUnavailable { .. }
             | crate::RuntimeDriverError::ControllerInUse
             | crate::RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
+            | crate::RuntimeDriverError::InputTerminalNotYetReadable { .. }
             | crate::RuntimeDriverError::UnregisterInProgress { .. }
             | crate::RuntimeDriverError::RuntimeStopInProgress { .. }
             | crate::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }

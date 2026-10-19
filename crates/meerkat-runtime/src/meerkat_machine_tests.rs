@@ -49992,6 +49992,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::RecoveryBackoff { reason } => {
             format!("recovery_backoff:{reason}")
         }
+        RuntimeDriverError::InputTerminalNotYetReadable { input_id, reason } => {
+            format!("input_terminal_not_yet_readable:{input_id}:{reason}")
+        }
         RuntimeDriverError::RecoveryRepairBlocked {
             evidence_digest,
             reason,

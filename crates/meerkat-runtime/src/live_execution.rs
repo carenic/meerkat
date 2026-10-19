@@ -1294,6 +1294,7 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             | E::ControllerReadinessUnavailable { .. }
             | E::RecoveryBackoff { .. }
             | E::UnregisterFinalizationOutcomeUnknown { .. }
+            | E::InputTerminalNotYetReadable { .. }
             | E::UnregisterInProgress { .. }
             | E::RuntimeStopInProgress { .. }
             | E::RuntimeTerminalPublicationInProgress { .. }

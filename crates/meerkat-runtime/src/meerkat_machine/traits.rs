@@ -147,12 +147,16 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         if let Some((driver, durability_health)) = target {
             // A degraded session whose driver a commit past its deadline
             // still holds cannot say yet whether the input is terminal. It
-            // answers not yet, as for a receipt that is not finalized: the
-            // reload settles the run's batch, and a later read resolves it.
-            let Ok(driver) = super::lock_driver_live(&driver, durability_health.as_ref()).await
-            else {
-                return Ok(None);
-            };
+            // refuses with the retryable InputTerminalNotYetReadable: the
+            // reload settles that commit, and a later read resolves it.
+            let driver = super::lock_driver_live(&driver, durability_health.as_ref())
+                .await
+                .map_err(|required| RuntimeDriverError::InputTerminalNotYetReadable {
+                    input_id: input_id.clone(),
+                    reason: format!(
+                        "the terminal of input {input_id} is not known yet: {required}; read it again after the session reloads"
+                    ),
+                })?;
             if let Some(row) = driver.as_driver().stored_input_state(input_id) {
                 let outcome = driver.exact_input_terminal_completion_outcome(input_id)?;
                 let permitted = super::scoped_context::disclosure_permitted_with(

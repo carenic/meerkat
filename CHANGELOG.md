@@ -277,7 +277,9 @@ them.
   - the existing input is still live: the occurrence waits for it and ends
     with its outcome;
   - it failed: `delivery_failed` with its failure class;
-  - its receipt is not finalized yet, or the store cannot be read: the
+  - its receipt is not finalized yet, the store cannot be read, or the
+    input's session degraded while a stalled commit holds its runtime
+    driver (`RuntimeDriverError::InputTerminalNotYetReadable`): the
     occurrence keeps its lease and re-reads the outcome for up to 5 lease
     periods (5 minutes at the default 60 s lease), then ends
     `delivery_failed` with `runtime_completion_authority_unavailable`;
@@ -432,9 +434,10 @@ them.
   terminalization that holds the session's driver. Past its deadline such a
   commit holds the driver until the store answers, so once the session
   degrades they answer without it: the active-input read answers busy, an
-  input's terminal completion answers not yet (`Ok(None)`), the contributor
-  terminal is unknown, and the others refuse with the typed, retryable
-  `RecoveryRepairBlocked`.
+  input's terminal completion refuses with the new, retryable
+  `RuntimeDriverError::InputTerminalNotYetReadable` (the enum is
+  `#[non_exhaustive]`), the contributor terminal is unknown, and the others
+  refuse with the typed, retryable `RecoveryRepairBlocked`.
 - A boundary commit whose store never answered (a stalled disk or a hung
   network filesystem, for example) kept the session's mutation gate for
   good, so every later wait for the gate waited for it, a mob destroy's

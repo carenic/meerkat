@@ -2327,6 +2327,11 @@ fn classify_admitted_outcome_answer(
         Err(RuntimeDriverError::Internal(error)) => {
             AdmittedOutcomeRead::NotYetReadable(format!("store read failed: {error}"))
         }
+        // A degraded session whose driver a stalled commit still holds: the
+        // reload settles that commit, so read again within the bound.
+        Err(RuntimeDriverError::InputTerminalNotYetReadable { reason, .. }) => {
+            AdmittedOutcomeRead::NotYetReadable(reason)
+        }
         Err(error) => AdmittedOutcomeRead::Unavailable(format!(
             "runtime could not provide the exact terminal completion receipt for input {input_id}: {error}"
         )),
@@ -6187,6 +6192,14 @@ mod tests {
                 Terminal,
             ),
             ("no finalized receipt yet", Some(Ok(None)), Reread),
+            (
+                "a stalled commit holds the degraded session's driver",
+                Some(Err(RuntimeDriverError::InputTerminalNotYetReadable {
+                    input_id: InputId::new(),
+                    reason: "the terminal is not known yet".to_string(),
+                })),
+                Reread,
+            ),
             (
                 "a store read failure",
                 Some(Err(RuntimeDriverError::Internal(
