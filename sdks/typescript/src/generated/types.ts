@@ -3490,6 +3490,35 @@ export interface MemberBuildRejectionSelfHostedServerMissing {
 
 export type MemberBuildRejection = MemberBuildRejectionUnknownProviderForModel | MemberBuildRejectionBindingUnresolvable | MemberBuildRejectionProviderAuth | MemberBuildRejectionSelfHostedServerMissing;
 
+export interface ForkInstructionRefusalCausePolicyRefuses {
+  kind: "policy_refuses";
+}
+
+export interface ForkInstructionRefusalCauseNotEffectiveInSource {
+  kind: "not_effective_in_source";
+}
+
+export interface ForkInstructionRefusalCauseLineageBodyBudgetExceeded {
+  kind: "lineage_body_budget_exceeded";
+  max_bytes: number;
+}
+
+export interface ForkInstructionRefusalCauseActivation {
+  code: "invalid_request" | "digest_mismatch" | "effective_activation_conflict" | "activation_identity_conflict" | "immutable_revision_conflict" | "recorded_but_not_effective" | "inherited_activation_requires_explicit_activation" | "malformed_activation_history";
+  kind: "activation";
+}
+
+export interface ForkInstructionRefusalCauseMemberHostUnsupported {
+  kind: "member_host_unsupported";
+}
+
+export type ForkInstructionRefusalCause = ForkInstructionRefusalCausePolicyRefuses | ForkInstructionRefusalCauseNotEffectiveInSource | ForkInstructionRefusalCauseLineageBodyBudgetExceeded | ForkInstructionRefusalCauseActivation | ForkInstructionRefusalCauseMemberHostUnsupported;
+
+export interface ForkInstructionRefusal {
+  cause: ForkInstructionRefusalCause;
+  keys: unknown[][];
+}
+
 export type ToolConfigChangeDomain = "tool_scope" | "deferred_catalog";
 
 export type ToolConfigChangeOperation = "add" | "remove" | "reload";
@@ -5071,7 +5100,7 @@ export interface BridgeRejectionCauseSessionOwnershipConflict {
 }
 
 export interface BridgeRejectionCauseForkInstructionRefusedPayload {
-  refusal: Record<string, unknown>;
+  refusal: ForkInstructionRefusal;
 }
 
 export interface BridgeRejectionCauseForkInstructionRefused {

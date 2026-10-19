@@ -4950,6 +4950,34 @@ class MemberBuildRejectionSelfHostedServerMissing(TypedDict, total=False):
 
 MemberBuildRejection = MemberBuildRejectionUnknownProviderForModel | MemberBuildRejectionBindingUnresolvable | MemberBuildRejectionProviderAuth | MemberBuildRejectionSelfHostedServerMissing
 
+# Why a fork that would inherit activation rows was refused.
+class ForkInstructionRefusalCausePolicyRefuses(TypedDict, total=False):
+    kind: Required[Literal['policy_refuses']]
+
+class ForkInstructionRefusalCauseNotEffectiveInSource(TypedDict, total=False):
+    kind: Required[Literal['not_effective_in_source']]
+
+class ForkInstructionRefusalCauseLineageBodyBudgetExceeded(TypedDict, total=False):
+    kind: Required[Literal['lineage_body_budget_exceeded']]
+    max_bytes: Required[int]
+
+class ForkInstructionRefusalCauseActivation(TypedDict, total=False):
+    code: Required[Literal['invalid_request', 'digest_mismatch', 'effective_activation_conflict', 'activation_identity_conflict', 'immutable_revision_conflict', 'recorded_but_not_effective', 'inherited_activation_requires_explicit_activation', 'malformed_activation_history']]
+    kind: Required[Literal['activation']]
+
+class ForkInstructionRefusalCauseMemberHostUnsupported(TypedDict, total=False):
+    kind: Required[Literal['member_host_unsupported']]
+
+ForkInstructionRefusalCause = ForkInstructionRefusalCausePolicyRefuses | ForkInstructionRefusalCauseNotEffectiveInSource | ForkInstructionRefusalCauseLineageBodyBudgetExceeded | ForkInstructionRefusalCauseActivation | ForkInstructionRefusalCauseMemberHostUnsupported
+
+@dataclass
+class ForkInstructionRefusal:
+    """A durable fork refused before commit because of inherited activation rows.
+No child session exists when this is returned."""
+    cause: ForkInstructionRefusalCause
+    keys: list[list[Any]]
+
+
 # Optional typed domain for tool-configuration change payloads.
 ToolConfigChangeDomain = Literal['tool_scope', 'deferred_catalog']
 
@@ -8786,7 +8814,7 @@ class BridgeRejectionCauseSessionOwnershipConflict(TypedDict, total=False):
     session_ownership_conflict: Required[BridgeRejectionCauseSessionOwnershipConflictPayload]
 
 class BridgeRejectionCauseForkInstructionRefusedPayload(TypedDict, total=False):
-    refusal: Required[dict[str, Any]]
+    refusal: Required[ForkInstructionRefusal]
 
 class BridgeRejectionCauseForkInstructionRefused(TypedDict, total=False):
     fork_instruction_refused: Required[BridgeRejectionCauseForkInstructionRefusedPayload]

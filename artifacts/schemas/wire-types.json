@@ -99677,6 +99677,241 @@
     "title": "ExecutionPlacementIdentity",
     "type": "object"
   },
+  "ForkInstructionRefusal": {
+    "$defs": {
+      "ForkInstructionRefusalCause": {
+        "description": "Why a fork that would inherit activation rows was refused.",
+        "oneOf": [
+          {
+            "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+            "properties": {
+              "kind": {
+                "const": "policy_refuses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+            "properties": {
+              "kind": {
+                "const": "not_effective_in_source",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+            "properties": {
+              "kind": {
+                "const": "lineage_body_budget_exceeded",
+                "type": "string"
+              },
+              "max_bytes": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "max_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The activation rules refused a re-activation row.",
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/InstructionActivationErrorCode"
+              },
+              "kind": {
+                "const": "activation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+            "properties": {
+              "kind": {
+                "const": "member_host_unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      },
+      "InstructionKey": {
+        "description": "Application-owned instruction key within one namespace.",
+        "type": "string"
+      },
+      "InstructionNamespace": {
+        "description": "Application or issuer namespace for one instruction artifact family.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "A durable fork refused before commit because of inherited activation rows.\nNo child session exists when this is returned.",
+    "properties": {
+      "cause": {
+        "$ref": "#/$defs/ForkInstructionRefusalCause"
+      },
+      "keys": {
+        "description": "The inherited keys the refusal concerns, in (namespace, key) order.",
+        "items": {
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/InstructionNamespace"
+            },
+            {
+              "$ref": "#/$defs/InstructionKey"
+            }
+          ],
+          "type": "array"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "cause",
+      "keys"
+    ],
+    "title": "ForkInstructionRefusal",
+    "type": "object"
+  },
+  "ForkInstructionRefusalCause": {
+    "$defs": {
+      "InstructionActivationErrorCode": {
+        "description": "Stable refusal code shared by core and generated surfaces.",
+        "enum": [
+          "invalid_request",
+          "digest_mismatch",
+          "effective_activation_conflict",
+          "activation_identity_conflict",
+          "immutable_revision_conflict",
+          "recorded_but_not_effective",
+          "inherited_activation_requires_explicit_activation",
+          "malformed_activation_history"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Why a fork that would inherit activation rows was refused.",
+    "oneOf": [
+      {
+        "description": "The effective policy refuses a child that inherits activation rows.\n`reactivate_inherited` carries the source's effective activations into\nthe child instead.",
+        "properties": {
+          "kind": {
+            "const": "policy_refuses",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Re-activation was asked for, but the last copied row of a key was not\neffective in the source: the source never ran a turn under it.",
+        "properties": {
+          "kind": {
+            "const": "not_effective_in_source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Re-activating the effective bodies would exceed the retained\nactivation-body budget of the lineage.",
+        "properties": {
+          "kind": {
+            "const": "lineage_body_budget_exceeded",
+            "type": "string"
+          },
+          "max_bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "max_bytes"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The activation rules refused a re-activation row.",
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/InstructionActivationErrorCode"
+          },
+          "kind": {
+            "const": "activation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The member host that holds a placed source predates the policy and\nrefused the request that carried it, so nothing was forked there.",
+        "properties": {
+          "kind": {
+            "const": "member_host_unsupported",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "ForkInstructionRefusalCause"
+  },
   "GoalAttentionTarget": {
     "$defs": {
       "SessionId": {

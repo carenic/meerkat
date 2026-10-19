@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn every_error_code_exits_with_its_cli_exit_code() {
         let codes = every_error_code();
-        assert_eq!(codes.len(), 28, "every ErrorCode variant is reached");
+        assert_eq!(codes.len(), 29, "every ErrorCode variant is reached");
         for code in codes {
             let documented = documented_exit_status(code);
             assert_eq!(i32::from(documented), code.cli_exit_code(), "{code}");
@@ -552,6 +552,25 @@ mod mob_tests {
                     actual: meerkat_mob::FenceToken::new(1),
                 }),
                 Some(ErrorCode::StaleFence),
+            ),
+            (
+                crate::mob_anyhow(meerkat_mob::MobError::ForkInstructionRefused {
+                    source_member_id: worker.clone(),
+                    refusal: meerkat_core::ForkInstructionRefusal::new(
+                        meerkat_core::ForkInstructionRefusalCause::PolicyRefuses,
+                        Vec::new(),
+                    ),
+                }),
+                Some(ErrorCode::ForkInstructionRefused),
+            ),
+            (
+                anyhow::Error::new(SessionError::ForkInstructionRefused(
+                    meerkat_core::ForkInstructionRefusal::new(
+                        meerkat_core::ForkInstructionRefusalCause::PolicyRefuses,
+                        Vec::new(),
+                    ),
+                )),
+                Some(ErrorCode::ForkInstructionRefused),
             ),
             (
                 crate::mob_anyhow(meerkat_mob::MobError::StaleDeliveryScope {
