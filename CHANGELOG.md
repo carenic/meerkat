@@ -339,7 +339,11 @@ them.
   the child's exit instead of on its output pipes closing: a process the
   child started that still held those pipes made `close()` wait the full
   5 seconds after the child had exited, or wait forever after the SIGKILL.
-  Pre-existing since 0.6.0.
+  Requests waiting on a child that exits by itself, a crash for instance,
+  likewise fail with `PROCESS_EXITED` at most about a second after the
+  exit, even when such a process still holds the pipes; before, they and
+  every request sent after the exit waited for the pipes to close, possibly
+  forever. Pre-existing since 0.6.0.
 
 ## [0.9.3] - 2026-10-18
 

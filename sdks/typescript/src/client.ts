@@ -974,6 +974,10 @@ function normalizeMobWireMembersBatchEdge(
   return { a, b };
 }
 
+// How long a child that exited by itself gets for its stdout and stderr to
+// close before its exit is settled anyway.
+const CHILD_EXIT_PIPE_GRACE_MS = 1_000;
+
 export class MeerkatClient {
   private process: ChildProcess | null = null;
   // Permanent transport-failed state: once the JSONL framing is untrustworthy
@@ -1177,24 +1181,38 @@ export class MeerkatClient {
         this.closeQueues();
       }
     });
-    child.once("close", (code, signal) => {
-      const expectedClose = this.process !== child;
-      if (this.process === child) {
-        this.process = null;
-        this.rl?.close();
-        this.rl = null;
-      }
-      if (!expectedClose) {
-        const suffix = this.processStderr.trim() ? `: ${this.processStderr.trim()}` : "";
-        this.rejectPendingRequests(
-          new MeerkatError(
-            "PROCESS_EXITED",
-            `${this.rkatPath} exited before replying (code ${code ?? "null"}, signal ${signal ?? "null"})${suffix}`,
-          ),
-        );
-        this.closeQueues();
-      }
+    // An unexpected exit settles on "close", once the child's stdout and
+    // stderr have ended, so the error carries all of stderr. A descendant
+    // that inherited those pipes can keep them open after the child has
+    // exited, so the exit settles anyway after a short grace, and the pipes
+    // are destroyed so they cannot keep the caller's process alive. Whichever
+    // comes first settles it.
+    let exitGrace: ReturnType<typeof setTimeout> | undefined;
+    const settleExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      clearTimeout(exitGrace);
+      if (this.process !== child) return;
+      this.process = null;
+      this.rl?.close();
+      this.rl = null;
+      const suffix = this.processStderr.trim() ? `: ${this.processStderr.trim()}` : "";
+      this.rejectPendingRequests(
+        new MeerkatError(
+          "PROCESS_EXITED",
+          `${this.rkatPath} exited before replying (code ${code ?? "null"}, signal ${signal ?? "null"})${suffix}`,
+        ),
+      );
+      this.closeQueues();
+    };
+    child.once("exit", (code, signal) => {
+      // close() and failTransport() drop the child before it exits.
+      if (this.process !== child) return;
+      exitGrace = setTimeout(() => {
+        settleExit(code, signal);
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }, CHILD_EXIT_PIPE_GRACE_MS);
     });
+    child.once("close", settleExit);
 
     this.rl = createInterface({ input: this.process.stdout! });
     this.rl.on("line", (line: string) => this.handleLine(line, child));
