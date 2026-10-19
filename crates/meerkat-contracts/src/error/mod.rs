@@ -393,6 +393,11 @@ fn session_error_code(err: &meerkat_core::SessionError) -> ErrorCode {
         }
         meerkat_core::SessionError::ExternalWriteFenceConflict { .. } => ErrorCode::StaleFence,
         meerkat_core::SessionError::ExternalWriteFenceBackoff { .. } => ErrorCode::SessionBusy,
+        meerkat_core::SessionError::FailedWithData { .. }
+            if err.is_fork_source_build_state_missing() =>
+        {
+            ErrorCode::InvalidParams
+        }
         meerkat_core::SessionError::Store(_)
         | meerkat_core::SessionError::FailedWithData { .. } => ErrorCode::InternalError,
     }
@@ -416,6 +421,11 @@ pub fn session_transport_error_code(error: &meerkat_core::SessionError) -> Error
         SessionError::Busy { .. } | SessionError::ServedElsewhere { .. } => ErrorCode::SessionBusy,
         SessionError::FailedWithData { .. } if error.is_runtime_teardown_in_progress() => {
             ErrorCode::SessionBusy
+        }
+        // A fork refused because its source cannot give a runnable child
+        // refuses the caller's request; it is not a service fault.
+        SessionError::FailedWithData { .. } if error.is_fork_source_build_state_missing() => {
+            ErrorCode::InvalidParams
         }
         // A durable resume hold is not a service fault: the session exists,
         // its content is retained intact, and it is not runnable until
@@ -631,6 +641,29 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::InternalError);
         assert_eq!(err.details, Some(details));
+    }
+
+    /// A fork refused because its source has no build state answers the
+    /// invalid-params class on the session transports and in the wire
+    /// envelope, with the refusal's data intact.
+    #[test]
+    fn fork_source_build_state_missing_answers_invalid_params_with_its_data() {
+        let source = meerkat_core::SessionId::new();
+        let refusal = meerkat_core::SessionError::fork_source_build_state_missing(&source);
+        assert_eq!(
+            session_transport_error_code(&refusal),
+            ErrorCode::InvalidParams
+        );
+        assert_eq!(ErrorCode::InvalidParams.jsonrpc_code(), -32602);
+        let wire = WireError::from(refusal);
+        assert_eq!(wire.code, ErrorCode::InvalidParams);
+        assert_eq!(
+            wire.details,
+            Some(serde_json::json!({
+                "kind": "fork_source_build_state_missing",
+                "source_session_id": source.to_string(),
+            }))
+        );
     }
 
     #[test]

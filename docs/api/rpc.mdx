@@ -1102,6 +1102,24 @@ Create a new idle session from the source prefix through `message_index`, replac
 
 Supported replacement variants are `message`, `user_content_block`, `assistant_block`, and `tool_result_content_block`. Edits always create a new session identity.
 
+#### What a fork child inherits
+
+A child of `session/fork_at` or `session/fork_replace` runs its turns under its source's session configuration:
+
+- the source's model, provider and tool access policy (a call's `tool_access_policy` replaces the policy on the child only);
+- the output schema, hook overrides, budget limits, shell and tool call timeouts, comms settings, application context and additional instructions;
+- the source's callback tool definitions. A client that runs the child must answer those tools' calls for the child's session id.
+
+The child does not inherit:
+
+- the shell environment (`shell_env`) given to `session/create`. The source keeps it when it resumes; the child runs shell commands without it.
+- MCP server attachments. Attach the servers the child needs to the child.
+- mob operator authority, the comms name, peer metadata and mob member binding, and `keep_alive`.
+
+The child's first turn continues the transcript prefix, System message included; it does not write a second System message from the inherited instructions.
+
+A fork derives the child's build state from its source's. A source with session metadata but no build state is refused before anything is committed, with `INVALID_PARAMS` (-32602) and data `{"kind": "fork_source_build_state_missing", "source_session_id": "<source id>"}`. A child forked by Meerkat 0.9.3 or earlier that never ran a turn has no build state: its `turn/start` fails with `INTERNAL_ERROR` (-32603) "turn abandoned: persisted session <id> is missing session build state". Fork its source again instead.
+
 ### session/list
 
 List sessions.
