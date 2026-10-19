@@ -191,6 +191,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "WireMemberProgressEvent": schema_for!(crate::wire::WireMemberProgressEvent),
         "WireMemberProgressSnapshot": schema_for!(crate::wire::WireMemberProgressSnapshot),
         "WireMemberPreviewUnavailable": schema_for!(crate::wire::WireMemberPreviewUnavailable),
+        "WireMemberRegistrationHookCall": schema_for!(crate::wire::WireMemberRegistrationHookCall),
         "MobSnapshotResult": schema_for!(crate::wire::MobSnapshotResult),
         "MobDestroyResult": schema_for!(crate::wire::MobDestroyResult),
         "MobRotateSupervisorResult": schema_for!(crate::wire::MobRotateSupervisorResult),

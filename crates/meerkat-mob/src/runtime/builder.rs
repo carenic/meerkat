@@ -1387,6 +1387,7 @@ async fn record_seeded_member_endpoint_broken(
             bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
             reason,
             hold: None,
+            registration_refusal: None,
         },
     );
     Ok(())
@@ -7022,16 +7023,24 @@ fn seed_mob_authority_restore_failures(
 ) -> Result<(), MobError> {
     use crate::machines::mob_machine as mob_dsl;
     for (identity, diagnostic) in restore_diagnostics {
-        apply_seeded_mob_signal(
-            authority,
-            mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
-                agent_identity: mob_dsl::AgentIdentity::from_domain(
-                    &crate::ids::AgentIdentity::from(identity.as_str()),
-                ),
-                reason: diagnostic.reason.clone(),
+        let agent_identity = mob_dsl::AgentIdentity::from_domain(&crate::ids::AgentIdentity::from(
+            identity.as_str(),
+        ));
+        let reason = diagnostic.reason.clone();
+        // A host refusal of the member's registration keeps its typed code
+        // (instead of the plain failure, whose transition clears the code).
+        let signal = match diagnostic.registration_refusal {
+            Some(call) => mob_dsl::MobMachineSignal::RecoverMemberRestoreHostRefused {
+                agent_identity,
+                refusal_code: call.as_code().to_string(),
+                reason,
             },
-            "recover_member_restore_failure",
-        )?;
+            None => mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
+                agent_identity,
+                reason,
+            },
+        };
+        apply_seeded_mob_signal(authority, signal, "recover_member_restore_failure")?;
     }
     Ok(())
 }
@@ -9315,6 +9324,7 @@ impl MobBuilder {
                         bridge_session_id: Some(bridge_session_id),
                         reason,
                         hold: None,
+                        registration_refusal: None,
                     },
                 );
             };
@@ -9822,7 +9832,8 @@ impl MobBuilder {
                         generated_self_owned_operation_owner: Some(
                             generated_self_owned_operation_owner,
                         ),
-                        runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                        runtime_revival_intent:
+                            super::provisioner::RuntimeRevivalIntent::ColdRestore,
                         held_bound: None,
                     })
                     .await
@@ -9877,13 +9888,25 @@ impl MobBuilder {
                             .remove(&entry.agent_identity);
                     }
                     Err(error) => {
-                        record_restore_failure(
-                            bridge_session_id.clone(),
-                            format!(
-                                "failed to restore durable session '{bridge_session_id}': {error}"
-                            ),
-                        )
-                        .await;
+                        // The provision's refusal slot is the only source of
+                        // this typed refusal; the seed records its code, and
+                        // the transaction's own rollback already removed the
+                        // registration the host was asked about.
+                        let registration_refusal = match &error {
+                            MobError::MemberRegistrationRefused { call, .. } => Some(*call),
+                            _ => None,
+                        };
+                        tool_handle.restore_diagnostics.write().await.insert(
+                            entry.agent_identity.clone(),
+                            super::handle::RestoreFailureDiagnostic {
+                                bridge_session_id: Some(bridge_session_id.clone()),
+                                reason: format!(
+                                    "failed to restore durable session '{bridge_session_id}': {error}"
+                                ),
+                                hold: None,
+                                registration_refusal,
+                            },
+                        );
                     }
                 }
                 continue;

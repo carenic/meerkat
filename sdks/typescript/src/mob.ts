@@ -37,6 +37,7 @@ import type {
   WireHostRef,
   WireMemberLifecycleCapabilities,
   WireMemberPreviewUnavailable,
+  WireMemberRegistrationHookCall,
   WireMobMemberStatus,
   WireMobBackendKind,
   WireMobRuntimeMode,
@@ -141,6 +142,11 @@ export interface MobMemberSnapshot {
    * Absent when they are observations.
    */
   previewUnavailable?: WireMemberPreviewUnavailable;
+  /**
+   * Set when the member's host refused its restored registration: the hook
+   * call that refused it. The member stays broken until an explicit repair.
+   */
+  registrationRefusal?: WireMemberRegistrationHookCall;
 }
 
 export interface MobKickoffWaitOptions {
@@ -163,6 +169,8 @@ export interface MobKickoffMemberSnapshot {
   peerConnectivity?: MobPeerConnectivity;
   /** As on {@link MobMemberSnapshot.previewUnavailable}. */
   previewUnavailable?: WireMemberPreviewUnavailable;
+  /** As on {@link MobMemberSnapshot.registrationRefusal}. */
+  registrationRefusal?: WireMemberRegistrationHookCall;
 }
 
 export type MobReadyWaitOptions = MobKickoffWaitOptions;

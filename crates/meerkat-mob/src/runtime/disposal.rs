@@ -67,6 +67,11 @@ pub(super) struct DisposalContext {
     /// One absolute budget minted when MobMachine publishes Retiring. It is
     /// carried through every local runtime teardown stage without reset.
     pub retirement_deadline: Option<Instant>,
+    /// Whether MobMachine recorded that the member's host refused its
+    /// registration when this disposal was planned. Such a member holds no
+    /// owner operation binding, so its archive projects into one only when
+    /// one is bound.
+    pub registration_refused: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +184,7 @@ mod tests {
             trust_unwire_authority_by_peer: BTreeMap::new(),
             historical_trust_unwire_authorities_by_peer: BTreeMap::new(),
             retirement_deadline: None,
+            registration_refused: false,
         }
     }
 

@@ -1064,6 +1064,41 @@ test('memberStatus surfaces the typed preview_unavailable marker and omits it wh
   );
 });
 
+test('memberStatus surfaces the registration_refusal hook call and omits it when unset', async () => {
+  const statusMob = (extra) =>
+    new Mob('mob-web-unit', {
+      async mob_member_status() {
+        return JSON.stringify({
+          status: 'broken',
+          member_ref: 'runtime-owned-ref-worker-1',
+          tokens_used: 0,
+          is_final: false,
+          ...extra,
+        });
+      },
+    });
+  for (const hookCall of [
+    'select_destination',
+    'select_agent_mandate',
+    'prepare_member_surface',
+    'verify_member_surface',
+  ]) {
+    const snapshot = await statusMob({ registration_refusal: hookCall }).memberStatus('worker-1');
+    assert.equal(snapshot.registration_refusal, hookCall);
+    assert.equal(snapshot.status, 'broken');
+  }
+  for (const extra of [{}, { registration_refusal: null }]) {
+    const snapshot = await statusMob(extra).memberStatus('worker-1');
+    assert.equal(Object.prototype.hasOwnProperty.call(snapshot, 'registration_refusal'), false);
+  }
+  for (const refusal of ['SelectDestination', { kind: 'select_destination' }]) {
+    await assert.rejects(
+      () => statusMob({ registration_refusal: refusal }).memberStatus('worker-1'),
+      /registration_refusal must be a valid registration hook call/,
+    );
+  }
+});
+
 test('memberStatus rejects malformed resolved_capabilities booleans instead of coercing', async () => {
   // A non-boolean capability flag must fail closed; the SDK must NOT coerce it
   // (e.g. Boolean("false") === true would silently flip the meaning).

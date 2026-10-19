@@ -5956,6 +5956,125 @@ async def test_wait_mob_members_carry_preview_unavailable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hook_call",
+    [
+        "select_destination",
+        "select_agent_mandate",
+        "prepare_member_surface",
+        "verify_member_surface",
+    ],
+)
+async def test_mob_member_status_surfaces_registration_refusal(hook_call):
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": hook_call,
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    status = await client.mob_member_status("mob-1", "agent-a")
+    assert status["registration_refusal"] == hook_call
+    assert status["status"] == "broken"
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_omits_absent_or_null_registration_refusal():
+    client = MeerkatClient()
+    responses = [
+        {},
+        {"registration_refusal": None},
+    ]
+
+    for extra in responses:
+
+        async def fake_request(_method, _params, extra=extra):
+            return {
+                "status": "active",
+                "member_ref": _make_member_ref("mob-1", "agent-a"),
+                "tokens_used": 3,
+                "is_final": False,
+                **extra,
+            }
+
+        client._request = fake_request  # type: ignore[method-assign]
+        status = await client.mob_member_status("mob-1", "agent-a")
+        assert "registration_refusal" not in status
+
+
+@pytest.mark.asyncio
+async def test_mob_member_status_rejects_unknown_registration_refusal():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": "SelectDestination",
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match="invalid registration_refusal"):
+        await client.mob_member_status("mob-1", "agent-a")
+
+    async def fake_object_request(_method, _params):
+        return {
+            "status": "broken",
+            "member_ref": _make_member_ref("mob-1", "agent-a"),
+            "tokens_used": 0,
+            "is_final": False,
+            "registration_refusal": {"kind": "select_destination"},
+        }
+
+    client._request = fake_object_request  # type: ignore[method-assign]
+
+    with pytest.raises(MeerkatError, match="invalid registration_refusal"):
+        await client.mob_member_status("mob-1", "agent-a")
+
+
+@pytest.mark.asyncio
+async def test_wait_mob_members_carry_registration_refusal():
+    client = MeerkatClient()
+
+    async def fake_request(_method, _params):
+        return {
+            "members": [
+                {
+                    "agent_identity": "lead",
+                    "status": "broken",
+                    "tokens_used": 0,
+                    "is_final": False,
+                    "registration_refusal": "select_destination",
+                },
+                {
+                    "agent_identity": "writer",
+                    "status": "active",
+                    "tokens_used": 7,
+                    "is_final": False,
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    for members in (
+        await client.wait_mob_kickoff("mob-1"),
+        await client.wait_mob_ready("mob-1"),
+    ):
+        assert members[0]["registration_refusal"] == "select_destination"
+        assert "registration_refusal" not in members[1]
+
+
+@pytest.mark.asyncio
 async def test_mob_member_status_rejects_unknown_peer_connectivity_tag():
     client = MeerkatClient()
 

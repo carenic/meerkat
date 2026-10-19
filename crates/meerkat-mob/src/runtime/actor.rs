@@ -11121,6 +11121,76 @@ impl MobActor {
         Ok(())
     }
 
+    /// The signal that records a failed revival of `agent_identity`'s
+    /// session `session_id`, with the reason it records. A host refusal of
+    /// the member's registration keeps its typed code and the host's own
+    /// reason, so every later answer repeats the first: the member stays
+    /// Broken with it until an explicit repair.
+    pub(super) fn member_revival_failure_signal(
+        agent_identity: mob_dsl::AgentIdentity,
+        session_id: &SessionId,
+        error: &MobError,
+    ) -> (mob_dsl::MobMachineSignal, String) {
+        match error {
+            MobError::MemberRegistrationRefused { call, reason, .. } => (
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
+                    agent_identity,
+                    refusal_code: call.as_code().to_string(),
+                    reason: reason.clone(),
+                },
+                reason.clone(),
+            ),
+            _ => {
+                let reason = format!(
+                    "machine-authorized revival of bridge session '{session_id}' failed: {error}"
+                );
+                (
+                    mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
+                        agent_identity,
+                        reason: reason.clone(),
+                    },
+                    reason,
+                )
+            }
+        }
+    }
+
+    /// Whether MobMachine records that `agent_identity`'s host refused its
+    /// registration, read through the one parser of the recorded
+    /// restore-failure code. Such a member keeps no registration and no
+    /// owner context until a host-approved materialization.
+    pub(super) fn member_registration_refused(&self, agent_identity: &AgentIdentity) -> bool {
+        self.dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                agent_identity,
+            ))
+            .is_some()
+    }
+
+    /// The typed host refusal `agent_identity` is Broken with, read from
+    /// MobMachine's recorded restore-failure code, so asking again answers
+    /// the same refusal without asking the host.
+    pub(super) fn recorded_registration_refusal(
+        &self,
+        agent_identity: &AgentIdentity,
+        session_id: Option<meerkat_core::types::SessionId>,
+        reason: String,
+    ) -> Option<MobError> {
+        let call = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                &crate::ids::AgentIdentity::from(agent_identity.as_str()),
+            ))?;
+        Some(MobError::MemberRegistrationRefused {
+            member_id: agent_identity.clone(),
+            session_id,
+            call,
+            reason,
+        })
+    }
+
     async fn ensure_member_not_broken(
         &self,
         agent_identity: &AgentIdentity,
@@ -11140,8 +11210,16 @@ impl MobActor {
                         .error
                         .unwrap_or_else(|| "member restore failed".to_string()),
                     hold: None,
+                    registration_refusal: None,
                 },
             );
+            if let Some(refusal) = self.recorded_registration_refusal(
+                agent_identity,
+                diag.bridge_session_id.clone(),
+                diag.reason.clone(),
+            ) {
+                return Err(refusal);
+            }
             return Err(MobError::MemberRestoreFailed {
                 member_id: agent_identity.clone(),
                 session_id: diag.bridge_session_id,
@@ -12596,6 +12674,7 @@ impl MobActor {
                                 bridge_session_id: Some(closed.session_id.clone()),
                                 reason: format!("{} [{}]", closed.reason, closed.refusal_code),
                                 hold: None,
+                                registration_refusal: None,
                             },
                         )
                         .await;
@@ -13023,6 +13102,10 @@ impl MobActor {
             .dsl_authority
             .state()
             .member_lifecycle_for_identity(&dsl_identity);
+        let registration_refusal = self
+            .dsl_authority
+            .state()
+            .member_registration_refusal_for_identity(&dsl_identity);
         let kickoff = kickoff_snapshot_from_machine_state(
             agent_identity.as_str(),
             self.dsl_authority.state(),
@@ -13164,6 +13247,7 @@ impl MobActor {
                 peer_connectivity: None,
                 kickoff,
                 progress,
+                registration_refusal,
             },
         ))
     }
@@ -13320,6 +13404,7 @@ impl MobActor {
                 bridge_session_id: entry.member_ref.bridge_session_id().cloned(),
                 reason,
                 hold: None,
+                registration_refusal: None,
             },
         )
         .await;
@@ -13384,6 +13469,7 @@ impl MobActor {
                 bridge_session_id: Some(bridge_session_id.clone()),
                 reason: reason.clone(),
                 hold: None,
+                registration_refusal: None,
             },
         )
         .await;
@@ -13519,6 +13605,7 @@ impl MobActor {
                         bridge_session_id: Some(bridge_session_id.clone()),
                         reason: classify_reason.clone(),
                         hold: None,
+                        registration_refusal: None,
                     },
                 )
                 .await;
@@ -13577,6 +13664,7 @@ impl MobActor {
                                 bridge_session_id: Some(bridge_session_id.clone()),
                                 reason: failure_reason.clone(),
                                 hold,
+                                registration_refusal: None,
                             },
                         )
                         .await;
@@ -30493,6 +30581,14 @@ impl MobActor {
         };
         let entries = self.roster.read().await.list().cloned().collect::<Vec<_>>();
         for entry in entries {
+            // A member whose host refused its registration at this boot keeps
+            // no registration and no owner context until a host-approved
+            // materialization: the refusal removed the registration it was
+            // asked about. Any other restore failure is retryable and keeps
+            // this restore, which its repair reuses.
+            if self.member_registration_refused(&entry.agent_identity) {
+                continue;
+            }
             if let Some(plan) = self.prepare_restored_member_operation_binding(entry)? {
                 Self::realize_restored_member_operation_binding(
                     io.clone(),
@@ -44693,6 +44789,8 @@ impl MobActor {
                 "destroy_retry_runtime_retire_after_detach_ack",
             )
             .await?;
+            #[cfg(feature = "runtime-adapter")]
+            self.drop_released_refused_member_retire_route(entry).await;
             return self.flush_routed_effects().await;
         }
 
@@ -44801,6 +44899,8 @@ impl MobActor {
                 )));
             }
         }
+        #[cfg(feature = "runtime-adapter")]
+        self.drop_released_refused_member_retire_route(entry).await;
         self.flush_routed_effects().await
     }
 
@@ -45906,6 +46006,7 @@ impl MobActor {
             historical_trust_unwire_authorities_by_peer: trust_cleanup_plan
                 .historical_trust_unwire_authorities_by_peer,
             retirement_deadline: None,
+            registration_refused: false,
         }
     }
 
@@ -47164,13 +47265,27 @@ impl MobActor {
             member_ref = ?ctx.entry.member_ref,
             "MobActor::dispose_archive_session retiring member via provisioner"
         );
-        let disposal_result = match ctx.retirement_deadline {
-            Some(deadline) => {
-                self.provisioner
-                    .retire_member_until(&ctx.entry.member_ref, &ctx.entry.agent_identity, deadline)
-                    .await
+        let disposal_result = if ctx.registration_refused {
+            self.provisioner
+                .retire_refused_member(
+                    &ctx.entry.member_ref,
+                    &ctx.entry.agent_identity,
+                    ctx.retirement_deadline,
+                )
+                .await
+        } else {
+            match ctx.retirement_deadline {
+                Some(deadline) => {
+                    self.provisioner
+                        .retire_member_until(
+                            &ctx.entry.member_ref,
+                            &ctx.entry.agent_identity,
+                            deadline,
+                        )
+                        .await
+                }
+                None => self.provisioner.retire_member(&ctx.entry.member_ref).await,
             }
-            None => self.provisioner.retire_member(&ctx.entry.member_ref).await,
         };
         let disposal = match disposal_result {
             Ok(disposal) => disposal,
@@ -48601,12 +48716,13 @@ impl MobActor {
         trust_cleanup_plan: RetireTrustCleanupPlan,
         report: &mut super::handle::MobDestroyReport,
     ) -> Result<(), super::handle::MobDestroyError> {
-        let ctx = Self::disposal_context_from_entry(
+        let mut ctx = Self::disposal_context_from_entry(
             &entry.agent_identity,
             &entry,
             trust_cleanup_plan,
             false,
         );
+        ctx.registration_refused = self.member_registration_refused(&entry.agent_identity);
         // Every step below is built in its own frame: at opt-level 0 each
         // awaited future reserved twice its size in this poll frame, beneath
         // the member's whole disposal.

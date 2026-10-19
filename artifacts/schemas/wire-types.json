@@ -125966,6 +125966,31 @@
         "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
         "type": "string"
       },
+      "WireMemberRegistrationHookCall": {
+        "description": "The member registration hook call that refused a restored member's\nregistration.",
+        "oneOf": [
+          {
+            "const": "select_destination",
+            "description": "The host refused to select the member's destination.",
+            "type": "string"
+          },
+          {
+            "const": "select_agent_mandate",
+            "description": "The host refused to select the agent the member's registration acts as.",
+            "type": "string"
+          },
+          {
+            "const": "prepare_member_surface",
+            "description": "The host refused the member's prepared tool surface.",
+            "type": "string"
+          },
+          {
+            "const": "verify_member_surface",
+            "description": "The host refused the member's built tool surface.",
+            "type": "string"
+          }
+        ]
+      },
       "WireMemberRunState": {
         "enum": [
           "idle",
@@ -126297,6 +126322,17 @@
             "type": "null"
           }
         ]
+      },
+      "registration_refusal": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMemberRegistrationHookCall"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Present when the member's host refused its restored registration: the\nhook call that refused it. The member stays Broken until an explicit\nrepair. Absent-omitted for byte-compat with released SDKs."
       },
       "resolved_capabilities": {
         "anyOf": [
@@ -177002,6 +177038,33 @@
     ],
     "title": "WireMemberProgressSnapshot",
     "type": "object"
+  },
+  "WireMemberRegistrationHookCall": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The member registration hook call that refused a restored member's\nregistration.",
+    "oneOf": [
+      {
+        "const": "select_destination",
+        "description": "The host refused to select the member's destination.",
+        "type": "string"
+      },
+      {
+        "const": "select_agent_mandate",
+        "description": "The host refused to select the agent the member's registration acts as.",
+        "type": "string"
+      },
+      {
+        "const": "prepare_member_surface",
+        "description": "The host refused the member's prepared tool surface.",
+        "type": "string"
+      },
+      {
+        "const": "verify_member_surface",
+        "description": "The host refused the member's built tool surface.",
+        "type": "string"
+      }
+    ],
+    "title": "WireMemberRegistrationHookCall"
   },
   "WireMemberRunState": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

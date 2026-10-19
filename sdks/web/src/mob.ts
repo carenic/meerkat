@@ -50,6 +50,7 @@ import type {
   WireMemberLifecycleCapabilities,
   WireMemberPreviewUnavailable,
   WireMemberProgressSnapshot,
+  WireMemberRegistrationHookCall,
   WireNonPortableResourceKind,
   WireReachability,
   WireResolvedModelCapabilities,
@@ -761,6 +762,35 @@ function parseWireMemberPreviewUnavailable(
   );
 }
 
+const WIRE_MEMBER_REGISTRATION_HOOK_CALL_VALUES: readonly WireMemberRegistrationHookCall[] = [
+  'select_destination',
+  'select_agent_mandate',
+  'prepare_member_surface',
+  'verify_member_surface',
+];
+
+/**
+ * The registration hook call that refused a restored member's registration.
+ * Absent (or `null`) means no host refused the member; a value outside the
+ * closed vocabulary fails closed.
+ */
+function parseWireMemberRegistrationRefusal(
+  raw: unknown,
+): WireMemberRegistrationHookCall | undefined {
+  if (raw == null) {
+    return undefined;
+  }
+  if (
+    typeof raw === 'string' &&
+    WIRE_MEMBER_REGISTRATION_HOOK_CALL_VALUES.includes(raw as WireMemberRegistrationHookCall)
+  ) {
+    return raw as WireMemberRegistrationHookCall;
+  }
+  throw new Error(
+    'Invalid mob member_status response: registration_refusal must be a valid registration hook call',
+  );
+}
+
 function parseWireReachability(raw: unknown, field: string): WireReachability | undefined {
   if (raw == null) {
     return undefined;
@@ -1036,6 +1066,10 @@ function parseMobMemberSnapshot(raw: unknown): MobMemberSnapshot {
   const previewUnavailable = parseWireMemberPreviewUnavailable(snapshot.preview_unavailable);
   if (previewUnavailable !== undefined) {
     result.preview_unavailable = previewUnavailable;
+  }
+  const registrationRefusal = parseWireMemberRegistrationRefusal(snapshot.registration_refusal);
+  if (registrationRefusal !== undefined) {
+    result.registration_refusal = registrationRefusal;
   }
   return result;
 }

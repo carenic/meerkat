@@ -310,6 +310,7 @@ from .generated.types import (
     WireProjectionProvenance as WireProjectionProvenance,
     WireReachability as WireReachability,
     WireMemberPreviewUnavailable as WireMemberPreviewUnavailable,
+    WireMemberRegistrationHookCall as WireMemberRegistrationHookCall,
     WireRouteInstallObligation as WireRouteInstallObligation,
     WireRuntimeBinding as WireRuntimeBinding,
     WireToolAccessPolicy as WireToolAccessPolicy,

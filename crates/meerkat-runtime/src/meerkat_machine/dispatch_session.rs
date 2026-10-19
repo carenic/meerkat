@@ -25,6 +25,9 @@ enum MaterializationClaimRequest<'a> {
         state_sink: &'a std::sync::Mutex<
             Option<Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>>,
         >,
+        /// Set once the prepare knows whether it inserted the session's
+        /// registration or found one already current.
+        inserted_sink: &'a std::sync::atomic::AtomicBool,
     },
 }
 
@@ -2150,14 +2153,19 @@ impl MeerkatMachine {
         claim: MaterializationClaimRequest<'_>,
         expected_registration: Option<&RuntimeSessionRegistrationWitness>,
     ) -> Result<MeerkatMachineCommandResult, RuntimeDriverError> {
-        let (requested_claim_id, release_materialization_claim_on_drop, claim_state_sink) =
-            match claim {
-                MaterializationClaimRequest::ReleaseOnDrop => (uuid::Uuid::new_v4(), true, None),
-                MaterializationClaimRequest::Owned {
-                    claim_id,
-                    state_sink,
-                } => (claim_id, false, Some(state_sink)),
-            };
+        let (
+            requested_claim_id,
+            release_materialization_claim_on_drop,
+            claim_state_sink,
+            inserted_sink,
+        ) = match claim {
+            MaterializationClaimRequest::ReleaseOnDrop => (uuid::Uuid::new_v4(), true, None, None),
+            MaterializationClaimRequest::Owned {
+                claim_id,
+                state_sink,
+                inserted_sink,
+            } => (claim_id, false, Some(state_sink), Some(inserted_sink)),
+        };
         let unique_materialization_transaction = !release_materialization_claim_on_drop;
         let candidate_materialization_claim_state = Arc::new(std::sync::Mutex::new(
             crate::RuntimeActorMaterializationClaimState::new(unique_materialization_transaction),
@@ -2223,6 +2231,9 @@ impl MeerkatMachine {
             ?preparation,
             "MeerkatMachine::prepare_session_runtime_bindings registered session"
         );
+        if let Some(inserted_sink) = inserted_sink {
+            inserted_sink.store(inserted_by_call, std::sync::atomic::Ordering::Release);
+        }
         // #1446: the binding transaction below runs in its own boxed block, so
         // its temporaries are not reserved in this frame while the registration
         // call above recurses. Its `return`s are the function's own returns.
@@ -2873,6 +2884,7 @@ impl MeerkatMachine {
                     RuntimeBindingsError::PrepareFailed(session_id.clone(), error.to_string())
                 })?;
         let claim_state_slot = pending.claim_state_slot();
+        let inserted_registration = std::sync::atomic::AtomicBool::new(false);
         let result = self
             .prepare_session_runtime_bindings_with_claim(
                 session_id.clone(),
@@ -2881,6 +2893,7 @@ impl MeerkatMachine {
                 MaterializationClaimRequest::Owned {
                     claim_id,
                     state_sink: &claim_state_slot,
+                    inserted_sink: &inserted_registration,
                 },
                 expected_registration.as_ref(),
             )
@@ -2901,6 +2914,7 @@ impl MeerkatMachine {
             Arc::clone(self),
             bindings,
             claim_id,
+            inserted_registration.load(std::sync::atomic::Ordering::Acquire),
             pending.cleanup_spawner(),
         )
         .map_err(|error| {

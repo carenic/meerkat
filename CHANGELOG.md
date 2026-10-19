@@ -546,6 +546,75 @@ them.
   `RetireAtScopeMobNotRunningDestroyed`. Every new variant is appended last,
   so no existing variant's discriminant moves. Exhaustive matches must add
   the arms.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a host refusal
+  of a restored member's registration (`select_destination`,
+  `select_agent_mandate`, `prepare_member_surface` or
+  `verify_member_surface`) now removes that registration exactly, as a new
+  member's refusal does. The removal is the canonical unregister: it is
+  recorded in the session's durable history, and it terminates every input
+  the session still holds (abandoned as `Stopped`, their completions
+  resolved as runtime-terminated). The owner context the restore bound to
+  the member is released with it. The member stays Broken with the typed
+  refusal (`MobError::MemberRegistrationRefused`, shown in
+  `MobMemberSnapshot::registration_refusal`) until an explicit repair, and
+  `ensure_member_live` returns that refusal without asking the host again.
+  A member that `MobBuilder::resume` restores at boot (a mob running at the
+  crash) gets the same typed refusal, and no registration of its session is
+  current after the refusal: the boot restore's own rollback removes the
+  registration it inserted, as before, and the actor's startup no longer
+  registers the refused member's session again. A refused member, on either
+  path, can be retired, respawned or destroyed: the retirement archives its
+  durable session without routing a retire to the runtime the refusal
+  released. A member the boot recreates on a fresh session still fails the
+  whole resume with the host's error. A failure that is not the host's
+  refusal keeps the restored registration for the repair to reuse, and a
+  spawn that adopts a session registered before it keeps that registration
+  on a refusal, as does the recovery of an attached member's actor.
+- `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
+  member_id, session_id, call, reason }`: a restored member's host refused
+  its registration at `call` (see above). Its RPC error data has the kind
+  `mob_member_registration_refused` with the refusing `hook_call`. Code that
+  matches `MobError` exhaustively adds an arm.
+- `meerkat-mob`: `MobError` gains the variant `MemberDestinationNotInstalled {
+  session_id, error }`, appended last: the member's runtime did not install
+  the destination its host selected, and `error` is the runtime's own
+  verdict. It is the runtime's answer, not a host refusal: a restored member
+  keeps its registration. Such a failure was a `MobError::WiringError`
+  before. Its `failure_class()` is `MobFailureClass::RuntimeRejected`, where
+  the `WiringError` was `MobRejected`, so schedule delivery now records the
+  failure reason `runtime_rejected` instead of `mob_rejected` for a delivery
+  whose member revival hits it. Its RPC error data has the kind
+  `mob_member_destination_not_installed` with the `session_id`, the runtime
+  verdict as a stable snake_case `cause` (for example
+  `scoped_context_generation_not_advanced` or `validation_failed`), the
+  `bound_generation` and `requested_generation` of a selection that does
+  not advance (null for any other cause) and `retryable: false`. A failed
+  revival's destination stays bound on the restored registration it keeps,
+  so a host's re-selection for that registration must advance
+  `context_generation`: a selection of the bound generation gets this
+  variant with the cause `scoped_context_generation_not_advanced`, and the
+  repair selects again with an advanced generation. Code that matches
+  `MobError` exhaustively adds an arm.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`:
+  `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance past the bound one with the new
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound,
+  requested }`, appended last, instead of `RuntimeDriverError::Internal`.
+  `RuntimeDriverError` is `non_exhaustive`, so the variant itself breaks
+  no match.
+- `meerkat-contracts`: `MobMemberStatusResult` gains the field
+  `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
+  the wire unless a restored member's host refused its registration. Code
+  that builds the result with a struct literal sets it.
+- `MobMachineSignal` (meerkat-machine-schema and meerkat-mob), its variant
+  enum `MobMachineSignalVariant` (meerkat-machine-schema), and the kernel
+  `Signal` and `SignalKind` (meerkat-machine-kernels) gain the variants
+  `ResolveMemberRevivalHostRefused` and `RecoverMemberRestoreHostRefused`,
+  appended last: they record a host's refusal of a restored member's
+  registration with the refusing hook call's code. The kernel
+  `generated::mob::TransitionId` gains `ResolveMemberRevivalHostRefusedRunning`
+  and `RecoverMemberRestoreHostRefusedRunning`, appended last. Code that
+  matches these enums exhaustively adds the arms.
 
 ### Security
 
@@ -996,6 +1065,13 @@ them.
   owns for the identity, answers `Ok(())` only once the identity has no
   roster entry and no stuck retirement, and answers a stuck retirement with
   `MemberRetirementStuck`.
+- `meerkat-mob`: `MemberRegistrationHookCall`, the registration hook call
+  that refused a restored member's registration, and
+  `MobMemberSnapshot::registration_refusal`, which carries it for a Broken
+  member. `meerkat-contracts` mirrors it as `WireMemberRegistrationHookCall`.
+- `meerkat-runtime`: `PreparedSessionMaterialization::inserted_registration()`
+  tells whether the materialization's own prepare inserted the session's
+  registration or found one already current.
 
 ### Changed
 

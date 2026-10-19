@@ -82864,6 +82864,12 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::RetirementInterrupted { stage, .. } => {
             format!("retirement_interrupted:{stage}")
         }
+        MobError::MemberRegistrationRefused { call, .. } => {
+            format!("member_registration_refused:{call}")
+        }
+        MobError::MemberDestinationNotInstalled { .. } => {
+            "member_destination_not_installed".to_string()
+        }
     }
 }
 

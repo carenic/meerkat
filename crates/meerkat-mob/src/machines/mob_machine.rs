@@ -2399,6 +2399,17 @@ impl MobMachineState {
             .collect()
     }
 
+    /// The host hook call that refused this member's restored registration,
+    /// when its recorded restore failure is that typed refusal.
+    pub(crate) fn member_registration_refusal_for_identity(
+        &self,
+        agent_identity: &AgentIdentity,
+    ) -> Option<crate::MemberRegistrationHookCall> {
+        self.member_restore_failure_codes
+            .get(agent_identity)
+            .and_then(|code| crate::MemberRegistrationHookCall::from_code(code))
+    }
+
     /// Project lifecycle truth for an identity from the machine's membership
     /// maps.
     pub fn member_lifecycle_for_identity(
@@ -2496,6 +2507,40 @@ impl MobMachineState {
 
 #[cfg(test)]
 mod tests {
+    /// The one predicate the startup restore skips on: only a registration
+    /// hook call's code reads as a registration refusal; no code, and a
+    /// runtime binding refusal's code, do not.
+    #[test]
+    fn only_a_registration_hook_code_reads_as_a_registration_refusal() {
+        let identity = super::AgentIdentity("member".into());
+        let mut state = super::MobMachineState::default();
+        assert_eq!(
+            state.member_registration_refusal_for_identity(&identity),
+            None
+        );
+        state
+            .member_restore_failure_codes
+            .insert(identity.clone(), "runtime_refused".into());
+        assert_eq!(
+            state.member_registration_refusal_for_identity(&identity),
+            None
+        );
+        for call in [
+            crate::MemberRegistrationHookCall::SelectDestination,
+            crate::MemberRegistrationHookCall::SelectAgentMandate,
+            crate::MemberRegistrationHookCall::PrepareMemberSurface,
+            crate::MemberRegistrationHookCall::VerifyMemberSurface,
+        ] {
+            state
+                .member_restore_failure_codes
+                .insert(identity.clone(), call.as_code().into());
+            assert_eq!(
+                state.member_registration_refusal_for_identity(&identity),
+                Some(call)
+            );
+        }
+    }
+
     use super::*;
 
     fn begin_completion_lifecycle_quiesce(
