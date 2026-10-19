@@ -93,6 +93,10 @@ pub(in crate::runtime) struct RetirementState {
     detach: Vec<MobDestroyingSessionIngressObligation>,
     retired_comms: Option<Arc<dyn CoreCommsRuntime>>,
     routes: Vec<super::super::composition::MobSeamEffect>,
+    /// Whether MobMachine recorded that the member's host refused its
+    /// registration when this retirement started. The member's Retire
+    /// transition clears that record, so the stages after it read this.
+    registration_refused: bool,
     retirement_started: bool,
     terminal_published: bool,
     disposal: Option<DisposalContext>,
@@ -298,6 +302,32 @@ enum RetirementRevokeObservation {
 struct RetirementRouteObservation {
     archive_complete: bool,
     exact_local_target_quiescent: bool,
+}
+
+/// Whether the runtime has released a host-refused member's session: it holds
+/// no registration, no executor attachment and no archive residue for it. The
+/// host's refusal removed the registration through the canonical unregister,
+/// which ended every input the session held and recorded the unregister
+/// durably; with nothing left in the runtime there is no runtime to route a
+/// retire to, and retiring the member only archives its durable session. A
+/// residue read failure fails closed.
+#[cfg(feature = "runtime-adapter")]
+async fn refused_member_runtime_released(
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    session: &SessionId,
+) -> Result<bool, MobError> {
+    Ok(adapter
+        .current_session_registration_witness(session)
+        .await
+        .is_none()
+        && adapter
+            .current_executor_attachment_witness(session)
+            .await
+            .is_none()
+        && !adapter
+            .archive_runtime_residue_present(session)
+            .await
+            .map_err(|error| MobError::Internal(error.to_string()))?)
 }
 
 struct RetirementArchiveObservationSource {
@@ -2680,6 +2710,7 @@ impl MobActor {
             continuation.preserve_topology,
         );
         ctx.retirement_deadline = Some(continuation.deadline);
+        ctx.registration_refused = continuation.registration_refused;
         continuation.disposal = Some(ctx);
         self.retirement_stop_host(continuation).await;
     }
@@ -2873,6 +2904,7 @@ impl MobActor {
         let member = continuation.entry.member_ref.clone();
         let identity = identity.clone();
         let deadline = continuation.deadline;
+        let registration_refused = continuation.registration_refused;
         let observation = RetirementArchiveObservationSource {
             service: self.session_service.clone(),
             #[cfg(feature = "runtime-adapter")]
@@ -2890,9 +2922,15 @@ impl MobActor {
                     {
                         return Ok(mob_dsl::MemberSessionDisposal::Archived);
                     }
-                    let result = provisioner
-                        .retire_member_until(&member, &identity, deadline)
-                        .await;
+                    let result = if registration_refused {
+                        provisioner
+                            .retire_refused_member(&member, &identity, Some(deadline))
+                            .await
+                    } else {
+                        provisioner
+                            .retire_member_until(&member, &identity, deadline)
+                            .await
+                    };
                     if matches!(
                         &result,
                         Err(MobError::SessionError(
@@ -2916,6 +2954,8 @@ impl MobActor {
         let service = self.session_service.clone();
         #[cfg(feature = "runtime-adapter")]
         let adapter = self.runtime_adapter.clone();
+        #[cfg(feature = "runtime-adapter")]
+        let registration_refused = continuation.registration_refused;
         // Fence scope: self-only; observes the retiring member's own session/runtime/archive
         // attachment.
         self.dispatch_retirement(
@@ -2933,6 +2973,19 @@ impl MobActor {
                     if service.has_live_session(&session).await?
                         || service.load_persisted_session(&session).await?.is_some()
                     {
+                        // A host-refused member keeps its durable session for
+                        // the archive below, but its runtime may hold nothing
+                        // to route a retire to.
+                        #[cfg(feature = "runtime-adapter")]
+                        if registration_refused
+                            && let Some(adapter) = adapter.as_ref()
+                            && refused_member_runtime_released(adapter, &session).await?
+                        {
+                            return Ok(RetirementRouteObservation {
+                                archive_complete: false,
+                                exact_local_target_quiescent: true,
+                            });
+                        }
                         return Ok(RetirementRouteObservation {
                             archive_complete: false,
                             exact_local_target_quiescent: false,
@@ -3127,6 +3180,31 @@ impl MobActor {
                 )
                 .await;
             }
+        }
+    }
+
+    /// Drop the routed retire a mob destroy queued for a host-refused member
+    /// whose runtime is released (see [`refused_member_runtime_released`]),
+    /// as a retirement whose runtime is quiescent does: the destroy's
+    /// disposal still archives the member's durable session.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn drop_released_refused_member_retire_route(&mut self, entry: &RosterEntry) {
+        let Some(session) = entry.bridge_session_id() else {
+            return;
+        };
+        if !self.member_registration_refused(&entry.agent_identity) {
+            return;
+        }
+        let Some(adapter) = self.runtime_adapter.clone() else {
+            return;
+        };
+        // A residue read failure keeps the route: the destroy then fails
+        // closed on it as before.
+        if matches!(
+            refused_member_runtime_released(&adapter, session).await,
+            Ok(true)
+        ) {
+            let _ = self.take_retirement_routes(entry);
         }
     }
 
@@ -3576,6 +3654,7 @@ impl MobActor {
         let placed =
             super::super::member_runtime_is_host_owned(self.dsl_authority.state(), &identity);
         let placement = self.retirement_placement_fence(&identity);
+        let registration_refused = self.member_registration_refused(&identity);
         let mut continuation = Box::new(RetirementState {
             ticket: 0,
             entry,
@@ -3591,6 +3670,7 @@ impl MobActor {
             detach: Vec::new(),
             retired_comms: None,
             routes: Vec::new(),
+            registration_refused,
             retirement_started: false,
             terminal_published: false,
             disposal: None,
@@ -4655,6 +4735,8 @@ impl MobActor {
             detach: Vec::new(),
             retired_comms: None,
             routes: Vec::new(),
+            // A spawn rollback retires a member it provisioned itself.
+            registration_refused: false,
             retirement_started: false,
             terminal_published: false,
             disposal: None,

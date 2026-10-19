@@ -231,6 +231,7 @@ impl MobActor {
                         bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
                         reason,
                         hold: None,
+                        registration_refusal: None,
                     },
                 )
                 .await;
@@ -518,6 +519,7 @@ impl MobActor {
                                 bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
                                 reason,
                                 hold: None,
+                                registration_refusal: None,
                             },
                         )
                         .await;

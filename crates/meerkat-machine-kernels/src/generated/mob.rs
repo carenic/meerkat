@@ -9370,12 +9370,6 @@ pub mod signals {
         pub reason: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct ResolveMemberRevivalHostRefused {
-        pub agent_identity: AgentIdentity,
-        pub refusal_code: String,
-        pub reason: String,
-    }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AdmitDestroyCleanup {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AdmitDestroyStorageFinalizing {}
@@ -9426,6 +9420,18 @@ pub mod signals {
     pub struct PeerInputAdmitted {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CreateRun {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveMemberRevivalHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverMemberRestoreHostRefused {
+        pub agent_identity: AgentIdentity,
+        pub refusal_code: String,
+        pub reason: String,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -9483,7 +9489,6 @@ pub enum Signal {
     ResolveMemberRevivalSucceeded(signals::ResolveMemberRevivalSucceeded),
     ResolveRecreatedMemberSessionSucceeded(signals::ResolveRecreatedMemberSessionSucceeded),
     ResolveMemberRevivalFailed(signals::ResolveMemberRevivalFailed),
-    ResolveMemberRevivalHostRefused(signals::ResolveMemberRevivalHostRefused),
     AdmitDestroyCleanup(signals::AdmitDestroyCleanup),
     AdmitDestroyStorageFinalizing(signals::AdmitDestroyStorageFinalizing),
     MarkCompleted(signals::MarkCompleted),
@@ -9507,6 +9512,8 @@ pub enum Signal {
     OperationPeerTrusted(signals::OperationPeerTrusted),
     PeerInputAdmitted(signals::PeerInputAdmitted),
     CreateRun(signals::CreateRun),
+    ResolveMemberRevivalHostRefused(signals::ResolveMemberRevivalHostRefused),
+    RecoverMemberRestoreHostRefused(signals::RecoverMemberRestoreHostRefused),
 }
 impl Signal {
     pub fn kind(&self) -> SignalKind {
@@ -9592,7 +9599,6 @@ impl Signal {
                 SignalKind::ResolveRecreatedMemberSessionSucceeded
             }
             Self::ResolveMemberRevivalFailed(_) => SignalKind::ResolveMemberRevivalFailed,
-            Self::ResolveMemberRevivalHostRefused(_) => SignalKind::ResolveMemberRevivalHostRefused,
             Self::AdmitDestroyCleanup(_) => SignalKind::AdmitDestroyCleanup,
             Self::AdmitDestroyStorageFinalizing(_) => SignalKind::AdmitDestroyStorageFinalizing,
             Self::MarkCompleted(_) => SignalKind::MarkCompleted,
@@ -9616,6 +9622,8 @@ impl Signal {
             Self::OperationPeerTrusted(_) => SignalKind::OperationPeerTrusted,
             Self::PeerInputAdmitted(_) => SignalKind::PeerInputAdmitted,
             Self::CreateRun(_) => SignalKind::CreateRun,
+            Self::ResolveMemberRevivalHostRefused(_) => SignalKind::ResolveMemberRevivalHostRefused,
+            Self::RecoverMemberRestoreHostRefused(_) => SignalKind::RecoverMemberRestoreHostRefused,
         }
     }
 }
@@ -9672,7 +9680,6 @@ pub enum SignalKind {
     ResolveMemberRevivalSucceeded,
     ResolveRecreatedMemberSessionSucceeded,
     ResolveMemberRevivalFailed,
-    ResolveMemberRevivalHostRefused,
     AdmitDestroyCleanup,
     AdmitDestroyStorageFinalizing,
     MarkCompleted,
@@ -9696,6 +9703,8 @@ pub enum SignalKind {
     OperationPeerTrusted,
     PeerInputAdmitted,
     CreateRun,
+    ResolveMemberRevivalHostRefused,
+    RecoverMemberRestoreHostRefused,
 }
 
 pub mod effects {
@@ -11721,7 +11730,6 @@ pub enum TransitionId {
     ResolveRecreatedMemberSessionSucceededRunningLocal,
     ResolveMemberRevivalSucceededRunningPlaced,
     ResolveMemberRevivalFailedRunning,
-    ResolveMemberRevivalHostRefusedRunning,
     AdmitDestroyCleanup,
     AdmitDestroyStorageFinalizing,
     MarkCompleted,
@@ -12412,6 +12420,8 @@ pub enum TransitionId {
     RecordLoopUntilConditionFailedCompleted,
     RecordLoopUntilConditionMetStopped,
     RecordLoopUntilConditionMetCompleted,
+    ResolveMemberRevivalHostRefusedRunning,
+    RecoverMemberRestoreHostRefusedRunning,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

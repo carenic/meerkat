@@ -67,10 +67,18 @@ them.
   refusal (`MobError::MemberRegistrationRefused`, shown in
   `MobMemberSnapshot::registration_refusal`) until an explicit repair, and
   `ensure_member_live` returns that refusal without asking the host again.
-  A failure that is not the host's refusal keeps the restored registration
-  for the repair to reuse, and a spawn that adopts a session registered
-  before it keeps that registration on a refusal, as does the recovery of
-  an attached member's actor.
+  A member that `MobBuilder::resume` restores at boot (a mob running at the
+  crash) gets the same typed refusal, and no registration of its session is
+  current after the refusal: the boot restore's own rollback removes the
+  registration it inserted, as before, and the actor's startup no longer
+  registers the refused member's session again. A refused member, on either
+  path, can be retired, respawned or destroyed: the retirement archives its
+  durable session without routing a retire to the runtime the refusal
+  released. A member the boot recreates on a fresh session still fails the
+  whole resume with the host's error. A failure that is not the host's
+  refusal keeps the restored registration for the repair to reuse, and a
+  spawn that adopts a session registered before it keeps that registration
+  on a refusal, as does the recovery of an attached member's actor.
 - `meerkat-mob`: `MobError` gains the variant `MemberRegistrationRefused {
   member_id, session_id, call, reason }`: a restored member's host refused
   its registration at `call` (see above). Its RPC error data has the kind
@@ -104,6 +112,15 @@ them.
   `registration_refusal: Option<WireMemberRegistrationHookCall>`, absent from
   the wire unless a restored member's host refused its registration. Code
   that builds the result with a struct literal sets it.
+- `MobMachineSignal` (meerkat-machine-schema and meerkat-mob), its variant
+  enum `MobMachineSignalVariant` (meerkat-machine-schema), and the kernel
+  `Signal` and `SignalKind` (meerkat-machine-kernels) gain the variants
+  `ResolveMemberRevivalHostRefused` and `RecoverMemberRestoreHostRefused`,
+  appended last: they record a host's refusal of a restored member's
+  registration with the refusing hook call's code. The kernel
+  `generated::mob::TransitionId` gains `ResolveMemberRevivalHostRefusedRunning`
+  and `RecoverMemberRestoreHostRefusedRunning`, appended last. Code that
+  matches these enums exhaustively adds the arms.
 
 ### Added
 

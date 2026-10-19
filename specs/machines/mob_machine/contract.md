@@ -574,7 +574,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResolveMemberRevivalSucceeded`(agent_identity: AgentIdentity)
 - `ResolveRecreatedMemberSessionSucceeded`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, bridge_session_id: SessionId)
 - `ResolveMemberRevivalFailed`(agent_identity: AgentIdentity, reason: String)
-- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
 - `AdmitDestroyCleanup`
 - `AdmitDestroyStorageFinalizing`
 - `MarkCompleted`
@@ -598,6 +597,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `OperationPeerTrusted`
 - `PeerInputAdmitted`
 - `CreateRun`
+- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
+- `RecoverMemberRestoreHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -7926,13 +7927,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `revival_pending`
 - To: `Running`
 
-### `ResolveMemberRevivalHostRefusedRunning`
-- From: `Running`
-- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
-- Guards:
-  - `revival_pending`
-- To: `Running`
-
 ### `AdmitDestroyCleanup`
 - From: `Running`
 - On: `AdmitDestroyCleanup`()
@@ -15147,6 +15141,18 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `iteration_matches_last_completed`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Completed`
+
+### `ResolveMemberRevivalHostRefusedRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
+- Guards:
+  - `revival_pending`
+- To: `Running`
+
+### `RecoverMemberRestoreHostRefusedRunning`
+- From: `Running`
+- On: `RecoverMemberRestoreHostRefused`(agent_identity, refusal_code, reason)
+- To: `Running`
 
 ## Coverage
 ### Code Anchors

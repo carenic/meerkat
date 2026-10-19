@@ -1740,10 +1740,6 @@ macro_rules! mob_catalog_machine_dsl {
             ResolveMemberRevivalSucceeded { agent_identity: AgentIdentity },
             ResolveRecreatedMemberSessionSucceeded { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, bridge_session_id: SessionId },
             ResolveMemberRevivalFailed { agent_identity: AgentIdentity, reason: String },
-            // The member's host refused the registration its revival
-            // prepared. As ResolveMemberRevivalFailed, plus the shell's
-            // stable code naming the refusing hook call.
-            ResolveMemberRevivalHostRefused { agent_identity: AgentIdentity, refusal_code: String, reason: String },
             AdmitDestroyCleanup,
             AdmitDestroyStorageFinalizing,
             MarkCompleted,
@@ -1767,6 +1763,14 @@ macro_rules! mob_catalog_machine_dsl {
             OperationPeerTrusted,
             PeerInputAdmitted,
             CreateRun,
+            // The member's host refused the registration its revival
+            // prepared. As ResolveMemberRevivalFailed, plus the shell's
+            // stable code naming the refusing hook call.
+            ResolveMemberRevivalHostRefused { agent_identity: AgentIdentity, refusal_code: String, reason: String },
+            // The member's host refused the registration its boot restore
+            // prepared. As RecoverMemberRestoreFailure, plus the shell's
+            // stable code naming the refusing hook call.
+            RecoverMemberRestoreHostRefused { agent_identity: AgentIdentity, refusal_code: String, reason: String },
         }
 
         effect MobMachineEffect {
@@ -12456,25 +12460,6 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
         }
 
-        transition ResolveMemberRevivalHostRefusedRunning {
-            on signal ResolveMemberRevivalHostRefused { agent_identity, refusal_code, reason }
-            guard { self.lifecycle_phase == Phase::Running }
-            guard "revival_pending" { self.member_revival_pending.contains(agent_identity) == true }
-            update {
-                self.member_revival_pending.remove(agent_identity);
-                self.member_restore_failures.insert(agent_identity, reason);
-                // Trust eligibility just changed: a broken member may not be
-                // re-wired or re-overlaid. Advance the canonical topology
-                // epoch so every generated trust permission minted against
-                // the previous eligibility is stale on use.
-                self.topology_epoch += 1;
-                // The typed refusal the member stays Broken with; only an
-                // explicit repair clears it.
-                self.member_restore_failure_codes.insert(agent_identity, refusal_code);
-            }
-            to Running
-        }
-
         transition AdmitDestroyCleanup {
             on signal AdmitDestroyCleanup
             guard "adaptive_lifecycle_drained" {
@@ -22137,6 +22122,42 @@ macro_rules! mob_catalog_machine_dsl {
             }
             to Completed
             emit EmitRunLifecycleNotice
+        }
+
+        transition ResolveMemberRevivalHostRefusedRunning {
+            on signal ResolveMemberRevivalHostRefused { agent_identity, refusal_code, reason }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "revival_pending" { self.member_revival_pending.contains(agent_identity) == true }
+            update {
+                self.member_revival_pending.remove(agent_identity);
+                self.member_restore_failures.insert(agent_identity, reason);
+                // Trust eligibility just changed: a broken member may not be
+                // re-wired or re-overlaid. Advance the canonical topology
+                // epoch so every generated trust permission minted against
+                // the previous eligibility is stale on use.
+                self.topology_epoch += 1;
+                // The typed refusal the member stays Broken with; only an
+                // explicit repair clears it.
+                self.member_restore_failure_codes.insert(agent_identity, refusal_code);
+            }
+            to Running
+        }
+
+        transition RecoverMemberRestoreHostRefusedRunning {
+            on signal RecoverMemberRestoreHostRefused { agent_identity, refusal_code, reason }
+            guard { self.lifecycle_phase == Phase::Running }
+            update {
+                self.member_restore_failures.insert(agent_identity, reason);
+                // Trust eligibility just changed: a broken member may not be
+                // re-wired or re-overlaid. Advance the canonical topology
+                // epoch so every generated trust permission minted against
+                // the previous eligibility is stale on use.
+                self.topology_epoch += 1;
+                // The typed refusal the member stays Broken with; only an
+                // explicit repair clears it.
+                self.member_restore_failure_codes.insert(agent_identity, refusal_code);
+            }
+            to Running
         }
 
     }

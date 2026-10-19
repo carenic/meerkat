@@ -2507,6 +2507,40 @@ impl MobMachineState {
 
 #[cfg(test)]
 mod tests {
+    /// The one predicate the startup restore skips on: only a registration
+    /// hook call's code reads as a registration refusal; no code, and a
+    /// runtime binding refusal's code, do not.
+    #[test]
+    fn only_a_registration_hook_code_reads_as_a_registration_refusal() {
+        let identity = super::AgentIdentity("member".into());
+        let mut state = super::MobMachineState::default();
+        assert_eq!(
+            state.member_registration_refusal_for_identity(&identity),
+            None
+        );
+        state
+            .member_restore_failure_codes
+            .insert(identity.clone(), "runtime_refused".into());
+        assert_eq!(
+            state.member_registration_refusal_for_identity(&identity),
+            None
+        );
+        for call in [
+            crate::MemberRegistrationHookCall::SelectDestination,
+            crate::MemberRegistrationHookCall::SelectAgentMandate,
+            crate::MemberRegistrationHookCall::PrepareMemberSurface,
+            crate::MemberRegistrationHookCall::VerifyMemberSurface,
+        ] {
+            state
+                .member_restore_failure_codes
+                .insert(identity.clone(), call.as_code().into());
+            assert_eq!(
+                state.member_registration_refusal_for_identity(&identity),
+                Some(call)
+            );
+        }
+    }
+
     use super::*;
 
     fn begin_completion_lifecycle_quiesce(

@@ -1477,6 +1477,110 @@ async fn each_refusing_hook_call_removes_the_restored_registration() {
     }
 }
 
+/// The control for a boot restore's held input (it holds without the typed
+/// refusal too): the boot restore inserts the member's registration from the
+/// session's durable runtime state, and the host's refusal rolls that
+/// registration back through the canonical unregister, so an input the
+/// session held across the crash ends abandoned as Stopped. The boot
+/// restore's refusal is typed.
+#[tokio::test]
+async fn a_boot_restore_its_host_refuses_stops_the_input_its_session_held() {
+    let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let service = Arc::new(MockSessionService::new());
+    let first_boot = Arc::new(
+        MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the first boot's runtime"),
+    );
+    service.set_runtime_adapter(Arc::clone(&first_boot));
+    let session = Session::new();
+    let id = session.id().clone();
+    SessionBackend::new(service.clone(), Some(Arc::clone(&first_boot)), None)
+        .provision_member(fresh_request(session))
+        .await
+        .expect("the member is provisioned before the crash");
+    // The member's live session goes away and a restore registers it again:
+    // the input it then accepts has no executor to run it, so the session's
+    // durable runtime state holds it across the crash.
+    service.discard_live_session(&id).await.unwrap();
+    first_boot.unregister_session(&id).await.unwrap();
+    first_boot
+        .prepare_local_session_bindings(id.clone())
+        .await
+        .expect("the restore registers the member again");
+    let (accepted, _) = first_boot
+        .accept_input_with_completion(
+            &id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "held across the crash",
+                None,
+            )),
+        )
+        .await
+        .expect("the restored registration holds the input");
+    let meerkat_runtime::AcceptOutcome::Accepted { input_id: held, .. } = accepted else {
+        panic!("the restored registration accepts the input, got {accepted:?}");
+    };
+    // The next boot's runtime reads the same durable state.
+    let second_boot = Arc::new(
+        MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the next boot's runtime"),
+    );
+    service.set_runtime_adapter(Arc::clone(&second_boot));
+    let backend = SessionBackend::new(service.clone(), Some(Arc::clone(&second_boot)), None)
+        .with_member_runtime_registration_hook(SelectingHost::new(false, true));
+    let mut restore = retained_resume_request(&service, &id).await;
+    stamp_identity(&mut restore);
+    restore.runtime_revival_intent = RuntimeRevivalIntent::ColdRestore;
+
+    let error = backend
+        .provision_member(restore)
+        .await
+        .expect_err("the host refused the boot restore");
+
+    assert!(
+        matches!(
+            &error,
+            MobError::MemberRegistrationRefused {
+                call: crate::MemberRegistrationHookCall::SelectDestination,
+                ..
+            }
+        ),
+        "the boot restore's refusal is typed, got {error:?}"
+    );
+    assert!(
+        second_boot
+            .current_session_registration_witness(&id)
+            .await
+            .is_none(),
+        "the boot restore leaves no registration of the session"
+    );
+    let rows = meerkat_runtime::store::load_input_states_for_recovery(
+        store.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&id),
+    )
+    .await
+    .expect("the session's durable inputs");
+    let row = rows
+        .iter()
+        .find(|row| row.state.input_id == held)
+        .expect("the held input's durable row");
+    assert_eq!(
+        row.seed.phase,
+        meerkat_runtime::InputLifecycleState::Abandoned
+    );
+    assert!(
+        matches!(
+            &row.seed.terminal_outcome,
+            Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::InputAbandonReason::Stopped
+            })
+        ),
+        "the held input ends Stopped, got {:?}",
+        row.seed.terminal_outcome
+    );
+}
+
 /// A new member's refusal keeps today's answer: its own transaction rolls the
 /// registration back and the caller gets the host's error, not the restored
 /// member's typed refusal.
@@ -1706,12 +1810,25 @@ async fn a_repair_of_a_kept_registration_must_advance_its_context_generation() {
 /// resume asks `second_boot` about that registration.
 struct RebootedMob {
     resumed: MobHandle,
+    service: Arc<MockSessionService>,
     machine: Arc<MeerkatMachine>,
+    events: Arc<dyn crate::store::MobEventStore>,
+    runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
     member: AgentIdentity,
     session: SessionId,
 }
 
 async fn rebooted_mob(second_boot: Arc<SelectingHost>, stopped: bool) -> RebootedMob {
+    rebooted_mob_with(second_boot, stopped, None).await
+}
+
+/// [`rebooted_mob`], with `customizer` as the resumed mob's spawn member
+/// customizer.
+async fn rebooted_mob_with(
+    second_boot: Arc<SelectingHost>,
+    stopped: bool,
+    customizer: Option<Arc<dyn SpawnMemberCustomizer>>,
+) -> RebootedMob {
     let service = Arc::new(MockSessionService::new());
     let _first_machine = governed_machine(&service);
     let storage = MobStorage::in_memory();
@@ -1738,28 +1855,74 @@ async fn rebooted_mob(second_boot: Arc<SelectingHost>, stopped: bool) -> Reboote
     if stopped {
         handle.stop().await.expect("stop before the restart");
     }
-    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
-    let machine = governed_machine(&restarted);
-    crash_stop_and_release_routes(handle).await;
-    drop(service);
-    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-        events,
-        runtime_metadata,
-    ))
-    .with_session_service(restarted)
-    .with_member_runtime_registration_hook(second_boot)
-    .resume()
-    .await
-    .unwrap();
+    let (resumed, service, machine) = resume_after_crash(
+        handle,
+        service,
+        &events,
+        &runtime_metadata,
+        second_boot,
+        customizer,
+    )
+    .await;
     RebootedMob {
         resumed,
+        service,
         machine,
+        events,
+        runtime_metadata,
         member,
         session,
     }
 }
 
+/// Crash `handle`'s process and resume its mob over the same durable state,
+/// on a fresh service and governed machine, with `host` as its host.
+async fn resume_after_crash(
+    handle: MobHandle,
+    service: Arc<MockSessionService>,
+    events: &Arc<dyn crate::store::MobEventStore>,
+    runtime_metadata: &Arc<dyn crate::store::MobRuntimeMetadataStore>,
+    host: Arc<SelectingHost>,
+    customizer: Option<Arc<dyn SpawnMemberCustomizer>>,
+) -> (MobHandle, Arc<MockSessionService>, Arc<MeerkatMachine>) {
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let machine = governed_machine(&restarted);
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    let builder = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        Arc::clone(events),
+        Arc::clone(runtime_metadata),
+    ))
+    .with_session_service(restarted.clone())
+    .with_member_runtime_registration_hook(host);
+    let builder = match customizer {
+        Some(customizer) => builder.with_spawn_member_customizer(customizer),
+        None => builder,
+    };
+    (builder.resume().await.unwrap(), restarted, machine)
+}
+
 impl RebootedMob {
+    /// Crash this boot and resume over the same durable state with
+    /// `next_boot` as the host.
+    async fn reboot(self, next_boot: Arc<SelectingHost>) -> RebootedMob {
+        let (resumed, service, machine) = resume_after_crash(
+            self.resumed,
+            self.service,
+            &self.events,
+            &self.runtime_metadata,
+            next_boot,
+            None,
+        )
+        .await;
+        RebootedMob {
+            resumed,
+            service,
+            machine,
+            ..self
+        }
+    }
+
     #[track_caller]
     fn assert_refused(error: &MobError) {
         assert!(
@@ -1789,22 +1952,407 @@ impl RebootedMob {
         );
     }
 
+    /// The runtime holds no archive residue for the member's session: the
+    /// retirement of a host-refused member settles it without a runtime to
+    /// route a retire to.
+    async fn assert_no_runtime_residue(&self) {
+        assert!(
+            !self
+                .machine
+                .archive_runtime_residue_present(&self.session)
+                .await
+                .expect("the runtime's residue read"),
+            "no runtime archive residue of the refused member's session stays"
+        );
+    }
+
+    /// The member is Broken with the typed refusal, and no registration of
+    /// its session is current. The status read is an actor command, admitted
+    /// only once the actor's startup restores are done, so the registration
+    /// is sampled after them.
     async fn assert_broken_with_the_refusal(&self) {
         let status = self.resumed.member_status(&self.member).await.unwrap();
+        assert!(
+            self.machine
+                .current_session_registration_witness(&self.session)
+                .await
+                .is_none(),
+            "no registration of the refused member is current after the startup"
+        );
         assert_eq!(status.status, MobMemberStatus::Broken);
         assert_eq!(
             status.registration_refusal,
             Some(crate::MemberRegistrationHookCall::SelectDestination),
             "the member's status carries the typed refusal"
         );
-        assert!(
-            self.machine
-                .current_session_registration_witness(&self.session)
-                .await
-                .is_none(),
-            "no registration of the refused member stays current"
-        );
     }
+}
+
+/// After the restart of a running mob, the host refuses the member its boot
+/// restores. The member stays Broken with the typed refusal, visible in its
+/// status. No registration of its session is current once the actor has
+/// started (a member status read is admitted only after the startup's
+/// restores), nor after asking for the member, and asking again answers the
+/// same refusal without asking the host.
+#[tokio::test]
+async fn a_member_its_host_refuses_after_a_restart_stays_broken_with_the_typed_refusal() {
+    let second_boot = SelectingHost::new(false, true);
+    let rebooted = rebooted_mob(second_boot.clone(), false).await;
+    assert_eq!(
+        second_boot.seen.lock().unwrap().len(),
+        1,
+        "the boot restore asks the host once"
+    );
+
+    rebooted.assert_broken_with_the_refusal().await;
+
+    let first = rebooted
+        .resumed
+        .ensure_member_live(&rebooted.member)
+        .await
+        .expect_err("the host refused the restored member");
+    RebootedMob::assert_refused(&first);
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_none(),
+        "asking for the refused member registers nothing"
+    );
+    let again = rebooted
+        .resumed
+        .ensure_member_live(&rebooted.member)
+        .await
+        .expect_err("the member stays refused");
+    RebootedMob::assert_refused(&again);
+    assert_eq!(
+        second_boot.seen.lock().unwrap().len(),
+        1,
+        "a repeat ask is answered without asking the host"
+    );
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// A member its host refused at the restart is retired like any member,
+/// though the startup restored no registration or owner context for it.
+#[tokio::test]
+async fn a_member_refused_at_a_restart_can_be_retired() {
+    let rebooted = rebooted_mob(SelectingHost::new(false, true), false).await;
+    rebooted.assert_broken_with_the_refusal().await;
+
+    rebooted
+        .resumed
+        .retire(rebooted.member.clone())
+        .await
+        .expect("the refused member is retired");
+
+    assert!(
+        rebooted
+            .resumed
+            .list_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != rebooted.member),
+        "the retired member leaves the roster"
+    );
+    rebooted.assert_no_runtime_residue().await;
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// Respawn is the repair a refused member's diagnostics name: once its host
+/// accepts, the respawned member runs on exactly one current registration,
+/// the one the host was asked about.
+#[tokio::test]
+async fn a_member_refused_at_a_restart_is_repaired_by_a_respawn() {
+    let host = SelectingHost::new(false, true);
+    let rebooted = rebooted_mob(host.clone(), false).await;
+    rebooted.assert_broken_with_the_refusal().await;
+    host.refuse.store(false, Ordering::SeqCst);
+
+    rebooted
+        .resumed
+        .respawn(rebooted.member.clone(), None)
+        .await
+        .expect("the accepted member respawns");
+
+    let selected = host
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the respawn asked the host");
+    let session = rebooted
+        .resumed
+        .resolve_bridge_session_id(&rebooted.member)
+        .await
+        .expect("the respawned member's session");
+    assert_eq!(
+        selected.registration().session_id(),
+        &session,
+        "the host was asked about it"
+    );
+    assert_eq!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(selected.registration()),
+        "the respawned member runs on the registration the host selected"
+    );
+    assert_ne!(
+        session, rebooted.session,
+        "the respawn runs a fresh session"
+    );
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_none(),
+        "the refused session stays unregistered: one current registration"
+    );
+    let status = rebooted
+        .resumed
+        .member_status(&rebooted.member)
+        .await
+        .unwrap();
+    assert_ne!(status.status, MobMemberStatus::Broken);
+    assert_eq!(status.registration_refusal, None);
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// The mob is destroyed with a member its host refused at the restart still
+/// in its roster.
+#[tokio::test]
+async fn a_mob_with_a_member_refused_at_a_restart_is_destroyed() {
+    let rebooted = rebooted_mob(SelectingHost::new(false, true), false).await;
+    rebooted.assert_broken_with_the_refusal().await;
+
+    rebooted
+        .resumed
+        .destroy()
+        .await
+        .expect("the mob is destroyed with the refused member present");
+    rebooted.assert_no_runtime_residue().await;
+}
+
+/// A member its host refused at the explicit resume of a mob stopped at the
+/// crash: Broken with the typed refusal, with no registration of its session
+/// current.
+async fn refused_at_an_explicit_resume(host: Arc<SelectingHost>) -> RebootedMob {
+    let rebooted = rebooted_mob(host, true).await;
+    let _ = rebooted.resumed.resume().await;
+    rebooted.assert_broken_with_the_refusal().await;
+    rebooted
+}
+
+/// A member its host refused at an explicit resume is retired like one
+/// refused at boot: its runtime holds nothing after the refusal, so the
+/// retirement archives its session without routing a retire to it.
+#[tokio::test]
+async fn a_member_refused_at_an_explicit_resume_can_be_retired() {
+    let rebooted = refused_at_an_explicit_resume(SelectingHost::new(false, true)).await;
+
+    rebooted
+        .resumed
+        .retire(rebooted.member.clone())
+        .await
+        .expect("the refused member is retired");
+
+    assert!(
+        rebooted
+            .resumed
+            .list_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != rebooted.member),
+        "the retired member leaves the roster"
+    );
+    rebooted.assert_no_runtime_residue().await;
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// A member its host refused at an explicit resume is repaired by a respawn
+/// once its host accepts: one current registration, the one the host was
+/// asked about.
+#[tokio::test]
+async fn a_member_refused_at_an_explicit_resume_is_repaired_by_a_respawn() {
+    let host = SelectingHost::new(false, true);
+    let rebooted = refused_at_an_explicit_resume(host.clone()).await;
+    host.refuse.store(false, Ordering::SeqCst);
+
+    rebooted
+        .resumed
+        .respawn(rebooted.member.clone(), None)
+        .await
+        .expect("the accepted member respawns");
+
+    let selected = host
+        .seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the respawn asked the host");
+    let session = rebooted
+        .resumed
+        .resolve_bridge_session_id(&rebooted.member)
+        .await
+        .expect("the respawned member's session");
+    assert_eq!(selected.registration().session_id(), &session);
+    assert_eq!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(selected.registration()),
+        "the respawned member runs on the registration the host selected"
+    );
+    assert_ne!(
+        session, rebooted.session,
+        "the respawn runs a fresh session"
+    );
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_none(),
+        "the refused session stays unregistered: one current registration"
+    );
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// The mob is destroyed with a member its host refused at an explicit resume
+/// still in its roster.
+#[tokio::test]
+async fn a_mob_with_a_member_refused_at_an_explicit_resume_is_destroyed() {
+    let rebooted = refused_at_an_explicit_resume(SelectingHost::new(false, true)).await;
+
+    rebooted
+        .resumed
+        .destroy()
+        .await
+        .expect("the mob is destroyed with the refused member present");
+    rebooted.assert_no_runtime_residue().await;
+}
+
+/// The control for the retirement of a refused member: a member Broken at
+/// the restart for another reason keeps its startup registration, and its
+/// retirement still routes the retire to its runtime, which releases that
+/// registration.
+#[tokio::test]
+async fn a_member_broken_at_a_restart_for_another_reason_is_retired_through_its_runtime() {
+    let host = SelectingHost::new(false, false);
+    let rebooted = rebooted_mob_with(
+        host.clone(),
+        false,
+        Some(Arc::new(RefusingUntilAdmitted::default())),
+    )
+    .await;
+    // The status read is admitted only once the actor's startup restores are
+    // done, so the registration is sampled after them.
+    let status = rebooted
+        .resumed
+        .member_status(&rebooted.member)
+        .await
+        .unwrap();
+    assert_eq!(status.status, MobMemberStatus::Broken);
+    assert_eq!(
+        status.registration_refusal, None,
+        "the member is Broken for a reason that is not its host's refusal"
+    );
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_some(),
+        "the startup restores the member's registration"
+    );
+
+    rebooted
+        .resumed
+        .retire(rebooted.member.clone())
+        .await
+        .expect("the broken member is retired");
+
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_none(),
+        "the retirement released the member's registration through its runtime"
+    );
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// The refusal is not durable: each restart asks the host again, and a host
+/// that still refuses gives the same typed outcome.
+#[tokio::test]
+async fn a_second_restart_asks_the_host_again_and_is_refused_the_same_way() {
+    let host = SelectingHost::new(false, true);
+    let rebooted = rebooted_mob(host.clone(), false).await;
+    rebooted.assert_broken_with_the_refusal().await;
+    assert_eq!(host.seen.lock().unwrap().len(), 1);
+
+    let rebooted = rebooted.reboot(host.clone()).await;
+
+    assert_eq!(
+        host.seen.lock().unwrap().len(),
+        2,
+        "the second restart asks the host once more"
+    );
+    rebooted.assert_broken_with_the_refusal().await;
+    let error = rebooted
+        .resumed
+        .ensure_member_live(&rebooted.member)
+        .await
+        .expect_err("the member stays refused");
+    RebootedMob::assert_refused(&error);
+    let _ = rebooted.resumed.stop().await;
+}
+
+/// The control: a member Broken at the restart for a reason that is not its
+/// host's refusal (here its spawn customizer refuses the restore) keeps
+/// today's startup restore, so its session's registration is current for
+/// its repair to reuse.
+#[tokio::test]
+async fn a_member_broken_at_a_restart_for_another_reason_keeps_its_startup_registration() {
+    let host = SelectingHost::new(false, false);
+    let rebooted = rebooted_mob_with(
+        host.clone(),
+        false,
+        Some(Arc::new(RefusingUntilAdmitted::default())),
+    )
+    .await;
+
+    let status = rebooted
+        .resumed
+        .member_status(&rebooted.member)
+        .await
+        .unwrap();
+
+    assert_eq!(status.status, MobMemberStatus::Broken);
+    assert_eq!(status.registration_refusal, None);
+    assert!(
+        host.seen.lock().unwrap().is_empty(),
+        "the customizer refused before the host was asked"
+    );
+    assert!(
+        rebooted
+            .machine
+            .current_session_registration_witness(&rebooted.session)
+            .await
+            .is_some(),
+        "the startup restores the member's registration"
+    );
+    let _ = rebooted.resumed.stop().await;
 }
 
 /// The control: a host that accepts the member it is asked about at the

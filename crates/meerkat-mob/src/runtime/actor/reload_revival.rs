@@ -807,6 +807,7 @@ impl MobActor {
                     bridge_session_id: Some(work.session_id.clone()),
                     reason: reason.clone(),
                     hold,
+                    registration_refusal: None,
                 },
             )
             .await;

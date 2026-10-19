@@ -5783,6 +5783,12 @@ pub(crate) struct RestoreFailureDiagnostic {
     /// carries it, so a host classifies the Broken member typed instead of
     /// parsing `reason`.
     pub(crate) hold: Option<meerkat_core::service::DurableResumeHold>,
+    /// The hook call that refused the member's registration when its boot
+    /// restore was refused by its host, set only from the provision's
+    /// refusal slot. It feeds only the MobMachine seed
+    /// (`RecoverMemberRestoreHostRefused`); every typed refusal is minted
+    /// from the machine's code, never from this record.
+    pub(crate) registration_refusal: Option<crate::MemberRegistrationHookCall>,
 }
 
 /// The machine's per-member subscribe verdict (phase 6): a local

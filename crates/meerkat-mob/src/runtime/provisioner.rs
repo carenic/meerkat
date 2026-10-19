@@ -435,6 +435,11 @@ pub(crate) enum RuntimeRevivalIntent {
     #[default]
     None,
     MissingLiveMaterialization,
+    /// `MobBuilder::resume` restoring a durable member at boot. It provisions
+    /// as `None` does; a host refusal of the registration it prepared comes
+    /// back typed (`MobError::MemberRegistrationRefused`), and the
+    /// transaction's own rollback removes that registration.
+    ColdRestore,
 }
 
 #[doc(hidden)]
@@ -1639,6 +1644,29 @@ pub trait MobProvisioner: Send + Sync {
         member_identity: &AgentIdentity,
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
+
+    /// Retire a member whose host refused its registration, as MobMachine
+    /// records it. The refusal left the member no owner operation binding in
+    /// this process, so its retirement projects into one only when one is
+    /// bound, where the fresh archive of any other member fails closed on a
+    /// missing binding. `deadline` bounds it as in
+    /// [`Self::retire_member_until`]; without one it retires under
+    /// [`Self::retire_member`]'s budget. The default retires it as any
+    /// member.
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        match deadline {
+            Some(deadline) => {
+                self.retire_member_until(member_ref, member_identity, deadline)
+                    .await
+            }
+            None => self.retire_member(member_ref).await,
+        }
+    }
     async fn interrupt_member(
         &self,
         member_ref: &MemberRef,
@@ -5823,6 +5851,58 @@ impl SessionBackend {
             MobError::Internal(format!(
                 "session-backed provisioner cannot {operation} member without session bridge: {member_ref:?}"
             ))
+        })
+    }
+
+    /// Dispose a session-backed member's session under `deadline`, then
+    /// project its retirement into its owner operation binding. A member
+    /// whose host refused its registration holds no such binding here (see
+    /// [`MobProvisioner::retire_refused_member`]), so its projection runs
+    /// only when one is bound.
+    async fn retire_session_member_until(
+        &self,
+        member_ref: &MemberRef,
+        deadline: Instant,
+        registration_refused: bool,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        tracing::debug!(
+            member_ref = ?member_ref,
+            registration_refused,
+            "SessionBackend::retire_member start"
+        );
+        let session_id = Self::require_session(member_ref, "retire")?;
+        let disposal = match self.disposal.dispose_until(&session_id, deadline).await {
+            Ok(disposal) => disposal,
+            Err(error) => {
+                return Err(MemberSessionDisposalArc::map_runtime_retirement_error(
+                    &session_id,
+                    error,
+                ));
+            }
+        };
+        if !matches!(
+            disposal,
+            MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+        ) {
+            if registration_refused {
+                self.ops_adapter
+                    .mark_member_retired_if_bound(member_ref)
+                    .await?;
+            } else {
+                self.ops_adapter
+                    .mark_member_retired_after_disposal(member_ref, disposal)
+                    .await?;
+            }
+        }
+        Ok(match disposal {
+            MemberSessionDisposalVerdict::Archived
+            | MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
+            | MemberSessionDisposalVerdict::AlreadyArchived => {
+                crate::machines::mob_machine::MemberSessionDisposal::Archived
+            }
+            MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned => {
+                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned
+            }
         })
     }
 
@@ -12760,9 +12840,12 @@ impl SessionBackend {
         } else {
             None
         };
-        // Only a restored member's revival settles a host refusal of its
-        // registration itself; spawns keep the transaction's own rollback.
-        let mut restored_refusal_cleanup = missing_live_revival.then(|| {
+        // Only a restored member's revival or boot restore settles a host
+        // refusal of its registration itself; spawns keep the transaction's
+        // own rollback and the host's own error.
+        let restored_member =
+            missing_live_revival || req.runtime_revival_intent == RuntimeRevivalIntent::ColdRestore;
+        let mut restored_refusal_cleanup = restored_member.then(|| {
             let member = req
                 .create_session
                 .build
@@ -14100,38 +14183,22 @@ impl MobProvisioner for SessionBackend {
         _member_identity: &AgentIdentity,
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
-        tracing::debug!(
-            member_ref = ?member_ref,
-            "SessionBackend::retire_member start"
-        );
-        let session_id = Self::require_session(member_ref, "retire")?;
-        let disposal = match self.disposal.dispose_until(&session_id, deadline).await {
-            Ok(disposal) => disposal,
-            Err(error) => {
-                return Err(MemberSessionDisposalArc::map_runtime_retirement_error(
-                    &session_id,
-                    error,
-                ));
-            }
-        };
-        if !matches!(
-            disposal,
-            MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
-        ) {
-            self.ops_adapter
-                .mark_member_retired_after_disposal(member_ref, disposal)
-                .await?;
-        }
-        Ok(match disposal {
-            MemberSessionDisposalVerdict::Archived
-            | MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
-            | MemberSessionDisposalVerdict::AlreadyArchived => {
-                crate::machines::mob_machine::MemberSessionDisposal::Archived
-            }
-            MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned => {
-                crate::machines::mob_machine::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned
-            }
-        })
+        self.retire_session_member_until(member_ref, deadline, false)
+            .await
+    }
+
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        _member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        self.retire_session_member_until(
+            member_ref,
+            deadline.unwrap_or_else(|| Instant::now() + MEMBER_RETIRE_TOTAL_TIMEOUT),
+            true,
+        )
+        .await
     }
 
     async fn interrupt_member(
@@ -17747,6 +17814,32 @@ impl MobProvisioner for MultiBackendProvisioner {
             _ => {
                 self.session
                     .retire_member_until(member_ref, member_identity, deadline)
+                    .await
+            }
+        }
+    }
+
+    async fn retire_refused_member(
+        &self,
+        member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
+        deadline: Option<Instant>,
+    ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
+        match member_ref {
+            // A peer-only member has no session here whose registration a
+            // host could refuse.
+            MemberRef::BackendPeer {
+                session_id: None, ..
+            } => match deadline {
+                Some(deadline) => {
+                    self.retire_member_until(member_ref, member_identity, deadline)
+                        .await
+                }
+                None => self.retire_member(member_ref).await,
+            },
+            _ => {
+                self.session
+                    .retire_refused_member(member_ref, member_identity, deadline)
                     .await
             }
         }

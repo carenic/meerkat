@@ -178,10 +178,17 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// canonical unregister: the session's durable history records it, every
     /// input the session still holds is abandoned as Stopped, and their
     /// completions resolve as runtime-terminated. Any other failure keeps the
-    /// restored registration for an explicit repair to reuse. A spawn that
-    /// adopts a session registered before it (a resumed or pre-registered
-    /// session) keeps that registration on a refusal; only the transaction
-    /// is rolled back.
+    /// restored registration for an explicit repair to reuse. A member that
+    /// `MobBuilder::resume` restores at boot is refused the same way: the
+    /// boot restore's own rollback removes the registration it inserted, and
+    /// the actor's startup registers nothing for the refused member. A member
+    /// refused either way can still be retired, respawned or destroyed: its
+    /// retirement archives the durable session without routing a retire to
+    /// the runtime the refusal released. A member the boot recreates on a
+    /// fresh session is not restored: a refusal there fails the whole resume
+    /// with the host's error unchanged. A spawn that adopts a session
+    /// registered before it (a resumed or pre-registered session) keeps that
+    /// registration on a refusal; only the transaction is rolled back.
     ///
     /// A failed revival's destination stays bound on the restored
     /// registration it keeps, so a host's re-selection for that registration
