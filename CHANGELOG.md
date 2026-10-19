@@ -116,32 +116,46 @@ them.
   draining step. It never said whether anything was written to
   configuration: that is the `persisted` of the `mcp/add`, `mcp/remove` and
   `mcp/reload` requests and responses, which keep their name and meaning.
-  - Wire: `tool_config_changed` event payloads and stored `tool_config`
-    notice payloads carry `settled` instead of `persisted`, and so do `mcp`
-    notice blocks.
-  - Decoding derives `settled` from the payload's `status_info`, and from an
-    `mcp` block's `phase`, instead of reading a stored bit, so rows written by
-    0.9.3 and earlier decode with the right value. An `mcp` block without a
-    phase keeps its stored bit (`settled`, or `persisted` from 0.9.3).
+  - Wire: `tool_config_changed` event payloads, stored `tool_config` notice
+    payloads and `mcp` notice blocks that 0.9.4 builds carry `settled`
+    instead of `persisted`. Rows and events stored by 0.9.3 and earlier keep
+    the key and value they were stored with when they are read back, served
+    in history or replayed, so their transcript digests, session heads and
+    rewrite records still verify. Readers must accept either key; the
+    schemas list both and require neither.
+  - Readers derive the fact instead of trusting the stored bit:
+    `ToolConfigChangedPayload::settled()` from `status_info`, and
+    `SystemNoticeBlock::lifecycle_settled()` from an `mcp` block's `phase`
+    (an `mcp` block without a phase reports its stored bit, `settled` or
+    0.9.3's `persisted`). The tool-scope, deferred-catalog and failed-closed
+    notices that 0.9.3 stored with `persisted: false` read as settled.
   - Rust API: `ToolConfigChangedPayload::new` takes no lifecycle argument
     (the status decides it), and the public `ToolConfigChangedPayload`
     field `persisted` is replaced by `ToolConfigChangedPayload::settled()`.
     The public `ExternalToolDelta` field `persisted` is removed in favour of
     `ExternalToolDelta::settled()`, derived from `phase` and not serialized.
     `SystemNoticeBlock::Mcp { persisted }` is now
-    `SystemNoticeBlock::Mcp { settled }`, and `meerkat-mcp`'s
+    `SystemNoticeBlock::Mcp { lifecycle_bit }`, a `ToolConfigLifecycleBit`
+    (`Settled`, `Persisted` or `Absent`) that keeps the stored spelling; read
+    the fact through `SystemNoticeBlock::lifecycle_settled()`. `meerkat-mcp`'s
     `ExternalToolSurfaceEffect::EmitExternalToolDelta { persisted }` is now
-    `{ settled }`. New: `ExternalToolDeltaPhase::is_settled` and
+    `{ settled }`. New: `ToolConfigLifecycleBit`,
+    `ToolConfigChangedPayload::lifecycle_bit`,
+    `SystemNoticeBlock::lifecycle_settled`,
+    `ExternalToolDeltaPhase::is_settled` and
     `ToolConfigChangeStatus::is_settled`.
   - SDKs: the Python and TypeScript `ToolConfigChangedPayload.persisted` is
-    now `settled`. Their parsers read `settled` and fall back to `persisted`
-    from rkat-rpc 0.9.3 and earlier. The generated Python, TypeScript and Web
-    types follow the schema.
+    now `settled`. Their event parsers derive it from `status_info` the way
+    rkat-rpc does and use the stored bit (`settled`, or `persisted` from
+    rkat-rpc 0.9.3 and earlier) only for a status they do not know. Stored
+    notices in session history stay raw and carry either key. The generated
+    Python, TypeScript and Web types follow the schemas, with both keys
+    optional.
   - Version skew: the 0.9.3 Python and TypeScript SDKs require `persisted`,
     so a 0.9.3 SDK talking to a 0.9.4 rkat-rpc fails on every
-    `tool_config_changed` event. The SDKs fetch their own matching rkat-rpc,
-    so this happens only with an overridden binary path; the remedy is to
-    upgrade the SDK.
+    `tool_config_changed` event that 0.9.4 builds. The SDKs fetch their own
+    matching rkat-rpc, so this happens only with an overridden binary path;
+    the remedy is to upgrade the SDK.
   - Stored transcripts: 0.9.3 cannot read back a transcript that 0.9.4 wrote
     with a `tool_config` notice (a tool-scope, deferred-catalog or
     failed-closed notice), because 0.9.3 requires the payload's `persisted`.
@@ -277,7 +291,9 @@ them.
   failed-closed tool-scope events, and the MCP restore-refusal delta, now
   report `settled: true` where they reported `persisted: false`: each is a
   change that has already applied or failed. A consumer that showed them as
-  pending now shows them as settled (#1658).
+  pending now shows them as settled. Rows stored by 0.9.3 keep their
+  `persisted: false`; the Rust accessors and the SDK event parsers derive the
+  fact from the status and report those as settled too (#1658).
 
 ### Fixed
 

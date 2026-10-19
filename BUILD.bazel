@@ -676,6 +676,7 @@ test_suite(
         "//crates/meerkat-core:transcript_graph_ingress_validation_test",
         "//crates/meerkat-core:transcript_history_retention_test",
         "//crates/meerkat-core:v0_8_10_recovery_migration_test",
+        "//crates/meerkat-core:v0_9_3_tool_config_notice_rows_test",
         "//crates/meerkat-core:wedge_evidence_probe_test",
         "//crates/meerkat-core:wholeblob_compaction_media_guard_test",
         "//crates/meerkat-gemini:meerkat_gemini_unit_test",

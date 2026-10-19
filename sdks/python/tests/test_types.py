@@ -3171,16 +3171,43 @@ def test_parse_tool_config_changed_with_non_boolean_settled(field):
     assert event.data == raw
 
 
-def test_parse_tool_config_changed_reads_settled_and_falls_back_to_persisted():
-    """rkat-rpc 0.9.4 writes the lifecycle bit as ``settled``; 0.9.3 and
-    earlier wrote the same bit as ``persisted``."""
-    status_info = {"kind": "external_tool_delta", "phase": "pending"}
-    for fields, settled in [
-        ({"settled": True}, True),
-        ({"settled": False}, False),
-        ({"persisted": True}, True),
-        ({"persisted": False}, False),
-        ({"settled": False, "persisted": True}, False),
+def test_parse_tool_config_changed_derives_settled_from_status_info():
+    """rkat-rpc derives the lifecycle fact from ``status_info``. Payloads
+    stored by 0.9.3 and earlier are served back with their ``persisted``,
+    which was ``False`` for changes that had already applied; only a status
+    this SDK does not know falls back to the stored bit."""
+    boundary = {
+        "kind": "boundary_applied",
+        "base_changed": True,
+        "visible_changed": True,
+        "revision": 2,
+    }
+    catalog = {
+        "kind": "deferred_catalog_delta",
+        "added_hidden_count": 1,
+        "removed_hidden_count": 0,
+        "pending_source_count": 0,
+    }
+    failed_closed = {"kind": "warning_failed_closed", "error": "scope refused"}
+
+    def delta(phase):
+        return {"kind": "external_tool_delta", "phase": phase}
+
+    for status_info, fields, settled in [
+        (boundary, {"persisted": False}, True),
+        (catalog, {"persisted": False}, True),
+        (failed_closed, {"persisted": False}, True),
+        (boundary, {"settled": True}, True),
+        (delta("pending"), {"persisted": True}, False),
+        (delta("draining"), {"settled": True}, False),
+        (delta("applied"), {"persisted": False}, True),
+        (delta("forced"), {"settled": False}, True),
+        (delta("failed"), {"persisted": False}, True),
+        (delta("pending"), {"settled": False, "persisted": True}, False),
+        ({"kind": "a_later_kind"}, {"settled": True}, True),
+        ({"kind": "a_later_kind"}, {"persisted": False}, False),
+        ({"kind": "a_later_kind"}, {"settled": False, "persisted": True}, False),
+        (delta("a_later_phase"), {"persisted": True}, True),
     ]:
         raw = {
             "type": "tool_config_changed",
@@ -3192,11 +3219,11 @@ def test_parse_tool_config_changed_reads_settled_and_falls_back_to_persisted():
             },
         }
         event = parse_event(raw)
-        assert isinstance(event, ToolConfigChanged), fields
-        assert event.payload.settled is settled, fields
+        assert isinstance(event, ToolConfigChanged), (status_info, fields)
+        assert event.payload.settled is settled, (status_info, fields)
     raw = {
         "type": "tool_config_changed",
-        "payload": {"operation": "add", "target": "filesystem", "status_info": status_info},
+        "payload": {"operation": "add", "target": "filesystem", "status_info": boundary},
     }
     event = parse_event(raw)
     assert isinstance(event, UnknownEvent)

@@ -3121,9 +3121,10 @@ mod tool_artifact_refusal {
     }
 }
 
-/// An `mcp` block derives `settled` from its phase on decode, whatever bit it
-/// stored (`settled`, or `persisted` from 0.9.3); a block without a phase keeps
-/// its stored bit, the only record it has. The block is written as `settled`.
+/// An `mcp` block reports its lifecycle fact from its phase, whatever bit it
+/// stored (`settled`, or `persisted` from 0.9.3); a block without a phase
+/// reports its stored bit, the only record it has. Either way the block is
+/// written back with the key and value it was stored with.
 #[test]
 fn mcp_notice_block_derives_settled_from_its_phase_on_decode() {
     for (phase, stored, settled) in [
@@ -3139,17 +3140,18 @@ fn mcp_notice_block_derives_settled_from_its_phase_on_decode() {
             if let Some(phase) = phase {
                 raw["phase"] = json!(phase);
             }
-            let block: SystemNoticeBlock = serde_json::from_value(raw).unwrap();
-            let SystemNoticeBlock::Mcp {
-                settled: decoded, ..
-            } = &block
-            else {
-                panic!("expected an mcp block: {block:?}");
-            };
-            assert_eq!(*decoded, settled, "phase {phase:?}, stored {key}={stored}");
-            let written = serde_json::to_value(&block).unwrap();
-            assert_eq!(written["settled"], settled);
-            assert!(written.get("persisted").is_none());
+            let block: SystemNoticeBlock = serde_json::from_value(raw.clone()).unwrap();
+            assert!(matches!(block, SystemNoticeBlock::Mcp { .. }), "{block:?}");
+            assert_eq!(
+                block.lifecycle_settled(),
+                Some(settled),
+                "phase {phase:?}, stored {key}={stored}"
+            );
+            assert_eq!(
+                serde_json::to_value(&block).unwrap(),
+                raw,
+                "phase {phase:?}, stored {key}={stored}: written back unchanged"
+            );
         }
     }
 }

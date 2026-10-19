@@ -1368,21 +1368,119 @@ pub fn compare_event_envelopes<T>(a: &EventEnvelope<T>, b: &EventEnvelope<T>) ->
         .then_with(|| a.event_id.cmp(&b.event_id))
 }
 
+/// The lifecycle bit of a tool-config notice as a row stores it: its key and
+/// its value.
+///
+/// A payload or `mcp` block built by 0.9.4 and later is written with
+/// `settled`. Rows written by 0.9.3 and earlier carry the same bit as
+/// `persisted`, `false` for boundary changes that had already applied. A
+/// transcript's head revision and every save and rewrite check digest the
+/// re-serialized rows, so a decoded row keeps the key and value it was stored
+/// with and serializes back to exactly those bytes. Readers never use the
+/// stored value: [`ToolConfigChangedPayload::settled`] derives the lifecycle
+/// fact from the status, and [`crate::types::SystemNoticeBlock::lifecycle_settled`]
+/// derives an `mcp` block's from its phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolConfigLifecycleBit {
+    /// Written as `settled` (0.9.4 and later).
+    Settled(bool),
+    /// Stored as `persisted` by 0.9.3 and earlier.
+    Persisted(bool),
+    /// Stored without a lifecycle bit.
+    Absent,
+}
+
+impl ToolConfigLifecycleBit {
+    /// The bit a decoded row stored: `settled` when present, else 0.9.3's
+    /// `persisted`. No release writes both.
+    #[must_use]
+    pub fn from_stored(settled: Option<bool>, persisted: Option<bool>) -> Self {
+        match (settled, persisted) {
+            (Some(value), _) => Self::Settled(value),
+            (None, Some(value)) => Self::Persisted(value),
+            (None, None) => Self::Absent,
+        }
+    }
+
+    /// The stored value, `false` when no bit was stored (the default 0.9.3
+    /// decoded a missing `mcp` block bit to).
+    #[must_use]
+    pub fn stored_value(self) -> bool {
+        match self {
+            Self::Settled(value) | Self::Persisted(value) => value,
+            Self::Absent => false,
+        }
+    }
+}
+
+/// Serialized flattened into its payload or block, at the position the bit
+/// has always had: one `settled` or `persisted` entry, or none.
+impl Serialize for ToolConfigLifecycleBit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        match *self {
+            Self::Settled(value) => {
+                let mut bit = serializer.serialize_struct("ToolConfigLifecycleBit", 1)?;
+                bit.serialize_field("settled", &value)?;
+                bit.end()
+            }
+            Self::Persisted(value) => {
+                let mut bit = serializer.serialize_struct("ToolConfigLifecycleBit", 1)?;
+                bit.serialize_field("persisted", &value)?;
+                bit.end()
+            }
+            Self::Absent => serializer
+                .serialize_struct("ToolConfigLifecycleBit", 0)?
+                .end(),
+        }
+    }
+}
+
+// Schema of the lifecycle bit: a payload this version builds carries
+// `settled`; one stored by 0.9.3 and earlier is served back with the
+// `persisted` it was stored with.
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ToolConfigChangedPayloadLifecycleBitSchema {
+    /// Whether the change is settled (not pending or draining), derived from
+    /// `status_info`. Every payload built by 0.9.4 and later carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "bool")]
+    settled: Option<bool>,
+    /// The bit a payload stored by 0.9.3 and earlier carries instead of
+    /// `settled`, served back unchanged. It was `false` for some changes that
+    /// had already applied, so derive the fact from `status_info` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "bool")]
+    persisted: Option<bool>,
+}
+
 /// Payload for tool configuration change notifications.
 ///
 /// The typed `status_info` is the sole owner of the change status; display
 /// text is derived at read time via [`ToolConfigChangedPayload::status_text`].
-/// `settled` is derived from it too ([`ToolConfigChangeStatus::is_settled`]):
-/// it is written for consumers, and decoding derives it again instead of
-/// reading the stored bit (or the `persisted` bit that 0.9.3 and earlier
-/// wrote, which was `false` for changes that had already applied).
+/// The lifecycle fact is derived from it too ([`Self::settled`],
+/// [`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+/// with that value as `settled`; a decoded payload keeps the bit it was stored
+/// with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+/// which carry `persisted`, serialize back unchanged.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolConfigChangedPayload {
     pub operation: ToolConfigChangeOperation,
     pub target: String,
     status_info: ToolConfigChangeStatus,
-    settled: bool,
+    // The bit as written, for byte fidelity; readers use `settled()`.
+    #[serde(flatten)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(with = "ToolConfigChangedPayloadLifecycleBitSchema")
+    )]
+    lifecycle_bit: ToolConfigLifecycleBit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_at_turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1396,13 +1494,17 @@ impl<'de> Deserialize<'de> for ToolConfigChangedPayload {
     where
         D: Deserializer<'de>,
     {
-        /// The stored shape without `settled`: a stored `settled` or
-        /// `persisted` is ignored, because the status decides it.
+        /// The stored shape. The lifecycle bit is kept as stored, for byte
+        /// fidelity only; the status decides [`ToolConfigChangedPayload::settled`].
         #[derive(Deserialize)]
         struct Stored {
             operation: ToolConfigChangeOperation,
             target: String,
             status_info: ToolConfigChangeStatus,
+            #[serde(default)]
+            settled: Option<bool>,
+            #[serde(default)]
+            persisted: Option<bool>,
             #[serde(default)]
             applied_at_turn: Option<u32>,
             #[serde(default)]
@@ -1411,12 +1513,13 @@ impl<'de> Deserialize<'de> for ToolConfigChangedPayload {
             deferred_catalog_delta: Option<DeferredCatalogDelta>,
         }
         let stored = Stored::deserialize(deserializer)?;
-        Ok(
-            Self::new(stored.operation, stored.target, stored.status_info)
-                .with_applied_at_turn(stored.applied_at_turn)
-                .with_domain(stored.domain)
-                .with_deferred_catalog_delta(stored.deferred_catalog_delta),
-        )
+        let mut payload = Self::new(stored.operation, stored.target, stored.status_info)
+            .with_applied_at_turn(stored.applied_at_turn)
+            .with_domain(stored.domain)
+            .with_deferred_catalog_delta(stored.deferred_catalog_delta);
+        payload.lifecycle_bit =
+            ToolConfigLifecycleBit::from_stored(stored.settled, stored.persisted);
+        Ok(payload)
     }
 }
 
@@ -1427,12 +1530,12 @@ impl ToolConfigChangedPayload {
         target: impl Into<String>,
         status_info: ToolConfigChangeStatus,
     ) -> Self {
-        let settled = status_info.is_settled();
+        let lifecycle_bit = ToolConfigLifecycleBit::Settled(status_info.is_settled());
         Self {
             operation,
             target: target.into(),
             status_info,
-            settled,
+            lifecycle_bit,
             applied_at_turn: None,
             domain: None,
             deferred_catalog_delta: None,
@@ -1445,12 +1548,21 @@ impl ToolConfigChangedPayload {
     }
 
     /// Whether the change is a settled lifecycle fact rather than a pending
-    /// or draining step. It says nothing about configuration: whether a change
-    /// was written there is the `mcp/add` / `mcp/remove` response's
-    /// `persisted`, and the realm configuration itself.
+    /// or draining step, derived from the status for every payload, decoded
+    /// or built. It says nothing about configuration: whether a change was
+    /// written there is the `mcp/add` / `mcp/remove` response's `persisted`,
+    /// and the realm configuration itself.
     #[must_use]
     pub fn settled(&self) -> bool {
-        self.settled
+        self.status_info.is_settled()
+    }
+
+    /// The lifecycle bit as this payload is written: `settled` for a payload
+    /// built here, or the bit a decoded row stored. Kept for byte fidelity;
+    /// use [`Self::settled`] for the lifecycle fact.
+    #[must_use]
+    pub fn lifecycle_bit(&self) -> ToolConfigLifecycleBit {
+        self.lifecycle_bit
     }
 
     #[must_use]
@@ -1722,7 +1834,7 @@ impl ExternalToolDelta {
                     server_id: Some(self.target.clone()),
                     operation: Some(self.operation.clone()),
                     phase: Some(self.phase),
-                    settled: self.settled(),
+                    lifecycle_bit: ToolConfigLifecycleBit::Settled(self.settled()),
                     detail: Some(detail),
                     confinement_refusal: self.confinement_refusal,
                     pending_sources: Vec::new(),
@@ -4187,8 +4299,10 @@ mod tests {
     }
 
     /// 0.9.3 wrote `persisted`, `false` for the three agent-boundary
-    /// statuses although those changes had applied. Decoding derives
-    /// `settled` from the status and never reads the stored bit.
+    /// statuses although those changes had applied. `settled()` derives the
+    /// fact from the status and never reads the stored bit, while the payload
+    /// writes the stored key and value back unchanged (its transcript digest
+    /// covers those bytes).
     #[test]
     fn tool_config_changed_payload_derives_settled_from_status_on_decode() {
         let stored_093 = |status_info: serde_json::Value, persisted: bool| {
@@ -4243,9 +4357,15 @@ mod tests {
                     settled,
                     "{status_info} stored persisted={stored}"
                 );
-                let rewritten = serde_json::to_value(&payload).unwrap();
-                assert_eq!(rewritten["settled"], settled);
-                assert!(rewritten.get("persisted").is_none());
+                assert_eq!(
+                    payload.lifecycle_bit(),
+                    ToolConfigLifecycleBit::Persisted(stored)
+                );
+                assert_eq!(
+                    serde_json::to_value(&payload).unwrap(),
+                    stored_093(status_info.clone(), stored),
+                    "the stored row is written back unchanged"
+                );
             }
         }
         let mut current = stored_093(
@@ -4255,11 +4375,21 @@ mod tests {
         let object = current.as_object_mut().unwrap();
         object.remove("persisted");
         object.insert("settled".into(), serde_json::json!(true));
-        let payload: ToolConfigChangedPayload = serde_json::from_value(current).unwrap();
+        let payload: ToolConfigChangedPayload = serde_json::from_value(current.clone()).unwrap();
         assert!(
             !payload.settled(),
             "a stored settled is not read back either"
         );
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            current,
+            "but it is written back as stored"
+        );
+        let mut bare = current;
+        bare.as_object_mut().unwrap().remove("settled");
+        let payload: ToolConfigChangedPayload = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(payload.lifecycle_bit(), ToolConfigLifecycleBit::Absent);
+        assert_eq!(serde_json::to_value(&payload).unwrap(), bare);
     }
 
     #[test]

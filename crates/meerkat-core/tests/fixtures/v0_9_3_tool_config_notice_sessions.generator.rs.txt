@@ -1,0 +1,231 @@
+//! Writes #1658 cross-version fixtures with the released v0.9.3 meerkat-core:
+//! sessions holding tool-config and MCP notices, as message rows plus the
+//! session head that v0.9.3 computes for them, as the whole session document
+//! v0.9.3 serializes, and the tool_config_changed events v0.9.3 emits for the
+//! same payloads.
+use meerkat_core::event::{DeferredCatalogDelta, ToolConfigChangeDomain};
+use meerkat_core::types::{
+    Message, SystemMessage, SystemNoticeBlock, SystemNoticeKind, SystemNoticeMessage, UserMessage,
+};
+use meerkat_core::{
+    AgentEvent, ExternalToolDelta, ExternalToolDeltaPhase, Session, SessionHead,
+    ToolConfigChangeOperation, ToolConfigChangeStatus, ToolConfigChangedPayload,
+    TranscriptStrandId,
+};
+use std::path::Path;
+
+fn notice(kind: SystemNoticeKind, body: &str, block: SystemNoticeBlock) -> Message {
+    Message::SystemNotice(SystemNoticeMessage::with_block(kind, Some(body.to_string()), block))
+}
+
+fn mcp_block(phase: Option<ExternalToolDeltaPhase>, persisted: bool) -> SystemNoticeBlock {
+    SystemNoticeBlock::Mcp {
+        server_id: Some("server".to_string()),
+        operation: None,
+        phase,
+        persisted,
+        detail: None,
+        confinement_refusal: None,
+        pending_sources: Vec::new(),
+    }
+}
+
+fn boundary_payload() -> ToolConfigChangedPayload {
+    ToolConfigChangedPayload::new(
+        ToolConfigChangeOperation::Reload,
+        "tool_scope",
+        ToolConfigChangeStatus::boundary_applied(true, false, 3),
+        false,
+    )
+    .with_applied_at_turn(Some(2))
+    .with_domain(Some(ToolConfigChangeDomain::ToolScope))
+}
+
+fn deferred_payload() -> ToolConfigChangedPayload {
+    ToolConfigChangedPayload::new(
+        ToolConfigChangeOperation::Reload,
+        "deferred_catalog",
+        ToolConfigChangeStatus::deferred_catalog_delta(1, 0, 1),
+        false,
+    )
+    .with_applied_at_turn(Some(2))
+    .with_domain(Some(ToolConfigChangeDomain::DeferredCatalog))
+    .with_deferred_catalog_delta(Some(DeferredCatalogDelta {
+        added_hidden_names: vec!["search".to_string().into()],
+        removed_hidden_names: Vec::new(),
+        pending_sources: vec!["server".to_string()],
+    }))
+}
+
+fn failed_closed_payload() -> ToolConfigChangedPayload {
+    ToolConfigChangedPayload::new(
+        ToolConfigChangeOperation::Reload,
+        "tool_scope",
+        ToolConfigChangeStatus::warning_failed_closed("injected scope failure"),
+        false,
+    )
+    .with_applied_at_turn(Some(2))
+    .with_domain(Some(ToolConfigChangeDomain::ToolScope))
+}
+
+fn delta_payload(phase: ExternalToolDeltaPhase) -> ToolConfigChangedPayload {
+    let mut payload =
+        ExternalToolDelta::new("server", ToolConfigChangeOperation::Add, phase)
+            .to_tool_config_changed_payload();
+    payload.applied_at_turn = Some(2);
+    payload
+}
+
+/// The restore-refusal delta 0.9.3's RPC runtime sends: failed, persisted
+/// false, as a literal rather than through `ExternalToolDelta::new`.
+fn restore_refusal_delta() -> ExternalToolDelta {
+    let mut delta = ExternalToolDelta::new(
+        "server",
+        ToolConfigChangeOperation::Add,
+        ExternalToolDeltaPhase::Failed,
+    );
+    delta.persisted = false;
+    delta
+}
+
+struct Case {
+    name: &'static str,
+    description: &'static str,
+    notices: Vec<Message>,
+    payloads: Vec<ToolConfigChangedPayload>,
+}
+
+fn cases() -> Vec<Case> {
+    let boundary = notice(
+        SystemNoticeKind::ToolScope,
+        "Tool configuration changed at turn boundary: boundary_applied(base_changed=true,visible_changed=false,revision=3)",
+        SystemNoticeBlock::ToolConfig { payload: boundary_payload() },
+    );
+    let deferred = notice(
+        SystemNoticeKind::ToolScope,
+        "Deferred catalog changed at turn boundary: new deferred tools available: search; sources still connecting: server",
+        SystemNoticeBlock::ToolConfig { payload: deferred_payload() },
+    );
+    let failed_closed = notice(
+        SystemNoticeKind::ToolScopeWarning,
+        "Tool scope apply failed (injected scope failure); closing the visible tool set until the next boundary.",
+        SystemNoticeBlock::ToolConfig { payload: failed_closed_payload() },
+    );
+    let pending_delta = notice(
+        SystemNoticeKind::Mcp,
+        "MCP server server is pending.",
+        SystemNoticeBlock::ToolConfig { payload: delta_payload(ExternalToolDeltaPhase::Pending) },
+    );
+    let applied_delta = notice(
+        SystemNoticeKind::Mcp,
+        "MCP server server was added.",
+        SystemNoticeBlock::ToolConfig { payload: delta_payload(ExternalToolDeltaPhase::Applied) },
+    );
+    let mcp_true = notice(
+        SystemNoticeKind::McpPending,
+        "Servers connecting: server. Tools will appear when ready.",
+        mcp_block(None, true),
+    );
+    let mcp_false = notice(
+        SystemNoticeKind::McpPending,
+        "Servers connecting: server. Tools will appear when ready.",
+        mcp_block(None, false),
+    );
+    let mcp_pending_phase = notice(
+        SystemNoticeKind::McpPending,
+        "Servers connecting: server. Tools will appear when ready.",
+        SystemNoticeBlock::Mcp {
+            server_id: None,
+            operation: None,
+            phase: Some(ExternalToolDeltaPhase::Pending),
+            persisted: false,
+            detail: Some("Servers connecting: server. Tools will appear when ready.".to_string()),
+            confinement_refusal: None,
+            pending_sources: vec!["server".to_string()],
+        },
+    );
+    let setup_failure = ExternalToolDelta::new(
+        "server",
+        ToolConfigChangeOperation::Add,
+        ExternalToolDeltaPhase::Failed,
+    )
+    .model_setup_failure_notice()
+    .expect("a failed add has a setup failure notice");
+    let restore_refusal = restore_refusal_delta()
+        .model_setup_failure_notice()
+        .expect("a failed add has a setup failure notice");
+    vec![
+        Case { name: "plain", description: "control: no tool-config or MCP notice", notices: vec![], payloads: vec![] },
+        Case { name: "mcp_no_phase_persisted_true", description: "mcp block without a phase, persisted true", notices: vec![mcp_true.clone()], payloads: vec![] },
+        Case { name: "mcp_no_phase_persisted_false", description: "mcp block without a phase, persisted false", notices: vec![mcp_false.clone()], payloads: vec![] },
+        Case { name: "mcp_pending_phase", description: "the agent's McpPending block: phase pending, persisted false", notices: vec![mcp_pending_phase.clone()], payloads: vec![] },
+        Case { name: "mcp_setup_failure", description: "setup failure notice: phase failed, persisted true", notices: vec![setup_failure.clone()], payloads: vec![] },
+        Case { name: "mcp_restore_refusal", description: "restore refusal notice: phase failed, persisted false", notices: vec![restore_refusal.clone()], payloads: vec![] },
+        Case { name: "tool_scope_boundary_applied", description: "tool_config boundary_applied, persisted false", notices: vec![boundary.clone()], payloads: vec![boundary_payload()] },
+        Case { name: "deferred_catalog_delta", description: "tool_config deferred_catalog_delta, persisted false", notices: vec![deferred.clone()], payloads: vec![deferred_payload()] },
+        Case { name: "warning_failed_closed", description: "tool_config warning_failed_closed, persisted false", notices: vec![failed_closed.clone()], payloads: vec![failed_closed_payload()] },
+        Case { name: "external_tool_delta_pending", description: "tool_config external_tool_delta pending, persisted false", notices: vec![pending_delta.clone()], payloads: vec![delta_payload(ExternalToolDeltaPhase::Pending)] },
+        Case { name: "external_tool_delta_applied", description: "tool_config external_tool_delta applied, persisted true", notices: vec![applied_delta.clone()], payloads: vec![delta_payload(ExternalToolDeltaPhase::Applied)] },
+        Case {
+            name: "all_notices",
+            description: "every shape above in one transcript",
+            notices: vec![mcp_true, mcp_false, mcp_pending_phase, setup_failure, restore_refusal, boundary, deferred, failed_closed, pending_delta, applied_delta],
+            payloads: vec![boundary_payload(), deferred_payload(), failed_closed_payload(), delta_payload(ExternalToolDeltaPhase::Pending), delta_payload(ExternalToolDeltaPhase::Applied)],
+        },
+    ]
+}
+
+fn main() {
+    let out = std::env::args().nth(1).expect("output dir");
+    let out = Path::new(&out);
+    for case in cases() {
+        let mut session = Session::new();
+        session.push(Message::System(SystemMessage::new("base system")));
+        session.push(Message::User(UserMessage::text("hello".to_string())));
+        for message in case.notices {
+            session.push(message);
+        }
+        session.push(Message::User(UserMessage::text("after".to_string())));
+        let head = SessionHead::from_session(&session, TranscriptStrandId::root(), 0)
+            .expect("session head");
+        let rows: Vec<String> = session
+            .messages()
+            .iter()
+            .map(|message| serde_json::to_string(message).expect("row"))
+            .collect();
+        let events: Vec<String> = case
+            .payloads
+            .into_iter()
+            .map(|payload| {
+                serde_json::to_string(&AgentEvent::ToolConfigChanged { payload }).expect("event")
+            })
+            .collect();
+        let session_document = serde_json::to_string(&session).expect("session document");
+        // Sanity: the writer loads its own rows and its own session document,
+        // and writes the document back unchanged.
+        let raw: Vec<Vec<u8>> = rows.iter().map(|row| row.clone().into_bytes()).collect();
+        head.clone()
+            .into_session_from_serialized_rows(raw)
+            .expect("v0.9.3 loads its own rows");
+        let reloaded: Session =
+            serde_json::from_str(&session_document).expect("v0.9.3 loads its own document");
+        assert_eq!(
+            serde_json::to_string(&reloaded).expect("document"),
+            session_document,
+            "v0.9.3 writes its own document back unchanged"
+        );
+        let fixture = serde_json::json!({
+            "written_by": "meerkat-core 0.9.3 (tag v0.9.3)",
+            "case": case.name,
+            "description": case.description,
+            "head": head,
+            "rows": rows,
+            "session_document": session_document,
+            "events": events,
+        });
+        let path = out.join(format!("{}.json", case.name));
+        std::fs::write(&path, serde_json::to_string_pretty(&fixture).expect("fixture json") + "\n")
+            .expect("write fixture");
+        println!("{} head_revision {}", case.name, head.head_revision);
+    }
+}

@@ -5016,17 +5016,19 @@ class ToolConfigChangedPayload:
 
 The typed `status_info` is the sole owner of the change status; display
 text is derived at read time via [`ToolConfigChangedPayload::status_text`].
-`settled` is derived from it too ([`ToolConfigChangeStatus::is_settled`]):
-it is written for consumers, and decoding derives it again instead of
-reading the stored bit (or the `persisted` bit that 0.9.3 and earlier
-wrote, which was `false` for changes that had already applied)."""
+The lifecycle fact is derived from it too ([`Self::settled`],
+[`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+with that value as `settled`; a decoded payload keeps the bit it was stored
+with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+which carry `persisted`, serialize back unchanged."""
     operation: ToolConfigChangeOperation
-    settled: bool
     status_info: ToolConfigChangeStatus
     target: str
     applied_at_turn: Optional[int] = None
     deferred_catalog_delta: Optional[DeferredCatalogDelta] = None
     domain: Optional[ToolConfigChangeDomain] = None
+    persisted: Optional[bool] = None
+    settled: Optional[bool] = None
 
 
 @dataclass
@@ -7915,6 +7917,7 @@ class SystemNoticeBlockMcp(TypedDict, total=False):
     detail: NotRequired[Optional[str]]
     operation: NotRequired[Optional[ToolConfigChangeOperation]]
     pending_sources: NotRequired[list[str]]
+    persisted: NotRequired[bool]
     phase: NotRequired[Optional[ExternalToolDeltaPhase]]
     server_id: NotRequired[Optional[str]]
     settled: NotRequired[bool]
