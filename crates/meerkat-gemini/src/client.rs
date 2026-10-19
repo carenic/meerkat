@@ -6758,6 +6758,7 @@ mod tests {
                             ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
                                 .expect("structured response block"),
                         ],
+                        delivery_id: None,
                     },
                 ),
             )],

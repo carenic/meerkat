@@ -1458,9 +1458,9 @@ Send a fire-and-forget collaboration message to a trusted peer.
 </Accordion>
 
 <Accordion title="reply_to_peer">
-Reply to the peer message that triggered the current turn. This tool is
-pre-addressed by a turn-scoped reply capability, so it deliberately has no
-`peer_id` argument.
+Reply to a peer message delivered in the current turn, at its start or while
+it ran. This tool is pre-addressed by a turn-scoped reply capability, so it
+deliberately has no `peer_id` argument.
 
 **Default enabled:** Yes when comms is active. It does not require runtime
 request/response command authority.
@@ -1478,8 +1478,10 @@ request/response command authority.
 </ParamField>
 
 <ParamField body="reply_to" type="String">
-  Delivery ID selector. Omit when exactly one peer message triggered the turn.
-  When several arrived, retry with one ID listed by `ambiguous_reply`.
+  Delivery ID selector: the `Delivery ID` line of the message notice. Omit
+  when the turn holds exactly one peer message. When several arrived, retry
+  with one ID listed by `ambiguous_reply`. An id that two senders' messages
+  share answers `ambiguous_reply` and sends nothing.
 </ParamField>
 
 ```json

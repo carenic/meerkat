@@ -28,6 +28,7 @@ from .types import (  # noqa: F401
     ContentBlock,
     ContentInput,
     ExternalToolDeltaPhase,
+    InteractionId,
     InterruptedInputKind,
     InterruptedToolRunDisposition,
     LiveBridgeEffectKind,
@@ -727,10 +728,6 @@ class InteractionFailureReasonExtractionFailed(TypedDict, total=False):
 #
 # [`Display`]: std::fmt::Display
 InteractionFailureReason = InteractionFailureReasonCancelled | InteractionFailureReasonAbandoned | InteractionFailureReasonInteractionStreamAbandoned | InteractionFailureReasonFinalizationFailed | InteractionFailureReasonExtractionFailed
-
-
-# Unique identifier for an interaction.
-InteractionId = str
 
 
 # Typed cause of a committed live channel close.
@@ -2192,16 +2189,17 @@ class AgentEventPeerContentIngested(TypedDict, total=False):
 
     Emitted as a pure projection of the typed transcript carrier
     ([`crate::types::SystemNoticeBlock::Comms`] with incoming direction)
-    at the moment the agent commits it — a queued delivery appended to the
-    transcript at run assembly, or a steer delivery injected as a
-    request-local User message at the model boundary. One event per committed comms
-    block, so a host taint tracker classifies peer ingestion from typed
-    facts (canonical peer identity + the sender's signed content-taint
+    at the moment the agent commits it: a delivery appended to the
+    transcript at run assembly, or a steer written into the running turn's
+    transcript at a model boundary. One event per committed comms block, so
+    a host taint tracker classifies peer ingestion from typed facts
+    (canonical peer identity + the sender's signed content-taint
     declaration) instead of parsing rendered projection text.
 
     The event stream is best-effort observability (see `event_tap`); the
     transcript block remains the durable owner of these facts.
     """
+    delivery_id: NotRequired[Optional[InteractionId]]
     kind: Required[CommsNoticeKind]
     peer: NotRequired[Optional[SystemNoticePeer]]
     request_id: NotRequired[Optional[str]]

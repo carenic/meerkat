@@ -1220,6 +1220,19 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
     let notice_peer = meerkat_core::comms::PeerId::parse(&peer_id)
         .ok()
         .map(|id| SystemNoticePeer { id, display_name });
+    // A peer message from a canonical peer names its delivery: the sender's
+    // envelope id, which the comms bridge stamps as the correlation id. It is
+    // exactly the `in_reply_to` of the reply capability the same input mints
+    // ([`peer_reply_capability`]), so the id the model reads is the one
+    // `reply_to_peer` accepts.
+    let delivery_id = if matches!(kind, CommsNoticeKind::Message) && notice_peer.is_some() {
+        peer.header
+            .correlation_id
+            .as_ref()
+            .map(|correlation| meerkat_core::InteractionId(correlation.0))
+    } else {
+        None
+    };
     Some(CoreRenderable::SystemNotice {
         kind: SystemNoticeKind::Comms,
         body: Some(summary.clone()),
@@ -1237,6 +1250,7 @@ fn peer_notice_renderable(peer: &PeerInput) -> Option<CoreRenderable> {
             summary: Some(summary),
             payload: peer.payload.clone(),
             content,
+            delivery_id,
         }],
     })
 }
@@ -2460,6 +2474,79 @@ mod tests {
         assert_eq!(
             projection_conversation_appends(&projection, idle_semantics).len(),
             1
+        );
+    }
+
+    /// A peer message from a canonical peer names its delivery on the notice
+    /// and on its ingestion event: the id its reply capability carries, so
+    /// the id the model reads is the one `reply_to_peer` accepts. Other
+    /// conventions and non-canonical senders name none.
+    #[test]
+    fn peer_message_notice_names_the_delivery_its_reply_capability_answers() {
+        let sender = uuid::Uuid::from_u128(0xC1);
+        let delivery = meerkat_core::InteractionId(uuid::Uuid::from_u128(0xD1));
+        let peer_input = |convention: PeerConvention, peer_id: String| {
+            let mut input = steer_peer_input(convention, "please look");
+            if let Input::Peer(peer) = &mut input {
+                peer.header.source = InputOrigin::Peer {
+                    peer_id,
+                    display_identity: Some("Peer A".into()),
+                    runtime_id: None,
+                };
+                peer.header.correlation_id = Some(crate::CorrelationId::from_uuid(delivery.0));
+            }
+            input
+        };
+        let notice_delivery_id = |input: &Input| {
+            let appends = projection_durable_boundary_appends(&runtime_input_projection(input));
+            match appends.as_slice() {
+                [append] => match &append.content {
+                    CoreRenderable::SystemNotice { blocks, .. } => match blocks.as_slice() {
+                        [meerkat_core::types::SystemNoticeBlock::Comms { delivery_id, .. }] => {
+                            *delivery_id
+                        }
+                        other => panic!("one comms block: {other:?}"),
+                    },
+                    other => panic!("a system notice: {other:?}"),
+                },
+                other => panic!("one notice row: {other:?}"),
+            }
+        };
+
+        let message = peer_input(PeerConvention::Message, sender.to_string());
+        assert_eq!(notice_delivery_id(&message), Some(delivery));
+        assert_eq!(
+            peer_reply_capability(&message).map(|capability| capability.in_reply_to),
+            Some(delivery),
+            "the notice names exactly the delivery the capability answers"
+        );
+        let appends = meerkat_core::DurableTurnBoundaryAppends::try_new(
+            message.id().clone(),
+            projection_durable_boundary_appends(&runtime_input_projection(&message)),
+            None,
+        )
+        .expect("the peer notice can join a running turn");
+        assert!(matches!(
+            appends.peer_ingested_events(),
+            [meerkat_core::AgentEvent::PeerContentIngested { delivery_id: Some(id), .. }]
+                if *id == delivery
+        ));
+
+        assert_eq!(
+            notice_delivery_id(&peer_input(PeerConvention::Message, "peer-a".into())),
+            None,
+            "a sender that is not a canonical peer has no reply capability to name"
+        );
+        assert_eq!(
+            notice_delivery_id(&peer_input(
+                PeerConvention::Request {
+                    request_id: "request-1".into(),
+                    intent: "review".into(),
+                },
+                sender.to_string()
+            )),
+            None,
+            "a request is answered with send_response, not reply_to_peer"
         );
     }
 

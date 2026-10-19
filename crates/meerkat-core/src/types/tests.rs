@@ -367,6 +367,7 @@ fn peer_terminal_notice_projection_does_not_default_missing_status() {
         summary: None,
         payload: Some(json!({"ok": true})),
         content: Vec::new(),
+        delivery_id: None,
     };
 
     let projection = block.model_projection_text();
@@ -451,6 +452,7 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
         }],
+        delivery_id: None,
     };
 
     let undeclared = block(None);
@@ -486,6 +488,62 @@ fn comms_notice_sender_taint_none_and_clean_are_distinct_but_render_identically(
 }
 
 #[test]
+fn comms_message_notice_renders_its_delivery_id_before_the_taint_marker() {
+    // The id `reply_to_peer` takes as `reply_to` is model-visible on the
+    // message notice it names; a notice without one renders as before, and
+    // the declared-taint marker stays the last line.
+    let delivery = crate::interaction::InteractionId(uuid::Uuid::from_u128(0x5e));
+    let block = |delivery_id, sender_taint| SystemNoticeBlock::Comms {
+        kind: CommsNoticeKind::Message,
+        direction: SystemNoticeDirection::Incoming,
+        peer: Some(SystemNoticePeer {
+            id: crate::comms::PeerId::new(),
+            display_name: Some("Peer A".to_string()),
+        }),
+        sender_taint,
+        request_id: None,
+        intent: None,
+        status: None,
+        summary: Some("Peer message".to_string()),
+        payload: None,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }],
+        delivery_id,
+    };
+
+    let without = block(None, None).model_projection_text();
+    let with = block(Some(delivery), None).model_projection_text();
+    assert!(!without.contains("Delivery ID"), "{without}");
+    assert_eq!(with, format!("{without}\nDelivery ID: {delivery}"));
+
+    let tainted = block(
+        Some(delivery),
+        Some(crate::comms::SenderContentTaint::Tainted),
+    )
+    .model_projection_text();
+    assert_eq!(
+        tainted,
+        format!("{with}\n[sender declared this content tainted]")
+    );
+
+    // The field rides the wire only when present, and round-trips.
+    let wire = serde_json::to_value(block(Some(delivery), None)).unwrap();
+    assert_eq!(wire["delivery_id"], json!(delivery.to_string()));
+    assert!(
+        serde_json::to_value(block(None, None))
+            .unwrap()
+            .get("delivery_id")
+            .is_none()
+    );
+    let decoded: SystemNoticeBlock = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        decoded,
+        SystemNoticeBlock::Comms { delivery_id: Some(id), .. } if id == delivery
+    ));
+}
+
+#[test]
 fn comms_block_round_trips_through_wire_with_typed_peer_id() {
     // The peer routing identity is typed but serializes as a hyphenated UUID
     // string on the wire, so persisted transcripts stay byte-stable.
@@ -504,6 +562,7 @@ fn comms_block_round_trips_through_wire_with_typed_peer_id() {
         summary: None,
         payload: None,
         content: Vec::new(),
+        delivery_id: None,
     };
 
     let value = serde_json::to_value(&block).unwrap();
@@ -529,6 +588,7 @@ fn system_notice_explicit_null_payloads_round_trip_without_becoming_absent() {
             summary: Some("Peer response terminal".to_string()),
             payload: Some(Value::Null),
             content: Vec::new(),
+            delivery_id: None,
         },
         SystemNoticeBlock::ExternalEvent {
             source: "connector".to_string(),

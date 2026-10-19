@@ -1914,6 +1914,36 @@ pub struct PeerReplyDispatchContext {
     pub deliveries: Vec<PeerReplyCapability>,
 }
 
+impl PeerReplyDispatchContext {
+    /// Add `delivery` unless this context already holds the same sender's
+    /// delivery with the same interaction id. Returns whether it was added.
+    ///
+    /// Deliveries are keyed by (sender, interaction id), never by the id
+    /// alone: the sender chooses the id, so two senders can carry the same
+    /// one, and each keeps its own capability (`reply_to_peer` then answers
+    /// `ambiguous_reply` instead of picking one).
+    pub fn insert_delivery(&mut self, delivery: PeerReplyCapability) -> bool {
+        let present = self.deliveries.iter().any(|existing| {
+            existing.peer_id == delivery.peer_id && existing.in_reply_to == delivery.in_reply_to
+        });
+        if !present {
+            self.deliveries.push(delivery);
+        }
+        !present
+    }
+}
+
+/// Why a turn's peer-reply context cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PeerReplyContextError {
+    /// The turn-start value under [`COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY`]
+    /// does not decode as a [`PeerReplyDispatchContext`]. It fails closed
+    /// instead of being coerced or ignored.
+    #[error("malformed peer reply context: {0}")]
+    Malformed(String),
+}
+
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

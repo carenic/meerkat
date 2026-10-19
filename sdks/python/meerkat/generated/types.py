@@ -7779,6 +7779,9 @@ class ContentBlockSkillContext(TypedDict, total=False):
 
 ContentBlock = ContentBlockText | ContentBlockImageInline | ContentBlockImageBlob | ContentBlockVideoInline | ContentBlockVideoUri | ContentBlockStructured | ContentBlockSkillContext
 
+# Unique identifier for an interaction.
+InteractionId = str
+
 # What kind of input an interrupted run had in flight.
 InterruptedInputKind = Literal['prompt', 'peer', 'flow_step', 'external_event', 'continuation', 'operation', 'unknown']
 
@@ -7882,6 +7885,7 @@ ToolProcessSpawner = ToolProcessSpawnerShellCall | ToolProcessSpawnerBackgroundJ
 # background work, and other runtime facts. They are never user-authored text.
 class SystemNoticeBlockComms(TypedDict, total=False):
     content: NotRequired[list[ContentBlock]]
+    delivery_id: NotRequired[Optional[InteractionId]]
     direction: Required[SystemNoticeDirection]
     intent: NotRequired[Optional[str]]
     kind: Required[CommsNoticeKind]
@@ -8246,7 +8250,7 @@ class CommsCommandPeerResponse(TypedDict, total=False):
     blocks: NotRequired[Optional[list[ContentBlock]]]
     content_taint: NotRequired[Optional[SendTaintOverride]]
     handling_mode: NotRequired[Optional[HandlingMode]]
-    in_reply_to: Required[str]
+    in_reply_to: Required[InteractionId]
     kind: Required[Literal['peer_response']]
     result: NotRequired[Optional[CommsPeerResponseResult]]
     status: Required[Literal['accepted', 'completed', 'failed']]
@@ -9003,7 +9007,7 @@ class CommsSendParamsPeerResponse(TypedDict, total=False):
     blocks: NotRequired[Optional[list[ContentBlock]]]
     content_taint: NotRequired[Optional[SendTaintOverride]]
     handling_mode: NotRequired[Optional[HandlingMode]]
-    in_reply_to: Required[str]
+    in_reply_to: Required[InteractionId]
     kind: Required[Literal['peer_response']]
     result: NotRequired[Optional[CommsPeerResponseResult]]
     session_id: Required[str]
@@ -9234,7 +9238,7 @@ class WireSessionMessageSystemNotice(TypedDict, total=False):
 class WireSessionMessageUser(TypedDict, total=False):
     content: Required[WireContentInput]
     created_at: Required[str]
-    interaction_id: NotRequired[Optional[str]]
+    interaction_id: NotRequired[Optional[InteractionId]]
     role: Required[Literal['user']]
     run_id: NotRequired[Optional[RunId]]
     transcript_role: NotRequired[TranscriptUserRole]
@@ -9243,7 +9247,7 @@ class WireSessionMessageBlockAssistant(TypedDict, total=False):
     assistant_message_id: NotRequired[Optional[str]]
     blocks: Required[list[WireAssistantBlock]]
     created_at: Required[str]
-    interaction_id: NotRequired[Optional[str]]
+    interaction_id: NotRequired[Optional[InteractionId]]
     realtime_origin: NotRequired[Optional[RealtimeMessageOrigin]]
     role: Required[Literal['block_assistant']]
     run_id: NotRequired[Optional[RunId]]

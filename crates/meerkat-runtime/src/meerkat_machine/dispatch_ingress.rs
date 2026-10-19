@@ -853,18 +853,26 @@ impl MeerkatMachine {
                 // The durable payload is exactly the appends the fallback
                 // follow-up turn would write, lowered with the input's own
                 // transcript identity so both paths produce the same rows.
-                let transcript_identity = driver
+                // A peer message keeps the reply capability its follow-up
+                // turn would carry, so `reply_to_peer` can answer it in the
+                // run it joins.
+                let persisted_input = driver
                     .as_driver()
                     .input_state(input_id)
-                    .and_then(|state| state.persisted_input.as_ref())
-                    .map(|input| {
-                        crate::runtime_loop::for_input(input, semantics).transcript_identity
-                    });
+                    .and_then(|state| state.persisted_input.as_ref());
+                let transcript_identity = persisted_input.map(|input| {
+                    crate::runtime_loop::for_input(input, semantics).transcript_identity
+                });
+                let reply_capabilities = persisted_input
+                    .and_then(crate::input::peer_reply_capability)
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 let appends = meerkat_core::DurableTurnBoundaryAppends::try_new(
                     input_id.clone(),
                     crate::input::projection_durable_boundary_appends(&projection),
                     transcript_identity,
-                );
+                )
+                .map(|appends| appends.with_peer_reply_capabilities(reply_capabilities));
                 match appends {
                     Ok(appends) => (run_id, LiveBoundaryDeliveryPlan::Durable(appends)),
                     Err(error) => {

@@ -310,6 +310,9 @@ impl HookObservation {
                 peer,
                 request_id,
                 sender_taint,
+                // Hooks observe the typed ingestion facts; the delivery id is
+                // the reply selector, which the transcript row carries.
+                delivery_id: _,
             } => Some(Self::PeerIngressCommitted(HookPeerIngressCommitted {
                 kind: kind.clone(),
                 peer: peer.clone(),
@@ -2665,6 +2668,7 @@ mod tests {
             }),
             request_id: Some("request-1".to_string()),
             sender_taint: Some(crate::comms::SenderContentTaint::Tainted),
+            delivery_id: None,
         };
         assert!(matches!(
             HookObservation::from_committed_agent_event(&peer_event),

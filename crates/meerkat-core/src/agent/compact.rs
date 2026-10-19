@@ -1993,6 +1993,7 @@ mod tests {
                     media_type: "image/png".to_string(),
                     data: ImageData::Inline { data: huge_base64 },
                 }],
+                delivery_id: None,
             },
         ))];
 

@@ -126,6 +126,11 @@ pub struct DurableTurnBoundaryAppends {
     /// carry, projected before lowering exactly as the turn-start path does,
     /// so both delivery paths publish the same ingestion events.
     peer_ingested_events: Vec<crate::event::AgentEvent>,
+    /// Reply capabilities of the peer deliveries these appends carry, which
+    /// the runner adds to the running turn's dispatch context when it writes
+    /// the rows, so `reply_to_peer` can answer a delivery that joined
+    /// mid-run exactly as one that started the turn.
+    peer_reply_capabilities: Vec<crate::comms::PeerReplyCapability>,
 }
 
 impl DurableTurnBoundaryAppends {
@@ -198,7 +203,19 @@ impl DurableTurnBoundaryAppends {
             messages,
             model_projection,
             peer_ingested_events,
+            peer_reply_capabilities: Vec::new(),
         })
+    }
+
+    /// Attach the reply capabilities of the peer deliveries these appends
+    /// carry (minted by the runtime from the input, never by the model).
+    #[must_use]
+    pub fn with_peer_reply_capabilities(
+        mut self,
+        capabilities: Vec<crate::comms::PeerReplyCapability>,
+    ) -> Self {
+        self.peer_reply_capabilities = capabilities;
+        self
     }
 
     /// The runtime input these appends belong to.
@@ -227,12 +244,20 @@ impl DurableTurnBoundaryAppends {
         &self.peer_ingested_events
     }
 
+    /// Reply capabilities the runner adds to the running turn when it
+    /// applies these appends.
+    #[must_use]
+    pub fn peer_reply_capabilities(&self) -> &[crate::comms::PeerReplyCapability] {
+        &self.peer_reply_capabilities
+    }
+
     pub(crate) fn into_parts(self) -> DurableTurnBoundaryAppendParts {
         DurableTurnBoundaryAppendParts {
             input_id: self.input_id,
             messages: self.messages,
             model_projection: self.model_projection,
             peer_ingested_events: self.peer_ingested_events,
+            peer_reply_capabilities: self.peer_reply_capabilities,
         }
     }
 }
@@ -243,6 +268,7 @@ pub(crate) struct DurableTurnBoundaryAppendParts {
     pub(crate) messages: Vec<Message>,
     pub(crate) model_projection: ContentInput,
     pub(crate) peer_ingested_events: Vec<crate::event::AgentEvent>,
+    pub(crate) peer_reply_capabilities: Vec<crate::comms::PeerReplyCapability>,
 }
 
 /// What became of one durable boundary delivery, as observed by the runtime
@@ -539,6 +565,7 @@ mod tests {
                     content: vec![crate::types::ContentBlock::Text {
                         text: "hello".to_string(),
                     }],
+                    delivery_id: None,
                 }],
             },
             identity: None,

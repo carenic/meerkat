@@ -772,6 +772,7 @@ export interface StructuredProviderExtension {
 
 export type SystemNoticeBlock = {
   content?: ContentBlock[];
+  delivery_id?: InteractionId | null;
   direction: SystemNoticeDirection;
   intent?: string | null;
   kind: CommsNoticeKind;
@@ -1308,6 +1309,7 @@ export interface ProviderCacheBreakpointsDiscardedEvent {
 }
 
 export interface PeerContentIngestedEvent {
+  delivery_id?: InteractionId | null;
   kind: CommsNoticeKind;
   peer?: SystemNoticePeer | null;
   request_id?: string | null;

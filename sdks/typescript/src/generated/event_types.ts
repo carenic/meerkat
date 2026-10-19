@@ -21,6 +21,7 @@ import type {
   DeferredCatalogDelta,
   ExternalToolDeltaPhase,
   GeminiImageMetadata,
+  InteractionId,
   InterruptedInputKind,
   InterruptedToolRunDisposition,
   LiveBridgeEffectKind,
@@ -566,11 +567,6 @@ export type InteractionFailureReason = {
   last_output: string;
   reason: string;
 };
-
-/**
- * Unique identifier for an interaction.
- */
-export type InteractionId = string;
 
 /**
  * Typed cause of a committed live channel close.
@@ -1506,6 +1502,7 @@ export type AgentEvent = {
   session_id: SessionId;
   type: "provider_cache_breakpoints_discarded";
 } | {
+  delivery_id?: InteractionId | null;
   kind: CommsNoticeKind;
   peer?: SystemNoticePeer | null;
   request_id?: string | null;

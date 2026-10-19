@@ -128,9 +128,40 @@ them.
   during one boundary reached the next model request; now one durable steer
   joins per boundary, and the later ones land at later boundaries of the run
   or in the follow-up turn.
+- `meerkat-core`: `SystemNoticeBlock::Comms` and
+  `AgentEvent::PeerContentIngested` gain the field
+  `delivery_id: Option<InteractionId>`: the delivery id of an incoming peer
+  message, which `reply_to_peer` takes as `reply_to` (see Fixed). Struct
+  literals and exhaustive patterns of either variant name it. On the wire it
+  is optional (`delivery_id` on the notice block and on
+  `peer_content_ingested`) and omitted when absent.
+- Behaviour (no type change): the text the model reads for an incoming peer
+  message notice now carries a `Delivery ID: <id>` line after its payload.
+- Compatibility (not measured by the gate): the transcript content digest
+  erases a comms notice's `delivery_id`, as it erases a notice's runtime
+  origin, so a row's revision is the same with or without the field. A 0.9.3
+  reader, which drops the key when it decodes the row, computes the revision
+  0.9.4 stored and loads the session. One residual: an append retried after a
+  crash over rows already stored compares the re-serialized rows byte for
+  byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote would refuse
+  the retry; the stored input state 7 entry above already keeps 0.9.3 off a
+  runtime store that 0.9.4 wrote.
 
 ### Added
 
+- `meerkat-core`: `ToolDispatchContext::peer_reply_deliveries` returns the
+  running turn's reply capabilities as one typed list (the deliveries that
+  started the turn and those that joined it at a model boundary, one per
+  sender and delivery id), or `PeerReplyContextError::Malformed` when the
+  turn-start list does not parse. `PeerReplyDispatchContext::insert_delivery`
+  adds a delivery unless the same sender's delivery with that id is listed.
+  `DurableTurnBoundaryAppends::with_peer_reply_capabilities` and
+  `peer_reply_capabilities` carry a durable in-turn delivery's reply
+  capabilities to the runner.
+- `meerkat-comms`: `ReplySelectionError` (`#[non_exhaustive]`), the typed
+  refusals of reply selection (`NoReplyCapability`, `InvalidReplyContext`,
+  `UnknownReplyTo`, `AmbiguousReply`); `reply_to_peer` reports each with its
+  stable code prefix.
 - `LocalGrantAuthority::resolve_lineage_observed`,
   `resolve_controller_lineage_observed` and
   `resolve_lineage_ceiling_observed` resolve a lineage for a caller inside
@@ -259,6 +290,16 @@ them.
   (see Breaking): one transcript row, committed with the run, recovered by
   exactly one follow-up turn when its image is discarded or the process stops
   mid-run. Pre-existing in 0.9.2 and 0.9.3.
+- `reply_to_peer` can answer a peer message that joined the running turn
+  (`meerkat-core`, `meerkat-runtime`, `meerkat-comms`). The turn's reply
+  capabilities came only from the deliveries that started it, so a message
+  delivered into the running turn was refused with `no_reply_capability`, or
+  with `unknown_reply_to` for its id. The durable in-turn delivery now adds
+  the message's reply capability to the running turn, and the message's
+  notice shows the `Delivery ID` that `reply_to` takes. When the selected id
+  matches deliveries of two different senders in one turn, the tool refuses
+  with `ambiguous_reply`, names each sender and sends nothing; before, it
+  answered the first. Pre-existing in 0.9.3.
 
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its

@@ -13196,6 +13196,7 @@ mod tests {
                 summary: None,
                 payload: None,
                 content: Vec::new(),
+                delivery_id: None,
             }],
         }
     }

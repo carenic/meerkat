@@ -267,14 +267,19 @@ pub(crate) fn merge_batch_turn_metadata(
         metadata.request_reasoning_disposition = request_reasoning.finish();
     }
     // Batch-level peer-reply capability mint: every peer *message* delivery
-    // in the admitted batch contributes one typed reply capability. Minted
-    // AFTER the per-input fold so the scalar overlay merge above never sees a
-    // runtime-minted overlay (which would spuriously conflict across inputs).
-    let deliveries = inputs
+    // in the admitted batch contributes one typed reply capability, keyed by
+    // (sender, delivery id) so two senders that chose the same id each keep
+    // their own. Minted AFTER the per-input fold so the scalar overlay merge
+    // above never sees a runtime-minted overlay (which would spuriously
+    // conflict across inputs).
+    let mut deliveries = meerkat_core::comms::PeerReplyDispatchContext::default();
+    for capability in inputs
         .iter()
         .filter_map(|(_, input)| crate::input::peer_reply_capability(input))
-        .collect::<Vec<_>>();
-    if !deliveries.is_empty() {
+    {
+        deliveries.insert_delivery(capability);
+    }
+    if !deliveries.deliveries.is_empty() {
         // `for_input` stamps `execution_kind` on every input, so a non-empty
         // batch always folded into `Some`; a missing accumulator here is a
         // logic error and fails closed with a typed error.
@@ -445,11 +450,10 @@ impl TranscriptIdentityConsensus {
 /// NOT a second `RuntimeTurnMetadata` construction site.
 fn attach_peer_reply_capabilities(
     metadata: &mut meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata,
-    deliveries: Vec<meerkat_core::comms::PeerReplyCapability>,
+    context: meerkat_core::comms::PeerReplyDispatchContext,
 ) -> Result<(), meerkat_core::lifecycle::run_primitive::TurnMetadataMergeConflict> {
     use meerkat_core::lifecycle::run_primitive::TurnMetadataMergeConflict;
 
-    let context = meerkat_core::comms::PeerReplyDispatchContext { deliveries };
     let value = serde_json::to_value(&context).map_err(|error| {
         tracing::error!(
             error = %error,
@@ -9857,6 +9861,7 @@ mod tests {
                     summary: Some("Peer message".to_string()),
                     payload: None,
                     content: Vec::new(),
+                    delivery_id: None,
                 }],
             },
             identity: None,
@@ -11056,6 +11061,66 @@ mod tests {
                 ),
             ],
             "deliveries must preserve batch delivery order"
+        );
+    }
+
+    /// Reply capabilities are keyed by (sender, delivery id): two senders that
+    /// chose the same id each keep their own capability, so `reply_to_peer`
+    /// answers ambiguous instead of routing to whichever came first, and one
+    /// sender's repeated id collapses to one.
+    #[test]
+    fn peer_message_batch_keys_reply_capabilities_by_sender_and_id() {
+        let first_peer = uuid::Uuid::from_u128(0xB1);
+        let second_peer = uuid::Uuid::from_u128(0xB2);
+        let shared_id = uuid::Uuid::from_u128(9);
+        let message = |peer: uuid::Uuid, body: &str| {
+            let mut input = make_peer_message(&peer.to_string(), body);
+            if let Input::Peer(peer) = &mut input {
+                peer.header.correlation_id = Some(crate::CorrelationId::from_uuid(shared_id));
+            }
+            input
+        };
+        let inputs = vec![
+            (InputId::new(), message(first_peer, "from the first sender")),
+            (
+                InputId::new(),
+                message(second_peer, "same id, second sender"),
+            ),
+            (
+                InputId::new(),
+                message(first_peer, "same id, first sender again"),
+            ),
+        ];
+        let semantics = inputs
+            .iter()
+            .map(|(_, input)| admission_semantics(input))
+            .collect::<Vec<_>>();
+
+        let metadata = merge_batch_turn_metadata(&inputs, &semantics)
+            .expect("peer message batch must merge")
+            .expect("peer message batch carries metadata");
+
+        let overlay = metadata
+            .turn_tool_overlay
+            .expect("peer message batch must mint a reply-capability overlay");
+        let context = reply_context_from_overlay(&overlay);
+        assert_eq!(
+            context
+                .deliveries
+                .iter()
+                .map(|capability| (capability.peer_id, capability.in_reply_to))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    meerkat_core::comms::PeerId::from_uuid(first_peer),
+                    InteractionId(shared_id)
+                ),
+                (
+                    meerkat_core::comms::PeerId::from_uuid(second_peer),
+                    InteractionId(shared_id)
+                ),
+            ],
+            "each sender keeps its own capability for a shared id, once"
         );
     }
 
