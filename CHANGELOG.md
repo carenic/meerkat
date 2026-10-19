@@ -74,7 +74,7 @@ them.
   entry and again at its body entry, each with its own deadline and free
   rebuilds, inside the tool's timeout; the review check point runs on the
   decision prepared after the wait, so a reviewed tool whose decision changed
-  meanwhile still refuses as a changed context and no review is reused. The
+  meanwhile is reviewed once more (see below) and no review is reused. The
   `web_search` tool's helper model request asks again under the same
   delegate operation. The debug event names the site (`model_request`,
   `compaction_summary`, `tool_dispatch`, `tool_entry`,
@@ -87,7 +87,8 @@ them.
   and malformed facts stay `Denied`.
 - A model-reviewed (R2) tool call no longer fails with `review_unsatisfied`
   (`context_changed`) when one owner publication change lands during its
-  review or at its verdict's commit. When the operation is still permitted at
+  review, at its verdict's commit, or at the dispatch's own entry staging
+  before the tool's dispatcher runs. When the operation is still permitted at
   R2 with the same review material, the fenced dispatch re-prepares it and
   reviews it once more from the start, as a second review attempt for the
   same `tool_call_id`; the earlier verdict is never used. A review observer
@@ -102,7 +103,11 @@ them.
   out (within the attempt's own review deadline, 2 s at most) instead of
   settling at once as changed authority; past that bound it settles as
   before. The re-review adds no record type: the audit shows a second
-  `ReviewAttemptStarted` after the successor's `Prepared` record.
+  `ReviewAttemptStarted` after the successor's `Prepared` record, and a
+  change at the entry staging also leaves that staging's `Entry` record
+  twice. Per tool call the waits stay bounded: at most 3 wait states (the
+  dispatch's preparation and each review attempt), 9 free rebuilds and 6 s
+  of waiting, inside the tool's timeout.
 
 ## [0.9.3] - 2026-10-18
 

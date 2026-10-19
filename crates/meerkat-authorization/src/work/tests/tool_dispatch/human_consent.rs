@@ -800,6 +800,39 @@ async fn the_fresh_retained_attempt_enters_exactly_once() {
 }
 
 #[tokio::test]
+async fn an_owner_change_before_a_consent_attempt_is_never_reviewed_again() {
+    let w = ConsentWorld::new();
+    let approval_id = w.request("consented").await;
+    w.approve(&approval_id);
+
+    // The decision the human approved goes stale before the attempt's entry
+    // staging: fresh consent is required, and nothing reviews it again.
+    w.work.republish();
+    let refused = w.attempt(&approval_id).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::ContextChanged,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(w.bodies().is_empty(), "zero entry");
+    let notices = w.notices(&approval_id);
+    assert!(!notices.contains(&ConsentNoticeKind::Used), "{notices:?}");
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|kind| **kind == ConsentNoticeKind::Requested)
+            .count(),
+        1,
+        "no second consent request: {notices:?}"
+    );
+}
+
+#[tokio::test]
 async fn copied_references_and_new_equal_calls_never_enter() {
     let w = ConsentWorld::new();
     let approval_id = w.request("consented").await;

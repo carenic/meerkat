@@ -241,6 +241,8 @@ impl OperationReviewer for PausedReviewer {
 struct RecordingObserver {
     observations: Mutex<Vec<ReviewObservation>>,
     arm_on_allowed: Mutex<Option<Arc<AtomicBool>>>,
+    /// Armed by the first `Allowed` only.
+    arm_on_first_allowed: Mutex<Option<Arc<AtomicBool>>>,
     body: Mutex<Option<Arc<RecordingDispatcher>>>,
     bodies_at_used: Mutex<Option<usize>>,
     edit_on_used: Mutex<Option<OwnerEdit>>,
@@ -250,6 +252,11 @@ impl OperationReviewObserver for RecordingObserver {
     fn observe(&self, observation: ReviewObservation) {
         if observation.status == ReviewAttemptStatus::Allowed
             && let Some(arm) = self.arm_on_allowed.lock().expect("arm").as_ref()
+        {
+            arm.store(true, Ordering::SeqCst);
+        }
+        if observation.status == ReviewAttemptStatus::Allowed
+            && let Some(arm) = self.arm_on_first_allowed.lock().expect("arm once").take()
         {
             arm.store(true, Ordering::SeqCst);
         }
@@ -560,6 +567,27 @@ impl PreparedOperationAuthorization for EntryHookDecision {
 fn entry_hook_context(world: &ReviewWorld, work: &ToolWork, edit: bool) -> ToolDispatchContext {
     let armed = Arc::new(AtomicBool::new(false));
     *world.observer.arm_on_allowed.lock().expect("arm") = Some(Arc::clone(&armed));
+    entry_hooked(world, work, armed, edit)
+}
+
+/// [`entry_hook_context`] armed by the first `Allowed` only: one owner edit
+/// lands during the first allowed attempt's entry staging.
+fn entry_hook_context_once(world: &ReviewWorld, work: &ToolWork) -> ToolDispatchContext {
+    let armed = Arc::new(AtomicBool::new(false));
+    *world
+        .observer
+        .arm_on_first_allowed
+        .lock()
+        .expect("arm once") = Some(Arc::clone(&armed));
+    entry_hooked(world, work, armed, true)
+}
+
+fn entry_hooked(
+    world: &ReviewWorld,
+    work: &ToolWork,
+    armed: Arc<AtomicBool>,
+    edit: bool,
+) -> ToolDispatchContext {
     let hooked = WorkAuthorizationContext::new(
         Arc::new(EntryHookWork {
             inner: work.context.authorization().clone(),
@@ -1559,24 +1587,110 @@ async fn owner_edit_during_entry_staging_after_allow_prevents_entry() {
     let controller = async {
         world.reviewer.wait_entered().await;
         world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
     };
     let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
 
-    // The allow was recorded while current; the owner edit is armed only
-    // then and lands during entry staging, so the check with the re-prepared
-    // decision retires it unspent.
+    // Each allow was recorded while current; an owner edit is armed by each
+    // and lands during that attempt's entry staging, so the check with the
+    // re-prepared decision retires it unspent. The dispatch reviews the
+    // superseded operation once more, never a third time.
     assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
     assert!(body_ids(&body).is_empty(), "zero physical body entry");
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
     let statuses = world.observer.statuses();
     assert_eq!(
         statuses,
         vec![
             pending(),
             allowed(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
             retired(ReviewRetirementReason::ContextChanged)
         ]
     );
-    assert!(!statuses.contains(&used()), "the allow was never spent");
+    assert!(!statuses.contains(&used()), "no allow was ever spent");
+}
+
+#[tokio::test]
+async fn an_owner_change_at_the_root_staging_is_reviewed_once_more_and_enters() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    // The first allowed attempt's root staging meets one completed change.
+    let context = entry_hook_context_once(&world, &work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert!(
+        !result
+            .expect("reviewed once more, then entered")
+            .result
+            .is_error
+    );
+    assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+    assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            allowed(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            used()
+        ]
+    );
+    assert_eq!(world.observer.attempts("reviewed").len(), 2);
+}
+
+#[tokio::test]
+async fn one_re_review_covers_both_the_verdict_and_the_root_staging() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    // The first allow is the second attempt's: its root staging meets a
+    // change after the first attempt was superseded during its review.
+    let context = entry_hook_context_once(&world, &work);
+    let reviewed = reviewed_call("reviewed");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        work.republish();
+        world.reviewer.release.notify_one();
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), controller);
+
+    assert_unsatisfied(result, ReviewUnsatisfiedKind::ContextChanged);
+    assert!(body_ids(&body).is_empty(), "zero entry");
+    assert_eq!(
+        world.reviewer.calls.load(Ordering::SeqCst),
+        2,
+        "one re-review per dispatch, whichever site superseded it"
+    );
+    assert_eq!(
+        world.observer.statuses(),
+        vec![
+            pending(),
+            retired(ReviewRetirementReason::ContextChanged),
+            pending(),
+            allowed(),
+            retired(ReviewRetirementReason::ContextChanged)
+        ]
+    );
 }
 
 #[tokio::test]

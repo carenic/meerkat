@@ -1419,17 +1419,22 @@ impl ToolDispatchContext {
 
     /// Non-consuming review check point for the decision entry staging
     /// returned. Ungoverned dispatch has no prepared decision and no tier.
-    fn check_review(&self, entering: &Self) -> Result<(), crate::ToolError> {
+    /// A retained model review that a completed owner publication change
+    /// superseded comes back typed (see [`Self::observe_root_tool_entry`]).
+    fn check_review(
+        &self,
+        entering: &Self,
+    ) -> Result<(), crate::approval::review::ReviewAdmissionRefusal> {
         let Some(check) = entering.prepared_authorization() else {
             return Ok(());
         };
         match self.review_entry.as_ref() {
-            Some(entry) => entry.check(check),
+            Some(entry) => entry.check_superseding(check),
             // A governed decision that did not traverse the common prepared
             // entry has no admitted review and may enter only at R1.
             None => check
                 .require_unreviewed_entry()
-                .map_err(crate::ToolError::from),
+                .map_err(|refusal| crate::ToolError::from(refusal).into()),
         }
     }
 
@@ -1775,6 +1780,38 @@ impl ToolDispatchContext {
         plan: Option<&crate::ResolvedToolExecutionPlan>,
         boundary: crate::authorization::OperationEntryBoundary,
     ) -> Result<Option<Self>, crate::ToolError> {
+        self.stage_tool_entry(call, plan, boundary)
+            .map_err(crate::approval::review::ReviewAdmissionRefusal::into_settled)
+    }
+
+    /// [`Self::observe_tool_entry`] at the fenced dispatch's own root
+    /// staging, before any dispatcher code ran. A retained model review that
+    /// a completed owner publication change superseded comes back typed, for
+    /// the dispatch's one supersession decision, instead of settled; every
+    /// other staging (adapters, the effect leaf) settles it. The entry is
+    /// recorded before the check point sees the supersession, so an
+    /// operation that is reviewed once more records this boundary twice.
+    pub(crate) fn observe_root_tool_entry(
+        &self,
+        call: ToolCallView<'_>,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+    ) -> Result<Option<Self>, crate::approval::review::ReviewAdmissionRefusal> {
+        self.stage_tool_entry(
+            call,
+            plan,
+            crate::authorization::OperationEntryBoundary::ToolDispatch,
+        )
+    }
+
+    /// The one entry staging: record an entry attempt at `boundary`, check
+    /// actual currentness after it, then run the review check point with the
+    /// decision staging returned.
+    fn stage_tool_entry(
+        &self,
+        call: ToolCallView<'_>,
+        plan: Option<&crate::ResolvedToolExecutionPlan>,
+        boundary: crate::authorization::OperationEntryBoundary,
+    ) -> Result<Option<Self>, crate::approval::review::ReviewAdmissionRefusal> {
         let first = self.check_tool_authorization(call, plan)?;
         let current = first.as_ref().unwrap_or(self);
         if let Some(prepared) = current.prepared_authorization() {
@@ -2496,18 +2533,20 @@ async fn prepare_current_after_owner_change(
 /// the decision again. An owner change still in progress on the work's own
 /// publication is waited out (bounded by `churn`) and the entry checked
 /// again. The review check point runs on the decision checked after the
-/// wait, so a reviewed operation whose decision changed meanwhile still
-/// refuses, and no verdict is reused.
+/// wait: a retained model review whose decision changed meanwhile comes back
+/// typed for the dispatch's supersession decision, and no verdict is reused.
 async fn stage_root_entry_after_owner_change(
     context: &ToolDispatchContext,
     call: ToolCallView<'_>,
     plan: &crate::ResolvedToolExecutionPlan,
     churn: &mut crate::authorization::OwnerChangeChurn,
     deadline: DispatchDeadline,
-) -> Result<Option<ToolDispatchContext>, crate::ToolError> {
+) -> Result<Option<ToolDispatchContext>, crate::approval::review::ReviewAdmissionRefusal> {
     loop {
-        let result = context.observe_tool_entry(call, Some(plan));
-        if let Err(crate::ToolError::AuthorizationRefused { refusal, .. }) = &result
+        let result = context.observe_root_tool_entry(call, Some(plan));
+        if let Err(crate::approval::review::ReviewAdmissionRefusal::Settled(
+            crate::ToolError::AuthorizationRefused { refusal, .. },
+        )) = &result
             && refusal.kind() == crate::authorization::OperationRefusalKind::ReprepareRequired
             && let Some(work) = context.work_authorization()
             && let Some(wait) = churn
@@ -2533,13 +2572,15 @@ async fn stage_root_entry_after_owner_change(
 /// memory plan without a target of its owner's kind is refused first (see
 /// [`ToolDispatchContext::require_authorized_operation_target`]).
 ///
-/// The prepared entry and the root staging entry each wait out an owner
-/// change in progress on the work's own publication with their own
-/// [`crate::authorization::OwnerChangeChurn`], inside the plan's tool timeout:
-/// per dispatch at most 2 such values, 6 free rebuilds and 4 s of waits. Both
-/// ask the dispatch context's work authorization, the run's own, which reports
-/// such a change through every wrapper; an exact-control work reports none,
-/// so its refusal takes the ordinary path.
+/// The prepared entry waits out an owner change in progress on the work's
+/// own publication with its own [`crate::authorization::OwnerChangeChurn`];
+/// each review attempt (one, or two when a superseded model review is
+/// reviewed once more) has another, shared by its post-verdict check and its
+/// root staging. All are inside the plan's tool timeout: per dispatch at most
+/// 3 such values, 9 free rebuilds and 6 s of waits. Each asks the dispatch
+/// context's work authorization, the run's own, which reports such a change
+/// through every wrapper; an exact-control work reports none, so its refusal
+/// takes the ordinary path.
 pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
@@ -2551,7 +2592,7 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
     // Retain one binding with the actual resolved call. Its generation is
     // checked here after the dispatch queue, and again by adapters after any
     // further preparation waits, such as application consequence policy.
-    let governed_context = if let Some(work) = context.work_authorization() {
+    let governed = if let Some(work) = context.work_authorization() {
         require_owner_target_for_targeted_sources(dispatcher.as_ref(), call, plan)?;
         let binding = crate::authorization::PreparedAuthorizationBinding::new(
             crate::authorization::OperationAuthorizationFacts {
@@ -2578,71 +2619,89 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
             deadline,
         )
         .await?;
-        // Review admission at the common prepared entry: the owner tier is
-        // enforced here for every dispatcher, wrapper or not. An allow is
-        // retained for the effect leaf; nothing is spent here.
-        // A model review that a completed owner publication change superseded
-        // before any dispatcher code ran is admitted again at most once, for
-        // the current decision; `ReviewSupersession::readmit` alone decides.
-        let mut prepared = prepared;
-        let mut supersession = crate::approval::review::ReviewSupersession::new();
-        let mut material = None;
-        let review_entry = loop {
-            let (review_call, _) = prepared.tool_dispatch_parts().ok_or_else(|| {
-                crate::ToolError::AuthorizationRefused {
-                    refusal: crate::authorization::OperationRefused::new(
-                        crate::authorization::OperationRefusalKind::MalformedFacts,
-                    ),
-                }
-            })?;
-            // Each review attempt has its own owner-change wait state.
-            let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
-            let admitted = crate::approval::review::admit_operation_review_attempt(
-                context.operation_review(),
-                dispatcher.review_entry_support(call.name),
-                review_call,
-                &prepared,
-                work,
-                material.take(),
-                &mut owner_change_churn,
-            )
-            .await;
-            match admitted {
-                Ok(entry) => break entry,
-                Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
-                    return Err(error);
-                }
-                Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(superseded)) => {
-                    let readmission = supersession.readmit(
-                        context.operation_review(),
-                        *superseded,
-                        deadline.remaining(),
-                    )?;
-                    prepared = readmission.successor;
-                    material = Some(readmission.material);
-                }
-            }
-        };
-        Some(
-            context
-                .clone()
-                .with_prepared_authorization(prepared)
-                .with_review_entry(review_entry),
-        )
+        Some((work, prepared))
     } else {
         None
     };
-    let context = governed_context.as_ref().unwrap_or(context);
-    let mut staging_churn = crate::authorization::OwnerChangeChurn::new();
-    dispatch_admitted_plan(
-        dispatcher,
-        call,
-        context,
-        plan,
-        &mut staging_churn,
-        deadline,
-    )
-    .await
+    let Some((work, mut prepared)) = governed else {
+        // Ungoverned work retains no review: nothing can be superseded.
+        let mut staging_churn = crate::authorization::OwnerChangeChurn::new();
+        return dispatch_admitted_plan(
+            dispatcher,
+            call,
+            context,
+            plan,
+            &mut staging_churn,
+            deadline,
+        )
+        .await
+        .settled();
+    };
+    // Review admission at the common prepared entry: the owner tier is
+    // enforced here for every dispatcher, wrapper or not. An allow is
+    // retained for the effect leaf; nothing is spent here.
+    // A model review that a completed owner publication change superseded
+    // before any dispatcher code ran (after its verdict, at its commit, or at
+    // this dispatch's own root staging) is admitted again at most once, for
+    // the current decision; `ReviewSupersession::readmit` alone decides.
+    let mut supersession = crate::approval::review::ReviewSupersession::new();
+    let mut material = None;
+    loop {
+        let (review_call, _) = prepared.tool_dispatch_parts().ok_or_else(|| {
+            crate::ToolError::AuthorizationRefused {
+                refusal: crate::authorization::OperationRefused::new(
+                    crate::authorization::OperationRefusalKind::MalformedFacts,
+                ),
+            }
+        })?;
+        // Each review attempt has its own owner-change wait state, shared by
+        // its post-verdict check and its root staging.
+        let mut attempt_churn = crate::authorization::OwnerChangeChurn::new();
+        let admitted = crate::approval::review::admit_operation_review_attempt(
+            context.operation_review(),
+            dispatcher.review_entry_support(call.name),
+            review_call,
+            &prepared,
+            work,
+            material.take(),
+            &mut attempt_churn,
+        )
+        .await;
+        let superseded = match admitted {
+            Ok(review_entry) => {
+                let governed = context
+                    .clone()
+                    .with_prepared_authorization(prepared.clone())
+                    .with_review_entry(review_entry);
+                match dispatch_admitted_plan(
+                    dispatcher,
+                    call,
+                    &governed,
+                    plan,
+                    &mut attempt_churn,
+                    deadline,
+                )
+                .await
+                {
+                    Admitted::Dispatched(result) => return result,
+                    Admitted::Superseded(superseded) => superseded,
+                }
+            }
+            Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
+                return Err(error);
+            }
+            Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(superseded)) => {
+                superseded
+            }
+        };
+        let readmission = supersession.readmit(
+            context.operation_review(),
+            *superseded,
+            deadline.remaining(),
+        )?;
+        prepared = readmission.successor;
+        material = Some(readmission.material);
+    }
 }
 
 /// Fresh explicit attempt of one retained R3 candidate after an
@@ -2693,6 +2752,8 @@ pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized +
     // attempt runs under the same effective timeout that call had.
     let deadline = DispatchDeadline::start(plan);
     let mut staging_churn = crate::authorization::OwnerChangeChurn::new();
+    // A consent entry is never superseded (its check point only settles), so
+    // nothing here is reviewed again.
     let Some(timeout) = plan.effective_timeout() else {
         return dispatch_admitted_plan(
             dispatcher,
@@ -2702,7 +2763,8 @@ pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized +
             &mut staging_churn,
             deadline,
         )
-        .await;
+        .await
+        .settled();
     };
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     match tokio::time::timeout(
@@ -2718,14 +2780,36 @@ pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized +
     )
     .await
     {
-        Ok(result) => result,
+        Ok(admitted) => admitted.settled(),
         Err(_) => Err(crate::error::ToolError::timeout(call.name, timeout_ms)),
+    }
+}
+
+/// How the common tail of one admitted fenced dispatch ended.
+enum Admitted {
+    /// Dispatched, or settled before or after its dispatcher ran.
+    Dispatched(Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>),
+    /// Its root staging found the retained model review superseded by a
+    /// completed owner publication change, before any dispatcher code ran.
+    Superseded(Box<crate::approval::review::SupersededReview>),
+}
+
+impl Admitted {
+    /// The result where no supersession decision follows: a superseded
+    /// review settles with its own settlement.
+    fn settled(self) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+        match self {
+            Self::Dispatched(result) => result,
+            Self::Superseded(superseded) => Err(superseded.into_settled()),
+        }
     }
 }
 
 /// The common tail of a fenced dispatch whose review admission is settled:
 /// entry staging and the check point, the body, the outcome observation, and
-/// the dispatch-lifetime review guard.
+/// the dispatch-lifetime review guard. A retained model review superseded at
+/// the root staging ends it before any dispatcher code ran
+/// ([`Admitted::Superseded`]).
 async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
@@ -2733,7 +2817,7 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
     plan: &crate::ResolvedToolExecutionPlan,
     staging_churn: &mut crate::authorization::OwnerChangeChurn,
     deadline: DispatchDeadline,
-) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+) -> Admitted {
     // The guard lives exactly as long as this dispatch. Dropping it here
     // (cancellation, enclosing tool timeout) abandons a retained review and
     // closes every clone a worker or transport may still hold.
@@ -2766,8 +2850,17 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
             (call, plan)
         };
         let entry_context =
-            stage_root_entry_after_owner_change(context, call, plan, staging_churn, deadline)
-                .await?;
+            match stage_root_entry_after_owner_change(context, call, plan, staging_churn, deadline)
+                .await
+            {
+                Ok(entry_context) => entry_context,
+                Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
+                    return Err(error);
+                }
+                Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(superseded)) => {
+                    return Ok(Admitted::Superseded(superseded));
+                }
+            };
         let context = entry_context.as_ref().unwrap_or(context);
         let result = match plan.kind() {
             crate::ResolvedExecutionKind::Streaming(policy) => {
@@ -2796,16 +2889,20 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
                     .await
             }
         };
-        context.observe_tool_outcome(dispatcher.live_bridge_effect_kind(call.name), result)
+        Ok(Admitted::Dispatched(context.observe_tool_outcome(
+            dispatcher.live_bridge_effect_kind(call.name),
+            result,
+        )))
     }
     .await;
-    // After the dispatcher returned: a retained allow the leaf never spent
-    // (a failure before entry) is released unspent, every clone is closed,
-    // and the deferred `Used` projection is delivered only now.
+    // After the dispatcher returned (or the root staging found the retained
+    // review superseded): a retained allow the leaf never spent is released
+    // unspent, every clone is closed, and the deferred `Used` projection is
+    // delivered only now.
     if let Some(guard) = review_guard {
         guard.complete();
     }
-    outcome
+    outcome.unwrap_or_else(|error| Admitted::Dispatched(Err(error)))
 }
 
 /// Compute whether the current exact catalog should stay inline or switch to deferred mode.
@@ -6190,8 +6287,9 @@ mod governed_operation_tests {
 
     /// The reviewed tool the body-entry check refused for a change that
     /// began after its review: the wait ends with a decision prepared from
-    /// current owners, the review check point refuses it as a changed
-    /// context, and the earlier allow is never reused for it.
+    /// current owners, the review check point finds the reviewed one
+    /// superseded, and the dispatch reviews the current decision once more
+    /// (with the same material) instead of reusing the earlier allow.
     #[tokio::test(start_paused = true)]
     async fn a_waited_body_entry_never_reuses_an_earlier_review() {
         struct CountingAllow(std::sync::atomic::AtomicUsize);
@@ -6243,18 +6341,19 @@ mod governed_operation_tests {
             ),
         )));
         let dispatcher = Arc::new(Reviewed(SourceKindDispatcher::default()));
-        let refused = fenced(&dispatcher, "read_file", &context).await;
-        assert!(
-            matches!(
-                refused,
-                Err(crate::ToolError::ReviewUnsatisfied {
-                    kind: crate::approval::review::ReviewUnsatisfiedKind::ContextChanged,
-                    ..
-                })
-            ),
-            "{refused:?}"
+        let outcome = fenced(&dispatcher, "read_file", &context)
+            .await
+            .expect("the current decision is reviewed once more, then entered");
+        assert!(!outcome.result.is_error);
+        assert_eq!(
+            reviewer.0.load(Ordering::SeqCst),
+            2,
+            "reviewed again, never by reusing the first allow"
         );
-        assert_eq!(reviewer.0.load(Ordering::SeqCst), 1, "reviewed once");
-        assert_eq!(dispatcher.0.0.load(Ordering::SeqCst), 0, "no body ran");
+        assert_eq!(
+            dispatcher.0.0.load(Ordering::SeqCst),
+            1,
+            "the body ran once"
+        );
     }
 }

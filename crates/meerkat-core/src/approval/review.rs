@@ -810,12 +810,18 @@ impl ReviewAdmissionRefusal {
     }
 
     /// The settlement that stands when nothing is admitted again.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn into_settled(self) -> crate::ToolError {
         match self {
             Self::Settled(error) => error,
-            Self::Superseded(superseded) => superseded.settled,
+            Self::Superseded(superseded) => superseded.into_settled(),
         }
+    }
+}
+
+impl SupersededReview {
+    /// The retired attempt's own settlement, when nothing is admitted again.
+    pub(crate) fn into_settled(self) -> crate::ToolError {
+        self.settled
     }
 }
 
@@ -945,13 +951,9 @@ async fn current_decision(
                 .wait_for_settled_change(work.authorization().as_ref(), Some(retained.remaining()))
                 .await
         {
-            tracing::debug!(
-                target: "meerkat::authz::owner_change_wait",
-                site = "review_currentness",
-                operation_id = %prepared.binding().facts().operation_id,
-                waited_ms = u64::try_from(wait.waited().as_millis()).unwrap_or(u64::MAX),
-                settled = wait.settled(),
-                "operation waited for an owner change"
+            wait.trace(
+                "review_currentness",
+                Some(&prepared.binding().facts().operation_id),
             );
             if wait.settled() {
                 continue;
@@ -972,7 +974,9 @@ async fn current_decision(
 /// A decision that a completed owner publication change superseded during
 /// the review, or at the verdict's commit, retires the attempt and comes back
 /// typed ([`ReviewAdmissionRefusal::Superseded`]) with its current successor,
-/// for the fenced dispatch's [`ReviewSupersession`]. An owner change still in
+/// for the fenced dispatch's [`ReviewSupersession`] (as does the retained
+/// allow's check point at that dispatch's own root staging; see
+/// [`ReviewEntry::check_superseding`]). An owner change still in
 /// progress on the work's own publication is first waited out through
 /// `churn`, this attempt's own wait state, within the attempt's own deadline.
 /// `successor_material` is the owner material a re-admitted successor was
@@ -1060,6 +1064,7 @@ pub(crate) async fn admit_operation_review_attempt(
         admitted: prepared.clone(),
         deadline,
         tool_call_id,
+        material: operation_context.clone(),
     };
 
     // Stage the candidate-to-attempt join in the existing protected input
@@ -1453,9 +1458,23 @@ impl ReviewEntry {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// Test adapter: the check point's settled projection.
+    #[cfg(test)]
+    pub(crate) fn check(&self, entering: &PreparedOperationCheck) -> Result<(), crate::ToolError> {
+        self.check_superseding(entering)
+            .map_err(ReviewAdmissionRefusal::into_settled)
+    }
+
     /// Non-consuming, repeatable check point, run by every entry staging after
     /// its final authorization check with the decision that staging returned.
-    pub(crate) fn check(&self, entering: &PreparedOperationCheck) -> Result<(), crate::ToolError> {
+    /// A retained model review whose decision a completed owner publication
+    /// change superseded (the entering decision is the canonical re-prepare
+    /// of the same binding) is retired and comes back typed; only the fenced
+    /// dispatch's own root staging acts on that, every other staging settles.
+    pub(crate) fn check_superseding(
+        &self,
+        entering: &PreparedOperationCheck,
+    ) -> Result<(), ReviewAdmissionRefusal> {
         let (result, pending, review) = {
             let mut inner = self.0.lock();
             let review = inner.review.clone();
@@ -1646,7 +1665,7 @@ impl Drop for ReviewDispatchGuard {
 
 type Transition = (
     ReviewEntryState,
-    Result<(), crate::ToolError>,
+    Result<(), ReviewAdmissionRefusal>,
     PendingObservations,
 );
 
@@ -1661,14 +1680,14 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
         // The consented decision is no longer the entering one: fresh consent.
         (_, Consent(consent)) => {
             let (error, pending) = consent.retire_changed();
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R3, Retained(mut retained)) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         // Terminal states keep their disposition for every tier, before the
         // R3 catch-all: a spent clone stays spent (its spend refuses as
@@ -1676,29 +1695,39 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
         (_, Consumed) => (Consumed, Ok(()), PendingObservations::default()),
         (_, Settled) => (
             Settled,
-            Err(unavailable(ReviewUnavailableKind::DispatchEnded)),
+            Err(unavailable(ReviewUnavailableKind::DispatchEnded).into()),
             PendingObservations::default(),
         ),
         (OperationReviewTier::R3, _) => (
             Settled,
-            Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired)),
+            Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired).into()),
             PendingObservations::default(),
         ),
         // A decision re-prepared after review (or a changed tier, which only
-        // a re-prepared decision can carry) means the reviewed context changed.
+        // a re-prepared decision can carry) means the reviewed context
+        // changed. The entering decision is the staging's canonical re-prepare
+        // of the same binding: it is handed back as the successor, and the
+        // supersession decision alone says whether it is reviewed once more.
         (_, Retained(mut retained)) if !entering.same_check(&retained.admitted) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
             );
-            (Settled, Err(error), pending)
+            let superseded = ReviewAdmissionRefusal::superseded(
+                error,
+                entering.clone(),
+                &retained.admitted,
+                SupersededOutcome::Allowed,
+                retained.material.clone(),
+            );
+            (Settled, Err(superseded), pending)
         }
         (OperationReviewTier::R2, Retained(mut retained)) if retained.expired() => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::DeadlineExpired,
                 unavailable(ReviewUnavailableKind::DeadlineExpired),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R2, Retained(retained)) => {
             (Retained(retained), Ok(()), PendingObservations::default())
@@ -1711,11 +1740,11 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
                 ReviewRetirementReason::ContextChanged,
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
             );
-            (Settled, Err(error), pending)
+            (Settled, Err(error.into()), pending)
         }
         (OperationReviewTier::R2, NotRequired) => (
             Settled,
-            Err(unsatisfied(ReviewUnsatisfiedKind::ContextChanged)),
+            Err(unsatisfied(ReviewUnsatisfiedKind::ContextChanged).into()),
             PendingObservations::default(),
         ),
     }
@@ -1842,6 +1871,8 @@ pub(crate) struct RetainedReview {
     admitted: PreparedOperationCheck,
     deadline: tokio::time::Instant,
     tool_call_id: Arc<str>,
+    /// The owner material this attempt's reviewer was shown.
+    material: ReviewOperationContextResolution,
 }
 
 impl RetainedReview {

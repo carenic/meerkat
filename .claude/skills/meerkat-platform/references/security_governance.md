@@ -198,10 +198,11 @@ max_output_tokens = 1024
   supply it settles the call as `review_unavailable` (`context_unavailable`)
   before any review; material that changes makes a retained allow stale
   (`review_unsatisfied`, `context_changed`) and a fresh attempt is reviewed
-  again. When only the owner's publication moved during an R2 review (same
-  permission, tier and material), the dispatch itself reviews the call once
-  more as a second attempt for the same call (0.9.4), so a review observer's
-  `context_changed` retirement is not always the call's outcome. Rust owners
+  again. When only the owner's publication moved during an R2 review or
+  before the tool started (same permission, tier and material), the dispatch
+  itself reviews the call once more as a second attempt for the same call
+  (0.9.4), so a review observer's `context_changed` retirement is not always
+  the call's outcome. Rust owners
   answer through `WorkAuthorization::review_operation_context`
   (`LocalWorkPolicy::review_context`, `AdmittedWorkPolicyOwner::review_mandate`,
   `OperationPolicyOwner::review_action_account`); every default fails closed.
