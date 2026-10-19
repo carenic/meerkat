@@ -8570,25 +8570,30 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
 /// after the reader's last read (#549b).
 ///
 /// - It bounds how long a quiet reader delays maintenance. The maintenance
-///   fence waits for kept connections to close, and a reader that has read
-///   nothing for this long closes, so a fence deadline longer than this plus
-///   one read always gets the database (`rkat storage migrate` waits 10 s by
-///   default).
+///   fence waits for kept connections to close. An owner closes its reader's
+///   connection when the reader has read nothing for this long, and before a
+///   pass delivers, since deliveries call into the host, which can wait. What
+///   else an owner does with the connection open is store operations, which
+///   the fence refuses, and registry lookups, so a fence deadline longer than
+///   this plus one store tick always gets the database (`rkat storage migrate`
+///   waits 10 s by default).
 /// - It bounds what a quiet store holds open. An armed delivery owner keeps
 ///   at most one reader, so each runtime delivery inbox holds at most one
-///   connection (descriptors for the database, its WAL and shared memory, and
-///   the connection's page cache), and none once its store has been quiet
-///   this long.
-/// - The store watch sweeps a shared store every 5 s when no notification
-///   arrives, so a quiet store pays one verified open per sweep instead of one
-///   per read.
+///   connection (descriptors for the database, its WAL, shared memory and
+///   presence lock files, and the connection's page cache), and none once its
+///   store has been quiet this long.
+/// - The store watch ticks a busy shared store up to every 10 ms, and those
+///   reads share the one kept connection. A quiet store's watch sweeps every
+///   5 s, longer than this bound, so its reader closes between sweeps and
+///   each sweep opens it again, as every read did before.
 pub const KEPT_DELIVERY_READER_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A delivery owner's reader of its store's durable delivery generation
 /// ([`RuntimeStore::delivery_generation_reader`]).
 ///
 /// A reader may keep a connection open between reads; its owner releases it
-/// once the store has been quiet for [`KEPT_DELIVERY_READER_IDLE`].
+/// once the store has been quiet for [`KEPT_DELIVERY_READER_IDLE`], and before
+/// it delivers.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait DeliveryGenerationReader: Send {

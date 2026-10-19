@@ -287,11 +287,12 @@ them.
   read; under the guard it checks that the path still names the file it
   opened and that the schema and the delivery domain's ledger row are
   unchanged, and opens again, verified, when they are not. The maintenance
-  fence takes the presence lock after its fence lock, so the reader closes
-  at its next read, which the fence refuses, or after
-  `KEPT_DELIVERY_READER_IDLE` (1 second) without one, well inside `rkat
-  storage migrate`'s default 10-second fence wait. Windows keeps the
-  fresh-open read path because no CI lane runs the kept reader on Windows.
+  fence takes the presence lock after its fence lock, and the reader closes
+  before its owner delivers anything, at its next read, which the fence
+  refuses, or after `KEPT_DELIVERY_READER_IDLE` (1 second) without a read,
+  so maintenance gets the database well inside `rkat storage migrate`'s
+  default 10-second fence wait. Windows keeps the fresh-open read path
+  because no CI lane runs the kept reader on Windows.
   Maintenance from an older binary takes only the fence lock and does not
   wait for a kept connection: run maintenance with the same release as the
   hosts.

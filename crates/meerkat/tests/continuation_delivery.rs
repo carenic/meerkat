@@ -3007,6 +3007,123 @@ mod hosting {
         drop(released);
         drop(handle);
     }
+
+    /// Holds each admission until the test opens the gate, and says when it
+    /// holds one.
+    struct GatedSink {
+        inner: Arc<ObservingSink>,
+        held: watch::Sender<bool>,
+        open: watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContinuationDeliverySink for GatedSink {
+        async fn admit(
+            &self,
+            session: &SessionId,
+            input: meerkat_runtime::Input,
+        ) -> Result<InputId, String> {
+            self.held.send_replace(true);
+            let mut open = self.open.clone();
+            if open.wait_for(|open| *open).await.is_err() {
+                return Err("the gate is gone".to_string());
+            }
+            self.inner.admit(session, input).await
+        }
+
+        async fn admitted_input(
+            &self,
+            session: &SessionId,
+            admission_key: &str,
+        ) -> Result<Option<StoredInputState>, String> {
+            self.inner.admitted_input(session, admission_key).await
+        }
+    }
+
+    /// Routes and claims as [`ClaimHost`] does, and admits through a
+    /// [`GatedSink`].
+    struct GatedHost {
+        claims: Arc<ClaimHost>,
+        sink: Arc<GatedSink>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeDeliveryHost for GatedHost {
+        async fn delivery_route(&self, session_id: &SessionId) -> Option<meerkat::DeliveryRoute> {
+            self.claims.delivery_route(session_id).await
+        }
+
+        async fn claim_cold_delivery(
+            &self,
+            session_id: &SessionId,
+        ) -> Option<Result<HostingClaim, HostingRefused>> {
+            self.claims.claim_cold_delivery(session_id).await
+        }
+
+        async fn continuation_sink(
+            &self,
+            _session_id: &SessionId,
+        ) -> Option<Arc<dyn ContinuationDeliverySink>> {
+            Some(self.sink.clone())
+        }
+
+        async fn resolve_address(&self, address: &LogicalRuntimeId) -> AddressResolution {
+            self.claims.resolve_address(address).await
+        }
+    }
+
+    /// #549b: delivering calls into the host, which can wait, so an owner
+    /// closes its kept reader's connection before it delivers, and maintenance
+    /// never waits on a delivery. The arming pass reads the delivery
+    /// generation through the kept reader, then delivers a continuation whose
+    /// admission the test holds: while it is held, the fence gets the
+    /// database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delivering_owner_holds_no_kept_connection_while_the_host_admits() {
+        let (fixture, path, capability) = watched_store();
+        let session = SessionId::new();
+        let owner = ContinuationOwner::Session {
+            session_id: session.clone(),
+        };
+        fixture
+            .continuations
+            .submit(&owner, delivery("task-1", host_producer()), 1)
+            .await
+            .expect("commit");
+
+        let claims = ClaimHost::new(&capability);
+        let (held, mut admission_held) = watch::channel(false);
+        let (gate, open) = watch::channel(false);
+        let sink = Arc::new(GatedSink {
+            inner: claims.sink.clone(),
+            held,
+            open,
+        });
+        let handle = fixture
+            .owner()
+            .with_store_sweep(Duration::from_secs(3600))
+            .arm(Arc::new(GatedHost { claims, sink }))
+            .expect("arm");
+        let mut passes = handle.subscribe_passes();
+
+        tokio::time::timeout(EVENT_GUARD, admission_held.wait_for(|held| *held))
+            .await
+            .expect("the arming pass reaches the admission")
+            .expect("the sink is alive");
+        let fence = meerkat_sqlite::ExclusiveFence::try_acquire(&path).expect("io");
+        assert!(
+            fence.is_some(),
+            "a delivering owner keeps no connection, so maintenance gets the database"
+        );
+        drop(fence);
+
+        gate.send_replace(true);
+        wait_for_status(&fixture, &owner, "task-1", &mut passes, |status| {
+            matches!(status, ContinuationStatus::Applied { .. })
+        })
+        .await;
+        drop(handle);
+    }
 }
 
 /// Invariant behind continuation routing (#1813): the applier routes and

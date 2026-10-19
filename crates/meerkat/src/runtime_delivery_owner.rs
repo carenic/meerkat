@@ -728,8 +728,8 @@ impl OwnerLoop {
         Ok(read?)
     }
 
-    /// Close the kept reader's connection once the store has been quiet for
-    /// [`KEPT_DELIVERY_READER_IDLE`].
+    /// Close the kept reader's connection: once the store has been quiet for
+    /// [`KEPT_DELIVERY_READER_IDLE`], and before a pass delivers.
     fn release_generation_reader(&mut self) {
         if let Some(reader) = self.generation_reader.as_mut() {
             reader
@@ -1181,6 +1181,12 @@ async fn run_pass(
     let mut seen = HashSet::new();
     runtimes.retain(|runtime_id| seen.insert(runtime_id.clone()));
 
+    // Delivering calls into the host, which can wait: the kept reader's
+    // connection closes first, so maintenance never waits on a delivery. The
+    // next store tick opens it again.
+    if !runtimes.is_empty() {
+        owner.release_generation_reader();
+    }
     for runtime_id in runtimes {
         let (session_id, via_address) = match serving_session(owner, &runtime_id).await {
             Ok(ServingSession::Session(session_id)) => (session_id, false),
