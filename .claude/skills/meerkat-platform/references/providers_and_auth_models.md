@@ -1,8 +1,8 @@
 Covers: choosing a provider and model on every surface and the resolution
-order; 0.9.0 default models and the catalog (`rkat models`); capabilities,
-thinking and effort; `provider_params` and prompt caching; realtime, voice and
-image models; self-hosted servers; OpenAI Responses and vLLM stream behavior;
-provider error kinds (quota, policy stop). Env keys, `rkat auth`, bindings,
+order; default models and the catalog (`rkat models`); capabilities, thinking
+and effort; `provider_params` and prompt caching; realtime, voice and image
+models; self-hosted servers; OpenAI Responses and vLLM stream behavior;
+provider errors, refusals and content filters. Env keys, `rkat auth`, bindings,
 backends, redirects, credential storage: references/providers_and_auth_credentials.md.
 
 # Providers and Models (Meerkat 0.9)
@@ -281,16 +281,13 @@ Prompt caching uses the `provider_tag` keys above:
   `prompt_cache_enabled = false` opts out: the request then carries only
   `prompt_cache_options = {"mode": "explicit"}` with no breakpoints, so
   nothing is cached.
-- OpenAI backends: the `openai_api` backend receives these fields; the
-  `chatgpt_backend` and `azure_openai` clients drop them (backend profiles
-  report `prompt_cache_applicable`).
-- Known 0.9.0 gap: the OpenAI-compatible Chat Completions client
-  (self-hosted servers, Copilot Chat Completions routes) and the Copilot
-  Responses route send these fields without that backend check: whatever an
-  `open_ai` tag sets, and on Copilot also the GPT-5.6 and GPT-6 defaults.
-  `prompt_cache_enabled = false` still sends `prompt_cache_options`. If a
-  self-hosted server rejects them, leave the cache fields out of its
-  `open_ai` tag.
+- OpenAI backends: only the `openai_api` backend receives these fields
+  (backend profiles report `prompt_cache_applicable`). Every other route
+  drops them, whether they came from model defaults or an explicit tag:
+  `chatgpt_backend`, `azure_openai`, self-hosted OpenAI-compatible servers
+  (Chat Completions and Responses) and the Copilot routes; a disabled cache
+  sends nothing there. 0.9.0 still sent them to self-hosted and Copilot
+  routes; fixed in 0.9.1.
 - Gemini: `cached_content_name` names an explicit context cache you created
   (`cachedContents/<id>`); the Copilot route refuses it. Meerkat sets no
   Gemini cache defaults.
@@ -425,14 +422,59 @@ rkat run -p self-hosted "Say hello"   # uses [self_hosted] default_model
   `{"error": {"message": ...}}`) fails the turn with
   `provider error event: <message>` unless the answer had already finished.
 
+## Refusals and content filters
+
+Since 0.9.4 a refusal or a provider content filter ends the response with a
+typed stop, never as answer text. Nothing of the turn is committed and none
+of its tool calls run. `run_failed` carries `error_report.class =
+"content_filtered"` and `reason = {"reason_type": "content_filtered", "stop":
+"refusal" | "content_filter", "detail": {...}}` (0.9.3 and earlier sent no
+reason). `detail` is the provider's own account, tagged by `provider`, and is
+omitted when the provider sent none:
+
+| `provider` | `detail` fields |
+|---|---|
+| `anthropic` | `category` (policy category, for example `cyber`), `explanation` (display text, not stable) |
+| `open_ai` | `reason` (`refusal`, or the raw filter reason), `refusal` (the refusal text) |
+| `gemini` | `stage` (`prompt` or `candidate`), `reason` (`blockReason` or `finishReason`), `blocked_categories` |
+
+Each text field is capped at 4 KiB; evidence of an unexpected shape reads as
+absent and never fails the stream. A 0.9.3 binary cannot read a session event
+log that holds such a `run_failed` line.
+
+- OpenAI: a Responses `refusal` output part (streamed as
+  `response.refusal.delta`/`.done`, or in the terminal response) and a Chat
+  Completions `delta.refusal` end the response as a refusal; the refusal
+  wins over text and tool calls in the same response. A Responses
+  `incomplete_details.reason` or a Chat `finish_reason` of `content_filter`
+  ends it as a content filter. Self-hosted OpenAI-compatible servers are read
+  the same way.
+- Anthropic: a `refusal` stop carries its `stop_details`, read from the
+  `message_delta` (inside or beside its delta) or from `message_stop`; the
+  `message_delta` value wins. A stream cut after the stop still ends as a
+  refusal.
+- Gemini: a prompt blocked before any candidate (`promptFeedback.blockReason`,
+  any reason including `OTHER`) fails after one call and is not retried: the
+  same prompt is blocked again. A candidate `finishReason` of `SAFETY`,
+  `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`,
+  `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION` or `LANGUAGE` is a content
+  filter; `OTHER`, `MALFORMED_FUNCTION_CALL` or an unknown reason is retried
+  as an incomplete response.
+- The `web_search` fallback tool reads its native search call's stop: a
+  refusal, content filter, filled context window or cancellation returns
+  `status: "failed"` with an `error` naming the stop and no answer, evidence
+  or native events. A call cut at `max_tokens` or paused (`pause_turn`) keeps
+  its status and answer, and its `error` says the answer may be incomplete.
+
 ## Errors and troubleshooting
 
 A provider failure that ends a run emits `run_failed`; its
 `error_report.reason` has `reason_type = "llm_provider_error"`, `provider_error_kind` (for example
-`quota_exhausted`, `policy_stop`, `request_too_large`, `content_filtered`,
-`server_error`), `provider_error_retryability` (`retryable` or
-`non_retryable`) and `provider_error` (the provider's code and message).
-SDK event types carry the same fields.
+`quota_exhausted`, `policy_stop`, `request_too_large`, `server_error`),
+`provider_error_retryability` (`retryable` or `non_retryable`) and
+`provider_error` (the provider's code and message). SDK event types carry the
+same fields. A refusal or content filter has its own reason (see Refusals and
+content filters).
 
 | Symptom | Cause and fix |
 |---|---|
