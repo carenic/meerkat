@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use meerkat_authorization_contracts::audit::{
     AuditDelegateAttribution, AuditDelegateRole, AuditModelTarget, AuditModelUse, AuditObservation,
-    AuditPolicyRead, AuditPublicationMode, AuditRecipient, AuditReviewAttribution, AuditReviewRole,
-    AuditSourceUse, AuditTarget, AuditToolOwner, AuthorizationAuditObservation,
-    AuthorizationAuditSink,
+    AuditPolicyRead, AuditPublicationMode, AuditRecipient, AuditRefusalBasis, AuditRefusalRead,
+    AuditReviewAttribution, AuditReviewRole, AuditSourceUse, AuditTarget, AuditToolOwner,
+    AuthorizationAuditObservation, AuthorizationAuditSink,
 };
 use meerkat_authorization_contracts::constraints::ResourceDomain;
 use meerkat_authorization_contracts::evidence::EvidenceDigest;
@@ -130,7 +130,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                 // once, from a fresh clock read, and only the final attempt is
                 // classified and recorded below, under its own stamp.
                 let mut rebuilt = false;
-                let (now, known_failure, observed) = loop {
+                let (now, known_failure, started, observed) = loop {
                     let now = match self.clock.now() {
                         Ok(now) => now,
                         Err(_) => {
@@ -146,6 +146,9 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                     // A changed stamp invalidates policy data, but must not erase a known
                     // infrastructure failure or turn it into another refusal to observe.
                     let mut known_failure = None;
+                    // The sequence this attempt starts from, for the read of
+                    // a refusal if the publication changes under it.
+                    let started = self.publication.current_read();
                     let observed = self.publication.observe(|| {
                         let result = self.inner.prepare(binding);
                         if matches!(
@@ -166,22 +169,32 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                         rebuilt = true;
                         continue;
                     }
-                    break (now, known_failure, observed);
+                    break (now, known_failure, started, observed);
                 };
-                let (result, revision) = if let Some(error) = known_failure {
+                let (result, read) = if let Some(error) = known_failure {
                     (Err(error), None)
                 } else {
                     match observed {
                         Ok((result, stamp)) => {
                             policy_observation = Some(stamp.policy_observation());
-                            (result, Some(stamp.observation_sequence()))
+                            (
+                                result,
+                                Some(AttemptRead::Coherent {
+                                    instance: stamp.instance(),
+                                    sequence: stamp.observation_sequence(),
+                                }),
+                            )
                         }
                         Err(PublicationError::Changed) => (
                             Err(
                                 OperationRefused::new(OperationRefusalKind::ReprepareRequired)
                                     .into(),
                             ),
-                            None,
+                            started.map(|(instance, sequence)| AttemptRead::Changed {
+                                instance,
+                                sequence,
+                                live: self.publication.current_read().map(|(_, live)| live),
+                            }),
                         ),
                         Err(PublicationError::Unavailable) => {
                             (Err(OperationAuthorizationError::Unavailable), None)
@@ -197,8 +210,11 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                     AuthorizationOperation::Model(facts) if crate::work::controller_route(facts, selected));
                         let operation = !matches!(&binding.facts().operation,
                     AuthorizationOperation::Model(facts) if crate::work::controller_route(facts, selected) && facts.hosted_capabilities.is_empty());
+                        let Some(AttemptRead::Coherent { instance, sequence }) = read else {
+                            return Err(denied().into());
+                        };
                         let policy = AuditPolicyRead {
-                            publication_sequence: revision.ok_or_else(denied)?,
+                            publication_sequence: sequence,
                             observed_at_ms: now.unix_ms,
                             operation_authorities: if operation {
                                 self.associations
@@ -216,6 +232,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                             } else {
                                 Vec::new()
                             },
+                            publication_instance: Some(instance),
                         };
                         self.sink.append(observation(
                             binding,
@@ -230,6 +247,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                             binding: binding.clone(),
                             target,
                             sink: Arc::clone(&self.sink),
+                            clock: Arc::clone(&self.clock),
                         }))
                     }
                     Err(OperationAuthorizationError::Unavailable) => {
@@ -245,6 +263,7 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                             AuditObservation::Refused {
                                 target,
                                 reason: refusal.kind(),
+                                read: read.map(|read| read.refusal_read(now.unix_ms)),
                             },
                         ))?;
                         Err(refusal.into())
@@ -261,12 +280,70 @@ impl WorkAuthorization for AuditedWorkAuthorization {
     }
 }
 
+/// The publication read of one audited preparation attempt.
+#[derive(Clone, Copy)]
+enum AttemptRead {
+    /// A coherent observation: the owners answered at `sequence`.
+    Coherent { instance: uuid::Uuid, sequence: u64 },
+    /// The publication changed under an attempt that started at `sequence`;
+    /// `live` is the sequence once the attempt ended.
+    Changed {
+        instance: uuid::Uuid,
+        sequence: u64,
+        live: Option<u64>,
+    },
+}
+
+impl AttemptRead {
+    /// The audit read of a refusal decided at this read.
+    fn refusal_read(self, observed_at_ms: u64) -> AuditRefusalRead {
+        match self {
+            Self::Coherent { instance, sequence } => AuditRefusalRead::new(
+                observed_at_ms,
+                AuditRefusalBasis::OwnerAnswer,
+                sequence,
+                None,
+                instance,
+            ),
+            Self::Changed {
+                instance,
+                sequence,
+                live,
+            } => AuditRefusalRead::new(
+                observed_at_ms,
+                if live.is_some_and(|live| !live.is_multiple_of(2)) {
+                    AuditRefusalBasis::ChangeInProgress
+                } else {
+                    AuditRefusalBasis::PublicationChanged
+                },
+                sequence,
+                live,
+                instance,
+            ),
+        }
+    }
+}
+
 struct AuditedPrepared {
     inner: Arc<dyn PreparedOperationAuthorization>,
     policy_observation: Option<meerkat_core::authorization::PolicyPublicationObservation>,
     binding: PreparedAuthorizationBinding,
     target: Arc<AuditTarget>,
     sink: Arc<dyn AuthorizationAuditSink>,
+    clock: Arc<dyn LocalAuthorizationClock>,
+}
+
+impl AuditedPrepared {
+    /// A check-time refusal is the owners' answer for this decision's own
+    /// coherent read. `None` when the clock cannot be read.
+    fn refusal_read(&self) -> Option<AuditRefusalRead> {
+        let meerkat_core::authorization::PolicyPublicationObservation::LocalPublication {
+            instance,
+            sequence,
+        } = self.policy_observation?;
+        let now = self.clock.now().ok()?;
+        Some(AttemptRead::Coherent { instance, sequence }.refusal_read(now.unix_ms))
+    }
 }
 
 impl PreparedOperationAuthorization for AuditedPrepared {
@@ -318,6 +395,7 @@ impl PreparedOperationAuthorization for AuditedPrepared {
             OperationObservation::Refused(reason) => AuditObservation::Refused {
                 target: Arc::clone(&self.target),
                 reason,
+                read: self.refusal_read(),
             },
         };
         self.sink.append(observation(binding, event))

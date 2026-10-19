@@ -214,6 +214,14 @@ impl LocalAuthorizationPublication {
         })
     }
 
+    /// The instance and live sequence, for an audit read of a refused
+    /// attempt. `None` once poisoned or exhausted. Not a permission and not
+    /// an observation: nothing may be decided from it.
+    pub(crate) fn current_read(&self) -> Option<(uuid::Uuid, u64)> {
+        let sequence = self.inner.sequence.load(Ordering::Acquire);
+        (sequence != INVALID).then_some((self.inner.instance, sequence))
+    }
+
     /// Observe the current owners and bind that disposable view to one coherent
     /// publication. The closure must read real owner data or their immutable
     /// snapshots, never a separately refreshed policy cache. It must not do I/O.
@@ -373,6 +381,12 @@ impl LocalPublicationStamp {
     /// durable policy epoch, or cross-process freshness proof.
     pub(crate) fn observation_sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// The instance this read belongs to; its sequences compare only with
+    /// that instance's.
+    pub(crate) fn instance(&self) -> uuid::Uuid {
+        self.inner.instance
     }
 
     /// One allocation-free local atomic read at the final operation boundary.

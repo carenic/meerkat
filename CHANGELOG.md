@@ -49,6 +49,12 @@ them.
   constructible struct (struct literals need it):
   `SessionPersistenceVersionAuthorityMachineState` gains
   `stored_input_state_migration_v6`.
+- `meerkat-authorization-contracts`: `AuditObservation` is now
+  `#[non_exhaustive]`, so a match outside the crate needs a wildcard arm.
+  `AuditObservation::Refused` gains `read: Option<AuditRefusalRead>`
+  (patterns without `..` and literals need it), and the exhaustively
+  constructible `AuditPolicyRead` gains `publication_instance:
+  Option<uuid::Uuid>` (struct literals need it).
 
 ### Added
 
@@ -62,6 +68,17 @@ them.
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners, and the native run and audit wrappers forward it.
   `OwnerChangeWait::trace` records one wait as the debug event below.
+- The protected authorization audit says where a refusal was decided. A
+  `Refused` record carries an `AuditRefusalRead`: when it was observed, its
+  basis (`AuditRefusalBasis`: the owners answered at one coherent
+  publication, the publication changed under the attempt and the change
+  completed, or a change was still in progress), the sequence the attempt
+  read, the live sequence when the publication changed under it, and the
+  publication instance. A `Prepared` record's policy read names its
+  publication instance too, since sequences of different instances do not
+  compare. Rows carry both at stored input state version 7; a row stamped
+  before v7 that carries either is refused. Records written earlier read
+  with neither.
 
 ### Fixed
 

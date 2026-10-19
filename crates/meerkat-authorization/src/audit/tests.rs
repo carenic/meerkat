@@ -518,16 +518,27 @@ impl AuthorizationAuditSink for RecordingSink {
 }
 
 /// The scripted preparation's result, the attempts the inner owner saw,
-/// every record the sink received, and the prepared operation's id.
+/// every record the sink received, the prepared operation's binding and id,
+/// and the publication instance.
 struct ScriptedPreparation {
     result: Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError>,
     attempts: usize,
     records: Vec<AuthorizationAuditObservation>,
     operation_id: OperationId,
+    binding: PreparedAuthorizationBinding,
+    sink: Arc<RecordingSink>,
+    instance: uuid::Uuid,
 }
 
 fn prepare_scripted(script: Vec<(bool, RebuildOutcome)>) -> ScriptedPreparation {
-    let publication = LocalAuthorizationPublication::new();
+    prepare_scripted_on(LocalAuthorizationPublication::new(), script)
+}
+
+fn prepare_scripted_on(
+    publication: LocalAuthorizationPublication,
+    script: Vec<(bool, RebuildOutcome)>,
+) -> ScriptedPreparation {
+    let (instance, _) = publication.current_read().expect("a live publication");
     let inner = Arc::new(ScriptedInner {
         publication: publication.clone(),
         script,
@@ -567,7 +578,20 @@ fn prepare_scripted(script: Vec<(bool, RebuildOutcome)>) -> ScriptedPreparation 
         attempts: inner.calls.load(std::sync::atomic::Ordering::SeqCst),
         records,
         operation_id: binding.facts().operation_id.clone(),
+        binding,
+        sink,
+        instance,
     }
+}
+
+/// The read of a scripted preparation's only `Refused` record.
+fn refusal_read(prepared: &ScriptedPreparation) -> AuditRefusalRead {
+    assert_eq!(prepared.records.len(), 1, "one record");
+    match &prepared.records[0].observation {
+        AuditObservation::Refused { read, .. } => read.clone(),
+        _ => None,
+    }
+    .expect("a refused record with its read")
 }
 
 #[test]
@@ -591,8 +615,9 @@ fn one_owner_change_during_preparation_is_rebuilt_once_and_recorded_once() {
         matches!(
             &prepared.records[0].observation,
             AuditObservation::Prepared { policy, .. } if policy.publication_sequence == 2
+                && policy.publication_instance == Some(prepared.instance)
         ),
-        "one Prepared record carrying the rebuilt attempt's own stamp"
+        "one Prepared record carrying the rebuilt attempt's own stamp and instance"
     );
 }
 
@@ -621,6 +646,46 @@ fn a_second_owner_change_still_refuses_with_one_refused_record() {
             ..
         }
     ));
+    // The rebuilt attempt read 2 and the change it met completed at 4.
+    assert!(
+        refusal_read(&prepared)
+            == AuditRefusalRead::new(
+                1,
+                AuditRefusalBasis::PublicationChanged,
+                2,
+                Some(4),
+                prepared.instance,
+            )
+    );
+}
+
+/// An owner change still in progress refuses every attempt before the owners
+/// are asked: the read names the odd sequence the attempts started from and
+/// the live one, still odd.
+#[test]
+fn a_change_still_in_progress_reads_as_change_in_progress() {
+    let publication = LocalAuthorizationPublication::new();
+    let change = publication
+        .begin_owner_change()
+        .expect("actual publication");
+    let prepared = prepare_scripted_on(publication.clone(), Vec::new());
+    drop(change);
+    assert!(matches!(
+        prepared.result,
+        Err(OperationAuthorizationError::Refused(refusal))
+            if refusal.kind() == OperationRefusalKind::ReprepareRequired
+    ));
+    assert_eq!(prepared.attempts, 0, "no owner is asked during a change");
+    assert!(
+        refusal_read(&prepared)
+            == AuditRefusalRead::new(
+                1,
+                AuditRefusalBasis::ChangeInProgress,
+                1,
+                Some(1),
+                prepared.instance,
+            )
+    );
 }
 
 #[test]
@@ -692,7 +757,49 @@ fn a_coherent_policy_refusal_is_final_and_not_rebuilt() {
             refused.records[0].observation,
             AuditObservation::Refused { reason, .. } if reason == kind
         ));
+        assert!(
+            refusal_read(&refused)
+                == AuditRefusalRead::new(
+                    1,
+                    AuditRefusalBasis::OwnerAnswer,
+                    0,
+                    None,
+                    refused.instance,
+                ),
+            "the owners answered at the coherent read"
+        );
     }
+}
+
+/// A refusal the prepared decision observes later, at its check, is the
+/// owners' answer at the decision's own coherent read.
+#[test]
+fn a_check_time_refusal_reads_at_the_decision_own_read() {
+    let prepared = prepare_scripted(vec![(false, RebuildOutcome::Prepared)]);
+    let decision = prepared.result.as_ref().expect("prepared");
+    decision
+        .observe(
+            &prepared.binding,
+            OperationObservation::Refused(OperationRefusalKind::Denied),
+        )
+        .expect("observed");
+    let records = prepared.sink.0.lock().expect("observations").clone();
+    assert_eq!(records.len(), 2, "Prepared, then the check-time refusal");
+    assert!(matches!(
+        &records[1].observation,
+        AuditObservation::Refused {
+            reason: OperationRefusalKind::Denied,
+            read: Some(read),
+            ..
+        } if *read
+            == AuditRefusalRead::new(
+                1,
+                AuditRefusalBasis::OwnerAnswer,
+                0,
+                None,
+                prepared.instance,
+            )
+    ));
 }
 
 #[test]

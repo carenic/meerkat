@@ -2212,6 +2212,14 @@ impl<'de> Deserialize<'de> for StoredInputState {
                 "stored input state before v6 cannot carry a mandatory hook withholding record",
             ));
         }
+        if observed_stored_input_state_version < 7
+            && helper.authorization_audit.has_publication_read()
+        {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v7 cannot carry an authorization audit refusal read \
+                 or a policy read's publication instance",
+            ));
+        }
         if observed_stored_input_state_version == 3 && helper.interaction_terminal_outbox.is_some()
         {
             return Err(<D::Error as serde::de::Error>::custom(
