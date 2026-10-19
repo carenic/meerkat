@@ -212,6 +212,10 @@ impl SqliteLockProfileReport {
 /// What a process's allocator-statistics switch found: SQLite accepted it
 /// (allocator statistics were on, or already off) or refused it because
 /// SQLite was already in use.
+///
+/// Exhaustive on purpose, like the `meerkat_sqlite::MemoryStatisticsOutcome`
+/// it reports: these three are every outcome the switch has, and the storage
+/// doctor maps that enum onto this one with an exhaustive match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SqliteMemoryStatisticsSwitch {

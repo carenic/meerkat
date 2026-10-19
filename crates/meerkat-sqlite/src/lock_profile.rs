@@ -142,6 +142,11 @@ pub fn check_lock_profile() -> Result<(), SqliteLockProfileMismatch> {
 /// What [`disable_memory_statistics_at_process_start`] did: SQLite either
 /// accepted the switch (and allocator statistics were on or already off) or
 /// refused it.
+///
+/// Exhaustive on purpose: SQLite accepts or refuses the switch, and a build
+/// has the statistics on or off, so these three are every outcome there is,
+/// and a new one would fail to compile at each exhaustive match on it (the
+/// storage doctor's report is one) instead of falling into a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryStatisticsOutcome {
     /// This build has allocator statistics on; they are now off.
