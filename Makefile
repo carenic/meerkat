@@ -220,6 +220,7 @@ test-minimal:
 	$(CARGO) check -p meerkat-store --no-default-features
 	$(CARGO) check -p meerkat-tools --no-default-features
 	$(CARGO) check -p meerkat --no-default-features
+	$(CARGO) check -p rkat --no-default-features
 	$(CARGO) nextest run -p meerkat-core
 
 # Library crate feature combinations
