@@ -18481,13 +18481,13 @@ mod tests {
             .expect("the creator still manages its mob");
     }
 
-    /// After a restart a session's implicit delegation mob runs as a new
-    /// incarnation: no grant from before the restart reaches it, and the
-    /// delegate's guard still knows it as the session's own, so the
-    /// session's next delegate grants manage scope at the restored
-    /// incarnation.
+    /// After a restart a session's implicit delegation mob keeps its
+    /// incarnation: the delegate's guard still knows it as the session's
+    /// own, and manage scope bound to it before the restart names the
+    /// restored mob. Grants are not persisted, so after a real restart the
+    /// session's next delegate grants that scope again.
     #[tokio::test]
-    async fn a_restored_implicit_mob_is_the_sessions_own_at_a_new_incarnation() {
+    async fn a_restored_implicit_mob_keeps_its_incarnation_and_stays_the_sessions_own() {
         let svc = Arc::new(MockSessionSvc::new());
         let root = tempfile::tempdir().expect("tempdir");
         let owner = SessionId::new();
@@ -18520,10 +18520,10 @@ mod tests {
             .handle_for(&mob_id)
             .await
             .expect("restored implicit mob");
-        assert!(restored.incarnation() != before_incarnation.incarnation());
+        assert_eq!(restored.incarnation(), before_incarnation.incarnation());
         assert!(AgentMobToolSurface::is_implicit_mob_of(&restored, &owner));
         assert!(
-            !managing_authority(&mob_id, before_incarnation)
+            managing_authority(&mob_id, before_incarnation)
                 .can_manage_mob(mob_id.as_str(), restored.incarnation())
         );
     }

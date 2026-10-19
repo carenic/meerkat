@@ -2601,7 +2601,7 @@ mod schema_floor_tests {
         let report =
             meerkat_sqlite::apply_domain_migrations(&mut conn, &MOB_DOMAIN).expect("upgrade");
         assert_eq!(report.from_version, 3);
-        assert_eq!(report.to_version, 11);
+        assert_eq!(report.to_version, 12);
     }
 
     #[test]
@@ -11770,7 +11770,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for retired in [
             "mob_identity_declaration_scopes",
@@ -11861,7 +11861,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for table in [
             "mob_identity_intent_mutation_receipts",
@@ -12254,16 +12254,21 @@ mod tests {
                     version: 10,
                     verify: verify_released_0_9_2_mob_schema,
                 },
-                // The requested "exact frozen v11 predecessor verifier".
                 meerkat_sqlite::SchemaPredecessor {
                     version: 11,
-                    verify: verify_released_0_9_2_mob_schema,
+                    verify: verify_released_0_9_3_mob_schema,
+                },
+                // The requested "exact frozen predecessor verifier" for the
+                // head version itself.
+                meerkat_sqlite::SchemaPredecessor {
+                    version: 12,
+                    verify: verify_released_0_9_3_mob_schema,
                 },
             ],
             ..MOB_DOMAIN
         };
         const WITHOUT_HEAD_FLOOR: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
-            allowed_existing_versions: &[3, 4, 7, 8, 9, 10],
+            allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
             ..MOB_DOMAIN
         };
 
