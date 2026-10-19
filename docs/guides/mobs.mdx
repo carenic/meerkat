@@ -556,6 +556,20 @@ member's session id or labels; a later registration of the same session is a
 different one. The identity is no longer `UnwindSafe`, so wrap it in
 `std::panic::AssertUnwindSafe` to move it into `catch_unwind`.
 
+Since 0.9.4 a hook that refuses a restored member's registration
+(`select_destination`, `select_agent_mandate`, `prepare_member_surface` or
+`verify_member_surface`) gets the same cleanup as a refusal for a new member:
+the restore removes that registration exactly (recorded in the session's
+history; inputs it still held end `Stopped`) and releases its owner context.
+The member stays Broken with `MobError::MemberRegistrationRefused`, shown as
+`registration_refusal` in its status, until an explicit repair, and
+`ensure_member_live` returns that refusal without asking the hook again. The
+member can still be retired, respawned or destroyed. A destination the hook
+selected that the runtime did not install is
+`MobError::MemberDestinationNotInstalled` instead (the runtime's verdict, not
+a refusal): the member keeps its registration, and the repair must select
+again with an advanced `context_generation`.
+
 ## Identity And Respawn
 
 Mobs separate stable member identity from runtime binding details:
@@ -1145,6 +1159,11 @@ destroy is retried. A recorded placed lifecycle intent, such as a Reset, is not
 retried while admission is closed; it stays recorded and the next start drives
 it. `MobError` is `#[non_exhaustive]` since 0.9.4: an exhaustive `match` needs a
 wildcard arm.
+
+Since 0.9.4 a destroy whose member's boundary commit fails while the destroy
+waits on that member's ingress detach reloads the member from its durable
+store, retries its retirement once, and names it in
+`MobDestroyReport::reloaded_members`; 0.9.3 answered `Incomplete`.
 
 ### Admission in custom Rust session services
 
