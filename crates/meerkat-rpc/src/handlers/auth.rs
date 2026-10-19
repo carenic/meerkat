@@ -3527,6 +3527,9 @@ mod tests {
 
         let logs = CanaryLogBuffer::default();
         let writer = logs.clone();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let _capture = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
@@ -3672,6 +3675,9 @@ mod tests {
 
         let logs = CanaryLogBuffer::default();
         let writer = logs.clone();
+        // A second registered Dispatch keeps callsite interest from being
+        // cached `never` by threads without a subscriber.
+        let _anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
         let _capture = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
