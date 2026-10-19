@@ -69,13 +69,13 @@ impl RecordsOnlyConfiguredServers {
         // This fixture records which configured servers are decided; it does
         // not decide per agent, so the registration's binding is unused.
         Arc::new(
-            move |session_id: &SessionId,
+            move |registration: &meerkat_runtime::RuntimeSessionRegistrationWitness,
                   _agent: meerkat_runtime::meerkat_machine::SessionAgentBinding| {
                 fixture
                     .sessions
                     .lock()
                     .expect("sessions")
-                    .push(session_id.clone());
+                    .push(registration.session_id().clone());
                 Some(Arc::clone(&fixture) as Arc<dyn ConfiguredMcpAttachmentAuthority>)
             },
         )

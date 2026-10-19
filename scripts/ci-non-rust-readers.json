@@ -882,49 +882,6 @@
         ]
       }
     ],
-    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json": [
-      {
-        "package": "meerkat-contracts",
-        "target": "lib",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-contracts/src/emit.rs"
-        ]
-      }
-    ],
-    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json": [
-      {
-        "package": "meerkat-contracts",
-        "target": "lib",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-contracts/src/emit.rs"
-        ]
-      }
-    ],
-    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_valid_v1.json": [
-      {
-        "package": "meerkat-contracts",
-        "target": "lib",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-contracts/src/emit.rs"
-        ]
-      }
-    ],
-    "crates/meerkat-core/tests/fixtures/v0_8_10_recovery_migration_session.json": [
-      {
-        "package": "meerkat-runtime",
-        "target": "lib",
-        "scope": "target",
-        "tests": [
-          "runtime_v2_migrates_published_v1_rows_to_current_schema"
-        ],
-        "sources": [
-          "crates/meerkat-runtime/src/store/sqlite.rs"
-        ]
-      }
-    ],
     "crates/meerkat-hooks/skills/hook-authoring/SKILL.md": [
       {
         "package": "meerkat-hooks",
@@ -1238,19 +1195,6 @@
         "scope": "target",
         "sources": [
           "crates/meerkat/src/persistence.rs"
-        ]
-      }
-    ],
-    "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml": [
-      {
-        "package": "rkat",
-        "target": "bin:rkat",
-        "scope": "target",
-        "tests": [
-          "test_load_config_accepts_released_realm_legacy_model_fallback_default"
-        ],
-        "sources": [
-          "crates/meerkat-cli/src/main.rs"
         ]
       }
     ],

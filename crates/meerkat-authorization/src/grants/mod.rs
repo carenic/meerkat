@@ -71,6 +71,37 @@ pub enum GrantRefusal {
     Unavailable,
 }
 
+/// Why a lineage resolution read inside the caller's own enclosing
+/// observation of this owner's publication has no grant. An owner change
+/// published during the resolution stays apart from the owner's refusals:
+/// the enclosing observation is stale too, so the caller classifies it as
+/// a stale read (for an operation, `OperationRefusalKind::ReprepareRequired`)
+/// and may rebuild once, never as unavailability. A standalone resolution
+/// ([`LocalGrantAuthority::resolve_lineage`] and its siblings) reports such
+/// a change as [`GrantRefusal::Unavailable`].
+///
+/// Closed by design: a resolution either met a change or the owner refused
+/// it, so a new reason to refuse is a [`GrantRefusal`] variant, never a new
+/// variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LineageResolutionRefusal {
+    /// An owner change published during this resolution's observation.
+    #[error("grant owner facts changed during the resolution")]
+    Changed,
+    /// The owner's own refusal, as the standalone resolution reports it.
+    #[error(transparent)]
+    Refused(GrantRefusal),
+}
+
+/// A standalone caller has no enclosing observation to rebuild: a
+/// concurrent change is "this owner cannot say now".
+fn standalone_refusal(refusal: LineageResolutionRefusal) -> GrantRefusal {
+    match refusal {
+        LineageResolutionRefusal::Changed => GrantRefusal::Unavailable,
+        LineageResolutionRefusal::Refused(refusal) => refusal,
+    }
+}
+
 /// One intended child grant, retained by its caller with a stable id before
 /// any attempt: the exact root-to-parent lineage of the independent parent
 /// grant, the caller issuing from it (that parent's grantee), the child's
@@ -1050,8 +1081,70 @@ impl LocalGrantAuthority {
         &self,
         references: &[GrantLineageRef],
     ) -> Result<ContributorCeiling, GrantRefusal> {
+        self.resolve_lineage_ceiling_observed(references)
+            .map_err(standalone_refusal)
+    }
+
+    /// [`resolve_lineage`](Self::resolve_lineage) for a caller inside its
+    /// own enclosing observation of this owner's publication: an owner
+    /// change published during the resolution is
+    /// [`LineageResolutionRefusal::Changed`], which that caller classifies
+    /// as a stale read, not as unavailability.
+    ///
+    /// # Errors
+    /// [`LineageResolutionRefusal::Changed`] for such a change; otherwise
+    /// [`LineageResolutionRefusal::Refused`] with the refusal
+    /// [`resolve_lineage`](Self::resolve_lineage) reports.
+    pub fn resolve_lineage_observed(
+        &self,
+        references: &[GrantLineageRef],
+        executor: &PrincipalRef,
+        represented_subject: Option<&PrincipalRef>,
+    ) -> Result<ResolvedGrant, LineageResolutionRefusal> {
+        self.resolve_lineage_observed_for_use(
+            references,
+            LineageUse::Executor {
+                executor,
+                represented_subject,
+            },
+            false,
+        )
+    }
+
+    /// [`resolve_controller_lineage`](Self::resolve_controller_lineage)
+    /// for a caller inside its own enclosing observation; see
+    /// [`resolve_lineage_observed`](Self::resolve_lineage_observed).
+    ///
+    /// # Errors
+    /// As [`resolve_lineage_observed`](Self::resolve_lineage_observed).
+    pub fn resolve_controller_lineage_observed(
+        &self,
+        references: &[GrantLineageRef],
+        executor: &PrincipalRef,
+        represented_subject: Option<&PrincipalRef>,
+    ) -> Result<ResolvedGrant, LineageResolutionRefusal> {
+        self.resolve_lineage_observed_for_use(
+            references,
+            LineageUse::Executor {
+                executor,
+                represented_subject,
+            },
+            true,
+        )
+    }
+
+    /// [`resolve_lineage_ceiling`](Self::resolve_lineage_ceiling) for a
+    /// caller inside its own enclosing observation; see
+    /// [`resolve_lineage_observed`](Self::resolve_lineage_observed).
+    ///
+    /// # Errors
+    /// As [`resolve_lineage_observed`](Self::resolve_lineage_observed).
+    pub fn resolve_lineage_ceiling_observed(
+        &self,
+        references: &[GrantLineageRef],
+    ) -> Result<ContributorCeiling, LineageResolutionRefusal> {
         // The lineage restrictions stay here: a ceiling carries no evidence.
-        self.resolve_lineage_for_use(references, LineageUse::LeafOwn, false)
+        self.resolve_lineage_observed_for_use(references, LineageUse::LeafOwn, false)
             .map(|resolved| ContributorCeiling {
                 restrictions: resolved.restrictions,
                 expires_at_ms: resolved.expires_at_ms,
@@ -1065,11 +1158,27 @@ impl LocalGrantAuthority {
         lineage_use: LineageUse<'_>,
         controller: bool,
     ) -> Result<ResolvedGrant, GrantRefusal> {
+        self.resolve_lineage_observed_for_use(references, lineage_use, controller)
+            .map_err(standalone_refusal)
+    }
+
+    fn resolve_lineage_observed_for_use(
+        &self,
+        references: &[GrantLineageRef],
+        lineage_use: LineageUse<'_>,
+        controller: bool,
+    ) -> Result<ResolvedGrant, LineageResolutionRefusal> {
         let (resolved, publication) = self
             .publication
             .observe(|| self.resolve_lineage_data(references, lineage_use, controller))
-            .map_err(|_| GrantRefusal::Unavailable)?;
-        let (restrictions, lineage, expires_at_ms) = resolved?;
+            .map_err(|error| match error {
+                PublicationError::Changed => LineageResolutionRefusal::Changed,
+                PublicationError::Unavailable => {
+                    LineageResolutionRefusal::Refused(GrantRefusal::Unavailable)
+                }
+            })?;
+        let (restrictions, lineage, expires_at_ms) =
+            resolved.map_err(LineageResolutionRefusal::Refused)?;
         Ok(ResolvedGrant {
             restrictions,
             lineage,

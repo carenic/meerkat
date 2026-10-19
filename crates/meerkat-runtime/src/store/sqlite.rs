@@ -735,10 +735,11 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     .ok_or("stored_input_state_version is not an unsigned integer")?;
                 match version {
                     3 => {}
-                    // A row a 0.8.11 to 0.8.51 binary wrote is carried to the
-                    // current encoding through the generic decode, re-encode
-                    // and loss check below; only its version stamp changes.
-                    5 if target_current => {}
+                    // A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0
+                    // to 0.9.3 binary wrote (v6), is carried to the current
+                    // encoding through the generic decode, re-encode and loss
+                    // check below; only its version stamp changes.
+                    5 | 6 if target_current => {}
                     version
                         if target_current
                             && version
@@ -3776,8 +3777,8 @@ END";
         }
 
         #[test]
-        fn maintenance_prepare_refuses_v4_and_preexisting_v5_at_source_boundary() {
-            for version in [4, 5] {
+        fn maintenance_prepare_refuses_v4_and_preexisting_v5_and_v6_at_source_boundary() {
+            for version in [4, 5, 6] {
                 let mut conn = Connection::open_in_memory().expect("open");
                 conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
                     .expect("runtime v1 schema");
@@ -3954,6 +3955,75 @@ END";
             );
             tx.commit().expect("rerun commit");
             assert_eq!(load_row(&conn, "runtime", &input_id), successor);
+        }
+
+        /// A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0 to 0.9.3
+        /// binary wrote (v6), is carried to the current encoding at a target
+        /// ledger: only its stamp changes, and a rerun leaves it alone.
+        #[test]
+        fn maintenance_prepare_target_v2_carries_v5_and_v6_rows_to_the_current_encoding() {
+            // The current canonical encoding of one row, as the bridge itself
+            // writes it from a legacy row.
+            let (input_id, canonical) = {
+                let mut conn = Connection::open_in_memory().expect("open");
+                conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                    .expect("runtime v1 schema");
+                let (input_id, source) = legacy_prompt_row();
+                insert_row(&conn, "runtime", &input_id, &source);
+                let tx = conn.transaction().expect("tx");
+                assert_eq!(
+                    prepare_pre_0_8_10_runtime_input_states(&tx)
+                        .expect("prepare")
+                        .changed,
+                    1
+                );
+                tx.commit().expect("commit");
+                let canonical = load_row(&conn, "runtime", &input_id);
+                (input_id, canonical)
+            };
+            for version in [5, 6] {
+                let mut stamped: serde_json::Value =
+                    serde_json::from_slice(&canonical).expect("canonical json");
+                stamped["stored_input_state_version"] = serde_json::json!(version);
+                let stamped = serde_json::to_vec(&stamped).expect("stamped bytes");
+                let mut conn = Connection::open_in_memory().expect("open");
+                conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                    .expect("runtime v1 schema");
+                conn.execute_batch(
+                    "CREATE TABLE meerkat_schema (
+                         domain TEXT PRIMARY KEY,
+                         version INTEGER NOT NULL
+                     );
+                     INSERT INTO meerkat_schema (domain, version)
+                     VALUES ('runtime-store', 2);",
+                )
+                .expect("target ledger");
+                insert_row(&conn, "runtime", &input_id, &stamped);
+
+                let tx = conn.transaction().expect("tx");
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(
+                    report.changed, 1,
+                    "a v{version} row is carried forward: {:?}",
+                    report.refused
+                );
+                tx.commit().expect("commit");
+                assert_eq!(
+                    load_row(&conn, "runtime", &input_id),
+                    canonical,
+                    "only the stamp of a v{version} row changes"
+                );
+
+                let tx = conn.transaction().expect("rerun tx");
+                assert_eq!(
+                    prepare_pre_0_8_10_runtime_input_states(&tx)
+                        .expect("rerun")
+                        .changed,
+                    0
+                );
+                tx.commit().expect("rerun commit");
+                assert_eq!(load_row(&conn, "runtime", &input_id), canonical);
+            }
         }
 
         #[test]
@@ -4665,7 +4735,7 @@ END";
     /// only [`open_runtime_delivery_write_connection`] creates the store.
     fn open_runtime_delivery_read_connection(
         path: &Path,
-    ) -> Result<Option<RuntimeConn>, RuntimeStoreError> {
+    ) -> Result<Option<RuntimeDeliveryReadConn>, RuntimeStoreError> {
         if runtime_database_absent(path) {
             meerkat_sqlite::OperationGuard::admit_missing_database(path)
                 .map_err(map_shared_sqlite_error)?;
@@ -4686,13 +4756,34 @@ END";
             Err(_) if runtime_database_absent(path) => return Ok(None),
             Err(error) => return Err(map_shared_sqlite_error(error)),
         };
-        let provisioned = meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
-            .map_err(map_shared_sqlite_error)?
-            .is_some();
-        Ok(provisioned.then_some(RuntimeConn {
-            conn,
-            _guard: guard,
+        // Decided from the version this check verifies, in one snapshot: a
+        // row stamped after the open's preflight (by another process,
+        // possibly a newer binary) is checked before it counts.
+        let version = meerkat_sqlite::preflight_domain_version(&conn, &RUNTIME_DELIVERY_DOMAIN)
+            .map_err(map_shared_sqlite_error)?;
+        Ok(version.map(|version| RuntimeDeliveryReadConn {
+            conn: RuntimeConn {
+                conn,
+                _guard: guard,
+            },
+            version,
         }))
+    }
+
+    /// A delivery-read connection with the delivery domain version its open
+    /// verified. A read that depends on that version (a table a later
+    /// migration added) decides on `version`, never on a later read of a
+    /// ledger row the open's check did not see.
+    struct RuntimeDeliveryReadConn {
+        conn: RuntimeConn,
+        version: i64,
+    }
+
+    impl std::ops::Deref for RuntimeDeliveryReadConn {
+        type Target = Connection;
+        fn deref(&self) -> &Connection {
+            &self.conn
+        }
     }
 
     /// Whether nothing is at `path`, a missing directory included. Anything
@@ -14261,11 +14352,9 @@ ORDER BY runtime_id";
                 return Ok(None);
             };
             // A file last written by a binary without the ledger holds no
-            // bindings yet; its first delivery write migrates it.
-            if meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
-                .map_err(map_shared_sqlite_error)?
-                < Some(2)
-            {
+            // bindings yet; its first delivery write migrates it. Decided on
+            // the version the open verified.
+            if conn.version < 2 {
                 return Ok(None);
             }
             load_continuation_key_binding_in(&conn, owner, key)
@@ -14279,10 +14368,7 @@ ORDER BY runtime_id";
             let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
                 return Ok(None);
             };
-            if meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
-                .map_err(map_shared_sqlite_error)?
-                < Some(2)
-            {
+            if conn.version < 2 {
                 return Ok(None);
             }
             load_continuation_admission_in(&conn, address, delivery_id)
@@ -14376,17 +14462,10 @@ ORDER BY runtime_id";
             let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
                 return Ok(0);
             };
-            // A version-1 delivery file not yet migrated by a write has no
-            // counter yet; its first delivery write migrates it.
-            let counted: bool = conn
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = \
-                     'runtime_delivery_generation')",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-            if !counted {
+            // A delivery file below version 3 (the counter's migration) not
+            // yet migrated by a write has no counter yet; its first delivery
+            // write migrates it. Decided on the version the open verified.
+            if conn.version < 3 {
                 return Ok(0);
             }
             let generation: i64 = conn
@@ -18307,9 +18386,19 @@ ORDER BY runtime_id";
             let mut conn = Connection::open_in_memory().unwrap();
             let tx = conn.transaction().unwrap();
             migration_0001_runtime_schema(&tx).unwrap();
-            let released_session = include_bytes!(
-                "../../../meerkat-core/tests/fixtures/v0_8_10_recovery_migration_session.json"
-            );
+            // This crate's own copy of meerkat-core's synthetic 0.8.10
+            // recovery-migration session (so the test builds from the
+            // published package), pinned to the original's provenance digest.
+            let released_session =
+                include_bytes!("../../tests/fixtures/v0_8_10_recovery_migration_session.json");
+            {
+                use sha2::Digest as _;
+                assert_eq!(
+                    format!("{:x}", sha2::Sha256::digest(released_session)),
+                    "3a1ba2e6ff8889c913dc0801c540c81a38bae7b54269259d8e370d1275a12c8a",
+                    "the copy differs from meerkat-core's 0.8.10 recovery-migration fixture"
+                );
+            }
             let imported = meerkat_core::import_released_0810_session(released_session).unwrap();
             let runtime_id = LogicalRuntimeId::for_session(imported.receipt().session_id());
             let expected_session = imported.session().clone();
@@ -25596,6 +25685,187 @@ ORDER BY runtime_id";
                     .is_empty()
             );
             assert!(!database.exists(), "a released read still creates nothing");
+        }
+
+        /// Two processes race their first durable delivery write: the open
+        /// whose schema preflight straddles the other's provisioning commit
+        /// sees the delivery domain whole or not at all, never its tables
+        /// without its ledger row.
+        #[test]
+        fn a_delivery_write_open_racing_the_first_provisioning_succeeds() {
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let racing = path.clone();
+            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let seen = std::rc::Rc::clone(&ran);
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                drop(
+                    open_runtime_delivery_write_connection(&racing)
+                        .expect("the racing first write provisions the delivery domain"),
+                );
+                seen.set(true);
+            });
+
+            drop(
+                open_runtime_delivery_write_connection(&path)
+                    .expect("an open whose preflight straddles that provisioning succeeds"),
+            );
+
+            assert!(
+                ran.get(),
+                "the racing provisioning committed inside the preflight"
+            );
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name).unwrap(),
+                Some(RUNTIME_DELIVERY_DOMAIN.supported_version())
+            );
+        }
+
+        /// A delivery read decides whether the domain is provisioned from the
+        /// version its own check verified. A delivery domain that a newer
+        /// binary stamps after the read's open preflight is refused, never
+        /// read as provisioned.
+        #[test]
+        fn a_delivery_read_refuses_a_future_domain_stamped_after_its_open_check() {
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let stamping = path.clone();
+            let future = RUNTIME_DELIVERY_DOMAIN.supported_version() + 1;
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                Connection::open(&stamping)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO main.meerkat_schema (domain, version) VALUES (?1, ?2)",
+                        params![RUNTIME_DELIVERY_DOMAIN.name, future],
+                    )
+                    .unwrap();
+            });
+
+            let read = open_runtime_delivery_read_connection(&path);
+
+            assert!(
+                matches!(
+                    &read,
+                    Err(RuntimeStoreError::SchemaFromTheFuture { domain, found, .. })
+                        if domain == RUNTIME_DELIVERY_DOMAIN.name && *found == future
+                ),
+                "a future delivery domain is refused, not read: provisioned={:?}",
+                read.as_ref().map(Option::is_some)
+            );
+        }
+
+        /// A continuation read decides on the delivery domain version its
+        /// open verified. The domain is at version 1 (no continuation
+        /// tables) when the read opens, and its ledger row alone is
+        /// restamped to a newer version right after the read's check: the
+        /// read answers from version 1 and never queries tables this file
+        /// does not have.
+        #[tokio::test]
+        async fn a_continuation_read_decides_on_the_version_its_open_verified() {
+            const DELIVERY_V1: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+                name: RUNTIME_DELIVERY_DOMAIN.name,
+                migrations: &[meerkat_sqlite::Migration {
+                    version: 1,
+                    name: "delivery-inbox",
+                    apply: migration_0001_runtime_delivery_inbox,
+                }],
+                initialize_current: migration_0001_runtime_delivery_inbox,
+                allowed_existing_versions: &[1],
+                bridge_recoverable_versions: &[],
+                released_predecessors: &[],
+                owned_objects: RELEASED_RUNTIME_DELIVERY_V1_OBJECTS,
+                retired_objects: &[],
+            };
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let mut seed = Connection::open(&path).unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut seed, &DELIVERY_V1)
+                .expect("a version-1 delivery domain");
+            drop(seed);
+            let restamp = path.clone();
+            // The first probe runs in the open's own preflight and arms the
+            // second, which runs in the check whose version the read keeps.
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                    Connection::open(&restamp)
+                        .unwrap()
+                        .execute(
+                            "UPDATE main.meerkat_schema SET version = ?1 WHERE domain = ?2",
+                            params![
+                                RUNTIME_DELIVERY_DOMAIN.supported_version() + 1,
+                                RUNTIME_DELIVERY_DOMAIN.name
+                            ],
+                        )
+                        .unwrap();
+                });
+            });
+
+            let binding = store.load_continuation_key_binding("owner", "key").await;
+
+            assert!(
+                matches!(binding, Ok(None)),
+                "a version-1 delivery file holds no bindings: {binding:?}"
+            );
+        }
+
+        /// The delivery generation is read only when the version the read's
+        /// open verified has the counter. The domain is at version 2 (no
+        /// counter) when the read opens; right after the read's check
+        /// another writer migrates it to the current version and counts a
+        /// commit. The read answers from version 2, never from a counter its
+        /// check did not see.
+        #[tokio::test]
+        async fn a_generation_read_decides_on_the_version_its_open_verified() {
+            const DELIVERY_V2: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
+                name: RUNTIME_DELIVERY_DOMAIN.name,
+                migrations: &[
+                    meerkat_sqlite::Migration {
+                        version: 1,
+                        name: "delivery-inbox",
+                        apply: migration_0001_runtime_delivery_inbox,
+                    },
+                    meerkat_sqlite::Migration {
+                        version: 2,
+                        name: "continuation-ledger",
+                        apply: migration_0002_runtime_continuation_ledger,
+                    },
+                ],
+                initialize_current: build_runtime_delivery_v2_schema,
+                allowed_existing_versions: &[2],
+                bridge_recoverable_versions: &[],
+                released_predecessors: &[],
+                owned_objects: RUNTIME_DELIVERY_V2_OBJECTS,
+                retired_objects: &[],
+            };
+            let (_dir, store) = temp_store();
+            let path = store.path().to_path_buf();
+            let mut seed = Connection::open(&path).unwrap();
+            meerkat_sqlite::apply_domain_migrations(&mut seed, &DELIVERY_V2)
+                .expect("a version-2 delivery domain");
+            drop(seed);
+            let writer = path.clone();
+            // As in the continuation case, the second probe runs in the check
+            // whose version the read keeps.
+            meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                meerkat_sqlite::arm_preflight_probe_for_test(move || {
+                    let conn = open_runtime_delivery_write_connection(&writer)
+                        .expect("the other writer migrates to the current version");
+                    conn.execute(
+                        "UPDATE runtime_delivery_generation SET generation = generation + 1 \
+                         WHERE singleton = 1",
+                        [],
+                    )
+                    .unwrap();
+                });
+            });
+
+            let generation = store.load_delivery_generation().await;
+
+            assert!(
+                matches!(generation, Ok(0)),
+                "a version-2 delivery file has no counter yet: {generation:?}"
+            );
         }
 
         #[tokio::test]
