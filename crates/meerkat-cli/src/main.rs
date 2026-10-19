@@ -23848,7 +23848,7 @@ mod tests {
         let store: Arc<dyn TokenStore> = Arc::new(EphemeralTokenStore::new());
         let auth_lease = new_cli_auth_handles().0;
         let auth_binding = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").expect("realm id parses"),
+            realm: meerkat_core::RealmId::parse("cli-save-boundary").expect("realm id parses"),
             binding: meerkat_core::BindingId::parse("default_openai").expect("binding id parses"),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -23942,7 +23942,7 @@ mod tests {
         let store: Arc<dyn TokenStore> = Arc::new(SaveFailingTokenStore);
         let auth_lease = new_cli_auth_handles().0;
         let auth_binding = meerkat_core::AuthBindingRef {
-            realm: meerkat_core::RealmId::parse("dev").expect("realm id parses"),
+            realm: meerkat_core::RealmId::parse("cli-save-failure").expect("realm id parses"),
             binding: meerkat_core::BindingId::parse("default_openai").expect("binding id parses"),
             profile: None,
             origin: meerkat_core::connection::BindingOrigin::Configured,
@@ -24479,6 +24479,21 @@ mod tests {
         }
     }
 
+    /// The login lifecycle guard is process-wide per lease key. A test that
+    /// takes it (a login, a token commit, a rollback) or reads status with
+    /// no live lease uses a realm of its own: under `cargo test`, another
+    /// test on the same key would block it, or make its status read find the
+    /// owner busy.
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    fn openai_auth_binding_in(realm: &str) -> AuthBindingRef {
+        AuthBindingRef {
+            realm: meerkat_core::RealmId::parse(realm).expect("realm id parses"),
+            binding: meerkat_core::BindingId::parse("openai_oauth").expect("binding id parses"),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        }
+    }
+
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     fn openai_oauth_tokens() -> meerkat_providers::auth_store::PersistedTokens {
         meerkat_providers::auth_store::PersistedTokens {
@@ -24496,15 +24511,15 @@ mod tests {
 
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     fn mark_tokens_lifecycle_published_for_test(
+        auth_binding: &AuthBindingRef,
         tokens: &meerkat_providers::auth_store::PersistedTokens,
         generation: u64,
         credential_published_at_millis: Option<u64>,
     ) -> meerkat_providers::auth_store::PersistedTokens {
         let _ = (generation, credential_published_at_millis);
         let handle = meerkat_runtime::RuntimeAuthLeaseHandle::new();
-        let key =
-            meerkat_providers::auth_store::TokenKey::from_auth_binding(&openai_auth_binding());
-        let lease_key = meerkat_core::handles::LeaseKey::from_auth_binding(&openai_auth_binding());
+        let key = meerkat_providers::auth_store::TokenKey::from_auth_binding(auth_binding);
+        let lease_key = meerkat_core::handles::LeaseKey::from_auth_binding(auth_binding);
         let transition = meerkat_core::handles::AuthLeaseHandle::acquire_lease(
             &handle,
             &lease_key,
@@ -25063,12 +25078,12 @@ mod tests {
 
         let store = EphemeralTokenStore::new();
         let auth_lease = new_cli_auth_handles().0;
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-status-rehydrate");
         let tokens = openai_oauth_tokens();
         store
             .save(
                 &TokenKey::from_auth_binding(&auth_binding),
-                &mark_tokens_lifecycle_published_for_test(&tokens, 1, None),
+                &mark_tokens_lifecycle_published_for_test(&auth_binding, &tokens, 1, None),
             )
             .await
             .expect("token save succeeds");
@@ -25093,6 +25108,10 @@ mod tests {
         .await
         .expect("AuthMachine freshness observation succeeds");
 
+        assert_eq!(
+            projection.credential_observation, None,
+            "the status read was answered, not refused with the owner busy"
+        );
         assert_eq!(projection.phase, AuthStatusPhase::Valid);
         assert!(projection.expires_at.is_some());
         let snapshot = auth_lease.snapshot(&LeaseKey::from_auth_binding(&auth_binding));
@@ -25211,7 +25230,7 @@ mod tests {
             ),
         );
         let store: Arc<dyn TokenStore> = Arc::new(EphemeralTokenStore::new());
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-oauth-login-consume");
         let credential_identity =
             meerkat_core::AuthCredentialIdentity::from_auth_binding(&auth_binding);
         let redirect_uri = "http://127.0.0.1:12345/callback";
@@ -25442,7 +25461,7 @@ mod tests {
         let auth_lease = new_cli_auth_handles().0;
         let store = Arc::new(SaveCountingCliTokenStore::new());
         let mutation_store: Arc<dyn meerkat_providers::auth_store::TokenStore> = store.clone();
-        let auth_binding = openai_auth_binding();
+        let auth_binding = openai_auth_binding_in("cli-oauth-consume-failure");
         let provider = meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt;
 
         let err = save_cli_oauth_tokens_and_consume_browser_flow(
