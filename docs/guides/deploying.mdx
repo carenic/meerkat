@@ -114,7 +114,7 @@ That action uses cargo-xwin with clang-cl, lld-link, and the Windows SDK to
 cross-compile the four surface binaries and package their ZIP archives. It
 adds an 8 GiB swap file when total swap is below 8 GiB; it does not set
 `CARGO_BUILD_JOBS=2` or inject the per-package optimization pins shown below.
-The subsequent `verify_windows_binaries` job runs on `windows-latest`,
+The subsequent `verify_windows_binaries` job runs on `windows-2025-vs2026`,
 extracts the archives, executes each binary's `--version`, and checks
 `rkat --help`; it does not compile them natively. These workflow settings are
 not new wall-time or memory measurements. Continuous integration

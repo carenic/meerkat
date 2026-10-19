@@ -57,10 +57,9 @@ rust_library(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -96,10 +95,9 @@ rust_library(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = [
@@ -143,10 +141,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -203,10 +200,9 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -250,10 +246,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/auth_binding_wire.rs",
@@ -312,10 +307,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/backend_profile_prompt_cache_wire.rs",
@@ -372,10 +366,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/image_generation_wire.rs",
@@ -432,10 +425,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/jobs_wire.rs",
@@ -492,10 +484,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/live_audio_format.rs",
@@ -552,10 +543,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/live_barge_in.rs",
@@ -612,10 +602,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/live_deadline_and_jitter.rs",
@@ -672,10 +661,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/live_execution_identity_wire.rs",
@@ -732,10 +720,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/mob_wire.rs",
@@ -792,10 +779,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/regression_wire_types.rs",
@@ -854,10 +840,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/runtime_turn_metadata_wire_override.rs",
@@ -914,10 +899,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/session_accept_input_typed_round_trip.rs",
@@ -974,10 +958,9 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "tests/fixtures/auth_principals_v0_8_49.json",
-    ] + [
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
-        "//crates/meerkat-core:tests/fixtures/compiled_application_tool_policy_valid_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json",
+        "tests/fixtures/compiled_application_tool_policy_valid_v1.json",
     ],
     srcs = [
         "tests/skill_ref_wire_no_legacy.rs",

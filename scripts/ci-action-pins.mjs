@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Supply-chain guard for GitHub Actions: every third-party action is pinned
 // to a full commit SHA, every container image the workflows and the Bazel
-// execution platforms name is pinned by digest, and Renovate never
-// automerges an action update.
+// execution platforms name is pinned by digest, Renovate never automerges
+// an action update, and it automerges nothing younger than a week.
 //
 // usage: ci-action-pins.mjs [--root DIR]
 //   Reads every .github/**/*.yml and *.yaml under DIR (default: the
@@ -22,7 +22,14 @@
 //   after every rule that could turn it on for them; a custom.regex rule
 //   does the same for what its customManagers pin; nothing outside
 //   packageRules may turn automerge on (vulnerabilityAlerts, an update
-//   type's settings). A `docker://` action, a `container:` or `image:`
+//   type's settings); a packageRule that turns automerge on sets the 7-day
+//   minimumReleaseAge itself, and no later rule shortens or clears it;
+//   vulnerabilityAlerts turns automerge off, so a security fix arrives at
+//   once as a pull request for review; `extends` names only the presets
+//   in RENOVATE_PRESETS (another preset's rules could automerge with no
+//   age this check reads), and no key uses `stabilityDays`, the legacy
+//   spelling of minimumReleaseAge. A
+//   `docker://` action, a `container:` or `image:`
 //   value in .github, and a `docker://` reference in the Bazel files under
 //   tools/bazel/ (and .bazelrc) must name its image by `@sha256:` digest;
 //   UNPINNED_IMAGES lists the exceptions, each with its reason. A step
@@ -69,6 +76,8 @@ const MANAGER = "github-actions";
 // The manager Renovate runs renovate.json's customManagers as.
 const CUSTOM_MANAGER = "custom.regex";
 const PIN_PRESET = "helpers:pinGitHubActionDigests";
+// The presets renovate.json may extend: their rules turn no automerge on.
+const RENOVATE_PRESETS = ["config:recommended", PIN_PRESET];
 const MINIMUM_RELEASE_AGE = "7 days";
 
 function workflowFiles(dir) {
@@ -258,18 +267,23 @@ export function imageProblems(root) {
   return problems;
 }
 
-// Every `automerge: true` below `value`, by path.
-function automergePaths(value, path, out = []) {
+// Every path below `value` whose key and value match, by path.
+function keyPaths(value, path, matches, out = []) {
   if (Array.isArray(value)) {
-    value.forEach((item, index) => automergePaths(item, `${path}[${index}]`, out));
+    value.forEach((item, index) => keyPaths(item, `${path}[${index}]`, matches, out));
   } else if (value && typeof value === "object") {
     for (const [key, child] of Object.entries(value)) {
       const here = path ? `${path}.${key}` : key;
-      if (key === "automerge" && child === true) out.push(here);
-      automergePaths(child, here, out);
+      if (matches(key, child)) out.push(here);
+      keyPaths(child, here, matches, out);
     }
   }
   return out;
+}
+
+// Every `automerge: true` below `value`, by path.
+function automergePaths(value, path) {
+  return keyPaths(value, path, (key, child) => key === "automerge" && child === true);
 }
 
 // Does a rule apply to every github-actions digest update (a moved tag)?
@@ -283,6 +297,40 @@ function coversAllDigests(rule) {
     (types === undefined || (Array.isArray(types) && types.includes("digest"))) &&
     criteria.every((key) => key === "matchManagers" || key === "matchUpdateTypes")
   );
+}
+
+// The days a minimumReleaseAge of "N day(s)" or "N week(s)" holds a release
+// back; null for any other spelling (hours, null), which this check cannot
+// prove is a week.
+function ageDays(value) {
+  const match = /^\s*(\d+)\s*(day|week)s?\s*$/.exec(String(value));
+  return match ? Number(match[1]) * (match[2] === "week" ? 7 : 1) : null;
+}
+
+// An automerged update is merged without a review, so it waits until its
+// release is a week old: every packageRule that turns automerge on sets
+// that age itself, and no later rule (the last matching rule wins) sets a
+// shorter one or clears it for updates it leaves automerged (a rule that
+// turns automerge off for its own updates may).
+function automergeAgeProblems(rules) {
+  const problems = [];
+  let firstOn = -1;
+  rules.forEach((rule, index) => {
+    if (rule.automerge === true) {
+      if (firstOn < 0) firstOn = index;
+      if (rule.minimumReleaseAge !== MINIMUM_RELEASE_AGE) {
+        problems.push(`renovate.json: packageRules[${index}] turns automerge on without a minimumReleaseAge of "${MINIMUM_RELEASE_AGE}"`);
+      }
+    } else if (
+      firstOn >= 0 &&
+      rule.automerge !== false &&
+      Object.hasOwn(rule, "minimumReleaseAge") &&
+      !(ageDays(rule.minimumReleaseAge) >= 7)
+    ) {
+      problems.push(`renovate.json: packageRules[${index}] can shorten the release age of updates packageRules[${firstOn}] automerges`);
+    }
+  });
+  return problems;
 }
 
 // A manager's updates are never automerged: a rule for all of them turns
@@ -314,6 +362,19 @@ export function renovateProblems(config) {
   if (!(config.extends ?? []).includes(PIN_PRESET)) {
     problems.push(`renovate.json: extends lacks ${PIN_PRESET}, which keeps the action pins current`);
   }
+  for (const preset of config.extends ?? []) {
+    if (!RENOVATE_PRESETS.includes(preset)) {
+      problems.push(`renovate.json: extends names ${JSON.stringify(preset)}, a preset whose rules this check cannot read (only ${RENOVATE_PRESETS.join(", ")})`);
+    }
+  }
+  for (const path of keyPaths(config, "", (key) => key === "stabilityDays")) {
+    problems.push(`renovate.json: ${path} sets stabilityDays, the legacy spelling of minimumReleaseAge, which this check does not read`);
+  }
+  // A vulnerability fix ignores minimumReleaseAge (its default sets none),
+  // so if it may automerge, a patch-type fix would merge unreviewed at once.
+  if (config.vulnerabilityAlerts?.automerge !== false) {
+    problems.push("renovate.json: vulnerabilityAlerts does not turn automerge off, so a patch-type security fix would automerge with no release age");
+  }
   if (config.automerge === true) problems.push("renovate.json: automerge is on for every update");
   // packageRules' own automerge is ordered below; anything else applies to
   // github-actions updates whatever the rules say (vulnerabilityAlerts
@@ -323,6 +384,7 @@ export function renovateProblems(config) {
     problems.push(`renovate.json: ${path} turns automerge on outside packageRules`);
   }
   const rules = config.packageRules ?? [];
+  problems.push(...automergeAgeProblems(rules));
   problems.push(...managerRuleProblems(rules, MANAGER));
   // What the customManagers pin (container digests, a tool release) is
   // never automerged either.
@@ -368,7 +430,7 @@ function main(argv) {
     return 1;
   }
   process.stdout.write(
-    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins\n",
+    "ci-action-pins: every third-party action is SHA-pinned, every container image digest-pinned, every sccache-action step names an exact release, and Renovate never automerges an action or what a customManager pins, nor anything younger than a week\n",
   );
   return 0;
 }

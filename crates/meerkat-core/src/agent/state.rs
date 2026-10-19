@@ -2165,6 +2165,12 @@ where
     /// a silent default) as a fail-loud error rather than an
     /// `unwrap_or_default` silent-drop.
     fn runtime_turn_authority_snapshot(&self) -> Result<crate::TurnStateSnapshot, AgentError> {
+        Ok(self.runtime_turn_authority()?.snapshot())
+    }
+
+    /// The attached runtime-backed turn-state authority, after the checks
+    /// every turn-state read makes.
+    fn runtime_turn_authority(&self) -> Result<&dyn crate::TurnStateHandle, AgentError> {
         let handle = self.turn_state_handle.as_deref().ok_or_else(|| {
             AgentError::InternalError(
                 "runtime turn-state handle missing: agent was built without \
@@ -2181,7 +2187,7 @@ where
                     .to_string(),
             ));
         }
-        Ok(handle.snapshot())
+        Ok(handle)
     }
 
     fn turn_active_run_id(&self) -> Result<Option<RunId>, AgentError> {
@@ -2189,7 +2195,7 @@ where
     }
 
     pub(super) fn turn_phase(&self) -> Result<TurnPhase, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.turn_phase)
+        Ok(self.runtime_turn_authority()?.turn_phase())
     }
 
     /// Mirror the machine-owned turn-terminality verdict.
@@ -2204,12 +2210,13 @@ where
 
     fn turn_cancel_after_boundary(&self) -> Result<bool, AgentError> {
         Ok(self
-            .runtime_turn_authority_snapshot()?
+            .runtime_turn_authority()?
+            .scalars()
             .cancel_after_boundary)
     }
 
     fn turn_has_barrier_ops(&self) -> Result<bool, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.has_barrier_ops)
+        Ok(self.runtime_turn_authority()?.scalars().has_barrier_ops)
     }
 
     fn turn_barrier_operation_ids(&self) -> Result<Vec<crate::ops::OperationId>, AgentError> {
@@ -2230,7 +2237,7 @@ where
         // transitions and run start). The former derivation from the
         // loop-local `extraction_state.primary_output` scratch was shell
         // shadow truth with a divergence window during retry rounds.
-        Ok(self.runtime_turn_authority_snapshot()?.extraction_active)
+        Ok(self.runtime_turn_authority()?.scalars().extraction_active)
     }
 
     fn turn_terminal_outcome(&self) -> Result<TurnTerminalOutcome, AgentError> {
@@ -2240,18 +2247,19 @@ where
         // the in-handle `None` to `TurnTerminalOutcome::None` per the
         // DSL contract (see `TurnStateSnapshot::terminal_outcome` doc).
         Ok(self
-            .runtime_turn_authority_snapshot()?
+            .runtime_turn_authority()?
+            .scalars()
             .terminal_outcome
             .unwrap_or(TurnTerminalOutcome::None))
     }
 
     fn turn_terminal_cause_kind(&self) -> Result<Option<TurnTerminalCauseKind>, AgentError> {
-        Ok(self.runtime_turn_authority_snapshot()?.terminal_cause_kind)
+        Ok(self.runtime_turn_authority()?.scalars().terminal_cause_kind)
     }
 
     fn turn_extraction_attempts(&self) -> Result<u32, AgentError> {
-        let snapshot = self.runtime_turn_authority_snapshot()?;
-        u32::try_from(snapshot.extraction_attempts).map_err(|_| {
+        let scalars = self.runtime_turn_authority()?.scalars();
+        u32::try_from(scalars.extraction_attempts).map_err(|_| {
             AgentError::InternalError(
                 "runtime turn-state authority projected extraction_attempts outside u32 range"
                     .to_string(),
@@ -3181,9 +3189,15 @@ where
         input: TurnExecutionInput,
     ) -> Result<TurnExecutionTransition, AgentError> {
         validate_turn_input_failure_reason(&input)?;
-        let prev_phase = self.turn_phase()?;
-        let effects = self.apply_turn_input_via_runtime_handle(&input)?;
-        let next_phase = self.turn_phase()?;
+        let handle = self.runtime_turn_authority()?;
+        let prev_phase = handle.turn_phase();
+        let (effects, next_phase) = handle
+            .apply_turn_input_observing_phase(input.clone())
+            .map_err(|err| {
+                AgentError::InternalError(format!(
+                    "runtime turn-state handle rejected {input:?}: {err}"
+                ))
+            })?;
 
         Ok(TurnExecutionTransition {
             prev_phase,
