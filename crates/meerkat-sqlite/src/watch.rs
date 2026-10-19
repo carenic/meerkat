@@ -199,6 +199,16 @@ struct RegistrationThread {
     started: Instant,
 }
 
+impl RegistrationThread {
+    fn describe(&self) -> SqliteWatchRetainedRegistration {
+        SqliteWatchRetainedRegistration {
+            directory: self.directory.clone(),
+            thread_name: self.name.clone(),
+            running_for: self.started.elapsed(),
+        }
+    }
+}
+
 /// Custody of a watch's notification registration: its result, and its
 /// thread until that is joined.
 struct RegistrationCustody {
@@ -276,6 +286,16 @@ impl RegistrationCustody {
             RegistrationSlot::Failed(reason) => SqliteWatchRegistration::Failed(reason.clone()),
             RegistrationSlot::Cancelled => SqliteWatchRegistration::Cancelled,
         }
+    }
+
+    /// The registration's thread while the registration is pending. Its
+    /// thread settles the slot before it ends, so a pending registration's
+    /// thread is running.
+    fn pending(&self) -> Option<SqliteWatchRetainedRegistration> {
+        if !matches!(*lock(&self.slot), RegistrationSlot::Pending) {
+            return None;
+        }
+        self.thread.as_ref().map(RegistrationThread::describe)
     }
 
     /// Stop the notifications, once the stop flag is set: drop a registered
@@ -368,6 +388,20 @@ impl SqliteChangeWatch {
         self.registration.state()
     }
 
+    /// The notification registration this watch would leave with the
+    /// process if it were dropped now, described as
+    /// [`retained_registrations`] would list it: `Some` exactly while
+    /// [`Self::registration`] is [`SqliteWatchRegistration::Pending`].
+    ///
+    /// Read after a stop request, it names the registration the stop
+    /// cancelled while the operating system still held it: that thread
+    /// discards the result when the platform call returns, and until then
+    /// stays with this watch or, once the watch is dropped, with the
+    /// process.
+    pub fn pending_registration(&self) -> Option<SqliteWatchRetainedRegistration> {
+        self.registration.pending()
+    }
+
     /// Request the stop, stop the notifications, and wait for the worker to
     /// return: a tick that is running finishes first. Unbounded by design: it
     /// waits exactly as long as that tick runs.
@@ -421,7 +455,8 @@ fn retained() -> &'static Mutex<Vec<RegistrationThread>> {
 }
 
 /// A notification registration still running after its watch was dropped
-/// ([`retained_registrations`]).
+/// ([`retained_registrations`]), or one a live watch would leave with the
+/// process ([`SqliteChangeWatch::pending_registration`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SqliteWatchRetainedRegistration {
@@ -440,14 +475,7 @@ pub struct SqliteWatchRetainedRegistration {
 pub fn retained_registrations() -> Vec<SqliteWatchRetainedRegistration> {
     let mut retained = lock(retained());
     reap(&mut retained);
-    retained
-        .iter()
-        .map(|thread| SqliteWatchRetainedRegistration {
-            directory: thread.directory.clone(),
-            thread_name: thread.name.clone(),
-            running_for: thread.started.elapsed(),
-        })
-        .collect()
+    retained.iter().map(RegistrationThread::describe).collect()
 }
 
 fn retain_registration(thread: RegistrationThread) {
@@ -1447,6 +1475,69 @@ mod tests {
             "the process joins a retained registration once it returns"
         );
         assert_eq!((held.live_sources(), held.dropped_sources()), (0, 1));
+    }
+
+    #[test]
+    fn a_pending_registration_is_described_as_the_process_retains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = test_support::hold_registrations_in(dir.path()).unwrap();
+        let directory = dir.path().canonicalize().unwrap();
+        let db = dir.path().join("store.sqlite3");
+        let watch =
+            start_sqlite_change_watch(&db, "test-held-pending", Duration::from_millis(20), |_| {
+                SqliteWatchControl::Handled
+            })
+            .expect("watch starts");
+        assert!(
+            held.wait_entered(1, HANG_GUARD),
+            "the registration reached its platform call"
+        );
+
+        // The stop cancels the held registration without ending it: it is
+        // still pending, and dropping the watch hands exactly it to the
+        // process.
+        watch.request_stop();
+        let pending = watch
+            .pending_registration()
+            .expect("a held registration is pending");
+        assert_eq!(pending.directory, directory);
+        assert_eq!(pending.thread_name, "test-held-pending-register");
+        drop(watch);
+        let retained = retained_in(&directory);
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert_eq!(
+            (&retained[0].directory, &retained[0].thread_name),
+            (&pending.directory, &pending.thread_name)
+        );
+
+        held.release();
+        let deadline = Instant::now() + HANG_GUARD;
+        while !retained_in(&directory).is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(retained_in(&directory).is_empty());
+    }
+
+    #[test]
+    fn a_settled_registration_is_not_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        // Released before the watch starts: the registration completes at
+        // once, without a platform call.
+        let held = test_support::hold_registrations_in(dir.path()).unwrap();
+        held.release();
+        let db = dir.path().join("store.sqlite3");
+        let watch =
+            start_sqlite_change_watch(&db, "test-settled-pending", SQLITE_WATCH_SWEEP, |_| {
+                SqliteWatchControl::Handled
+            })
+            .expect("watch starts");
+        assert_eq!(
+            settled_registration(&watch),
+            SqliteWatchRegistration::Registered
+        );
+        assert_eq!(watch.pending_registration(), None);
+        watch.request_stop();
+        assert_eq!(watch.pending_registration(), None);
     }
 
     #[test]

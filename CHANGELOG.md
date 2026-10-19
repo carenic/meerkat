@@ -42,6 +42,14 @@ them.
   drained observer's change watches that were still running when the drain
   stopped them (see Fixed). Code that builds the report with a struct
   literal sets it.
+- Not measured by the gate (a return type change): `meerkat`:
+  `RuntimeDeliveryOwnerRetirement::join` returns
+  `Result<RuntimeDeliveryOwnerRetired, RuntimeDeliveryOwnerRetirementIncomplete>`
+  instead of `Result<(), RuntimeDeliveryOwnerRetirementIncomplete>`: the
+  report names the store watch's notification registration the retirement
+  left with the process (see Added). Code that uses `?` or discards the
+  value compiles unchanged; code that matches `Ok(())` matches `Ok(_)` or
+  reads the report.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` or
   `RefUnwindSafe`: it now carries the member's exact
   `RuntimeSessionRegistrationWitness` (see `registration()` under Added),
@@ -184,6 +192,21 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat`: a retired runtime delivery owner reports the file notification
+  registration of its store watch when the operating system still held it
+  as the owner stopped the watch:
+  `RuntimeDeliveryOwnerRetirement::join` returns `RuntimeDeliveryOwnerRetired`,
+  whose `notification_registration_retained` names the registered directory
+  (`meerkat_runtime::RetainedNotificationRegistration`). Nothing can
+  interrupt that platform call (macOS FSEvents can hold it for tens of
+  seconds), so the retirement cancels the registration without waiting for
+  it, and its thread stays with the process until the call returns, as a
+  mob observer drain reports its own (`retained_registrations`).
+  `meerkat-runtime`: `DeliveryStoreWatch::stop` stops a watch as dropping it
+  does and returns that registration. `meerkat-sqlite`:
+  `SqliteChangeWatch::pending_registration` describes the registration a
+  watch would leave with the process, as
+  `meerkat_sqlite::watch::retained_registrations` lists it.
 
 ### Changed
 

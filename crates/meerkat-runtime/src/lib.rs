@@ -646,9 +646,9 @@ pub use session_hosting::spawn_blocking_holding_claim;
 pub use session_hosting::{
     ColdDeliveryOwnership, HostingAcquisition, HostingCapability, HostingClaim,
     HostingClaimUnavailable, HostingOwner, HostingOwnerLossProof, HostingPaths, HostingRefused,
-    OwnerLossAttachment, OwnerLossReservation, ServedElsewhere, SessionHostingAuthority,
-    SessionServing, grant_session_hosting, local_session_serving, os_lock_if_trusted,
-    try_cold_delivery_ownership, with_write_hosting,
+    OwnerLossAttachment, OwnerLossReservation, RetainedNotificationRegistration, ServedElsewhere,
+    SessionHostingAuthority, SessionServing, grant_session_hosting, local_session_serving,
+    os_lock_if_trusted, try_cold_delivery_ownership, with_write_hosting,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use session_hosting::{DELIVERY_STORE_SWEEP, DeliveryStoreWatch, watch_delivery_store};

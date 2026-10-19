@@ -223,7 +223,7 @@ mod runtime_delivery_owner;
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime_delivery_owner::{
     OwedContinuationCursor, OwedContinuationProjection, RuntimeDeliveryHost, RuntimeDeliveryOwner,
-    RuntimeDeliveryOwnerHandle, RuntimeDeliveryOwnerRetirement,
+    RuntimeDeliveryOwnerHandle, RuntimeDeliveryOwnerRetired, RuntimeDeliveryOwnerRetirement,
     RuntimeDeliveryOwnerRetirementIncomplete, RuntimeDeliveryPass, default_address_resolution,
 };
 #[cfg(not(target_arch = "wasm32"))]
