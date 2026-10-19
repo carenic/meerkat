@@ -37,7 +37,7 @@ are first reduced to generic runtime or mob contracts.
 
 ## Excluded From This Plan
 
-The following feature areas should be planned in `~/src/meerkat-mobkit`, not in
+The following feature areas should be planned in the Meta repository, not in
 this repository, unless a smaller generic contract is identified first:
 
 - runtime host registry/discovery as a deployable registry service
