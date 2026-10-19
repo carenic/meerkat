@@ -74,6 +74,20 @@ impl OwnerChangeWait {
             Self::Settled { waited } | Self::NotSettled { waited } => waited,
         }
     }
+
+    /// Record this wait of `operation` at `site` as one `debug` event of
+    /// target `meerkat::authz::owner_change_wait`, with `waited_ms` and
+    /// `settled`, so a host can tell a waited refusal from a final one.
+    pub fn trace(self, site: &'static str, operation: Option<&crate::OperationId>) {
+        tracing::debug!(
+            target: "meerkat::authz::owner_change_wait",
+            site,
+            operation_id = operation.map(tracing::field::display),
+            waited_ms = u64::try_from(self.waited().as_millis()).unwrap_or(u64::MAX),
+            settled = self.settled(),
+            "operation waited for an owner change"
+        );
+    }
 }
 
 impl OwnerChangeChurn {
@@ -87,9 +101,10 @@ impl OwnerChangeChurn {
     /// wait for that change, and for any later one, to complete. The first
     /// call sets the operation's deadline to [`OWNER_CHANGE_WAIT_BOUND`] from
     /// now, clamped to `budget_remaining`, and later calls keep it. A free
-    /// rebuild is granted only once the sequence has moved past the change
-    /// seen here and is not odd again, and at most
-    /// [`OWNER_CHANGE_FREE_REBUILDS`] times per operation. A publication
+    /// rebuild is granted only when a read finds no change in progress, and
+    /// at most [`OWNER_CHANGE_FREE_REBUILDS`] times per operation. The
+    /// sequence only moves forward, so such a read means the sequence has
+    /// moved past the change seen here and is not odd again. A publication
     /// poisoned during the wait also ends it as settled; see
     /// [`OwnerChangeWait::Settled`].
     ///

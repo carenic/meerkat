@@ -39,8 +39,8 @@ pub enum HelperChildIssuanceRefusal {
     /// requested bounds refuse it, or the intended id names another grant.
     /// No child was appended.
     Denied,
-    /// The owners cannot say now (contention, clock or custody). No child
-    /// was appended.
+    /// The owners cannot say now (contention, a refusal to rebuild after an
+    /// owner change, clock or custody). No child was appended.
     Unavailable,
     /// Whether a child was appended is unknown: the grant owner's append
     /// outcome was uncertain (the owner is then unavailable until restored),
@@ -166,7 +166,9 @@ impl GovernedHelperChildIssuance {
                         .map_or(Err(HelperChildIssuanceRefusal::Uncertain), |outcome| {
                             (*outcome).map_err(child_refusal)
                         }),
-                    Err(meerkat_core::ToolError::AuthorizationRefused { .. }) => {
+                    Err(meerkat_core::ToolError::AuthorizationRefused { refusal, .. })
+                        if super::effect_leaf_denies(refusal) =>
+                    {
                         Err(HelperChildIssuanceRefusal::Denied)
                     }
                     Err(_) => Err(HelperChildIssuanceRefusal::Unavailable),
@@ -177,8 +179,13 @@ impl GovernedHelperChildIssuance {
             .grants
             .issue_or_recover_child_under_exclusion(&self.intent, || {
                 prepared.originating().map_err(|error| match error {
-                    OperationAuthorizationError::Refused(_) => GrantRefusal::Denied,
-                    OperationAuthorizationError::Unavailable
+                    OperationAuthorizationError::Refused(refusal)
+                        if super::effect_leaf_denies(refusal) =>
+                    {
+                        GrantRefusal::Denied
+                    }
+                    OperationAuthorizationError::Refused(_)
+                    | OperationAuthorizationError::Unavailable
                     | OperationAuthorizationError::ObservationUnavailable(_) => {
                         GrantRefusal::Unavailable
                     }

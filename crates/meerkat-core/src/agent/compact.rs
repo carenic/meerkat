@@ -645,6 +645,9 @@ fn is_compaction_capacity_error(error: &crate::error::AgentError) -> bool {
 
 pub(crate) struct CompactionInvocation<'a> {
     pub(crate) authorization: Option<crate::LlmRequestAuthorization>,
+    /// The run's budget: a summary call waiting for an owner change never
+    /// waits past it.
+    pub(crate) budget: Option<&'a crate::budget::Budget>,
     /// Exact model-facing projection. Superseded prompt versions remain in
     /// the durable `window` for rewrite validation but never enter forecasts
     /// or the summarization request.
@@ -761,6 +764,7 @@ where
 {
     let CompactionInvocation {
         authorization,
+        budget,
         model_messages,
         observation_source,
         window,
@@ -846,17 +850,41 @@ where
             compaction_prompt.to_string(),
         )));
 
-        // Call LLM with empty tools, max_summary_tokens
-        let llm_result = client
-            .stream_response_authorized(
-                &compaction_messages,
-                &[],
-                max_summary_tokens,
-                None,
-                None,
-                authorization,
-            )
-            .await;
+        // Call LLM with empty tools, max_summary_tokens. A summary refused
+        // because an owner change is still in progress on the work's own
+        // publication waits for it (bounded) and asks again under the same
+        // operation; any other refusal fails this compaction as before.
+        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
+        let llm_result = loop {
+            let result = client
+                .stream_response_authorized(
+                    &compaction_messages,
+                    &[],
+                    max_summary_tokens,
+                    None,
+                    None,
+                    authorization.clone(),
+                )
+                .await;
+            if let Err(error) = &result
+                && error.operation_refusal().is_some_and(|refusal| {
+                    refusal.kind() == crate::OperationRefusalKind::ReprepareRequired
+                })
+                && let Some(request) = authorization.as_ref()
+                && let Some(wait) = owner_change_churn
+                    .wait_for_settled_change(
+                        request.work_authorization().authorization().as_ref(),
+                        budget.and_then(crate::budget::Budget::remaining_duration),
+                    )
+                    .await
+            {
+                wait.trace("compaction_summary", Some(request.operation_id()));
+                if wait.settled() {
+                    continue;
+                }
+            }
+            break result;
+        };
 
         // A summary the provider stopped because the model context window
         // filled is truncated. It joins the capacity fallback below instead
@@ -1435,6 +1463,7 @@ mod tests {
             None,
             CompactionInvocation {
                 authorization: None,
+                budget: None,
                 model_messages: &model_messages,
                 observation_source: CompactionObservationSource::from_session(session).unwrap(),
                 window: CompactionWindow {
@@ -1727,6 +1756,7 @@ mod tests {
             Some(&curator),
             CompactionInvocation {
                 authorization: None,
+                budget: None,
                 model_messages: &model_messages,
                 observation_source: CompactionObservationSource::from_session(&session).unwrap(),
                 window: CompactionWindow {

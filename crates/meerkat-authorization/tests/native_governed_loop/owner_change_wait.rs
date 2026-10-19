@@ -10,6 +10,7 @@ use meerkat_core::authorization::{
 };
 
 const ANSWER: &str = "answered after the owner change";
+const TOOL_CALL: &str = "read-during-change";
 
 /// How the scripted transport churns the run's publication.
 #[derive(Clone, Copy)]
@@ -20,6 +21,10 @@ enum Churn {
     /// `hold`: changes that keep beginning as each one completes. Other
     /// operations find the last one completed.
     EveryRequestOfFirstOperation { hold: Duration },
+    /// The first request answers with a tool call and, once that request is
+    /// checked, begins one change held for `hold`: the tool's dispatch meets
+    /// it. A request carrying the tool's result answers.
+    HeldOverToolCall { hold: Duration },
 }
 
 /// One request the transport received.
@@ -135,7 +140,7 @@ impl LlmClient for ChurnProvider {
             }
             // Another operation finds the last change completed.
             Churn::EveryRequestOfFirstOperation { .. } => self.join_holders(),
-            Churn::HeldOnce { .. } => {}
+            Churn::HeldOnce { .. } | Churn::HeldOverToolCall { .. } => {}
         }
         // The physical transport's own exact target, checked immediately
         // before entry, as the real adapter does.
@@ -167,6 +172,24 @@ impl LlmClient for ChurnProvider {
             messages: request.request().messages.clone(),
             observed: check.policy_observation(),
         });
+        if let Churn::HeldOverToolCall { hold } = self.churn
+            && tool_feedback(&request.request().messages, TOOL_CALL).is_none()
+        {
+            return Box::pin(
+                futures::stream::once(async move {
+                    if self.first_held.lock().expect("held token").is_none() {
+                        self.hold_change(hold);
+                    }
+                    Ok(LlmEvent::ToolCallComplete {
+                        id: TOOL_CALL.into(),
+                        name: "read_record".into(),
+                        args: serde_json::json!({"record":"record-7"}),
+                        meta: None,
+                    })
+                })
+                .chain(futures::stream::iter([done(StopReason::ToolUse)])),
+            );
+        }
         // Keep the run alive while the test reads its real row.
         Box::pin(
             futures::stream::once(async move {
@@ -196,10 +219,11 @@ struct NativeRun {
 }
 
 /// Admit one governed prompt on a native host whose grant owner shares
-/// `publication`, served by `provider`.
+/// `publication`, served by `provider` and `tools`.
 async fn start_native_run(
     provider: Arc<ChurnProvider>,
     publication: LocalAuthorizationPublication,
+    tools: Arc<RecordingTools>,
 ) -> NativeRun {
     let grants = Arc::new(
         LocalGrantAuthority::new(
@@ -247,7 +271,7 @@ async fn start_native_run(
     );
     let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
     builder.default_llm_client = Some(provider);
-    builder.default_tool_dispatcher = Some(Arc::new(RecordingTools::default()));
+    builder.default_tool_dispatcher = Some(tools);
     builder.default_session_store = Some(Arc::new(RecordingStore::default()));
     let service = Arc::new(EphemeralSessionService::new(builder, 2));
     let created = meerkat::surface::materialize_ephemeral_runtime_session(
@@ -402,7 +426,12 @@ async fn a_held_owner_change_is_waited_out_by_the_native_model_request() {
         },
         publication.clone(),
     ));
-    let run = start_native_run(Arc::clone(&provider), publication).await;
+    let run = start_native_run(
+        Arc::clone(&provider),
+        publication,
+        Arc::new(RecordingTools::default()),
+    )
+    .await;
     let (audit, outcome) = answered_run(&provider, run).await;
 
     let requests = provider.requests();
@@ -496,7 +525,12 @@ async fn a_publication_storm_bounds_native_model_attempts_and_their_audit() {
         },
         publication.clone(),
     ));
-    let run = start_native_run(Arc::clone(&provider), publication).await;
+    let run = start_native_run(
+        Arc::clone(&provider),
+        publication,
+        Arc::new(RecordingTools::default()),
+    )
+    .await;
     let (audit, outcome) = answered_run(&provider, run).await;
 
     let requests = provider.requests();
@@ -546,4 +580,131 @@ async fn a_publication_storm_bounds_native_model_attempts_and_their_audit() {
         panic!("the controller feedback request answers: {outcome:?}")
     };
     assert_eq!(result.text, ANSWER);
+}
+
+/// An owner change that begins while the model's tool call is on its way to
+/// dispatch, held past the dispatch's immediate rebuild. The governed
+/// dispatch asks the run's own work authorization, which reports the change
+/// through every wrapper; it waits for the change and prepares the same
+/// operation again. The body runs once, the model receives its result and no
+/// refusal, and the audit holds the refused preparation and one preparation,
+/// at the publication the held change completed. A wait that asked a work
+/// which does not report the change, as an exact-control work does not,
+/// would refuse the tool instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_owner_change_is_waited_out_by_the_native_tool_dispatch() {
+    let publication = LocalAuthorizationPublication::new();
+    let provider = Arc::new(ChurnProvider::new(
+        Churn::HeldOverToolCall {
+            hold: Duration::from_millis(500),
+        },
+        publication.clone(),
+    ));
+    let tools = Arc::new(RecordingTools::default());
+    let run = start_native_run(Arc::clone(&provider), publication, Arc::clone(&tools)).await;
+    let (audit, outcome) = answered_run(&provider, run).await;
+
+    assert_eq!(
+        *tools.0.lock().expect("body entries"),
+        ["read_record"],
+        "the body ran once"
+    );
+    let feedback = provider
+        .requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .find_map(|request| tool_feedback(&request.messages, TOOL_CALL))
+        .expect("the tool result reached the model");
+    assert!(!feedback.is_error, "{}", feedback.text_content());
+    assert_eq!(feedback.text_content(), "record-7 value");
+    let held = provider
+        .first_held
+        .lock()
+        .expect("held token")
+        .expect("a change was in progress at the tool call");
+    let answered = provider
+        .requests()
+        .last()
+        .and_then(|(_, observed)| *observed)
+        .expect("the answering request observed its publication");
+    let PolicyPublicationObservation::LocalPublication { instance, sequence } = answered;
+    assert_eq!(
+        held,
+        OwnerChangeInProgress::new(instance, sequence - 1),
+        "the held change completed at the publication the answer observed"
+    );
+    let tool_operation = audit
+        .iter()
+        .find_map(|(id, observation)| match observation {
+            AuditObservation::Refused { target, .. }
+            | AuditObservation::Prepared { target, .. }
+                if matches!(target.as_ref(), AuditTarget::Tool { call_id, .. }
+                    if call_id == TOOL_CALL) =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .expect("the audit names the tool operation");
+    let records: Vec<&AuditObservation> = audit
+        .iter()
+        .filter(|(id, _)| *id == tool_operation)
+        .map(|(_, observation)| observation)
+        .collect();
+    let refused: Vec<OperationRefusalKind> = records
+        .iter()
+        .filter_map(|observation| match observation {
+            AuditObservation::Refused { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !refused.is_empty(),
+        "the dispatch met the change: {records:?}"
+    );
+    assert!(
+        refused
+            .iter()
+            .all(|reason| *reason == OperationRefusalKind::ReprepareRequired),
+        "{refused:?}"
+    );
+    let prepared: Vec<u64> = records
+        .iter()
+        .filter_map(|observation| match observation {
+            AuditObservation::Prepared { policy, .. } => Some(policy.publication_sequence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prepared, [sequence], "exactly one preparation, at S + 2");
+    assert!(
+        !records.iter().any(|observation| matches!(
+            observation,
+            AuditObservation::AuthorizationUnavailable { .. }
+        )),
+        "no unavailable record"
+    );
+    assert!(records.iter().any(|observation| matches!(
+        observation,
+        AuditObservation::Outcome {
+            outcome: OperationObservedOutcome::ToolDispatchReturned {
+                result_is_error: false,
+                ..
+            }
+        }
+    )));
+    assert!(
+        !provider
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|request| refusal_notice(&request.messages)),
+        "no refusal notice reached the model"
+    );
+    let CompletionOutcome::Completed(result) = outcome else {
+        panic!("a waited owner change must not end the run: {outcome:?}")
+    };
+    assert_eq!(result.text, ANSWER);
+    assert!(result.terminal_cause_kind.is_none());
 }
