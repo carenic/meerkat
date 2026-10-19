@@ -51,6 +51,49 @@ last `MobReset`, and every spawn takes its generation from the MobMachine. A
 member re-spawned after a reset and a restart therefore never reuses its
 pre-reset runtime id or member address.
 
+### Member binding history
+
+Since 0.9.4 a Rust host can read which member incarnation held which session.
+`MobHandle::member_binding_history()` folds the mob's durable member journal
+and Core's identity intent rows, read in one store transaction, into a
+`MemberBindingHistory`. `MobReadHandle` (`read_handle()`) has the same reads.
+
+| Read | Answers |
+|------|---------|
+| `member_binding_for_session(session_id)` | The latest binding that named the session, across mob resets. A resume keeps a session across generations. |
+| `last_member_binding(identity)` | The identity's latest incarnation since the latest mob reset, live or retired. A retired identity's session is the one `ensure_member` with `MemberLaunchMode::Resume` can restore. |
+| `durable_identity_members()` | The live members spawned with `SpawnContinuityIntent::DurableIdentity`. |
+| `identity_management(identity)` | Whether Core holds an identity intent row for the identity, spawned or not. |
+
+The history value answers the same questions (`binding_for_session`,
+`last_binding`, `durable_identity_members`, `identity_management`), and
+`durable_identity_bindings` lists every durable identity's last binding since
+the latest mob reset, live or retired.
+
+Each `MemberBinding` carries its identity, generation, session (none for a
+peer-only member), role, continuity intent and a `MemberBindingState`: `Live`,
+`Moved` (a binding recovery moved the membership to another session) or
+`Retired` (retired, or ended by a mob reset). `MemberIdentityManagement` is
+`CommandDriven` (lifecycle commands alone drive the identity), `IntentManaged`
+(Core's identity reconciler drives it, so lifecycle commands from another
+caller would make a second driver) or `IntentUnreadable` (an intent row this
+build cannot read; do not drive the identity).
+
+The reads are store reads: they never wait behind the mob actor, need
+`ControlScope::List` (`MobError::ScopeDenied` otherwise), and a failed read is
+an error, never an empty history. A storage composition without the built-in
+identity and member store refuses them with
+`MobStoreError::IdentityMemberAtomicPersistenceUnavailable`. Pruning never
+removes the events the history reads. Destroying the mob clears its journal,
+so a mob created again under the same id starts a new history.
+
+With no running mob, `MobStorage::read_member_binding_history(path)` (native
+builds) reads the same history from a persistent store. It opens the file
+read-only and never creates or migrates it. A missing file is
+`MemberBindingHistoryReadError::StoreMissing`, and a file that is not a mob
+store this build reads is `ForeignSchema`; a store that holds no mob answers
+an empty history.
+
 ### One-shot durable role migration
 
 Role is durable context, but it is not member identity. `MemberLaunchMode::Resume`

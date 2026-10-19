@@ -104,6 +104,7 @@ Primary crates:
 - subscriptions: `subscribe_agent_events()`, `subscribe_all_agent_events()`, `subscribe_mob_events()`, `subscribe_mob_events_with_config()`
 - admission: `close_if_idle()`, `close_admission(reason)`, `admission_closed()`, `observer()`, `acquire_owner()`, `is_public_owner()`
 - delivery scope: `capture_member_delivery_scope(identity)`, `submit_work_with_mode_and_delivery_identity_bounded(&scope, ...)`, `recover_bounded_work_at_scope(&scope, ...)`
+- member history (0.9.4+): `member_binding_history()`, `member_binding_for_session(&session_id)`, `last_member_binding(&identity)`, `durable_identity_members()`, `identity_management(&identity)`; `read_handle()` has the same reads
 - held spawns (native, `runtime-adapter`): `spawn_held_within(spec, deadline)` / `spawn_held_until(spec, deadline)`; publish the `HeldSpawn` with `activate()` or abort it with `abort()`
 
 Admission close: every exported `MobHandle` clone shares one public-owner
@@ -135,6 +136,33 @@ and is never retargeted: re-capture the scope. `recover_bounded_work_at_scope`
 reads only the scope's session and returns a `ScopedWorkState` (`Absent` is
 never retry permission). A member with no session binding has no scope
 (`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`).
+
+Member binding history (since 0.9.4): `member_binding_history()` folds the
+mob's durable member journal and Core's identity intent rows, read in one
+store transaction, into a `MemberBindingHistory`. A `MemberBinding` carries
+identity, generation, session (`None` for a peer-only member), role,
+continuity intent, a `MemberBindingState` (`Live`; `Moved`: a binding
+recovery moved the membership to another session; `Retired`: retired or
+ended by a mob reset) and a `MemberIdentityManagement` (`CommandDriven`;
+`IntentManaged`: Core's identity reconciler drives the identity, so do not
+send it lifecycle commands too; `IntentUnreadable`: an intent row this build
+cannot read, do not drive it). `binding_for_session` spans mob resets;
+`last_binding`, `durable_identity_members` (live members spawned with
+`SpawnContinuityIntent::DurableIdentity`) and `durable_identity_bindings`
+(live or retired) see only spawns since the latest mob reset. A retired
+identity keeps its last binding, and its session is the one `ensure_member`
+with `MemberLaunchMode::Resume` can restore. The reads never enter the actor
+queue, need `ControlScope::List` (`MobError::ScopeDenied`), and fail rather
+than answer empty; a storage composition without the built-in identity and
+member store refuses with
+`MobStoreError::IdentityMemberAtomicPersistenceUnavailable`. Pruning never
+removes the events they read. Destroy clears the journal, so a mob created
+again under the same id starts a new history and `journal_cursor()` values
+can repeat. With no running mob, `MobStorage::read_member_binding_history(path)`
+(native builds) reads a persistent store with the same fold, read-only: it
+never creates or migrates the store and refuses with
+`MemberBindingHistoryReadError::StoreMissing` or `ForeignSchema` (`Read` for
+a failed read).
 
 Scratch `task_create` / `task_update` / `task_list` / `task_get` are separately
 enabled agent tools, not `MobHandle` methods. Durable shared commitments belong

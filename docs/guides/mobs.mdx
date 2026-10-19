@@ -1107,6 +1107,18 @@ in-flight resume work. Cleanup failures retain exact retry authority; an
 unproven cleanup is not a successful cancellation. Compensation preserves
 durable session documents and refuses to remove a successor attachment.
 
+### Member binding history (Rust hosts)
+
+Since 0.9.4 a Rust host can ask which incarnation of a member held which
+session, as a store read that never waits behind the mob actor:
+`MobHandle::member_binding_history()` (also on `read_handle()`) and its
+single-read forms `member_binding_for_session`, `last_member_binding`,
+`durable_identity_members` and `identity_management`. For a stopped mob,
+`MobStorage::read_member_binding_history(path)` reads the same history from
+the persistent store, read-only. See
+[Member binding history](/reference/mob-architecture#member-binding-history)
+for what each read answers.
+
 ### Shutdown, destroy and admission (Rust hosts)
 
 Every exported `MobHandle` clone shares one owner token. A mob whose admission
