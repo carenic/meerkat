@@ -90,6 +90,7 @@ Primary crates:
 - `.with_default_llm_client(client)` — override LLM client (primarily for testing)
 - `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
 - `.with_member_runtime_registration_hook(hook)` (`runtime-adapter`) - the host selects each member's destination and agent mandate. Since 0.9.4 `MemberRuntimeBuildIdentity::registration()` names the exact registration a call is for (a new member's prepared one, or a recovered member's current one): bind decisions to it, not to the session id or labels. The identity is no longer `UnwindSafe`; wrap it in `AssertUnwindSafe` to move it into `catch_unwind`
+- `.with_fork_instruction_policy(policy)` (0.9.4+) - the host's `ForkInstructionPolicy` for every fork of a member with activated host instructions: `RequireExplicitActivation` (default), `ReactivateInherited` or `Refuse`. Never a tool argument or part of a definition; `MobMcpState::with_fork_instruction_policy` sets it for MCP-managed mobs
 - `.create().await`
 - `.resume().await`
 
@@ -103,7 +104,7 @@ Primary crates:
 - flows: `list_flows()`, `run_flow()`, `run_flow_with_stream()`, `flow_status()`, `cancel_flow()`
 - subscriptions: `subscribe_agent_events()`, `subscribe_all_agent_events()`, `subscribe_mob_events()`, `subscribe_mob_events_with_config()`
 - admission: `close_if_idle()`, `close_admission(reason)`, `admission_closed()`, `observer()`, `acquire_owner()`, `is_public_owner()`
-- delivery scope: `capture_member_delivery_scope(identity)`, `submit_work_with_mode_and_delivery_identity_bounded(&scope, ...)`, `recover_bounded_work_at_scope(&scope, ...)`
+- delivery scope: `capture_member_delivery_scope(identity)`, `submit_work_with_mode_and_delivery_identity_bounded(&scope, ...)`, `recover_bounded_work_at_scope(&scope, ...)`, `retire_at_scope(&scope)` (0.9.4+)
 - member history (0.9.4+): `member_binding_history()`, `member_binding_for_session(&session_id)`, `last_member_binding(&identity)`, `durable_identity_members()`, `identity_management(&identity)`; `read_handle()` has the same reads
 - held spawns (native, `runtime-adapter`): `spawn_held_within(spec, deadline)` / `spawn_held_until(spec, deadline)`; publish the `HeldSpawn` with `activate()` or abort it with `abort()`
 
@@ -160,6 +161,68 @@ and is never retargeted: re-capture the scope. `recover_bounded_work_at_scope`
 reads only the scope's session and returns a `ScopedWorkState` (`Absent` is
 never retry permission). A member with no session binding has no scope
 (`DeliveryScopeUnavailable`, wire `CAPABILITY_UNAVAILABLE`).
+
+Retire at scope (since 0.9.4): `retire_at_scope(&scope)` retires exactly the
+incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
+semantics. MobMachine admits every step (each descendant and the member) on
+the scope in the same actor command that retires it, so a successor minted
+meanwhile (respawn, reset) is never retired through an older scope. Refusals:
+`MobError::StaleFenceToken` (another incarnation is current),
+`StaleDeliveryScope` (the session is not the member's binding or the one its
+retirement is releasing), `InvalidTransition` (completed or destroyed mob); a
+refusal stops the call. `Ok(())` is `retire`'s barrier: it waits out a
+retirement the mob still owns and answers `MemberRetirementStuck` for a stuck
+one. Like `retire`, a never-seen identity answers `Ok(())`; it needs the
+`Retire` control scope.
+
+Fork instruction policy (since 0.9.4): a fork child holds the instruction
+activations it copied from its source as history and runs no model turn until
+each inherited key is activated in the child. Under the default
+`RequireExplicitActivation`, `fork_member` keeps the host's activation window,
+but the forks that start the child's turn themselves (`fork_off`,
+`fork_member_then_run_bounded` and `_detached`, `fork_member_at_turn_boundary`
+and so the live delegation's durable fork, council participants, local or
+placed) are refused before anything is committed with
+`MobError::ForkInstructionRefused { source_member_id, refusal }` (wire
+`FORK_INSTRUCTION_REFUSED`, -32037, HTTP 422, exit 57, data kind
+`fork_instruction_refused`). `ReactivateInherited` makes the fork append the
+child's own activation of every key effective in the source
+(`PlannedForkRequest::inherited_instructions`; `MobSessionService` decorators
+forward it); `Refuse` refuses every fork whose child would inherit one. 0.9.3
+committed such a child and its first turn failed ("forked session must
+explicitly activate inherited instruction keys"). A council ends with
+`TemporaryCouncilExitReason::ParticipantForkInstructionRefused
+{ participant_order, refusal }` and the slot's `TemporaryCouncilAcquisition`
+is `Refused` (nothing to revoke, no cleanup debt); a 0.9.3 reader cannot decode
+such a council record. Upgrade member hosts before their controller: a 0.9.3
+member host answers `ReactivateInherited` with the refusal cause
+`member_host_unsupported` and forks participants without the policy otherwise.
+
+Refused restore (since 0.9.4): when a registration hook (`select_destination`,
+`select_agent_mandate`, `prepare_member_surface` or `verify_member_surface`)
+refuses a restored member, the restore removes that registration exactly (the
+canonical unregister, recorded in the session's history; inputs it still held
+end `Stopped`) and releases its owner context. The member stays Broken with
+`MobError::MemberRegistrationRefused { member_id, session_id, call, reason }`
+(data kind `mob_member_registration_refused` with `hook_call`), shown in
+`MobMemberSnapshot::registration_refusal` (`MemberRegistrationHookCall`) and
+in member status as `registration_refusal`, until an explicit repair;
+`ensure_member_live` returns it without asking the host again, and retire,
+respawn and destroy still work. A member `MobBuilder::resume` restores at boot
+gets the same refusal (a member it recreates on a fresh session still fails the
+whole resume). A runtime that did not install the destination the host
+selected answers `MobError::MemberDestinationNotInstalled { session_id, error }`
+(data kind `mob_member_destination_not_installed` with a snake_case `cause`;
+before, a `WiringError`). Its failure class is `RuntimeRejected`, so schedule
+delivery records `runtime_rejected` instead of `mob_rejected`; the restored
+member keeps its registration, and a re-selection must advance
+`context_generation` (else the cause is `scoped_context_generation_not_advanced`).
+
+Reload-required members (since 0.9.4): `force_cancel_member` and
+`cancel_all_work` on a member whose runtime needs a durability reload answer
+`MobError::MemberReloadRequired` at once (wire `MEMBER_RELOAD_REQUIRED`:
+-32029, HTTP 409, exit 49); reload with `reload_member_registration`, then
+cancel again. 0.9.3 failed with `MobError::Internal`.
 
 Member binding history (since 0.9.4): `member_binding_history()` folds the
 mob's durable member journal and Core's identity intent rows, read in one
@@ -396,7 +459,10 @@ held by another `MobMcpState`), it keeps the files and answers
 those handles and retry as the same caller; the retry continues the owed
 cleanup and answers the canonical report. Creating, restoring or inserting a
 mob under that id is refused until the cleanup is done. An admitted destroy
-closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`). A
+closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`).
+Since 0.9.4 a member whose boundary commit fails while the destroy waits on its
+ingress detach is reloaded and its retirement retried once;
+`MobDestroyReport::reloaded_members` names it (0.9.3 answered `Incomplete`). A
 host that drains observers itself reads a `SqliteMobObserverDrainReport`;
 since 0.9.4 its `retained_registrations` counts change-watch notification
 registrations still running when the drain stopped them (a struct literal

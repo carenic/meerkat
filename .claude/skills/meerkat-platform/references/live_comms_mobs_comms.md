@@ -2,8 +2,8 @@ Covers: Meerkat 0.9 agent-to-agent comms: transports (inproc, tcp, uds), the
 [comms] config, enabling comms (comms_enabled, rkat run --comms-* flags, the
 --comms-advertise-tcp address rules, tools.comms), agent comms tools,
 comms/send on JSON-RPC, REST, MCP and SDKs, delivery outcomes, the SDK send
-fix in 0.9.1, remote signed peers. Live: live_comms_mobs_live.md. Mobs:
-live_comms_mobs_mobs.md.
+fix in 0.9.1, durable steers and reply_to_peer delivery ids (0.9.4), remote
+signed peers. Live: live_comms_mobs_live.md. Mobs: live_comms_mobs_mobs.md.
 
 # Agent-to-Agent Comms (0.9)
 
@@ -23,6 +23,9 @@ and mob changes in live_comms_mobs_mobs.md.
 - Since 0.9.1 the Python and TypeScript SDK `send` accepts every delivery
   outcome. A 0.9.0 SDK could raise `INVALID_RESPONSE` after the message was
   sent; do not retry such a send (see Host surfaces).
+- Since 0.9.4 a `steer` into a running turn is written into that turn's
+  transcript, and `reply_to_peer` can answer every peer message delivered in
+  the turn by its `Delivery ID` (see Tools agents get).
 
 ## Transports and config
 
@@ -82,7 +85,7 @@ require_peer_auth = true                     # default true
 |---|---|
 | `peers` | List visible peers. Always call it first; send by `peer_id`, never by display name |
 | `send_message` | One-way message: `peer_id`, `body`, `handling_mode` (`queue` or `steer`), optional `blocks` |
-| `reply_to_peer` | Reply to the peer message that triggered this turn; no `peer_id`; `reply_to` only when several arrived |
+| `reply_to_peer` | Reply to a peer message delivered in this turn (it started the turn or joined it); no `peer_id`; `reply_to` (the notice's `Delivery ID`) only when several arrived |
 | `send_request` | Typed request with a correlated reply. Intent is `checksum_token` or `supervisor.bridge` only |
 | `send_response` | Answer a request: `in_reply_to`, `status` (`accepted`, `completed` or `failed`), optional `result` |
 
@@ -94,6 +97,29 @@ require_peer_auth = true                     # default true
   mid-turn target at its next checkpoint, and acts like `queue` when the target
   is idle. Images go in `blocks` as `image_ref` with `source` `blob` (plus
   `blob_id`, `media_type`) or `current_turn` (plus `index`).
+- Since 0.9.4 a steer is durable: its notice is written into the running
+  turn's transcript at the next model boundary, every later model request of
+  the run sees it, it commits with the run, and one `peer_content_ingested`
+  event is published for it. Steers join one per boundary in arrival order; a
+  steer that finds no boundary before the run ends, and a directed delivery,
+  are taken by exactly one follow-up turn. Prompts, lifecycle notices,
+  external events and flow steps steered into a run behave the same. 0.9.3
+  and earlier showed a peer or text-only steer to one model request, then
+  lost it (no transcript row, no event).
+- Since 0.9.4 an incoming peer message notice ends with a `Delivery ID: <id>`
+  line, plus `In reply to: <id>` when it is a reply. `reply_to_peer` takes
+  that id as `reply_to`, also for a message that joined the running turn
+  (0.9.3 refused those with `no_reply_capability` or `unknown_reply_to`).
+  When the id matches deliveries of two senders, it refuses with
+  `ambiguous_reply`, names both and sends nothing (0.9.3 answered the first);
+  answer one with `send_message`. Rust: `ReplySelectionError`
+  (`NoReplyCapability`, `InvalidReplyContext`, `UnknownReplyTo`,
+  `AmbiguousReply`; non-exhaustive).
+- A `reply_to_peer` reply carries the delivery it answers as `in_reply_to`, a
+  label the sender declares: routing and authorization never read it, and
+  `send_message` never sets it. A 0.9.3 receiver that checks signatures (the
+  default) drops such a reply, so the sender sees an ambiguous outcome, not a
+  failure; `send_message` and the other kinds still reach it.
 
 ## Host surfaces
 
@@ -156,3 +182,10 @@ rkat run --comms-name worker-1 \
 The binding file (`kind: "external"`, address, Ed25519 identity, typed
 `bootstrap_token`) is what external mob members need. `rkat-rpc --tcp` is
 the JSON-RPC control plane, not a signed peer listener.
+
+Since 0.9.4 a receiver checks a peer envelope's signature over the envelope
+as it arrived, fields it does not know included, and drops such fields only
+after the check, so a newer sender can add an optional field to a signed
+message kind. An envelope that repeats a map key, or keys a map by anything
+but a text string, at any depth is refused. A request carrying a field this
+build does not know keeps its delivery but not its TCP callback route.

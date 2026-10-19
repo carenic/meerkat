@@ -245,6 +245,19 @@ source's shell environment, MCP attachments or mob operator authority; see
 a fork child can run turns. A child forked by 0.9.3 or earlier that never ran a
 turn cannot: fork its source again.
 
+Both fork calls take `inherited_instructions`, the fork instruction policy for
+the instruction activations the prefix carries: `"require_explicit_activation"`
+(the default), `"reactivate_inherited"` or `"refuse"`. A forked child is not
+materialized, so under the default and under `"refuse"` a prefix that carries
+activation rows is refused before anything is committed with
+`FORK_INSTRUCTION_REFUSED`; `MeerkatError.details` carries the typed
+`fork_instruction_refusal` (its cause and keys). Pass `"reactivate_inherited"`
+to give the child its own activation of every key that was effective in the
+source; `SessionForkResult.reactivated_instruction_count` counts those rows,
+which `message_count` includes. A prefix without activation rows forks the same
+way under every value. See
+[session/fork_at](/api/rpc#session%2Ffork_at).
+
 ## Additional client wrappers
 
 The Python SDK also exposes:

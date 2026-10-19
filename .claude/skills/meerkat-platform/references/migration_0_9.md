@@ -215,6 +215,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   that recorded a failed realtime response (realtime sidecar event schema 4),
   or restore a grant owner whose journal holds an owner-scoped
   resource-domain restriction (`RestartRequired`).
+- Mixed versions: a 0.9.3 peer that checks signatures drops a 0.9.4
+  `reply_to_peer` reply (the sender sees an ambiguous outcome; other message
+  kinds still reach it), and mob member hosts must be upgraded before their
+  controller (fork instruction policy). A temporary council record holding a
+  participant refused by that policy cannot be read by 0.9.3.
 - Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
   every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds, and does not
   know the `turn_failed` live observation. It runs a binary you supply
@@ -265,6 +270,40 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `settlement` (`MemberUnregisterSettlement`: `try_state()`,
   `settle_within(deadline)`; states `Settled`, `Pending`, `Failed`,
   `HandedOver`) and is non-exhaustive; match it with `{ stage, .. }`.
+- Forks: under the default fork instruction policy
+  (`require_explicit_activation`), a fork whose copied prefix carries
+  activated host instructions and that starts the child's first turn itself
+  (`fork_off`, `fork_member_then_run_*`, `fork_member_at_turn_boundary`,
+  council participants) and the RPC forks `session/fork_at` /
+  `session/fork_replace` are refused before commit with
+  `FORK_INSTRUCTION_REFUSED` (-32037, HTTP 422, exit 57); set
+  `reactivate_inherited` (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
+  or pass `inherited_instructions: "reactivate_inherited"` on the RPC fork, to
+  carry the activations. Rust:
+  `SessionError::ForkInstructionRefused`, `MobError::ForkInstructionRefused`,
+  `AgentError::InstructionActivation` (was `ConfigError`), new
+  `inherited_instructions` fields and `reactivated_instruction_count`, council
+  `ParticipantForkInstructionRefused` / `Refused`.
+- Comms: in-turn steers (prompts, peer messages, requests, notices, events,
+  flow steps) are written into the running turn at a model boundary or taken
+  by one follow-up turn, so history holds them; the peer notice text gains
+  `Delivery ID:` and `In reply to:` lines. Rust: `delivery_id` and
+  `in_reply_to` fields on the comms notice block, `PeerContentIngested`,
+  `CommsCommand::PeerMessage`, `InteractionContent::Message`,
+  `MessageKind::Message` and `PeerInput`.
+- Mobs: a host's refusal of a restored member's registration removes the
+  registration and leaves the member Broken with
+  `MobError::MemberRegistrationRefused` until a repair; an uninstalled
+  destination is `MobError::MemberDestinationNotInstalled` (was
+  `WiringError`; schedule delivery records `runtime_rejected`);
+  `force_cancel_member` / `cancel_all_work` on a member needing a durability
+  reload answer `MemberReloadRequired` (-32029, HTTP 409, exit 49): reload it
+  with `reload_member_registration`, then cancel again.
+- Runtime: a boundary commit with no durable outcome within the store's
+  deadline (120 s for SQLite) marks the session reload-required; waiters get
+  `CompletionWaitError::DurableOutcomeUnknown` (a rejected commit
+  `BoundaryRolledBack`), and `CompletionWaitError` is non-exhaustive. Read the
+  input after the reload instead of resubmitting it.
 - Realtime: a response the provider ends without completing it arrives as the
   non-terminal `turn_failed` live observation (route on `failure.status`;
   nothing of it is committed, the transcript records `assistant_turn_failed`,
@@ -316,7 +355,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   Live adapter enums gain `FinishedPending`, `NoteDelegationFinishedContext`
   and `InstructionsContextAppendWithdrawn`. Generated machine state structs
   gain fields (`stored_input_state_migration_v6`,
-  `identity_generation_highwater`, `identity_generation_highwater_sealed`).
+  `identity_generation_highwater`, `identity_generation_highwater_sealed`),
+  and mob machine enums gain the `RetireAtScope` and host-refused restore
+  variants.
 
 ### Other behaviour changes
 
@@ -360,3 +401,5 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
    treat a `ContextChanged` review retirement as not final.
 7. Realtime clients: handle `turn_failed`; Rust: add the new arms and
    `signal_turn_failed`.
+8. Forks: handle `FORK_INSTRUCTION_REFUSED`; upgrade member hosts before their
+   controller and comms peers together.

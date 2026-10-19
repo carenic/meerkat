@@ -1,5 +1,5 @@
 Covers: Meerkat 0.9 API surface changes: JSON-RPC methods and REST routes
-added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32036)
+added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32037)
 with HTTP status, input readiness kinds (`original_admission_pending`), and
 real `rkat` exit codes; Python, TypeScript and Web SDK changes (RunInput,
 CONNECTION_CLOSED stderr tail, wasm stack, 0.9.4 `run_failed` content-filtered
@@ -64,6 +64,7 @@ with the resumable session identity in `details`.
 | `APPROVAL_CONFLICT` | -32034 | 409 | Approval changed by another owner (0.9.0) |
 | `APPROVAL_COMMIT_UNKNOWN` | -32035 | 500 | Approval commit unknown; reconcile (0.9.0) |
 | `STALE_DELIVERY_SCOPE` | -32036 | 409 | Member session rotated; re-capture the delivery scope (0.9.0) |
+| `FORK_INSTRUCTION_REFUSED` | -32037 | 422 | A fork refused before commit by the fork instruction policy; `data.fork_instruction_refusal` names the cause and keys; CLI exit 57 (0.9.4) |
 | `INVALID_PARAMS` | -32602 | 400 | Invalid request |
 | `INTERNAL_ERROR` | -32603 | 500 | Unexpected failure |
 
@@ -373,6 +374,33 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   (`Conflict`, `NotAdmitted`, `UnknownRuntime`, `Unavailable`).
 - `meerkat_sqlite::preflight_domain_version` runs the schema eligibility check
   and returns the ledger version it verified (`None` for a fresh domain).
+- Fork instruction policy: `SessionError::ForkInstructionRefused` (wire
+  `FORK_INSTRUCTION_REFUSED`; exhaustive matches handle it).
+  `SessionForkAtRequest`, `SessionForkReplaceRequest` and
+  `DurableSessionForkTarget` gain `inherited_instructions` (`None` is the
+  default policy) and `SessionForkResult` gains `reactivated_instruction_count`
+  (`prefix_message_count()` excludes those rows); struct literals set them.
+  New: `ForkInstructionPolicy` (`RequireExplicitActivation` default,
+  `ReactivateInherited`, `Refuse`) with `effective`, `ActivationWindow`,
+  `ForkInstructionRefusal` and `ForkInstructionRefusalCause`,
+  `Session::apply_fork_instruction_policy`, `Session::fork_reactivation_suffix_len`.
+  A turn refused because a fork child never activated its inherited keys
+  fails with `AgentError::InstructionActivation` (was `ConfigError(String)`;
+  same error class and wire code).
+- `CompletionWaitError` is `#[non_exhaustive]` (add a wildcard arm) and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (predicates `is_boundary_rolled_back`, `is_durable_outcome_unknown`; both map
+  to the `AuthorityUnavailable` wait-failure observation).
+  `RuntimeStore::commit_outcome_deadline`, declared through
+  `RuntimeSessionAuthorityOps::commit_outcome_deadline` (decorators forward
+  it; a composed store adds the busy timeout of each lock-acquiring
+  transaction of its own; default `DEFAULT_COMMIT_OUTCOME_DEADLINE` = two
+  `COMMIT_BUSY_WINDOW`s of 60 s; `InMemoryRuntimeStore` declares none).
+- `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance with
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`
+  (was `Internal`). `PreparedSessionMaterialization::inserted_registration()`
+  says whether the materialization's own prepare inserted the registration.
 - `TurnStateHandle` gains provided methods `turn_phase`,
   `apply_turn_input_observing_phase` and `scalars` (`TurnStateScalars`);
   existing implementors keep working.
