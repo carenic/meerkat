@@ -51,6 +51,12 @@ them.
   that is not ready to admit a retained continuation, for a typed cause, to
   it: the continuation stays pending and is retried, as for `Failed`, and
   keeps the cause the runtime named.
+- `meerkat-contracts`: `WireControllerReadinessFailure` gains
+  `OriginalAdmissionPending` (kind `original_admission_pending`), which
+  `ControllerReadinessFailure::OriginalAdmissionPending` now maps to instead
+  of `Unknown`. A Rust decoder of this type built before it rejects the new
+  kind; the Python, TypeScript and Web SDKs keep error details as untyped
+  data.
 
 ### Added
 
