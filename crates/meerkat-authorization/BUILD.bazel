@@ -274,6 +274,7 @@ rust_test(
         "tests/native_governed_loop/e1_policy_control/stock_persistent/revalidation.rs",
         "tests/native_governed_loop/e3_tool_settlement.rs",
         "tests/native_governed_loop/observation_deferred_siblings.rs",
+        "tests/native_governed_loop/owner_change_wait.rs",
         "tests/native_governed_loop/s1_scoped_original.rs",
         "tests/native_governed_loop/s3_scoped_context.rs",
     ],

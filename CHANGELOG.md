@@ -299,6 +299,12 @@ them.
   field and drops it when it next writes the cadence; back on this release,
   that session compacts as before until its next rewrite records the field
   again, so a downgrade and upgrade cost at most one extra summary call.
+- `meerkat-authorization-contracts`: `AuditObservation` is now
+  `#[non_exhaustive]`, so a match outside the crate needs a wildcard arm.
+  `AuditObservation::Refused` gains `read: Option<AuditRefusalRead>`
+  (patterns without `..` and literals need it), and the exhaustively
+  constructible `AuditPolicyRead` gains `publication_instance:
+  Option<uuid::Uuid>` (struct literals need it).
 
 ### Security
 
@@ -424,6 +430,35 @@ them.
 - `meerkat-core`: `AgentError::ClientModelChangeRequiresHotSwap`, a
   configuration-class error that names the durable and the requested provider
   and model and points to `hot_swap_llm_identity`.
+- `meerkat_core::authorization::OwnerChangeChurn`, with `OwnerChangeWait`,
+  `OwnerChangeInProgress`, `OWNER_CHANGE_WAIT_BOUND` (2 s) and
+  `OWNER_CHANGE_FREE_REBUILDS` (3): one bounded wait, for a site that rebuilds
+  an operation after a `ReprepareRequired` refusal, until an owner change in
+  progress on the work's own authorization publication completes.
+  `WorkAuthorization::owner_change_in_progress` (provided, default `None`)
+  reports such a change as a waiting hint, never a permission;
+  `LocalAuthorizationPublication::change_in_progress` answers it for the local
+  owners, and the native run and audit wrappers forward it.
+  `OwnerChangeWait::trace` records one wait as the debug event below.
+- `ToolDispatchContext::remaining_tool_time`: the tool time a fenced
+  dispatch has left, measured from its start against its plan's effective
+  timeout, for a tool that waits inside its body. The `web_search` helper's
+  owner-change wait is bounded by it.
+- The protected authorization audit says where a refusal was decided. A
+  `Refused` record carries an `AuditRefusalRead`: when it was observed, its
+  basis (`AuditRefusalBasis`: the owners answered at one coherent
+  publication, the publication changed under the attempt and the change
+  completed, or a change was still in progress), the sequence the attempt
+  read, the live sequence when the publication changed under it, and the
+  publication instance. A refusal to rebuild that a prepared decision
+  observes at its check reads as a changed publication against the live
+  sequence, since the publication moved after the decision's own read; a
+  denial at the check, one from the decision's own validity window
+  included, is an owner answer. A `Prepared` record's policy read names its
+  publication instance too, since sequences of different instances do not
+  compare. Rows carry both at stored input state version 7; a row stamped
+  before v7 that carries either is refused. Records written earlier read
+  with neither.
 
 ### Changed
 
@@ -780,6 +815,79 @@ them.
 - `meerkat-session`: the last-resort compaction source (user requests only)
   no longer claims to keep every user request. Its note says it carries the
   newest N of the M requests, and the completion reports the same counts.
+- A model request of the agent loop no longer returns to the controller with
+  an `operation_refused` notice, or fails the turn, because an owner change
+  was still in progress on its work's own publication. An owner that holds a
+  change across its storage commit outlasted both built-in rebuilds, the
+  preparation's and the request's own. On such a `ReprepareRequired` refusal
+  the request now waits for the change to complete, then rebuilds under the
+  same operation without spending its own rebuild. The wait is bounded: one
+  wall-clock deadline per model call, set at its first wait to 2 s or to the
+  remaining run budget if that is less, so the rebuilds in between count
+  against it; at most 3 such free rebuilds per call; and a free rebuild only
+  once no change is in progress. Past those bounds the refusal takes its
+  ordinary path (one rebuild, then the controller feedback request), as does
+  any other refusal kind and a refusal while the work's own publication has
+  no change in progress. The run budget is checked after every wait, so a
+  turn whose budget runs out during one ends with the time-budget terminal,
+  not a refusal. Each refused attempt keeps its own audit record, and a
+  `debug` event `meerkat::authz::owner_change_wait` (operation id,
+  `waited_ms`, `settled`) marks each wait.
+- The same bounded wait covers the other operations that rebuild after a
+  `ReprepareRequired` refusal. A governed tool dispatch waits at its prepared
+  entry and again at its body entry, and when the call-level execution
+  policy gate stages the call again after its own awaits (dispatch admission,
+  consequence policy), inside the tool's timeout. At the body entry the review
+  check point runs on the decision checked after the wait; a reviewed tool whose
+  decision changed meanwhile is reviewed once more (see below) and no review
+  is reused. The `web_search` tool's helper model request waits within the
+  call's remaining tool time and asks again under the same delegate
+  operation. A compaction summary waits within the same
+  bounds, and past them the refusal still fails its compaction. When the
+  body entry or the gate's staging waits out a change after recording its
+  `Entry` record, it records another for the decision checked after the
+  wait. The gate's check point also runs on the decision checked after its
+  wait, but the gate's own code already ran: a reviewed tool whose decision
+  changed while the gate waited settles as `review_unsatisfied`
+  (`context_changed`) and is not reviewed again. A streaming tool's gate
+  wait also counts against its inactivity window, and past that window the
+  call ends as the tool's inactivity timeout. The debug event names the
+  site (`model_request`, `compaction_summary`, `tool_dispatch`,
+  `tool_entry`, `tool_policy_entry`, `web_search_delegate`).
+- A governed helper admission fence and a helper child issuance answer
+  `Unavailable` instead of `Denied` when their check refuses to rebuild
+  (`ReprepareRequired`), on the prepared path and on the dispatch path alike:
+  under the owner-change exclusion they cannot wait, and a refusal to rebuild
+  is no verdict on the operation, so a later attempt may succeed. A denial
+  and malformed facts stay `Denied`.
+- A model-reviewed (R2) tool call no longer fails with `review_unsatisfied`
+  (`context_changed`) when one owner publication change lands during its
+  review, at its verdict's commit, or at the dispatch's own entry staging
+  before the tool's dispatcher runs. When the operation is still permitted at
+  R2 with the same review material, the fenced dispatch re-prepares it and
+  reviews it once more from the start, as a second review attempt for the
+  same `tool_call_id`; the earlier verdict is never used. Deciding to review
+  once more reads the successor's review material once
+  (`review_operation_context`), so an owner sees one more read per
+  superseded call; when the material is unchanged, that read is the one the
+  second attempt is shown. A review observer can therefore see a
+  `ContextChanged` retirement followed by that second attempt: a host must
+  not treat the retirement as the call's final outcome.
+  At most one re-review runs per call, only after an allow or a reviewer
+  failure, and only with enough tool time left for a whole review deadline.
+  A second change, a denial or escalation, an expired review, a changed tier
+  (human consent included), changed or unreadable review material, and a
+  change once the tool's dispatcher is running still settle as before. An
+  owner change still in progress when the verdict is checked is now waited
+  out (within the attempt's own review deadline, 2 s at most) instead of
+  settling at once as changed authority; past that bound it settles as
+  before. The re-review adds no record type: the audit shows a second
+  `ReviewAttemptStarted` after the successor's `Prepared` record, and a
+  change at the entry staging also leaves that staging's `Entry` record
+  twice. Per tool call the waits stay bounded: at most 3 wait states (the
+  dispatch's preparation, and each review attempt's, which every staging of
+  that attempt shares), 9 free rebuilds and 6 s of waiting, inside the
+  tool's timeout.
 
 ## [0.9.3] - 2026-10-18
 

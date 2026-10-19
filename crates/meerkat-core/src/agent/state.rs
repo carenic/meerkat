@@ -2443,6 +2443,9 @@ where
         let mut retry_request_pressure_recheck = false;
         let mut next_request_attempt = Some(prepared_attempt);
         let mut authorization_reprepared = false;
+        // One bounded wait state per model call: its wall-clock deadline and
+        // free rebuilds span every rebuild and the controller-feedback attempt.
+        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
 
         let recovery_context = LlmRecoveryContext {
             run_id,
@@ -2848,10 +2851,36 @@ where
                     if error.operation_refusal().is_some()
                         || error.operation_authorization_unavailable() =>
                 {
-                    if error.operation_refusal().is_some_and(|refusal| {
+                    let reprepare = error.operation_refusal().is_some_and(|refusal| {
                         refusal.kind() == crate::OperationRefusalKind::ReprepareRequired
-                    }) && !authorization_reprepared
+                    });
+                    // An owner change still in progress on this work's own
+                    // publication refuses every rebuild until it completes:
+                    // wait for it (bounded), then rebuild without spending
+                    // the one rebuild below. Nothing is decided meanwhile.
+                    if reprepare
+                        && let Some(work) = self.tool_dispatch_context.work_authorization().cloned()
+                        && let Some(wait) = owner_change_churn
+                            .wait_for_settled_change(
+                                work.authorization().as_ref(),
+                                self.budget.remaining_duration(),
+                            )
+                            .await
                     {
+                        wait.trace(
+                            "model_request",
+                            authorization
+                                .as_ref()
+                                .map(crate::LlmRequestAuthorization::operation_id),
+                        );
+                        if let Some(exceeded) = self.budget.observe().exceeded() {
+                            return Err(exceeded.to_agent_error());
+                        }
+                        if wait.settled() {
+                            continue;
+                        }
+                    }
+                    if reprepare && !authorization_reprepared {
                         // The final check observed a relevant owner change.
                         // Rebuild once from that owner; never retag old facts.
                         authorization_reprepared = true;
@@ -3610,6 +3639,7 @@ where
                                         crate::authorization::ModelAuthorizationUse::Compaction,
                                         crate::OperationId::new(),
                                     ),
+                                    budget: Some(&self.budget),
                                     model_messages: &model_messages,
                                     observation_source,
                                     window: crate::compact::CompactionWindow {
@@ -32594,6 +32624,632 @@ mod tests {
                     assert_completed_without_failure(&mut rx);
                 }
             }
+        }
+
+        /// One scripted step of a churn owner, taken by a model preparation
+        /// that finds no owner change in progress. While a change is in
+        /// progress every preparation refuses `ReprepareRequired`, as an
+        /// observation of an odd publication does.
+        #[derive(Clone, Copy)]
+        enum ChurnStep {
+            /// An owner change begins during this preparation, which refuses
+            /// `ReprepareRequired`; the change completes after `settle`, or
+            /// never.
+            Begin {
+                settle: Option<std::time::Duration>,
+            },
+            /// Refuse `ReprepareRequired` for a change that already completed.
+            Stale,
+            /// An owner change begins and this preparation refuses `Denied`;
+            /// the change completes after `settle`.
+            DenyDuringChange {
+                settle: std::time::Duration,
+            },
+            Allow,
+        }
+
+        /// A work owner whose publication churns as scripted. The last step
+        /// repeats once the script runs out.
+        struct ChurnPolicy {
+            sequence: Arc<std::sync::atomic::AtomicU64>,
+            script: Mutex<std::collections::VecDeque<ChurnStep>>,
+            prepared_at: Mutex<Vec<tokio::time::Instant>>,
+        }
+
+        impl ChurnPolicy {
+            fn new(script: impl IntoIterator<Item = ChurnStep>) -> Arc<Self> {
+                Arc::new(Self {
+                    sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    script: Mutex::new(script.into_iter().collect()),
+                    prepared_at: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn begin_change(&self, settle: Option<std::time::Duration>) {
+                let odd = self.sequence.load(Ordering::SeqCst) + 1;
+                self.sequence.store(odd, Ordering::SeqCst);
+                if let Some(settle) = settle {
+                    let sequence = Arc::clone(&self.sequence);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(settle).await;
+                        sequence.store(odd + 1, Ordering::SeqCst);
+                    });
+                }
+            }
+
+            fn prepares(&self) -> usize {
+                self.prepared_at.lock().unwrap().len()
+            }
+
+            /// Time from the first model preparation to preparation `index`.
+            fn prepared_after_first(&self, index: usize) -> std::time::Duration {
+                let prepared_at = self.prepared_at.lock().unwrap();
+                prepared_at[index] - prepared_at[0]
+            }
+        }
+
+        impl WorkAuthorization for ChurnPolicy {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn owner_change_in_progress(
+                &self,
+            ) -> Option<crate::authorization::OwnerChangeInProgress> {
+                let sequence = self.sequence.load(Ordering::SeqCst);
+                (sequence % 2 == 1).then(|| {
+                    crate::authorization::OwnerChangeInProgress::new(uuid::Uuid::nil(), sequence)
+                })
+            }
+
+            fn prepare(
+                &self,
+                binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, crate::OperationAuthorizationError>
+            {
+                if !matches!(binding.facts().operation, AuthorizationOperation::Model(_)) {
+                    return Ok(Arc::new(FixturePrepared(binding.clone())));
+                }
+                self.prepared_at
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
+                if self.owner_change_in_progress().is_some() {
+                    return Err(
+                        OperationRefused::new(OperationRefusalKind::ReprepareRequired).into(),
+                    );
+                }
+                let step = {
+                    let mut script = self.script.lock().unwrap();
+                    if script.len() > 1 {
+                        script.pop_front()
+                    } else {
+                        script.front().copied()
+                    }
+                }
+                .unwrap_or(ChurnStep::Allow);
+                match step {
+                    ChurnStep::Begin { settle } => {
+                        self.begin_change(settle);
+                        Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into())
+                    }
+                    ChurnStep::Stale => {
+                        Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into())
+                    }
+                    ChurnStep::DenyDuringChange { settle } => {
+                        self.begin_change(Some(settle));
+                        Err(OperationRefused::new(OperationRefusalKind::Denied).into())
+                    }
+                    ChurnStep::Allow => Ok(Arc::new(FixturePrepared(binding.clone()))),
+                }
+            }
+        }
+
+        /// The session's model and its retained controller. Each attempt
+        /// takes `delay` (a slow rebuild), then prepares and checks its
+        /// operation at send; a compaction summary does the same at once.
+        struct ChurnClient {
+            delay: std::time::Duration,
+            operations: Mutex<Vec<crate::OperationId>>,
+            summaries: Mutex<Vec<crate::OperationId>>,
+        }
+
+        impl ChurnClient {
+            fn new(delay: std::time::Duration) -> Arc<Self> {
+                Arc::new(Self {
+                    delay,
+                    operations: Mutex::new(Vec::new()),
+                    summaries: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn operations(&self) -> Vec<crate::OperationId> {
+                self.operations.lock().unwrap().clone()
+            }
+        }
+
+        struct ChurnAttempt {
+            client: Arc<ChurnClient>,
+            authorization: crate::LlmRequestAuthorization,
+        }
+
+        #[async_trait]
+        impl AgentLlmRequestAttempt for ChurnAttempt {
+            fn request_pressure(
+                &self,
+            ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+                Ok(None)
+            }
+
+            async fn stream_response(
+                &self,
+                _assistant_message_id: crate::AssistantMessageId,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                if !self.client.delay.is_zero() {
+                    tokio::time::sleep(self.client.delay).await;
+                }
+                self.authorization
+                    .prepare(fixture_model_facts(false))
+                    .map_err(AgentError::from)?
+                    .current()
+                    .map_err(AgentError::from)?;
+                Ok(crate::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "answered after the owner change".into(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self.client.as_ref(), Usage::default()),
+                ))
+            }
+        }
+
+        #[async_trait]
+        impl AgentLlmClient for ChurnClient {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn prepare_request_attempt_authorized(
+                self: Arc<Self>,
+                _messages: Arc<Vec<Message>>,
+                _tools: Arc<[Arc<ToolDef>]>,
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<Arc<dyn AgentLlmRequestAttempt>, AgentError> {
+                let authorization =
+                    authorization.expect("governed context must reach the provider");
+                self.operations
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
+                Ok(Arc::new(ChurnAttempt {
+                    client: self,
+                    authorization,
+                }))
+            }
+
+            async fn stream_response(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                panic!("governed execution must not use the raw provider path")
+            }
+
+            async fn stream_response_authorized(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                let authorization =
+                    authorization.expect("a governed compaction summary keeps its work");
+                assert!(authorization.usage() == ModelAuthorizationUse::Compaction);
+                self.summaries
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
+                authorization
+                    .prepare(fixture_model_facts(false))
+                    .map_err(AgentError::from)?
+                    .current()
+                    .map_err(AgentError::from)?;
+                Ok(crate::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "summary of the first input".into(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                ))
+            }
+
+            fn provider(&self) -> crate::Provider {
+                crate::Provider::OpenAI
+            }
+            fn model(&self) -> &'static str {
+                "fixture-model"
+            }
+        }
+
+        struct ChurnRun {
+            result: Result<crate::RunResult, AgentError>,
+            notices: usize,
+            events: mpsc::Receiver<crate::AgentEvent>,
+            elapsed: std::time::Duration,
+        }
+
+        /// Run one prompt with `client` as both the session's model and the
+        /// work's retained controller, under `policy`.
+        async fn run_churn(
+            policy: &Arc<ChurnPolicy>,
+            client: &Arc<ChurnClient>,
+            limits: Option<crate::budget::BudgetLimits>,
+        ) -> ChurnRun {
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .build_standalone(
+                    Arc::clone(client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            if let Some(limits) = limits {
+                agent.budget = crate::budget::Budget::new(limits);
+            }
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            let (tx, events) = mpsc::channel(1024);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                agent.run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work),
+                ),
+            )
+            .await
+            .expect("a churning owner never holds the run past its bounds");
+            let elapsed = started.elapsed();
+            let notices = agent
+                .session()
+                .messages()
+                .iter()
+                .filter(|message| {
+                    matches!(message, Message::SystemNotice(_))
+                        && serde_json::to_string(message)
+                            .unwrap()
+                            .contains("operation_refused")
+                })
+                .count();
+            ChurnRun {
+                result,
+                notices,
+                events,
+                elapsed,
+            }
+        }
+
+        fn refused_kind(
+            result: &Result<crate::RunResult, AgentError>,
+        ) -> Option<OperationRefusalKind> {
+            result
+                .as_ref()
+                .err()
+                .and_then(AgentError::operation_refusal)
+                .map(OperationRefused::kind)
+        }
+
+        /// An owner change held across its storage commit outlasts the
+        /// immediate rebuild. The model request waits for it to complete,
+        /// then rebuilds under the same operation, with no refusal notice and
+        /// no controller-feedback request.
+        #[tokio::test(start_paused = true)]
+        async fn an_owner_change_in_progress_is_waited_out_before_the_rebuild() {
+            let policy = ChurnPolicy::new([
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            let result = run
+                .result
+                .expect("the rebuild after the change completes is authorized");
+            assert_eq!(result.text, "answered after the owner change");
+            assert_eq!(run.notices, 0, "no refusal reached the transcript");
+            assert_eq!(policy.prepares(), 2, "one refused attempt, one rebuild");
+            assert!(
+                policy.prepared_after_first(1) >= std::time::Duration::from_millis(30),
+                "the rebuild waited for the change to complete"
+            );
+            let operations = client.operations();
+            assert_eq!(operations.len(), 2);
+            assert_eq!(
+                operations[0], operations[1],
+                "the rebuild keeps its operation"
+            );
+            assert!(run.elapsed < crate::authorization::OWNER_CHANGE_WAIT_BOUND);
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// Changes that keep beginning as each one completes earn at most
+        /// three free rebuilds per model call; then the call takes its own
+        /// rebuild, the controller feedback attempt and the refusal, as
+        /// without waiting.
+        #[tokio::test(start_paused = true)]
+        async fn a_flip_storm_spends_at_most_three_free_rebuilds() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin {
+                settle: Some(std::time::Duration::from_millis(1)),
+            }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let run = run_churn(&policy, &client, None).await;
+
+            assert_eq!(
+                refused_kind(&run.result),
+                Some(OperationRefusalKind::ReprepareRequired),
+                "{:?}",
+                run.result
+            );
+            // 1 attempt + 3 free rebuilds + its own rebuild, then one
+            // controller feedback attempt.
+            assert_eq!(
+                policy.prepares(),
+                1 + usize::from(crate::authorization::OWNER_CHANGE_FREE_REBUILDS) + 1 + 1
+            );
+            assert_eq!(run.notices, 1);
+            let operations = client.operations();
+            assert_eq!(operations.len(), 6);
+            assert!(operations[..5].iter().all(|id| *id == operations[0]));
+            assert_ne!(operations[5], operations[0], "feedback is a new operation");
+            assert!(run.elapsed < crate::authorization::OWNER_CHANGE_WAIT_BOUND);
+        }
+
+        /// The wait bound is wall-clock from the first wait, so the time the
+        /// rebuilds themselves take counts against it: slow rebuilds end
+        /// the free rebuilds before the cap does.
+        #[tokio::test(start_paused = true)]
+        async fn the_wait_bound_counts_rebuild_time() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin {
+                settle: Some(std::time::Duration::from_millis(10)),
+            }]);
+            let client = ChurnClient::new(std::time::Duration::from_millis(1200));
+            let run = run_churn(&policy, &client, None).await;
+
+            assert_eq!(
+                refused_kind(&run.result),
+                Some(OperationRefusalKind::ReprepareRequired),
+                "{:?}",
+                run.result
+            );
+            // Attempts at 1.2 s and 2.4 s wait and rebuild for free; the
+            // third refusal, at 3.6 s, is past the deadline (1.2 s + 2 s), so
+            // the call takes its own rebuild and then the feedback attempt.
+            assert_eq!(policy.prepares(), 5);
+            assert_eq!(run.notices, 1);
+        }
+
+        /// With less run budget left than the wait bound, the wait ends at
+        /// the run deadline and the turn ends with the budget error, not a
+        /// refusal.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_budget_under_the_wait_bound_ends_the_turn_on_time() {
+            const TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+            let policy = ChurnPolicy::new([ChurnStep::Begin { settle: None }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let run = run_churn(
+                &policy,
+                &client,
+                Some(crate::budget::BudgetLimits {
+                    max_tokens: None,
+                    max_duration: None,
+                    max_turn_duration: Some(TURN_BUDGET),
+                    max_tool_calls: None,
+                }),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    run.result,
+                    Err(AgentError::TerminalFailure {
+                        outcome: crate::TurnTerminalOutcome::TimeBudgetExceeded,
+                        cause_kind: crate::TurnTerminalCauseKind::TimeBudgetExceeded,
+                        ..
+                    })
+                ),
+                "{:?}",
+                run.result
+            );
+            assert_eq!(
+                run.elapsed, TURN_BUDGET,
+                "the wait never overshoots the run"
+            );
+            assert_eq!(policy.prepares(), 1);
+            assert_eq!(run.notices, 0);
+        }
+
+        /// The wait belongs to the call's own future: dropping the run stops
+        /// it, and nothing keeps preparing afterwards.
+        #[tokio::test(start_paused = true)]
+        async fn dropping_a_waiting_model_call_stops_the_wait() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin { settle: None }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .build_standalone(
+                    Arc::clone(&client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(&policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(&client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            let (tx, _events) = mpsc::channel(1024);
+            let waited = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                agent.run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work),
+                ),
+            )
+            .await;
+            assert!(waited.is_err(), "the call was still waiting when dropped");
+            assert_eq!(policy.prepares(), 1);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            assert_eq!(policy.prepares(), 1, "nothing prepares after the drop");
+        }
+
+        /// A `ReprepareRequired` refusal with no change in progress takes its
+        /// ordinary path at once: one rebuild, then the controller feedback.
+        #[tokio::test(start_paused = true)]
+        async fn a_refusal_without_a_change_in_progress_rebuilds_at_once() {
+            let policy = ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            run.result
+                .expect("the controller feedback attempt is authorized");
+            assert_eq!(policy.prepares(), 3);
+            assert_eq!(run.notices, 1);
+            assert_eq!(run.elapsed, std::time::Duration::ZERO, "nothing waited");
+            let operations = client.operations();
+            assert_eq!(operations.len(), 3);
+            assert_eq!(operations[0], operations[1]);
+            assert_ne!(operations[2], operations[0]);
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// Only `ReprepareRequired` waits: a denial with a change in progress
+        /// returns to the controller at once, and that new operation then
+        /// waits for the change like any other.
+        #[tokio::test(start_paused = true)]
+        async fn other_refusals_never_wait_for_a_change_in_progress() {
+            let policy = ChurnPolicy::new([
+                ChurnStep::DenyDuringChange {
+                    settle: std::time::Duration::from_millis(50),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            run.result
+                .expect("the controller feedback attempt is authorized");
+            assert_eq!(policy.prepares(), 3);
+            assert_eq!(run.notices, 1);
+            assert_eq!(
+                policy.prepared_after_first(1),
+                std::time::Duration::ZERO,
+                "the denial did not wait"
+            );
+            assert!(policy.prepared_after_first(2) >= std::time::Duration::from_millis(50));
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// A compaction summary refused while an owner change is in progress
+        /// on the work's own publication waits for it and asks again under
+        /// the same operation: the compaction completes, and the controller
+        /// sees no refusal.
+        #[tokio::test(start_paused = true)]
+        async fn a_compaction_summary_waits_out_an_owner_change_in_progress() {
+            // The first run answers; the second compacts first, and its
+            // summary meets a change in progress.
+            let policy = ChurnPolicy::new([
+                ChurnStep::Allow,
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .build_standalone(
+                    Arc::clone(&client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(&policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(&client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            for (prompt, events) in [("first retained input", false), ("second input", true)] {
+                let (tx, mut rx) = mpsc::channel(1024);
+                agent
+                    .run_with_events_and_work_authorization(
+                        prompt.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(work.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                if events {
+                    let mut completed = 0;
+                    while let Ok(event) = rx.try_recv() {
+                        assert!(
+                            !matches!(event, crate::AgentEvent::CompactionFailed { .. }),
+                            "{event:?}"
+                        );
+                        if matches!(event, crate::AgentEvent::CompactionCompleted { .. }) {
+                            completed += 1;
+                        }
+                    }
+                    assert_eq!(completed, 1, "the compaction completed");
+                }
+            }
+            let summaries = client.summaries.lock().unwrap().clone();
+            assert_eq!(summaries.len(), 2, "one refused summary, one more");
+            assert_eq!(summaries[0], summaries[1], "the same compaction operation");
+            assert!(
+                policy
+                    .prepared_after_first(2)
+                    .saturating_sub(policy.prepared_after_first(1))
+                    >= std::time::Duration::from_millis(30),
+                "the summary waited for the change to complete"
+            );
+            let transcript = serde_json::to_string(agent.session().messages()).unwrap();
+            assert!(!transcript.contains("operation_refused"));
         }
 
         /// A PreLlm gate fixture. It denies every ordinary request and,

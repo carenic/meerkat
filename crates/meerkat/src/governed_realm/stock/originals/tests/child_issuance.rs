@@ -4,7 +4,9 @@
 //! The grant owner's records, revision and resolved lineages are the oracle.
 
 use super::*;
-use crate::governed_realm::helper_admission::GovernedHelperAdmissionFence;
+use crate::governed_realm::helper_admission::{
+    GovernedHelperAdmissionFence, HelperAdmissionRefusal,
+};
 use crate::governed_realm::helper_child_issuance::{
     GovernedHelperChildIssuance, HelperChildIssuanceRefusal,
 };
@@ -871,4 +873,235 @@ fn a_pending_further_original_leaves_the_child_unissued_and_unavailable() {
         "a cancellation wins over a pending admission"
     );
     assert!(f.issued("cancelled").is_none());
+}
+
+/// The records owner, refusing as the host sets it after preparation: 1
+/// refuses to rebuild (`ReprepareRequired`), 2 denies, 3 refuses malformed
+/// facts, 0 is [`Records`].
+struct ChurnedRecords(std::sync::atomic::AtomicU8);
+impl OperationPolicyOwner for ChurnedRecords {
+    fn authorize_operation(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        purpose: LocalPolicyPurpose,
+        now_ms: u64,
+    ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        use meerkat_core::authorization::{OperationRefusalKind, OperationRefused};
+        match self.0.load(Ordering::SeqCst) {
+            1 => Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into()),
+            2 => Err(OperationRefused::new(OperationRefusalKind::Denied).into()),
+            3 => Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into()),
+            _ => Records.authorize_operation(association, binding, purpose, now_ms),
+        }
+    }
+}
+
+/// Each refusal mode of [`ChurnedRecords`] with what the fence and the child
+/// issuance must answer for it: only a refusal to rebuild is unavailable.
+const LEAF_REFUSALS: [(u8, HelperAdmissionRefusal, HelperChildIssuanceRefusal); 3] = [
+    (
+        1,
+        HelperAdmissionRefusal::Unavailable,
+        HelperChildIssuanceRefusal::Unavailable,
+    ),
+    (
+        2,
+        HelperAdmissionRefusal::Denied,
+        HelperChildIssuanceRefusal::Denied,
+    ),
+    (
+        3,
+        HelperAdmissionRefusal::Denied,
+        HelperChildIssuanceRefusal::Denied,
+    ),
+];
+
+fn setup_request() -> CreateWorkItemRequest {
+    CreateWorkItemRequest {
+        title: "setup helper".to_string(),
+        ..Default::default()
+    }
+}
+
+/// A refusal to rebuild at the prepared effect leaf is no denial: the
+/// prepared fence commits nothing and the prepared child issuance appends
+/// nothing, both unavailable, and each succeeds once the owners answer
+/// again. A denial and malformed facts stay denials on both.
+#[tokio::test]
+async fn a_rebuild_refusal_at_the_prepared_effect_leaf_is_unavailable() {
+    let owner = Arc::new(ChurnedRecords(std::sync::atomic::AtomicU8::new(0)));
+    let fixture = Fixture::new_with(owner.clone());
+    fixture.source("p", ExecutionRestrictions::unrestricted());
+    let service = WorkGraphService::new(Arc::new(MemoryWorkGraphStore::new()));
+    let fence = |key: &str| {
+        let key = WorkAdmissionKey::new(key).expect("key");
+        let fence = GovernedHelperAdmissionFence::new(
+            Arc::clone(&fixture.grants),
+            fixture.ledger.clone(),
+            fixture.child.clone(),
+            Arc::from([retained_original("p")]),
+            fixture.setup.clone(),
+            Arc::clone(&fixture.policy),
+            Arc::clone(&fixture.clock) as Arc<dyn LocalAuthorizationClock>,
+            "default",
+            WorkNamespace::default(),
+            service
+                .admission_identity(key.clone(), setup_request())
+                .expect("identity"),
+        );
+        (key, fence)
+    };
+
+    for (mode, admission, issuance) in LEAF_REFUSALS {
+        owner.0.store(mode, Ordering::SeqCst);
+        let (key, refused) = fence(&format!("helper-{mode}"));
+        assert!(
+            service
+                .create_idempotent_with_fence(key, setup_request(), refused.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(refused.refusal(), Some(admission), "fence, mode {mode}");
+        assert_eq!(
+            fixture.issuance("helper-child", &["p"]).issue_or_recover(),
+            Err(issuance),
+            "issuance, mode {mode}"
+        );
+        assert_eq!(fixture.issued("helper-child"), None, "nothing appended");
+    }
+    assert!(
+        service
+            .list(meerkat_workgraph::WorkItemFilter {
+                include_terminal: true,
+                ..Default::default()
+            })
+            .await
+            .expect("list")
+            .is_empty(),
+        "nothing committed"
+    );
+
+    owner.0.store(0, Ordering::SeqCst);
+    let (key, admitted) = fence("helper-current");
+    assert!(matches!(
+        service
+            .create_idempotent_with_fence(key, setup_request(), admitted)
+            .await,
+        Ok(WorkAdmissionOutcome::Created(_))
+    ));
+    assert!(matches!(
+        fixture.issuance("helper-child", &["p"]).issue_or_recover(),
+        Ok(ChildGrantOutcome::Issued { .. })
+    ));
+}
+
+/// The dispatch paths answer the same when the dispatch's own work owners
+/// refuse under their exclusion: unavailable for a refusal to rebuild,
+/// denied for a denial or malformed facts, at the fence and at the child
+/// issuance; both succeed once the owners answer again.
+#[tokio::test]
+async fn a_rebuild_refusal_at_the_dispatch_effect_leaf_is_unavailable() {
+    use meerkat_core::authorization::{ToolAuthorizationFacts, ToolAuthorizationTarget};
+
+    let owner = Arc::new(ChurnedRecords(std::sync::atomic::AtomicU8::new(0)));
+    let fixture = Fixture::new_with(owner.clone());
+    fixture.source("s", ExecutionRestrictions::unrestricted());
+    // The dispatch's own prepared tool operation in the child's work.
+    let plan = meerkat_core::ToolExecutionContract::default()
+        .resolve_default(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(1),
+                ),
+            ])
+            .expect("deadlines"),
+        )
+        .expect("plan");
+    let arguments: Arc<serde_json::value::RawValue> =
+        Arc::from(serde_json::value::RawValue::from_string("{}".to_string()).expect("arguments"));
+    let prepared = PreparedOperationCheck::prepare(
+        fixture.context.clone(),
+        PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+            operation_id: meerkat_core::OperationId::new(),
+            execution_scope: fixture.context.execution_scope().clone(),
+            run_id: None,
+            context_revision: None,
+            operation: AuthorizationOperation::Tool(ToolAuthorizationFacts {
+                call_id: Arc::from("setup-call"),
+                name: "setup".into(),
+                arguments,
+                target: ToolAuthorizationTarget::Dispatcher(Arc::new(plan)),
+            }),
+        }),
+    )
+    .expect("the dispatch's operation is prepared");
+    let context = meerkat_core::ToolDispatchContext::default()
+        .with_work_authorization(Some(fixture.context.clone()))
+        .__test_with_prepared_authorization(prepared.clone());
+    // The dispatch's own call, borrowed from the binding it was prepared with.
+    let call = match &prepared.binding().facts().operation {
+        AuthorizationOperation::Tool(tool) => Some(tool.call()),
+        _ => None,
+    }
+    .expect("a tool operation");
+    let service = WorkGraphService::new(Arc::new(MemoryWorkGraphStore::new()));
+    let fence = |key: &str| {
+        let key = WorkAdmissionKey::new(key).expect("key");
+        let fence = GovernedHelperAdmissionFence::from_dispatch(
+            call,
+            &context,
+            fixture.ledger.clone(),
+            Arc::from([retained_original("s")]),
+            "default",
+            WorkNamespace::default(),
+            service
+                .admission_identity(key.clone(), setup_request())
+                .expect("identity"),
+        )
+        .expect("the dispatch's own operation builds the fence");
+        (key, fence)
+    };
+    let issuance = || {
+        GovernedHelperChildIssuance::from_dispatch(
+            call,
+            &context,
+            fixture.ledger.clone(),
+            Arc::from([retained_original("s")]),
+            fixture.intent("dispatch-child"),
+        )
+        .expect("the dispatch's own operation builds the issuance")
+    };
+
+    for (mode, admission, refused_issuance) in LEAF_REFUSALS {
+        owner.0.store(mode, Ordering::SeqCst);
+        let (key, refused) = fence(&format!("helper-{mode}"));
+        assert!(
+            service
+                .create_idempotent_with_fence(key, setup_request(), refused.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(refused.refusal(), Some(admission), "fence, mode {mode}");
+        assert_eq!(
+            issuance().issue_or_recover(),
+            Err(refused_issuance),
+            "issuance, mode {mode}"
+        );
+        assert_eq!(fixture.issued("dispatch-child"), None, "nothing appended");
+    }
+
+    owner.0.store(0, Ordering::SeqCst);
+    let (key, admitted) = fence("helper-current");
+    assert!(matches!(
+        service
+            .create_idempotent_with_fence(key, setup_request(), admitted)
+            .await,
+        Ok(WorkAdmissionOutcome::Created(_))
+    ));
+    assert!(matches!(
+        issuance().issue_or_recover(),
+        Ok(ChildGrantOutcome::Issued { .. })
+    ));
 }

@@ -39,6 +39,10 @@ pub use audit::{
     OperationEntryBoundary, OperationObservation, OperationObservationError,
     OperationObservationPhase, OperationObservedOutcome,
 };
+mod owner_change_wait;
+pub use owner_change_wait::{
+    OWNER_CHANGE_FREE_REBUILDS, OWNER_CHANGE_WAIT_BOUND, OwnerChangeChurn, OwnerChangeWait,
+};
 
 /// Why an input or session operation cannot obtain current runtime authority.
 /// No variant is a permission verdict or a terminal result for existing work.
@@ -455,6 +459,25 @@ pub enum ReviewOperationContextResolution {
     Material(ReviewOperationContext),
 }
 
+/// An owner change in progress on a work's own authorization publication: a
+/// token for waiting until that change completes, never a permission. Equal
+/// tokens name the same change in progress; a different token is a later
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerChangeInProgress {
+    instance: uuid::Uuid,
+    sequence: u64,
+}
+
+impl OwnerChangeInProgress {
+    /// The token of the change in progress on publication `instance` at
+    /// its odd `sequence`. Only that publication's owner mints it.
+    #[must_use]
+    pub const fn new(instance: uuid::Uuid, sequence: u64) -> Self {
+        Self { instance, sequence }
+    }
+}
+
 /// Immutable feature-owned context attached to one admitted work item.
 ///
 /// Implementations resolve current owner policy against all correlated operation
@@ -579,6 +602,17 @@ pub trait WorkAuthorization: Send + Sync {
         _entered_tier: OperationReviewTier,
     ) -> Result<Box<dyn std::any::Any + Send>, OperationAuthorizationError> {
         Err(OperationAuthorizationError::Unavailable)
+    }
+
+    /// The owner change in progress on this work's own authorization
+    /// publication, if any: a token for waiting until it completes
+    /// ([`OwnerChangeChurn`]). A hint only, never a permission; it covers
+    /// this work's own publication instance and nothing else. A wrapper of a
+    /// run's work authorization forwards it. An owner without a publication
+    /// answers `None`, and so does a poisoned publication, whose observations
+    /// stay unavailable; a refusal then takes its ordinary path.
+    fn owner_change_in_progress(&self) -> Option<OwnerChangeInProgress> {
+        None
     }
 }
 

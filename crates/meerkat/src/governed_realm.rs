@@ -38,6 +38,19 @@ pub mod staged;
 pub mod stock;
 pub mod stock_host;
 
+/// Whether `refusal`, met at a synchronous governed effect leaf, is a
+/// denial. Such a leaf runs under an owner-change exclusion it must not wait
+/// in, so a refusal to rebuild is no verdict on the operation: the leaf
+/// answers unavailable, and a later attempt rebuilds from current owners. A
+/// policy denial and malformed facts stay denials, and so does any refusal
+/// kind this version does not know.
+pub(crate) fn effect_leaf_denies(refusal: meerkat_core::authorization::OperationRefused) -> bool {
+    !matches!(
+        refusal.kind(),
+        meerkat_core::authorization::OperationRefusalKind::ReprepareRequired
+    )
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
