@@ -9,6 +9,13 @@
 //! The persistent variants step and consume the input through the persistent
 //! driver's inner driver, so they pin the delegation of the step subscription,
 //! not a durable commit.
+//!
+//! The cancellations' settle deadline is a std-clock instant, which the paused
+//! clock does not move. The paused-clock bound tests therefore cover the read
+//! a timed-out wait falls through to, and the real-clock tests past the bound
+//! cover a read that starts after the deadline. Under a paused clock, a
+//! cancellation that never settles keeps re-parking (each wait auto-advances
+//! about 5 s) until 5 real seconds pass, as the released 25 ms poll did.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use super::*;
@@ -390,6 +397,148 @@ async fn ephemeral_exact_cancellation_after_the_bound_answers_a_settled_terminal
 #[tokio::test]
 async fn persistent_exact_cancellation_after_the_bound_answers_a_settled_terminal() {
     exact_cancellation_after_the_bound_answers_a_settled_terminal(persistent_machine()).await;
+}
+
+/// A publication handle the held dispatch below never reaches: its start
+/// permit is never sent.
+struct UnreachedPublisher;
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for UnreachedPublisher {
+    async fn publish_interaction_terminals(
+        &self,
+        _events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        panic!("the held dispatch never starts its publication")
+    }
+}
+
+/// Past the settle deadline, a consumed input whose session driver still has
+/// a runless terminal dispatch pending keeps the drain: the cancellation
+/// reports the publication outstanding, never success.
+#[tokio::test]
+async fn exact_cancellation_after_the_bound_reports_a_pending_dispatch() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let input_id = input_between_steps(&machine, &session_id, "exact-held-dispatch").await;
+    consume(&machine, &session_id, &input_id).await;
+    let (driver, completions, mutation_gate) = {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered session");
+        (
+            entry.driver.clone(),
+            entry.completions.clone(),
+            Arc::clone(&entry.mutation_gate),
+        )
+    };
+    let (_dispatch_result, start_permit) = machine
+        .prepare_runless_terminal_publication_dispatch(
+            &driver,
+            &completions,
+            &mutation_gate,
+            Arc::new(UnreachedPublisher),
+        )
+        .expect("hold a runless terminal dispatch slot");
+
+    let outcome = machine
+        .cancel_input_if_present_owned_before(
+            &session_id,
+            &input_id,
+            "cancelled after the bound".to_string(),
+            meerkat_core::time_compat::Instant::now(),
+        )
+        .await;
+    // Unsent, the permit ends the held dispatch, which clears its slot.
+    drop(start_permit);
+    assert!(
+        matches!(
+            outcome,
+            Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
+        ),
+        "a pending dispatch keeps the drain at the spent deadline: {outcome:?}"
+    );
+}
+
+/// Past the settle deadline, an abandoned directed input whose committed
+/// runless terminal carrier is not yet published keeps the drain: the
+/// cancellation reports the carrier outstanding, never success.
+#[tokio::test]
+async fn exact_cancellation_after_the_bound_reports_an_unpublished_carrier() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    // A runless terminal carrier names the runtime placement it terminates.
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("runtime binding");
+    let interaction = meerkat_core::time_compat::new_uuid_v7().to_string();
+    let input = crate::mob_adapter::create_tracked_flow_step_input(
+        "unpublished-carrier",
+        meerkat_core::types::ContentInput::Text("abandoned before it runs".to_string()),
+        "input-transition-wait-flow",
+        None,
+        &interaction,
+    )
+    .expect("directed input");
+    let input_id = input.id().clone();
+    {
+        // Admitted on the driver itself: the machine's admission refuses
+        // directed input to a session with no publication capability, and the
+        // drain under test is the one without a publication handle.
+        let driver = session_driver(&machine, &session_id).await;
+        let mut driver = driver.lock().await;
+        assert!(
+            driver
+                .as_driver_mut()
+                .accept_input(input)
+                .await
+                .expect("accept the directed input")
+                .is_accepted()
+        );
+        let prepared = driver
+            .prepare_runless_runtime_terminated_interaction_outboxes(
+                std::slice::from_ref(&input_id),
+                "abandoned before it runs".to_string(),
+            )
+            .expect("stage the runless terminal carrier");
+        driver
+            .abandon_queued_input(&input_id, crate::input_state::InputAbandonReason::Cancelled)
+            .await
+            .expect("abandon the queued input");
+        assert_eq!(
+            crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+            Some(input_id.clone()),
+            "the abandoned input owns an unpublished carrier"
+        );
+    }
+
+    let outcome = machine
+        .cancel_input_if_present_owned_before(
+            &session_id,
+            &input_id,
+            "cancelled after the bound".to_string(),
+            meerkat_core::time_compat::Instant::now(),
+        )
+        .await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(RuntimeDriverError::Internal(reason))
+                if reason.contains("did not converge before its deadline")
+        ),
+        "an unpublished carrier keeps the drain at the spent deadline: {outcome:?}"
+    );
 }
 
 /// Queue a consume behind a cancellation on the session's driver lock, which

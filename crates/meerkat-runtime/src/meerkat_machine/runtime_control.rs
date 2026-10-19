@@ -17847,9 +17847,10 @@ impl MeerkatMachine {
                     Some(stored) if stored.seed.terminal_outcome.is_some() => {
                         // A read that starts after the settle deadline (the
                         // one after a wait that reached it) waits for
-                        // nothing: a terminal input answers at once unless a
-                        // runless terminal is still owed its publication,
-                        // which only the drain can wait for.
+                        // nothing, and a terminal input answers at once. A
+                        // runless terminal still owed its publication keeps
+                        // the drain, which at the spent deadline reports the
+                        // publication outstanding instead of success.
                         if Instant::now() >= deadline
                             && !self.runless_terminal_publication_dispatch_pending(&driver)
                             && !Self::owes_runless_runtime_termination(&driver_guard).await?
@@ -18060,7 +18061,7 @@ impl MeerkatMachine {
 
     /// Whether a committed runless runtime-termination carrier on this driver
     /// still waits for its publication: what the terminal drain of an exact
-    /// cancellation publishes before it answers. The same row predicate as
+    /// cancellation publishes before it answers. The row predicate of
     /// `control_plane::has_committed_runless_recovery_carrier`, without its
     /// stop-only runtime phase gate, since a queued-input abandon commits its
     /// carrier while the runtime runs.
@@ -18070,21 +18071,8 @@ impl MeerkatMachine {
         Ok(driver
             .pending_terminal_input_states()
             .await?
-            .into_iter()
-            .any(|stored| {
-                stored
-                    .state
-                    .interaction_terminal_outbox
-                    .is_some_and(|outbox| {
-                        matches!(
-                            outbox.batch_key,
-                            crate::input_state::InteractionTerminalBatchKey::RuntimeTermination { .. }
-                        ) && !matches!(
-                            outbox.phase,
-                            crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
-                        )
-                    })
-            }))
+            .iter()
+            .any(crate::control_plane::carries_unpublished_runless_termination))
     }
 
     pub fn accept_input_with_completion_boxed<'a>(
