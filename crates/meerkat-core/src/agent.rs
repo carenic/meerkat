@@ -6464,9 +6464,10 @@ mod governed_operation_tests {
             }
         }
 
-        // The entry's check and the post-review check pass; the change begins
-        // after the second, before the body entry.
-        let work = ChurnWork::new(crate::authorization::OperationReviewTier::R2, 0, Some(2));
+        // The entry's check, the post-review check and the verdict commit's
+        // final check pass; the change begins after the third, before the
+        // body entry.
+        let work = ChurnWork::new(crate::authorization::OperationReviewTier::R2, 0, Some(3));
         let reviewer = Arc::new(CountingAllow(std::sync::atomic::AtomicUsize::new(0)));
         let context = churn_context(&work).with_operation_review(Some(Arc::new(
             crate::approval::review::BoundOperationReview::new(
