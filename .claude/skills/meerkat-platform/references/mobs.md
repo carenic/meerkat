@@ -127,6 +127,30 @@ close does not refuse gets the retryable `MobError::ShutdownInProgress`
 (wire `SESSION_BUSY`); `ActorCommandChannelClosed` means the actor has exited
 or is exiting. `MobError` is `#[non_exhaustive]`.
 
+Shutdown report: `shutdown_with_report(ShutdownOptions)`
+(`ShutdownOptions::default().with_deadline(deadline)` bounds its waits)
+returns a `MobShutdownReport` with per-member `members`
+(`MemberShutdownOutcome`), `runs` and `run_starts`; `is_clean()` is true when
+every member is `Unregistered`. Since 0.9.4 `UnregisterPending { stage,
+settlement, .. }` (`#[non_exhaustive]`) carries a `MemberUnregisterSettlement`
+that follows the member's exact runtime registration after Shutdown returns,
+also after the actor exited, and holds the mob's runtime only weakly.
+`try_state()` answers at once; `settle_within(deadline)` waits (dropping the
+future cancels only the wait; `Pending` at the deadline, and a later call
+continues), admitting the unregister itself when Shutdown's deadline passed
+first. `MemberUnregisterState` is `Settled`, `Pending`, `Failed(reason)` or
+`HandedOver`: terminal, a resumed mob or another caller took the
+registration over in place, and nothing was unregistered or discarded. A
+durability-degraded member goes through the runtime's reload-required discard
+first (stage `durability_reload_discard` while the runtime refuses its
+unregister until then), so it no longer stays registered until the process
+exits.
+
+Stop hold: Stop holds run starts for every local member until Resume. Since
+0.9.4 that includes a member reloaded while the mob is stopped, one spawned
+into a stopped mob and one held again after a failed Resume; retire, Shutdown
+and destroy release the hold for the members they dispose of.
+
 Delivery scope: a host that persists effect-bearing deliveries captures the
 member's `MemberDeliveryScope` (runtime incarnation, fence and session; it
 serializes with a `version` field), persists it, then submits against it. A
