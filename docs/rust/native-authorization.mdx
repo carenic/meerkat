@@ -273,6 +273,28 @@ is not evidence that the tool executed. See the
 [review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
 for the boundary and remaining acceptance scope.
 
+Since 0.9.4 a single owner change does not fail an R2 call. When one owner
+publication change lands during the review, at its verdict's commit, or at the
+dispatch's own entry staging before the tool's dispatcher runs, and the
+operation is still permitted at R2 with the same review material, the fenced
+dispatch re-prepares it and reviews it once more from the start as a second
+attempt for the same `tool_call_id`; the earlier verdict is never used.
+Deciding to review again reads the successor's material once
+(`review_operation_context`); when the material is unchanged, that read is the
+one the second attempt is shown. A `with_observer` observer can therefore see a
+`ContextChanged` retirement followed by the second attempt: do not treat the
+retirement as the call's final outcome. At most one re-review runs per call,
+only after an allow or a reviewer failure and only with enough tool time left
+for a whole review deadline. A second change, a denial or escalation, an
+expired review, a changed tier (human consent included), changed or unreadable
+material, and a change once the dispatcher runs settle as before. A change
+still in progress when the verdict is checked is waited out within the
+attempt's review deadline (2 s at most). The re-review adds no record type: the
+audit shows a second `ReviewAttemptStarted` after the successor's `Prepared`
+record, and a change at the entry staging leaves that staging's `Entry` record
+twice. Per tool call the waits stay bounded: at most 3 wait states, 9 free
+rebuilds and 6 s of waiting, inside the tool's timeout.
+
 ## Authorize the builtin web_search and its helper
 
 <Note>
@@ -339,6 +361,23 @@ another authority's domain permits nothing. The bound isolates applications
 only as far as each application's domains carry an authority that no other
 application shares. An owner bound records no MCP connector approval: only an
 exact connector domain or connector action records one.
+
+Since 0.9.4 `ExecutionRestrictions.resource_domains` is a `DomainRestriction`
+(it was `ExactRestriction<ResourceDomain>`). Build it with
+`DomainRestriction::{unrestricted, exact, owned_by, unresolved}` and read it
+through `bound()`, which returns the `#[non_exhaustive]` `DomainBound`
+(`Unrestricted`, `Exact`, `OwnedBy`). A reader that cannot interpret a bound
+kind must treat it as naming nothing. Conjunction is the exact intersection of
+both match sets: an owner bound meets exact domains as the owners' own domains,
+two owner sets meet as their intersection, and no owner is the empty exact set.
+Namespaces stay opaque. Review text states an owner bound as "owned by" and its
+owners. Unrestricted and exact bounds keep their earlier wire bytes in both
+directions, and the shared restriction conformance corpus moves to contract 1.1
+with owner-scoped vectors (the 1.0 vectors are unchanged). A 0.9.3 binary
+refuses to restore a grant owner whose journal holds an owner-scoped restriction
+(`RestartRequired`); a journal that holds none stays readable by 0.9.3. An input
+row that carries an owner-scoped restriction is written at stored input state 7,
+and a row stamped before 7 that carries one is rejected.
 
 The attribution keys the selection and the protected audit record
 (`AuditDelegateAttribution`, with the call's operation id and the role); it
@@ -640,6 +679,164 @@ grant/resource owners. Keep local refusals as affected-call feedback while
 permitted work continues; audit availability and launch failures require their
 own infrastructure repair. No CLI grant command or universal Console permission
 control is supplied by this API.
+
+## Bind a session agent's MCP servers
+
+A trusted host that selected the agent a registered session acts as binds that
+selection to the session's registration before the agent is built, as a
+`SessionAgentMandate`: the qualified executor, the exact worker grant lineage
+selected for each MCP server the agent may use, and the represented subject the
+mandate applies to. Since 0.9.4 `SessionAgentMandate::new(executor, servers,
+represented_subject)` takes no catalog argument and refuses an empty server
+selection (`AgentMandateError::NoSelection`). `SessionAgentMandate::catalog_lineage`
+and the stock realm's `AgentGrantRefs::catalog_lineage` are removed: the agent's
+tool catalog is base work, whose lineage the work's authority basis selects
+(`AgentGrantRefs::prompt_selection` still places the catalog grant there). A
+stock selection that grants only the catalog therefore binds no session agent;
+every configured MCP server stays unavailable, as before, and the registration
+stays free for a server mandate.
+
+## Survive owner changes in progress
+
+Every owner mutation passes through the grant authority's publication. While a
+change is being published, observations refuse to rebuild
+(`OperationRefusalKind::ReprepareRequired`): a stale read, not a verdict. Since
+0.9.4 the runtime classifies that consistently and waits it out within fixed
+bounds.
+
+- `LocalGrantAuthority::resolve_lineage_observed`,
+  `resolve_controller_lineage_observed` and `resolve_lineage_ceiling_observed`
+  resolve a lineage inside the caller's own observation of the publication and
+  return `LineageResolutionRefusal::Changed` when an owner change published
+  during the resolution (classify it as a stale read) or `Refused` with the
+  refusal the standalone resolution reports. A standalone
+  `LocalGrantAuthority::resolve_lineage` still reports a concurrent change as
+  `GrantRefusal::Unavailable`.
+- In the native runtime that stale read is `ReprepareRequired`. A grant-backed
+  preparation rebuilds once, for the work's own grant and for the contributor
+  ceilings of work that names other originals (a helper's source). Controller
+  admission refuses with `ReprepareRequired`, which the runtime driver reports as
+  `RuntimeDriverError::ControllerReadinessUnavailable` with
+  `ControllerReadinessFailure::PolicyChanged`. A review read, which reads its
+  material once by design, refuses as stale (`ToolError::AuthorizationRefused`
+  with `ReprepareRequired`) instead of an unavailable review context, and a
+  fresh attempt reads it again. `AgentInstallationGrant` reports a change it
+  meets while reading the agent's lineage as `McpAttachmentRefusal::NotCurrent`.
+  A poisoned publication still answers `Unavailable` and is never retried.
+  Failed durable grant custody and a clock failure still answer `Unavailable`,
+  except one met while an owner change publishes, which is discarded with that
+  stale read; a preparation's one rebuild then answers `Unavailable` if the
+  failure persists.
+- `meerkat_core::authorization::OwnerChangeChurn` (with `OwnerChangeWait` and
+  `OwnerChangeInProgress`) is one bounded wait, for a site that rebuilds after
+  `ReprepareRequired`, until an owner change in progress on the work's own
+  publication completes: `OWNER_CHANGE_WAIT_BOUND` (2 s) and
+  `OWNER_CHANGE_FREE_REBUILDS` (3 rebuilds that do not spend the operation's
+  own). `WorkAuthorization::owner_change_in_progress` (provided, default `None`)
+  reports such a change as a waiting hint, never a permission;
+  `LocalAuthorizationPublication::change_in_progress` answers it for the local
+  owners, and the native run and audit wrappers forward it.
+  `OwnerChangeChurn::wait_for_settled_change` takes the wait's trace site and
+  operation: it records the debug event below and reports the wait to the
+  host's operation refusal observer. `ToolDispatchContext::owner_change_churn`
+  gives a delegate operation of a tool call, such as the `web_search` helper's
+  model request, the waiting state that reports as that call's.
+- The runtime waits at a model request (one deadline per model call, set at its
+  first wait to 2 s or to the remaining run budget if less; the budget is
+  checked after every wait), at a governed tool dispatch's prepared entry, body
+  entry and call-level policy gate (inside the tool's timeout; a streaming
+  tool's gate wait also counts against its inactivity window), at the
+  `web_search` helper's model request (bounded by
+  `ToolDispatchContext::remaining_tool_time`, the tool time a fenced dispatch
+  has left) and at a compaction summary (past the bounds the refusal still
+  fails its compaction). A free rebuild runs only once no change is in
+  progress. When the body entry or the gate's staging waits out a change after
+  recording its `Entry` record, it records another for the decision checked
+  after the wait. The gate's check point runs on the decision checked after
+  its wait, but the gate's own code already ran: a reviewed tool whose
+  decision changed while the gate waited settles as `review_unsatisfied`
+  (`context_changed`) and is not reviewed again.
+- A governed helper admission fence and a helper child issuance answer
+  `Unavailable` instead of `Denied` when their check refuses to rebuild, on the
+  prepared and dispatch paths alike: under the owner-change exclusion they
+  cannot wait, and a refusal to rebuild is no verdict, so a later attempt may
+  succeed. A denial and malformed facts stay `Denied`.
+- `OwnerChangeWait::trace` records each wait as one `debug` event of target
+  `meerkat::authz::owner_change_wait` with `site` (`model_request`,
+  `compaction_summary`, `tool_dispatch`, `tool_entry`, `tool_policy_entry` or
+  `web_search_delegate`), `operation_id`, `waited_ms` and `settled`. Each
+  refused attempt keeps its own audit record.
+
+## Observe refusal dispositions
+
+Since 0.9.4 the Rust host that composed an agent can see each refusal disposition
+the agent decides for a governed operation. Install a
+`meerkat_core::authorization::OperationRefusalObserver` with
+`AgentBuilder::with_operation_refusal_observer` or the facade's
+`AgentFactory::with_operation_refusal_observer`. Its `observe` receives an
+`OperationRefusalObservation` with `session_id()`, `run_id()`, `operation_id()`,
+`surface()` (`OperationRefusalSurface::ModelRequest`, `ToolCall { tool_use_id }`
+for the call or a delegate operation of it, `Compaction`), `outcome()`
+(`OperationRefusalOutcome::Refused { kind, dispatch }`, read from the same value
+the model payload renders, or `AuthorityUnavailable`) and `disposition()`
+(`OperationRefusalDisposition::WaitedForOwnerChange { waited_ms, settled }`,
+`Rebuilt`, `ControllerFeedback`, `ToolResult`, `CompactionSkipped`, `RunFailed`).
+The surface, outcome and disposition enums are `#[non_exhaustive]`.
+
+The contract: an observation is a diagnostic emitted when Core decides the
+disposition, before any effect of it is durable, so it is not exactly-once across
+a crash and an operation reported as waiting or rebuilding may still fail. It is
+called synchronously on the deciding task and must not block; hand it to your own
+channel. Core holds no lock shared with another operation while calling it. A
+panicking observer is a host bug and the panic propagates. Nothing of it enters
+the agent event stream, a wire type, a config type or any model context. Review
+outcomes, a consent attempt refused before it resolved its candidate, and
+exact-control refusals (MCP attachments, tool applications, context controls) are
+not observed.
+
+`OperationRefused::dispatch` returns a `RefusalDispatch` (`NotDispatched`,
+`Unknown`; non-exhaustive): whether the tool code that the certifying core
+component guards ran. The fenced dispatch (and the retained consent attempt)
+certifies `NotDispatched` for every operation refusal it meets before it invokes
+the dispatcher, and the execution policy gate for every one it meets before it
+invokes its inner dispatcher. Every other refusal, one a dispatcher returns
+included, is `Unknown`, which makes no claim. A dispatcher layer that runs tool
+code of its own before delegating to a certifying component forwards
+`OperationRefused::new(refusal.kind())`. `OperationRefused` equality compares both
+facts, so a certified refusal no longer equals `OperationRefused::new(kind)` of
+the same kind: compare `kind()` and `dispatch()`.
+
+The model-facing `operation_refused` payload renders the same value as `data`:
+`{"kind": "reprepare_required", "tool_invoked": false}`, with `kind` one of
+`reprepare_required`, `denied` and `malformed_facts`, and `tool_invoked` `false`
+(certified) or `"unknown"`, always present. The kind carries no policy detail,
+owner data or audit content, and neither field is a permission: a typed reason
+never grants replay after entry, and a new call is a new operation with fresh
+admission. The message, `Display`, `Debug` and tracing stay uniform. A mob member
+upcall keeps carrying the bare kind, so a 0.9.3 peer decodes it as before; whether
+the tool ran does not cross it, and the receiving side's model reads `"unknown"`.
+An upcall refusal whose data is absent or names no known kind decodes as
+`operation_authorization_unavailable` instead of `operation_refused` with
+`malformed_facts`: it is no verdict the peer gave.
+
+## Read where a refusal was decided
+
+Since 0.9.4 `AuditObservation::Refused` carries `read: Option<AuditRefusalRead>`
+with `observed_at_ms`, `basis`, `publication_sequence`, `live_sequence` and
+`publication_instance`. `AuditRefusalBasis::OwnerAnswer` means the owners
+answered at one coherent publication (a refusal from a prepared decision's own
+validity window is such an answer); `PublicationChanged` means the publication
+changed after the sequence the attempt read and the change completed;
+`ChangeInProgress` means an owner change was still in progress when the attempt
+ended. A refusal to rebuild that a prepared decision observes at its check reads
+as a changed publication against the live sequence. `AuditPolicyRead` gains
+`publication_instance`, since sequences of different instances do not compare.
+Both are process-local diagnostics, not permissions or cross-process freshness
+proofs. Rows carry them at stored input state version 7; a row stamped before
+version 7 that carries either is refused, and records written earlier read with
+neither. `AuditObservation` is now `#[non_exhaustive]`: matches outside the crate
+need a wildcard arm, `Refused` patterns without `..` need the `read` field, and
+`AuditPolicyRead` struct literals need `publication_instance`.
 
 ## Append external context under current permissions
 
