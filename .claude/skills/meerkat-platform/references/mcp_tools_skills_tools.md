@@ -104,7 +104,10 @@ run continues. Codes: `tool_not_found`, `tool_unavailable`,
 `confinement_refused`, `hook_denied`, `hook_launch_refused`,
 `operation_observation_unavailable`, `operation_authorization_unavailable`,
 `review_unsatisfied`, `review_unavailable`, `policy_denied`,
-`policy_indeterminate`, `callback_pending`, `tool_error`.
+`policy_indeterminate`, `callback_pending`, `tool_error`. Since 0.9.4 an
+`operation_refused` result also carries `data: {"kind": "reprepare_required"
+| "denied" | "malformed_facts", "tool_invoked": false | "unknown"}`; neither
+field permits a retry, and a new call is a new operation.
 
 ## Tool modes, filters and overlays
 
