@@ -251,18 +251,6 @@ them.
   unknown reason and keep it raw. Downgrade: the session event store decodes
   every line strictly, so a 0.9.3 binary cannot read a session event log that
   holds such a `run_failed` line.
-
-### Security
-
-- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
-  (deprecated) and the archived unsafe-libyaml it brought in
-  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
-  including from the `@rkat/web` wasm module, and `deny.toml` no longer
-  ignores that advisory. serde-saphyr is pinned exactly; its parser
-  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
-  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
-  that could).
-
 - `meerkat-core`: a compaction summary reports what its source carried.
   `Compactor::prepare_for_summarization` takes the summarization source budget
   and returns the source with its bound, `(messages: &[Message], budget:
@@ -311,6 +299,17 @@ them.
   field and drops it when it next writes the cadence; back on this release,
   that session compacts as before until its next rewrite records the field
   again, so a downgrade and upgrade cost at most one extra summary call.
+
+### Security
+
+- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
+  (deprecated) and the archived unsafe-libyaml it brought in
+  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
+  including from the `@rkat/web` wasm module, and `deny.toml` no longer
+  ignores that advisory. serde-saphyr is pinned exactly; its parser
+  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
+  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
+  that could).
 
 ### Added
 
@@ -410,7 +409,6 @@ them.
 - `meerkat-llm-core`: `classify_web_search_stop` and `WebSearchStop`, one
   classification of a native web-search call's stop reason for every
   provider's executor.
-
 - `meerkat-core`: `SummarizationSourceBudget`, the serialized-byte budget for
   the transcript a compactor sends to the summarizing model.
   `for_summary_model` derives it from that model's context window and
@@ -489,7 +487,6 @@ them.
   `0x1F` is `31`, `~` is `null`). Quote a value with leading zeros, such as
   a file mode (`'0755'`), to keep it as text: unquoted, `0755` is `755.0`
   (upstream serde-saphyr issue #225).
-
 - The compaction summary is sized for the model that writes it: the
   session's active model (after any model fallback) or the admitted
   controller's. Its source may take two bytes per token of that model's
@@ -780,7 +777,6 @@ them.
 - A native web search cut at its output cap (`max_tokens`) or paused by the
   provider's server-tool loop (`pause_turn`) keeps its status and answer and
   now says, in its `error`, that the answer may be incomplete (#1887).
-
 - `meerkat-session`: the last-resort compaction source (user requests only)
   no longer claims to keep every user request. Its note says it carries the
   newest N of the M requests, and the completion reports the same counts.
