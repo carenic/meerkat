@@ -575,7 +575,10 @@ impl From<&AgentError> for AgentErrorClass {
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
             | AgentError::ControlAppendBlockedByCallbackBatch
-            | AgentError::ClientModelChangeRequiresHotSwap { .. } => Self::Config,
+            | AgentError::ClientModelChangeRequiresHotSwap { .. }
+            // A turn refused by instruction activation history keeps the
+            // config class of its previous `ConfigError` representation.
+            | AgentError::InstructionActivation(_) => Self::Config,
         }
     }
 }

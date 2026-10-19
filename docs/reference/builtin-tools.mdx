@@ -553,8 +553,8 @@ the `council_id`, a `job_id`, and a `note`, and the sealed outcome (`result`,
 `council:<job_id>`. A council that fails after the call returned is recorded
 with `{"error": ...}` as its outcome and status `failed`, and so is a sealed
 council whose exit reason is a failure (`participant_seating_failed`,
-`participant_source_replaced`, `wiring_incomplete`, `exchange_failed`,
-`coordinator_interrupted`), whose
+`participant_fork_instruction_refused`, `participant_source_replaced`,
+`wiring_incomplete`, `exchange_failed`, `coordinator_interrupted`), whose
 record keeps the full sealed outcome. A detached council also survives a
 restart: its custody record carries the convener's job, and the post-restore
 recovery sweep delivers the council's sealed result, or

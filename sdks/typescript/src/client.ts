@@ -1694,6 +1694,9 @@ export class MeerkatClient {
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
     }
+    if (options?.inheritedInstructions !== undefined) {
+      params.inherited_instructions = options.inheritedInstructions;
+    }
     const raw = await this.request("session/fork_at", params);
     return MeerkatClient.parseSessionForkResult(raw);
   }
@@ -1714,6 +1717,9 @@ export class MeerkatClient {
     }
     if (options?.toolAccessPolicy !== undefined) {
       params.tool_access_policy = options.toolAccessPolicy;
+    }
+    if (options?.inheritedInstructions !== undefined) {
+      params.inherited_instructions = options.inheritedInstructions;
     }
     const raw = await this.request("session/fork_replace", params);
     return MeerkatClient.parseSessionForkResult(raw);
@@ -7706,6 +7712,14 @@ export class MeerkatClient {
         wire.cache_inheritance,
         context,
       ),
+      reactivatedInstructionCount:
+        wire.reactivated_instruction_count == null
+          ? 0
+          : MeerkatClient.requireNonNegativeIntegerField(
+              wire,
+              "reactivated_instruction_count",
+              context,
+            ),
     };
   }
 

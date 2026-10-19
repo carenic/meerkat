@@ -34,8 +34,8 @@ use meerkat_mob_mcp::{
 };
 use serde_json::{Value, json};
 use support::{
-    CouncilFixture, GatedClaimCouncilStore, ScriptedTurn, TurnGate, last_user_text,
-    role_in_request, user_text,
+    CouncilFixture, GatedClaimCouncilStore, ScriptedTurn, TurnGate, council_definition,
+    last_user_text, role_in_request, user_text,
 };
 
 /// Marker in every child task, so the script can tell a child's turn from
@@ -3637,5 +3637,127 @@ async fn an_unobservable_owner_lifecycle_never_retires_its_row() {
         .await
         .expect("status");
     assert!(owed(&status, &receipt), "{status:?}");
+    fixture.teardown().await;
+}
+
+// ===========================================================================
+// fork_off of a member with an activated host instruction
+// ===========================================================================
+
+const POLICY_CHILD_TASK: &str = "policy-child-task-marker";
+const POLICY_CHILD_REPLY: &str = "policy child reply";
+const STANDING_BODY: &str = "Always state your uncertainty explicitly.";
+
+/// Seed the forker on a model that can represent an ordered mid-conversation
+/// System activation, and activate one host instruction on it.
+async fn seed_activated_forker(fixture: &CouncilFixture) {
+    let mut definition = council_definition(fixture.source_mob_id().as_str());
+    for binding in definition.profiles.values_mut() {
+        if let Some(profile) = meerkat_mob::ProfileBinding::as_inline_mut(binding) {
+            profile.model = "claude-opus-5".to_string();
+        }
+    }
+    fixture.seed_source_mob_from(definition, &["forker"]).await;
+    source_handle(fixture)
+        .await
+        .activate_member_instruction(
+            &AgentIdentity::from("forker"),
+            meerkat_core::InstructionActivationRequest {
+                revision: meerkat_core::InstructionRevisionRef {
+                    namespace: meerkat_core::InstructionNamespace::new("host.standing").unwrap(),
+                    key: meerkat_core::InstructionKey::new("member").unwrap(),
+                    revision_id: meerkat_core::InstructionRevisionId::new("rev-standing-1")
+                        .unwrap(),
+                    content_sha256: meerkat_core::InstructionContentDigest::for_body(STANDING_BODY),
+                },
+                activation_id: meerkat_core::InstructionActivationId::new("standing-1").unwrap(),
+                expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                supersedes: None,
+                body: STANDING_BODY.to_string(),
+            },
+        )
+        .await
+        .expect("the host activates an instruction on the forker");
+}
+
+/// fork_off starts the child's turn itself, so under the default policy the
+/// tool call is refused, typed, before any child is committed or seated.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_off_of_an_activated_member_is_refused_typed_by_default() {
+    let log = RequestLog::default();
+    let fixture = CouncilFixture::new_runtime_backed(routed_script(
+        log.clone(),
+        vec![(POLICY_CHILD_TASK, ChildReply::Text(POLICY_CHILD_REPLY))],
+    ));
+    seed_activated_forker(&fixture).await;
+    fixture
+        .state
+        .set_detached_completion_delivery(DetachedCompletionDelivery::Unavailable);
+    let forker = member_surface(&fixture, "forker").await;
+
+    let outcome = dispatch(
+        &forker.surface,
+        "fork_off",
+        fork_args("policy-child", POLICY_CHILD_TASK),
+    )
+    .await;
+    match outcome {
+        Err(ToolError::ExecutionFailedWithData { data, .. }) => {
+            assert_eq!(data["kind"], "fork_instruction_refused", "{data}");
+            assert_eq!(
+                data["fork_instruction_refusal"]["cause"]["kind"], "policy_refuses",
+                "{data}"
+            );
+        }
+        other => panic!("expected the typed fork instruction refusal, got {other:?}"),
+    }
+    assert!(
+        log.matching(|request| request.last_user.contains(POLICY_CHILD_TASK))
+            .is_empty(),
+        "no child turn reached the model"
+    );
+    assert_not_seated(&source_handle(&fixture).await, "policy-child").await;
+    fixture.teardown().await;
+}
+
+/// With `ReactivateInherited` the child runs its task with the instruction.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_off_of_an_activated_member_runs_when_the_host_opts_in() {
+    let log = RequestLog::default();
+    let fixture = CouncilFixture::new_runtime_backed_with(
+        routed_script(
+            log.clone(),
+            vec![(POLICY_CHILD_TASK, ChildReply::Text(POLICY_CHILD_REPLY))],
+        ),
+        |state, _root| {
+            state.with_fork_instruction_policy(
+                meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+            )
+        },
+    );
+    seed_activated_forker(&fixture).await;
+    fixture
+        .state
+        .set_detached_completion_delivery(DetachedCompletionDelivery::Unavailable);
+    let forker = member_surface(&fixture, "forker").await;
+
+    let outcome = dispatch(
+        &forker.surface,
+        "fork_off",
+        fork_args("policy-child", POLICY_CHILD_TASK),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the child runs its task: {error:?}"));
+    let result = result_json(&outcome);
+    assert_eq!(
+        result["bounded_result"]["text"], POLICY_CHILD_REPLY,
+        "{result}"
+    );
+    let child_request = log.request_for(POLICY_CHILD_TASK);
+    assert_eq!(
+        child_request.rendered.matches(STANDING_BODY).count(),
+        2,
+        "the child's request carries the inherited history row and its own activation"
+    );
     fixture.teardown().await;
 }

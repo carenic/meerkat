@@ -83,6 +83,12 @@ pub enum ErrorCode {
     /// [`Self::StaleFence`] (a superseded incarnation): the recovery is to
     /// re-capture the delivery scope, not to re-resolve the member.
     StaleDeliveryScope,
+    /// A durable fork was refused before commit because of the activation
+    /// rows its child would inherit, under the host's fork instruction
+    /// policy. No child exists; the typed cause and keys ride in the error
+    /// data. A fork request may set `inherited_instructions` to
+    /// `reactivate_inherited` to carry the source's effective activations.
+    ForkInstructionRefused,
 }
 
 impl ErrorCode {
@@ -117,6 +123,7 @@ impl ErrorCode {
             Self::ApprovalConflict => -32034,
             Self::ApprovalCommitUnknown => -32035,
             Self::StaleDeliveryScope => -32036,
+            Self::ForkInstructionRefused => -32037,
         }
     }
 
@@ -151,6 +158,7 @@ impl ErrorCode {
             -32034 => Some(Self::ApprovalConflict),
             -32035 => Some(Self::ApprovalCommitUnknown),
             -32036 => Some(Self::StaleDeliveryScope),
+            -32037 => Some(Self::ForkInstructionRefused),
             _ => None,
         }
     }
@@ -173,7 +181,7 @@ impl ErrorCode {
             Self::HookDenied | Self::ScopeDenied | Self::InputRefused => 403,
             Self::AgentError | Self::InternalError | Self::ApprovalCommitUnknown => 500,
             Self::CapabilityUnavailable => 501,
-            Self::SkillResolutionFailed => 422,
+            Self::SkillResolutionFailed | Self::ForkInstructionRefused => 422,
             Self::InvalidParams => 400,
             Self::HostUnavailable
             | Self::InputNotReady
@@ -214,6 +222,7 @@ impl ErrorCode {
             Self::ApprovalConflict => 54,
             Self::ApprovalCommitUnknown => 55,
             Self::StaleDeliveryScope => 56,
+            Self::ForkInstructionRefused => 57,
         }
     }
 }
@@ -265,7 +274,8 @@ impl ErrorCode {
             | Self::StaleCursor
             | Self::StaleFence
             | Self::MemberReloadRequired
-            | Self::StaleDeliveryScope => ErrorCategory::Session,
+            | Self::StaleDeliveryScope
+            | Self::ForkInstructionRefused => ErrorCategory::Session,
             Self::RequestCancelled => ErrorCategory::Request,
             // Provider is the transient-upstream-failure class (502-family);
             // an unreachable member host is the same retryable class and
@@ -398,6 +408,7 @@ fn session_error_code(err: &meerkat_core::SessionError) -> ErrorCode {
         {
             ErrorCode::InvalidParams
         }
+        meerkat_core::SessionError::ForkInstructionRefused(_) => ErrorCode::ForkInstructionRefused,
         meerkat_core::SessionError::Store(_)
         | meerkat_core::SessionError::FailedWithData { .. } => ErrorCode::InternalError,
     }
@@ -434,6 +445,8 @@ pub fn session_transport_error_code(error: &meerkat_core::SessionError) -> Error
         | SessionError::DurableTailRecoveryRefused { .. }
         | SessionError::DurableEvidenceQuarantined { .. }
         | SessionError::WholeBlobAuditedEndpointDivergence { .. } => ErrorCode::SessionNotRunning,
+        // A fork refused by the host's fork instruction policy: no child exists.
+        SessionError::ForkInstructionRefused(_) => ErrorCode::ForkInstructionRefused,
         SessionError::Agent(error) => agent_transport_error_code(error),
         _ => ErrorCode::InternalError,
     }
@@ -448,7 +461,12 @@ pub fn agent_transport_error_code(error: &meerkat_core::AgentError) -> ErrorCode
         AgentError::TokenBudgetExceeded { .. }
         | AgentError::TimeBudgetExceeded { .. }
         | AgentError::ToolCallBudgetExceeded { .. } => ErrorCode::BudgetExhausted,
-        AgentError::ConfigError(_) => ErrorCode::InvalidParams,
+        // A turn refused by its instruction activation history (a fork child
+        // that never activated its inherited keys) keeps the code its former
+        // configuration-string form had.
+        AgentError::ConfigError(_) | AgentError::InstructionActivation(_) => {
+            ErrorCode::InvalidParams
+        }
         AgentError::HookDenied { .. } => ErrorCode::HookDenied,
         AgentError::Llm { .. } | AgentError::BuildError(_) => ErrorCode::ProviderError,
         AgentError::SessionNotFound(_) => ErrorCode::SessionNotFound,
@@ -476,6 +494,18 @@ impl From<meerkat_core::SessionError> for WireError {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A turn refused by instruction activation history is a typed agent
+    /// error; on the wire it keeps the code its configuration-string form had.
+    #[test]
+    fn a_typed_instruction_activation_refusal_keeps_its_wire_code() {
+        let error = meerkat_core::AgentError::InstructionActivation(
+            meerkat_core::InstructionActivationError::InheritedActivationRequiresExplicitActivation {
+                keys: Vec::new(),
+            },
+        );
+        assert_eq!(agent_transport_error_code(&error), ErrorCode::InvalidParams);
+    }
 
     #[test]
     fn settlement_companions_preserve_wire_class_and_readiness_details() {

@@ -480,6 +480,7 @@ fn identity_session_load_error_class(
         | SessionError::ExternalWriteFenceBackoff { .. }
         | SessionError::ServedElsewhere { .. }
         | SessionError::HostingUnavailable { .. }
+        | SessionError::ForkInstructionRefused(_)
         | SessionError::FailedWithData { .. } => IdentitySessionLoadErrorClass::Unavailable,
     }
 }
@@ -7943,6 +7944,9 @@ pub(super) struct MobActor {
     /// sole writer) so a durable fork can hand its child the source's overlay
     /// (see `ForkBuildInheritance`).
     pub(super) per_spawn_external_tools: super::handle::PerSpawnExternalTools,
+    /// The host's fork instruction policy
+    /// ([`super::MobBuilder::with_fork_instruction_policy`]).
+    pub(super) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// R3 case-3 base-prompt seam for placed spawns (ADJ-2). `None` ⇒
     /// case-3 remote spawns fail typed at spec compile.
     pub(super) spawn_base_prompt_source:
@@ -14248,6 +14252,7 @@ impl MobActor {
             // `MobHandle` returned from `MobBuilder`. Tools built from the
             // actor do not dial realtime endpoints.
             realtime_session_factory: None,
+            fork_instruction_policy: self.fork_instruction_policy,
             flow_target_provisioner: Arc::clone(&self.flow_target_provisioner),
             explicit_resume_operations: Arc::clone(&self.explicit_resume_operations),
             member_admission_backlog: Arc::clone(&self.member_admission_backlog),
@@ -36705,6 +36710,7 @@ impl MobActor {
             binding_generation,
             source_member.clone(),
             request,
+            self.fork_instruction_policy,
         )
         .ok_or_else(|| {
             Self::forked_participant_refused(
@@ -36805,7 +36811,7 @@ impl MobActor {
             .member_placement
             .get(&dsl_identity)
             .cloned();
-        match placement {
+        let created = match placement {
             Some(host_id) => {
                 self.create_placed_forked_participant(&entry, host_id, &request)
                     .await
@@ -36816,10 +36822,10 @@ impl MobActor {
                 let service =
                     self.local_forked_participant_service(&source_identity, realm_id.clone())?;
                 service
-                    .create(
+                    .create_with_fork_instruction_policy(
                         &ForkedParticipantRequest {
                             request_id: request.request_id.clone(),
-                            source_identity,
+                            source_identity: source_identity.clone(),
                             source_session_id,
                             owner_route: ForkedParticipantOwnerRoute::Local { realm_id },
                             prefix_message_count: request.prefix_message_count,
@@ -36827,11 +36833,65 @@ impl MobActor {
                             reuse: request.reuse,
                             ttl: request.ttl,
                         },
+                        self.fork_instruction_policy,
                         chrono::Utc::now(),
                     )
                     .await
                     .map_err(Self::forked_participant_refused)
             }
+        };
+        let policy_carried = super::forked_participant_routing::carried_fork_instruction_policy(
+            self.fork_instruction_policy,
+        )
+        .is_some();
+        created.map_err(|error| {
+            Self::forked_participant_create_error(&source_identity, policy_carried, error)
+        })
+    }
+
+    /// Type one capability creation failure. A participant fork that the fork
+    /// instruction policy refused is the same [`MobError::ForkInstructionRefused`]
+    /// whether its source is local (the source runtime's typed session error)
+    /// or placed (the member host's typed bridge rejection).
+    ///
+    /// A member host that predates the policy refuses a create payload that
+    /// carries it (its payload type denies unknown fields) as an unsupported
+    /// command. When `policy_carried`, that rejection is the typed version
+    /// skew [`meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported`].
+    fn forked_participant_create_error(
+        source_identity: &AgentIdentity,
+        policy_carried: bool,
+        error: MobError,
+    ) -> MobError {
+        match error {
+            MobError::ForkedParticipantRefused(refused) => match *refused {
+                crate::forked_participant::ForkedParticipantError::Session(
+                    meerkat_core::SessionError::ForkInstructionRefused(refusal),
+                ) => MobError::ForkInstructionRefused {
+                    source_member_id: source_identity.clone(),
+                    refusal,
+                },
+                refused => MobError::ForkedParticipantRefused(Box::new(refused)),
+            },
+            MobError::BridgeCommandRejected {
+                cause:
+                    super::bridge_protocol::BridgeRejectionCause::ForkInstructionRefused { refusal },
+                ..
+            } => MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal,
+            },
+            MobError::BridgeCommandRejected {
+                cause: super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                ..
+            } if policy_carried => MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal: meerkat_core::ForkInstructionRefusal::new(
+                    meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported,
+                    Vec::new(),
+                ),
+            },
+            error => error,
         }
     }
 

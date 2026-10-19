@@ -1370,6 +1370,17 @@ pub enum MobError {
         bundle: String,
         offered: Vec<String>,
     },
+
+    /// A durable fork of `source_member_id` was refused before anything was
+    /// committed: its child would inherit activated host instructions that
+    /// the host's [`meerkat_core::ForkInstructionPolicy`] does not carry
+    /// into it. Member forks, `fork_off`, the bounded and turn-boundary
+    /// forks and council participants (local or placed) all report it.
+    #[error("fork of member '{source_member_id}' refused: {refusal}")]
+    ForkInstructionRefused {
+        source_member_id: AgentIdentity,
+        refusal: meerkat_core::ForkInstructionRefusal,
+    },
 }
 
 /// THE single owner of the operator-facing name-occupancy remedy text, shared
@@ -1617,6 +1628,14 @@ impl MobError {
                 error.structured_data()
             }
             Self::SessionError(error) => meerkat_contracts::error::session_error_details(error),
+            Self::ForkInstructionRefused {
+                source_member_id,
+                refusal,
+            } => Some(serde_json::json!({
+                "kind": meerkat_core::service::SessionError::FORK_INSTRUCTION_REFUSED_KIND,
+                "fork_instruction_refusal": refusal,
+                "source_member_id": source_member_id.as_str(),
+            })),
             // A restore failure that IS a typed resume hold projects the hold
             // under meerkat's own key, so a wire caller classifies the Broken
             // member exactly as it classifies meerkat's -32013 refusal.
@@ -1877,6 +1896,9 @@ impl MobError {
                 }
                 Self::SupervisorProtocolUpgradeRequired { .. } => {
                     Some(meerkat_contracts::ErrorCode::SupervisorRotationIncomplete)
+                }
+                Self::ForkInstructionRefused { .. } => {
+                    Some(meerkat_contracts::ErrorCode::ForkInstructionRefused)
                 }
                 _ => None,
             })

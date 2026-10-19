@@ -492,6 +492,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "BridgeTurnDirective": schema_for!(crate::wire::BridgeTurnDirective),
         "BridgeTurnOutcomeRecord": schema_for!(crate::wire::BridgeTurnOutcomeRecord),
         "ConnectionTargetErrorKind": schema_for!(crate::wire::ConnectionTargetErrorKind),
+        "ForkInstructionRefusal": schema_for!(meerkat_core::ForkInstructionRefusal),
+        "ForkInstructionRefusalCause": schema_for!(meerkat_core::ForkInstructionRefusalCause),
         "MaterializeLaunchMode": schema_for!(crate::wire::MaterializeLaunchMode),
         "MaterializeLaunchOutcome": schema_for!(crate::wire::MaterializeLaunchOutcome),
         "MemberBuildRejection": schema_for!(crate::wire::MemberBuildRejection),

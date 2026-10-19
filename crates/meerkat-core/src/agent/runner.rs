@@ -1787,7 +1787,7 @@ where
     ) -> Result<Vec<Message>, AgentError> {
         self.session
             .validate_instruction_activation_turn_readiness()
-            .map_err(|error| AgentError::ConfigError(error.to_string()))?;
+            .map_err(AgentError::InstructionActivation)?;
         let mut messages = self.session.messages_for_model_boundary();
         if let Some(instructions) = self.output_schema_request_instructions() {
             crate::structured_output::project_output_schema_instructions(

@@ -647,6 +647,9 @@ pub struct MobBuilder {
     /// W1-C coverage matrix can be exercised end-to-end without per-test
     /// TCP orchestration.
     realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+    /// Host policy for the activation rows a durable fork child of this
+    /// mob's members inherits ([`MobBuilder::with_fork_instruction_policy`]).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// Controlling-side reverse-lane acceptor composition (ADJ-P4-2).
     /// `None` means mixed-host routes that need a local reverse lane fail
     /// closed instead of publishing the member's process-local endpoint.
@@ -7143,6 +7146,7 @@ impl MobBuilder {
             spawn_member_customizer: None,
             owner_bridge_session_create_authority: None,
             realtime_session_factory: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
@@ -7226,6 +7230,7 @@ impl MobBuilder {
             spawn_member_customizer: None,
             owner_bridge_session_create_authority: None,
             realtime_session_factory: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
@@ -7436,6 +7441,23 @@ impl MobBuilder {
         self
     }
 
+    /// Set the host policy for the activation rows a durable fork child of
+    /// this mob's members inherits: `fork_member`, `fork_off`, the bounded
+    /// and turn-boundary forks, and council participants forked from this
+    /// mob. It is the host's setting, never a member or tool argument and
+    /// never part of the mob definition. The default
+    /// ([`meerkat_core::ForkInstructionPolicy::RequireExplicitActivation`])
+    /// refuses, before anything is committed, a fork that starts the child's
+    /// first turn itself, since the host has no window to activate the
+    /// child; `fork_member` leaves that activation to the host.
+    pub fn with_fork_instruction_policy(
+        mut self,
+        policy: meerkat_core::ForkInstructionPolicy,
+    ) -> Self {
+        self.fork_instruction_policy = policy;
+        self
+    }
+
     /// Inject a [`meerkat_client::RealtimeSessionFactory`] for mob-provisioned
     /// members that open a realtime channel (W2-E / issue #264).
     ///
@@ -7540,6 +7562,7 @@ impl MobBuilder {
                 spawn_member_customizer,
                 owner_bridge_session_create_authority,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 // A created mob has no restored members to hold.
@@ -7758,6 +7781,7 @@ impl MobBuilder {
                     storage.forked_participants.clone(),
                     notify_orchestrator_on_resume,
                     realtime_session_factory,
+                    fork_instruction_policy,
                     controlling_acceptor,
                     member_live_host,
                     before_activation,
@@ -7827,6 +7851,7 @@ impl MobBuilder {
             spawn_member_customizer,
             owner_bridge_session_create_authority: _,
             realtime_session_factory,
+            fork_instruction_policy,
             controlling_acceptor,
             member_live_host,
             restored_member_run_start_holds,
@@ -8304,6 +8329,7 @@ impl MobBuilder {
                 reachability_observations,
                 phase_watch_rx: preview_phase_rx,
                 realtime_session_factory: realtime_session_factory.clone(),
+                fork_instruction_policy,
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
                 explicit_resume_operations: Arc::clone(&explicit_resume_operations),
                 member_admission_backlog: Arc::clone(&member_admission_backlog),
@@ -8603,6 +8629,7 @@ impl MobBuilder {
                 member_admission_backlog,
                 lifecycle_observations,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 // Cold resume already bound the preview handle before any
@@ -10315,6 +10342,7 @@ impl MobBuilder {
         forked_participant_store: Option<Arc<dyn crate::store::ForkedParticipantStore>>,
         notify_orchestrator_on_resume: bool,
         realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+        fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
@@ -10422,6 +10450,7 @@ impl MobBuilder {
                 member_admission_backlog,
                 lifecycle_observations,
                 realtime_session_factory,
+                fork_instruction_policy,
                 controlling_acceptor,
                 member_live_host,
                 before_activation,
@@ -10473,6 +10502,7 @@ impl MobBuilder {
         member_admission_backlog: Arc<super::handle::MemberAdmissionBacklogGauge>,
         lifecycle_observations: Arc<super::MemberLifecycleObservations>,
         realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+        fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
@@ -10552,6 +10582,7 @@ impl MobBuilder {
                 reachability_observations: Arc::clone(&reachability_observations),
                 phase_watch_rx,
                 realtime_session_factory,
+                fork_instruction_policy,
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
                 explicit_resume_operations: Arc::clone(&explicit_resume_operations),
                 member_admission_backlog: Arc::clone(&member_admission_backlog),
@@ -10862,6 +10893,7 @@ impl MobBuilder {
                 default_external_tools_provider,
                 identity_local_external_tools_provider,
                 per_spawn_external_tools,
+                fork_instruction_policy,
                 spawn_base_prompt_source,
                 spawn_member_customizer,
                 realm_profile_store,

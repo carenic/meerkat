@@ -5206,6 +5206,7 @@ impl MobSessionService for MockSessionService {
                 },
             },
             session_ref: None,
+            reactivated_instruction_count: 0,
         })
     }
 
@@ -82587,6 +82588,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "member_role_migration_rejected".to_string()
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
+        MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
         MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
         MobError::ShutdownInProgress { .. } => "shutdown_in_progress".to_string(),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {

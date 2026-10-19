@@ -277,6 +277,14 @@ pub enum TemporaryCouncilAcquisition {
     /// if that also failed the record stays `Pending`. Either way the slot is
     /// never reported as "nothing was created".
     Ambiguous,
+    /// The create call came back with the typed fork instruction refusal:
+    /// the source host's policy refused the participant's fork before the
+    /// owner committed anything.
+    ///
+    /// Recorded in the same write that seals the council's typed exit, so
+    /// nothing exists for the slot and cleanup neither revokes nor records
+    /// debt for it. Every other create failure stays `Pending`.
+    Refused,
 }
 
 impl TemporaryCouncilAcquisition {
@@ -284,9 +292,11 @@ impl TemporaryCouncilAcquisition {
     ///
     /// `Pending` answers TRUE: the honest reading of an unknown create outcome
     /// is "may exist", so cleanup reconciles instead of assuming absence.
+    /// `Refused` answers false: the owner refused the create, typed, before
+    /// committing anything.
     #[must_use]
     pub const fn may_exist(self) -> bool {
-        !matches!(self, Self::NotAttempted)
+        !matches!(self, Self::NotAttempted | Self::Refused)
     }
 
     /// Whether the exact reference is durably held.
@@ -705,6 +715,16 @@ pub enum TemporaryCouncilExitReason {
         /// The source mob id, which now names the other mob.
         source_mob_id: MobId,
     },
+    /// One participant's fork was refused before any child was committed:
+    /// the child would inherit activated host instructions that the source
+    /// mob host's fork instruction policy does not carry into it. Local and
+    /// placed sources report the same refusal.
+    ParticipantForkInstructionRefused {
+        /// Slot that was refused.
+        participant_order: u32,
+        /// The typed refusal.
+        refusal: meerkat_core::ForkInstructionRefusal,
+    },
 }
 
 impl TemporaryCouncilExitReason {
@@ -727,6 +747,7 @@ impl TemporaryCouncilExitReason {
                 | Self::ExchangeFailed { .. }
                 | Self::CoordinatorInterrupted
                 | Self::ParticipantSourceReplaced { .. }
+                | Self::ParticipantForkInstructionRefused { .. }
         )
     }
 }
@@ -1016,5 +1037,41 @@ mod tests {
             "an exhausted budget is not a settlement"
         );
         assert_eq!(receipt.status(), TemporaryCouncilCleanupStatus::Pending);
+    }
+
+    #[test]
+    fn a_refused_create_leaves_nothing_for_cleanup_to_reconcile() {
+        assert!(!TemporaryCouncilAcquisition::Refused.may_exist());
+        assert!(!TemporaryCouncilAcquisition::Refused.is_resolved());
+        assert!(!TemporaryCouncilAcquisition::NotAttempted.may_exist());
+        // Control: an unknown create outcome is still reconciled.
+        assert!(TemporaryCouncilAcquisition::Pending.may_exist());
+        assert!(TemporaryCouncilAcquisition::Ambiguous.may_exist());
+
+        let id = TemporaryCouncilId::new("refused").expect("id");
+        let mut custody = TemporaryCouncilParticipantCustody {
+            order: 0,
+            role: "analyst".to_string(),
+            source_mob_id: MobId::from("source"),
+            source_identity: AgentIdentity::from("researcher"),
+            target_identity: AgentIdentity::from("analyst"),
+            target_profile: ProfileName::from("participant"),
+            scope: ForkedParticipantOperationScope::InvokeAndObserve,
+            capability_request_id: id.capability_request_id(0).expect("request id"),
+            capability_correlation_hint: None,
+            capability_ref: None,
+            attachment_id: id.attachment_id(0).expect("attachment id"),
+            acquisition: TemporaryCouncilAcquisition::Refused,
+            seated: false,
+            seated_session_id: None,
+        };
+        assert!(!custody.acquired_but_unattached());
+        custody.acquisition = TemporaryCouncilAcquisition::Pending;
+        assert!(custody.acquired_but_unattached());
+
+        let encoded = serde_json::to_string(&TemporaryCouncilAcquisition::Refused).expect("encode");
+        assert_eq!(encoded, "\"refused\"");
+        let decoded: TemporaryCouncilAcquisition = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded, TemporaryCouncilAcquisition::Refused);
     }
 }

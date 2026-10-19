@@ -1145,6 +1145,7 @@ fn lower_session_fork_at_request(
             .tool_access_policy
             .clone()
             .map(meerkat_contracts::wire::WireToolAccessPolicy::into_core),
+        inherited_instructions: params.inherited_instructions,
     }
 }
 
@@ -1160,6 +1161,7 @@ fn lower_session_fork_replace_request(
             .tool_access_policy
             .clone()
             .map(meerkat_contracts::wire::WireToolAccessPolicy::into_core),
+        inherited_instructions: params.inherited_instructions,
     }
 }
 
@@ -5199,6 +5201,7 @@ mod tests {
                 message_index: 4,
                 running_behavior: Default::default(),
                 tool_access_policy: policy.clone(),
+                inherited_instructions: None,
             };
             let at_request = lower_session_fork_at_request(&at_params);
             assert_eq!(at_request.tool_access_policy, expected);
@@ -5216,6 +5219,7 @@ mod tests {
                 .expect("typed replacement should parse"),
                 running_behavior: Default::default(),
                 tool_access_policy: policy,
+                inherited_instructions: None,
             };
             let replace_request = lower_session_fork_replace_request(
                 &replace_params,
@@ -16970,5 +16974,253 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             0,
             "strict answer must validate playback custody before provider IO"
         );
+    }
+
+    /// A session with one applied host activation and its transcript length.
+    async fn activated_rpc_session(router: &MethodRouter) -> (String, u64) {
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "model": "claude-opus-5"
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body = "Always report uncertainty explicitly.";
+        let activation = meerkat_core::InstructionActivationRequest {
+            revision: meerkat_core::InstructionRevisionRef {
+                namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                revision_id: meerkat_core::InstructionRevisionId::new("revision-1").unwrap(),
+                content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+            },
+            activation_id: meerkat_core::InstructionActivationId::new("activation-1").unwrap(),
+            expectation: meerkat_core::InstructionActivationExpectation::Absent,
+            supersedes: None,
+            body: body.to_string(),
+        };
+        let apply = router
+            .dispatch(make_request(
+                "session/activate_instruction",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "activation": activation,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(apply.error.is_none(), "activation failed: {apply:?}");
+        let history = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let message_count = result_value(&history)["message_count"].as_u64().unwrap();
+        (session_id, message_count)
+    }
+
+    async fn rpc_session_count(router: &MethodRouter) -> usize {
+        let list_resp = router
+            .dispatch(make_request_no_params("session/list"))
+            .await
+            .unwrap();
+        result_value(&list_resp)["sessions"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+
+    /// Assert an RPC response is the typed fork instruction refusal: its own
+    /// error code and the typed cause and keys in `data`.
+    fn assert_fork_instruction_refused(response: &RpcResponse) {
+        let error = response
+            .error
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected a fork instruction refusal, got {response:?}"));
+        assert_eq!(error.code, -32037, "the dedicated error code: {error:?}");
+        let data = error.data.as_ref().expect("typed refusal data");
+        assert_eq!(data["kind"], "fork_instruction_refused");
+        assert_eq!(
+            data["fork_instruction_refusal"]["cause"]["kind"],
+            "policy_refuses"
+        );
+        assert_eq!(
+            data["fork_instruction_refusal"]["keys"],
+            serde_json::json!([["app.example", "primary"]])
+        );
+    }
+
+    /// `session/fork_at` without `inherited_instructions` on a session with an
+    /// applied activation is refused before commit: the child could never be
+    /// activated (it is not materialized), so committing it would leave a
+    /// session whose first turn must fail.
+    #[tokio::test]
+    async fn session_fork_at_refuses_an_activated_source_by_default() {
+        let (router, _notif_rx) = test_router().await;
+        let (session_id, message_count) = activated_rpc_session(&router).await;
+        let sessions_before = rpc_session_count(&router).await;
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": message_count,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_fork_instruction_refused(&fork_resp);
+        assert_eq!(rpc_session_count(&router).await, sessions_before);
+    }
+
+    /// `session/fork_replace` refuses the same way (its own code path).
+    #[tokio::test]
+    async fn session_fork_replace_refuses_an_activated_source_by_default() {
+        let (router, _notif_rx) = test_router().await;
+        let (session_id, _message_count) = activated_rpc_session(&router).await;
+        // A turn after the activation, so the replaced message follows the
+        // activation row and the fork's prefix carries it.
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "prompt": "Follow up",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "the source runs a turn after the activation: {turn_resp:?}"
+        );
+        let history = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let user_index = result_value(&history)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rposition(|message| message["role"] == "user")
+            .expect("a user message to replace");
+        let sessions_before = rpc_session_count(&router).await;
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_replace",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": user_index,
+                    "replacement": {
+                        "type": "message",
+                        "message": {"role": "user", "content": "A replaced question"}
+                    },
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_fork_instruction_refused(&fork_resp);
+        assert_eq!(rpc_session_count(&router).await, sessions_before);
+    }
+
+    /// With `inherited_instructions: reactivate_inherited` the fork commits a
+    /// child that carries its own activation of the inherited key.
+    #[tokio::test]
+    async fn session_fork_at_reactivates_when_asked() {
+        let (router, _notif_rx) = test_router().await;
+        let (session_id, message_count) = activated_rpc_session(&router).await;
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": message_count,
+                    "running_behavior": "reject",
+                    "inherited_instructions": "reactivate_inherited"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(fork_resp.error.is_none(), "the fork commits: {fork_resp:?}");
+        let forked = result_value(&fork_resp);
+        assert_eq!(forked["reactivated_instruction_count"], 1);
+        assert_eq!(forked["message_count"], message_count + 1);
+        let forked_id = forked["session_id"].as_str().unwrap().to_string();
+
+        let history = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &forked_id }),
+            ))
+            .await
+            .unwrap();
+        let rows = result_value(&history)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message.get("instruction_activation").is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let own = rows
+            .iter()
+            .filter(|row| row["instruction_activation"]["origin_session_id"] == forked_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(own.len(), 1, "the child's own activation: {rows:?}");
+        assert_eq!(
+            own[0]["instruction_activation"]["supersedes"],
+            "activation-1"
+        );
+    }
+
+    /// Control: a session without activation rows forks with the field absent,
+    /// as before, and its child carries no activation rows.
+    #[tokio::test]
+    async fn session_fork_at_without_activation_rows_forks_as_before() {
+        let (router, _notif_rx) = test_router().await;
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "Hello" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 2,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(fork_resp.error.is_none(), "the fork commits: {fork_resp:?}");
+        let forked = result_value(&fork_resp);
+        assert!(
+            forked.get("reactivated_instruction_count").is_none(),
+            "no re-activation rows: {forked}"
+        );
+        assert_eq!(forked["message_count"], 2);
     }
 }

@@ -93,6 +93,24 @@ fn agent_event_subscription_error(
     }
 }
 
+/// Type a durable member fork's session failure. A fork refused because of
+/// inherited instruction activations names its source member; everything else
+/// keeps its session error.
+fn fork_session_error(
+    source_identity: &AgentIdentity,
+    error: meerkat_core::SessionError,
+) -> MobError {
+    match error {
+        meerkat_core::SessionError::ForkInstructionRefused(refusal) => {
+            MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal,
+            }
+        }
+        error => MobError::from(error),
+    }
+}
+
 const DEFAULT_KICKOFF_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Pause between wait polls of a member that is not yet terminal.
 const MEMBER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2226,11 +2244,12 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberProvisionFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        // Durable-fork provisioning and bounded helper projection are
-        // separate composite operations. None can originate from a
+        // Durable-fork provisioning and refusal and bounded helper projection
+        // are separate composite operations. None can originate from a
         // spawn-many row, so exposing a session/transport classification here
         // would invent a modeled spawn cause that MobMachine never observed.
         MobError::ForkMemberProvisionFailed { .. }
+        | MobError::ForkInstructionRefused { .. }
         | MobError::InvalidBoundedHelperResult { .. }
         | MobError::ForkJobOwnerNotSource { .. }
         | MobError::BoundedHelperResultUnavailable { .. }
@@ -5515,6 +5534,9 @@ pub struct MobHandle {
     /// provided (production mob paths typically wire the factory at the
     /// surface layer directly).
     pub(super) realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
+    /// The host's fork instruction policy
+    /// ([`super::MobBuilder::with_fork_instruction_policy`]).
+    pub(super) fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     pub(super) flow_target_provisioner: Arc<StdRwLock<Option<FlowTargetProvisioner>>>,
     pub(super) explicit_resume_operations: Arc<ResumeOperationRegistry>,
     /// Read-only view of the actor's per-member admission lanes (#1102).
@@ -15495,6 +15517,7 @@ impl MobHandle {
             member,
             message_count,
             meerkat_core::DurableForkSourceAdmission::Quiescent,
+            meerkat_core::ActivationWindow::HostDriven,
         )
         .await
     }
@@ -15522,11 +15545,14 @@ impl MobHandle {
         message_count: Option<usize>,
         bound: Duration,
     ) -> Result<ForkMemberAtTurnBoundary, MobError> {
+        // The delegation that asks for this fork admits the child's bounded
+        // turn itself, so the host has no window to activate the child.
         let (source_session_id, fork_target) = self
             .admit_fork_member(
                 source_identity,
                 &member,
                 meerkat_core::DurableForkSourceAdmission::Quiescent,
+                meerkat_core::ActivationWindow::None,
             )
             .await?;
         let fork = self
@@ -15541,7 +15567,7 @@ impl MobHandle {
             .await
             // The owner reports a source it could not fork after winning the
             // boundary as `SourceBusy`, never as `Busy`.
-            .map_err(MobError::from)?;
+            .map_err(|error| fork_session_error(source_identity, error))?;
         let fork = match fork {
             meerkat_core::DurableForkAtTurnBoundary::Forked(fork) => fork,
             meerkat_core::DurableForkAtTurnBoundary::SourceBusy { waited } => {
@@ -15555,11 +15581,17 @@ impl MobHandle {
 
     /// Admission shared by every durable member fork: control scope, source
     /// and child identities, placement, and the source's bridge session.
+    ///
+    /// `activation_window` says whether the host can activate inherited
+    /// instruction keys on the child before its first turn; the host's
+    /// [`meerkat_core::ForkInstructionPolicy`] resolves against it here, once,
+    /// for every member fork path.
     async fn admit_fork_member(
         &self,
         source_identity: &AgentIdentity,
         member: &SpawnMemberSpec,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
     ) -> Result<
         (
             meerkat_core::SessionId,
@@ -15609,6 +15641,7 @@ impl MobHandle {
             // alive. See `ForkCacheInheritance`.
             cache_identity: None,
             source_admission,
+            inherited_instructions: self.fork_instruction_policy.effective(activation_window),
         };
         Ok((source_session_id, fork_target))
     }
@@ -15743,7 +15776,7 @@ impl MobHandle {
         let child_identity = member.identity.clone();
         let fork_session_id = fork.session_id.clone();
         if let Some(job) = member.fork_job.as_mut() {
-            job.prefix_message_count = fork.message_count;
+            job.prefix_message_count = fork.prefix_message_count();
         }
         member.launch_mode = crate::launch::MemberLaunchMode::Resume {
             bridge_session_id: fork_session_id.clone(),
@@ -15862,6 +15895,7 @@ impl MobHandle {
         mut member: SpawnMemberSpec,
         message_count: Option<usize>,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
     ) -> Result<ForkMemberResult, MobError> {
         let fork = self
             .fork_source_session(
@@ -15869,6 +15903,7 @@ impl MobHandle {
                 &mut member,
                 message_count,
                 source_admission,
+                activation_window,
                 None,
             )
             .await?;
@@ -15891,12 +15926,13 @@ impl MobHandle {
         member: &mut SpawnMemberSpec,
         message_count: Option<usize>,
         source_admission: meerkat_core::DurableForkSourceAdmission,
+        activation_window: meerkat_core::ActivationWindow,
         caller_turn_job_owner: Option<&meerkat_core::SessionId>,
     ) -> Result<meerkat_core::SessionForkResult, MobError> {
         #[cfg(test)]
         pause_fork_admission_if_requested(source_identity).await;
         let (source_session_id, fork_target) = self
-            .admit_fork_member(source_identity, member, source_admission)
+            .admit_fork_member(source_identity, member, source_admission, activation_window)
             .await?;
         if let Some(owner_session_id) = caller_turn_job_owner
             && owner_session_id != &source_session_id
@@ -15927,7 +15963,7 @@ impl MobHandle {
                     source_member_id: source_identity.to_string(),
                     cause: crate::error::ForkSourceUnavailableCause::Running,
                 },
-                error => MobError::from(error),
+                error => fork_session_error(source_identity, error),
             })
     }
 
@@ -15970,12 +16006,15 @@ impl MobHandle {
         ) {
             member.spawned_by = Some(source_identity.clone());
         }
+        // This call admits the child's turn itself: the host has no window to
+        // activate inherited instruction keys on the child first.
         let fork = self
             .fork_member_with_source_admission(
                 source_identity,
                 member,
                 message_count,
                 source_admission,
+                meerkat_core::ActivationWindow::None,
             )
             .await?;
         let turn = self
@@ -16090,12 +16129,15 @@ impl MobHandle {
             // provably the spawner and owns the child.
             member.spawned_by = Some(source_identity.clone());
         }
+        // This call admits the child's turn itself: the host has no window to
+        // activate inherited instruction keys on the child first.
         let session_fork = self
             .fork_source_session(
                 source_identity,
                 &mut member,
                 message_count,
                 source_admission,
+                meerkat_core::ActivationWindow::None,
                 caller_turn_job_owner.as_ref(),
             )
             .await?;

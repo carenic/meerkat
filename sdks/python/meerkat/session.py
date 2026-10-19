@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 from .generated.types import CommsSendResult, StopRunResult
 from .types import (
     ContentBlock,
+    ForkInstructionPolicy,
     InstructionActivationReadPage,
     InstructionActivationReceipt,
     InstructionActivationRequest,
@@ -351,6 +352,7 @@ class Session:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
         """Fork this idle session at a transcript message index."""
         return await self._client.fork_session_at(  # noqa: SLF001
@@ -358,6 +360,7 @@ class Session:
             message_index,
             running_behavior=running_behavior,
             tool_access_policy=tool_access_policy,
+            inherited_instructions=inherited_instructions,
         )
 
     async def fork_replace(
@@ -367,6 +370,7 @@ class Session:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
         """Fork this idle session and apply a typed transcript replacement."""
         return await self._client.fork_session_replace(  # noqa: SLF001
@@ -375,6 +379,7 @@ class Session:
             replacement,
             running_behavior=running_behavior,
             tool_access_policy=tool_access_policy,
+            inherited_instructions=inherited_instructions,
         )
 
     async def rewrite_transcript(
@@ -701,6 +706,7 @@ class DeferredSession:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
         """Fork this idle session at a transcript message index."""
         return await self._client.fork_session_at(  # noqa: SLF001
@@ -708,6 +714,7 @@ class DeferredSession:
             message_index,
             running_behavior=running_behavior,
             tool_access_policy=tool_access_policy,
+            inherited_instructions=inherited_instructions,
         )
 
     async def fork_replace(
@@ -717,6 +724,7 @@ class DeferredSession:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
         """Fork this idle session and apply a typed transcript replacement."""
         return await self._client.fork_session_replace(  # noqa: SLF001
@@ -725,6 +733,7 @@ class DeferredSession:
             replacement,
             running_behavior=running_behavior,
             tool_access_policy=tool_access_policy,
+            inherited_instructions=inherited_instructions,
         )
 
     async def rewrite_transcript(

@@ -343,6 +343,12 @@ BRIDGE_REJECTION_NESTED_ALIAS_TYPES = [
     "ConnectionTargetErrorKind",
     "WireControlScope",
     "MemberBuildRejection",
+    "ForkInstructionRefusalCause",
+]
+
+# Typed records carried by `BridgeRejectionCause` payloads.
+BRIDGE_REJECTION_NESTED_CONTRACT_TYPES = [
+    "ForkInstructionRefusal",
 ]
 
 # Typed records carried by the canonical `SystemNoticeBlock` transcript union.
@@ -754,6 +760,7 @@ MOB_RPC_PROMOTED_SCHEMA_DEFS = frozenset(
         *BRIDGE_NESTED_CONTRACT_TYPES,
         *BRIDGE_NESTED_ALIAS_TYPES,
         *BRIDGE_REJECTION_NESTED_ALIAS_TYPES,
+        *BRIDGE_REJECTION_NESTED_CONTRACT_TYPES,
         *SYSTEM_NOTICE_NESTED_CONTRACT_TYPES,
         *SYSTEM_NOTICE_NESTED_ALIAS_TYPES,
         "WireMemberHistoryPageBody",
@@ -3919,6 +3926,8 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         append_python_alias(name, wire_schema, f"Supervisor bridge nested type {name}.")
     for name in BRIDGE_REJECTION_NESTED_ALIAS_TYPES:
         append_python_alias(name, wire_schema, f"Supervisor bridge rejection type {name}.")
+    for name in BRIDGE_REJECTION_NESTED_CONTRACT_TYPES:
+        append_python_contract_dataclass(name)
     for name in SYSTEM_NOTICE_NESTED_ALIAS_TYPES:
         append_python_alias(name, wire_schema, f"System notice nested type {name}.")
     for name in SYSTEM_NOTICE_NESTED_CONTRACT_TYPES:
@@ -4782,6 +4791,8 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
         append_typescript_alias(name, wire_schema)
     for name in BRIDGE_REJECTION_NESTED_ALIAS_TYPES:
         append_typescript_alias(name, wire_schema)
+    for name in BRIDGE_REJECTION_NESTED_CONTRACT_TYPES:
+        append_typescript_contract_interface(name)
     for name in SYSTEM_NOTICE_NESTED_ALIAS_TYPES:
         append_typescript_alias(name, wire_schema)
     for name in SYSTEM_NOTICE_NESTED_CONTRACT_TYPES:
