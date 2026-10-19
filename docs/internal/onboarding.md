@@ -141,6 +141,16 @@ make docs-check
 Check examples against the current CLI help, public schemas, SDK signatures,
 and `meerkat-models` catalog rather than copying an older page.
 
+Every ```-fenced `rkat` invocation in a `docs/` page is also test data: the
+published `rkat` package parses each one against the CLI from
+`crates/meerkat-cli/tests/fixtures/doc_examples.txt`, because it carries no
+`docs/`. Adding or changing an `rkat` example means refreshing that fixture, as
+with schemas and BUILD files:
+
+```bash
+UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture
+```
+
 ## Before You Open A Pull Request
 
 Run the narrowest relevant tests while iterating, then finish with the broad

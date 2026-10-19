@@ -51,6 +51,47 @@ them.
 
 ### Changed
 
+- Every crate the release publishes now passes its own tests standalone:
+  `cargo test` in the unpacked published package builds with the default
+  features, and passes with the features its
+  `[package.metadata.meerkat.standalone-tests]` declares (meerkat,
+  meerkat-runtime and meerkat-mob, whose packages now carry a README.md
+  that prints the command). Plain `cargo test` runs a binary's tests as
+  threads of one process, and three suites no longer collide there:
+  meerkat's realtime pipeline tests take the process-wide open reservation
+  one at a time, meerkat-rpc's callback-ownership tests give each case its
+  own mob, and meerkat-rest's unit tests build their app states one at a
+  time (concurrent states queued on SQLite's process-wide allocation
+  statistics mutex until creates and stops missed their bounds). A test
+  that needs the repository, or a crate the package cannot depend on (a
+  cyclic or unpublished dev-dependency), is workspace-only and does not
+  reach the package: its file is left out
+  (`[package] exclude`, each entry with its reason, the same list as
+  `ci/standalone-workspace-only.toml`), or it compiles only with the
+  crate's `workspace-tests` feature (meerkat, meerkat-auth-core,
+  meerkat-authorization, meerkat-comms, meerkat-core, meerkat-llm-core,
+  meerkat-mcp, meerkat-openai and meerkat-rpc). `workspace-tests` is
+  internal, not for consumers: only the crate's path-only self
+  dev-dependency enables it, and `cargo package` strips that dependency.
+  Tests that read another crate's files now read their own copy or a shared
+  constant: meerkat-store embeds its own copy of meerkat-runtime's released
+  0.8.10 corpus, pinned byte-identical, and the REST, MCP server and rkat
+  hook-override tests parse `meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON`
+  (meerkat-core's `test-support`). The rkat-rpc, rkat-rest and rkat-mcp
+  binary tests take their binary from Cargo (`CARGO_BIN_EXE_*`) and fail
+  when it is missing instead of passing without running. rkat's
+  docs-examples test parses `tests/fixtures/doc_examples.txt`, which the
+  package carries, instead of reading `docs/`; after adding or changing an
+  `rkat` example in `docs/`, refresh it with
+  `UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture`
+  (that test fails until the fixture matches).
+- A nightly workflow, `published-crates-standalone.yml`, packages every
+  release crate, runs each one's tests in its unpacked package, and compares
+  every test target's test names with the workspace's. The release workflow
+  publishes no crate unless a successful run of it exists at the exact
+  release commit (job `release_standalone_gate`,
+  `scripts/release-require-standalone-green`); `release-doctor` checks that
+  wiring.
 - `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,
   which nothing called any more (a browser opens through
   `HostLaunchExemption::browser_opener`). Builds drop it and its platform

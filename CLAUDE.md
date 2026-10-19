@@ -412,9 +412,16 @@ and its CI must be green before a release tag (`require_ci_green`):
   explicit way to give a release's parent that evidence.
 - `fmt-governance` (always): fmt, docs-check, semver self-test, version
   parity, lock consistency, `make ci-lanes-selftest`,
-  `make path-classifier-selftest`, and the ripgrep tombstone scans
+  `make path-classifier-selftest`, the ripgrep tombstone scans
   (`legacy-surface-gate`, `session-control-gate`, `deprecated-backend-gate`;
-  ripgrep is installed first, and each scan refuses to run without it).
+  ripgrep is installed first, and each scan refuses to run without it), and
+  the published crates' static standalone guard
+  (`make published-crates-standalone-selftest
+  check-published-crates-standalone-guard`: no packaged test reads outside
+  its package or skips itself when a binary is missing, every workspace-only
+  test file is left out in both the crate's `[package] exclude` and
+  `ci/standalone-workspace-only.toml`, and a crate whose tests need features
+  or a stack prints the exact `cargo test` command in its README).
 - `ratchets`: generated-contract freshness when contract paths changed;
   `machine-check-drift`/`protocol-check-drift` when machine authority changed;
   `verify-machine-poster-coverage` when machine authority or a poster input
@@ -609,6 +616,21 @@ existing `lint` (clippy `--all-targets`), `lint-feature-matrix`,
 `e2e-system`, `test-sdk-web`, `wasm-contract`, `check-rust-release-packaging`,
 and cargo-deny sweep.
 
+**Published crates standalone** (`.github/workflows/published-crates-standalone.yml`,
+daily after nightly's chains and on dispatch) runs
+`make published-crates-standalone-census` in shards: every release crate is
+packaged and unpacked into a synthetic workspace, and per crate, without
+sibling feature unification, its tests run there with plain `cargo test` and
+the feature set its `[package.metadata.meerkat.standalone-tests]` publishes,
+the naive `cargo test --no-run` compiles with default features, and the test
+names per target must equal the workspace's minus the files and tests
+`ci/standalone-workspace-only.toml` declares workspace-only. A unit test that
+needs a crate the package cannot depend on (a cyclic or unpublished
+dev-dependency) is gated on its crate's internal `workspace-tests` feature,
+which only the crate's path-only self dev-dependency enables (`cargo package`
+strips it), and the Bazel generator fails a crate that declares the feature
+without that edge.
+
 The release tag path requires successful exact-main CI (schema-4 attestation)
 and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
 BuildBuddy graph (`release_validate_buildbuddy_full`) as its validation gate;
@@ -658,6 +680,7 @@ release semver gate; PR and manual artifacts are previews.
 | `publish_github_release` | Tags or manual asset recovery | The trailing publisher: after exact-main CI (`require_ci_green`) and the full gate, downloads artifacts (a prebuild's once that run's full binary build gate passed, verified exactly like an `assets_run_id` recovery), adds the archives not yet on the release (never replacing one), then writes the complete `checksums.sha256` + `index.json` once (refusing to change a published one) |
 | `update_homebrew` | After the trailing publisher | Updates the Homebrew tap formula from the complete release's published checksums |
 | `publish_semver_baseline` / `attach_semver_baseline` | Tags or asset recovery, alongside publication | `publish_semver_baseline` generates rustdoc JSON for every publishable library crate on the release tag as soon as `require_ci_green` passes; `attach_semver_baseline` attaches it as `semver-rustdoc-<version>.tar.zst` once the GitHub release is published (add-only: a baseline already attached stays). It is the baseline the next release's semver gate compares against; no job waits for either |
+| `release_standalone_gate` | Tags or manual `publish_release_packages=true` (not Web-only) | Requires a completed, successful `published-crates-standalone.yml` run on main at exactly the release commit, its gate job green (`scripts/release-require-standalone-green`, which waits for a run still going); dispatch it on main once the release commit is main's head. `publish_registries` needs it |
 | `publish_registries` | Tags or manual `publish_release_packages=true` | Publishes 46 Rust crates → crates.io by dependency level (concurrently within a level), Python SDK → PyPI, TypeScript SDK → npm; before the SDK packages build, it waits for the release's complete manifest (`scripts/release-await-binary-manifest`), verifies each `rkat-rpc` archive's build attestation and stamps the archive and binary digests into both (`scripts/release-stamp-sdk-binary-digests`), and each publish step refuses a package that does not pin them for its version |
 | `publish_web_sdk` | Tags or manual package/Web recovery | After `require_ci_green`, `release_validate_gate` and `release_semver_gate` (both skipped only on Web-only recovery), the registry credential preflight and the build (or a found prebuild), checks the artifact's stamp against the release commit (and a reused artifact's source run), verifies a prebuild's package attestation and version, then publishes `@rkat/web` → npm |
 
@@ -732,7 +755,7 @@ features, which only nightly's workspace unit lane runs:
 - `changed-path-ratchets`: `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy). CI: the `ratchets` job (generated contracts; drift on a machine-authority change), the `governance-gates` job (the typed governance gates on a machine-authority or dogma change), `example-web` and `wasm-check`, selected by the same paths; `scripts/test-pre-push-ratchets.sh` pins it (each ratchet's CI step and trigger included) and runs in `make ci-lanes-selftest`
 - `machine-codegen-drift` / `machine-codegen-verify`: `scripts/pre-push-machines.sh --codegen-only|--verify-only` (machine and protocol codegen under the clean-tree contract; the canonical TLC lane). CI: the `ratchets` job's `machine-check-drift`/`protocol-check-drift` and the `tlc-audits` shards on a machine-authority change; the `machine-verify --all` sweep nightly and on the release gate
 - `cargo-test`: `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend). CI: the pull request's unit lanes for the changed packages, the push's `main-unit` and `closure-tests` rows, nightly's workspace unit lane
-- `release-test-code-guards-contract`, `release-doctor-workflow-contract`, `release-find-prebuild-contract`, `macos-x86-release-binary-check-contract`, `release-asset-provenance-contract`: CI's `Format + governance` job runs these on every pull request
+- `release-test-code-guards-contract`, `release-doctor-workflow-contract`, `release-find-prebuild-contract`, `release-standalone-gate-contract`, `macos-x86-release-binary-check-contract`, `release-asset-provenance-contract`: CI's `Format + governance` job runs these on every pull request
 
 The manual deterministic gate's source-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
@@ -936,6 +959,7 @@ per minute) still bounds a full release.
 - **Use the final qualification sequence above** - run change-specific required checks, then normal commit hooks and one normal push for the overlapping inventory; retain standalone and explicit checks for coverage the push does not supply
 - **`ContractVersion::CURRENT` must equal `workspace.package.version`** — they are lock-stepped
 - **Never change `Cargo.lock` without refreshing `MODULE.bazel.lock`** - the lock is a crate_universe extension input; `make buildbuddy-lock-update` regenerates it, and `make verify-bazel-locks` proves it
+- **Never add or change a fenced `rkat` example in `docs/` without refreshing its fixture** - the published `rkat` package parses every one against the CLI from `crates/meerkat-cli/tests/fixtures/doc_examples.txt`; `UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture` regenerates it, and that test fails until it matches
 - **Never hand-maintain a second list of workspace crates** - `scripts/release-rust-crates.sh` is the one hand-ordered enumeration; the patch config derives from it and `make check-rust-release-config` fails when the documented order, count, or patch map disagrees
 - **Never write a bare crate count in this file that nothing derives** - `make check-rust-release-config` rejects any `N crates` / `N path deps` claim it cannot bind to a computed quantity. Register the new claim in `documented_count_claim_errors` (`scripts/check_rust_release_packaging.py`) alongside the artifact that owns the number, or write it as an approximation with a leading `~`. Release crate count and internal path-dep count are different facts with different owners; they are not interchangeable even when they happen to be equal
 - **Never size a thread stack in a host binary or bypass the budget with `#[tokio::main]`** - every host runs through `meerkat_runtime::host_stack::run_host` on the one documented 8 MiB default budget (`HOST_WORKER_STACK_BUDGET`); a deep frame is fixed with `meerkat_runtime::stack_relief`, not a bigger stack. The debug canary `rpc_dispatch_path_fits_debug_worker_stack_budget` (4 MiB) and nightly `make stack-budget-release` (1 MiB release) pin the numbers
