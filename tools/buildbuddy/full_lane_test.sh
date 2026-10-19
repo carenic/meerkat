@@ -421,7 +421,7 @@ case "${lane}" in
     configure_rust "${host_rust_toolchain}"
     configure_cargo_nextest
     configure_nested_cargo_workspace
-    export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
+    export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
     export_mcp_test_server_fixture
     # Profile ci-unit, not default: the default profile has no slow-timeout,
     # so a lib test that hung in the remote sandbox ran until the 3000 s GCP
@@ -440,7 +440,7 @@ case "${lane}" in
     configure_rust "${host_rust_toolchain}"
     configure_cargo_nextest
     configure_nested_cargo_workspace
-    export RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}"
+    export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
     export_mcp_test_server_fixture
     # Profile ci-integration: `fast` plus a kill bound (see .config/nextest.toml),
     # so a hang fails as a named TIMEOUT instead of eating the SLO; status level

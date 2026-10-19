@@ -737,3 +737,113 @@ fn a_poison_after_the_pre_append_check_leaves_the_issued_child_unusable_until_re
         .resolve_controller_lineage(&lineage, &who("helper"), None)
         .expect("the recovered child is valid after reconstruction");
 }
+
+/// A clock that fails while its switch is set.
+struct SwitchClock(AtomicBool);
+impl LocalAuthorizationClock for SwitchClock {
+    fn now(&self) -> Result<LocalAuthorizationTime, LocalClockError> {
+        if self.0.load(Ordering::SeqCst) {
+            return Err(LocalClockError::Unavailable);
+        }
+        Ok(now())
+    }
+}
+
+/// A resolution inside an enclosing observation keeps an owner change
+/// published during it apart from the owner's unavailability; a standalone
+/// resolution keeps its public contract.
+#[test]
+fn an_observed_resolution_keeps_a_concurrent_change_apart_from_unavailability() {
+    let clock = Arc::new(SwitchClock(AtomicBool::new(false)));
+    let owner = authority(clock.clone());
+    let lineage = [issue(&owner, "grant")];
+    let observed = |owner: &LocalGrantAuthority| {
+        owner
+            .resolve_lineage_observed(&lineage, &who("holder"), None)
+            .err()
+    };
+    {
+        let _change = owner
+            .publication
+            .begin_owner_change()
+            .expect("an owner change in progress");
+        assert_eq!(observed(&owner), Some(LineageResolutionRefusal::Changed));
+        assert_eq!(
+            owner.resolve_lineage(&lineage, &who("holder"), None).err(),
+            Some(GrantRefusal::Unavailable),
+            "the standalone contract is unchanged"
+        );
+    }
+    assert_eq!(observed(&owner), None, "current once the change completed");
+
+    clock.0.store(true, Ordering::SeqCst);
+    assert_eq!(
+        observed(&owner),
+        Some(LineageResolutionRefusal::Refused(GrantRefusal::Unavailable)),
+        "a clock failure is unavailability, not a change"
+    );
+    clock.0.store(false, Ordering::SeqCst);
+
+    owner.publication.poison();
+    assert_eq!(
+        observed(&owner),
+        Some(LineageResolutionRefusal::Refused(GrantRefusal::Unavailable)),
+        "a poison is unavailability, not a change"
+    );
+}
+
+/// The controller and ceiling resolutions keep the same split: an owner
+/// change in progress is `Changed` for a caller inside its own observation
+/// and `Unavailable` for a standalone caller; a poison is unavailable for
+/// both.
+#[test]
+fn every_observed_resolution_keeps_a_concurrent_change_apart_from_unavailability() {
+    let owner = authority(Arc::new(Clock));
+    let lineage = [issue(&owner, "grant")];
+    {
+        let _change = owner
+            .publication
+            .begin_owner_change()
+            .expect("an owner change in progress");
+        assert_eq!(
+            owner
+                .resolve_controller_lineage_observed(&lineage, &who("holder"), None)
+                .err(),
+            Some(LineageResolutionRefusal::Changed)
+        );
+        assert_eq!(
+            owner.resolve_lineage_ceiling_observed(&lineage).err(),
+            Some(LineageResolutionRefusal::Changed)
+        );
+        assert_eq!(
+            owner
+                .resolve_controller_lineage(&lineage, &who("holder"), None)
+                .err(),
+            Some(GrantRefusal::Unavailable),
+            "the standalone contract is unchanged"
+        );
+        assert_eq!(
+            owner.resolve_lineage_ceiling(&lineage).err(),
+            Some(GrantRefusal::Unavailable),
+            "the standalone contract is unchanged"
+        );
+    }
+    assert!(
+        owner
+            .resolve_controller_lineage_observed(&lineage, &who("holder"), None)
+            .is_ok()
+    );
+    assert!(owner.resolve_lineage_ceiling_observed(&lineage).is_ok());
+
+    owner.publication.poison();
+    assert_eq!(
+        owner
+            .resolve_controller_lineage_observed(&lineage, &who("holder"), None)
+            .err(),
+        Some(LineageResolutionRefusal::Refused(GrantRefusal::Unavailable))
+    );
+    assert_eq!(
+        owner.resolve_lineage_ceiling_observed(&lineage).err(),
+        Some(LineageResolutionRefusal::Refused(GrantRefusal::Unavailable))
+    );
+}
