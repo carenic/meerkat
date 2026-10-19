@@ -263,6 +263,21 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - `RKAT_WORKER_THREADS` sets the host's Tokio worker count (default: one per
   available CPU; `TOKIO_WORKER_THREADS` is read when it is unset). Set it
   below a container's pids limit, which counts threads.
+- Commits that never answer (since 0.9.4): a persistent session's boundary
+  commit or run terminalization that reports no durable outcome within its
+  store's declared deadline (120 seconds for the SQLite store, two 60-second
+  busy windows) marks the session reload-required instead of holding its
+  mutation gate for good (a stalled disk or hung network filesystem used to
+  wedge every later wait, a mob destroy and force cancel included). The commit
+  keeps running and keeps the gate until the store answers. The run's
+  completion waiters fail (`DurableOutcomeUnknown`; a rejected boundary commit
+  gives `BoundaryRolledBack`), but the input stays durably admitted: read it
+  after the reload, never resubmit it. Until the store answers, a reload and
+  every live-work wait for the gate (admission, interrupts, stops, recover and
+  destroy, comms aborts, unregisters) refuse with the typed, retryable
+  `RecoveryRepairBlocked`; afterwards the reload replaces the registration
+  from durable truth. A mob member's tracked turn stays pending, and a
+  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
 - Since 0.9.4 creating a persistent runtime over one store no longer waits for
   another store's OAuth flow rehydration: each store has its own slot in the
   process-wide provider-auth cache, and runtimes over one store still share
