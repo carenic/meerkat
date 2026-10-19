@@ -79,6 +79,9 @@ mcp-test-server = { path = "../../tests/fixtures/mcp-test-server" } # test-only 
 # deterministic facade tests in src/experimental_gpt_live.rs.
 axum = { workspace = true, features = ["ws"] }
 meerkat-runtime = { workspace = true, features = ["test-support"] }
+# Held change-watch registrations for the delivery owner's store-watch tests
+# (tests/runtime_delivery_hosting.rs).
+meerkat-sqlite = { workspace = true, features = ["test-support"] }
 tracing-subscriber = { workspace = true }
 meerkat-core = { workspace = true, features = [
     "jsonschema",
