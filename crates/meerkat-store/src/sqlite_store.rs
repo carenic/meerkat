@@ -6864,8 +6864,9 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
 /// as this store's physical session through the same one-time full-history
 /// layout as a released blob, and the head comes back exactly as
 /// [`ensure_head_canonical_for_runtime_in_txn`] returns it. The seam refuses
-/// when this store already holds a head or blob row for the session, and it
-/// neither opens nor commits a transaction.
+/// ([`SessionStoreError::Internal`]: the caller seeds only a session this
+/// store holds no row for) when this store already holds a head or blob row
+/// for the session, and it neither opens nor commits a transaction.
 #[doc(hidden)]
 pub fn seed_head_canonical_for_runtime_in_txn(
     tx: &Transaction<'_>,
@@ -6877,11 +6878,9 @@ pub fn seed_head_canonical_for_runtime_in_txn(
             .map_err(into_session_store_error)?
             .is_some()
     {
-        return Err(SessionStoreError::InvalidTranscriptRewrite {
-            id: id.clone(),
-            reason: "seeding requires a co-tenant session store that holds no row for this session"
-                .to_string(),
-        });
+        return Err(SessionStoreError::Internal(format!(
+            "seeding session {id} requires a co-tenant session store that holds no row for it"
+        )));
     }
     lay_out_blob_session_in_txn(tx, id, session)?;
     ensure_head_canonical_for_runtime_in_txn(tx, id)?
@@ -9931,6 +9930,81 @@ mod tests {
         let path = dir.path().join("sessions.sqlite3");
         let store = SqliteSessionStore::open(&path).unwrap();
         (dir, store)
+    }
+
+    /// The standalone conversion's seeding seam lays out a session this store
+    /// holds no row for, with the head realm activation derives from it, and
+    /// refuses typed when the store already holds a head row or a released
+    /// blob row for that session.
+    #[tokio::test]
+    async fn runtime_seed_lays_out_an_absent_session_and_refuses_an_existing_row() {
+        let (_dir, store) = temp_store();
+        let mut session = Session::new();
+        session.push(user("seeded from a runtime body"));
+        let seed = session.clone();
+        let (seeded, seeded_token) = store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .expect("seed a session the store holds no row for");
+        let id = session.id().clone();
+        let (ensured, ensured_token) = store
+            .in_write_txn(move |tx| {
+                ensure_head_canonical_for_runtime_in_txn(tx, &id)?
+                    .ok_or(SessionStoreError::NotFound(id))
+            })
+            .await
+            .expect("the seeded head is the canonical runtime head");
+        assert_eq!(seeded_token, ensured_token);
+        assert_eq!(seeded.message_count, ensured.message_count);
+        let loaded = store
+            .load(session.id())
+            .await
+            .unwrap()
+            .expect("the seeded session loads");
+        assert_eq!(loaded.messages(), session.messages());
+
+        let again = session.clone();
+        match store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &again))
+            .await
+        {
+            Err(SessionStoreError::Internal(detail)) => {
+                assert!(detail.contains("holds no row"), "{detail}");
+            }
+            other => panic!("seeding over a head row: {other:?}"),
+        }
+
+        let (_blob_dir, blob_store) = temp_store();
+        let mut released = Session::new();
+        released.push(user("held as a released blob row"));
+        Connection::open(blob_store.path())
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    released.id().to_string(),
+                    system_time_millis(released.created_at()),
+                    system_time_millis(released.updated_at()),
+                    1_i64,
+                    0_i64,
+                    "{}",
+                    serde_json::to_vec(&released).unwrap(),
+                ],
+            )
+            .unwrap();
+        let blob = released.clone();
+        match blob_store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &blob))
+            .await
+        {
+            Err(SessionStoreError::Internal(detail)) => {
+                assert!(detail.contains("holds no row"), "{detail}");
+            }
+            other => panic!("seeding over a released blob row: {other:?}"),
+        }
     }
 
     /// The durable-writer invariant for the session store, asserted through

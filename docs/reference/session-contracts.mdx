@@ -662,8 +662,9 @@ database - one a host composed with `SqliteRuntimeStore::new` on a file of its
 own while its session store lived elsewhere, such as a Meta 0.9.3 persistent
 gateway's `runtime.sqlite` - holds no physical session, so it converts once,
 offline, through `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`.
-The host first opens `SqliteSessionStore` on the same file (the conversion
-refuses typed, and writes nothing, without the co-located session schema).
+The host first opens `SqliteSessionStore` on the same file: without the
+co-located session schema the conversion refuses typed and leaves the database
+file unchanged.
 The conversion pins the file and seeds each runtime's session that the
 co-located store holds no row for from its digest-verified WholeBlob body, in
 the transaction that installs the runtime's authority and completes its

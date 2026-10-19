@@ -10845,8 +10845,10 @@ ORDER BY runtime_id";
         ///
         /// The file must already carry the co-located session store's schema
         /// (open the SQLite session store on it first). Without it this
-        /// refuses typed ([`RuntimeStoreError::Unsupported`]) and writes
-        /// nothing. It then pins the file to the head-canonical profile and
+        /// refuses typed ([`RuntimeStoreError::Unsupported`]) and leaves the
+        /// database file unchanged; reading a WAL-mode file can still create
+        /// its empty `-wal` and `-shm` sidecars. It then pins the file to the
+        /// head-canonical profile and
         /// activates every queued runtime as [`Self::new_head_canonical`]
         /// does, with one difference: a runtime whose session the co-located
         /// store holds no row for is seeded from its store-owned WholeBlob
