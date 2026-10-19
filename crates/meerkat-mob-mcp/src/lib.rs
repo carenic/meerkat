@@ -2076,6 +2076,68 @@ impl MobMcpState {
         Ok(matches.into_values().collect())
     }
 
+    /// Whether the creation record of the mob `handle` serves proves that
+    /// `session_id` is that mob's creator, as the session is bound now. A
+    /// session's persisted operator authority binds no mob, so after a
+    /// restart the agent mob tools re-derive the creator's manage grant from
+    /// this record instead.
+    ///
+    /// The record proves it for:
+    /// - `MobProvenance::Session { session_id }`: the session created the mob
+    ///   while no hosted roster named it;
+    /// - `MobProvenance::Member`: the session created the mob as the member
+    ///   `creator_identity` at `creator_generation` of the parent mob at
+    ///   `parent_incarnation`. The generation rule: the record proves only
+    ///   that member incarnation, so the parent must be hosted at that
+    ///   incarnation and the session must still be the bridge session of
+    ///   exactly that member at exactly that generation. A later generation
+    ///   of the identity (a reset or a respawn), a re-created parent, or a
+    ///   parent that is not hosted proves nothing, even over the same
+    ///   session.
+    ///
+    /// `Host`, `Ambiguous` and `Unrecorded` name no creator session, and a
+    /// record that cannot be read proves nothing: every one answers `false`.
+    pub(crate) async fn session_is_recorded_creator(
+        &self,
+        handle: &MobHandle,
+        session_id: &SessionId,
+    ) -> bool {
+        let provenance = match handle.provenance().await {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                tracing::warn!(
+                    mob_id = %handle.mob_id(),
+                    %error,
+                    "a mob's creation record could not be read to re-derive its creator's grant"
+                );
+                return false;
+            }
+        };
+        match provenance {
+            meerkat_mob::MobProvenance::Session {
+                session_id: creator,
+            } => creator == *session_id,
+            meerkat_mob::MobProvenance::Member {
+                parent_mob_id,
+                parent_incarnation,
+                creator_identity,
+                creator_generation,
+                owner_session,
+            } => {
+                if owner_session != *session_id {
+                    return false;
+                }
+                let Ok(parent) = self.handle_for(&parent_mob_id).await else {
+                    return false;
+                };
+                parent.incarnation() == parent_incarnation
+                    && parent.member_of_session(session_id).await
+                        == Some((creator_identity, creator_generation))
+            }
+            _ => false,
+        }
+    }
+
     /// The member of a held child's stored roster whose session is
     /// `session_id`, with the child's recorded incarnation. The child's store
     /// is opened and read once per hold: the first read that succeeds is kept
@@ -16558,6 +16620,130 @@ mod tests {
                 .await
                 .expect("the kept read answers for any session")
                 .is_empty()
+        );
+    }
+
+    /// The creator a mob's creation record proves, whose manage grant the
+    /// agent mob tools re-derive after a restart. A Session record proves the
+    /// creating session. A Member record proves the creating member's session
+    /// only while that session still serves the recorded member at the
+    /// recorded generation in the recorded parent incarnation: once the
+    /// member is respawned at its next generation, neither its old session
+    /// nor its new one proves anything. A host create, and any other session,
+    /// prove nothing.
+    #[tokio::test]
+    async fn a_creation_record_proves_its_creator_session_at_the_recorded_generation() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let parent = state
+            .mob_create_definition(explicit_definition("creator-parent"))
+            .await
+            .expect("create the parent mob");
+        let worker = AgentIdentity::from("worker-1");
+        state
+            .mob_spawn(
+                &parent,
+                ProfileName::from("worker"),
+                worker.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn the creator");
+        let creator_session = state
+            .mob_resolve_bridge_session_id(&parent, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("creator bridge session");
+        let member_child = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("creator-member-child"),
+                creator_session.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect("the member's session creates a mob");
+        let member_child = state
+            .handle_for(&member_child)
+            .await
+            .expect("member child handle");
+        assert!(matches!(
+            member_child.provenance().await.expect("provenance"),
+            meerkat_mob::MobProvenance::Member { .. }
+        ));
+        assert!(
+            state
+                .session_is_recorded_creator(&member_child, &creator_session)
+                .await
+        );
+        assert!(
+            !state
+                .session_is_recorded_creator(&member_child, &SessionId::new())
+                .await
+        );
+
+        let caller = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(caller.clone()))
+            .await;
+        let session_child = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("creator-session-child"),
+                caller.clone(),
+                false,
+                false,
+            )
+            .await
+            .expect("a session creates a mob");
+        let session_child = state
+            .handle_for(&session_child)
+            .await
+            .expect("session child handle");
+        assert!(
+            state
+                .session_is_recorded_creator(&session_child, &caller)
+                .await
+        );
+        assert!(
+            !state
+                .session_is_recorded_creator(&session_child, &creator_session)
+                .await
+        );
+
+        let host = state
+            .mob_create_definition(explicit_definition("creator-host"))
+            .await
+            .expect("a host create");
+        let host = state.handle_for(&host).await.expect("host handle");
+        assert!(!state.session_is_recorded_creator(&host, &caller).await);
+        assert!(
+            !state
+                .session_is_recorded_creator(&host, &creator_session)
+                .await
+        );
+
+        state
+            .mob_respawn(&parent, worker.clone(), None)
+            .await
+            .expect("respawn the creating member at its next generation");
+        let respawned_session = state
+            .mob_resolve_bridge_session_id(&parent, &worker)
+            .await
+            .expect("resolve the respawned bridge session")
+            .expect("respawned bridge session");
+        assert!(
+            !state
+                .session_is_recorded_creator(&member_child, &creator_session)
+                .await,
+            "the old session no longer serves the recorded generation"
+        );
+        assert!(
+            !state
+                .session_is_recorded_creator(&member_child, &respawned_session)
+                .await,
+            "a later generation of the creating member proves nothing"
         );
     }
 

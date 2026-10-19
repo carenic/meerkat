@@ -1383,6 +1383,17 @@ them.
 
 ### Fixed
 
+- `meerkat-mob-mcp`: after a restart, the session that created a mob with
+  the agent mob tools manages it again. A session's persisted mob operator
+  authority binds no mob, so the manage grant its create returned was gone
+  after a restart; the agent mob tools now re-derive it, for the incarnation
+  the mob runs at, from the mob's creation record. The record proves it for
+  `MobProvenance::Session` naming the session, and for
+  `MobProvenance::Member` only while the session is still the bridge session
+  of the recorded member at the recorded generation in the recorded parent
+  incarnation. Nothing else is granted: `Host`, `Ambiguous` and `Unrecorded`
+  records, another session, and a later generation of the creating member
+  get no grant.
 - `meerkat-store`: the SQLite session store lays out a whole-blob session
   whose transcript graph retired its oldest occurrences, which every session
   compacted more often than `history_retained_rewrites` (default 4) has. It

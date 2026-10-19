@@ -454,6 +454,45 @@ impl AgentMobToolSurface {
             .clone()
     }
 
+    /// The operator authority this surface's session holds over the mob
+    /// `handle` serves: the effective authority as the turn owner committed
+    /// it, or, when that holds no manage scope over the mob's incarnation and
+    /// the mob's creation record proves this session is its creator
+    /// ([`MobMcpState::session_is_recorded_creator`]), the effective
+    /// authority with the creator's manage grant re-derived for that
+    /// incarnation through the generated authority. A session's persisted
+    /// authority binds no mob, so after a restart this is how a creator
+    /// manages the mob it created. The re-derived grant serves this
+    /// admission only and is derived again for the next one; nothing is
+    /// written to the session.
+    async fn authority_over(&self, mob_id: &MobId, handle: &MobHandle) -> MobToolAuthorityContext {
+        let authority = self.authority_context_snapshot();
+        if !authority.is_generated_authority_context()
+            || authority.can_manage_mob(mob_id.as_str(), handle.incarnation())
+            || !self
+                .state
+                .session_is_recorded_creator(handle, &self.owner_bridge_session_id)
+                .await
+        {
+            return authority;
+        }
+        match meerkat_runtime::mob_operator_authority::grant_manage_mob(
+            &authority,
+            mob_id.as_str(),
+            handle.live_incarnation(),
+        ) {
+            Ok(granted) => granted,
+            Err(error) => {
+                tracing::warn!(
+                    mob_id = %mob_id,
+                    %error,
+                    "generated mob operator authority rejected the creator's re-derived grant"
+                );
+                authority
+            }
+        }
+    }
+
     async fn ensure_create_authority(&self, tool_name: &str) -> Result<(), ToolError> {
         // Pure observation extracted from the machine-minted operator-authority
         // projection (the create-mobs capability bit). MobMachine — not this
@@ -586,7 +625,8 @@ impl AgentMobToolSurface {
             ))
         })?;
         let can_manage_mob = self
-            .authority_context_snapshot()
+            .authority_over(mob_id, &handle)
+            .await
             .can_manage_mob(mob_id.as_str(), handle.incarnation());
         let caller = if can_manage_mob {
             None
@@ -647,7 +687,8 @@ impl AgentMobToolSurface {
         // MobMachine - not this surface - decides the Allow/Deny verdict; we
         // mirror it (Denied -> access_denied). Fails closed.
         let can_manage_mob = self
-            .authority_context_snapshot()
+            .authority_over(mob_id, handle)
+            .await
             .can_manage_mob(mob_id.as_str(), handle.incarnation());
         let admission = handle
             .resolve_current_mob_admission(can_manage_mob)
@@ -686,7 +727,7 @@ impl AgentMobToolSurface {
             ))
         })?;
         let incarnation = handle.incarnation();
-        let authority = self.authority_context_snapshot();
+        let authority = self.authority_over(mob_id, &handle).await;
         let observations = meerkat_mob::SpawnMemberAdmissionObservations {
             manage_scope_present: authority.can_manage_mob(mob_id.as_str(), incarnation),
             profile_scope_contains: authority.spawn_profile_scope_contains(
@@ -1507,7 +1548,7 @@ impl AgentMobToolSurface {
                     "fork_off resolved the current session binding but its durable roster member is absent",
                 )
             })?;
-        let authority = self.authority_context_snapshot();
+        let authority = self.authority_over(&mob_id, &audit_handle).await;
         let incarnation = audit_handle.incarnation();
         let observations = meerkat_mob::SpawnMemberAdmissionObservations {
             manage_scope_present: authority.can_manage_mob(mob_id.as_str(), incarnation),
@@ -2167,7 +2208,6 @@ impl AgentMobToolSurface {
         &self,
         call: ToolCallView<'_>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
-        let authority_context = self.authority_context_snapshot();
         let mobs = self
             .state
             .mob_list()
@@ -2184,8 +2224,10 @@ impl AgentMobToolSurface {
             let Ok(handle) = self.bound_handle(&id).await else {
                 continue;
             };
-            let can_manage_mob =
-                authority_context.can_manage_mob(id.as_str(), handle.incarnation());
+            let can_manage_mob = self
+                .authority_over(&id, &handle)
+                .await
+                .can_manage_mob(id.as_str(), handle.incarnation());
             match handle.resolve_current_mob_admission(can_manage_mob).await {
                 Ok(meerkat_mob::CurrentMobAdmission::Allowed) => {
                     mob_list.push(json!({
@@ -6453,6 +6495,122 @@ mod tests {
             }
             other => panic!("unexpected mob_create session effect: {other:?}"),
         }
+    }
+
+    /// After a restart a session's persisted operator authority binds no
+    /// mob: the factory refuses the persisted context and the session gets a
+    /// fresh create-only one, so the grant its `mob_create` returned is gone.
+    /// A fresh create-only surface for the creating session stands for that
+    /// restarted session here. The creator's manage grant is re-derived from
+    /// the mob's creation record (`MobProvenance::Session` naming the
+    /// session): the creator lists and manages the mob it created, while
+    /// another session gets nothing, and neither does the creator over a mob
+    /// the host created.
+    #[tokio::test]
+    async fn a_creator_session_manages_its_mob_again_after_a_restart() {
+        let state = MobMcpState::new_in_memory();
+        let creator = SessionId::new();
+        let surface_for = |session_id: SessionId| {
+            AgentMobToolSurface::new(
+                Arc::clone(&state),
+                None,
+                create_only_authority(),
+                "claude-sonnet-4-5".to_string(),
+                session_id,
+                None,
+                None,
+                None,
+            )
+        };
+        let listed = |surface: AgentMobToolSurface| async move {
+            let args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+            let result = surface
+                .dispatch(ToolCallView {
+                    id: "list-1",
+                    name: "mob_list",
+                    args: &args,
+                })
+                .await
+                .expect("mob_list");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result.result.text_content()).unwrap();
+            parsed["mobs"]
+                .as_array()
+                .expect("mobs")
+                .iter()
+                .map(|mob| mob["mob_id"].as_str().expect("mob_id").to_string())
+                .collect::<Vec<_>>()
+        };
+        let create_args = serde_json::value::RawValue::from_string(
+            json!({
+                "definition": {
+                    "id": "created-before-restart",
+                    "profiles": {
+                        "worker": {
+                            "model": "claude-sonnet-4-5",
+                            "tools": { "comms": true },
+                            "peer_description": "worker",
+                            "runtime_mode": "turn_driven"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let created = surface_for(creator.clone())
+            .dispatch(ToolCallView {
+                id: "create-1",
+                name: "mob_create",
+                args: &create_args,
+            })
+            .await
+            .expect("create-only authority allows mob_create");
+        let created: serde_json::Value =
+            serde_json::from_str(&created.result.text_content()).unwrap();
+        let mob_id = MobId::from(created["mob_id"].as_str().expect("mob_id"));
+        assert_eq!(
+            state
+                .handle_for(&mob_id)
+                .await
+                .expect("created mob handle")
+                .provenance()
+                .await
+                .expect("provenance"),
+            meerkat_mob::MobProvenance::Session {
+                session_id: creator.clone()
+            },
+            "the record names the creating session"
+        );
+        let host_mob = state
+            .mob_create_definition(sample_definition("host-created-mob"))
+            .await
+            .expect("create a host mob");
+
+        let restarted = surface_for(creator.clone());
+        restarted
+            .ensure_mob_scope_authority("mob_status", &mob_id)
+            .await
+            .expect("the creator manages the mob it created after a restart");
+        assert!(matches!(
+            restarted
+                .ensure_mob_scope_authority("mob_status", &host_mob)
+                .await,
+            Err(ToolError::AccessDenied { .. })
+        ));
+        assert_eq!(
+            listed(surface_for(creator.clone())).await,
+            vec![mob_id.to_string()]
+        );
+
+        let other = surface_for(SessionId::new());
+        assert!(matches!(
+            other
+                .ensure_mob_scope_authority("mob_status", &mob_id)
+                .await,
+            Err(ToolError::AccessDenied { .. })
+        ));
+        assert!(listed(surface_for(SessionId::new())).await.is_empty());
     }
 
     /// An agent's `mob_create` names the calling session to the host's create
