@@ -125,17 +125,29 @@ When running background jobs...
 | `name` | `String` | Yes | Canonical lowercase slug name for the skill. For filesystem skills, this must match the containing directory. |
 | `description` | `String` | Yes | One-line description |
 | `requires_capabilities` | `Vec<String>` | No (default `[]`) | Lowercase capability IDs that must be available |
+| `metadata` | map of `String` to `String` | No | Author metadata, kept as text |
+| `version` | `String` | No | Stored as the `version` entry of `metadata` |
+| `<vendor>.<key>` | any YAML value | No | Author extension field. Any other key without a `.` is refused. A mapping or sequence value needs a `<vendor>.version` field beside it. |
 
 The frontmatter is delimited by `---` markers. The body (everything after the closing `---`) is stored as the skill's `body` field.
 
-The frontmatter is one YAML 1.2 document. `yes`, `on` and `off` stay strings,
-and `<<` is an ordinary key, not a merge. The parser refuses a key given twice
-at any level, a null (`~` or an empty value) where text is expected, an
-unrecognized tag, a `...` document end marker, nesting deeper than 64 levels,
-and 100 or more aliases that outnumber their anchors more than ten to one. A
-block scalar keeps its line breaks as YAML specifies, also at the end of the
-frontmatter. In an extension value, quote a number with leading zeros, such as
-a file mode (`mode: '0755'`): unquoted, `0755` resolves as the decimal
+Since 0.9.4 the frontmatter is parsed as one YAML 1.2 document by a pure-Rust
+parser. `yes`, `on` and `off` stay strings, `<<` is an ordinary key, not a
+merge, and a second document is refused. The parser also refuses frontmatter
+that 0.9.3 and earlier accepted: a key given twice at any level (0.9.3 kept the
+last value), a null (`~` or an empty value) as `description` or as a `metadata`
+value (0.9.3 stored `~` or an empty string), an unrecognized tag such as
+`!custom`, a `...` document end marker, nesting deeper than 64 levels, and 100
+or more aliases that outnumber their anchors more than ten to one. A block
+scalar keeps its line breaks as YAML specifies, also at the end of the
+frontmatter, where 0.9.3 dropped the final one.
+
+Extension values reach `SkillDocument.extensions` as text: a string as written,
+and any other value as YAML rendered from its resolved value, not from your
+source text. `1.10` is `1.1`, `1_000` is `1000`, `017` is `17.0`, `tRUE` is
+`true`, `6.02e23` is `6.02e+23`, and a mapping or sequence is block YAML; parse
+a structured value as YAML to read it. Quote a number with leading zeros, such
+as a file mode (`mode: '0755'`): unquoted, `0755` resolves as the decimal
 `755.0`.
 
 ## Capability gating
