@@ -20,9 +20,10 @@ name: Live gate
 #           provider-degraded verdict (provider input transcription lagged
 #           past the measured threshold), or a provider that stalled after it
 #           started speaking (it began an answer, then sent only silent audio
-#           until the wait for spoken output timed out, and the log shows no
-#           product hold, duck or channel end). Not green: re-run the gate in
-#           a healthy provider window.
+#           until the wait for spoken output timed out; after the answer
+#           began, the log shows only its transcript, the provider's input
+#           clock and reflected output, and nowhere a hold, duck or channel
+#           end). Not green: re-run the gate in a healthy provider window.
 
 on:
   pull_request:
