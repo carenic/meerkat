@@ -31,6 +31,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   before Stop runs only after Resume. The result carries `stop_report` with
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
+  A member reported `reload_required` needs a durability reload: it starts no
+  turn until it is reloaded, and the reloaded member stays held until Resume.
   A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
   member reloaded while the mob is stopped stays held until Resume, as does
   one spawned into a stopped mob or held again after a failed Resume;

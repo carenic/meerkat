@@ -1102,6 +1102,10 @@ them.
   `load_delivery_generation`), `RuntimeDeliveryInbox::delivery_generation_reader`,
   and `KEPT_DELIVERY_READER_IDLE`. A store decorator forwards the method to
   the store it wraps or keeps the default.
+- `meerkat-mob`: `MemberStopRun::ReloadRequired` and
+  `MemberRunStarts::ReloadRequired`, the stop outcome of a member whose
+  runtime registration needs a durability reload (see Changed). Both enums are
+  `#[non_exhaustive]`.
 
 ### Changed
 
@@ -1345,6 +1349,18 @@ them.
   Maintenance from an older binary takes only the fence lock and does not
   wait for a kept connection: run maintenance with the same release as the
   hosts.
+- `meerkat-mob`: a mob Shutdown or Stop of a local member whose runtime
+  registration is durability-degraded reports the member's run and run
+  starts as `ReloadRequired`, where it failed or waited on the degraded
+  registration. That registration starts no run until a reload replaces it;
+  a Shutdown's teardown discards it and unregisters the cold successor, and
+  the `MobStop` a Stop staged first holds the reloaded registration until
+  Resume. An autonomous member's stop skips its comms-drain abort and its run
+  settlement for such a registration (the discard aborts and joins the drain
+  itself). Resume releases such a member. A Shutdown now holds every
+  member's run starts and reports the first failure in roster order instead
+  of stopping at it. On the wire, `stop_report` reports such a member with
+  `run` and `starts` `reload_required`.
 
 ### Fixed
 
@@ -2047,6 +2063,16 @@ them.
   its transport forwards nothing behind a row that waits, so its voice goes
   silent while a member turn runs and arrives in a burst when the turn ends
   (see `docs/guides/realtime.mdx`). (#1821)
+
+### Known limitations
+
+- `meerkat-mob`: in a multi-host mob, while a remote member's runtime needs
+  a durability reload, a Stop fails with an internal bridge rejection
+  (`MobError::BridgeCommandRejected`, cause `internal`), and so does a
+  Shutdown when that member is `AutonomousHost`: the member's host refuses
+  the run-start hold. A failed Stop rolls back and the mob stays Running; a
+  failed Shutdown keeps every member and can be retried. Reload that member
+  on its host, then retry.
 
 ## [0.9.3] - 2026-10-18
 

@@ -2178,7 +2178,9 @@ pub struct MobLifecycleResult {
     pub destroy_report: Option<Value>,
     /// For `stop`: what the stop did to each member's run and whether its
     /// run starts are held (#1500). A member reported `not_holdable` may
-    /// still start a turn while the mob is stopped.
+    /// still start a turn while the mob is stopped. A member reported
+    /// `reload_required` needs a durability reload: it starts no turn until
+    /// it is reloaded, and the reloaded member stays held until resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_report: Option<Value>,
 }

@@ -10,6 +10,7 @@
 //! reconciles it to the restored posture before any member registers.
 
 use super::*;
+use crate::runtime::stop_report::{MemberRunStarts, MemberStopRun};
 
 /// Bound for test steps that must happen promptly; it only turns a hang into
 /// a failure.
@@ -321,5 +322,147 @@ async fn a_destroy_of_a_stopped_mob_leaves_no_staged_hold() {
         held_on_registering_again(&adapter, &session_id).await,
         Some(false),
         "a later registration of a disposed member's session is not held"
+    );
+}
+
+/// A Stop of a member whose registration is durability-degraded reports the
+/// member `ReloadRequired` instead of failing: the degraded registration
+/// refuses the hold and starts no run, and the `MobStop` the Stop staged
+/// first holds the registration a reload replaces it with. Nothing runs
+/// while the mob is Stopped, and the input admitted to the reloaded member
+/// runs only once Resume released it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_reports_a_degraded_member_reload_required_and_holds_its_reload() {
+    let mob = persistent_single_member_mob("stop-degraded").await;
+    assert!(
+        mob.adapter
+            .force_session_durability_reload_required_for_test(mob.session(0))
+            .await,
+        "the member's registration degrades"
+    );
+    let report = tokio::time::timeout(STEP, mob.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("the stop succeeds");
+    let outcome = report
+        .members
+        .get(mob.member(0))
+        .expect("the degraded member's stop outcome");
+    assert_eq!(outcome.run, MemberStopRun::ReloadRequired, "{report:?}");
+    assert_eq!(
+        outcome.starts,
+        MemberRunStarts::ReloadRequired,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.not_holdable().count(),
+        0,
+        "a degraded member is not reported as able to start a turn: {report:?}"
+    );
+
+    // The degraded registration admits no input while the mob is Stopped.
+    let refused = mob
+        .adapter
+        .accept_input_with_completion(
+            mob.session(0),
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "offered to the degraded member",
+                None,
+            )),
+        )
+        .await;
+    assert!(
+        !matches!(&refused, Ok((accepted, _)) if accepted.is_accepted()),
+        "the degraded registration admits no input"
+    );
+
+    // A reload while Stopped publishes a successor that applies the staged
+    // MobStop; its revival waits for Running.
+    let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
+        .await
+        .expect("the reload answers");
+    assert!(
+        matches!(
+            reload,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "the reload's revival waits for Running: {reload:?}"
+    );
+    assert_eq!(
+        mob.adapter.run_starts_held_for_test(mob.session(0)).await,
+        Some(true),
+        "the reload's successor registration applies the staged MobStop"
+    );
+    let prompt = "admitted to the reloaded member while the mob is stopped";
+    let (accepted, _completion) = mob
+        .adapter
+        .accept_input_with_completion(
+            mob.session(0),
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(prompt, None)),
+        )
+        .await
+        .expect("the runtime admits the input");
+    assert!(accepted.is_accepted());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !mob.executed_prompts(0)
+            .await
+            .iter()
+            .any(|executed| executed == prompt),
+        "no run starts while the mob is Stopped"
+    );
+    mob.handle.resume().await.expect("resume the mob");
+    wait_until("the held input runs after Resume", STEP, || async {
+        mob.executed_prompts(0)
+            .await
+            .iter()
+            .any(|executed| executed == prompt)
+    })
+    .await;
+}
+
+/// Resume releases a member whose registration is still durability-degraded.
+/// The release unstages `MobStop`, and the degraded registration then
+/// refuses the rest, which counts as released: the registration starts no
+/// run until a reload, and the reload's successor applies no `MobStop`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_releases_a_member_still_degraded() {
+    let mob = persistent_single_member_mob("resume-degraded").await;
+    assert!(
+        mob.adapter
+            .force_session_durability_reload_required_for_test(mob.session(0))
+            .await,
+        "the member's registration degrades"
+    );
+    let report = tokio::time::timeout(STEP, mob.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("the stop succeeds");
+    assert_eq!(
+        report
+            .members
+            .get(mob.member(0))
+            .map(|outcome| outcome.starts.clone()),
+        Some(MemberRunStarts::ReloadRequired),
+        "{report:?}"
+    );
+    tokio::time::timeout(STEP, mob.handle.resume())
+        .await
+        .expect("the resume answers")
+        .expect("the resume releases the degraded member");
+    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
+
+    // The reload's successor registers unheld: Resume left no staged MobStop.
+    tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
+        .await
+        .expect("the reload answers")
+        .expect("the reload succeeds while the mob is Running");
+    assert_eq!(
+        mob.adapter.run_starts_held_for_test(mob.session(0)).await,
+        Some(false),
+        "the reloaded member is not held after Resume"
     );
 }

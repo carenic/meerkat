@@ -17867,11 +17867,27 @@ impl DetachedMemberReadinessContext {
     ) -> Result<(), MobError> {
         let member_ref = &target.incarnation.member_ref;
         let expected_member = target.incarnation.expected_member.as_ref();
+        // A member whose runtime registration needs a durability reload has
+        // neither the drain abort nor the run settlement to wait for. Both
+        // would wait on the degraded registration: the abort behind the
+        // mutation fence a failed boundary commit retains, which only the
+        // reload-required discard releases, and the settlement for a run end
+        // no degraded registration can record. The discard (a Shutdown's
+        // teardown, or a reload) aborts and joins the drain itself, and the
+        // cold registration it publishes reads the run's outcome from durable
+        // truth. Until then the drain may keep re-arming, but it admits no
+        // input: admission waits for a durability-ready registration.
+        #[cfg(feature = "runtime-adapter")]
+        let reload_required = matches!(
+            target.outcome.run,
+            super::stop_report::MemberStopRun::ReloadRequired
+        );
         // Abort the comms drain but keep the session registered. A placed
         // member's session and drain belong to the member host; its exact
         // remote interrupt is the stop boundary.
         #[cfg(feature = "runtime-adapter")]
         if expected_member.is_none()
+            && !reload_required
             && let (Some(adapter), Some(session_id)) =
                 (&self.runtime_adapter, member_ref.bridge_session_id())
         {
@@ -17915,8 +17931,9 @@ impl DetachedMemberReadinessContext {
             // hold, set before the interrupt, keeps a queued input from
             // starting another run meanwhile.
             #[cfg(feature = "runtime-adapter")]
-            if let (Some(adapter), Some(session_id)) =
-                (&self.runtime_adapter, member_ref.bridge_session_id())
+            if !reload_required
+                && let (Some(adapter), Some(session_id)) =
+                    (&self.runtime_adapter, member_ref.bridge_session_id())
             {
                 stage.enter(AUTONOMOUS_MEMBER_STOP_RUN_SETTLEMENT_STAGE);
                 adapter.wait_current_run_settled(session_id).await;
@@ -18424,7 +18441,9 @@ impl MobActor {
     /// hosts (`local_only`), one after another. A remote member's host is not
     /// contacted during Shutdown, which never probes a placed member it has no
     /// live channel to. A Stop holds every member concurrently instead
-    /// ([`Self::hold_every_member_run_starts_concurrently`]).
+    /// ([`Self::hold_every_member_run_starts_concurrently`]). As there, every
+    /// member is held and the first failure in roster order is returned, so a
+    /// member whose hold failed leaves no later member unheld.
     async fn hold_all_member_run_starts(
         &mut self,
         local_only: bool,
@@ -18434,6 +18453,7 @@ impl MobActor {
             roster.list().cloned().collect::<Vec<_>>()
         };
         let mut outcomes = BTreeMap::new();
+        let mut first_error = None;
         for entry in &entries {
             if self.placed_member_carrier_dormant(&entry.agent_identity) {
                 outcomes.insert(
@@ -18445,7 +18465,13 @@ impl MobActor {
                 );
                 continue;
             }
-            let incarnation = self.autonomous_stop_interrupt_incarnation(entry)?;
+            let incarnation = match self.autonomous_stop_interrupt_incarnation(entry) {
+                Ok(incarnation) => incarnation,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             if local_only
                 && (incarnation.expected_member.is_some()
                     || incarnation.member_ref.bridge_session_id().is_none())
@@ -18456,7 +18482,7 @@ impl MobActor {
                 );
                 continue;
             }
-            let outcome = converge_autonomous_stop_member_result(
+            match converge_autonomous_stop_member_result(
                 self.provisioner
                     .stop_member_runtime(
                         &incarnation.member_ref,
@@ -18464,10 +18490,16 @@ impl MobActor {
                         false,
                     )
                     .await,
-            )?;
-            outcomes.insert(entry.agent_identity.clone(), outcome);
+            ) {
+                Ok(outcome) => {
+                    outcomes.insert(entry.agent_identity.clone(), outcome);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Ok(outcomes)
+        first_error.map_or(Ok(outcomes), Err)
     }
 
     /// Hold every member's run starts for a Stop (#1500), before any stop
@@ -20372,13 +20404,24 @@ impl MobActor {
             member_ref: member_ref.clone(),
             expected_member: None,
         };
-        if let Err(error) =
-            Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
+        match Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
         {
-            tracing::warn!(
-                error = %error,
-                "holding a member spawned into a stopped mob failed"
-            );
+            Ok(outcome)
+                if outcome.starts == super::stop_report::MemberRunStarts::ReloadRequired =>
+            {
+                tracing::info!(
+                    "a member spawned into a stopped mob needs a durability reload: it starts no \
+                     run until it is reloaded, and the reloaded registration stays held until \
+                     resume"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "holding a member spawned into a stopped mob failed"
+                );
+            }
         }
     }
 
@@ -20402,16 +20445,28 @@ impl MobActor {
                 Ok(incarnation) => {
                     Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation)
                         .await
-                        .map(|_| ())
                 }
                 Err(error) => Err(error),
             };
-            if let Err(error) = held {
-                tracing::warn!(
-                    agent_identity = %entry.agent_identity,
-                    error = %error,
-                    "re-holding a member's run starts after a failed resume failed"
-                );
+            match held {
+                Ok(outcome)
+                    if outcome.starts == super::stop_report::MemberRunStarts::ReloadRequired =>
+                {
+                    tracing::info!(
+                        agent_identity = %entry.agent_identity,
+                        "a member of the stopped mob needs a durability reload: it starts no run \
+                         until it is reloaded, and the reloaded registration stays held until \
+                         resume"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        agent_identity = %entry.agent_identity,
+                        error = %error,
+                        "re-holding a member's run starts after a failed resume failed"
+                    );
+                }
             }
         }
     }
