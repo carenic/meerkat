@@ -65,7 +65,9 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
 
 - `force_cancel` cancels the current run at its next boundary and drops
   input queued before the cancel. It is idempotent, and an idle member answers
-  ok. Only a never-seen identity fails with `MemberNotFound`.
+  ok. A never-seen identity fails with `MemberNotFound`; since 0.9.4 a member
+  whose runtime needs a durability reload fails with `MemberReloadRequired`
+  (`-32029`) until it is reloaded.
 - The run id comes from the `run_started` event. A stale id returns the
   receipt `not_current`, not an error; other outcomes are `stopped` and
   `not_stoppable`.

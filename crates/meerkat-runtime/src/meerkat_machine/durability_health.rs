@@ -52,6 +52,10 @@ struct DurabilityHealthRecord {
     /// install capability. Any real degradation revokes it before replacing
     /// the provisional ReloadRequired reason.
     cold_install_open: bool,
+    /// Set by the transition that performs a real degradation, while it holds
+    /// this record's lock. The provisional cold-install state is not a
+    /// degradation, so it never sets it.
+    degraded: crate::tokio::sync::watch::Sender<bool>,
 }
 
 /// Cloneable durability gate shared by the runtime entry and its persistent
@@ -102,7 +106,56 @@ impl DurabilityHealthHandle {
         record.state =
             DurabilityHealthState::ReloadRequired(DurabilityReloadRequired::new(operation, reason));
         record.cold_install_open = false;
+        // Published under the record's lock: a waiter that subscribes and
+        // reads the level under the same lock sees this transition either in
+        // the level or on its receiver, never in neither.
+        record.degraded.send_replace(true);
         true
+    }
+
+    /// Subscribe to this session's real degradation. The level and the
+    /// receiver are read under the lock every degradation publishes under,
+    /// so a degradation that happened before the call is reported as already
+    /// fired and one after it is delivered: none falls between the read and
+    /// the subscribe. The provisional cold-install state is not a
+    /// degradation.
+    pub(crate) fn subscribe_degradation(&self) -> DurabilityDegradation {
+        let record = match self.inner.lock() {
+            Ok(record) => record,
+            Err(_) => {
+                return DurabilityDegradation::Fired(DurabilityReloadRequired::new(
+                    "durability_health_poison",
+                    "persistent health owner is not a verified image",
+                ));
+            }
+        };
+        if *record.degraded.borrow()
+            && let DurabilityHealthState::ReloadRequired(required) = &record.state
+        {
+            return DurabilityDegradation::Fired(required.clone());
+        }
+        DurabilityDegradation::Pending(DurabilityDegradationWatch {
+            rx: record.degraded.subscribe(),
+            handle: self.clone(),
+        })
+    }
+
+    /// The retained cause of a real degradation, or `None` while the session
+    /// is Ready or still in its provisional cold install.
+    fn degradation_cause(&self) -> Option<DurabilityReloadRequired> {
+        let record = match self.inner.lock() {
+            Ok(record) => record,
+            Err(_) => {
+                return Some(DurabilityReloadRequired::new(
+                    "durability_health_poison",
+                    "persistent health owner is not a verified image",
+                ));
+            }
+        };
+        match (&record.state, *record.degraded.borrow()) {
+            (DurabilityHealthState::ReloadRequired(required), true) => Some(required.clone()),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -112,6 +165,47 @@ impl DurabilityHealthHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state
             .clone()
+    }
+}
+
+/// What [`DurabilityHealthHandle::subscribe_degradation`] found.
+pub(crate) enum DurabilityDegradation {
+    /// The session had already degraded: treat the signal as fired.
+    Fired(DurabilityReloadRequired),
+    /// Not degraded when subscribed; the watch resolves on the first real
+    /// degradation.
+    Pending(DurabilityDegradationWatch),
+}
+
+impl DurabilityDegradation {
+    /// Resolve with the degradation's retained cause: at once when it had
+    /// already happened, otherwise on the first real degradation.
+    pub(crate) async fn fired(self) -> DurabilityReloadRequired {
+        match self {
+            Self::Fired(required) => required,
+            Self::Pending(mut watch) => watch.degraded().await,
+        }
+    }
+}
+
+/// Resolves on a session's first real degradation.
+pub(crate) struct DurabilityDegradationWatch {
+    rx: crate::tokio::sync::watch::Receiver<bool>,
+    handle: DurabilityHealthHandle,
+}
+
+impl DurabilityDegradationWatch {
+    /// Wait for the first real degradation and return its retained cause.
+    /// Pends forever when the health owner is gone without degrading.
+    pub(crate) async fn degraded(&mut self) -> DurabilityReloadRequired {
+        loop {
+            if self.rx.wait_for(|degraded| *degraded).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            if let Some(cause) = self.handle.degradation_cause() {
+                return cause;
+            }
+        }
     }
 }
 
@@ -156,6 +250,7 @@ pub(super) fn begin_registration_cold_install()
                 "persistent runtime cold install has not published readiness",
             )),
             cold_install_open: true,
+            degraded: crate::tokio::sync::watch::channel(false).0,
         })),
     };
     let authority = DurabilityRehydrationAuthority {
@@ -205,6 +300,60 @@ mod tests {
             health.require_ready().is_err(),
             "poison is not a verified Ready image"
         );
+    }
+
+    #[tokio::test]
+    async fn the_degradation_signal_reaches_an_earlier_subscriber_and_reads_as_fired_after() {
+        let (health, rehydration) = begin_registration_cold_install();
+        rehydration.mark_ready().unwrap();
+        let subscribed = health.subscribe_degradation();
+        assert!(
+            matches!(subscribed, DurabilityDegradation::Pending(_)),
+            "a Ready session has not degraded"
+        );
+        assert!(health.mark_reload_required("atomic_apply", "outcome unknown"));
+        let fired =
+            crate::tokio::time::timeout(std::time::Duration::from_secs(5), subscribed.fired())
+                .await
+                .expect("a subscriber from before the degradation is woken by it");
+        assert_eq!(fired.operation(), "atomic_apply");
+        match health.subscribe_degradation() {
+            DurabilityDegradation::Fired(required) => {
+                assert_eq!(required.operation(), "atomic_apply");
+            }
+            DurabilityDegradation::Pending(_) => {
+                panic!("a subscriber after the degradation reads it as already fired")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_provisional_cold_install_never_fires_the_degradation_signal() {
+        let (health, rehydration) = begin_registration_cold_install();
+        let subscribed = health.subscribe_degradation();
+        assert!(
+            matches!(subscribed, DurabilityDegradation::Pending(_)),
+            "the provisional ReloadRequired of a cold install is not a degradation"
+        );
+        rehydration.mark_ready().unwrap();
+        assert!(
+            crate::tokio::time::timeout(std::time::Duration::from_millis(200), subscribed.fired(),)
+                .await
+                .is_err(),
+            "publishing readiness is not a degradation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_degradation_during_the_cold_install_fires_the_signal() {
+        let (health, _rehydration) = begin_registration_cold_install();
+        let subscribed = health.subscribe_degradation();
+        assert!(health.mark_reload_required("recovery_cas", "durable image changed"));
+        let fired =
+            crate::tokio::time::timeout(std::time::Duration::from_secs(5), subscribed.fired())
+                .await
+                .expect("a real degradation replaces the provisional state and fires");
+        assert_eq!(fired.operation(), "recovery_cas");
     }
 
     #[test]

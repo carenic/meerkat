@@ -222,17 +222,20 @@ pub trait NativeWorkAuthorizationHost: Send + Sync {
         Arc::new(RefuseConfiguredMcpAttachment)
     }
 
-    /// [`Self::configured_mcp_attachment`] with the session registration's
-    /// own agent binding: the agent the trusted host bound for this exact
-    /// registration, read when each configured server is decided. An unbound
-    /// registration's [`crate::meerkat_machine::SessionAgentBinding::current`]
-    /// is typed unavailable. The default ignores the binding.
+    /// [`Self::configured_mcp_attachment`] for one exact session
+    /// registration, with that registration's own agent binding: the agent
+    /// the trusted host bound for this exact registration, read when each
+    /// configured server is decided. A later registration of the same session
+    /// is a different registration. An unbound registration's
+    /// [`crate::meerkat_machine::SessionAgentBinding::current`] is typed
+    /// unavailable. The default ignores the binding and decides for the
+    /// registration's session.
     fn configured_mcp_attachment_for_agent(
         &self,
-        session_id: &meerkat_core::SessionId,
+        registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         _agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
-        self.configured_mcp_attachment(session_id)
+        self.configured_mcp_attachment(registration.session_id())
     }
 
     /// The per-agent selection conjunct of an MCP attachment control: whether

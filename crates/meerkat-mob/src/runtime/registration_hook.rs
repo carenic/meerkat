@@ -72,6 +72,7 @@ pub struct MemberRuntimeBuildIdentity {
     realm_id: RealmId,
     member: MobMemberBinding,
     session_document: EvidenceId,
+    registration: RuntimeSessionRegistrationWitness,
 }
 
 impl MemberRuntimeBuildIdentity {
@@ -87,6 +88,16 @@ impl MemberRuntimeBuildIdentity {
     /// name.
     pub fn session_document(&self) -> &EvidenceId {
         &self.session_document
+    }
+
+    /// The member's exact runtime registration this call is made for: the
+    /// one being prepared for a new member, or the current one of a member
+    /// whose actor is recovered. A later registration of the same session is
+    /// a different registration, so a host binds what it decides here to
+    /// this registration, not to an identity it derives from the member's
+    /// session id or labels.
+    pub fn registration(&self) -> &RuntimeSessionRegistrationWitness {
+        &self.registration
     }
 
     pub(super) fn from_request(
@@ -119,6 +130,7 @@ impl MemberRuntimeBuildIdentity {
             realm_id,
             member,
             session_document: session_document(registration)?,
+            registration: registration.clone(),
         })
     }
 }

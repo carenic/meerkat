@@ -11,6 +11,10 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# This test pins the CLI's mobpack help against the repository's docs/, which
+# no crate packages, so it runs in the repository only and stays out of the
+# published package (whose other tests build standalone).
+exclude = ["tests/help_mobpack_contract.rs"]
 
 [[bin]]
 name = "rkat"
@@ -74,7 +78,6 @@ meerkat-openai = { workspace = true, features = ["oauth"] }
 meerkat-gemini = { workspace = true, features = ["oauth"] }
 meerkat-copilot = { workspace = true, optional = true, features = ["oauth"] }
 meerkat-providers = { workspace = true, features = ["anthropic", "openai", "gemini", "oauth", "native-keyring", "refresh-file-lock"] }
-webbrowser = "1"
 meerkat-store = { workspace = true }
 meerkat-runtime = { workspace = true }
 meerkat-tools = { workspace = true }

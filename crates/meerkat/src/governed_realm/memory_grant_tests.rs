@@ -22,7 +22,8 @@ use meerkat_authorization::policy::{
 };
 use meerkat_authorization::publication::LocalAuthorizationPublication;
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, ExactRestriction, ExecutionRestrictions, ProcessorRef, ResourceDomain,
+    ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    ProcessorRef, ResourceDomain,
 };
 use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -298,7 +299,7 @@ async fn a_memory_search_needs_the_lineage_selected_for_its_own_memory_scope() {
             None,
             ExecutionRestrictions {
                 actions: ExactRestriction::exact([memory_read()]),
-                resource_domains: ExactRestriction::exact([memory_domain(&session)]),
+                resource_domains: DomainRestriction::exact([memory_domain(&session)]),
                 ..ExecutionRestrictions::unrestricted()
             },
         )
