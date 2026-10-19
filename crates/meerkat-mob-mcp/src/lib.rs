@@ -222,6 +222,21 @@ struct HeldChildMob {
     storage_path: PathBuf,
     owner: SessionId,
     reason: ChildMobHoldReason,
+    /// The child's stored roster and recorded incarnation, kept by the first
+    /// member lookup that reads them successfully and shared by every clone
+    /// of this entry. A held child does not run and every move into or out
+    /// of the held set takes the transfer lock, so it stays true while the
+    /// entry exists; a re-hold makes a new entry. A failed read is not kept.
+    roster_read: Arc<std::sync::OnceLock<HeldChildRosterRead>>,
+}
+
+/// One read of a held child's store for member lookups: every stored member
+/// with a bridge session, by that session, and the incarnation its creation
+/// record names (`None`: no record yet).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct HeldChildRosterRead {
+    members: BTreeMap<SessionId, (AgentIdentity, meerkat_mob::Generation)>,
+    incarnation: Option<meerkat_core::service::MobIncarnationId>,
 }
 
 /// A parked child-teardown preflight (test seam).
@@ -238,6 +253,20 @@ enum ChildMobRestoreGate {
     Resume,
     Teardown { mob_id: MobId, owner: SessionId },
     Hold(HeldChildMob),
+}
+
+/// Why an entry joins the managed set: only a host insert sets
+/// `MobMcpState::handles_inserted` (see `MobMcpState::managed_mob_entry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum ManagedInsertOrigin {
+    /// A create this state ran.
+    OwnCreate,
+    /// This state's restore from its persistent root.
+    RootRestore,
+    /// A handle a host built and inserted
+    /// (`MobMcpState::try_mob_insert_handle`).
+    HostInsert,
 }
 
 #[derive(Clone)]
@@ -1048,9 +1077,10 @@ pub struct MobMcpState {
     /// outside the set is then gone for good.
     mob_set_restored: std::sync::atomic::AtomicBool,
     /// Set by the first handle a host inserts, under the managed set's write
-    /// lock and before the handle is visible. Only
-    /// [`MobMcpState::try_mob_insert_handle`] inserts a handle this state did
-    /// not build, so no insert skips it. Until it is set a state without a
+    /// lock and before the handle is visible. Every managed-set entry is
+    /// built by [`MobMcpState::managed_mob_entry`], which sets it for a host
+    /// insert, and only [`MobMcpState::try_mob_insert_handle`] inserts as the
+    /// host, so no insert skips it. Until it is set a state without a
     /// persistent root hosts only mobs it created in this process, so a
     /// lookup over its rosters is complete without a declared restore. It is
     /// never cleared.
@@ -1901,6 +1931,31 @@ impl MobMcpState {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The one builder of a managed-set entry. Every insert into the managed
+    /// set takes its value from here, under the set's write guard, and
+    /// inserts it right away. A host insert sets `handles_inserted` here,
+    /// under that guard and before the handle is visible, so a member lookup
+    /// that could see the handle reads the latch set; this state's own
+    /// creates and its persistent restore never set it (see
+    /// [`Self::member_lookup_complete`]).
+    fn managed_mob_entry(
+        &self,
+        handle: MobHandle,
+        storage_path: Option<PathBuf>,
+        origin: ManagedInsertOrigin,
+    ) -> ManagedMob {
+        match origin {
+            ManagedInsertOrigin::HostInsert => self
+                .handles_inserted
+                .store(true, std::sync::atomic::Ordering::Release),
+            ManagedInsertOrigin::OwnCreate | ManagedInsertOrigin::RootRestore => {}
+        }
+        ManagedMob {
+            handle,
+            storage_path,
+        }
+    }
+
     /// Whether this state hosts every mob whose roster could name a session:
     /// its mob set is complete ([`Self::mob_set_complete`]), or it has no
     /// persistent root and no handle was ever inserted, so it hosts only the
@@ -1908,7 +1963,9 @@ impl MobMcpState {
     /// holds only while no host inserts a handle: every inserted handle goes
     /// through [`Self::try_mob_insert_handle`], which sets the latch before
     /// the handle is visible, and a lookup reads the answer again after its
-    /// scan.
+    /// scan. Complete means complete over the mobs hosted when the lookup
+    /// runs: a member of a mob a host has not inserted yet is not found, so a
+    /// host inserts a mob's handle before its members can run turns.
     fn member_lookup_complete(&self) -> bool {
         self.mob_set_complete()
             || (self.persistent_storage_root.is_none()
@@ -1928,7 +1985,11 @@ impl MobMcpState {
     /// its restore done with [`Self::declare_mob_set_restored`]). A held
     /// child whose roster cannot be read, or whose roster names the session
     /// but whose incarnation is not recorded yet (a store from before 0.9.4
-    /// that no 0.9.4 runtime has resumed), refuses it naming that child.
+    /// that no 0.9.4 runtime has resumed), refuses it naming that child. A
+    /// held child's store is read once per hold. The lookup reads the mobs
+    /// hosted when it runs: a member of a mob a host has not inserted yet is
+    /// not found, so a host inserts a mob's handle before its members can run
+    /// turns.
     pub async fn session_member_matches(
         &self,
         session_id: &SessionId,
@@ -2000,9 +2061,11 @@ impl MobMcpState {
     }
 
     /// The member of a held child's stored roster whose session is
-    /// `session_id`, with the child's recorded incarnation. A read that
-    /// fails, or a match without a recorded incarnation, refuses with
-    /// [`MobError::ProvenanceUnavailable`] naming the child.
+    /// `session_id`, with the child's recorded incarnation. The child's store
+    /// is opened and read once per hold: the first read that succeeds is kept
+    /// on the held entry and answers every later lookup. A read that fails is
+    /// not kept and, like a match without a recorded incarnation, refuses
+    /// with [`MobError::ProvenanceUnavailable`] naming the child.
     #[cfg(not(target_arch = "wasm32"))]
     async fn held_child_member_of_session(
         held: &HeldChildMob,
@@ -2024,25 +2087,36 @@ impl MobMcpState {
                 mob_id: Some(held.mob_id.clone()),
             }
         };
-        let storage = MobStorage::persistent(&held.storage_path)
-            .map_err(|error| unavailable(Some(&error)))?;
-        let Some((identity, generation)) = storage
-            .stored_member_of_session(session_id)
-            .await
-            .map_err(|error| unavailable(Some(&error)))?
-        else {
+        let read = match held.roster_read.get() {
+            Some(read) => read,
+            None => {
+                let storage = MobStorage::persistent(&held.storage_path)
+                    .map_err(|error| unavailable(Some(&error)))?;
+                let members = storage
+                    .stored_members_by_session()
+                    .await
+                    .map_err(|error| unavailable(Some(&error)))?;
+                let incarnation = storage
+                    .creation_incarnation()
+                    .await
+                    .map_err(|error| unavailable(Some(&error)))?;
+                // Lookups read held children under the transfer lock, so no
+                // other read kept one meanwhile.
+                held.roster_read.get_or_init(|| HeldChildRosterRead {
+                    members,
+                    incarnation,
+                })
+            }
+        };
+        let Some((identity, generation)) = read.members.get(session_id) else {
             return Ok(None);
         };
-        let incarnation = storage
-            .creation_incarnation()
-            .await
-            .map_err(|error| unavailable(Some(&error)))?
-            .ok_or_else(|| unavailable(None))?;
+        let incarnation = read.incarnation.ok_or_else(|| unavailable(None))?;
         Ok(Some(SessionMemberMatch {
             mob_id: held.mob_id.clone(),
             incarnation,
-            identity,
-            generation,
+            identity: identity.clone(),
+            generation: *generation,
         }))
     }
 
@@ -3581,10 +3655,11 @@ impl MobMcpState {
                 return Err(Self::owed_destroy_cleanup_error(&mob_id));
             }
             Entry::Vacant(entry) => {
-                entry.insert(ManagedMob {
+                entry.insert(self.managed_mob_entry(
                     handle,
-                    storage_path: Some(path.to_path_buf()),
-                });
+                    Some(path.to_path_buf()),
+                    ManagedInsertOrigin::RootRestore,
+                ));
                 // Under the managed set's write lock: a caller that finds
                 // the mob also finds what its build bound.
                 if let Some(on_managed) = on_managed {
@@ -3636,6 +3711,7 @@ impl MobMcpState {
                     storage_path: path.to_path_buf(),
                     owner: owner.bridge_session_id,
                     reason: ChildMobHoldReason::HistoryUnreadable(error.to_string()),
+                    roster_read: Arc::default(),
                 }));
             }
         }
@@ -3651,6 +3727,7 @@ impl MobMcpState {
                     storage_path: path.to_path_buf(),
                     owner: owner.bridge_session_id,
                     reason,
+                    roster_read: Arc::default(),
                 }),
             },
         )
@@ -3778,6 +3855,7 @@ impl MobMcpState {
             storage_path: path.clone(),
             owner: owner.clone(),
             reason: ChildMobHoldReason::TeardownBlocked(error.to_string()),
+            roster_read: Arc::default(),
         };
         #[cfg(test)]
         {
@@ -4306,10 +4384,11 @@ impl MobMcpState {
                 Err(Self::owed_destroy_cleanup_error(&mob_id))
             }
             Entry::Vacant(entry) => {
-                entry.insert(ManagedMob {
+                entry.insert(self.managed_mob_entry(
                     handle,
                     storage_path,
-                });
+                    ManagedInsertOrigin::OwnCreate,
+                ));
                 if let Some(on_managed) = on_managed {
                     on_managed(&mob_id);
                 }
@@ -4547,10 +4626,11 @@ impl MobMcpState {
                 return Err(Self::owed_destroy_cleanup_error(&mob_id));
             }
             Entry::Vacant(entry) => {
-                entry.insert(ManagedMob {
+                entry.insert(self.managed_mob_entry(
                     handle,
                     storage_path,
-                });
+                    ManagedInsertOrigin::OwnCreate,
+                ));
                 if let Some(on_managed) = on_managed {
                     on_managed(&mob_id);
                 }
@@ -4594,6 +4674,11 @@ impl MobMcpState {
 
     /// [`Self::mob_insert_handle`], refusing with a typed error once a
     /// stand-down has started.
+    ///
+    /// Insert a mob's handle before its members can run turns: a member
+    /// lookup ([`Self::session_member_matches`]) reads the rosters of the
+    /// mobs hosted when it runs, so a member of a mob not inserted yet is not
+    /// found, and a create by its session records `Session`.
     pub async fn try_mob_insert_handle(
         &self,
         mob_id: MobId,
@@ -4605,16 +4690,11 @@ impl MobMcpState {
             if self.destroy_cleanup_owed(&mob_id) {
                 return Err(Self::owed_destroy_cleanup_error(&mob_id));
             }
-            // Latched before the handle is visible: a member lookup that
-            // could see the handle reads the latch set.
-            self.handles_inserted
-                .store(true, std::sync::atomic::Ordering::Release);
+            // The entry latches before the handle is visible: a member
+            // lookup that could see the handle reads the latch set.
             mobs.insert(
                 mob_id.clone(),
-                ManagedMob {
-                    handle: handle.clone(),
-                    storage_path: None,
-                },
+                self.managed_mob_entry(handle.clone(), None, ManagedInsertOrigin::HostInsert),
             );
         }
         self.note_mob_set_changed();
@@ -16160,6 +16240,143 @@ mod tests {
             meerkat_mob::MobProvenance::Session {
                 session_id: session_id.clone()
             }
+        );
+    }
+
+    /// Every managed-set entry is built by the one helper that sets the
+    /// host-insert latch, and only `try_mob_insert_handle` inserts as the
+    /// host. An insert path that builds its entry itself, or a second
+    /// host-insert site, fails here, so a host insert can never skip the
+    /// latch that keeps the member lookup's second completeness arm honest.
+    #[test]
+    fn every_managed_set_entry_is_built_by_the_latching_helper() {
+        // The shipped code of every source file of this crate: the code
+        // before its `mod tests`, and no test-only module file.
+        fn shipped_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read the crate's sources") {
+                let path = entry.expect("a source entry").path();
+                if path.is_dir() {
+                    shipped_sources(&path, out);
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.ends_with(".rs") || name == "tests.rs" || name.ends_with("_tests.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read a source file");
+                let shipped = source.split("\nmod tests {").next().unwrap_or_default();
+                out.push((path, shipped.to_string()));
+            }
+        }
+        // Where the method that starts with `signature` lies in `source`: up
+        // to the end of its body at method indentation.
+        fn method(source: &str, signature: &str) -> std::ops::Range<usize> {
+            let start = source.find(signature).expect("the method exists");
+            let end = source[start..]
+                .find("\n    }\n")
+                .map(|end| start + end)
+                .expect("the method ends");
+            start..end
+        }
+        let mut sources = Vec::new();
+        shipped_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let lib_source = &sources
+            .iter()
+            .find(|(path, _)| path == &lib)
+            .expect("the crate root is shipped code")
+            .1;
+        let helper = method(lib_source, "fn managed_mob_entry(");
+        let host_insert = method(lib_source, "pub async fn try_mob_insert_handle(");
+        let mut literals = Vec::new();
+        let mut host_origins = Vec::new();
+        for (path, source) in &sources {
+            for (at, _) in source.match_indices("ManagedMob {") {
+                // The struct's own definition is not an entry.
+                if !source[..at].ends_with("struct ") {
+                    literals.push((path.clone(), at));
+                }
+            }
+            for (at, _) in source.match_indices("ManagedInsertOrigin::HostInsert") {
+                if !(path == &lib && helper.contains(&at)) {
+                    host_origins.push((path.clone(), at));
+                }
+            }
+        }
+        assert_eq!(
+            literals.len(),
+            1,
+            "only the helper builds a managed-set entry: {literals:?}"
+        );
+        assert!(
+            literals[0].0 == lib && helper.contains(&literals[0].1),
+            "the one entry literal is the helper's: {literals:?}"
+        );
+        assert_eq!(
+            host_origins.len(),
+            1,
+            "one host-insert site outside the helper: {host_origins:?}"
+        );
+        assert!(
+            host_origins[0].0 == lib && host_insert.contains(&host_origins[0].1),
+            "the host-insert site is try_mob_insert_handle: {host_origins:?}"
+        );
+    }
+
+    /// A held child's store is read once per hold: after the first lookup
+    /// read it, a damaged store changes no answer, for the session its
+    /// roster names or for any other. (A read that fails is not kept: see
+    /// `an_incomplete_lookup_refuses_the_create_and_names_the_blocking_mob`,
+    /// whose first read happens after the damage.)
+    #[tokio::test]
+    async fn a_held_childs_store_is_read_once_per_hold() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, child, owner, worker_session) = seat_child_worker_then_exit(
+            &Arc::new(MockSessionSvc::new()),
+            root.path(),
+            "held-read-once",
+        )
+        .await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let restored = restored_state(&svc, root.path());
+        assert_eq!(restored.held_child_mobs().await.len(), 1);
+        let first = restored
+            .session_member_matches(&worker_session)
+            .await
+            .expect("the held child's roster is read");
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].mob_id, child);
+        assert_eq!(first[0].identity, AgentIdentity::from("worker-1"));
+
+        let held_path = restored
+            .held_child_mobs
+            .read()
+            .await
+            .get(&child)
+            .map(|held| held.storage_path.clone())
+            .expect("the child is held");
+        std::fs::write(&held_path, b"not a mob store").expect("damage the held store");
+        assert_eq!(
+            restored
+                .session_member_matches(&worker_session)
+                .await
+                .expect("the kept read answers"),
+            first
+        );
+        assert!(
+            restored
+                .session_member_matches(&SessionId::new())
+                .await
+                .expect("the kept read answers for any session")
+                .is_empty()
         );
     }
 

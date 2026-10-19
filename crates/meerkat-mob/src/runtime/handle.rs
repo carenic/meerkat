@@ -8299,7 +8299,10 @@ impl MobHandle {
 
     /// Who created this mob ([`crate::MobProvenance`]): the fact its create
     /// recorded with its first event, read from its store. It never changes;
-    /// a mob created before 0.9.4 reads `Unrecorded`.
+    /// a mob created before 0.9.4 reads `Unrecorded`. A handle kept past its
+    /// mob's destroy, over a store a later create reused, never reads the
+    /// later mob's record: it is [`MobError::IncarnationDestroyed`] for this
+    /// handle's incarnation.
     pub async fn provenance(&self) -> Result<crate::MobProvenance, MobError> {
         let record = self.events.creation_record().await?.ok_or_else(|| {
             MobError::Internal(format!(
@@ -8307,6 +8310,12 @@ impl MobHandle {
                 self.definition.id
             ))
         })?;
+        if record.incarnation != self.incarnation {
+            return Err(MobError::IncarnationDestroyed {
+                mob_id: self.definition.id.clone(),
+                incarnation: self.incarnation,
+            });
+        }
         Ok(record.provenance()?)
     }
 
@@ -13792,6 +13801,12 @@ impl MobHandle {
     /// retargeted to today's session, or resubmitted. The work reference is
     /// derived from the delivery's stable idempotency key.
     ///
+    /// A scope captured at another incarnation of this mob (one destroyed and
+    /// created again under the same id) is refused first, before any other
+    /// check, as the typed [`MobError::IncarnationMismatch`] and never as
+    /// [`MobError::StaleDeliveryScope`]: re-capturing would address the new
+    /// mob's member. Nothing is admitted.
+    ///
     /// The receipt proves [`WorkAdmissionStage::IngressAccepted`] and names
     /// the admitted session; it is not a durable runtime-input claim. Recover
     /// a lost reply with [`Self::recover_bounded_work_at_scope`] and the same
@@ -13804,6 +13819,7 @@ impl MobHandle {
         delivery_identity: crate::store::MobDeliveryIdentity,
         deadline: Instant,
     ) -> Result<WorkDeliveryReceipt, MobError> {
+        self.require_scope_incarnation(scope).await?;
         delivery_identity.validate()?;
         let runtime_id = scope.runtime_id().clone();
         let work_ref = WorkRef::for_delivery(

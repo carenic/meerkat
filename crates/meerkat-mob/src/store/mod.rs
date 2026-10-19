@@ -271,7 +271,10 @@ pub(crate) mod private {
         /// The one assignment for a mob created before creation records
         /// existed: record `incarnation` for `mob_id` as migrated, with an
         /// `Unrecorded` provenance, unless the store already holds a record,
-        /// and answer the record the store then holds.
+        /// and answer the record the store then holds. Every store refuses
+        /// the assignment with [`MobStoreError::Internal`] when it holds no
+        /// record and no event of `mob_id`; resume calls it only after it
+        /// read the mob's `MobCreated`.
         async fn assign_legacy_incarnation(
             &self,
             mob_id: &MobId,
@@ -682,11 +685,10 @@ pub(crate) fn assign_legacy_incarnation_in_memory(
     if let Some(record) = creation.as_ref() {
         return Ok(record.clone());
     }
-    if !events.iter().any(|event| {
-        &event.mob_id == mob_id && matches!(event.kind, MobEventKind::MobCreated { .. })
-    }) {
+    // The same precondition as every other store (see the trait method).
+    if !events.iter().any(|event| &event.mob_id == mob_id) {
         return Err(MobStoreError::Internal(format!(
-            "the store holds no MobCreated of mob '{mob_id}' to assign an incarnation to"
+            "the store holds no events of mob '{mob_id}' to assign an incarnation to"
         )));
     }
     let record = MobCreationRecord {

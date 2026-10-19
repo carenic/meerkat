@@ -384,6 +384,35 @@ impl MobStorage {
             .map(|entry| (entry.agent_identity.clone(), entry.generation)))
     }
 
+    /// Every member of this store's roster that has a bridge session, keyed
+    /// by that session: for each session, the identity and generation
+    /// [`Self::stored_member_of_session`] answers for it. One read of the
+    /// stored events, without building a runtime, so a caller that looks up
+    /// many sessions in one store reads it once.
+    pub async fn stored_members_by_session(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<
+            meerkat_core::SessionId,
+            (crate::AgentIdentity, crate::Generation),
+        >,
+        MobError,
+    > {
+        let events = self.events.replay_all().await?;
+        let roster = crate::roster::Roster::project(&events);
+        let mut members = std::collections::BTreeMap::new();
+        for entry in roster.list_all() {
+            if let Some(session_id) = entry.member_ref.bridge_session_id() {
+                // The first entry naming a session answers for it, as
+                // `Roster::find_by_bridge_session_id` does.
+                members
+                    .entry(session_id.clone())
+                    .or_insert_with(|| (entry.agent_identity.clone(), entry.generation));
+            }
+        }
+        Ok(members)
+    }
+
     /// Read the canonical definition together with its sealed resume precondition.
     pub async fn created_definition_snapshot(
         &self,

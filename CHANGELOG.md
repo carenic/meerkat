@@ -43,9 +43,13 @@ them.
   mob whose incarnation was assigned to a store from before 0.9.4 honours
   it. `MobHandle::require_scope_incarnation` refuses a scope from another
   incarnation of the mob with the new `MobError::IncarnationMismatch`
-  (appended last), and `MobHandle::recover_bounded_work_at_scope` answers
-  such a scope with the new `ScopedRecoveryUnresolved::IncarnationNotHosted`
-  without reading any session. Consumers that persist scopes keep their
+  (appended last), and so does the scoped submit
+  `MobHandle::submit_work_with_mode_and_delivery_identity_bounded`, first and
+  with nothing admitted, where such a scope reached the session check and
+  failed as `MobError::StaleDeliveryScope`.
+  `MobHandle::recover_bounded_work_at_scope` answers such a scope with the
+  new `ScopedRecoveryUnresolved::IncarnationNotHosted` without reading any
+  session. Consumers that persist scopes keep their
   version-1 scopes; a 0.9.3 build refuses a version-2 scope as an
   unsupported version.
 - `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
@@ -177,7 +181,9 @@ them.
   `meerkat_mob::MobStoreError` gains `IncarnationInconsistent`, all appended
   last. Exhaustive matches must add the arms. The kind of an
   `IncarnationInconsistent` is the new `meerkat_mob::IncarnationInconsistency`
-  (see Added).
+  (see Added). `MobError::failure_class` classifies `IncarnationDestroyed`
+  and `IncarnationMismatch` as `TargetMissing`, `IncarnationInconsistent` as
+  `Internal` and `ProvenanceUnavailable` as `RuntimeRejected`.
 - Behaviour-only (not measured by the gate): a mob keeps its
   `meerkat_core::service::MobIncarnationId` across resume. Its create mints
   it once and stores it with the mob's `MobCreated`, and every resume reads
@@ -210,7 +216,10 @@ them.
   inserting handles declares the set restored with `declare_mob_set_restored`),
   when a host inserts a handle while the lookup runs, or naming a held child
   mob whose stored roster or creation record cannot be read. Nothing is
-  created. A create with no caller session is not affected.
+  created. A create with no caller session is not affected. The lookup reads
+  the rosters of the mobs hosted when it runs: a host inserts a mob's handle
+  before its members can run turns, because a member of a mob not inserted
+  yet is in no hosted roster and its session's create records `Session`.
 
 ### Added
 
@@ -301,7 +310,8 @@ them.
 - `meerkat_mob::MobHandle::member_of_session` and
   `meerkat_mob::MobStorage::stored_member_of_session`: the member whose
   bridge session is a given session, in a running mob's roster or a stored
-  one.
+  one. `meerkat_mob::MobStorage::stored_members_by_session` reads every such
+  member of a stored roster at once, by session.
 - `meerkat_mob_mcp::MobMcpState::session_member_matches` (with
   `meerkat_mob_mcp::SessionMemberMatch`): every hosted roster, managed or
   held, that names a session, read as one complete lookup.

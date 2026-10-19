@@ -479,17 +479,6 @@ impl MobHandle {
     }
 }
 
-/// Whether this mob's durable member history bound `scope`'s session to
-/// `scope`'s member incarnation and fence at any point.
-///
-/// These are the events the owner rebuilds its member bindings from on
-/// restart: a spawn binds a session to an incarnation and its fence, a reset
-/// carries the session to the successor incarnation and its new fence, and a
-/// recovered binding moves the current incarnation to another session under
-/// the same fence. Nothing removes a binding from the history, so a genuine
-/// scope stays provable after a rotation, a retirement, an unregistration or
-/// a restart.
-#[cfg(feature = "runtime-adapter")]
 /// Whether a scope captured at `scope` belongs to the incarnation this mob
 /// runs at: the same incarnation, or a version-1 scope at a migrated one.
 fn scope_incarnation_hosted(
@@ -503,6 +492,17 @@ fn scope_incarnation_hosted(
     }
 }
 
+/// Whether this mob's durable member history bound `scope`'s session to
+/// `scope`'s member incarnation and fence at any point.
+///
+/// These are the events the owner rebuilds its member bindings from on
+/// restart: a spawn binds a session to an incarnation and its fence, a reset
+/// carries the session to the successor incarnation and its new fence, and a
+/// recovered binding moves the current incarnation to another session under
+/// the same fence. Nothing removes a binding from the history, so a genuine
+/// scope stays provable after a rotation, a retirement, an unregistration or
+/// a restart.
+#[cfg(feature = "runtime-adapter")]
 fn history_binds_scope(
     history: &[crate::event::MobEvent],
     mob_id: &crate::ids::MobId,

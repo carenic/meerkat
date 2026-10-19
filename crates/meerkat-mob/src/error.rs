@@ -2043,7 +2043,12 @@ impl MobError {
             | Self::MemberSessionNotLive { .. }
             | Self::FlowNotFound(_)
             | Self::RunNotFound(_)
-            | Self::WorkNotFound(_) => MobFailureClass::TargetMissing,
+            | Self::WorkNotFound(_)
+            // The addressed incarnation is over for good: a finished destroy,
+            // or a scope captured at an incarnation this mob does not run at
+            // (a live handle's `current` is final).
+            | Self::IncarnationDestroyed { .. }
+            | Self::IncarnationMismatch { .. } => MobFailureClass::TargetMissing,
             Self::SessionUnavailableForResume { reason, .. } => match reason {
                 SessionResumeUnavailableReason::Absent => MobFailureClass::TargetMissing,
                 SessionResumeUnavailableReason::ArchivedNotRevivable => {
@@ -2083,9 +2088,10 @@ impl MobError {
             | Self::FlowTurnTimedOut => MobFailureClass::Transport,
             Self::Internal(_)
             | Self::WorkInputCompletionUnavailable { .. }
-            | Self::ExternalMemberCleanupUncertain { .. } => {
-                MobFailureClass::Internal
-            }
+            | Self::ExternalMemberCleanupUncertain { .. }
+            // The store disagrees with itself, as
+            // `ContradictoryDurableAuthority` above.
+            | Self::IncarnationInconsistent { .. } => MobFailureClass::Internal,
             Self::CallbackPending { .. }
             | Self::CallbackBatchPending { .. }
             | Self::RetirementInProgress { .. }
@@ -2108,7 +2114,11 @@ impl MobError {
             | Self::DirectMemberAdoptionPending { .. }
             | Self::WorkInputIdempotencyConflict { .. }
             | Self::MemberInputRefused { .. }
-            | Self::RuntimeEffectRefused { .. } => MobFailureClass::RuntimeRejected,
+            | Self::RuntimeEffectRefused { .. }
+            // An explicit action closes it (declare the restored mob set, or
+            // destroy or repair the named held child), the same shape as
+            // `MemberReloadRequired`.
+            | Self::ProvenanceUnavailable { .. } => MobFailureClass::RuntimeRejected,
             _ => MobFailureClass::MobRejected,
         }
     }
@@ -2655,6 +2665,21 @@ mod tests {
             MobError::FlowNotFound(FlowId::from("f")),
             MobError::RunNotFound(RunId::new()),
             MobError::WorkNotFound(WorkRef::new()),
+            MobError::IncarnationDestroyed {
+                mob_id: MobId::from("mob"),
+                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+            },
+            MobError::IncarnationMismatch {
+                mob_id: MobId::from("mob"),
+                expected: Some(meerkat_core::service::MobIncarnationId::mint()),
+                current: Some(meerkat_core::service::MobIncarnationId::mint()),
+            },
+            // A version-1 scope at an incarnation that does not honour it.
+            MobError::IncarnationMismatch {
+                mob_id: MobId::from("mob"),
+                expected: None,
+                current: Some(meerkat_core::service::MobIncarnationId::mint()),
+            },
         ];
         for err in &missing {
             assert_eq!(
@@ -2713,6 +2738,23 @@ mod tests {
             (
                 MobError::Internal("i".to_string()),
                 MobFailureClass::Internal,
+            ),
+            (
+                MobError::IncarnationInconsistent {
+                    mob_id: MobId::from("mob"),
+                    inconsistency: IncarnationInconsistency::RecordWithoutCreation,
+                },
+                MobFailureClass::Internal,
+            ),
+            (
+                MobError::ProvenanceUnavailable {
+                    mob_id: Some(MobId::from("mob")),
+                },
+                MobFailureClass::RuntimeRejected,
+            ),
+            (
+                MobError::ProvenanceUnavailable { mob_id: None },
+                MobFailureClass::RuntimeRejected,
             ),
             // A variant outside every explicit arm falls through to the
             // mob-rejected default.
