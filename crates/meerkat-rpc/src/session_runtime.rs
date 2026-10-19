@@ -6735,6 +6735,20 @@ impl SessionRuntime {
             .await
     }
 
+    /// Hold the session's turn boundary for one live channel's projections
+    /// (#1821); see
+    /// `PersistentSessionService::hold_live_channel_projection_boundary`.
+    #[doc(hidden)]
+    pub async fn hold_live_channel_projection_boundary(
+        &self,
+        session_id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) -> Result<meerkat_session::LiveChannelProjectionBoundaryHold, SessionError> {
+        self.service
+            .hold_live_channel_projection_boundary(session_id, channel_id)
+            .await
+    }
+
     /// Admit an assistant playback target only from the generated foreground
     /// user interaction already sealed by provider TurnStarted authority.
     #[allow(clippy::too_many_arguments)]

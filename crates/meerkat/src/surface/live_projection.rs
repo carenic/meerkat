@@ -960,6 +960,18 @@ impl<B: SessionAgentBuilder + 'static> LiveProjectionSink for ServiceLiveProject
             .await
             .map_err(|err| session_error_to_projection(err, session_id))
     }
+
+    async fn hold_channel_projection_boundary(
+        &self,
+        session_id: &SessionId,
+        channel_id: &LiveChannelId,
+    ) -> Result<Option<meerkat_live::LiveProjectionBoundaryHold>, LiveProjectionError> {
+        self.service
+            .hold_live_channel_projection_boundary(session_id, channel_id)
+            .await
+            .map(|hold| Some(meerkat_live::LiveProjectionBoundaryHold::new(hold)))
+            .map_err(|err| session_error_to_projection(err, session_id))
+    }
 }
 
 #[cfg(all(test, feature = "memory-store"))]
