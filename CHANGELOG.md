@@ -241,9 +241,11 @@ them.
   serialized form when absent, so recorded frames keep their bytes.
 - `meerkat-core`: `AgentError::ContentFiltered` gains the fields
   `stop: ContentFilteredStop` (`refusal` or `content_filter`, the refusing stop
-  the provider ended on) and `detail: Option<Box<ProviderStopDetail>>`.
+  the provider ended on) and `detail: Option<Box<ProviderStopDetail>>`. A
+  pattern that names `turn` without `..` needs the new fields.
 - `meerkat-core`: `AgentErrorReason` gains the variant
-  `ContentFiltered { stop, detail }`, appended last. Wire change: every
+  `ContentFiltered { stop, detail }`, appended last. The enum is exhaustive,
+  so a `match` on it needs the new arm. Wire change: every
   content-filtered run failure now carries it, so `error_report.reason` of a
   `run_failed` event with class `content_filtered` goes from `null` to
   `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` (`detail`

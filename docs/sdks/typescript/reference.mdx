@@ -739,9 +739,9 @@ interface ToolConfigChangedPayload {
   status_info?: ToolConfigChangeStatus;
   // A settled lifecycle fact (not pending or draining), derived from
   // status_info the way rkat-rpc derives it. Not a configuration write: that
-  // is the `persisted` of the mcp/add and mcp/remove responses. Payloads
-  // stored by rkat-rpc 0.9.3 and earlier are served back with their stored
-  // `persisted` bit; the parser derives the fact for them too.
+  // is the `persisted` of the mcp/add, mcp/remove and mcp/reload responses.
+  // Payloads stored by rkat-rpc 0.9.3 and earlier are served back with their
+  // stored `persisted` bit; the parser derives the fact for them too.
   settled?: boolean;
   applied_at_turn?: number;
 }
