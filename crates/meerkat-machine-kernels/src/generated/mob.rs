@@ -6539,6 +6539,8 @@ pub struct State {
     pub runtime_fence_tokens: std::collections::BTreeMap<AgentRuntimeId, FenceToken>,
     pub identity_runtime_generations: std::collections::BTreeMap<AgentIdentity, Generation>,
     pub identity_runtime_fence_tokens: std::collections::BTreeMap<AgentIdentity, FenceToken>,
+    pub identity_generation_highwater: std::collections::BTreeMap<AgentIdentity, Generation>,
+    pub identity_generation_highwater_sealed: bool,
     pub active_run_count: u64,
     pub flow_authority_schema_version: u64,
     pub run_status: std::collections::BTreeMap<RunId, FlowRunStatus>,
@@ -9421,6 +9423,13 @@ pub mod signals {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CreateRun {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverIdentityGenerationHighwater {
+        pub agent_identity: AgentIdentity,
+        pub generation: Generation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SealIdentityGenerationHighwater {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveMemberRevivalHostRefused {
         pub agent_identity: AgentIdentity,
         pub refusal_code: String,
@@ -9512,6 +9521,8 @@ pub enum Signal {
     OperationPeerTrusted(signals::OperationPeerTrusted),
     PeerInputAdmitted(signals::PeerInputAdmitted),
     CreateRun(signals::CreateRun),
+    RecoverIdentityGenerationHighwater(signals::RecoverIdentityGenerationHighwater),
+    SealIdentityGenerationHighwater(signals::SealIdentityGenerationHighwater),
     ResolveMemberRevivalHostRefused(signals::ResolveMemberRevivalHostRefused),
     RecoverMemberRestoreHostRefused(signals::RecoverMemberRestoreHostRefused),
 }
@@ -9622,6 +9633,10 @@ impl Signal {
             Self::OperationPeerTrusted(_) => SignalKind::OperationPeerTrusted,
             Self::PeerInputAdmitted(_) => SignalKind::PeerInputAdmitted,
             Self::CreateRun(_) => SignalKind::CreateRun,
+            Self::RecoverIdentityGenerationHighwater(_) => {
+                SignalKind::RecoverIdentityGenerationHighwater
+            }
+            Self::SealIdentityGenerationHighwater(_) => SignalKind::SealIdentityGenerationHighwater,
             Self::ResolveMemberRevivalHostRefused(_) => SignalKind::ResolveMemberRevivalHostRefused,
             Self::RecoverMemberRestoreHostRefused(_) => SignalKind::RecoverMemberRestoreHostRefused,
         }
@@ -9703,6 +9718,8 @@ pub enum SignalKind {
     OperationPeerTrusted,
     PeerInputAdmitted,
     CreateRun,
+    RecoverIdentityGenerationHighwater,
+    SealIdentityGenerationHighwater,
     ResolveMemberRevivalHostRefused,
     RecoverMemberRestoreHostRefused,
 }
@@ -12420,6 +12437,14 @@ pub enum TransitionId {
     RecordLoopUntilConditionFailedCompleted,
     RecordLoopUntilConditionMetStopped,
     RecordLoopUntilConditionMetCompleted,
+    RecoverIdentityGenerationHighwaterRunning,
+    RecoverIdentityGenerationHighwaterStopped,
+    RecoverIdentityGenerationHighwaterCompleted,
+    RecoverIdentityGenerationHighwaterDestroyed,
+    SealIdentityGenerationHighwaterRunning,
+    SealIdentityGenerationHighwaterStopped,
+    SealIdentityGenerationHighwaterCompleted,
+    SealIdentityGenerationHighwaterDestroyed,
     ResolveMemberRevivalHostRefusedRunning,
     RecoverMemberRestoreHostRefusedRunning,
 }
@@ -12503,6 +12528,8 @@ pub fn initial_state() -> State {
         runtime_fence_tokens: Default::default(),
         identity_runtime_generations: Default::default(),
         identity_runtime_fence_tokens: Default::default(),
+        identity_generation_highwater: Default::default(),
+        identity_generation_highwater_sealed: false,
         active_run_count: 0,
         flow_authority_schema_version: 7,
         run_status: Default::default(),

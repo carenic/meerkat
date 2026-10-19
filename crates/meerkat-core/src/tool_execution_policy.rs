@@ -712,11 +712,17 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         } else {
             context
         };
-        let current_context = match base.observe_tool_entry_at(
-            call,
-            None,
-            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
-        ) {
+        // Staged again after this gate's own awaits: an owner change in
+        // progress meanwhile is waited out within the dispatch attempt's own
+        // bounds, as at the root staging.
+        let current_context = match base
+            .observe_tool_entry_after_owner_change_at(
+                call,
+                None,
+                crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+            )
+            .await
+        {
             Ok(current) => current,
             Err(error) => {
                 return custody
@@ -777,11 +783,17 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         } else {
             context
         };
-        let current_context = match base.observe_tool_entry_at(
-            call,
-            Some(plan),
-            crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
-        ) {
+        // Staged again after this gate's own awaits: an owner change in
+        // progress meanwhile is waited out within the dispatch attempt's own
+        // bounds, as at the root staging.
+        let current_context = match base
+            .observe_tool_entry_after_owner_change_at(
+                call,
+                Some(plan),
+                crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+            )
+            .await
+        {
             Ok(current) => current,
             Err(error) => {
                 return custody
@@ -2209,6 +2221,8 @@ pub(crate) mod tests {
 
     struct FixedConsequenceSnapshot {
         verdict: ToolConsequenceVerdict,
+        /// Runs at each evaluation, before the verdict.
+        on_evaluate: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl ToolConsequencePolicySnapshot for FixedConsequenceSnapshot {
@@ -2220,6 +2234,9 @@ pub(crate) mod tests {
         }
 
         fn evaluate(&self, _request: &ToolConsequenceRequest) -> ToolConsequenceVerdict {
+            if let Some(on_evaluate) = &self.on_evaluate {
+                on_evaluate();
+            }
             self.verdict.clone()
         }
     }
@@ -2250,12 +2267,39 @@ pub(crate) mod tests {
         verdict: ToolConsequenceVerdict,
         deadline: std::time::Duration,
     ) -> BoundToolConsequencePolicy {
+        bound_fixed_consequence_policy(
+            FixedConsequenceSnapshot {
+                verdict,
+                on_evaluate: None,
+            },
+            deadline,
+        )
+    }
+
+    /// An allowing consequence policy that runs `on_evaluate` at each
+    /// evaluation (on the policy's own worker thread).
+    pub(crate) fn allowing_consequence_policy_running(
+        on_evaluate: impl Fn() + Send + Sync + 'static,
+    ) -> BoundToolConsequencePolicy {
+        bound_fixed_consequence_policy(
+            FixedConsequenceSnapshot {
+                verdict: ToolConsequenceVerdict::Allow,
+                on_evaluate: Some(Box::new(on_evaluate)),
+            },
+            std::time::Duration::from_secs(5),
+        )
+    }
+
+    fn bound_fixed_consequence_policy(
+        snapshot: FixedConsequenceSnapshot,
+        deadline: std::time::Duration,
+    ) -> BoundToolConsequencePolicy {
         let provider_id = PolicyProviderId::new("test-provider").expect("provider id");
         let policy_id = PolicyId::new("test-policy").expect("policy id");
         let provider: Arc<dyn ToolConsequenceNarrowingPolicy> =
             Arc::new(FixedConsequenceProvider {
                 provider_id: provider_id.clone(),
-                snapshot: Arc::new(FixedConsequenceSnapshot { verdict }),
+                snapshot: Arc::new(snapshot),
             });
         let registry = Arc::new(
             ToolConsequencePolicyRegistry::new(

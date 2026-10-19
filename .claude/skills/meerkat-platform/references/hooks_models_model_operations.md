@@ -357,7 +357,7 @@ Switching the model yourself:
 | CLI | `rkat run --resume <ID> -m <MODEL> [-p <PROVIDER>] [--params-json <JSON>]` |
 | SDKs | Python `Session.turn(..., model=, provider=, provider_params=)`; TypeScript `turn(prompt, {model, provider, providerParams})` |
 | Agent | builtin `brain_swap` tool; `target_model` is an enum of the reachable models. The switch is permanent: the current run stays on its model, and if the run finishes cleanly the request is saved with the session and applied before the next input, also after a restart. Offered only when more than one model is reachable |
-| Rust | `Agent::replace_client`; `SessionService::hot_swap_session_llm_identity` (the trait default returns `SessionError::Unsupported`) |
+| Rust | `Agent::hot_swap_llm_identity`; `SessionService::hot_swap_session_llm_identity` (the trait default returns `SessionError::Unsupported`). `Agent::replace_client` and `SessionService::set_session_client` keep the model: a client for another provider or model is refused with `AgentError::ClientModelChangeRequiresHotSwap` |
 
 Rules for `turn/start`: `model` alone takes the provider that owns it in the
 catalog (an uncatalogued model keeps the current provider); `provider`

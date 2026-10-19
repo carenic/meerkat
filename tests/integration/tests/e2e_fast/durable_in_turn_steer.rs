@@ -173,9 +173,7 @@ fn text_events(model: &str, text: &str) -> Vec<LlmEvent> {
         },
         usage(model),
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         },
     ]
 }
@@ -190,9 +188,7 @@ fn tool_events(model: &str, id: &str, name: &str) -> Vec<LlmEvent> {
         },
         usage(model),
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::ToolUse,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
         },
     ]
 }

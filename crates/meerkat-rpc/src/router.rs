@@ -5650,9 +5650,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -5764,9 +5762,9 @@ mod tests {
                         )),
                         2 => Some((
                             Ok(meerkat_client::LlmEvent::Done {
-                                outcome: meerkat_client::LlmDoneOutcome::Success {
-                                    stop_reason: StopReason::EndTurn,
-                                },
+                                outcome: meerkat_client::LlmDoneOutcome::success(
+                                    StopReason::EndTurn,
+                                ),
                             }),
                             3,
                         )),
@@ -13411,9 +13409,7 @@ mod tests {
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -13528,9 +13524,9 @@ mod tests {
                         1 => Some((Ok(meerkat_client::LlmEvent::UsageUpdate { usage }), 2)),
                         2 => Some((
                             Ok(meerkat_client::LlmEvent::Done {
-                                outcome: meerkat_client::LlmDoneOutcome::Success {
-                                    stop_reason: StopReason::EndTurn,
-                                },
+                                outcome: meerkat_client::LlmDoneOutcome::success(
+                                    StopReason::EndTurn,
+                                ),
                             }),
                             3,
                         )),
@@ -13813,9 +13809,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                     ),
                 }),
                 Ok(meerkat_client::LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }

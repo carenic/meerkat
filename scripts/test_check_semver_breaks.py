@@ -328,6 +328,11 @@ Failed in:
                 "variant AgentEvent::Idle in crates/meerkat-core/src/event.rs:40",
                 ("AgentEvent", "Idle"),
             ),
+            "enum_variant_marked_non_exhaustive": (
+                "variant MemberShutdownOutcome:UnregisterPending in "
+                "crates/meerkat-mob/src/runtime/retirement_settlement.rs:257",
+                ("MemberShutdownOutcome", "UnregisterPending"),
+            ),
             "trait_missing": (
                 "trait meerkat_core::SessionStore, previously in file "
                 "crates/meerkat-core/src/session_store.rs:1315",
@@ -361,6 +366,11 @@ Failed in:
                 "method runtime_adapter of trait MobSessionService, previously in file "
                 "crates/meerkat-mob/src/runtime/session_service.rs:1433",
                 ("MobSessionService", "runtime_adapter"),
+            ),
+            "trait_method_default_impl_removed": (
+                "trait method meerkat_core::compact::Compactor::prepare_for_summarization "
+                "in file crates/meerkat-core/src/compact.rs:515",
+                ("Compactor", "prepare_for_summarization"),
             ),
             "enum_discriminants_undefined_non_unit_variant": (
                 "enum DslRejectionKind in crates/meerkat-core/src/handles.rs:756",
@@ -419,6 +429,35 @@ Failed in:
         self.assertEqual(len(errors), 1)
         self.assertIn("missing: `DslRejectionKind`", errors[0])
         declared = "`TokenStoreError` is `#[non_exhaustive]`; `DslRejectionKind` gains a tuple variant."
+        self.assertEqual(gate.check_named(parsed, section(declared)), [])
+
+    def test_variant_marked_non_exhaustive_requires_the_variant(self) -> None:
+        # The v0.50.0 template names the enum and the variant with one colon,
+        # as enum_variant_added does; read off a 0.9.4 branch report.
+        report = """\
+    Checking meerkat-llm-core v0.9.3 -> v0.9.3 (assume patch change)
+--- failure enum_variant_marked_non_exhaustive: enum variant marked #[non_exhaustive] ---
+Failed in:
+  variant LlmDoneOutcome:Success in crates/meerkat-llm-core/src/types.rs:719
+     Summary semver requires new major version: 1 major and 0 minor checks failed
+    Finished [   0.100s] meerkat-llm-core
+"""
+        parsed = gate.parse_report(report)
+        self.assertEqual(
+            [(f.lint_id, f.symbols, f.structural) for f in parsed.findings],
+            [("enum_variant_marked_non_exhaustive", ("LlmDoneOutcome", "Success"), True)],
+        )
+        self.assertEqual(gate.check_recognized(parsed), [])
+
+        def section(body: str) -> "gate.Section":
+            return gate.Section(
+                "## [9.9.9] - 2026-01-01", "9.9.9", " - 2026-01-01", f"\n### Breaking\n\n- {body}\n"
+            )
+
+        errors = gate.check_named(parsed, section("`LlmDoneOutcome` gains a field."))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing: `Success`", errors[0])
+        declared = "`LlmDoneOutcome::Success` is `#[non_exhaustive]`."
         self.assertEqual(gate.check_named(parsed, section(declared)), [])
 
     def test_unrecognized_shape_fails_closed_naming_the_lint(self) -> None:

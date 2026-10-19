@@ -149,6 +149,13 @@ pub(crate) struct MemberLifecycleObservations {
     #[cfg(test)]
     pub(crate) parked_member_controls:
         crate::tokio::sync::watch::Sender<BTreeMap<AgentIdentity, u64>>,
+    /// Test probe: how many member-work starts a parked Shutdown refused.
+    #[cfg(test)]
+    pub(crate) parked_shutdown_member_work_refusals: crate::tokio::sync::watch::Sender<u64>,
+    /// Test probe: how many SubmitWork commands the submit-work pump handed
+    /// back to the actor loop for dispatch.
+    #[cfg(test)]
+    pub(crate) submit_work_pump_dispatches: crate::tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Debug)]

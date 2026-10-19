@@ -52,8 +52,9 @@ fn isolated_credential(mut prompt: Input) -> Input {
 }
 
 /// The source owner's custody of the originals it authenticated, by work,
-/// and its operational dispositions: a cancellation (with its evidence) or
-/// an unobservable disposition, by work.
+/// its operational dispositions (a cancellation with its evidence, or an
+/// unobservable disposition), and the held originals whose admission it has
+/// not settled yet, by work.
 #[derive(Default)]
 struct Custody(
     Mutex<HashMap<EvidenceId, AuthenticatedOriginal>>,
@@ -63,6 +64,7 @@ struct Custody(
             Option<meerkat_authorization_contracts::evidence::HistoricalEvidenceRef>,
         >,
     >,
+    Mutex<std::collections::HashSet<EvidenceId>>,
 );
 impl AuthenticatedOriginalSource for Custody {
     fn authenticated_original(
@@ -77,18 +79,23 @@ impl AuthenticatedOriginalSource for Custody {
         Ok(self.0.lock().expect("fixture").get(&original.work).cloned())
     }
 
-    fn retained_original(
+    fn retained_custody(
         &self,
         _namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
-    ) -> Result<Option<WorkAuthorityBasis>, meerkat_core::authorization::ControllerReadinessFailure>
-    {
-        Ok(self
-            .0
-            .lock()
-            .expect("fixture")
-            .get(&original.work)
-            .map(|custody| custody.authority_basis.clone()))
+    ) -> Result<
+        crate::meerkat_machine::RetainedCustody,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        if self.2.lock().expect("fixture").contains(&original.work) {
+            return Ok(crate::meerkat_machine::RetainedCustody::AdmissionPending);
+        }
+        Ok(self.0.lock().expect("fixture").get(&original.work).map_or(
+            crate::meerkat_machine::RetainedCustody::NotRetained,
+            |custody| {
+                crate::meerkat_machine::RetainedCustody::Retained(custody.authority_basis.clone())
+            },
+        ))
     }
 
     fn original_disposition(
@@ -579,6 +586,43 @@ async fn named_contributor(case: NamedContributor) {
                     "cleanup never revokes a contributor's grant in use"
                 );
             }
+            // RED-7 (R7): while B's admission is pending its owner may still
+            // promote it, so the answer is unavailable, never "unreferenced".
+            custody.2.lock().expect("fixture").insert(b_work.clone());
+            {
+                let native = machine
+                    .try_controller_grant_mutation()
+                    .expect("native custody");
+                assert_eq!(
+                    native.unfinished_work_references_grant(&b_grant, custody.as_ref()),
+                    Err(
+                        meerkat_authorization_contracts::grant_mutation::ControllerCustodyRefusal::Unavailable
+                    ),
+                    "a pending contributor fails closed"
+                );
+            }
+            // CONTROL-cancelled (R7): cancelled while pending, B can no
+            // longer authorize A's work.
+            let cancellation = custody.0.lock().expect("fixture")[&b_work]
+                .root_event
+                .clone();
+            custody
+                .1
+                .lock()
+                .expect("fixture")
+                .insert(b_work.clone(), Some(cancellation));
+            {
+                let native = machine
+                    .try_controller_grant_mutation()
+                    .expect("native custody");
+                assert_eq!(
+                    native.unfinished_work_references_grant(&b_grant, custody.as_ref()),
+                    Ok(false),
+                    "a cancellation wins over a pending admission"
+                );
+            }
+            custody.1.lock().expect("fixture").remove(&b_work);
+            custody.2.lock().expect("fixture").remove(&b_work);
             // Once the source owner no longer holds B, nothing of A can
             // resolve B's grant any more.
             custody.0.lock().expect("fixture").remove(&b_work);

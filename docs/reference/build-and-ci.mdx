@@ -209,8 +209,10 @@ enforces 1080 s of lane execution and a 1200 s push-to-terminal ceiling on
 it, runner queue excluded; the push runs every lane.
 Compiled
 objects are cached by sccache (a release pinned by sha256, content-addressed
-and shared by every lane; push and schedule runs set the client to write it,
-every other run, a pull request included, to only read it, a client-side
+and shared by every lane; push and schedule runs, and a dispatch on a
+release branch (`rel/**` or `release/**`, so it warms the bucket for that
+tree's pull request and main push), set the client to write it, every other
+run, a pull request included, to only read it, a client-side
 setting, see [Known limits](#known-limits));
 rust-cache holds only the
 registry, because per-lane target caches exceeded the repository's 10 GB
@@ -238,7 +240,7 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `governed-jsonl`, `mcp-confinement-positive`: the non-MCP governed JSONL tests and the Linux positive confinement cases | when the pull request touches the lane's own inputs (`GUARD_LANE_INPUTS`: the files defining the selected cases and their crates' manifests), changes its definition between base and head (`GUARD_LANE_DEFINITIONS`: its ci.yml job without comments, the Makefile's confinement rule and assignments, the default nextest profile's selection, the selected modules' declarations) or has no diff, deferred otherwise | yes | - | - |
 | `wasm-check` | when the web runtime or a workspace crate it compiles (its dependency closure, the provider crates included) or the CLI web template changes, or the plan is the whole workspace | yes | browser contract suite | Bazel wasm-check |
 | `sdk-host`: Python + TypeScript SDK suites | deferred | yes | yes, plus Web SDK | Bazel SDK suites |
-| `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change | yes | - | - |
+| `example-web`: build the `sdks/web` wasm runtime once (wasm-pack 0.13.1, no wasm-opt), then run examples 031, 032 and 033 in Playwright Chromium | when `sdks/web/`, `crates/meerkat-web-runtime/`, `crates/meerkat-contracts/` or those examples change; when the change also reaches a crate the runtime builds on (or plans the workspace), only the Web SDK's `npm test`, and the wasm build and browser suites run on the push | yes | - | - |
 | dense Mob topology, feature matrices, minimal builds, audit, `e2e-system`, release packaging | - | - | yes | BuildBuddy `full-fresh` graph |
 | `gate` (`CI gate`): fail-closed aggregate; on pull requests a 1080-second lane execution budget and a 1200-second push-to-terminal runaway ceiling, both excluding runner queue, which is reported as a warning; it prints what the pull request left to the push and refuses a push plan that left anything; schema-4 attestation on `main` | yes | yes (no budget) | - | consumed by `require_ci_green` |
 
@@ -284,7 +286,11 @@ long row picked late set the wall time. The measurements are
 `scripts/ci-row-durations.json`, regenerated from green runs with
 `scripts/ci-row-durations.mjs --repository OWNER/REPO --output
 scripts/ci-row-durations.json RUN_ID...`; a stale entry only moves a row
-between waves. The `CI gate` counts a two-wave lane as run when every wave
+between waves. A row is keyed by its name without the member count of a
+packed row (`core+12` is `core`, `openai+8 bazel set` is `openai bazel set`),
+so a merge that moves line counts and repacks the rows keeps a row's
+measurement while the bin's heaviest member, which names it, stays the
+same. The `CI gate` counts a two-wave lane as run when every wave
 that holds rows succeeded. Other runs on the account (pull-request CI,
 nightly, dispatches) take runners from the same pool: keep them off while a
 release commit's main run is in progress.
@@ -325,8 +331,10 @@ pull request, `main` push and nightly, and a busy hour fills that cap. The
 gate writes a typed verdict (`within_budget`, `queue_delayed`,
 `exec_over_budget`, `runaway`) with the execution path, terminal and queue
 seconds to its step outputs and summary, and prints the lane table on every
-run that was not cancelled, including runs whose lanes failed and `main`
-pushes, where nothing is enforced and a failure to measure is only a warning.
+run that was not cancelled, including runs whose lanes failed, pushes and
+dispatches. The budget keeps pull-request feedback fast; a push or a
+dispatch is a full validation run, where nothing is enforced and a failure to
+measure is only a warning.
 
 Sizing: the owner's cap is 20 minutes from the start of the pre-push hook to
 a green `CI gate`, and the hook takes about a minute, so 1080 s (18 minutes)
@@ -366,6 +374,12 @@ and the confinement lane, and it fails when the classifier produced no lanes.
 `make ci-lanes-selftest` (`scripts/ci-cargo-lanes-selftest.mjs`) pins these
 properties with fixtures for a core touch, docs-only, `Cargo.lock`-only,
 machine-authority-only, an unmapped `.rs`, and a missing base.
+`scripts/ci-gate-consistency-selftest.mjs`, in the same target, runs the
+gate's own shell on the planner's plans for both events, a release
+projection and a dispatch, with every job's `if:` evaluated: the gate must
+pass when every lane the plan selected ran and passed, and fail when a lane
+that ran fails or is skipped instead (its allowlist names, with the reason,
+the lanes a dispatch's gate does not require).
 
 PR CI runs the directly changed packages, not their dependents: measured on
 a 4-vCPU runner, compiling the reverse-dependency closure of `meerkat-core`
@@ -387,11 +401,16 @@ graph.
 ### Known limits
 
 - The sccache read-only mode is a client-side setting. A run that only
-  reads the bucket (a pull request from this repository, a dispatch) still
+  reads the bucket (a pull request from this repository, a dispatch on any
+  other ref) still
   authenticates as the identity push runs write with: any of its steps can
   read the credentials file `SCCACHE_GCS_KEY_PATH` names. Only a separate
   read-only identity for those runs, an IAM change outside this
   repository, closes that.
+- The release-branch prefix that lets a dispatch write the bucket is no
+  authorization control either: any writer can create a `rel/**` branch and
+  dispatch it, as any writer can push to `release/**`. The write boundary is
+  repository write access.
 - The bearer token in that credentials file (`gha-creds-*.json`) is the
   job's Actions runtime token: the runner sets
   `ACTIONS_ID_TOKEN_REQUEST_TOKEN` to the same token. No step exports the

@@ -16,7 +16,10 @@
 //! with owners and admitted work present, by design) and an acquisition after
 //! any close is refused. Closing never stops
 //! admitted work: the ordinary Stop, Shutdown and Destroy remain the teardown
-//! path.
+//! path. An admitted Shutdown closes admission itself, before its teardown;
+//! so do an admitted Destroy, a durability fail-stop and a dispatch failure
+//! that stops the actor, and a lost actor task closes it from its spawn
+//! wrapper, so no actor exit leaves admission open. A Stop leaves it open.
 
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +35,23 @@ pub enum MobAdmissionCloseReason {
     LastOwnerReleased,
     /// The embedder closed admission unconditionally to stand the mob down.
     StandDown,
+    /// The mob admitted a Shutdown: [`MobHandle::shutdown`](super::MobHandle::shutdown)
+    /// closes admission before its teardown, and the actor accepts no more
+    /// commands once the Shutdown completes.
+    Shutdown,
+    /// The mob's destroy was admitted (its durable destroy marker is
+    /// written): the actor exits once the destroy completes.
+    Destroyed,
+    /// The actor fail-stopped for a cold recovery and takes no further
+    /// command: a durable mutation's outcome stayed uncertain, or its durable
+    /// recovery failed before it admitted a command.
+    DurabilityFailStop,
+    /// The actor task ended without its loop returning (a panic or an
+    /// abort), so the mob takes no further command.
+    ActorLost,
+    /// A structural composition dispatch failure at a loop boundary stopped
+    /// the actor, so the mob takes no further command.
+    DispatchFailed,
 }
 
 impl std::fmt::Display for MobAdmissionCloseReason {
@@ -40,6 +60,11 @@ impl std::fmt::Display for MobAdmissionCloseReason {
             Self::IdleClose => f.write_str("idle close"),
             Self::LastOwnerReleased => f.write_str("last public owner released"),
             Self::StandDown => f.write_str("stand down"),
+            Self::Shutdown => f.write_str("shutdown"),
+            Self::Destroyed => f.write_str("destroyed"),
+            Self::DurabilityFailStop => f.write_str("durability fail-stop"),
+            Self::ActorLost => f.write_str("actor lost"),
+            Self::DispatchFailed => f.write_str("dispatch failure"),
         }
     }
 }
@@ -84,8 +109,9 @@ pub enum CloseIfIdleOutcome {
 }
 
 /// Owner presence and the Closing state of one mob, shared by its handles and
-/// its actor. The actor is the only writer of `closed`; it decides under the
-/// same lock that owner acquisition takes.
+/// its actor. The actor writes `closed`, and so does the actor task's end
+/// guard, only once the actor future has stopped (a lost task); every write
+/// decides under the same lock that owner acquisition takes.
 pub(super) struct MobOwnership {
     state: Mutex<OwnershipState>,
     /// Signalled when the last owner drops. A stored permit survives until

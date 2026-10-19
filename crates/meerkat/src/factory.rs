@@ -10365,6 +10365,9 @@ mod auth_clear_default_hot_swap_tests;
 #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod brain_swap_runtime_loop_ab_tests;
+#[cfg(all(test, feature = "session-compaction", not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod compaction_summary_budget_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -11232,9 +11235,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -13271,9 +13272,7 @@ mod tests {
                 ),
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             },
         ]);
         let mut build = config_probe_build(Session::new(), client).await;
@@ -14624,9 +14623,9 @@ mod tests {
                         ),
                     }),
                     Ok(meerkat_client::LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::EndTurn,
+                        ),
                     }),
                 ]))
             }
@@ -21518,9 +21517,7 @@ mod prompt_tests {
             _request: &'a LlmRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
             Box::pin(stream::iter(vec![Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             })]))
         }
 
@@ -21800,9 +21797,7 @@ mod prompt_tests {
                         meta: None,
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::ToolUse),
                     }),
                 ]))
             } else {
@@ -21812,9 +21807,7 @@ mod prompt_tests {
                         meta: None,
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ]))
             }

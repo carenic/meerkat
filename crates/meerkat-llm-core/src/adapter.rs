@@ -428,6 +428,7 @@ impl LlmClientAdapter {
         let mut assembler = BlockAssembler::new();
         let mut reasoning_started = false;
         let mut stop_reason = StopReason::EndTurn;
+        let mut stop_detail = None;
         let mut usage = Usage::default();
         let mut saw_done = false;
 
@@ -552,9 +553,11 @@ impl LlmClientAdapter {
                     LlmEvent::Done { outcome } => match outcome {
                         LlmDoneOutcome::Success {
                             stop_reason: completed_reason,
+                            stop_detail: completed_detail,
                         } => {
                             saw_done = true;
                             stop_reason = completed_reason;
+                            stop_detail = completed_detail;
                         }
                         LlmDoneOutcome::Error { error } => {
                             return Err(error.into_agent_error(self.provider.as_str()));
@@ -594,7 +597,8 @@ impl LlmClientAdapter {
         }
         Ok(
             LlmStreamResult::new(assembler.finalize(), stop_reason, usage)
-                .with_cache_breakpoint_claims(cache_breakpoint_claims),
+                .with_cache_breakpoint_claims(cache_breakpoint_claims)
+                .with_stop_detail(stop_detail),
         )
     }
 }
@@ -889,9 +893,7 @@ mod tests {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ]))
         }
@@ -1040,9 +1042,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1086,9 +1086,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1140,9 +1138,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1227,9 +1223,7 @@ mod tests {
                         ),
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1280,9 +1274,7 @@ mod tests {
                         meta: None,
                     }),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1322,9 +1314,7 @@ mod tests {
                     Ok(LlmEvent::WireLiveness),
                     Ok(LlmEvent::WireLiveness),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                     }),
                 ],
             }),
@@ -1398,9 +1388,7 @@ mod tests {
                 delta: "trailing".to_string(),
             }),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]
     }
@@ -1796,9 +1784,7 @@ mod tests {
                         error: LlmError::ConnectionReset,
                     }
                 } else {
-                    LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    }
+                    LlmDoneOutcome::success(StopReason::EndTurn)
                 },
             }));
             let adapter = LlmClientAdapter::with_event_channel(

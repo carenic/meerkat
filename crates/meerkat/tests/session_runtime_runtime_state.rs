@@ -715,9 +715,7 @@ mod stale_discard {
                     meta: None,
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }

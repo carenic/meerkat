@@ -2443,6 +2443,9 @@ where
         let mut retry_request_pressure_recheck = false;
         let mut next_request_attempt = Some(prepared_attempt);
         let mut authorization_reprepared = false;
+        // One bounded wait state per model call: its wall-clock deadline and
+        // free rebuilds span every rebuild and the controller-feedback attempt.
+        let mut owner_change_churn = crate::authorization::OwnerChangeChurn::new();
 
         let recovery_context = LlmRecoveryContext {
             run_id,
@@ -2848,10 +2851,36 @@ where
                     if error.operation_refusal().is_some()
                         || error.operation_authorization_unavailable() =>
                 {
-                    if error.operation_refusal().is_some_and(|refusal| {
+                    let reprepare = error.operation_refusal().is_some_and(|refusal| {
                         refusal.kind() == crate::OperationRefusalKind::ReprepareRequired
-                    }) && !authorization_reprepared
+                    });
+                    // An owner change still in progress on this work's own
+                    // publication refuses every rebuild until it completes:
+                    // wait for it (bounded), then rebuild without spending
+                    // the one rebuild below. Nothing is decided meanwhile.
+                    if reprepare
+                        && let Some(work) = self.tool_dispatch_context.work_authorization().cloned()
+                        && let Some(wait) = owner_change_churn
+                            .wait_for_settled_change(
+                                work.authorization().as_ref(),
+                                self.budget.remaining_duration(),
+                            )
+                            .await
                     {
+                        wait.trace(
+                            "model_request",
+                            authorization
+                                .as_ref()
+                                .map(crate::LlmRequestAuthorization::operation_id),
+                        );
+                        if let Some(exceeded) = self.budget.observe().exceeded() {
+                            return Err(exceeded.to_agent_error());
+                        }
+                        if wait.settled() {
+                            continue;
+                        }
+                    }
+                    if reprepare && !authorization_reprepared {
                         // The final check observed a relevant owner change.
                         // Rebuild once from that owner; never retag old facts.
                         authorization_reprepared = true;
@@ -3505,7 +3534,7 @@ where
                     .into_iter()
                     .flatten()
                     .max();
-                    let ctx = crate::agent::compact::build_compaction_context(
+                    let mut ctx = crate::agent::compact::build_compaction_context(
                         &model_messages,
                         self.last_input_tokens,
                         request_context_budget,
@@ -3513,6 +3542,8 @@ where
                         last_guarded_boundary,
                         current_boundary_index,
                     );
+                    ctx.last_rewrite_history_tokens =
+                        self.compaction_cadence.last_rewrite_history_tokens;
                     if compactor.should_compact(&ctx) {
                         self.tool_application_observations.invalidate();
                         let rollback_state = crate::agent::CompactionRollbackState {
@@ -3583,12 +3614,32 @@ where
                         });
                         let outcome = match compaction_source {
                             Ok((parent_revision, observation_source)) => {
+                                // Compaction of the admitted controller's own
+                                // context is its housekeeping: it runs on the
+                                // retained controller client (still authorized
+                                // per request as Compaction). Any other
+                                // compactor route keeps the session client.
+                                let controller = self.bound_controller_client();
+                                // The summary's source is sized for the client
+                                // that writes it: the controller's registry
+                                // witness, or the active model's, which a model
+                                // fallback replaces.
+                                let summarization_budget = self
+                                    .request_model_profile(controller.is_some())
+                                    .and_then(|model| {
+                                        crate::compact::SummarizationSourceBudget::for_summary_model(
+                                            &model,
+                                            compactor.max_summary_tokens(),
+                                            compactor.compaction_prompt(),
+                                        )
+                                    });
                                 let invocation = crate::agent::compact::CompactionInvocation {
                                     authorization: self.model_request_authorization(
                                         self.tool_dispatch_context.run_id().cloned(),
                                         crate::authorization::ModelAuthorizationUse::Compaction,
                                         crate::OperationId::new(),
                                     ),
+                                    budget: Some(&self.budget),
                                     model_messages: &model_messages,
                                     observation_source,
                                     window: crate::compact::CompactionWindow {
@@ -3598,6 +3649,7 @@ where
                                     },
                                     request_pressure: provider_request_pressure,
                                     parent_revision,
+                                    summarization_budget,
                                 };
                                 // The compactor's warnings (a bounded source,
                                 // a rewrite keeping no complete turn) name the
@@ -3606,12 +3658,7 @@ where
                                     "compaction",
                                     session_id = %self.session.id()
                                 );
-                                // Compaction of the admitted controller's own
-                                // context is its housekeeping: it runs on the
-                                // retained controller client (still authorized
-                                // per request as Compaction). Any other
-                                // compactor route keeps the session client.
-                                let attempt = match self.bound_controller_client() {
+                                let attempt = match controller {
                                     Some(controller) => {
                                         crate::agent::compact::run_compaction(
                                             controller.as_ref(),
@@ -3722,8 +3769,10 @@ where
                             // can silently refund usage.
                             self.charge_compaction_summary_call(
                                 &outcome.summary_usage,
-                                outcome.summary_source
-                                    == crate::agent::compact::CompactionSummarySource::ProviderCall,
+                                matches!(
+                                    outcome.summary_source,
+                                    crate::agent::compact::CompactionSummarySource::ProviderCall { .. }
+                                ),
                                 outcome.summary_usage_identity_dispute.clone(),
                                 event_tx,
                             )
@@ -3747,9 +3796,29 @@ where
                                     }
                                     Ok(commit)
                                 });
+                            // What the rewrite leaves, in the unit of the
+                            // history trigger: the evidence the next boundary
+                            // judges a crossing by, and what the completion
+                            // reports.
+                            let mut history_tokens_after = None;
                             let compacted_session = match prepared_rewrite {
-                                Ok(Some(commit)) => Some((compacted_session, commit)),
+                                Ok(Some(commit)) => {
+                                    history_tokens_after =
+                                        crate::agent::compact::estimated_history_tokens(
+                                            &compacted_session.messages_for_model_boundary(),
+                                        );
+                                    Some((compacted_session, commit))
+                                }
                                 Ok(None) => {
+                                    // The transcript is unchanged: it is
+                                    // what this rewrite left. Measured here,
+                                    // not copied from the context, which
+                                    // reports 0 for a transcript it could
+                                    // not measure.
+                                    self.compaction_cadence.last_rewrite_history_tokens =
+                                        crate::agent::compact::estimated_history_tokens(
+                                            &compacted_session.messages_for_model_boundary(),
+                                        );
                                     let error =
                                         crate::agent::compact::CompactionError::InvalidRebuild(
                                             "compactor produced a no-op transcript rewrite"
@@ -3876,6 +3945,8 @@ where
                                                             summary_tokens: outcome.summary_usage.output_tokens,
                                                             messages_before: outcome.messages_before,
                                                             messages_after: outcome.messages_after,
+                                                            summary_source: Some(outcome.summary_source),
+                                                            estimated_history_tokens_after: history_tokens_after,
                                                         };
                                                         match compacted_session
                                                             .add_compaction_projection_intent(intent)
@@ -4069,6 +4140,8 @@ where
                                     });
                                 self.compaction_cadence.last_compaction_boundary_index =
                                     Some(outcome.session_boundary_index);
+                                self.compaction_cadence.last_rewrite_history_tokens =
+                                    history_tokens_after;
                                 if emit_completed_now
                                     && !crate::event_tap::tap_emit(
                                         &self.event_tap,
@@ -4077,6 +4150,8 @@ where
                                             summary_tokens: outcome.summary_usage.output_tokens,
                                             messages_before: outcome.messages_before,
                                             messages_after: outcome.messages_after,
+                                            summary_source: Some(outcome.summary_source),
+                                            estimated_history_tokens_after: history_tokens_after,
                                         },
                                     )
                                     .await
@@ -4483,6 +4558,8 @@ where
                     summary_tokens: intent.summary_tokens,
                     messages_before: intent.messages_before,
                     messages_after: intent.messages_after,
+                    summary_source: intent.summary_source,
+                    estimated_history_tokens_after: intent.estimated_history_tokens_after,
                 },
             )
             .await
@@ -7331,6 +7408,9 @@ where
             ));
         }
 
+        // The provider's own account of a refusal or filter travels with the
+        // failure as tagged evidence; nothing here reads it.
+        let stop_detail = result.stop_detail().cloned().map(Box::new);
         let (blocks, stop_reason, _raw_usage) = result.into_parts();
         let has_reasoning = blocks
             .iter()
@@ -7369,9 +7449,15 @@ where
                     .and_then(|profile| profile.context_window()),
                 turn_usage.as_ref().map(TurnUsage::normalized_total_tokens),
             )),
-            StopReason::Refusal | StopReason::ContentFilter => Some(AgentError::ContentFiltered {
-                turn: ctx.turn_count,
-            }),
+            StopReason::Refusal | StopReason::ContentFilter => {
+                crate::types::ContentFilteredStop::from_stop_reason(stop_reason).map(|stop| {
+                    AgentError::ContentFiltered {
+                        turn: ctx.turn_count,
+                        stop,
+                        detail: stop_detail,
+                    }
+                })
+            }
             _ => None,
         };
         if let Some(error) = refused_response {
@@ -9866,6 +9952,7 @@ mod tests {
     }
 
     struct HotSwapLimitRecordingClient {
+        provider: crate::provider::Provider,
         model: String,
         seen_max_tokens: Mutex<Vec<u32>>,
         request_pressure_bytes: Option<u64>,
@@ -9875,6 +9962,7 @@ mod tests {
     impl HotSwapLimitRecordingClient {
         fn new(model: &str) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: None,
@@ -9884,6 +9972,7 @@ mod tests {
 
         fn with_request_pressure(model: &str, encoded_bytes: u64) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: Some(encoded_bytes),
@@ -9893,11 +9982,17 @@ mod tests {
 
         fn with_provider_issued_input_tokens(model: &str, input_tokens: u64) -> Self {
             Self {
+                provider: crate::provider::Provider::OpenAI,
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
                 request_pressure_bytes: Some(1_024),
                 provider_issued_input_tokens: Some(input_tokens),
             }
+        }
+
+        fn on_provider(mut self, provider: crate::provider::Provider) -> Self {
+            self.provider = provider;
+            self
         }
 
         fn seen_max_tokens(&self) -> Vec<u32> {
@@ -10246,7 +10341,7 @@ mod tests {
         }
 
         fn provider(&self) -> crate::provider::Provider {
-            crate::provider::Provider::OpenAI
+            self.provider
         }
 
         fn model(&self) -> &str {
@@ -10564,6 +10659,16 @@ mod tests {
             32
         }
 
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
+        }
+
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             CompactionResult {
                 messages: messages.to_vec(),
@@ -10610,6 +10715,16 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10780,13 +10895,21 @@ mod tests {
 
     struct DiscardingCompactor {
         compact_on_boundary: u64,
+        source_bound: crate::compact::SummarizationSourceBound,
     }
 
     impl DiscardingCompactor {
         fn new(compact_on_boundary: u64) -> Self {
             Self {
                 compact_on_boundary,
+                source_bound: crate::compact::SummarizationSourceBound::Whole,
             }
+        }
+
+        /// Report `source_bound` for every summarization source.
+        fn reporting(mut self, source_bound: crate::compact::SummarizationSourceBound) -> Self {
+            self.source_bound = source_bound;
+            self
         }
     }
 
@@ -10801,6 +10924,17 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource {
+                messages: crate::types::materialize_latest_system_prompt_versions(messages),
+                bound: self.source_bound,
+            }
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10844,6 +10978,68 @@ mod tests {
         }
     }
 
+    /// Compacts at every boundary after the first. A rewrite whose summary
+    /// matches, word for word, the summary the history starts with replays
+    /// that summary row unchanged: the rewrite is then a no-op.
+    struct ReplayingSummaryCompactor;
+
+    impl Compactor for ReplayingSummaryCompactor {
+        fn should_compact(&self, ctx: &CompactionContext) -> bool {
+            ctx.session_boundary_index >= 1
+        }
+
+        fn compaction_prompt(&self) -> &'static str {
+            "COMPACT NOW"
+        }
+
+        fn max_summary_tokens(&self) -> u32 {
+            32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
+        }
+
+        fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
+            let replayed = messages
+                .first()
+                .filter(|first| {
+                    matches!(
+                        first,
+                        Message::User(user)
+                            if user.transcript_role.is_compaction_summary()
+                                && user.text_content()
+                                    == format!("{COMPACTION_SUMMARY_PREFIX}{summary}")
+                    )
+                })
+                .cloned();
+            let Some(previous) = replayed else {
+                return DiscardingCompactor::new(0).rebuild_history(messages, summary);
+            };
+            CompactionResult {
+                messages: messages.to_vec(),
+                summary: CompactionSummary::new(0, previous.clone()),
+                retained: messages
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(offset, message)| {
+                        let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+                        CompactionRetained::new(offset, offset, message)
+                    })
+                    .collect(),
+                discarded: vec![CompactionDiscard::new(0, previous)],
+            }
+        }
+    }
+
     /// Test compactor whose trigger is the BYTE threshold only, evaluated
     /// through the production-owned `request_byte_trigger_threshold`
     /// arithmetic (4/5 of the cap) — the same expression `DefaultCompactor`
@@ -10878,6 +11074,16 @@ mod tests {
             32
         }
 
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
+        }
+
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             DiscardingCompactor::new(0).rebuild_history(messages, summary)
         }
@@ -10896,6 +11102,16 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -10945,6 +11161,16 @@ mod tests {
 
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
 
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
@@ -11863,6 +12089,15 @@ mod tests {
         ));
         let intents = agent.session().compaction_projection_intents().unwrap();
         assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].summary_source,
+            Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Whole,
+                }
+            ),
+            "the staged intent carries the summary source to the completion its commit emits"
+        );
         assert_eq!(transaction.projections, vec![intents[0].projection.clone()]);
         assert_eq!(
             memory_store.staged.lock().unwrap().as_slice(),
@@ -11877,6 +12112,85 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "callback-pending is a commit-worthy boundary and must retain the typed rewrite"
+        );
+    }
+
+    /// A staged compaction reports its completion only when the runtime
+    /// commits it, and that deferred completion carries the summary source
+    /// the staged intent recorded.
+    #[tokio::test]
+    async fn runtime_committed_compaction_completion_carries_the_staged_summary_source() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let client = Arc::new(CompactionTerminalLlmClient::new(
+            PostCompactionOutcome::CallbackPending,
+        ));
+        let session = crate::Session::new();
+        let session_id = session.id().clone();
+        let (event_tx, mut event_rx) = mpsc::channel(4096);
+        // A bound other than the default `Whole`, so only a faithful copy of
+        // the staged source passes, not a constant fill.
+        let staged_source = crate::agent::compact::CompactionSummarySource::ProviderCall {
+            source_bound: crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 },
+        };
+        let mut agent = with_test_turn_state_handle_for_session(AgentBuilder::new(), session)
+            .compactor(Arc::new(DiscardingCompactor::new(1).reporting(
+                crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 },
+            )))
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(Arc::new(AllowCompactionCoordinator { session_id }))
+            .with_default_event_tx(event_tx)
+            .build_standalone(
+                client,
+                Arc::new(CallbackPendingTools::new()),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let error = agent.run("second".into()).await.unwrap_err();
+        assert!(matches!(error, AgentError::CallbackPending { .. }));
+        let completions = |event_rx: &mut mpsc::Receiver<crate::event::AgentEvent>| {
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    crate::event::AgentEvent::CompactionCompleted {
+                        summary_source,
+                        estimated_history_tokens_after,
+                        ..
+                    } => Some((summary_source, estimated_history_tokens_after)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            completions(&mut event_rx).is_empty(),
+            "a staged compaction completes only when the runtime commits it"
+        );
+
+        let intents = agent
+            .session()
+            .validated_compaction_projection_intents()
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].summary_source, Some(staged_source));
+        let staged_left = intents[0].estimated_history_tokens_after;
+        assert!(
+            staged_left.is_some(),
+            "the staged intent carries what the rewrite left"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens, staged_left,
+            "the staged rewrite records the same evidence"
+        );
+        agent
+            .reconcile_runtime_compaction_projections(&intents)
+            .await
+            .expect("the runtime commit finalizes the staged compaction");
+
+        assert_eq!(
+            completions(&mut event_rx),
+            vec![(Some(staged_source), staged_left)],
+            "the completion the runtime commit emits carries the staged summary source and \
+             what the rewrite left"
         );
     }
 
@@ -11925,6 +12239,8 @@ mod tests {
                 summary_tokens: 1,
                 messages_before,
                 messages_after: 1,
+                summary_source: None,
+                estimated_history_tokens_after: None,
             })
             .unwrap();
         projection
@@ -12076,6 +12392,7 @@ mod tests {
             serde_json::to_value(rollback_session.transcript_history_state().unwrap()).unwrap();
         let rollback_usage = rollback_session.total_usage();
         let rollback_last_input_tokens = agent.last_input_tokens;
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(111);
         let rollback_compaction_cadence = agent.compaction_cadence.clone();
         let attempted_boundary = rollback_compaction_cadence.session_boundary_index + 1;
         let projection = append_abort_test_projection(agent.session_mut(), "atomic-apply-failure");
@@ -12096,6 +12413,7 @@ mod tests {
             .compaction_cadence
             .last_compaction_attempt_boundary_index = Some(attempted_boundary);
         agent.compaction_cadence.last_compaction_boundary_index = Some(attempted_boundary);
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(999);
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
@@ -12151,6 +12469,11 @@ mod tests {
             agent.compaction_cadence.last_compaction_boundary_index,
             rollback_compaction_cadence.last_compaction_boundary_index,
             "a rolled-back compaction must retain the attempt but not claim successful completion"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(111),
+            "an aborted rewrite left nothing: the previous rewrite's evidence stays"
         );
         assert!(
             agent
@@ -14451,10 +14774,19 @@ mod tests {
         let mut turns_completed = 0usize;
         while let Ok(event) = rx.try_recv() {
             match event {
-                crate::event::AgentEvent::CompactionCompleted { summary_tokens, .. } => {
+                crate::event::AgentEvent::CompactionCompleted {
+                    summary_tokens,
+                    summary_source,
+                    ..
+                } => {
                     assert_eq!(
                         summary_tokens, 0,
                         "curated summaries consume no LLM tokens; summary usage must be zero"
+                    );
+                    assert_eq!(
+                        summary_source,
+                        Some(crate::agent::compact::CompactionSummarySource::HostCurator),
+                        "the completion names the curator as the summary's author"
                     );
                     saw_completed = true;
                 }
@@ -14497,6 +14829,179 @@ mod tests {
                         && user.text_content().contains("curated summary")
             )),
             "the committed history must carry the curated summary as a typed compaction-summary message"
+        );
+    }
+
+    /// The completion event says who wrote the summary and, for a provider
+    /// call, how much of the history its source carried, as the compactor
+    /// reported it.
+    #[tokio::test]
+    async fn compaction_completed_reports_the_summary_source_bound() {
+        let bound = crate::compact::SummarizationSourceBound::RequestsOnly { kept: 1, of: 2 };
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1).reporting(bound)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the compaction commits and the turn continues");
+
+        let sources: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                crate::event::AgentEvent::CompactionCompleted { summary_source, .. } => {
+                    Some(summary_source)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: bound
+                }
+            )]
+        );
+    }
+
+    /// A committed rewrite records the history estimate it left as the
+    /// session's cadence evidence, persisted with the cadence, and the
+    /// completion reports the same number.
+    #[tokio::test]
+    async fn compaction_records_and_reports_the_history_its_rewrite_left() {
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        assert_eq!(agent.compaction_cadence.last_rewrite_history_tokens, None);
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("the compaction commits and the turn continues");
+
+        let mut started = Vec::new();
+        let mut left = Vec::new();
+        for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+            match event {
+                crate::event::AgentEvent::CompactionStarted {
+                    estimated_history_tokens,
+                    ..
+                } => started.push(estimated_history_tokens),
+                crate::event::AgentEvent::CompactionCompleted {
+                    estimated_history_tokens_after,
+                    ..
+                } => left.push(estimated_history_tokens_after),
+                _ => {}
+            }
+        }
+        let [before] = started.as_slice() else {
+            panic!("expected one compaction, got {started:?}");
+        };
+        let [Some(after)] = left.as_slice() else {
+            panic!("the completion must report what the rewrite left: {left:?}");
+        };
+        assert!(
+            after < before,
+            "the rewrite shrank the history: {after} vs {before}"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(*after),
+            "the evidence is the number the completion reports"
+        );
+        let mut persisted = agent.session().clone();
+        assert_eq!(
+            crate::agent::compact::load_compaction_cadence(&mut persisted)
+                .unwrap()
+                .last_rewrite_history_tokens,
+            Some(*after),
+            "the evidence is persisted with the session's compaction cadence"
+        );
+    }
+
+    /// A rewrite rejected as a no-op left the transcript as it was, so the
+    /// evidence is the estimate the attempt started from.
+    #[tokio::test]
+    async fn rejected_noop_rewrite_records_the_unchanged_history() {
+        let client = Arc::new(CompactionAwareLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(ReplayingSummaryCompactor))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent
+            .run("second".into())
+            .await
+            .expect("the first compaction commits");
+        let committed = agent.compaction_cadence.last_rewrite_history_tokens;
+        assert!(committed.is_some(), "the committed rewrite left evidence");
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("third".into(), tx)
+            .await
+            .expect("a rejected no-op rewrite keeps the history and the turn continues");
+        let mut started = Vec::new();
+        let mut rejected = false;
+        for event in std::iter::from_fn(|| rx.try_recv().ok()) {
+            match event {
+                crate::event::AgentEvent::CompactionStarted {
+                    estimated_history_tokens,
+                    ..
+                } => started.push(estimated_history_tokens),
+                crate::event::AgentEvent::CompactionFailed {
+                    reason:
+                        crate::event::CompactionFailureReason::TranscriptRewriteFailed { message },
+                } if message.contains("no-op") => rejected = true,
+                _ => {}
+            }
+        }
+        assert!(rejected, "the replayed summary must be rejected as a no-op");
+        let [before] = started.as_slice() else {
+            panic!("expected one compaction attempt, got {started:?}");
+        };
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(*before),
+            "a no-op rewrite left exactly the history it started from"
+        );
+    }
+
+    /// A summary call that fails proves nothing about what a rewrite would
+    /// leave: the evidence of the last rewrite stays.
+    #[tokio::test]
+    async fn failed_summary_call_keeps_the_previous_rewrite_evidence() {
+        let client = Arc::new(FailingCompactionLlmClient::new());
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent.compaction_cadence.last_rewrite_history_tokens = Some(12_345);
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("a failed summary call keeps the history and the turn continues");
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|event| matches!(event, crate::event::AgentEvent::CompactionFailed { .. })),
+            "the summary call must have failed"
+        );
+        assert_eq!(
+            agent.compaction_cadence.last_rewrite_history_tokens,
+            Some(12_345)
         );
     }
 
@@ -15007,6 +15512,16 @@ mod tests {
         }
         fn max_summary_tokens(&self) -> u32 {
             32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
         fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
             let tail_start = messages
@@ -16844,6 +17359,141 @@ mod tests {
         assert_eq!(primary.seen_max_tokens(), vec![8192]);
     }
 
+    /// Records the summarization source budget each compaction hands it.
+    struct BudgetRecordingCompactor {
+        compact_on_boundary: u64,
+        seen_budgets: Mutex<Vec<Option<crate::compact::SummarizationSourceBudget>>>,
+    }
+
+    impl Compactor for BudgetRecordingCompactor {
+        fn should_compact(&self, ctx: &CompactionContext) -> bool {
+            ctx.session_boundary_index == self.compact_on_boundary
+        }
+
+        fn compaction_prompt(&self) -> &'static str {
+            "COMPACT NOW"
+        }
+
+        fn max_summary_tokens(&self) -> u32 {
+            32
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            self.seen_budgets.lock().unwrap().push(budget);
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
+        }
+
+        fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult {
+            CompactionResult {
+                messages: messages.to_vec(),
+                summary: test_compaction_summary(0, summary),
+                retained: identity_compaction_retentions(messages),
+                discarded: Vec::new(),
+            }
+        }
+    }
+
+    /// Custom OpenAI `models`, each with its context window.
+    fn summary_window_test_registry(models: &[(&str, u32)]) -> Arc<crate::ModelRegistry> {
+        let mut config = crate::Config::default();
+        for &(model, context_window) in models {
+            config.models.custom.insert(
+                model.to_string(),
+                crate::config::CustomModelConfig {
+                    provider: crate::Provider::OpenAI,
+                    display_name: None,
+                    context_window: Some(context_window),
+                    max_input_tokens: None,
+                    max_output_tokens: Some(2_048),
+                    vision: Some(false),
+                    web_search: Some(false),
+                    call_timeout_secs: None,
+                },
+            );
+        }
+        let empty_catalog = crate::ModelCatalog {
+            entries: &[],
+            capabilities: &[],
+            provider_defaults: &[],
+            image_generation_models: &[],
+            providers: &[],
+            default_models: &[],
+            image_generation_defaults: &[],
+            global_default_model: "",
+            provider_priority: &[],
+        };
+        Arc::new(
+            crate::ModelRegistry::from_config(&config, empty_catalog)
+                .expect("summary window test registry"),
+        )
+    }
+
+    /// The compaction summary is written by the session's active model, and
+    /// its source is sized for that model: after the session switches to a
+    /// model with a smaller window (a model fallback replaces the active
+    /// profile the same way), the next compaction gets that model's budget.
+    #[tokio::test]
+    async fn compaction_summary_budget_follows_the_active_model() {
+        let registry = summary_window_test_registry(&[("primary", 128_000), ("backup", 16_000)]);
+        let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
+        let backup = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let compactor = Arc::new(BudgetRecordingCompactor {
+            compact_on_boundary: 1,
+            seen_budgets: Mutex::new(Vec::new()),
+        });
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(2_048)
+                .compactor(compactor.clone())
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(primary.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        agent
+            .run("on primary".into())
+            .await
+            .expect("the primary turn should succeed");
+        agent
+            .hot_swap_llm_identity(
+                backup.clone(),
+                explicit_hot_swap_identity("backup"),
+                explicit_hot_swap_policy("backup"),
+            )
+            .expect("primary to backup hot-swap should commit");
+        agent
+            .run("on backup".into())
+            .await
+            .expect("the backup turn should succeed");
+
+        let budget_for = |model: &str| {
+            let witness = registry
+                .profile_witness_for_provider(crate::Provider::OpenAI, model)
+                .expect("registry witness");
+            crate::compact::SummarizationSourceBudget::for_summary_model(
+                &witness,
+                32,
+                "COMPACT NOW",
+            )
+        };
+        assert_ne!(budget_for("backup"), budget_for("primary"));
+        assert_eq!(
+            compactor.seen_budgets.lock().unwrap().clone(),
+            vec![budget_for("backup")],
+            "the summary written on the backup model is sized for its window"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_hot_swap_rejects_unknown_profile_before_live_mutation() {
         let registry = fallback_activation_test_registry();
@@ -16948,10 +17598,95 @@ mod tests {
         assert_eq!(backup.seen_max_tokens(), vec![2048]);
     }
 
+    /// A direct client replacement keeps the session's model: a client for
+    /// another model or provider, or a request policy for another model, is
+    /// refused with a typed error that names the hot swap, and the live
+    /// client, request model and active profile stay as they were.
+    #[tokio::test]
+    async fn direct_client_replacement_refuses_a_model_change() {
+        let registry = fallback_activation_test_registry();
+        let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
+        let backup = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(16_384)
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(primary.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        let error = agent
+            .replace_client(backup.clone())
+            .expect_err("a client for another model must not replace the session's client");
+        assert!(
+            matches!(
+                &error,
+                AgentError::ClientModelChangeRequiresHotSwap {
+                    durable_provider: crate::Provider::OpenAI,
+                    durable_model,
+                    requested_provider: crate::Provider::OpenAI,
+                    requested_model,
+                } if durable_model == "primary" && requested_model == "backup"
+            ),
+            "unexpected refusal: {error:?}"
+        );
+        assert!(error.to_string().contains("hot_swap_llm_identity"));
+
+        let other_provider = Arc::new(
+            HotSwapLimitRecordingClient::new("primary").on_provider(crate::Provider::Anthropic),
+        );
+        let provider_error = agent
+            .replace_client(other_provider.clone())
+            .expect_err("a client for another provider must not replace the session's client");
+        assert!(
+            matches!(
+                &provider_error,
+                AgentError::ClientModelChangeRequiresHotSwap {
+                    requested_provider: crate::Provider::Anthropic,
+                    requested_model,
+                    ..
+                } if requested_model == "primary"
+            ),
+            "unexpected refusal: {provider_error:?}"
+        );
+
+        let policy_error = agent
+            .replace_client_with_request_policy(primary.clone(), explicit_hot_swap_policy("backup"))
+            .expect_err("a request policy for another model must not reach the session");
+        assert!(
+            matches!(
+                &policy_error,
+                AgentError::ClientModelChangeRequiresHotSwap { requested_model, .. }
+                    if requested_model == "backup"
+            ),
+            "unexpected refusal: {policy_error:?}"
+        );
+        assert_eq!(agent.config.model, "primary");
+        assert_eq!(
+            agent
+                .active_model_profile
+                .as_ref()
+                .map(crate::ModelProfileWitness::model),
+            Some("primary")
+        );
+
+        agent
+            .run("the session keeps its model".into())
+            .await
+            .expect("the original client should remain live");
+        assert_eq!(primary.seen_max_tokens().len(), 1);
+        assert!(backup.seen_max_tokens().is_empty());
+        assert!(other_provider.seen_max_tokens().is_empty());
+    }
+
     #[tokio::test]
     async fn direct_client_replacement_preserves_arbitrary_position_system_messages() {
         let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
-        let replacement = Arc::new(HotSwapLimitRecordingClient::new("backup"));
+        let replacement = Arc::new(HotSwapLimitRecordingClient::new("primary"));
         let mut session = explicit_hot_swap_session("primary");
         session.push(Message::User(UserMessage::text("ordinary turn")));
         session.push(Message::System(crate::SystemMessage::new(
@@ -31891,6 +32626,632 @@ mod tests {
             }
         }
 
+        /// One scripted step of a churn owner, taken by a model preparation
+        /// that finds no owner change in progress. While a change is in
+        /// progress every preparation refuses `ReprepareRequired`, as an
+        /// observation of an odd publication does.
+        #[derive(Clone, Copy)]
+        enum ChurnStep {
+            /// An owner change begins during this preparation, which refuses
+            /// `ReprepareRequired`; the change completes after `settle`, or
+            /// never.
+            Begin {
+                settle: Option<std::time::Duration>,
+            },
+            /// Refuse `ReprepareRequired` for a change that already completed.
+            Stale,
+            /// An owner change begins and this preparation refuses `Denied`;
+            /// the change completes after `settle`.
+            DenyDuringChange {
+                settle: std::time::Duration,
+            },
+            Allow,
+        }
+
+        /// A work owner whose publication churns as scripted. The last step
+        /// repeats once the script runs out.
+        struct ChurnPolicy {
+            sequence: Arc<std::sync::atomic::AtomicU64>,
+            script: Mutex<std::collections::VecDeque<ChurnStep>>,
+            prepared_at: Mutex<Vec<tokio::time::Instant>>,
+        }
+
+        impl ChurnPolicy {
+            fn new(script: impl IntoIterator<Item = ChurnStep>) -> Arc<Self> {
+                Arc::new(Self {
+                    sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    script: Mutex::new(script.into_iter().collect()),
+                    prepared_at: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn begin_change(&self, settle: Option<std::time::Duration>) {
+                let odd = self.sequence.load(Ordering::SeqCst) + 1;
+                self.sequence.store(odd, Ordering::SeqCst);
+                if let Some(settle) = settle {
+                    let sequence = Arc::clone(&self.sequence);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(settle).await;
+                        sequence.store(odd + 1, Ordering::SeqCst);
+                    });
+                }
+            }
+
+            fn prepares(&self) -> usize {
+                self.prepared_at.lock().unwrap().len()
+            }
+
+            /// Time from the first model preparation to preparation `index`.
+            fn prepared_after_first(&self, index: usize) -> std::time::Duration {
+                let prepared_at = self.prepared_at.lock().unwrap();
+                prepared_at[index] - prepared_at[0]
+            }
+        }
+
+        impl WorkAuthorization for ChurnPolicy {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn owner_change_in_progress(
+                &self,
+            ) -> Option<crate::authorization::OwnerChangeInProgress> {
+                let sequence = self.sequence.load(Ordering::SeqCst);
+                (sequence % 2 == 1).then(|| {
+                    crate::authorization::OwnerChangeInProgress::new(uuid::Uuid::nil(), sequence)
+                })
+            }
+
+            fn prepare(
+                &self,
+                binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, crate::OperationAuthorizationError>
+            {
+                if !matches!(binding.facts().operation, AuthorizationOperation::Model(_)) {
+                    return Ok(Arc::new(FixturePrepared(binding.clone())));
+                }
+                self.prepared_at
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
+                if self.owner_change_in_progress().is_some() {
+                    return Err(
+                        OperationRefused::new(OperationRefusalKind::ReprepareRequired).into(),
+                    );
+                }
+                let step = {
+                    let mut script = self.script.lock().unwrap();
+                    if script.len() > 1 {
+                        script.pop_front()
+                    } else {
+                        script.front().copied()
+                    }
+                }
+                .unwrap_or(ChurnStep::Allow);
+                match step {
+                    ChurnStep::Begin { settle } => {
+                        self.begin_change(settle);
+                        Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into())
+                    }
+                    ChurnStep::Stale => {
+                        Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into())
+                    }
+                    ChurnStep::DenyDuringChange { settle } => {
+                        self.begin_change(Some(settle));
+                        Err(OperationRefused::new(OperationRefusalKind::Denied).into())
+                    }
+                    ChurnStep::Allow => Ok(Arc::new(FixturePrepared(binding.clone()))),
+                }
+            }
+        }
+
+        /// The session's model and its retained controller. Each attempt
+        /// takes `delay` (a slow rebuild), then prepares and checks its
+        /// operation at send; a compaction summary does the same at once.
+        struct ChurnClient {
+            delay: std::time::Duration,
+            operations: Mutex<Vec<crate::OperationId>>,
+            summaries: Mutex<Vec<crate::OperationId>>,
+        }
+
+        impl ChurnClient {
+            fn new(delay: std::time::Duration) -> Arc<Self> {
+                Arc::new(Self {
+                    delay,
+                    operations: Mutex::new(Vec::new()),
+                    summaries: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn operations(&self) -> Vec<crate::OperationId> {
+                self.operations.lock().unwrap().clone()
+            }
+        }
+
+        struct ChurnAttempt {
+            client: Arc<ChurnClient>,
+            authorization: crate::LlmRequestAuthorization,
+        }
+
+        #[async_trait]
+        impl AgentLlmRequestAttempt for ChurnAttempt {
+            fn request_pressure(
+                &self,
+            ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+                Ok(None)
+            }
+
+            async fn stream_response(
+                &self,
+                _assistant_message_id: crate::AssistantMessageId,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                if !self.client.delay.is_zero() {
+                    tokio::time::sleep(self.client.delay).await;
+                }
+                self.authorization
+                    .prepare(fixture_model_facts(false))
+                    .map_err(AgentError::from)?
+                    .current()
+                    .map_err(AgentError::from)?;
+                Ok(crate::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "answered after the owner change".into(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self.client.as_ref(), Usage::default()),
+                ))
+            }
+        }
+
+        #[async_trait]
+        impl AgentLlmClient for ChurnClient {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn prepare_request_attempt_authorized(
+                self: Arc<Self>,
+                _messages: Arc<Vec<Message>>,
+                _tools: Arc<[Arc<ToolDef>]>,
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<Arc<dyn AgentLlmRequestAttempt>, AgentError> {
+                let authorization =
+                    authorization.expect("governed context must reach the provider");
+                self.operations
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
+                Ok(Arc::new(ChurnAttempt {
+                    client: self,
+                    authorization,
+                }))
+            }
+
+            async fn stream_response(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                panic!("governed execution must not use the raw provider path")
+            }
+
+            async fn stream_response_authorized(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                let authorization =
+                    authorization.expect("a governed compaction summary keeps its work");
+                assert!(authorization.usage() == ModelAuthorizationUse::Compaction);
+                self.summaries
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
+                authorization
+                    .prepare(fixture_model_facts(false))
+                    .map_err(AgentError::from)?
+                    .current()
+                    .map_err(AgentError::from)?;
+                Ok(crate::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "summary of the first input".into(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                ))
+            }
+
+            fn provider(&self) -> crate::Provider {
+                crate::Provider::OpenAI
+            }
+            fn model(&self) -> &'static str {
+                "fixture-model"
+            }
+        }
+
+        struct ChurnRun {
+            result: Result<crate::RunResult, AgentError>,
+            notices: usize,
+            events: mpsc::Receiver<crate::AgentEvent>,
+            elapsed: std::time::Duration,
+        }
+
+        /// Run one prompt with `client` as both the session's model and the
+        /// work's retained controller, under `policy`.
+        async fn run_churn(
+            policy: &Arc<ChurnPolicy>,
+            client: &Arc<ChurnClient>,
+            limits: Option<crate::budget::BudgetLimits>,
+        ) -> ChurnRun {
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .build_standalone(
+                    Arc::clone(client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            if let Some(limits) = limits {
+                agent.budget = crate::budget::Budget::new(limits);
+            }
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            let (tx, events) = mpsc::channel(1024);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(600),
+                agent.run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work),
+                ),
+            )
+            .await
+            .expect("a churning owner never holds the run past its bounds");
+            let elapsed = started.elapsed();
+            let notices = agent
+                .session()
+                .messages()
+                .iter()
+                .filter(|message| {
+                    matches!(message, Message::SystemNotice(_))
+                        && serde_json::to_string(message)
+                            .unwrap()
+                            .contains("operation_refused")
+                })
+                .count();
+            ChurnRun {
+                result,
+                notices,
+                events,
+                elapsed,
+            }
+        }
+
+        fn refused_kind(
+            result: &Result<crate::RunResult, AgentError>,
+        ) -> Option<OperationRefusalKind> {
+            result
+                .as_ref()
+                .err()
+                .and_then(AgentError::operation_refusal)
+                .map(OperationRefused::kind)
+        }
+
+        /// An owner change held across its storage commit outlasts the
+        /// immediate rebuild. The model request waits for it to complete,
+        /// then rebuilds under the same operation, with no refusal notice and
+        /// no controller-feedback request.
+        #[tokio::test(start_paused = true)]
+        async fn an_owner_change_in_progress_is_waited_out_before_the_rebuild() {
+            let policy = ChurnPolicy::new([
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            let result = run
+                .result
+                .expect("the rebuild after the change completes is authorized");
+            assert_eq!(result.text, "answered after the owner change");
+            assert_eq!(run.notices, 0, "no refusal reached the transcript");
+            assert_eq!(policy.prepares(), 2, "one refused attempt, one rebuild");
+            assert!(
+                policy.prepared_after_first(1) >= std::time::Duration::from_millis(30),
+                "the rebuild waited for the change to complete"
+            );
+            let operations = client.operations();
+            assert_eq!(operations.len(), 2);
+            assert_eq!(
+                operations[0], operations[1],
+                "the rebuild keeps its operation"
+            );
+            assert!(run.elapsed < crate::authorization::OWNER_CHANGE_WAIT_BOUND);
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// Changes that keep beginning as each one completes earn at most
+        /// three free rebuilds per model call; then the call takes its own
+        /// rebuild, the controller feedback attempt and the refusal, as
+        /// without waiting.
+        #[tokio::test(start_paused = true)]
+        async fn a_flip_storm_spends_at_most_three_free_rebuilds() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin {
+                settle: Some(std::time::Duration::from_millis(1)),
+            }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let run = run_churn(&policy, &client, None).await;
+
+            assert_eq!(
+                refused_kind(&run.result),
+                Some(OperationRefusalKind::ReprepareRequired),
+                "{:?}",
+                run.result
+            );
+            // 1 attempt + 3 free rebuilds + its own rebuild, then one
+            // controller feedback attempt.
+            assert_eq!(
+                policy.prepares(),
+                1 + usize::from(crate::authorization::OWNER_CHANGE_FREE_REBUILDS) + 1 + 1
+            );
+            assert_eq!(run.notices, 1);
+            let operations = client.operations();
+            assert_eq!(operations.len(), 6);
+            assert!(operations[..5].iter().all(|id| *id == operations[0]));
+            assert_ne!(operations[5], operations[0], "feedback is a new operation");
+            assert!(run.elapsed < crate::authorization::OWNER_CHANGE_WAIT_BOUND);
+        }
+
+        /// The wait bound is wall-clock from the first wait, so the time the
+        /// rebuilds themselves take counts against it: slow rebuilds end
+        /// the free rebuilds before the cap does.
+        #[tokio::test(start_paused = true)]
+        async fn the_wait_bound_counts_rebuild_time() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin {
+                settle: Some(std::time::Duration::from_millis(10)),
+            }]);
+            let client = ChurnClient::new(std::time::Duration::from_millis(1200));
+            let run = run_churn(&policy, &client, None).await;
+
+            assert_eq!(
+                refused_kind(&run.result),
+                Some(OperationRefusalKind::ReprepareRequired),
+                "{:?}",
+                run.result
+            );
+            // Attempts at 1.2 s and 2.4 s wait and rebuild for free; the
+            // third refusal, at 3.6 s, is past the deadline (1.2 s + 2 s), so
+            // the call takes its own rebuild and then the feedback attempt.
+            assert_eq!(policy.prepares(), 5);
+            assert_eq!(run.notices, 1);
+        }
+
+        /// With less run budget left than the wait bound, the wait ends at
+        /// the run deadline and the turn ends with the budget error, not a
+        /// refusal.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_budget_under_the_wait_bound_ends_the_turn_on_time() {
+            const TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(300);
+            let policy = ChurnPolicy::new([ChurnStep::Begin { settle: None }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let run = run_churn(
+                &policy,
+                &client,
+                Some(crate::budget::BudgetLimits {
+                    max_tokens: None,
+                    max_duration: None,
+                    max_turn_duration: Some(TURN_BUDGET),
+                    max_tool_calls: None,
+                }),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    run.result,
+                    Err(AgentError::TerminalFailure {
+                        outcome: crate::TurnTerminalOutcome::TimeBudgetExceeded,
+                        cause_kind: crate::TurnTerminalCauseKind::TimeBudgetExceeded,
+                        ..
+                    })
+                ),
+                "{:?}",
+                run.result
+            );
+            assert_eq!(
+                run.elapsed, TURN_BUDGET,
+                "the wait never overshoots the run"
+            );
+            assert_eq!(policy.prepares(), 1);
+            assert_eq!(run.notices, 0);
+        }
+
+        /// The wait belongs to the call's own future: dropping the run stops
+        /// it, and nothing keeps preparing afterwards.
+        #[tokio::test(start_paused = true)]
+        async fn dropping_a_waiting_model_call_stops_the_wait() {
+            let policy = ChurnPolicy::new([ChurnStep::Begin { settle: None }]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .build_standalone(
+                    Arc::clone(&client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(&policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(&client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            let (tx, _events) = mpsc::channel(1024);
+            let waited = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                agent.run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work),
+                ),
+            )
+            .await;
+            assert!(waited.is_err(), "the call was still waiting when dropped");
+            assert_eq!(policy.prepares(), 1);
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            assert_eq!(policy.prepares(), 1, "nothing prepares after the drop");
+        }
+
+        /// A `ReprepareRequired` refusal with no change in progress takes its
+        /// ordinary path at once: one rebuild, then the controller feedback.
+        #[tokio::test(start_paused = true)]
+        async fn a_refusal_without_a_change_in_progress_rebuilds_at_once() {
+            let policy = ChurnPolicy::new([ChurnStep::Stale, ChurnStep::Stale, ChurnStep::Allow]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            run.result
+                .expect("the controller feedback attempt is authorized");
+            assert_eq!(policy.prepares(), 3);
+            assert_eq!(run.notices, 1);
+            assert_eq!(run.elapsed, std::time::Duration::ZERO, "nothing waited");
+            let operations = client.operations();
+            assert_eq!(operations.len(), 3);
+            assert_eq!(operations[0], operations[1]);
+            assert_ne!(operations[2], operations[0]);
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// Only `ReprepareRequired` waits: a denial with a change in progress
+        /// returns to the controller at once, and that new operation then
+        /// waits for the change like any other.
+        #[tokio::test(start_paused = true)]
+        async fn other_refusals_never_wait_for_a_change_in_progress() {
+            let policy = ChurnPolicy::new([
+                ChurnStep::DenyDuringChange {
+                    settle: std::time::Duration::from_millis(50),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut run = run_churn(&policy, &client, None).await;
+
+            run.result
+                .expect("the controller feedback attempt is authorized");
+            assert_eq!(policy.prepares(), 3);
+            assert_eq!(run.notices, 1);
+            assert_eq!(
+                policy.prepared_after_first(1),
+                std::time::Duration::ZERO,
+                "the denial did not wait"
+            );
+            assert!(policy.prepared_after_first(2) >= std::time::Duration::from_millis(50));
+            assert_completed_without_failure(&mut run.events);
+        }
+
+        /// A compaction summary refused while an owner change is in progress
+        /// on the work's own publication waits for it and asks again under
+        /// the same operation: the compaction completes, and the controller
+        /// sees no refusal.
+        #[tokio::test(start_paused = true)]
+        async fn a_compaction_summary_waits_out_an_owner_change_in_progress() {
+            // The first run answers; the second compacts first, and its
+            // summary meets a change in progress.
+            let policy = ChurnPolicy::new([
+                ChurnStep::Allow,
+                ChurnStep::Begin {
+                    settle: Some(std::time::Duration::from_millis(30)),
+                },
+                ChurnStep::Allow,
+            ]);
+            let client = ChurnClient::new(std::time::Duration::ZERO);
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .compactor(Arc::new(DiscardingCompactor::new(1)))
+                .build_standalone(
+                    Arc::clone(&client),
+                    Arc::new(IndeterminateDispatcher),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let work = WorkAuthorizationContext::new(
+                Arc::clone(&policy) as Arc<dyn WorkAuthorization>,
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                Arc::clone(&client) as Arc<dyn AgentLlmClient>,
+            ))
+            .unwrap();
+            for (prompt, events) in [("first retained input", false), ("second input", true)] {
+                let (tx, mut rx) = mpsc::channel(1024);
+                agent
+                    .run_with_events_and_work_authorization(
+                        prompt.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(work.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                if events {
+                    let mut completed = 0;
+                    while let Ok(event) = rx.try_recv() {
+                        assert!(
+                            !matches!(event, crate::AgentEvent::CompactionFailed { .. }),
+                            "{event:?}"
+                        );
+                        if matches!(event, crate::AgentEvent::CompactionCompleted { .. }) {
+                            completed += 1;
+                        }
+                    }
+                    assert_eq!(completed, 1, "the compaction completed");
+                }
+            }
+            let summaries = client.summaries.lock().unwrap().clone();
+            assert_eq!(summaries.len(), 2, "one refused summary, one more");
+            assert_eq!(summaries[0], summaries[1], "the same compaction operation");
+            assert!(
+                policy
+                    .prepared_after_first(2)
+                    .saturating_sub(policy.prepared_after_first(1))
+                    >= std::time::Duration::from_millis(30),
+                "the summary waited for the change to complete"
+            );
+            let transcript = serde_json::to_string(agent.session().messages()).unwrap();
+            assert!(!transcript.contains("operation_refused"));
+        }
+
         /// A PreLlm gate fixture. It denies every ordinary request and,
         /// when `deny_feedback` is set, the feedback request it attests it
         /// does not govern too. `attest` controls whether it states the gate.
@@ -33092,6 +34453,99 @@ mod tests {
             assert!(
                 session_client.requests.lock().unwrap().is_empty(),
                 "nothing of the controller's work entered the session client"
+            );
+        }
+
+        /// The retained controller client writes the summary of the admitted
+        /// controller's context, so the source is sized for the controller's
+        /// model, not for the session's active model.
+        #[tokio::test]
+        async fn controller_compaction_summary_budget_is_sized_for_the_controller_model() {
+            let registry =
+                summary_window_test_registry(&[("primary", 128_000), ("fixture-model", 16_000)]);
+            let fixture = || {
+                Arc::new(FixtureClient {
+                    requests: Mutex::new(Vec::new()),
+                    tool_first: false,
+                    authorizations: Mutex::new(Vec::new()),
+                    hosted_default: false,
+                })
+            };
+            let controller = Arc::new(ControllerProbe {
+                inner: fixture(),
+                compactions: AtomicUsize::new(0),
+            });
+            let policy = Arc::new(FixturePolicy {
+                hosted_denials: AtomicUsize::new(0),
+                compaction_denials: AtomicUsize::new(0),
+            });
+            let compactor = Arc::new(BudgetRecordingCompactor {
+                compact_on_boundary: 1,
+                seen_budgets: Mutex::new(Vec::new()),
+            });
+            let mut agent = with_test_turn_state_handle_for_session(
+                AgentBuilder::new()
+                    .model("primary")
+                    .compactor(compactor.clone())
+                    .with_effective_model_registry(Arc::clone(&registry)),
+                explicit_hot_swap_session("primary"),
+            )
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(fixture(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+            assert_eq!(
+                agent
+                    .active_model_profile
+                    .as_ref()
+                    .map(crate::ModelProfileWitness::model),
+                Some("primary"),
+                "the session's active model is not the controller's"
+            );
+            let context = WorkAuthorizationContext::new(
+                policy.clone(),
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                controller.clone(),
+            ))
+            .unwrap();
+            for input in ["first retained input", "second input"] {
+                let (tx, mut rx) = mpsc::channel(128);
+                agent
+                    .run_with_events_and_work_authorization(
+                        input.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(context.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                assert_completed_without_failure(&mut rx);
+            }
+            assert_eq!(
+                controller.compactions.load(Ordering::Relaxed),
+                1,
+                "the compaction request reached the retained controller client"
+            );
+
+            let budget_for = |model: &str| {
+                let witness = registry
+                    .profile_witness_for_provider(crate::Provider::OpenAI, model)
+                    .expect("registry witness");
+                crate::compact::SummarizationSourceBudget::for_summary_model(
+                    &witness,
+                    32,
+                    "COMPACT NOW",
+                )
+            };
+            assert_ne!(budget_for("fixture-model"), budget_for("primary"));
+            assert_eq!(
+                compactor.seen_budgets.lock().unwrap().clone(),
+                vec![budget_for("fixture-model")],
+                "the controller's summary is sized for the controller's window"
             );
         }
 

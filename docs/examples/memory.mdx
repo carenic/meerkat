@@ -143,7 +143,12 @@ The compaction cycle emits events into the session stream:
   "type": "compaction_completed",
   "summary_tokens": 2048,
   "messages_before": 48,
-  "messages_after": 12
+  "messages_after": 12,
+  "summary_source": {
+    "kind": "provider_call",
+    "source_bound": { "kind": "trimmed", "through": "tool_results" }
+  },
+  "estimated_history_tokens_after": 18500
 }
 
 // CompactionFailed -- session is not mutated on failure

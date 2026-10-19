@@ -17,7 +17,7 @@ use meerkat_authorization_contracts::protocol::ContractRequirements;
 use meerkat_authorization_contracts::resource::ResourceRef;
 use meerkat_authorization_contracts::work_association::{
     GrantLineageRef, InputAuthorityAssociation, InputAuthorityAssociationCandidate,
-    NativeWorkTarget,
+    NativeWorkTarget, WorkAuthorityBasis,
 };
 use meerkat_core::authorization::{
     AuthorizationOperation, OperationAuthorizationFacts, OwnerQualifiedTarget,
@@ -129,11 +129,14 @@ fn held(ledger: &StockOriginalLedger, occurrence: &str, name: &str) -> bool {
         .is_some()
 }
 
-fn retained(ledger: &StockOriginalLedger, name: &str) -> bool {
+fn custody(ledger: &StockOriginalLedger, name: &str) -> RetainedCustody {
     ledger
-        .retained_original(&namespace("any"), &work(name))
+        .retained_custody(&namespace("any"), &work(name))
         .expect("readable")
-        .is_some()
+}
+
+fn retained(ledger: &StockOriginalLedger, name: &str) -> bool {
+    matches!(custody(ledger, name), RetainedCustody::Retained(_))
 }
 
 /// A candidate authenticates only its own submission; native acceptance
@@ -195,6 +198,53 @@ fn a_candidate_becomes_custody_only_through_native_acceptance() {
         .expect("released");
     assert!(!retained(&ledger, "a"));
     assert!(!held(&ledger, "b", "a"));
+}
+
+/// The ledger's own bound on a pending admission: a candidate reads
+/// `AdmissionPending` only while the one submission that recorded it holds its
+/// [`PendingOriginal`]. Promotion makes it `Retained`; dropping the handle, or
+/// a promotion that cannot publish, withdraws it for good (`NotRetained`). An
+/// exact replay of an admitted original stays `Retained`.
+#[test]
+fn a_candidate_is_pending_only_while_its_submission_holds_it() {
+    let (ledger, _) = ledger();
+    let promoted = ledger
+        .record_candidate(&namespace("a"), &principal("requester"), original("a"))
+        .expect("recorded");
+    assert_eq!(custody(&ledger, "a"), RetainedCustody::AdmissionPending);
+    promoted.admit().expect("admitted");
+    assert!(retained(&ledger, "a"));
+    let replay = ledger
+        .record_candidate(&namespace("a"), &principal("requester"), original("a"))
+        .expect("an exact replay keeps the admitted record");
+    assert!(
+        retained(&ledger, "a"),
+        "a replay of an admitted original is no candidate"
+    );
+    drop(replay);
+    assert!(retained(&ledger, "a"));
+
+    let dropped = ledger
+        .record_candidate(&namespace("b"), &principal("requester"), original("b"))
+        .expect("recorded");
+    assert_eq!(custody(&ledger, "b"), RetainedCustody::AdmissionPending);
+    drop(dropped);
+    assert_eq!(custody(&ledger, "b"), RetainedCustody::NotRetained);
+
+    let failing = ledger
+        .record_candidate(&namespace("c"), &principal("requester"), original("c"))
+        .expect("recorded");
+    ledger.fail_next_promotion_for_test();
+    assert!(matches!(
+        failing.admit(),
+        Err(StockCustodyError::Unavailable)
+    ));
+    assert_eq!(
+        custody(&ledger, "c"),
+        RetainedCustody::NotRetained,
+        "a promotion that cannot publish withdraws the candidate"
+    );
+    assert!(!held(&ledger, "c", "c"), "and leaves no candidate behind");
 }
 
 /// Two distinct candidates never share an occurrence: the second is refused,
@@ -531,6 +581,260 @@ fn a_pending_candidate_never_authenticates_as_a_contributor_of_a_replay() {
     drop(replay);
 }
 
+/// The scoped native check over this ledger, and the input of original `a`
+/// in occurrence `s2` naming `b` (whose own occurrence is `s1`) as its
+/// contributor.
+fn contributor_check(
+    ledger: &Arc<StockOriginalLedger>,
+) -> (
+    ScopedOriginalIngress,
+    Input,
+    NativeIngressContext,
+    InputAuthorityAssociation,
+) {
+    let grants = Arc::new(
+        LocalGrantAuthority::new(
+            LocalGrantConfiguration {
+                root: principal("grant-owner"),
+                namespace: id("controller"),
+                generation: 1,
+            },
+            ledger.publication.clone(),
+            Arc::new(Clock),
+        )
+        .expect("actual generated grant owner"),
+    );
+    let space = namespace("s2");
+    let check = ScopedOriginalIngress::new(
+        grants,
+        space.ingress.clone(),
+        Arc::clone(ledger) as Arc<dyn AuthenticatedOriginalSource>,
+        &ScopedInvocation::from_policy(Arc::new(Policy)),
+    );
+    let mut a = original("a");
+    a.occurrence_scope = id("s2");
+    a.contributing_work = vec![work("b")];
+    let association = association_of(&a, &space);
+    let mut prompt = PromptInput::new("a names b", None);
+    prompt.header.authority_association = Some(association.clone());
+    let input = Input::Prompt(prompt);
+    let ingress = NativeIngressContext::from_trusted_ingress(
+        &input,
+        principal("requester"),
+        principal("cli"),
+        RealmId::parse("stock").expect("realm"),
+        evidence("local-os-user"),
+    )
+    .expect("trusted ingress");
+    let _a = ledger
+        .record_candidate(&space, &principal("requester"), a)
+        .expect("a's own submission")
+        .admit();
+    (check, input, ingress, association)
+}
+
+fn b_in_its_own_occurrence() -> AuthenticatedOriginal {
+    let mut b = original("b");
+    b.occurrence_scope = id("s1");
+    b
+}
+
+/// RED-1 (R1): input naming a contributor whose admission its owner has not
+/// settled yet is not yet admissible, never a malformed claim. The check reads
+/// the contributor's custody before the requester-bound lookup, which never
+/// answers for another occurrence's candidate. Once the owner promotes the
+/// contributor, the same check passes.
+#[test]
+fn a_pending_contributor_is_not_yet_admissible() {
+    let (ledger, _) = ledger();
+    let (check, input, ingress, association) = contributor_check(&ledger);
+    let runtime = LogicalRuntimeId::new("rt");
+    let pending_b = ledger
+        .record_candidate(
+            &namespace("s1"),
+            &principal("requester"),
+            b_in_its_own_occurrence(),
+        )
+        .expect("b recorded in its own occurrence");
+    let not_yet = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        matches!(
+            not_yet,
+            Err(NativeAdmissionError::Readiness(
+                meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending
+            ))
+        ),
+        "not yet admissible while b is pending: {not_yet:?}"
+    );
+    pending_b.admit().expect("b admitted");
+    let admitted = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        admitted.is_ok(),
+        "admissible once b is promoted: {admitted:?}"
+    );
+}
+
+/// The sequence pin for R1's read order: a contributor that another requester
+/// recorded gets the not-yet answer while it is pending (its custody is read
+/// before the requester-bound lookup), and after its promotion the
+/// requester-bound lookup still refuses it as malformed, never `Ok`.
+#[test]
+fn another_requesters_pending_contributor_is_not_yet_then_still_malformed() {
+    let (ledger, _) = ledger();
+    let (check, input, ingress, association) = contributor_check(&ledger);
+    let runtime = LogicalRuntimeId::new("rt");
+    let pending_b = ledger
+        .record_candidate(
+            &namespace("s1"),
+            &principal("someone-else"),
+            b_in_its_own_occurrence(),
+        )
+        .expect("b recorded by another requester");
+    let not_yet = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        matches!(
+            not_yet,
+            Err(NativeAdmissionError::Readiness(
+                meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending
+            ))
+        ),
+        "not yet while b is pending: {not_yet:?}"
+    );
+    pending_b.admit().expect("b admitted for its own requester");
+    let settled = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        matches!(
+            &settled,
+            Err(NativeAdmissionError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::MalformedFacts
+        ),
+        "the requester-bound lookup still decides once b is settled: {settled:?}"
+    );
+}
+
+/// CONTROL-cancelled (R1): a pending contributor whose operations are
+/// cancelled is still a definite refusal, never "not yet". CONTROL-notheld
+/// (R1): a contributor the owner never recorded stays malformed.
+#[test]
+fn a_cancelled_or_unknown_contributor_stays_a_definite_refusal() {
+    let (ledger, _) = ledger();
+    let (check, input, ingress, association) = contributor_check(&ledger);
+    let runtime = LogicalRuntimeId::new("rt");
+    let unknown = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        matches!(
+            &unknown,
+            Err(NativeAdmissionError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::MalformedFacts
+        ),
+        "a contributor never recorded: {unknown:?}"
+    );
+    let _pending_b = ledger
+        .record_candidate(
+            &namespace("s1"),
+            &principal("requester"),
+            b_in_its_own_occurrence(),
+        )
+        .expect("b recorded in its own occurrence");
+    ledger
+        .cancel_operations(&namespace("s1"), &work("b"), evidence("cancel-b"))
+        .expect("a pending candidate can be cancelled");
+    let cancelled = check.check(&runtime, &input, &ingress, &association);
+    assert!(
+        matches!(
+            &cancelled,
+            Err(NativeAdmissionError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::Denied
+        ),
+        "a cancellation wins over a pending admission: {cancelled:?}"
+    );
+}
+
+/// RED-4 (R3): a contributor released and recorded again as a candidate is
+/// pending, not gone. A fresh preparation of an operation of work that names
+/// it is unavailable (retried), never denied, until the owner settles it.
+/// CONTROL-cancelled (R3): cancelled while pending, it is denied.
+#[test]
+fn a_re_presented_pending_contributor_makes_operations_unavailable_not_denied() {
+    let (ledger, publication) = ledger();
+    let grants = Arc::new(
+        LocalGrantAuthority::new(
+            LocalGrantConfiguration {
+                root: principal("grant-owner"),
+                namespace: id("controller"),
+                generation: 1,
+            },
+            publication,
+            Arc::new(Clock),
+        )
+        .expect("actual generated grant owner"),
+    );
+    let configuration = ScopedGrantComposition {
+        grants: Arc::clone(&grants),
+        ingress_domain: namespace("x").ingress,
+        originals: Arc::clone(&ledger) as Arc<dyn AuthenticatedOriginalSource>,
+        invocation: ScopedInvocation::from_policy(Arc::new(Policy)),
+        operation_owner: Arc::new(Records),
+        retained_resume: None,
+    }
+    .into_configuration();
+    let policy = Arc::new(GrantBackedWorkPolicy::new(
+        grants,
+        configuration.invocation_owner,
+        configuration.operation_owner,
+    ));
+    ledger
+        .record_candidate(&namespace("a"), &principal("requester"), original("a"))
+        .expect("recorded")
+        .admit()
+        .expect("admitted");
+    let context = policy
+        .work_context(Arc::from([association_naming_a()]), scope())
+        .expect("work context");
+    let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+        operation_id: meerkat_core::OperationId::new(),
+        execution_scope: context.execution_scope().clone(),
+        run_id: Some(meerkat_core::RunId::new()),
+        context_revision: None,
+        operation: AuthorizationOperation::Source(SourceAuthorizationFacts {
+            target: SourceAuthorizationTarget::External(OwnerQualifiedTarget {
+                authority: principal("owner"),
+                namespace: "records".into(),
+                id: "record".into(),
+            }),
+            usage: SourceAuthorizationUse::Read,
+        }),
+    });
+    PreparedOperationCheck::prepare(context.clone(), binding.clone())
+        .expect("prepared while the contributor is held");
+
+    ledger
+        .release(&namespace("a"), &work("a"))
+        .expect("released");
+    let pending_a = ledger
+        .record_candidate(&namespace("a"), &principal("requester"), original("a"))
+        .expect("presented again");
+    assert!(
+        matches!(
+            PreparedOperationCheck::prepare(context.clone(), binding.clone()),
+            Err(meerkat_core::OperationAuthorizationError::Unavailable)
+        ),
+        "a pending contributor is not yet, never denied"
+    );
+    ledger
+        .cancel_operations(&namespace("a"), &work("a"), evidence("cancel-a"))
+        .expect("a pending candidate can be cancelled");
+    assert!(
+        matches!(
+            PreparedOperationCheck::prepare(context, binding),
+            Err(meerkat_core::OperationAuthorizationError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::Denied
+        ),
+        "a cancellation wins over a pending admission"
+    );
+    drop(pending_a);
+}
+
 /// Cancelling an original's operations keeps its identity and admitted
 /// custody (so its controller evidence survives) and is published on the
 /// grant publication; its disposition is then cancelled, for a sibling it is
@@ -836,6 +1140,178 @@ async fn a_helper_work_item_is_admitted_only_while_its_child_original_is_current
     );
 }
 
+/// RED-2 (R2): a retained ancestor released and recorded again as a pending
+/// candidate makes the helper's WorkGraph admission unavailable (retried),
+/// never denied, and nothing is created; once its owner promotes it, the
+/// admission is created. CONTROL-cancelled (R2): cancelled while pending, the
+/// ancestor refuses the admission.
+#[tokio::test]
+async fn a_pending_retained_ancestor_makes_the_helper_admission_unavailable() {
+    use crate::governed_realm::helper_admission::{
+        GovernedHelperAdmissionFence, HelperAdmissionRefusal,
+    };
+    use meerkat_workgraph::{
+        CreateWorkItemRequest, MemoryWorkGraphStore, WorkAdmissionKey, WorkAdmissionOutcome,
+        WorkGraphError, WorkGraphService, WorkNamespace,
+    };
+
+    let (ledger, publication) = ledger();
+    let grants = Arc::new(
+        LocalGrantAuthority::new(
+            LocalGrantConfiguration {
+                root: principal("grant-owner"),
+                namespace: id("controller"),
+                generation: 1,
+            },
+            publication,
+            Arc::new(Clock),
+        )
+        .expect("grant owner on the ledger's publication"),
+    );
+    let configuration = ScopedGrantComposition {
+        grants: Arc::clone(&grants),
+        ingress_domain: namespace("x").ingress,
+        originals: Arc::clone(&ledger) as Arc<dyn AuthenticatedOriginalSource>,
+        invocation: ScopedInvocation::from_policy(Arc::new(Policy)),
+        operation_owner: Arc::new(Records),
+        retained_resume: None,
+    }
+    .into_configuration();
+    let policy = Arc::new(GrantBackedWorkPolicy::new(
+        Arc::clone(&grants),
+        configuration.invocation_owner,
+        configuration.operation_owner,
+    ));
+    let admit = |original: AuthenticatedOriginal, occurrence: &str| {
+        ledger
+            .record_candidate(&namespace(occurrence), &principal("requester"), original)
+            .expect("recorded")
+            .admit()
+            .expect("admitted");
+    };
+    admit(original("b"), "b");
+    admit(original("c"), "c");
+    let mut a = original("a");
+    a.contributing_work = vec![work("b")];
+    admit(a.clone(), "a");
+    let child = association_of(&a, &namespace("a"));
+    let retained: Arc<[meerkat_authorization::work::RetainedOriginal]> =
+        Arc::from([meerkat_authorization::work::RetainedOriginal {
+            namespace: namespace("c"),
+            original: work("c"),
+        }]);
+    let context = policy
+        .work_context(Arc::from([child.clone()]), scope())
+        .expect("work context");
+    let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+        operation_id: meerkat_core::OperationId::new(),
+        execution_scope: context.execution_scope().clone(),
+        run_id: Some(meerkat_core::RunId::new()),
+        context_revision: None,
+        operation: AuthorizationOperation::Source(SourceAuthorizationFacts {
+            target: SourceAuthorizationTarget::External(OwnerQualifiedTarget {
+                authority: principal("owner"),
+                namespace: "records".into(),
+                id: "record".into(),
+            }),
+            usage: SourceAuthorizationUse::Read,
+        }),
+    });
+    // Prepared after the last custody change, so the fence reads the
+    // ancestor's custody, never a stale preparation.
+    let setup = || {
+        PreparedOperationCheck::prepare(context.clone(), binding.clone())
+            .expect("the setup operation is prepared")
+    };
+    let service = WorkGraphService::new(Arc::new(MemoryWorkGraphStore::new()));
+    let request = || CreateWorkItemRequest {
+        title: "setup helper".to_string(),
+        ..Default::default()
+    };
+    let key = |value: &str| WorkAdmissionKey::new(value).expect("key");
+    let fence = |value: &str| {
+        GovernedHelperAdmissionFence::new(
+            Arc::clone(&grants),
+            ledger.clone(),
+            child.clone(),
+            Arc::clone(&retained),
+            setup(),
+            Arc::clone(&policy),
+            Arc::new(Clock),
+            "default",
+            WorkNamespace::default(),
+            service
+                .admission_identity(key(value), request())
+                .expect("identity"),
+        )
+    };
+    let refused = |result: Result<WorkAdmissionOutcome, WorkGraphError>,
+                   fence: &GovernedHelperAdmissionFence,
+                   expected: HelperAdmissionRefusal,
+                   label: &str| {
+        assert!(
+            matches!(result, Err(WorkGraphError::Conflict(_))),
+            "{label}"
+        );
+        assert_eq!(fence.refusal(), Some(expected), "{label}");
+    };
+
+    ledger
+        .release(&namespace("c"), &work("c"))
+        .expect("the ancestor is released");
+    let pending_c = ledger
+        .record_candidate(&namespace("c"), &principal("requester"), original("c"))
+        .expect("and presented again");
+    let not_yet = fence("helper-1");
+    refused(
+        service
+            .create_idempotent_with_fence(key("helper-1"), request(), not_yet.clone())
+            .await,
+        &not_yet,
+        HelperAdmissionRefusal::Unavailable,
+        "a pending ancestor is not yet, never denied",
+    );
+    pending_c.admit().expect("the ancestor is promoted");
+    let current = fence("helper-1");
+    assert!(matches!(
+        service
+            .create_idempotent_with_fence(key("helper-1"), request(), current.clone())
+            .await,
+        Ok(WorkAdmissionOutcome::Created(_))
+    ));
+
+    ledger
+        .release(&namespace("c"), &work("c"))
+        .expect("released again");
+    let _pending_again = ledger
+        .record_candidate(&namespace("c"), &principal("requester"), original("c"))
+        .expect("presented again");
+    ledger
+        .cancel_operations(&namespace("c"), &work("c"), evidence("cancel"))
+        .expect("cancelled while pending");
+    let cancelled = fence("helper-2");
+    refused(
+        service
+            .create_idempotent_with_fence(key("helper-2"), request(), cancelled.clone())
+            .await,
+        &cancelled,
+        HelperAdmissionRefusal::Denied,
+        "a cancellation wins over a pending admission",
+    );
+    assert_eq!(
+        service
+            .list(meerkat_workgraph::WorkItemFilter {
+                include_terminal: true,
+                ..Default::default()
+            })
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "the refused admissions wrote nothing"
+    );
+}
+
 /// A retained ancestor's REAL grant bounds the setup operation: a current
 /// permissive grant admits, a restrictive grant whose actions exclude the
 /// operation refuses, and a revoked grant refuses. A default dispatch context
@@ -1121,15 +1597,15 @@ fn each_original_resolves_under_its_own_ingress_and_unavailable_stays_typed() {
                 .authenticated_original(ingress, namespace, original)
         }
 
-        fn retained_original(
+        fn retained_custody(
             &self,
             namespace: &QualifiedIngressNamespace,
             original: &OriginalWorkRef,
-        ) -> Result<Option<WorkAuthorityBasis>, ControllerReadinessFailure> {
+        ) -> Result<RetainedCustody, ControllerReadinessFailure> {
             if original == &self.broken {
                 return Err(ControllerReadinessFailure::PolicyUnavailable);
             }
-            self.ledger.retained_original(namespace, original)
+            self.ledger.retained_custody(namespace, original)
         }
     }
 

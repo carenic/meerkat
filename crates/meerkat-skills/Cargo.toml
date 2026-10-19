@@ -28,7 +28,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 strum = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 indexmap = "2"
 regex = "1"
 urlencoding = { version = "2", optional = true }

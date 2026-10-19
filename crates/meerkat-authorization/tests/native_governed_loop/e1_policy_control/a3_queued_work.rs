@@ -323,7 +323,7 @@ fn assert_queued_controller_fallback(
     let (refused_index, refused) = refusals[0];
     assert!(
         matches!(&refused.observation.observation,
-            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+            AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
             if target.as_ref() == &AuditTarget::Model(hosted)
         ),
         "unexpected queued refusal target or reason: {diagnostic}"
@@ -649,7 +649,7 @@ async fn exercise_queued(server: &Server, barriers: Arc<QueueBarriers>) {
     let first_audit = observations(&first_row);
     assert_originals(&first_audit, &session_id, &first_id, &first_run);
     let denied: Vec<_> = first_audit.iter().filter(|record| matches!(&record.observation.observation,
-        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied }
+        AuditObservation::Refused { target, reason: OperationRefusalKind::Denied, .. }
         if matches!(target.as_ref(), AuditTarget::Tool { call_id, tool_name, .. } if call_id == DENIED_CALL && tool_name == "delete_record"))).collect();
     assert_eq!(denied.len(), 1);
     assert!(

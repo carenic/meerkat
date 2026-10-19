@@ -135,8 +135,71 @@ pub struct AuditPolicyRead {
     /// successful preparation. Refusals never claim every conjunct resolved.
     pub operation_authorities: Vec<WorkAuthorityBasis>,
     pub controller_lineages: Vec<Vec<GrantLineageRef>>,
+    /// The publication instance `publication_sequence` belongs to. Sequences
+    /// of different instances do not compare. Records written before 0.9.4
+    /// omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_instance: Option<uuid::Uuid>,
 }
 
+/// The publication read one refusal was decided at, and its basis. Process-
+/// local diagnostic data like [`AuditPolicyRead`]: not a permission, durable
+/// policy epoch or cross-process freshness proof.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRefusalRead {
+    pub observed_at_ms: u64,
+    pub basis: AuditRefusalBasis,
+    /// The sequence the refused attempt read: the coherent sequence of an
+    /// owner answer; when the publication changed, the sequence read just
+    /// before the attempt (for a refusal at a prepared decision's check, the
+    /// decision's own sequence).
+    pub publication_sequence: u64,
+    /// The live sequence once the refused attempt ended, when the
+    /// publication changed under it. Absent for an owner answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_sequence: Option<u64>,
+    pub publication_instance: uuid::Uuid,
+}
+
+impl AuditRefusalRead {
+    #[must_use]
+    pub const fn new(
+        observed_at_ms: u64,
+        basis: AuditRefusalBasis,
+        publication_sequence: u64,
+        live_sequence: Option<u64>,
+        publication_instance: uuid::Uuid,
+    ) -> Self {
+        Self {
+            observed_at_ms,
+            basis,
+            publication_sequence,
+            live_sequence,
+            publication_instance,
+        }
+    }
+}
+
+/// Why a refusal was decided at its read.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRefusalBasis {
+    /// The owners answered at one coherent publication. A refusal from the
+    /// prepared decision's own validity window (its not-before, expiry or
+    /// deadline) is such an answer too, not a policy change.
+    OwnerAnswer,
+    /// The publication changed after the sequence the attempt read (under a
+    /// preparation, or after a prepared decision's own read when its check
+    /// refused to rebuild), and the change completed.
+    PublicationChanged,
+    /// An owner change was still in progress when the attempt ended.
+    ChangeInProgress,
+}
+
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuditObservation {
@@ -151,6 +214,11 @@ pub enum AuditObservation {
     Refused {
         target: Arc<AuditTarget>,
         reason: OperationRefusalKind,
+        /// The publication read the refusal was decided at. Records written
+        /// before 0.9.4 omit it, and a refusal whose read could not be
+        /// taken has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read: Option<AuditRefusalRead>,
     },
     AuthorizationUnavailable {
         target: Arc<AuditTarget>,
@@ -271,6 +339,7 @@ redacted_debug!(
     AuditRecipient,
     AuditToolOwner,
     AuditPolicyRead,
+    AuditRefusalRead,
     AuditObservation,
     AuthorizationAuditObservation,
     AuditReviewAttribution,
@@ -410,6 +479,91 @@ mod tests {
         let decoded: AuthorizationAuditObservation = serde_json::from_value(old.clone()).unwrap();
         assert!(decoded.review_attribution.is_none());
         assert!(decoded.delegate_attribution.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+    }
+
+    /// A refusal record carries the publication read it was decided at, and
+    /// a policy read names its publication instance. Records written before
+    /// either decode without them and round-trip unchanged; an unknown basis
+    /// is refused.
+    #[test]
+    fn refusal_and_policy_reads_round_trip_and_old_records_omit_them() {
+        let target = Arc::new(AuditTarget::Publication {
+            recipient: AuditRecipient::Principal {
+                principal: PrincipalRef::in_domain(
+                    meerkat_core::PrincipalKind::ServiceAccount,
+                    "recipient",
+                    meerkat_core::TrustDomainId::new("audit").unwrap(),
+                )
+                .unwrap(),
+            },
+            mode: AuditPublicationMode::Buffered,
+        });
+        let instance = uuid::Uuid::new_v4();
+        let record = |observation| AuthorizationAuditObservation {
+            operation_id: OperationId::new(),
+            execution_scope: OperationExecutionScope::Domain,
+            run_id: None,
+            context_revision: None,
+            review_attribution: None,
+            delegate_attribution: None,
+            observation,
+        };
+        let refused = record(AuditObservation::Refused {
+            target: Arc::clone(&target),
+            reason: OperationRefusalKind::ReprepareRequired,
+            read: Some(AuditRefusalRead::new(
+                7,
+                AuditRefusalBasis::PublicationChanged,
+                2,
+                Some(4),
+                instance,
+            )),
+        });
+        let encoded = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            encoded["observation"]["read"]["basis"],
+            serde_json::json!("publication_changed")
+        );
+        let decoded: AuthorizationAuditObservation =
+            serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded == refused);
+        let mut unknown = encoded.clone();
+        unknown["observation"]["read"]["basis"] = serde_json::json!("future_basis");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown).is_err());
+        let mut old = encoded;
+        old["observation"].as_object_mut().unwrap().remove("read");
+        let decoded: AuthorizationAuditObservation = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            decoded.observation,
+            AuditObservation::Refused { read: None, .. }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+
+        let prepared = record(AuditObservation::Prepared {
+            target,
+            policy: AuditPolicyRead {
+                publication_sequence: 4,
+                observed_at_ms: 7,
+                operation_authorities: Vec::new(),
+                controller_lineages: Vec::new(),
+                publication_instance: Some(instance),
+            },
+        });
+        let encoded = serde_json::to_value(&prepared).unwrap();
+        let decoded: AuthorizationAuditObservation =
+            serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded == prepared);
+        let mut old = encoded;
+        old["observation"]["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_instance");
+        let decoded: AuthorizationAuditObservation = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            &decoded.observation,
+            AuditObservation::Prepared { policy, .. } if policy.publication_instance.is_none()
+        ));
         assert_eq!(serde_json::to_value(decoded).unwrap(), old);
     }
 

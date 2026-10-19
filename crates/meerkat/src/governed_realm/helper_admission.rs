@@ -49,8 +49,9 @@ pub enum HelperAdmissionRefusal {
     /// review this entry cannot carry, or a relevant original is cancelled,
     /// no longer retained or does not allow the operation.
     Denied,
-    /// The owners cannot say now (contention, clock or custody unavailable).
-    /// The store operation did not run; nothing was committed or disclosed.
+    /// The owners cannot say now (contention, a refusal to rebuild after an
+    /// owner change, clock or custody unavailable). The store operation did
+    /// not run; nothing was committed or disclosed.
     Unavailable,
 }
 
@@ -316,8 +317,11 @@ fn check_prepared(
 
 fn refusal_of(error: OperationAuthorizationError) -> HelperAdmissionRefusal {
     match error {
-        OperationAuthorizationError::Refused(_) => HelperAdmissionRefusal::Denied,
-        OperationAuthorizationError::Unavailable
+        OperationAuthorizationError::Refused(refusal) if super::effect_leaf_denies(refusal) => {
+            HelperAdmissionRefusal::Denied
+        }
+        OperationAuthorizationError::Refused(_)
+        | OperationAuthorizationError::Unavailable
         | OperationAuthorizationError::ObservationUnavailable(_) => {
             HelperAdmissionRefusal::Unavailable
         }
@@ -326,7 +330,11 @@ fn refusal_of(error: OperationAuthorizationError) -> HelperAdmissionRefusal {
 
 fn tool_refusal_of(error: &meerkat_core::ToolError) -> HelperAdmissionRefusal {
     match error {
-        meerkat_core::ToolError::AuthorizationRefused { .. } => HelperAdmissionRefusal::Denied,
+        meerkat_core::ToolError::AuthorizationRefused { refusal, .. }
+            if super::effect_leaf_denies(*refusal) =>
+        {
+            HelperAdmissionRefusal::Denied
+        }
         _ => HelperAdmissionRefusal::Unavailable,
     }
 }

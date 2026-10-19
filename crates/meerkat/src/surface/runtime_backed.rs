@@ -3202,9 +3202,7 @@ mod tests {
                 })
             });
             let done: Result<LlmEvent, LlmError> = Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             });
             Box::pin(futures::StreamExt::chain(
                 usage,
@@ -3253,9 +3251,7 @@ mod tests {
                     },
                     usage(),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     },
                 ]
             } else {
@@ -3266,9 +3262,7 @@ mod tests {
                     },
                     usage(),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     },
                 ]
             };
@@ -4252,9 +4246,7 @@ mod tests {
                 ),
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::ToolUse,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
             },
         ]);
         let (service, adapter) = build_test_service_with_llm(&temp, Arc::new(llm)).await;

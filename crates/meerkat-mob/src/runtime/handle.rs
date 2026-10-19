@@ -2422,6 +2422,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // So does a shutting-down one.
+        MobError::ShutdownInProgress { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         MobError::MemberRetirementInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -8903,9 +8907,12 @@ impl MobHandle {
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
+                // A shutting-down source answers without revoking: the
+                // recovery transport revokes instead, as once it has exited.
                 Err(
                     error @ (MobError::ActorCommandChannelClosed
-                    | MobError::ActorReplyChannelClosed),
+                    | MobError::ActorReplyChannelClosed
+                    | MobError::ShutdownInProgress { .. }),
                 ) => error,
                 Err(error) => return Err(error),
             }
@@ -14361,6 +14368,16 @@ impl MobHandle {
     }
 
     /// Retire active members, clear persisted mob storage, and terminate the actor.
+    ///
+    /// Once the destroy is admitted (its durable destroy marker is written)
+    /// admission closes, before any destroy cleanup (D67; the reason is
+    /// [`MobAdmissionCloseReason::Destroyed`](crate::runtime::MobAdmissionCloseReason::Destroyed)
+    /// unless admission had already closed): [`Self::acquire_owner`] and every
+    /// command the Closing state refuses then fail with
+    /// [`MobError::AdmissionClosed`]. A destroy left incomplete after its
+    /// admission keeps admission closed; retry the destroy. A mob restored
+    /// with that marker starts with admission closed: `MobBuilder::resume`
+    /// returns its handle already closed.
     pub async fn destroy(&self) -> Result<MobDestroyReport, MobDestroyError> {
         match self
             .execute_destroy_machine_command(MobMachineCommand::Destroy)
@@ -14540,6 +14557,16 @@ impl MobHandle {
 
     /// Shut down the actor. After this, no more commands are accepted.
     ///
+    /// The admitted Shutdown closes admission first, before any teardown
+    /// (D67; the reason is
+    /// [`MobAdmissionCloseReason::Shutdown`](crate::runtime::MobAdmissionCloseReason::Shutdown)
+    /// unless admission had already closed): from then on
+    /// [`Self::acquire_owner`] and every command the Closing state refuses
+    /// fail with [`MobError::AdmissionClosed`], and [`Self::admission_closed`]
+    /// reports the reason. A Shutdown that fails after its admission leaves
+    /// admission closed: the mob can still be torn down (Shutdown again, or
+    /// Destroy) but admits no new work. A Stop leaves admission open.
+    ///
     /// Shutdown makes progress past members it cannot settle instead of
     /// waiting on them:
     /// - an in-flight member retirement is interrupted cooperatively;
@@ -14657,6 +14684,23 @@ impl MobHandle {
             "member turn admission test gate already armed for this identity and stage"
         );
         (entered_rx, release_tx)
+    }
+
+    /// Hold this mob's next Shutdown in its inline drain: the actor spawns a
+    /// member-live task that the drain joins, and that task ends once the
+    /// returned sender is used or dropped. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn hold_shutdown_drain_for_test(
+        &self,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, MobError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.send_actor_command(|reply_tx| MobCommand::SpawnHeldLiveMutationForTest {
+            release_rx,
+            reply_tx,
+        })
+        .await??;
+        Ok(release_tx)
     }
 
     /// Move `identity`'s session binding to `session_id` under its current

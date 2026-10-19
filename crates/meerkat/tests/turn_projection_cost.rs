@@ -83,9 +83,7 @@ fn selection() -> ControllerModelSelection {
 
 fn done(reason: StopReason) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success {
-            stop_reason: reason,
-        },
+        outcome: LlmDoneOutcome::success(reason),
     })
 }
 

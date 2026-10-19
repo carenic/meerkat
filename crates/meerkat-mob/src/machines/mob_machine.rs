@@ -5994,7 +5994,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_reset_requires_old_history_exact_successor_and_new_fence() {
+    fn recovered_reset_requires_old_history_ascent_and_new_fence() {
         let identity = AgentIdentity::from("reset-history");
         let runtime_v0 = AgentRuntimeId::from("reset-history:0");
         let runtime_v1 = AgentRuntimeId::from("reset-history:1");
@@ -6043,9 +6043,9 @@ mod tests {
                 FenceToken(8),
             ),
             (
-                "skipped successor",
+                "repeated generation",
                 Generation(0),
-                Generation(2),
+                Generation(0),
                 FenceToken(8),
             ),
             ("reused fence", Generation(0), Generation(1), FenceToken(7)),
@@ -6064,6 +6064,25 @@ mod tests {
                 "{label} must leave the old incarnation current"
             );
         }
+
+        // A mint above the high-water after a reused generation leaves a gap,
+        // and the replay accepts any ascending generation.
+        let mut skipped =
+            MobMachineAuthority::recover_from_state(base.clone()).expect("recover gap base");
+        skipped
+            .apply_signal(MobMachineSignal::RecoverRosterMemberReset {
+                agent_identity: identity.clone(),
+                previous_agent_runtime_id: runtime_v0.clone(),
+                previous_generation: Generation(0),
+                agent_runtime_id: AgentRuntimeId::from("reset-history:2"),
+                fence_token: FenceToken(8),
+                generation: Generation(2),
+            })
+            .expect("an ascending reset replay may skip generations");
+        assert_eq!(
+            skipped.state().identity_runtime_generations.get(&identity),
+            Some(&Generation(2))
+        );
 
         let mut authority =
             MobMachineAuthority::recover_from_state(base).expect("recover valid base");
@@ -6109,6 +6128,130 @@ mod tests {
                     .member_kickoff_error
                     .contains_key(&identity),
             "valid reset must clear every prior kickoff fact"
+        );
+    }
+
+    #[test]
+    fn committed_placed_recovery_accepts_ascending_generations_only() {
+        // Like the roster and reset replays, the placed replay sees only the
+        // events after the last reset, so a member's first recovered
+        // generation can sit above zero, and a mint above the high-water
+        // leaves gaps. A repeated, regressed or exhausted generation stays
+        // refused.
+        let identity = AgentIdentity::from("ascending-placed-worker");
+        let host = HostId("placed-host".to_string());
+        let owner = SessionId("owner-session".to_string());
+        let recovery_signal =
+            |generation: Generation| MobMachineSignal::RecoverCommittedPlacedSpawn {
+                spawn_id: PlacedSpawnId(format!("ascending-spawn-{}", generation.0)),
+                agent_identity: identity.clone(),
+                agent_runtime_id: AgentRuntimeId(format!(
+                    "ascending-placed-worker:{}",
+                    generation.0
+                )),
+                generation,
+                fence_token: FenceToken(51),
+                host_id: host.clone(),
+                host_binding_generation: 1,
+                member_session_id: SessionId("member-session".to_string()),
+                member_peer_endpoint: MemberPeerEndpoint {
+                    name: PeerName("mob/worker/ascending-placed-worker".to_string()),
+                    peer_id: PeerId("ascending-peer-id".to_string()),
+                    address: PeerAddress("tcp://placed-member.test:4200".to_string()),
+                    signing_key: PeerSigningKey([3; 32]),
+                },
+                profile_name: "worker".to_string(),
+                runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
+                external_addressable: true,
+                provision_operation_id: "ascending-operation-id".to_string(),
+                operation_owner_session_id: owner.clone(),
+            };
+        let mut seeded = MobMachineAuthority::new();
+        seeded
+            .apply_signal(MobMachineSignal::RecoverOwnerBridgeSession {
+                bridge_session_id: owner.clone(),
+                destroy_on_owner_archive: false,
+                implicit_delegation_mob: false,
+            })
+            .expect("recover owner before committed placed carrier");
+        seeded
+            .apply_signal(MobMachineSignal::RecoverHostBinding {
+                host_id: host.clone(),
+                pubkey: PeerSigningKey([8; 32]),
+                endpoint: PeerAddress("tcp://placed-host.test:4100".to_string()),
+                epoch: 1,
+                binding_generation: 1,
+                protocol_min: 4,
+                protocol_max: 4,
+                engine_version: "placed-test-engine".to_string(),
+                durable_sessions: true,
+                autonomous_members: true,
+                hard_cancel_member: true,
+                tracked_input_cancel: true,
+                memory_store: true,
+                mcp: true,
+                resolvable_providers: std::collections::BTreeSet::from(["anthropic".to_string()]),
+                approval_forwarding: false,
+                live_endpoint: None,
+            })
+            .expect("recover bound host before committed placed carrier");
+        let base = seeded.state().clone();
+
+        let mut first =
+            MobMachineAuthority::recover_from_state(base.clone()).expect("recover placed base");
+        first
+            .apply_signal(recovery_signal(Generation(3)))
+            .expect("a first recovered placed generation may sit above zero");
+        assert_eq!(
+            first.state().identity_runtime_generations.get(&identity),
+            Some(&Generation(3))
+        );
+
+        // The identity retired at generation 1 earlier in the replayed epoch.
+        let retired_at = |generation: Generation| {
+            let mut state = base.clone();
+            state
+                .identity_runtime_generations
+                .insert(identity.clone(), generation);
+            state
+                .identity_runtime_fence_tokens
+                .insert(identity.clone(), FenceToken(50));
+            state
+                .member_profile_names
+                .insert(identity.clone(), "worker".to_string());
+            state
+                .member_runtime_modes
+                .insert(identity.clone(), SpawnPolicyRuntimeMode::TurnDriven);
+            MobMachineAuthority::recover_from_state(state).expect("recover retired history")
+        };
+        for (label, retired, generation) in [
+            ("repeated generation", Generation(1), Generation(1)),
+            ("regressed generation", Generation(1), Generation(0)),
+            (
+                "exhausted generation space",
+                Generation(u64::MAX),
+                Generation(u64::MAX),
+            ),
+        ] {
+            let mut authority = retired_at(retired);
+            assert!(
+                authority.apply_signal(recovery_signal(generation)).is_err(),
+                "{label} must fail closed"
+            );
+            assert!(
+                !authority
+                    .state()
+                    .identity_to_runtime
+                    .contains_key(&identity),
+                "{label} must recover nothing"
+            );
+        }
+        let mut gap = retired_at(Generation(1));
+        gap.apply_signal(recovery_signal(Generation(3)))
+            .expect("an ascending placed replay may skip generations");
+        assert_eq!(
+            gap.state().identity_runtime_generations.get(&identity),
+            Some(&Generation(3))
         );
     }
 

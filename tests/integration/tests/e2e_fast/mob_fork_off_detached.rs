@@ -87,9 +87,7 @@ impl ForkOffScript {
                 },
                 usage.clone(),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 },
             ]
         };
@@ -115,9 +113,7 @@ impl ForkOffScript {
                 },
                 usage,
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                 },
             ];
         }
@@ -664,9 +660,7 @@ fn scripted_text(model: &str, text: &str) -> Vec<LlmEvent> {
             ),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         },
     ]
 }
@@ -687,9 +681,7 @@ fn scripted_tool_call(model: &str, id: &str, name: &str, args: Value) -> Vec<Llm
             ),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::ToolUse,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
         },
     ]
 }
@@ -894,9 +886,7 @@ impl LlmClient for AdmissionScript {
                 meta: None,
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             },
         ];
         let gate = self.gate.clone();

@@ -34,8 +34,11 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   A spawn that finishes into a stopped mob leaves it stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. While a mob shuts down, every other command fails
-  with `ActorCommandChannelClosed`.
+  and reports each member. While a mob shuts down, a command its closed
+  admission refuses (a spawn, work, a flow, wiring) fails with
+  `AdmissionClosed`, and while the Shutdown drains its own work other
+  commands fail with the retryable `ShutdownInProgress`. Once the actor has
+  exited, commands fail with `ActorCommandChannelClosed`.
 - Destroy deletes the mob's database files only after its actor ended and its
   observer drained. Until then it answers `mob_destroy_incomplete` with
   `destroy_report` and `retryable: true` (JSON-RPC and MCP: internal error

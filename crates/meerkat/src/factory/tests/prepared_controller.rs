@@ -1272,9 +1272,7 @@ impl LlmClient for ManagedLeaseClient {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ],
             Err(message) => vec![Err(LlmError::InvalidRequest { message })],

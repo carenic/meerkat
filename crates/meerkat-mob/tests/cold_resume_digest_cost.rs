@@ -165,7 +165,7 @@ impl meerkat_client::LlmClient for ToolRoundClient {
             ),
         });
         events.push(meerkat_client::LlmEvent::Done {
-            outcome: meerkat_client::LlmDoneOutcome::Success { stop_reason },
+            outcome: meerkat_client::LlmDoneOutcome::success(stop_reason),
         });
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
     }

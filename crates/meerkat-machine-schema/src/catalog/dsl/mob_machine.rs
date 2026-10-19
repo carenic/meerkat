@@ -24,6 +24,19 @@ macro_rules! mob_catalog_machine_dsl {
             runtime_fence_tokens: Map<AgentRuntimeId, FenceToken>,
             identity_runtime_generations: Map<AgentIdentity, Generation>,
             identity_runtime_fence_tokens: Map<AgentIdentity, FenceToken>,
+            // Per-identity generation high-water recovered at resume from the
+            // whole event log, every reset epoch included. Resume seeds the
+            // maps above from the last reset epoch only, so without it an
+            // identity re-spawned after a reset and a restart would mint a
+            // generation its pre-reset incarnation already had. Minting reads
+            // it (mob_machine_next_minted_generation). Recovery replay does
+            // not: it accepts any ascending generation, so a store whose last
+            // reset epoch continued or reused a generation still resumes.
+            identity_generation_highwater: Map<AgentIdentity, Generation>,
+            // Closes the high-water recovery window: the recovery signal is
+            // accepted only while this is false, and create and resume seal
+            // it once before the actor runs.
+            identity_generation_highwater_sealed: bool,
             active_run_count: u64,
             flow_authority_schema_version: u64,
             run_status: Map<RunId, Enum<FlowRunStatus>>,
@@ -520,6 +533,8 @@ macro_rules! mob_catalog_machine_dsl {
             runtime_fence_tokens = EmptyMap,
             identity_runtime_generations = EmptyMap,
             identity_runtime_fence_tokens = EmptyMap,
+            identity_generation_highwater = EmptyMap,
+            identity_generation_highwater_sealed = false,
             active_run_count = 0,
             flow_authority_schema_version = 7,
             run_status = EmptyMap,
@@ -1763,6 +1778,8 @@ macro_rules! mob_catalog_machine_dsl {
             OperationPeerTrusted,
             PeerInputAdmitted,
             CreateRun,
+            RecoverIdentityGenerationHighwater { agent_identity: AgentIdentity, generation: Generation },
+            SealIdentityGenerationHighwater,
             // The member's host refused the registration its revival
             // prepared. As ResolveMemberRevivalFailed, plus the shell's
             // stable code naming the refusing hook call.
@@ -2882,6 +2899,17 @@ macro_rules! mob_catalog_machine_dsl {
             && for_all(id in self.identity_runtime_fence_tokens.keys(), self.identity_runtime_generations.contains_key(id))
             && for_all(id in self.member_profile_names.keys(), self.identity_runtime_generations.contains_key(id))
             && for_all(id in self.member_runtime_modes.keys(), self.identity_runtime_generations.contains_key(id))
+        }
+
+        // Whatever an identity mints next is above its recovered high-water,
+        // so no generation repeats within the mob incarnation, across a reset
+        // and a restart too. None is an exhausted generation space, which
+        // mints nothing.
+        invariant next_generation_above_highwater {
+            for_all(id in self.identity_generation_highwater.keys(),
+                mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, id) == None
+                || mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, id).get("value")
+                    > self.identity_generation_highwater.get_copied(id).get("value"))
         }
 
         // `identity_to_runtime` is current membership, while the four maps
@@ -6079,7 +6107,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             guard "bridge_session_present" { bridge_session_id != None }
             update {
@@ -6172,7 +6200,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             guard "bridge_session_absent" { bridge_session_id == None }
             update {
@@ -6253,7 +6281,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "placement_present" { self.member_placement.contains_key(agent_identity) == true }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             guard "bridge_session_present" { bridge_session_id != None }
             guard "ack_endpoint_present" { member_peer_endpoint != None }
@@ -6430,7 +6458,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "spawn_exec_settled" { self.spawn_exec_phase.contains_key(agent_identity) == false }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             guard "identity_not_external_peer" { mob_machine_external_peer_identity_absent(self.external_peer_edges, agent_identity) }
             guard "spawn_profile_name_authorized" { self.spawn_profile_authority_profile_names.contains_key(agent_identity) == true }
@@ -6462,7 +6490,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "spawn_exec_settled" { self.spawn_exec_phase.contains_key(agent_identity) == false }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             guard "identity_not_external_peer" { mob_machine_external_peer_identity_absent(self.external_peer_edges, agent_identity) }
             guard "spawn_profile_name_authorized" { self.spawn_profile_authority_profile_names.contains_key(agent_identity) == true }
@@ -7060,7 +7088,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "no_placed_carrier_cleanup" { mob_machine_placed_cleanup_absent_for_identity(self.pending_placed_carrier_cleanup, agent_identity) }
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "current_binding_absent" { self.identity_to_runtime.contains_key(agent_identity) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            guard "generation_is_next" { Some(generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "replacing_absent" { replacing == None }
             // The member session id comes from the materialization ack at
             // commit; a locally pre-provisioned session for a remote spawn is
@@ -7423,7 +7451,16 @@ macro_rules! mob_catalog_machine_dsl {
             }
             guard "identity_not_recovered" { self.identity_to_runtime.contains_key(agent_identity) == false }
             guard "runtime_not_recovered" { self.live_runtime_ids.contains(agent_runtime_id) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            // Replay sees only the events after the last reset, so an
+            // identity's first recovered generation can continue its
+            // pre-reset history above zero, and a mint above the high-water
+            // can follow a generation an earlier restart reused. Replay
+            // accepts any ascending generation; minting stays above the
+            // high-water.
+            guard "generation_ascends" {
+                mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) != None
+                && generation >= mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity).get("value")
+            }
             guard "pending_attempt_absent" { self.pending_placed_spawn_ids.contains_key(agent_identity) == false }
             guard "committed_attempt_absent" { self.current_placed_spawn_ids.contains_key(agent_identity) == false }
             guard "cleanup_absent" { mob_machine_placed_cleanup_absent_for_identity(self.pending_placed_carrier_cleanup, agent_identity) }
@@ -7541,7 +7578,16 @@ macro_rules! mob_catalog_machine_dsl {
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_not_recovered" { self.identity_to_runtime.contains_key(agent_identity) == false }
             guard "runtime_not_recovered" { self.live_runtime_ids.contains(agent_runtime_id) == false }
-            guard "generation_is_next" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            // Replay sees only the events after the last reset, so an
+            // identity's first recovered generation can continue its
+            // pre-reset history above zero, and a mint above the high-water
+            // can follow a generation an earlier restart reused. Replay
+            // accepts any ascending generation; minting stays above the
+            // high-water.
+            guard "generation_ascends" {
+                mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) != None
+                && generation >= mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity).get("value")
+            }
             update {
                 self.live_runtime_ids.insert(agent_runtime_id);
                 if external_addressable {
@@ -7801,7 +7847,16 @@ macro_rules! mob_catalog_machine_dsl {
             guard "previous_runtime_recovered" { self.live_runtime_ids.contains(previous_agent_runtime_id) == true }
             guard "identity_recovered" { self.identity_to_runtime.get_cloned(agent_identity) == Some(previous_agent_runtime_id) }
             guard "previous_generation_matches_history" { self.identity_runtime_generations.get_copied(agent_identity) == Some(previous_generation) }
-            guard "generation_is_exact_successor" { Some(generation) == mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) }
+            // Replay sees only the events after the last reset, so an
+            // identity's first recovered generation can continue its
+            // pre-reset history above zero, and a mint above the high-water
+            // can follow a generation an earlier restart reused. Replay
+            // accepts any ascending generation; minting stays above the
+            // high-water.
+            guard "generation_ascends" {
+                mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity) != None
+                && generation >= mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity).get("value")
+            }
             guard "fence_token_changes" { self.identity_runtime_fence_tokens.get_copied(agent_identity) != Some(fence_token) }
             guard "replacement_runtime_not_recovered" { self.live_runtime_ids.contains(agent_runtime_id) == false }
             guard "previous_runtime_session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(previous_agent_runtime_id) == false }
@@ -9678,8 +9733,9 @@ macro_rules! mob_catalog_machine_dsl {
             per_phase [Running, Stopped, Completed, Destroyed]
             on input ComputeRespawnGeneration { agent_identity }
             guard "generation_space_available" {
-                mob_machine_next_respawn_generation(
+                mob_machine_next_minted_generation(
                     self.identity_runtime_generations,
+                    self.identity_generation_highwater,
                     agent_identity
                 ) != None
             }
@@ -9687,8 +9743,9 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
             emit RespawnGenerationComputed {
                 agent_identity: agent_identity,
-                next_generation: mob_machine_next_respawn_generation(
+                next_generation: mob_machine_next_minted_generation(
                     self.identity_runtime_generations,
+                    self.identity_generation_highwater,
                     agent_identity
                 ).get("value")
             }
@@ -12581,6 +12638,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
+                self.identity_generation_highwater = EmptyMap;
                 self.identity_runtime_fence_tokens = EmptyMap;
                 self.member_session_bindings = EmptyMap;
                 self.member_profile_names = EmptyMap;
@@ -19380,6 +19438,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
+                self.identity_generation_highwater = EmptyMap;
                 self.identity_runtime_fence_tokens = EmptyMap;
                 self.member_session_bindings = EmptyMap;
                 self.member_profile_names = EmptyMap;
@@ -22124,6 +22183,35 @@ macro_rules! mob_catalog_machine_dsl {
             emit EmitRunLifecycleNotice
         }
 
+        // Resume recovers each identity's generation high-water from the whole
+        // log before it seeds the last reset epoch, and only before the seal.
+        // It inserts or raises; a lower value is refused, never applied.
+        transition RecoverIdentityGenerationHighwater {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal RecoverIdentityGenerationHighwater { agent_identity, generation }
+            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
+            guard "highwater_not_lowered" {
+                self.identity_generation_highwater.contains_key(agent_identity) == false
+                || generation >= self.identity_generation_highwater.get_copied(agent_identity).get("value")
+            }
+            update {
+                self.identity_generation_highwater.insert(agent_identity, generation);
+            }
+            to Running
+        }
+
+        // Create and resume close the high-water recovery window once, before
+        // the actor runs; a sealed machine refuses the recovery signal.
+        transition SealIdentityGenerationHighwater {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal SealIdentityGenerationHighwater
+            guard "highwater_recovery_open" { self.identity_generation_highwater_sealed == false }
+            update {
+                self.identity_generation_highwater_sealed = true;
+            }
+            to Running
+        }
+
         transition ResolveMemberRevivalHostRefusedRunning {
             on signal ResolveMemberRevivalHostRefused { agent_identity, refusal_code, reason }
             guard { self.lifecycle_phase == Phase::Running }
@@ -23190,6 +23278,24 @@ macro_rules! mob_catalog_machine_dsl {
             agent_identity: &AgentIdentity,
         ) -> Option<Generation> {
             match identity_runtime_generations.get(agent_identity) {
+                Some(generation) => generation.0.checked_add(1).map(Generation),
+                None => Some(Generation(0)),
+            }
+        }
+
+        // The generation an identity's next incarnation mints: one past the
+        // larger of its retained generation and its recovered high-water, or
+        // zero for an identity in neither. Recovery replay instead accepts
+        // any generation at or above `mob_machine_next_respawn_generation`,
+        // which reads the retained map only.
+        fn mob_machine_next_minted_generation(
+            identity_runtime_generations: &std::collections::BTreeMap<AgentIdentity, Generation>,
+            identity_generation_highwater: &std::collections::BTreeMap<AgentIdentity, Generation>,
+            agent_identity: &AgentIdentity,
+        ) -> Option<Generation> {
+            let retained = identity_runtime_generations.get(agent_identity);
+            let highwater = identity_generation_highwater.get(agent_identity);
+            match retained.max(highwater) {
                 Some(generation) => generation.0.checked_add(1).map(Generation),
                 None => Some(Generation(0)),
             }

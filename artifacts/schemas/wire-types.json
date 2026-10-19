@@ -538,6 +538,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -1300,6 +1329,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -1311,6 +1349,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -2821,6 +2870,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -3006,6 +3104,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -3426,6 +3539,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -4535,6 +4663,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -6009,6 +6224,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",
@@ -25263,6 +25561,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -26025,6 +26352,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -26036,6 +26372,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -27638,6 +27985,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -27823,6 +28219,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -28281,6 +28692,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -29424,6 +29850,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -30898,6 +31411,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",
@@ -38485,6 +39081,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -39247,6 +39872,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -39258,6 +39892,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -42603,6 +43248,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -42803,6 +43497,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -43261,6 +43970,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -44794,6 +45518,93 @@
         },
         "type": "object"
       },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
         "oneOf": [
@@ -46282,6 +47093,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -53414,6 +54308,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -54176,6 +55099,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -54187,6 +55119,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -60495,6 +61438,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -60695,6 +61687,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -61243,6 +62250,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -63970,6 +64992,93 @@
         },
         "type": "object"
       },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
         "oneOf": [
@@ -65534,6 +66643,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -76127,6 +77319,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -76889,6 +78110,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -76900,6 +78130,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -81058,6 +82299,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -81258,6 +82548,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -81716,6 +83021,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -83249,6 +84569,93 @@
         },
         "type": "object"
       },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
         "oneOf": [
@@ -84737,6 +86144,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -91668,6 +93158,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -92430,6 +93949,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -92441,6 +93969,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -93951,6 +95490,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -94136,6 +95724,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -94620,6 +96223,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -95729,6 +97347,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -97212,6 +98917,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SurfaceMetadata": {
         "description": "Opaque caller-owned metadata shared across public surfaces.",
@@ -152608,6 +154396,20 @@
           "kind"
         ],
         "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "An original the input or operation relies on is still its source\nowner's submission candidate: the owner has not settled its admission\nyet.",
+        "properties": {
+          "kind": {
+            "const": "original_admission_pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireControllerReadinessFailure"
@@ -153234,6 +155036,35 @@
               "reason_type",
               "hook_id",
               "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
             ],
             "type": "object"
           }
@@ -153998,6 +155829,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -154009,6 +155849,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -155519,6 +157370,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -155704,6 +157604,21 @@
               "text"
             ],
             "type": "object"
+          }
+        ]
+      },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
           }
         ]
       },
@@ -156162,6 +158077,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -157271,6 +159201,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -158745,6 +160762,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",
@@ -165764,6 +167864,20 @@
             "properties": {
               "kind": {
                 "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An original the input or operation relies on is still its source\nowner's submission candidate: the owner has not settled its admission\nyet.",
+            "properties": {
+              "kind": {
+                "const": "original_admission_pending",
                 "type": "string"
               }
             },
