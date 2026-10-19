@@ -22,8 +22,10 @@ use crate::traits::RuntimeDriverError;
 
 /// A trusted selection of the agent a session acts as: the qualified
 /// executor principal, the exact worker grant lineage selected for each MCP
-/// server it may use (and optionally for its catalog), and the represented
-/// subject its mandate applies to (explicitly none when it acts for itself).
+/// server it may use, and the represented subject its mandate applies to
+/// (explicitly none when it acts for itself). The agent's tool catalog is
+/// base work: the work's authority basis selects its lineage, not this
+/// mandate.
 ///
 /// The per-server lineages are selection data, not permission: each names
 /// which root-to-leaf lineage the native grant owner resolves, at use, for
@@ -34,7 +36,6 @@ use crate::traits::RuntimeDriverError;
 pub struct SessionAgentMandate {
     executor: PrincipalRef,
     servers: BTreeMap<String, Vec<GrantLineageRef>>,
-    catalog: Option<Vec<GrantLineageRef>>,
     represented_subject: Option<PrincipalRef>,
 }
 
@@ -49,18 +50,18 @@ pub enum AgentMandateError {
     UnnamedServer,
     #[error("the session agent's mandate selects an empty grant lineage")]
     EmptyLineage,
-    #[error("the session agent's mandate selects no grant lineage")]
+    #[error("the session agent's mandate selects no MCP server")]
     NoSelection,
 }
 
 impl SessionAgentMandate {
     /// # Errors
     /// Refuses unqualified principals, an unnamed server, an empty lineage
-    /// and a mandate that selects nothing (leave such a registration unbound).
+    /// and a mandate that selects no server (leave such a registration
+    /// unbound).
     pub fn new(
         executor: PrincipalRef,
         servers: BTreeMap<String, Vec<GrantLineageRef>>,
-        catalog: Option<Vec<GrantLineageRef>>,
         represented_subject: Option<PrincipalRef>,
     ) -> Result<Self, AgentMandateError> {
         executor
@@ -74,16 +75,15 @@ impl SessionAgentMandate {
         if servers.keys().any(String::is_empty) {
             return Err(AgentMandateError::UnnamedServer);
         }
-        if servers.values().chain(catalog.iter()).any(Vec::is_empty) {
+        if servers.values().any(Vec::is_empty) {
             return Err(AgentMandateError::EmptyLineage);
         }
-        if servers.is_empty() && catalog.is_none() {
+        if servers.is_empty() {
             return Err(AgentMandateError::NoSelection);
         }
         Ok(Self {
             executor,
             servers,
-            catalog,
             represented_subject,
         })
     }
@@ -103,11 +103,6 @@ impl SessionAgentMandate {
         self.servers
             .iter()
             .map(|(server, lineage)| (server.as_str(), lineage.as_slice()))
-    }
-
-    /// The lineage selected for the agent's catalog, if any.
-    pub fn catalog_lineage(&self) -> Option<&[GrantLineageRef]> {
-        self.catalog.as_deref()
     }
 
     pub fn represented_subject(&self) -> Option<&PrincipalRef> {
@@ -348,7 +343,7 @@ mod tests {
     }
 
     fn mandate(name: &str, grant: &str) -> SessionAgentMandate {
-        SessionAgentMandate::new(agent(name), servers(grant), None, None).unwrap()
+        SessionAgentMandate::new(agent(name), servers(grant), None).unwrap()
     }
 
     fn governed() -> MeerkatMachine {
@@ -373,44 +368,35 @@ mod tests {
     fn a_mandate_needs_qualified_principals_and_a_selection() {
         let unqualified = PrincipalRef::new(PrincipalKind::SharedAgent, "loose").unwrap();
         assert_eq!(
-            SessionAgentMandate::new(unqualified.clone(), servers("g"), None, None),
+            SessionAgentMandate::new(unqualified.clone(), servers("g"), None),
             Err(AgentMandateError::UnqualifiedExecutor)
         );
         assert_eq!(
-            SessionAgentMandate::new(agent("a"), servers("g"), None, Some(unqualified)),
+            SessionAgentMandate::new(agent("a"), servers("g"), Some(unqualified)),
             Err(AgentMandateError::UnqualifiedSubject)
         );
         assert_eq!(
             SessionAgentMandate::new(
                 agent("a"),
                 BTreeMap::from([("server".to_owned(), Vec::new())]),
-                None,
                 None
             ),
-            Err(AgentMandateError::EmptyLineage)
-        );
-        assert_eq!(
-            SessionAgentMandate::new(agent("a"), servers("g"), Some(Vec::new()), None),
             Err(AgentMandateError::EmptyLineage)
         );
         assert_eq!(
             SessionAgentMandate::new(
                 agent("a"),
                 BTreeMap::from([(String::new(), vec![lineage("g")])]),
-                None,
                 None
             ),
             Err(AgentMandateError::UnnamedServer)
         );
+        // A mandate carries MCP server lineages only: one that selects no
+        // server is no mandate (the registration stays unbound).
         assert_eq!(
-            SessionAgentMandate::new(agent("a"), BTreeMap::new(), None, None),
+            SessionAgentMandate::new(agent("a"), BTreeMap::new(), None),
             Err(AgentMandateError::NoSelection)
         );
-        let catalog_only =
-            SessionAgentMandate::new(agent("a"), BTreeMap::new(), Some(vec![lineage("c")]), None)
-                .expect("a catalog selection alone is a selection");
-        assert_eq!(catalog_only.server_lineage("server"), None);
-        assert_eq!(catalog_only.catalog_lineage(), Some(&[lineage("c")][..]));
     }
 
     #[test]
@@ -422,7 +408,6 @@ mod tests {
                 ("second".to_owned(), vec![lineage("g2")]),
             ]),
             None,
-            None,
         )
         .unwrap();
         assert_eq!(selected.server_lineage("first"), Some(&[lineage("g1")][..]));
@@ -431,7 +416,6 @@ mod tests {
             Some(&[lineage("g2")][..])
         );
         assert_eq!(selected.server_lineage("third"), None);
-        assert_eq!(selected.catalog_lineage(), None);
         assert_eq!(
             selected
                 .server_lineages()

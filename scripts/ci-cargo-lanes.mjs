@@ -344,6 +344,10 @@ export const FEATURE_UNIT_SUITES = [
   // The deprecated private broker adds its admission and broker tests.
   { package: "meerkat", id: "experimental-gpt-live", features: ["experimental-gpt-live", "openai-realtime", "memory-store", "test-realtime-fixtures"], rustMinStack: GPT_LIVE_TEST_STACK, pullRequest: false },
   { package: "meerkat-openai", id: "live", features: ["live", "experimental-gpt-live-gate0-harness", "test-realtime-fixtures"] },
+  // The realtime adapter (live.rs, text_adapter.rs) is behind `realtime`,
+  // which neither the default features nor the `live` suite enable: without
+  // this row its tests ran only in nightly's workspace lane.
+  { package: "meerkat-openai", id: "realtime", features: ["realtime"] },
   { package: "meerkat-live", id: "webrtc", features: ["webrtc"] },
   { package: "meerkat-session", id: "live", features: ["live", "session-store"] },
   { package: "meerkat-auth-core", id: "cloud", features: ["aws-sigv4", "gcp-auth", "azure-ad"] },

@@ -6,7 +6,9 @@ description: >-
   setting of the client, not of the identity. When that
   identity is unavailable (pull requests from forks have no id-token, or the
   variables are unset) run with a local disk cache only, with no remote cache,
-  instead of failing the lane.
+  instead of failing the lane. When the sccache release cannot be downloaded,
+  run without sccache (an empty RUSTC_WRAPPER) instead of failing the lane; a
+  download whose sha256 does not match the pin still fails it.
 
 inputs:
   bucket:
@@ -32,8 +34,8 @@ inputs:
 
 outputs:
   backend:
-    description: Selected backend, gcs or local.
-    value: ${{ steps.select.outputs.backend }}
+    description: Selected backend, gcs or local; none when the download failed and the job runs without sccache.
+    value: ${{ steps.select.outputs.backend || 'none' }}
 
 runs:
   using: composite
@@ -43,11 +45,24 @@ runs:
     # exports the job's Actions cache token, which neither backend below uses.
     # Renovate proposes a new SCCACHE_VERSION (renovate.json); SCCACHE_SHA256
     # changes with it, or this check fails. The backend is selected below.
+    # The release is fetched with the job's own token first (gh release
+    # download, an authenticated API request) and from the anonymous release
+    # URL, with its retries, only when that fails: the release host once
+    # answered one lane's nine anonymous tries with 403 while the run's other
+    # lanes downloaded it. The token is unset before anything else runs. A
+    # download that fails both ways leaves the lane without sccache instead of
+    # failing it: an empty RUSTC_WRAPPER, which Cargo reads as no wrapper,
+    # replaces the job's sccache wrapper, and the steps below are skipped. An
+    # archive from either path is used only once its sha256 matches; a
+    # mismatch still fails the lane, so no unverified binary ever reaches PATH
+    # or runs.
     - name: Install sccache
+      id: install
       shell: bash
       env:
         SCCACHE_VERSION: v0.18.0
         SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         if [[ "${RUNNER_OS}/${RUNNER_ARCH}" != "Linux/X64" ]]; then
@@ -58,17 +73,52 @@ runs:
         dir="${RUNNER_TEMP}/sccache-install"
         archive="${dir}/${name}.tar.gz"
         mkdir -p "${dir}/bin"
-        curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors -o "${archive}" \
-          "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz"
+        gh_status=skipped
+        if [[ -n "${GH_TOKEN:-}" ]]; then
+          gh_status=0
+          gh release download "${SCCACHE_VERSION}" -R mozilla/sccache -p "${name}.tar.gz" \
+            -O "${archive}" --clobber 2> "${dir}/gh.err" || gh_status=$?
+          cat "${dir}/gh.err" >&2
+        fi
+        unset GH_TOKEN
+        status=0
+        if [[ "${gh_status}" != 0 ]]; then
+          rm -f "${archive}"
+          curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors -o "${archive}" \
+            "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz" \
+            2> "${dir}/curl.err" || status=$?
+          cat "${dir}/curl.err" >&2
+        fi
+        if (( status != 0 )); then
+          rm -f "${archive}"
+          gh_cause="no token"
+          if [[ "${gh_status}" != skipped ]]; then
+            gh_error="$(tail -n 1 "${dir}/gh.err")"
+            gh_cause="exit ${gh_status}: ${gh_error:-no message}"
+          fi
+          curl_cause="$(tail -n 1 "${dir}/curl.err" | sed 's/^curl: ([0-9]*) //')"
+          cause="gh ${gh_cause}; curl exit ${status}: ${curl_cause:-no message}"
+          cause="${cause//%/%25}"
+          echo "::warning::sccache ${SCCACHE_VERSION} download failed (${cause}); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
+          echo "installed=false" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
         echo "${SCCACHE_SHA256}  ${archive}" | sha256sum --check --strict
         tar -xzf "${archive}" -C "${dir}/bin" --strip-components=1 "${name}/sccache"
         echo "${dir}/bin" >> "${GITHUB_PATH}"
         echo "SCCACHE_PATH=${dir}/bin/sccache" >> "${GITHUB_ENV}"
+        # A server that stops answering mid-job (an I/O error between the
+        # sccache client and its server) degrades a compile to a plain rustc
+        # run instead of failing it, as in the workflows that install sccache
+        # through sccache-action.
+        echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
         "${dir}/bin/sccache" --version
+        echo "installed=true" >> "${GITHUB_OUTPUT}"
 
     - name: Authenticate to GCP with workload identity
       id: gcp
-      if: ${{ inputs.bucket != '' && inputs.workload_identity_provider != '' && inputs.service_account != '' }}
+      if: ${{ steps.install.outputs.installed == 'true' && inputs.bucket != '' && inputs.workload_identity_provider != '' && inputs.service_account != '' }}
       # A fork's pull request has no id-token permission; a failed
       # authentication selects the local fallback below, it never fails the
       # lane (and the gate grants no budget exemption for it).
@@ -83,6 +133,7 @@ runs:
 
     - name: Select the sccache backend
       id: select
+      if: ${{ steps.install.outputs.installed == 'true' }}
       shell: bash
       env:
         BUCKET: ${{ inputs.bucket }}
@@ -115,6 +166,7 @@ runs:
         fi
 
     - name: Start the sccache server
+      if: ${{ steps.install.outputs.installed == 'true' }}
       shell: bash
       env:
         BACKEND: ${{ steps.select.outputs.backend }}
@@ -127,19 +179,38 @@ runs:
         # for some of them and that server silently runs ReadOnly for the
         # whole lane. Stagger the start and restart until the server reports
         # ReadWrite (a read-write GCS backend only; a read-only one is meant
-        # to come up ReadOnly, and the local fallback has no probe).
+        # to come up ReadOnly, and the local fallback has no probe). A server
+        # that does not start in any attempt leaves the lane without sccache
+        # instead of failing it, and the stats lines below are only reported.
+        started=false
+        start_output=""
         for attempt in 1 2 3 4 5 6; do
           sccache --stop-server >/dev/null 2>&1 || true
           if [[ -n "${SCCACHE_ERROR_LOG:-}" ]]; then : > "${SCCACHE_ERROR_LOG}"; fi
           sleep "$((RANDOM % 10 + attempt))"
-          sccache --start-server
+          started=false
+          if start_output="$(sccache --start-server 2>&1)"; then
+            started=true
+          fi
+          printf '%s\n' "${start_output}"
+          if [[ "${started}" != true ]]; then
+            echo "sccache server did not start (attempt ${attempt})"
+            continue
+          fi
           if [[ "${BACKEND}" == "gcs" && "${RW_MODE}" == "READ_WRITE" && -n "${SCCACHE_ERROR_LOG:-}" ]] && grep -q 'server has setup with ReadOnly' "${SCCACHE_ERROR_LOG}"; then
             echo "sccache server came up ReadOnly (bucket write probe rate-limited); restarting (attempt ${attempt})"
             continue
           fi
           break
         done
-        sccache --show-stats | grep -E 'Cache location|Compile requests'
+        if [[ "${started}" != true ]]; then
+          cause="$(printf '%s\n' "${start_output}" | tail -n 1)"
+          cause="${cause//%/%25}"
+          echo "::warning::the sccache server did not start (${cause:-no message}); this job compiles without sccache"
+          echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
+          exit 0
+        fi
+        sccache --show-stats | grep -E 'Cache location|Compile requests' || true
         if [[ "${BACKEND}" == "gcs" && -n "${SCCACHE_ERROR_LOG:-}" ]]; then
-          grep -E 'server has setup with' "${SCCACHE_ERROR_LOG}" | tail -1
+          grep -E 'server has setup with' "${SCCACHE_ERROR_LOG}" | tail -1 || true
         fi

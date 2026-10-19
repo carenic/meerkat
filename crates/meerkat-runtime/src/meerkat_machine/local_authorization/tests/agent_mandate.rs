@@ -11,7 +11,9 @@ use meerkat_authorization::grants::LocalGrantAuthority;
 use meerkat_authorization::mcp_installation::{
     MCP_INSTALLATION_FEATURE, mcp_connector_action, mcp_connector_domain,
 };
-use meerkat_authorization_contracts::constraints::{ExactRestriction, LifetimeRestriction};
+use meerkat_authorization_contracts::constraints::{
+    DomainRestriction, ExactRestriction, LifetimeRestriction,
+};
 use meerkat_authorization_contracts::grant::GrantLineageRef;
 use meerkat_core::mcp_attachment::{ConfiguredMcpAttachmentAuthority, McpAttachmentRefusal};
 use meerkat_core::mcp_config::McpConnectorBinding;
@@ -106,7 +108,7 @@ struct WithoutPolicy {
 impl NativeWorkAuthorizationHost for WithoutPolicy {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -144,7 +146,7 @@ struct PerAgentHost {
 impl NativeWorkAuthorizationHost for PerAgentHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -254,7 +256,7 @@ impl Fixture {
                             mcp_connector_action(server, &McpConnectorApproval::NoConnector),
                         ]
                     })),
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         servers.iter().map(|server| server_domain(realm, server)),
                     ),
                     lifetime,
@@ -291,7 +293,7 @@ impl Fixture {
                                 .map(|approval| mcp_connector_action(server, approval)),
                         ),
                     ),
-                    resource_domains: ExactRestriction::exact([server_domain("alpha", server)]),
+                    resource_domains: DomainRestriction::exact([server_domain("alpha", server)]),
                     ..ExecutionRestrictions::unrestricted()
                 },
             )
@@ -314,7 +316,7 @@ impl Fixture {
                 who(agent),
                 None,
                 ExecutionRestrictions {
-                    resource_domains: ExactRestriction::exact(
+                    resource_domains: DomainRestriction::exact(
                         std::iter::once(server_domain("alpha", server)).chain(
                             approvals.iter().map(|approval| {
                                 mcp_connector_domain(&operator_of("alpha"), server, approval)
@@ -383,7 +385,7 @@ impl Fixture {
         self.machine
             .bind_session_agent_mandate(
                 witness,
-                SessionAgentMandate::new(who(agent), servers, None, None).expect("mandate"),
+                SessionAgentMandate::new(who(agent), servers, None).expect("mandate"),
             )
             .await
     }
@@ -510,6 +512,73 @@ async fn the_generic_host_without_a_provider_refuses_configured_servers() {
     assert_eq!(
         authority.authorize_configured(&server("sentinel")),
         Err(McpAttachmentRefusal::Unavailable)
+    );
+}
+
+/// The configured provider is asked for the exact registration whose
+/// servers are staged: the registration current when the bindings are
+/// prepared and, after the session registers again, the new registration,
+/// which shares the session id but is not the ended one.
+#[tokio::test]
+async fn the_configured_provider_is_asked_for_the_exact_registration() {
+    type Asked = std::sync::Mutex<Vec<crate::meerkat_machine::RuntimeSessionRegistrationWitness>>;
+    let asked: Arc<Asked> = Arc::default();
+    let recorder = Arc::clone(&asked);
+    let (mut configuration, _, _) = super::configuration();
+    configuration.configured_mcp_attachment = Some(Arc::new(
+        move |registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
+              _agent: crate::meerkat_machine::SessionAgentBinding|
+              -> Option<Arc<dyn ConfiguredMcpAttachmentAuthority>> {
+            recorder.lock().expect("asked").push(registration.clone());
+            None
+        },
+    ));
+    let machine = MeerkatMachine::ephemeral()
+        .with_local_grant_authorization(configuration)
+        .expect("exclusive setup");
+    let session = SessionId::new();
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register");
+    let first = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the first registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&first),
+        "the provider is asked for the registration whose servers are staged"
+    );
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("unregister");
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("register again");
+    let second = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the second registration");
+    machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    assert_eq!(first.session_id(), second.session_id(), "the same session");
+    assert_ne!(
+        first, second,
+        "a later registration of the same session is a different registration"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").last(),
+        Some(&second),
+        "the provider is asked for the new registration, never the ended one"
     );
 }
 
@@ -712,6 +781,39 @@ async fn an_every_operation_grant_approves_only_the_connector_its_domains_name()
     }
 }
 
+/// An owner-scoped grant covers the installation's domain but records no
+/// connector approval: every configured descriptor of the server is
+/// unavailable (missing evidence), never admitted and never denied.
+#[tokio::test]
+async fn an_owner_scoped_grant_approves_no_connector() {
+    let fx = fixture();
+    let grant = fx
+        .grants
+        .issue_root(
+            &who("operator"),
+            EvidenceId::new("a-owned").expect("id"),
+            who("agent-a"),
+            None,
+            ExecutionRestrictions {
+                resource_domains: DomainRestriction::owned_by([operator_of("alpha")]),
+                ..ExecutionRestrictions::unrestricted()
+            },
+        )
+        .expect("issue");
+    let (_, witness, authority) = fx.session().await;
+    fx.select(&witness, "agent-a", grant).await.expect("select");
+    for configured in [
+        connector_server("sentinel", "account-a"),
+        server("sentinel"),
+    ] {
+        assert_eq!(
+            authority.authorize_configured(&configured),
+            Err(McpAttachmentRefusal::Unavailable),
+            "an owner bound records no approval"
+        );
+    }
+}
+
 #[tokio::test]
 async fn revoked_expired_and_other_realm_grants_refuse_at_each_decision() {
     let fx = fixture();
@@ -827,7 +929,7 @@ async fn a_registration_binds_once_and_a_replacement_starts_unbound() {
 #[test]
 fn a_mandate_needs_a_selection() {
     assert_eq!(
-        SessionAgentMandate::new(who("agent-a"), Default::default(), None, None).map(|_| ()),
+        SessionAgentMandate::new(who("agent-a"), Default::default(), None).map(|_| ()),
         Err(AgentMandateError::NoSelection)
     );
 }
@@ -937,7 +1039,7 @@ struct MutatingPolicyHost {
 impl NativeWorkAuthorizationHost for MutatingPolicyHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(
@@ -1061,7 +1163,7 @@ struct InterferingInstallationHost {
 impl NativeWorkAuthorizationHost for InterferingInstallationHost {
     fn configured_mcp_attachment_for_agent(
         &self,
-        _session_id: &SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: crate::meerkat_machine::SessionAgentBinding,
     ) -> Arc<dyn ConfiguredMcpAttachmentAuthority> {
         self.grant.for_agent(

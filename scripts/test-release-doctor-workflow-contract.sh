@@ -37,6 +37,8 @@ BASELINE_PASS="PASS Semver baseline rustdoc builds alongside the release and gat
 BASELINE_FAIL="FAIL The semver baseline rustdoc must stay off every path a user waits on"
 TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the trailing Intel macOS and Windows lanes; no upload replaces a published asset"
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
+WINDOWS_PASS="PASS Release workflow cross-compiles Windows binaries on Linux, verifies them on the pinned windows-2025-vs2026 runner, and gates on both"
+WINDOWS_FAIL="FAIL Release workflow should cross-compile Windows binaries on Linux (build_binaries_windows_cross using build-windows-cross from the workflow-ref tooling checkout), verify them on the pinned windows-2025-vs2026 runner (verify_windows_binaries), keep the artifact name meerkat-x86_64-pc-windows-msvc-windows-latest, and gate on both jobs"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
 CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job or semver readiness run restores a cache on any event, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
@@ -647,6 +649,9 @@ elif name == "reusable-on-dispatch":
         "    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
         "    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}\n",
     )
+elif name == "windows-verify-moving-image":
+    # The verify job back on the label whose image GitHub moves.
+    replace_once("    runs-on: windows-2025-vs2026\n", "    runs-on: windows-latest\n")
 elif name == "both-defects":
     replace_once(
         MEASUREMENT_STEP_IF,
@@ -1231,7 +1236,7 @@ run_doctor() {
 }
 
 run_doctor "$WORKFLOW" "${TEST_ROOT}/doctor-committed.log"
-for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS"; do
+for line in "$SEMVER_PASS" "$SLO_PASS" "$DISPATCH_PASS" "$TAG_VALIDATION_PASS" "$PREBUILD_PASS" "$BASELINE_PASS" "$TRAILING_PASS" "$WINDOWS_PASS" "$TOKEN_PASS" "$WEB_TOOLS_PASS" "$CACHES_PASS"; do
   if ! grep -Fxq "$line" "${TEST_ROOT}/doctor-committed.log"; then
     fail "doctor does not report \`${line}\` for the committed workflow" \
       "$(cat "${TEST_ROOT}/doctor-committed.log")"
@@ -1280,6 +1285,13 @@ run_doctor "${TEST_ROOT}/doctor-trailing.yml" "${TEST_ROOT}/doctor-trailing.log"
 if ! grep -Fq "$TRAILING_FAIL" "${TEST_ROOT}/doctor-trailing.log"; then
   fail "doctor does not report \`${TRAILING_FAIL}\` for a workflow whose critical assets wait for the trailing lanes" \
     "$(cat "${TEST_ROOT}/doctor-trailing.log")"
+fi
+
+mutate windows-verify-moving-image "${TEST_ROOT}/doctor-windows.yml"
+run_doctor "${TEST_ROOT}/doctor-windows.yml" "${TEST_ROOT}/doctor-windows.log"
+if ! grep -Fxq "$WINDOWS_FAIL" "${TEST_ROOT}/doctor-windows.log"; then
+  fail "doctor does not report \`${WINDOWS_FAIL}\` for a workflow that verifies the Windows binaries on windows-latest" \
+    "$(cat "${TEST_ROOT}/doctor-windows.log")"
 fi
 
 mutate cache-xwin-dispatch-save "${TEST_ROOT}/doctor-caches.yml"

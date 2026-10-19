@@ -329,6 +329,7 @@ ci-lanes-selftest:
 	@node scripts/ci-non-rust-readers-selftest.mjs
 	@scripts/test-ci-non-rust-readers.sh
 	@scripts/test-ci-clippy-sccache-wrapper.sh
+	@scripts/test-setup-sccache-ci.sh
 	@echo "$(GREEN)Checking that CI runs what the pre-push hook no longer runs...$(NC)"
 	@scripts/test-pre-push-ratchets.sh
 

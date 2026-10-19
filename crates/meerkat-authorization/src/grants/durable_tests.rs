@@ -5,7 +5,7 @@ use super::*;
 use crate::clock::{LocalAuthorizationTime, LocalClockError};
 use crate::publication::PublicationError;
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, DelegationDepth, ExactRestriction, LifetimeRestriction,
+    ActionRef, DelegationDepth, DomainRestriction, ExactRestriction, LifetimeRestriction,
 };
 use meerkat_authorization_contracts::grant_mutation::{
     ControllerCustodyRefusal, ControllerGrantMutationCustody,
@@ -978,6 +978,151 @@ fn a_child_intent_is_issued_once_only_within_its_conjunct() {
         "a revoked parent issues nothing"
     );
     assert_eq!(state(&owner), revoked);
+}
+
+/// An owner-scoped parent across the file journal: a child intent for the
+/// owner's own domain is issued at exactly that domain and recovered by the
+/// same intent; the same id asked for another application's domain is not
+/// this child and is refused, never recovered; the restored owner keeps the
+/// owner-scoped root and the exact child; and an operation of the child on
+/// another authority's domain is outside its bounds.
+#[test]
+fn an_owner_scoped_parent_issues_and_recovers_its_exact_child_across_the_journal() {
+    use meerkat_authorization_contracts::constraints::{
+        AudienceRef, OperationRestrictionValues, ProcessorRef, ResourceDomain,
+        RestrictionDimension, RestrictionFailure,
+    };
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("grant-owner.jsonl");
+    let owner = durable(Arc::new(FileGrantOwnerStore::new(&path)));
+    let app = who("app");
+    let session = |authority: &PrincipalRef| ResourceDomain {
+        authority: authority.clone(),
+        namespace: "toolkit-session-catalog/s1".into(),
+    };
+    let parent = owner
+        .issue_root(
+            &who("root"),
+            id("parent"),
+            who("holder"),
+            None,
+            ExecutionRestrictions {
+                resource_domains: DomainRestriction::owned_by([app.clone()]),
+                ..ExecutionRestrictions::unrestricted()
+            },
+        )
+        .expect("owner-scoped parent");
+    let intent = |authority: &PrincipalRef| ChildGrantIntent {
+        requested: ExecutionRestrictions {
+            resource_domains: DomainRestriction::exact([session(authority)]),
+            ..ExecutionRestrictions::unrestricted()
+        },
+        ..child_intent(&parent, "child")
+    };
+    let Ok(ChildGrantOutcome::Issued { lineage }) =
+        owner.issue_or_recover_child_under_exclusion(&intent(&app), || Ok(open()))
+    else {
+        panic!("first append issues")
+    };
+    let resolved = owner
+        .resolve_controller_lineage(&lineage, &who("helper"), None)
+        .expect("the helper's controller lineage");
+    assert_eq!(
+        resolved.restrictions().resource_domains,
+        DomainRestriction::exact([session(&app)])
+    );
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent(&app), || Ok(open())),
+        Ok(ChildGrantOutcome::Recovered {
+            lineage: lineage.clone()
+        })
+    );
+    assert_eq!(
+        owner.issue_or_recover_child_under_exclusion(&intent(&who("other-app")), || Ok(open())),
+        Err(ChildGrantRefusal::Denied),
+        "another application's domain is not this child"
+    );
+    let before = state(&owner);
+    drop(owner);
+
+    let restored = restart(Arc::new(FileGrantOwnerStore::new(&path))).expect("restore");
+    assert_eq!(state(&restored), before);
+    let resolved = restored
+        .resolve_controller_lineage(&lineage, &who("helper"), None)
+        .expect("restored lineage");
+    assert_eq!(
+        resolved.restrictions().resource_domains,
+        DomainRestriction::exact([session(&app)])
+    );
+    let action = ActionRef {
+        feature: "catalog".into(),
+        action: "read".into(),
+    };
+    let processor = ProcessorRef::Principal {
+        principal: who("helper"),
+    };
+    let audience = AudienceRef::Principal {
+        principal: who("helper"),
+    };
+    let values = |domain| OperationRestrictionValues {
+        action: &action,
+        resource_domain: domain,
+        processor: &processor,
+        audience: &audience,
+        now_ms: 100,
+    };
+    let own = session(&app);
+    let foreign = session(&who("other-app"));
+    assert_eq!(resolved.restrictions().check_bounds(values(&own)), Ok(()));
+    assert_eq!(
+        resolved.restrictions().check_bounds(values(&foreign)),
+        Err(RestrictionFailure::OutsideBounds {
+            dimension: RestrictionDimension::ResourceDomain
+        })
+    );
+}
+
+/// A persisted child whose bound is wider than its owner-scoped parent is not
+/// the attenuation result and refuses restore.
+#[test]
+fn restore_refuses_a_child_widened_past_its_owner_scoped_parent() {
+    let store = Arc::new(InMemoryGrantOwnerStore::new());
+    let owner = durable(store.clone());
+    let parent = owner
+        .issue_root(
+            &who("root"),
+            id("parent"),
+            who("holder"),
+            None,
+            ExecutionRestrictions {
+                resource_domains: DomainRestriction::owned_by([who("app")]),
+                ..ExecutionRestrictions::unrestricted()
+            },
+        )
+        .expect("owner-scoped parent");
+    owner
+        .issue_child(
+            &who("holder"),
+            &parent,
+            id("child"),
+            who("child"),
+            ExecutionRestrictions::unrestricted(),
+        )
+        .expect("child keeps the owner bound");
+    drop(owner);
+    restart(store.clone()).expect("untampered store restores");
+    for widened in [
+        DomainRestriction::owned_by([who("app"), who("other-app")]),
+        DomainRestriction::unrestricted(),
+    ] {
+        let tampered = tamper(&store, |record| {
+            record.restrictions.resource_domains = widened;
+        });
+        assert!(matches!(
+            restart(tampered),
+            Err(GrantDurabilityError::RestartRequired)
+        ));
+    }
 }
 
 /// An uncertain child append is typed Uncertain, not relabelled; the owner

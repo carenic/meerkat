@@ -236,7 +236,7 @@ mod tests {
                 }
                 RestrictionDimension::ResourceDomain => {
                     unknown.resource_domains =
-                        ExactRestriction::unresolved(UnresolvedConstraint::Unknown);
+                        DomainRestriction::unresolved(UnresolvedConstraint::Unknown);
                 }
                 RestrictionDimension::Processor => {
                     unknown.processors =
@@ -374,13 +374,37 @@ mod tests {
                 );
             }
         }
+        // The resource-domain dimension is a `DomainRestriction`; its exact
+        // vectors keep the same wire and expectations.
+        fn check_domain_set(case: &serde_json::Value, corpus: &serde_json::Value) {
+            let atoms = &corpus["atoms"]["resource_domains"];
+            let mut actual = DomainRestriction::unrestricted();
+            for input in fixture::entries(&case["inputs"]) {
+                actual = actual.conjoin(&fixture::domain_restriction(input, corpus));
+            }
+            assert_eq!(
+                actual,
+                fixture::domain_restriction(&case["expected"], corpus),
+                "{}",
+                case["id"]
+            );
+            for probe in fixture::entries(&case["probes"]) {
+                let value: ResourceDomain = fixture::decode(&atoms[fixture::name(&probe["value"])]);
+                assert_eq!(
+                    outcome(&actual.check(&value)),
+                    fixture::name(&probe["expected"]),
+                    "{}",
+                    case["id"]
+                );
+            }
+        }
         let corpus = fixture::corpus();
         for case in fixture::entries(&corpus["set_cases"]) {
             let dimension = fixture::name(&case["dimension"]);
             let atoms = &corpus["atoms"][dimension];
             match dimension {
                 "actions" => check_set::<ActionRef>(case, atoms),
-                "resource_domains" => check_set::<ResourceDomain>(case, atoms),
+                "resource_domains" => check_domain_set(case, &corpus),
                 "processors" => check_set::<ProcessorRef>(case, atoms),
                 other => {
                     assert_eq!(other, "audiences", "unsupported corpus dimension");
@@ -450,7 +474,7 @@ mod tests {
             );
         }
         assert_eq!(fixture::entries(&corpus["depth_cases"]).len(), 5);
-        assert_eq!(fixture::entries(&corpus["attenuation_cases"]).len(), 2);
+        assert_eq!(fixture::entries(&corpus["attenuation_cases"]).len(), 3);
     }
 }
 
@@ -507,4 +531,351 @@ fn projection_wrappers_keep_existing_literal_wire_bytes() {
         serde_json::to_string(&DelegationDepth::remaining(2)).expect("encode"),
         r#"{"bound":{"bound":"remaining","edges":2},"unresolved":[]}"#
     );
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod domain_restriction_tests {
+    use super::*;
+    use meerkat_core::auth::{PrincipalKind, PrincipalRef};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    fn principal(id: &str) -> PrincipalRef {
+        PrincipalRef::new(PrincipalKind::ServiceAccount, id).expect("test principal")
+    }
+
+    fn domain(authority: &PrincipalRef, namespace: &str) -> ResourceDomain {
+        ResourceDomain {
+            authority: authority.clone(),
+            namespace: namespace.into(),
+        }
+    }
+
+    #[test]
+    fn owned_by_refuses_equal_namespace_under_another_authority() {
+        let app = principal("app");
+        let other = principal("other-app");
+        let bound = DomainRestriction::owned_by([app.clone()]);
+        for namespace in ["toolkit-session-catalog/s1", "toolkit-session-setup/s2", ""] {
+            assert_eq!(bound.check(&domain(&app, namespace)), BoundMatch::Matches);
+            assert_eq!(
+                bound.check(&domain(&other, namespace)),
+                BoundMatch::OutsideBounds
+            );
+        }
+        assert!(matches!(
+            bound
+                .conjoin(&DomainRestriction::unresolved(
+                    UnresolvedConstraint::Unknown
+                ))
+                .check(&domain(&app, "records")),
+            BoundMatch::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn owned_by_parent_meets_another_authority_as_empty() {
+        let app = principal("app");
+        let other = principal("other-app");
+        let parent = DomainRestriction::owned_by([app.clone()]);
+        let foreign = parent.conjoin(&DomainRestriction::exact([domain(&other, "s1")]));
+        assert_eq!(foreign.bound(), &DomainBound::Exact(BTreeSet::new()));
+        assert_eq!(
+            foreign.check(&domain(&other, "s1")),
+            BoundMatch::OutsideBounds
+        );
+        assert_eq!(
+            foreign.check(&domain(&app, "s1")),
+            BoundMatch::OutsideBounds
+        );
+        let own = parent.conjoin(&DomainRestriction::exact([
+            domain(&app, "s1"),
+            domain(&other, "s1"),
+        ]));
+        assert_eq!(own, DomainRestriction::exact([domain(&app, "s1")]));
+    }
+
+    #[test]
+    fn child_cannot_widen_owned_by() {
+        let app = principal("app");
+        let parent = DomainRestriction::owned_by([app.clone()]);
+        assert_eq!(parent.conjoin(&DomainRestriction::unrestricted()), parent);
+        assert_eq!(
+            parent.conjoin(&DomainRestriction::owned_by([app, principal("other-app")])),
+            parent
+        );
+    }
+
+    fn session_values<'a>(
+        domain: &'a ResourceDomain,
+        action: &'a ActionRef,
+        processor: &'a ProcessorRef,
+        audience: &'a AudienceRef,
+    ) -> OperationRestrictionValues<'a> {
+        OperationRestrictionValues {
+            action,
+            resource_domain: domain,
+            processor,
+            audience,
+            now_ms: 150,
+        }
+    }
+
+    /// A child grant under an owner-scoped parent: naming another
+    /// authority's domain permits nothing, naming the owner's own domain
+    /// permits only that domain, and asking for more keeps the owner bound.
+    #[test]
+    fn child_of_owned_by_parent_naming_another_authority_permits_nothing() {
+        let app = principal("app");
+        let other = principal("other-app");
+        let action = ActionRef {
+            feature: "catalog".into(),
+            action: "read".into(),
+        };
+        let processor = ProcessorRef::Principal {
+            principal: principal("helper"),
+        };
+        let audience = AudienceRef::Principal {
+            principal: principal("helper"),
+        };
+        let mut parent = ExecutionRestrictions::unrestricted();
+        parent.resource_domains = DomainRestriction::owned_by([app.clone()]);
+        parent.delegation_depth = DelegationDepth::remaining(1);
+        let mut foreign = ExecutionRestrictions::unrestricted();
+        foreign.resource_domains = DomainRestriction::exact([domain(&other, "s1")]);
+        let child = parent.for_child(&foreign).expect("one child edge");
+        assert_eq!(child.resource_domains, DomainRestriction::exact([]));
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&other, "s1"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Err(RestrictionFailure::OutsideBounds {
+                dimension: RestrictionDimension::ResourceDomain
+            })
+        );
+        let mut own = ExecutionRestrictions::unrestricted();
+        own.resource_domains = DomainRestriction::exact([domain(&app, "s1")]);
+        let child = parent.for_child(&own).expect("one child edge");
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&app, "s1"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            child.check_bounds(session_values(
+                &domain(&app, "s2"),
+                &action,
+                &processor,
+                &audience
+            )),
+            Err(RestrictionFailure::OutsideBounds {
+                dimension: RestrictionDimension::ResourceDomain
+            })
+        );
+        let wider = parent
+            .for_child(&ExecutionRestrictions::unrestricted())
+            .expect("one child edge");
+        assert_eq!(wider.resource_domains, DomainRestriction::owned_by([app]));
+    }
+
+    #[test]
+    fn empty_owner_set_is_exact_empty() {
+        assert_eq!(
+            DomainRestriction::owned_by([]),
+            DomainRestriction::exact([])
+        );
+        assert_eq!(
+            DomainRestriction::owned_by([principal("a")])
+                .conjoin(&DomainRestriction::owned_by([principal("b")])),
+            DomainRestriction::exact([])
+        );
+    }
+
+    /// Exhaustive over three authorities and three namespaces. Exact sets list
+    /// two authorities and two namespaces, so neither an owner bound nor the
+    /// unrestricted bound is ever semantically equal to a finite exact set
+    /// over the probes, and structural equality must equal semantic equality.
+    #[test]
+    fn domain_meet_is_exact_intersection_in_canonical_form() {
+        let owners = [principal("a"), principal("b")];
+        let listed: Vec<ResourceDomain> = owners
+            .iter()
+            .flat_map(|owner| ["n1", "n2"].map(|namespace| domain(owner, namespace)))
+            .collect();
+        let probes: Vec<ResourceDomain> = [principal("a"), principal("b"), principal("c")]
+            .iter()
+            .flat_map(|owner| ["n1", "n2", "n3"].map(|namespace| domain(owner, namespace)))
+            .collect();
+        let mut bounds = vec![DomainRestriction::unrestricted()];
+        for mask in 0_u8..16 {
+            bounds.push(DomainRestriction::exact(
+                listed
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, value)| value.clone()),
+            ));
+        }
+        for mask in 1_u8..4 {
+            bounds.push(DomainRestriction::owned_by(
+                owners
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| mask & (1 << index) != 0)
+                    .map(|(_, owner)| owner.clone()),
+            ));
+        }
+        let matches = |bound: &DomainRestriction, value| bound.check(value) == BoundMatch::Matches;
+        for x in &bounds {
+            assert_eq!(&x.conjoin(x), x, "idempotent");
+            for y in &bounds {
+                let meet = x.conjoin(y);
+                assert_eq!(meet, y.conjoin(x), "commutative");
+                for value in &probes {
+                    assert_eq!(
+                        matches(&meet, value),
+                        matches(x, value) && matches(y, value),
+                        "the meet is the exact intersection"
+                    );
+                }
+                let same_match_set = probes
+                    .iter()
+                    .all(|value| matches(x, value) == matches(y, value));
+                assert_eq!(x == y, same_match_set, "canonical form");
+                for z in &bounds {
+                    assert_eq!(meet.conjoin(z), x.conjoin(&y.conjoin(z)), "associative");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn domain_decode_refuses_noncanonical_unknown_and_reserved_shapes() {
+        let owner = serde_json::to_value(principal("a")).expect("principal");
+        for wire in [
+            json!({"bound":{"bound":"owned_by","values":[]},"unresolved":[]}),
+            json!({"bound":{"bound":"owned_by"},"unresolved":[]}),
+            json!({"bound":{"bound":"owned_by","values":null},"unresolved":[]}),
+            json!({"bound":{"bound":"unrestricted","values":null},"unresolved":[]}),
+            json!({"bound":{"bound":"owned_by","values":[owner],"pattern":"*"},"unresolved":[]}),
+            json!({"bound":{"bound":"prefix","values":["records"]},"unresolved":[]}),
+            json!({"bound":{"bound":"unrestricted"}}),
+            json!({"bound":{"bound":"unrestricted"},"unresolved":[],"owners":[]}),
+        ] {
+            assert!(
+                serde_json::from_value::<DomainRestriction>(wire.clone()).is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    /// Unrestricted and exact bounds keep the earlier `ExactRestriction`
+    /// bytes in both directions; the owner-scoped kind encodes as its own
+    /// tag, which the earlier type refuses.
+    #[test]
+    fn domain_restriction_keeps_the_exact_restriction_wire() {
+        let app = principal("app");
+        let records = domain(&app, "records");
+        let unknown = UnresolvedConstraint::Unknown;
+        for (earlier, current) in [
+            (
+                ExactRestriction::<ResourceDomain>::unrestricted(),
+                DomainRestriction::unrestricted(),
+            ),
+            (
+                ExactRestriction::exact([records.clone()]),
+                DomainRestriction::exact([records.clone()]),
+            ),
+            (ExactRestriction::exact([]), DomainRestriction::exact([])),
+            (
+                ExactRestriction::exact([records.clone()])
+                    .conjoin(&ExactRestriction::unresolved(unknown)),
+                DomainRestriction::exact([records])
+                    .conjoin(&DomainRestriction::unresolved(unknown)),
+            ),
+        ] {
+            let earlier_wire = serde_json::to_string(&earlier).expect("encode earlier");
+            let current_wire = serde_json::to_string(&current).expect("encode current");
+            assert_eq!(current_wire, earlier_wire, "byte-identical");
+            assert_eq!(
+                serde_json::from_str::<DomainRestriction>(&earlier_wire).expect("upgrade"),
+                current
+            );
+            assert_eq!(
+                serde_json::from_str::<ExactRestriction<ResourceDomain>>(&current_wire)
+                    .expect("downgrade"),
+                earlier
+            );
+        }
+        let owned = DomainRestriction::owned_by([app.clone()]);
+        let wire = serde_json::to_value(&owned).expect("encode owned");
+        assert_eq!(
+            wire,
+            json!({
+                "bound": {"bound": "owned_by", "values": [serde_json::to_value(&app).expect("principal")]},
+                "unresolved": []
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DomainRestriction>(wire.clone()).expect("decode owned"),
+            owned
+        );
+        assert!(serde_json::from_value::<ExactRestriction<ResourceDomain>>(wire).is_err());
+    }
+
+    #[test]
+    fn shared_json_owner_scoped_domain_vectors() {
+        use crate::conformance_tests as fixture;
+        fn outcome(result: &BoundMatch) -> &'static str {
+            match result {
+                BoundMatch::Matches => "matches",
+                BoundMatch::OutsideBounds => "outside_bounds",
+                BoundMatch::Unresolved(_) => "unresolved",
+            }
+        }
+        let corpus = fixture::corpus();
+        for case in fixture::entries(&corpus["domain_cases"]) {
+            let mut actual = DomainRestriction::unrestricted();
+            for input in fixture::entries(&case["inputs"]) {
+                actual = actual.conjoin(&fixture::domain_restriction(input, &corpus));
+            }
+            assert_eq!(
+                actual,
+                fixture::domain_restriction(&case["expected"], &corpus),
+                "{}",
+                case["id"]
+            );
+            for probe in fixture::entries(&case["probes"]) {
+                let value: ResourceDomain = fixture::decode(
+                    &corpus["atoms"]["resource_domains"][fixture::name(&probe["value"])],
+                );
+                assert_eq!(
+                    outcome(&actual.check(&value)),
+                    fixture::name(&probe["expected"]),
+                    "{}",
+                    case["id"]
+                );
+            }
+        }
+        for case in fixture::entries(&corpus["domain_decode_rejections"]) {
+            assert!(
+                serde_json::from_value::<DomainRestriction>(case["wire"].clone()).is_err(),
+                "{}",
+                case["id"]
+            );
+        }
+        assert_eq!(fixture::entries(&corpus["domain_cases"]).len(), 7);
+        assert_eq!(
+            fixture::entries(&corpus["domain_decode_rejections"]).len(),
+            5
+        );
+    }
 }

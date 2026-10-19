@@ -327,6 +327,19 @@ flag, so a read-only lineage is one whose actions are only read actions. A
 typed public-search target or a read-only declaration does not mean that
 private information cannot leave through a query; do not infer it.
 
+A resource-domain restriction (`DomainRestriction`) is unrestricted, a set of
+exact domains, or every domain whose typed authority is one of a non-empty set
+of owners (`DomainRestriction::owned_by`). An owner bound matches a domain by
+its authority alone; a namespace is never a pattern. This lets a parent grant
+fix the application while each child names its exact session domain: issue the
+parent with `owned_by([application])` and each session's child with
+`DomainRestriction::exact` of the application's domain for that session. The
+child's effective bound is then exactly that domain, and a child that names
+another authority's domain permits nothing. The bound isolates applications
+only as far as each application's domains carry an authority that no other
+application shares. An owner bound records no MCP connector approval: only an
+exact connector domain or connector action records one.
+
 The attribution keys the selection and the protected audit record
 (`AuditDelegateAttribution`, with the call's operation id and the role); it
 grants nothing. The helper's own decision and its authorization refusal are

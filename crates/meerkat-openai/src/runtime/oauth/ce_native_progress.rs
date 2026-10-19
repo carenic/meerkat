@@ -30,7 +30,8 @@ use meerkat_authorization_contracts::audit::{
     AuditObservation, AuditTarget, StoredAuthorizationAuditObservation,
 };
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, AudienceRef, ExactRestriction, ExecutionRestrictions, ProcessorRef, ResourceDomain,
+    ActionRef, AudienceRef, DomainRestriction, ExactRestriction, ExecutionRestrictions,
+    ProcessorRef, ResourceDomain,
 };
 use meerkat_authorization_contracts::evidence::{
     EvidenceDigest, EvidenceId, HistoricalEvidenceRef,
@@ -149,7 +150,7 @@ fn values(verb: &str) -> Vec<LocalOperationValues> {
 fn ceiling(verb: &str) -> ExecutionRestrictions {
     let mut ceiling = ExecutionRestrictions::unrestricted();
     ceiling.actions = ExactRestriction::exact([action(verb)]);
-    ceiling.resource_domains = ExactRestriction::exact([domain()]);
+    ceiling.resource_domains = DomainRestriction::exact([domain()]);
     ceiling.processors = ExactRestriction::exact([ProcessorRef::Principal {
         principal: principal("executor"),
     }]);
