@@ -505,6 +505,16 @@ them.
   was created again still replays its first receipt, bound to the old
   member's address.
 
+### Known limitations
+
+- A host that creates a mob again under the same id at every start, over
+  in-memory mob storage, starts a new mob incarnation each time
+  (`meerkat-mob`). A continuation or detached-job delivery still owed to a
+  member of the earlier incarnation is not delivered to the new member: it
+  strands, and its status reads `Stranded` with `OwnerRetired`. A delivery
+  scope captured at the earlier incarnation is refused the same way
+  (`MobError::IncarnationMismatch`).
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
