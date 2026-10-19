@@ -186,7 +186,9 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   SDKs older than 0.9.4 keep it as an unknown, raw reason.
 - **`web_search`:** a search the provider refused or filtered, one that filled
   its context window and a cancelled one now come back `failed`, naming the
-  stop reason, with no answer.
+  stop reason, with no answer. A search cut at its output cap (`max_tokens`)
+  or paused by the provider (`pause_turn`) keeps its status and answer, and
+  its `error` now says the answer may be incomplete.
 - **Do (Rust):** build `LlmDoneOutcome::Success` with
   `LlmDoneOutcome::success(stop_reason)` or `success_with_detail(..)` and match
   it with `Success { stop_reason, .. }`; `AgentError::ContentFiltered` gains
@@ -306,8 +308,8 @@ last.
 
 - **Compaction is sized for the model that writes the summary.** The summary
   source may take two bytes per token of that model's context window left
-  after `max_summary_tokens` (at least 4 KiB), instead of a quarter of the
-  compaction threshold. With the default threshold that is about ten times
+  after `max_summary_tokens` (capped by a declared input ceiling, at least
+  4 KiB), instead of a quarter of the compaction threshold. With the default threshold that is about ten times
   more, so a summary call can cost more input tokens on a large window; it
   never costs more than the history being compacted plus the compaction
   prompt.
