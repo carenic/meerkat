@@ -138,8 +138,9 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
   unconditionally. An admitted `shutdown()` closes it too
   (`MobAdmissionCloseReason::Shutdown`), before its teardown; a Stop leaves
   it open. An admitted `destroy()` closes it with `Destroyed`, a durability
-  fail-stop with `DurabilityFailStop`, and a lost actor task with
-  `ActorLost`, so no actor exit leaves it open. Later mutating commands and
+  fail-stop with `DurabilityFailStop`, a lost actor task with `ActorLost`,
+  and a dispatch failure that stops the actor with `DispatchFailed`, so no
+  actor exit leaves it open. Later mutating commands and
   `acquire_owner()` are refused with
   `MobError::AdmissionClosed`. Closing tears nothing down, so keep a
   `MobHandle` clone for as long as the mob must admit work.

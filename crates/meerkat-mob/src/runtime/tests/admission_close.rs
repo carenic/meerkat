@@ -813,6 +813,36 @@ async fn a_lost_actor_task_closes_admission() {
     }
 }
 
+/// A structural composition dispatch failure at a loop boundary stops the
+/// actor through its ordinary return, not as a lost task: admission closes
+/// with its own reason first, so the stopped mob grants no owner lease.
+#[tokio::test]
+async fn a_dispatch_failure_closes_admission() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-dispatch-failed");
+    let (handle, _service) = create_test_mob(definition).await;
+    let observer = handle.observer();
+    let mut task = handle.actor_task_watch();
+    assert!(observer.admission_closed().borrow().is_none());
+
+    crate::runtime::actor::fail_next_boundary_flush_for_test(handle.mob_id());
+    // Any command takes the loop to its next boundary, where the flush fails.
+    let _phase = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await;
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    assert_eq!(
+        *observer.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::DispatchFailed)
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a mob stopped by a dispatch failure grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::DispatchFailed),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

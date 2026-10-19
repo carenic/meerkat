@@ -65,6 +65,11 @@ them.
   `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
   (reason `MobAdmissionCloseReason::ActorLost`) where it granted an owner
   lease (see Fixed).
+- Behaviour-only (not measured by the gate): after a composition dispatch
+  failure stops the mob's actor, `MobHandle::acquire_owner` is refused with
+  `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::DispatchFailed`) where it granted an owner lease
+  on the stopped actor (see Fixed).
 
 ### Fixed
 
@@ -95,17 +100,21 @@ them.
   or a durable recovery that fails before the actor admits a command) closes
   the mob's admission before the actor quiesces and exits, with the new
   `MobAdmissionCloseReason::DurabilityFailStop` (it displays as "durability
-  fail-stop"); an earlier close keeps its reason. With the Shutdown and
-  Destroy closes above, every exit the mob actor takes on its own closes
-  admission first.
+  fail-stop"); an earlier close keeps its reason.
 - A lost mob actor task (one that ends without its loop returning, as on a
   panic or an abort) closes the mob's admission from its spawn wrapper,
   before the task is reported lost, with the new
   `MobAdmissionCloseReason::ActorLost` (it displays as "actor lost"); an
   earlier close keeps its reason. Before, a lost actor left admission open,
   so `acquire_owner` still handed out owner leases and `admission_closed()`
-  stayed `None`. With the closes above, no mob actor exit leaves admission
-  open.
+  stayed `None`.
+- A composition dispatch failure at a loop boundary (a structural routing
+  failure, which stops the mob's actor) closes the mob's admission before the
+  actor stops, with the new `MobAdmissionCloseReason::DispatchFailed` (it
+  displays as "dispatch failure"); an earlier close keeps its reason. Before,
+  the actor stopped with admission open, so `acquire_owner` still handed out
+  owner leases and `admission_closed()` stayed `None`. With the closes above,
+  no mob actor exit leaves admission open.
 
 ## [0.9.3] - 2026-10-18
 

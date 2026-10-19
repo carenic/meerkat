@@ -4190,26 +4190,42 @@ pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
     std::sync::Mutex::new(None);
-/// Test seam: the actor loop of this mob panics at the top of its next turn.
+/// Arm a one-shot per-mob test seam: it fires once, for this mob only.
 #[cfg(test)]
-static PANIC_ACTOR_LOOP_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
-    if let Ok(mut target) = PANIC_ACTOR_LOOP_FOR_MOB.lock() {
+fn arm_mob_seam_for_test(seam: &std::sync::Mutex<Option<MobId>>, mob_id: &MobId) {
+    if let Ok(mut target) = seam.lock() {
         *target = Some(mob_id.clone());
     }
 }
 
+/// Whether the seam is armed for this mob, disarming it if so.
 #[cfg(test)]
-fn take_actor_loop_panic_for_test(mob_id: &MobId) -> bool {
-    PANIC_ACTOR_LOOP_FOR_MOB.lock().is_ok_and(|mut target| {
+fn take_mob_seam_for_test(seam: &std::sync::Mutex<Option<MobId>>, mob_id: &MobId) -> bool {
+    seam.lock().is_ok_and(|mut target| {
         let armed = target.as_ref() == Some(mob_id);
         if armed {
             *target = None;
         }
         armed
     })
+}
+
+/// Test seam: the actor loop of this mob panics at the top of its next turn.
+#[cfg(test)]
+static PANIC_ACTOR_LOOP_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&PANIC_ACTOR_LOOP_FOR_MOB, mob_id);
+}
+
+/// Test seam: the next loop-boundary flush of this mob fails structurally.
+#[cfg(test)]
+static FAIL_BOUNDARY_FLUSH_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn fail_next_boundary_flush_for_test(mob_id: &MobId) {
+    arm_mob_seam_for_test(&FAIL_BOUNDARY_FLUSH_FOR_MOB, mob_id);
 }
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
@@ -18544,7 +18560,9 @@ impl MobActor {
     ///   restored actor that carries that marker, before its handle escapes
     ///   ([`Self::close_admission_if_destroy_admitted`]);
     /// - a durability fail-stop, before the actor quiesces and exits, and a
-    ///   durable recovery that fail-stops before command admission.
+    ///   durable recovery that fail-stops before command admission;
+    /// - a structural dispatch failure at a loop boundary, before the actor
+    ///   stops.
     ///
     /// Nothing is then handed an owner lease on an actor that will take no
     /// further command. Unconditional, keeping the first reason (D67); it
@@ -28944,7 +28962,7 @@ impl MobActor {
         'actor: loop {
             #[cfg(test)]
             assert!(
-                !take_actor_loop_panic_for_test(&self.definition.id),
+                !take_mob_seam_for_test(&PANIC_ACTOR_LOOP_FOR_MOB, &self.definition.id),
                 "test seam: the mob actor loop panics"
             );
             // Detached completion paths can re-enter through `continue` or
@@ -29228,6 +29246,15 @@ impl MobActor {
             }
             loop {
                 let result = boxed_arm_future(|| self.flush_routed_effects()).await;
+                #[cfg(test)]
+                let result =
+                    if take_mob_seam_for_test(&FAIL_BOUNDARY_FLUSH_FOR_MOB, &self.definition.id) {
+                        Err(MobError::WiringError(
+                            "test seam: the boundary flush fails".to_string(),
+                        ))
+                    } else {
+                        result
+                    };
                 match Self::classify_actor_boundary_flush(result) {
                     ActorBoundaryFlushDisposition::Drained => break,
                     ActorBoundaryFlushDisposition::RetryAfterMachineClosure(error) => {
@@ -29239,6 +29266,9 @@ impl MobActor {
                         );
                     }
                     ActorBoundaryFlushDisposition::Fatal(error) => {
+                        // The actor takes no further command: admission
+                        // closes first, so no owner lease is granted on it.
+                        self.close_admission_for_exit(MobAdmissionCloseReason::DispatchFailed);
                         tracing::error!(
                             mob_id = %self.definition.id,
                             error = %error,

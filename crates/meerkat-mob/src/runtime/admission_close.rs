@@ -17,9 +17,9 @@
 //! any close is refused. Closing never stops
 //! admitted work: the ordinary Stop, Shutdown and Destroy remain the teardown
 //! path. An admitted Shutdown closes admission itself, before its teardown;
-//! so do an admitted Destroy and a durability fail-stop, and a lost actor
-//! task closes it from its spawn wrapper, so no actor exit leaves admission
-//! open. A Stop leaves it open.
+//! so do an admitted Destroy, a durability fail-stop and a dispatch failure
+//! that stops the actor, and a lost actor task closes it from its spawn
+//! wrapper, so no actor exit leaves admission open. A Stop leaves it open.
 
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +49,9 @@ pub enum MobAdmissionCloseReason {
     /// The actor task ended without its loop returning (a panic or an
     /// abort), so the mob takes no further command.
     ActorLost,
+    /// A structural composition dispatch failure at a loop boundary stopped
+    /// the actor, so the mob takes no further command.
+    DispatchFailed,
 }
 
 impl std::fmt::Display for MobAdmissionCloseReason {
@@ -61,6 +64,7 @@ impl std::fmt::Display for MobAdmissionCloseReason {
             Self::Destroyed => f.write_str("destroyed"),
             Self::DurabilityFailStop => f.write_str("durability fail-stop"),
             Self::ActorLost => f.write_str("actor lost"),
+            Self::DispatchFailed => f.write_str("dispatch failure"),
         }
     }
 }
@@ -105,8 +109,9 @@ pub enum CloseIfIdleOutcome {
 }
 
 /// Owner presence and the Closing state of one mob, shared by its handles and
-/// its actor. The actor is the only writer of `closed`; it decides under the
-/// same lock that owner acquisition takes.
+/// its actor. The actor writes `closed`, and so does the actor task's end
+/// guard, only once the actor future has stopped (a lost task); every write
+/// decides under the same lock that owner acquisition takes.
 pub(super) struct MobOwnership {
     state: Mutex<OwnershipState>,
     /// Signalled when the last owner drops. A stored permit survives until
