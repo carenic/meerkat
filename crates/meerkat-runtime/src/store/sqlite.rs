@@ -8457,7 +8457,8 @@ ORDER BY runtime_id";
     /// Deserialize a persisted `StoredInputState` row through typed serde.
     /// `StoredInputState::deserialize` validates the mandatory
     /// `stored_input_state_version` byte against the generated persistence
-    /// version authority, so a missing or non-current row fails closed.
+    /// version authority, so a missing or unsupported stamp (outside 3..=7)
+    /// fails closed.
     fn deserialize_persisted_input_state(
         bytes: &[u8],
     ) -> Result<StoredInputState, RuntimeStoreError> {
