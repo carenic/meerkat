@@ -728,7 +728,7 @@ Installed via `make install-hooks`. Two stages:
 
 **On commit** (`pre-commit`):
 - `repo-cargo fmt --all`
-- `node scripts/generate-bazel-rust-builds.mjs` (regenerates Bazel rust build metadata)
+- `node scripts/generate-bazel-rust-builds.mjs` (regenerates Bazel rust build metadata when Cargo metadata, a Rust source under `crates/` or `tests/`, or a generator input changes; about 5 s)
 - `scripts/sync-meerkat-dogma-skill-docs.sh` (syncs dogma docs into the skill)
 
 **On push** (`pre-push`), sized to finish in a few minutes warm (the CI it
