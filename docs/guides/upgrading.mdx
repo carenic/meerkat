@@ -78,11 +78,13 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
     (a tool-scope, deferred-catalog or failed-closed notice; see
     [Tool configuration events](#tool-configuration-events)).
 - **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
-  fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. The
-  SDKs fetch their own matching `rkat-rpc`, so this happens only when you
-  point an SDK at another binary.
-- **Upgrade every process that shares a runtime store together**, and take a
-  backup first (step 2 of [How to upgrade](#how-to-upgrade)).
+  fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
+  downloads its own matching `rkat-rpc` only when you supply none, so this
+  happens when it runs a binary you supply: `MEERKAT_BIN_PATH`, an explicit
+  path, or an `rkat-rpc` on `PATH` (for example one Homebrew upgraded).
+- **Upgrade every process that shares a runtime store together:** stop them
+  all, back up the state root, then start 0.9.4 on all of them (steps 1, 2
+  and 5 of [How to upgrade](#how-to-upgrade)).
 
 ### Breaking changes and what to do
 
@@ -93,9 +95,11 @@ refuses frontmatter the old parser accepted:
 
 - a key given twice, at any level (a top-level extension key or a `metadata`
   key; the old parser kept the last value);
-- a null `description` or `metadata` value (`~` or an empty value);
+- a null `description`, or a null value under `metadata` (`~` or an empty
+  value);
 - an unrecognized tag such as `!custom`, anywhere;
-- nesting deeper than 64 levels, or very alias-heavy documents;
+- nesting deeper than 64 levels, or 100 or more aliases that outnumber their
+  anchors more than ten to one;
 - a `...` document end marker line.
 
 **Do:** remove duplicate keys, give `description` and every `metadata` key a
@@ -105,9 +109,10 @@ the frontmatter now keeps its final line break.
 Extension values read back through `SkillDocument.extensions` are rendered by
 the new parser. A structured value's YAML uses double quotes where a string
 needs quoting (`'1.10'` is now `"1.10"`), and some unquoted scalars now
-resolve as YAML values (`1_000` is `1000`, `tRUE` is `true`, `017` is
-`17.0`). **Do:** quote a value that must stay text, such as a file mode with
-leading zeros (`'0755'`; unquoted it reads as `755.0`).
+resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, `tRUE` is
+`true`, an integer past u64 is a float, `1e999` is `.inf`, and a `!!binary`
+value is decoded. **Do:** quote a value that must stay text, such as a file
+mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
 
 #### Mobs
 
@@ -191,12 +196,14 @@ leading zeros (`'0755'`; unquoted it reads as `755.0`).
 
 `Agent::replace_client`, `Agent::replace_client_with_request_policy` and the
 ephemeral service's `SessionService::set_session_client` no longer change the
-session's model: a client for another provider or model is refused with
+session's model: a client, or a request-policy model, whose provider or model
+differs from the session's durable identity is refused with
 `AgentError::ClientModelChangeRequiresHotSwap` before anything changes.
 
 **Do:** change the model with `Agent::hot_swap_llm_identity` or
 `SessionService::hot_swap_session_llm_identity`. A replacement client for the
-same model is accepted as before.
+same model, and any client on a session without a durable identity, is
+accepted as before.
 
 #### Custom compactors
 
@@ -210,6 +217,16 @@ SummarizationSource`. It has no default implementation.
 and ignore the budget. To fit the summarizing model, bound the source by the
 budget and report the bound, as `DefaultCompactor` does. A
 `CompactionContext` built by hand sets `last_rewrite_history_tokens: None`.
+
+The compaction types around it change too:
+
+- `SessionCompactionCadence` gains `last_rewrite_history_tokens` (set it in
+  struct literals).
+- `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source` and `estimated_history_tokens_after` (patterns without
+  `..` need them).
+- `CompactionSummarySource` is `#[non_exhaustive]` (add a wildcard arm), and
+  its `ProviderCall` variant carries the call's `source_bound`.
 
 #### Governed realms and authorization (Rust hosts)
 
@@ -235,6 +252,17 @@ budget and report the bound, as `DefaultCompactor` does. A
 - `OperationRefused` equality includes whether the refused call's tool code
   ran (`OperationRefused::dispatch`): compare `kind()` and `dispatch()`
   instead of comparing with `OperationRefused::new(kind)`.
+- A model-reviewed (R2) tool call whose owner publication changes during its
+  review is prepared again and reviewed once more, as a second review attempt
+  for the same `tool_call_id`, where 0.9.3 settled it as `review_unsatisfied`
+  (`context_changed`). An `OperationReviewObserver` can therefore see an
+  attempt retired as `ContextChanged` followed by a second attempt (the audit
+  shows a second `ReviewAttemptStarted`). **Do:** do not treat that
+  retirement as the call's final outcome; only the last attempt settles it.
+- A governed helper admission fence and a helper child issuance that refuse
+  to rebuild (`ReprepareRequired`) now answer `Unavailable` instead of
+  `Denied`: a later attempt may succeed. A denial and malformed facts stay
+  `Denied`.
 
 #### Runtime and registration (Rust hosts)
 
@@ -248,9 +276,10 @@ budget and report the bound, as `DefaultCompactor` does. A
   answered `None`.
 - `ContinuationAdmitError` and `BlockedDeliveryReason` gain
   `NotReady(ControllerReadinessFailure)`; `ContinuationAdmitError` is
-  `#[non_exhaustive]`. The wire `WireControllerReadinessFailure` gains
-  `original_admission_pending`, which a Rust decoder built before 0.9.4
-  rejects.
+  `#[non_exhaustive]`, and `BlockedDeliveryReason`'s variants no longer have
+  defined discriminants (an `as` cast on it no longer compiles). The wire
+  `WireControllerReadinessFailure` gains `original_admission_pending`, which a
+  Rust decoder built before 0.9.4 rejects.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` (wrap
   it in `std::panic::AssertUnwindSafe` to move it into `catch_unwind`), and
   `SqliteMobObserverDrainReport` gains `retained_registrations`.
@@ -317,22 +346,25 @@ last.
 
 ### Upgrade checklist
 
-1. Back up the realm state root; there is no downgrade to 0.9.3 after 0.9.4
+1. Stop every 0.9.3 process that shares a runtime store.
+2. Back up the realm state root; there is no downgrade to 0.9.3 after 0.9.4
    writes to it.
-2. Stop every 0.9.3 process that shares a runtime store, then start 0.9.4 on
-   all of them together, and upgrade the Python and TypeScript SDKs with
-   `rkat-rpc`.
-3. Fix `SKILL.md` frontmatter the new parser refuses (duplicate keys, null
-   values, custom tags, `...` lines).
-4. Handle `MobError::AdmissionClosed` and `MobError::ShutdownInProgress`, and
+3. Upgrade the binaries, the Python and TypeScript SDKs and the Rust crates
+   together, then start 0.9.4 on all of those processes.
+4. Fix `SKILL.md` frontmatter the new parser refuses (duplicate keys, null
+   values, custom tags, `...` lines), and quote extension values that must
+   stay text (`'0755'`).
+5. Handle `MobError::AdmissionClosed` and `MobError::ShutdownInProgress`, and
    add wildcard arms for the non-exhaustive mob errors.
-5. Read `content_filtered` run failures with their typed reason, and stop
+6. Read `content_filtered` run failures with their typed reason, and stop
    treating refusal text as an answer.
-6. Move model changes on a running session to `hot_swap_llm_identity`.
-7. Update custom compactors for the new `prepare_for_summarization`.
-8. Governed hosts: bind host-reported outcomes with `bind_host_outcome`.
-9. Read tool configuration changes by `settled` (accepting `persisted` on
-   rows stored before 0.9.4).
+7. Move model changes on a running session to `hot_swap_llm_identity`.
+8. Update custom compactors for the new `prepare_for_summarization`.
+9. Governed hosts: bind host-reported outcomes with `bind_host_outcome`, and
+   do not treat a review attempt retired as `ContextChanged` as the call's
+   final outcome.
+10. Read tool configuration changes by `settled` (accepting `persisted` on
+    rows stored before 0.9.4).
 
 ## Upgrading to 0.8.51
 

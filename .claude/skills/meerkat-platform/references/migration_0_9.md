@@ -186,8 +186,8 @@ under `### Breaking`. The common ones:
 
 ## Checklist
 
-1. Back up, stop every process sharing the state root, and upgrade binaries,
-   SDKs and crates together.
+1. Stop every process sharing the state root, back it up, and upgrade
+   binaries, SDKs and crates together.
 2. Rename `mobkit/jobs/*` calls to `meta/jobs/*` (and the SDK methods).
 3. Fix hook entries: `model_operations = "ordinary_only"` on model-request
    Guardrails, and no Guardrails at `run_started` / `turn_boundary`.
@@ -197,7 +197,7 @@ under `### Breaking`. The common ones:
 6. Rust hosts: keep a `MobHandle` clone while a mob must admit work, retry
    `mob_destroy_incomplete`, and update struct literals and matches.
 
-## 0.9.3 -> 0.9.4 (2026-10-20)
+## 0.9.3 -> 0.9.4
 
 The source is the `## [0.9.4]` section of `CHANGELOG.md`; the operator steps
 are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
@@ -207,26 +207,30 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - No downgrade to 0.9.3 once a 0.9.4 binary has written to a runtime store:
   stored input state is now version 7 (0.9.4 reads versions 3-6 and writes
   every row it stores at 7; 0.9.3 refuses a version 7 row and leaves the bytes
-  in place). Stop every process that shares a runtime store and start 0.9.4 on
-  all of them together.
+  in place). Stop every process that shares a runtime store, back up the
+  state root, then start 0.9.4 on all of them together.
 - 0.9.3 also cannot read back a session event log that holds a
   content-filtered `run_failed` event, a transcript holding a tool-scope,
   deferred-catalog or failed-closed notice that 0.9.4 wrote, or restore a
   grant owner whose journal holds an owner-scoped resource-domain restriction
   (`RestartRequired`).
 - Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
-  every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds (only possible
-  with an overridden binary path).
+  every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. It runs a
+  binary you supply (`MEERKAT_BIN_PATH`, an explicit path, or `rkat-rpc` on
+  `PATH`) before it downloads its own matching one.
 
 ### Breaking changes
 
 - Skill frontmatter: the YAML parser is serde-saphyr. It refuses a duplicated
-  key at any level, a null `description` or `metadata` value, an unrecognized
-  tag (`!custom`), nesting deeper than 64 levels, alias-heavy documents and a
-  `...` end marker line. A block scalar ending the frontmatter keeps its final
+  key at any level, a null `description` or a null value under `metadata`, an
+  unrecognized tag (`!custom`), nesting deeper than 64 levels, 100 or more
+  aliases that outnumber their anchors more than ten to one, and a `...` end
+  marker line. A block scalar ending the frontmatter keeps its final
   line break. Extension values render through the new parser (`'1.10'`
-  becomes `"1.10"`; unquoted `1_000` becomes `1000`, `0755` becomes `755.0`):
-  quote values that must stay text.
+  becomes `"1.10"`; unquoted, `1_000` becomes `1000`, `0755` becomes
+  `755.0`, `tRUE` becomes `true`, an integer past u64 becomes a float,
+  `1e999` becomes `.inf`, and a `!!binary` value is decoded): quote values
+  that must stay text.
 - Mobs: an admitted `MobHandle::shutdown` closes admission before teardown
   (`MobError::AdmissionClosed`, reason `shutdown`): spawn, respawn, work,
   flows, wiring, host binds, live commits, resume, reset, reload and owner
@@ -259,14 +263,20 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `LlmDoneOutcome::success(..)` / `success_with_detail(..)`);
   `AgentError::ContentFiltered` gains `stop` and `detail`; `AgentErrorReason`
   gains `ContentFiltered`.
-- `Agent::replace_client` and `SessionService::set_session_client` refuse a
-  client for another model (`AgentError::ClientModelChangeRequiresHotSwap`);
-  change models with `hot_swap_llm_identity` /
-  `hot_swap_session_llm_identity`.
+- `Agent::replace_client` (and `replace_client_with_request_policy`) and
+  `SessionService::set_session_client` refuse a client, or a request-policy
+  model, whose provider or model differs from the session's durable identity
+  (`AgentError::ClientModelChangeRequiresHotSwap`); change models with
+  `hot_swap_llm_identity` / `hot_swap_session_llm_identity`. A session
+  without a durable identity still accepts any client.
 - Custom compactors: `Compactor::prepare_for_summarization(messages, budget)`
   returns a `SummarizationSource` and has no default. Return
   `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
-  to keep the old behaviour.
+  to keep the old behaviour. `SessionCompactionCadence` and
+  `CompactionContext` gain `last_rewrite_history_tokens`;
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source` and `estimated_history_tokens_after`;
+  `CompactionSummarySource` is non-exhaustive.
 - Governed realms (Rust hosts): `StockGovernance::bind_prompt` binds only
   operator prompts (`StockGovernanceError::RequesterUnsupported` otherwise);
   bind host-reported outcomes with `StockGovernance::bind_host_outcome`. The
@@ -276,16 +286,22 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `DomainRestriction` (`unrestricted`, `exact`, `owned_by`, `unresolved`).
   `AuditObservation` is non-exhaustive. `OperationRefused` equality includes
   `dispatch()` (whether the tool code ran); compare `kind()` and `dispatch()`.
+  An R2-reviewed tool call whose owner publication changes during review is
+  reviewed once more under the same `tool_call_id`: an observer can see an
+  attempt retired as `ContextChanged` before the second attempt, so do not
+  treat that retirement as final. A helper admission fence or child issuance
+  that refuses to rebuild answers `Unavailable`, not `Denied`.
 - Runtime (Rust hosts): MCP attachment providers take the exact
   `RuntimeSessionRegistrationWitness`; `retained_original` becomes
   `retained_custody` (`RetainedCustody`); `ContinuationAdmitError` and
-  `BlockedDeliveryReason` gain `NotReady(..)`; the wire readiness failure gains
-  `original_admission_pending`; `RuntimeDeliveryOwnerRetirement::join`
-  returns a `#[must_use]` report. GPT Live adapter enums gain
-  `FinishedPending`, `NoteDelegationFinishedContext` and
-  `InstructionsContextAppendWithdrawn`. New fields on generated machine state structs
-  (`stored_input_state_migration_v6`, `identity_generation_highwater`,
-  `identity_generation_highwater_sealed`).
+  `BlockedDeliveryReason` gain `NotReady(..)` (`BlockedDeliveryReason` loses
+  its defined discriminants, so `as` casts stop compiling); the wire
+  readiness failure gains `original_admission_pending`;
+  `RuntimeDeliveryOwnerRetirement::join` returns a `#[must_use]` report. GPT
+  Live adapter enums gain `FinishedPending`, `NoteDelegationFinishedContext`
+  and `InstructionsContextAppendWithdrawn`. Generated machine state structs
+  gain fields (`stored_input_state_migration_v6`,
+  `identity_generation_highwater`, `identity_generation_highwater_sealed`).
 
 ### Other behaviour changes
 
@@ -310,10 +326,12 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 
 ### Checklist
 
-1. Back up, stop every process that shares a runtime store, and upgrade
-   everything together, SDKs included.
-2. Fix skill frontmatter the new parser refuses.
+1. Stop every process that shares a runtime store, back up the state root,
+   and upgrade everything together, SDKs included.
+2. Fix skill frontmatter the new parser refuses, and quote extension values
+   that must stay text.
 3. Handle `AdmissionClosed` and `ShutdownInProgress`; add wildcard arms.
 4. Read `content_filtered` failures by their typed reason.
 5. Use `hot_swap_llm_identity` for model changes; update custom compactors.
-6. Governed hosts: use `bind_host_outcome` for host-reported outcomes.
+6. Governed hosts: use `bind_host_outcome` for host-reported outcomes, and
+   treat a `ContextChanged` review retirement as not final.

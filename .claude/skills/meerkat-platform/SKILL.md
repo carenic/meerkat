@@ -15,10 +15,10 @@ This guide is an overview. The reference documents below carry the detail; read 
 - `references/sessions_runtime_surfaces_sessions.md` - sessions on every surface: create, resume, list, read, history, archive, turn queueing and the attempt cap, interrupt versus `turn/stop_run`, forks, transcript edits, system prompts, events and replay, ATIF export, durable resume holds and tool-process recovery.
 - `references/sessions_runtime_surfaces_storage_config.md` - realm ids and where state lives, backends, multiprocess hosting, SQLite, `rkat storage`, runtime health and shutdown, WorkGraph limits, schedules, `rkat config` and config keys.
 - `references/sessions_runtime_surfaces_api_changes.md` - JSON-RPC methods and REST routes added or renamed since 0.8.40, the `ErrorCode` table with HTTP statuses and `rkat` exit codes, SDK changes, binaries and installs, Rust embedding, removals.
-- `references/providers_and_auth_models.md` - choosing a provider and model, default models and the catalog, capabilities, thinking and effort, `provider_params` and prompt caching, realtime, voice and image models, self-hosted servers, provider errors.
+- `references/providers_and_auth_models.md` - choosing a provider and model, default models and the catalog, capabilities, thinking and effort, `provider_params` and prompt caching, realtime, voice and image models, self-hosted servers, provider errors, refusals and content filters.
 - `references/providers_and_auth_credentials.md` - env-var API keys, realm backends, auth profiles and bindings, base URLs and cloud routes, credential storage and keychain refusals, every `rkat auth` subcommand, `--auth-binding`, auth RPC/REST/SDK methods and errors, connector OAuth clients.
 - `references/security.md` - OS sandboxing (process confinement) and what is not a sandbox, shell command policy, tool access policy and read-only, where credentials and secrets live, MCP security boundaries, audit, security errors and refusals.
-- `references/security_governance.md` - governed realms (`rkat realm govern`, grants, `--as-agent`, governed `rkat-rpc`), review tiers R1/R2/R3, human consent and approvals, native authorization for Rust hosts.
+- `references/security_governance.md` - governed realms (`rkat realm govern`, grants, `--as-agent`, governed `rkat-rpc`), review tiers R1/R2/R3, human consent and approvals, native authorization for Rust hosts, authorization changes while work runs.
 - `references/mcp_tools_skills_mcp.md` - MCP servers: `mcp.toml` and realm config, every `rkat mcp` flag, which hosts start configured servers, MCP OAuth, access ceilings, live `mcp/*`, deferred tools, MCP Apps, MCP errors.
 - `references/mcp_tools_skills_tools.md` - built-in tool families and exact names, `--tools` presets, `[shell]`/`[tools]` config, tool errors, filters and overlays, `tool_access_policy`, streaming tool deadlines, callback tools.
 - `references/mcp_tools_skills_skills.md` - skills: SKILL.md format, identity and sources, `[skills]` config, `rkat skill`, `rkat run --skill`, `preload_skills` and `skill_refs`, mob skills, introspection, skill errors.
@@ -28,7 +28,7 @@ This guide is an overview. The reference documents below carry the detail; read 
 - `references/live_comms_mobs_live.md` - live (realtime voice) channels: `live/*` on `rkat-rpc`, realtime models, audio and size limits, SDK calls, the GPT Live preview, mob member live (`rkat mob live`).
 - `references/live_comms_mobs_comms.md` - agent-to-agent comms: transports, `[comms]` config, `rkat run --comms-*` flags, comms tools, `comms/send` on every surface and its delivery outcomes, remote signed peers.
 - `references/mobs.md` - multi-agent orchestration in depth.
-- `references/live_comms_mobs_mobs.md` - mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy, member lifetime, helpers, `fork_off`, council, profile keys, flows and runs, multi-host mobs, mobpacks and deploy, error codes.
+- `references/live_comms_mobs_mobs.md` - mob changes since 0.8.40 (through 0.9.4): stop, shutdown, destroy and admission close, member lifetime, member binding history, helpers, `fork_off`, council, profile keys, flows and runs, multi-host mobs, mobpacks and deploy, error codes.
 - `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes), and 0.9.3 to 0.9.4.
 - `references/migration_0_5.md` - only if you're upgrading from 0.5 (`host_mode` → `keep_alive`, etc.).
 
@@ -317,12 +317,14 @@ for live messages.
 For platform integration answers in this checkout, assume the current branch
 surface, not the old live-adapter/docs-refresh snapshot:
 
-- **0.9.4 (2026-10-20).** Breaking changes and a checklist are in the last
-  section of `references/migration_0_9.md`. In short:
+- **0.9.4.** Breaking changes and a checklist are in the last section of
+  `references/migration_0_9.md`. In short:
   - No downgrade to 0.9.3 after 0.9.4 writes a runtime store (stored input
     state version 7); upgrade every process that shares one together.
   - SKILL.md frontmatter is parsed by serde-saphyr and refuses duplicated
-    keys, null `description`/`metadata` values, custom tags and `...` lines.
+    keys, a null `description` or a null value under `metadata`, custom tags
+    and `...` lines. Unquoted extension values resolve as YAML (`0755` reads
+    as `755.0`), so quote values that must stay text.
   - An admitted mob Shutdown closes admission at once (`AdmissionClosed`,
     reason `shutdown`); requests during its drain get the retryable
     `MobError::ShutdownInProgress`; destroy, durability fail-stop, actor loss
@@ -333,6 +335,11 @@ surface, not the old live-adapter/docs-refresh snapshot:
   - Compaction sizes the summary source for the summarizing model and reports
     it (`summary_source`, `estimated_history_tokens_after`); custom
     `Compactor`s implement the new `prepare_for_summarization`.
+  - `Agent::replace_client` and `SessionService::set_session_client` refuse a
+    client for another provider or model
+    (`AgentError::ClientModelChangeRequiresHotSwap`); change the model of a
+    running session with `hot_swap_llm_identity` /
+    `hot_swap_session_llm_identity`.
   - Governed realms: `bind_prompt` binds only operator prompts; host-reported
     outcomes use `bind_host_outcome`.
   - The tool configuration change bit is `settled`, not `persisted` (rows
