@@ -4190,29 +4190,53 @@ pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
     std::sync::Mutex::new(None);
+/// The mobs a one-shot per-mob test seam is armed for. A set, so arming the
+/// seam for one mob never disarms another's arm: tests in one process
+/// (in-process `cargo test`) can arm the same seam concurrently.
+#[cfg(test)]
+type MobSeamForTest = std::sync::Mutex<std::collections::BTreeSet<MobId>>;
+
 /// Arm a one-shot per-mob test seam: it fires once, for this mob only.
 #[cfg(test)]
-fn arm_mob_seam_for_test(seam: &std::sync::Mutex<Option<MobId>>, mob_id: &MobId) {
-    if let Ok(mut target) = seam.lock() {
-        *target = Some(mob_id.clone());
+fn arm_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) {
+    if let Ok(mut armed) = seam.lock() {
+        armed.insert(mob_id.clone());
     }
 }
 
 /// Whether the seam is armed for this mob, disarming it if so.
 #[cfg(test)]
-fn take_mob_seam_for_test(seam: &std::sync::Mutex<Option<MobId>>, mob_id: &MobId) -> bool {
-    seam.lock().is_ok_and(|mut target| {
-        let armed = target.as_ref() == Some(mob_id);
-        if armed {
-            *target = None;
-        }
-        armed
-    })
+fn take_mob_seam_for_test(seam: &MobSeamForTest, mob_id: &MobId) -> bool {
+    seam.lock().is_ok_and(|mut armed| armed.remove(mob_id))
+}
+
+#[cfg(test)]
+mod mob_seam_for_test_tests {
+    use super::*;
+
+    #[test]
+    fn arming_a_mob_seam_keeps_every_other_armed_mob() {
+        let seam: MobSeamForTest = std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let first = MobId::from("seam-first");
+        let second = MobId::from("seam-second");
+        arm_mob_seam_for_test(&seam, &first);
+        arm_mob_seam_for_test(&seam, &second);
+        assert!(take_mob_seam_for_test(&seam, &first));
+        assert!(
+            !take_mob_seam_for_test(&seam, &first),
+            "a seam fires once per arm"
+        );
+        assert!(
+            take_mob_seam_for_test(&seam, &second),
+            "arming the first mob left the second mob armed"
+        );
+    }
 }
 
 /// Test seam: the actor loop of this mob panics at the top of its next turn.
 #[cfg(test)]
-static PANIC_ACTOR_LOOP_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+static PANIC_ACTOR_LOOP_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 #[cfg(test)]
 pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
@@ -4221,7 +4245,8 @@ pub(super) fn panic_actor_loop_for_test(mob_id: &MobId) {
 
 /// Test seam: the next loop-boundary flush of this mob fails structurally.
 #[cfg(test)]
-static FAIL_BOUNDARY_FLUSH_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+static FAIL_BOUNDARY_FLUSH_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 #[cfg(test)]
 pub(super) fn fail_next_boundary_flush_for_test(mob_id: &MobId) {
@@ -4231,7 +4256,8 @@ pub(super) fn fail_next_boundary_flush_for_test(mob_id: &MobId) {
 /// Test seam: this mob's next admitted Shutdown fails in its lifecycle drain,
 /// after its admission.
 #[cfg(test)]
-static FAIL_SHUTDOWN_DRAIN_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+static FAIL_SHUTDOWN_DRAIN_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 #[cfg(test)]
 pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
@@ -4241,7 +4267,8 @@ pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
 /// Test seam: this mob's next actor start fail-stops in its durable recovery,
 /// before command admission.
 #[cfg(test)]
-static FAIL_STOP_ACTOR_START_FOR_MOB: std::sync::Mutex<Option<MobId>> = std::sync::Mutex::new(None);
+static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 #[cfg(test)]
 pub(super) fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
