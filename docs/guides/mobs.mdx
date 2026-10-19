@@ -570,12 +570,14 @@ Mobs separate stable member identity from runtime binding details:
 Use `AgentIdentity` for facts that survive respawn, such as wiring and durable
 configuration. Runtime IDs and fence tokens protect the lower-level binding.
 
-A member's generation only grows, across mob resets and restarts too. Since
-0.9.4 resume recovers each identity's highest generation from the whole event
+Since 0.9.4 a spawn never reuses a generation, across mob resets and restarts
+too: resume recovers each identity's highest generation from the whole event
 log, so a member re-spawned after a reset and a restart never reuses its
 pre-reset runtime id or member address, and a mob that was reset and then
 re-spawned a member under a pre-reset identity resumes after a restart (0.9.3
-and earlier failed that resume with an internal error).
+and earlier failed that resume with an internal error). A store written
+before 0.9.4 whose last epoch already reused a generation still resumes, and
+that identity's next spawn goes above the recovered high-water.
 
 ### Durable role migration
 
