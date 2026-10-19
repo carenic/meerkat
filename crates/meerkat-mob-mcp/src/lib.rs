@@ -3382,20 +3382,41 @@ impl MobMcpState {
                     // A creation record that is not finalized names a mob
                     // whose log lost its MobCreated: the store disagrees with
                     // itself, so it is left unrestored as found, never
-                    // swept. With no record, or one a finished destroy
-                    // finalized, the store is empty.
-                    if let Some(mob_id) = storage.unfinalized_creation_mob().await? {
-                        self.keep_unrestored_mob(
-                            Some(mob_id.clone()),
-                            &path,
-                            MobError::IncarnationInconsistent {
-                                mob_id,
-                                inconsistency:
-                                    meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
-                            },
-                        )
-                        .await?;
-                        continue;
+                    // swept. So is a store whose records disagree among
+                    // themselves. With no record, or one a finished destroy
+                    // finalized, the store is empty. Any other read fault
+                    // fails the restore.
+                    match storage.unfinalized_creation_mob().await {
+                        Ok(Some(mob_id)) => {
+                            self.keep_unrestored_mob(
+                                Some(mob_id.clone()),
+                                &path,
+                                MobError::IncarnationInconsistent {
+                                    mob_id,
+                                    inconsistency:
+                                        meerkat_mob::IncarnationInconsistency::RecordWithoutCreation,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(MobError::IncarnationInconsistent {
+                            mob_id,
+                            inconsistency,
+                        }) => {
+                            self.keep_unrestored_mob(
+                                Some(mob_id.clone()),
+                                &path,
+                                MobError::IncarnationInconsistent {
+                                    mob_id,
+                                    inconsistency,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                     if let Err(error) = Self::remove_storage_files(Some(path.as_path())).await {
                         tracing::error!(error = %error, "empty mob store sweep failed");
