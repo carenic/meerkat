@@ -1266,8 +1266,12 @@ export class MeerkatClient {
       process.stdin?.end();
       const closed = once(process, "close").catch(() => []);
       process.kill();
-      const timeout = delay(5000).then(() => "timeout");
+      // Cancel the 5 s cap once the child has closed: a pending timer keeps
+      // the caller's Node process alive until it fires.
+      const cap = new AbortController();
+      const timeout = delay(5000, "timeout" as const, { signal: cap.signal });
       const outcome = await Promise.race([closed, timeout]);
+      cap.abort();
       if (outcome === "timeout" && process.exitCode == null && process.signalCode == null) {
         process.kill("SIGKILL");
         await closed.catch(() => {});

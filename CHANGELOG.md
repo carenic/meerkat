@@ -330,6 +330,13 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- `@rkat/sdk`: a Node process that calls `MeerkatClient.close()` now exits
+  as soon as it has nothing else to do, instead of about 5 seconds later.
+  `close()` waits up to 5 seconds for the `rkat-rpc` child to close before
+  it kills the child with SIGKILL, and the timer for that wait kept running
+  when the child closed first. It is now cancelled; a child that does not
+  close within 5 seconds is still killed as before. Pre-existing since
+  0.6.0.
 
 ## [0.9.3] - 2026-10-18
 
