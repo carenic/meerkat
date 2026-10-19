@@ -1194,6 +1194,23 @@ impl PublicLiveBrokerFactory {
         Self::from_admitted(admitted, Self::options_for_base_url(base_url)?)
     }
 
+    /// [`Self::__try_from_target_with_base_url`] with the client's request
+    /// timeout replaced, so a test can bound a write the peer never drains
+    /// well below the production 30 s. Test fixtures only; never a
+    /// production setting.
+    #[cfg(feature = "test-realtime-fixtures")]
+    #[doc(hidden)]
+    pub fn __try_from_target_with_base_url_and_request_timeout(
+        target: ResolvedRealtimeTarget,
+        base_url: &str,
+        request_timeout: std::time::Duration,
+    ) -> Result<Self, ProviderClientError> {
+        let admitted = Self::admit_target(target)?;
+        let mut options = Self::options_for_base_url(base_url)?;
+        options.request_timeout = request_timeout;
+        Self::from_admitted(admitted, options)
+    }
+
     fn from_admitted(
         admitted: AdmittedPublicLiveTarget,
         options: ClientOptions,
@@ -1999,7 +2016,10 @@ impl PublicLiveBrokerSession {
     /// reading, never writing), so a frame loop waiting on this lock cannot
     /// stall the write; and a write that does not complete within the
     /// client's request timeout fails as ambiguous, the transport rejects
-    /// every queued write and disconnects, and this returns the error.
+    /// every queued write and disconnects, and this returns the error. The
+    /// worst case for one fragment is the rest of a write already in flight
+    /// plus one request timeout for its own write; the first timeout ends
+    /// the transport, so every later send fails at once.
     async fn send_finished_notice_locked(
         &self,
         state: &mut SessionState,
@@ -10925,6 +10945,151 @@ mod tests {
             finished_notice_pause::Point::AfterReserve,
         )
         .await;
+    }
+
+    /// #1820: the parked-writer side of the test above. The provider stops
+    /// reading while a large result is written, so the transport's write
+    /// parks with the socket buffers full. A held result's finished notice
+    /// is then sent under the state lock, queued behind that write. The
+    /// parked write fails as ambiguous after the client's request timeout
+    /// (shortened by the test-only override), the transport rejects the
+    /// queued notice and disconnects, the held result's append returns, the
+    /// state lock is free, and the observation stream ends.
+    #[tokio::test]
+    async fn a_finished_notice_behind_a_parked_write_returns_within_the_request_timeout() {
+        const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+        // Far more than the loopback socket buffers absorb (the client's
+        // send buffer is capped at 4 MiB by default), and below the codec's
+        // 16 MiB event cap: the write cannot complete while nothing reads.
+        let big = "x".repeat(12 * 1024 * 1024);
+        let capture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let floor = Arc::new(tokio::sync::Notify::new());
+        let server_floor = Arc::clone(&floor);
+        let attach = move |State(_capture): State<SharedCapture>, upgrade: WebSocketUpgrade| {
+            let floor = Arc::clone(&server_floor);
+            async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    send_json(&mut socket, json!({"type":"session.started","event_id":"s","session":{"id":"live_fixture","model":"gpt-live-1","status":"active","expires_at":1.0}})).await;
+                    send_json(&mut socket, input_delta("book a table")).await;
+                    send_json(&mut socket, delegation_created("dlg_cue", "client")).await;
+                    send_json(&mut socket, input_delta_at("and summarize the report", 1000.0)).await;
+                    send_json(&mut socket, delegation_created("dlg_big", "client")).await;
+                    send_json(&mut socket, output_delta_span("one moment", 1500.0, 2000.0)).await;
+                    floor.notified().await;
+                    send_json(&mut socket, input_delta_at("is it done yet", 2500.0)).await;
+                    // Never reads: the client's writes park once the socket
+                    // buffers are full.
+                    std::future::pending::<()>().await;
+                })
+            }
+        };
+        let app = Router::new()
+            .route("/v1/live/sessions", post(create_session))
+            .route("/v1/live/sessions/{session_id}/attach", get(attach))
+            .with_state(Arc::clone(&capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_, session) =
+            PublicLiveBrokerFactory::__try_from_target_with_base_url_and_request_timeout(
+                realtime_target("gpt-live-1", OpenAiBackendKind::OpenAiApi),
+                &format!("http://{address}/v1/"),
+                REQUEST_TIMEOUT,
+            )
+            .unwrap()
+            .open(PublicLiveOpenConfig::new("v=0", "marin").unwrap())
+            .await
+            .unwrap()
+            .into_parts();
+        let session = Arc::new(session);
+        loop {
+            if let Some(GptLiveBrokerObservation::AssistantTranscriptFragment { text, .. }) =
+                session.next_observation().await.unwrap()
+                && text.contains("one moment")
+            {
+                break;
+            }
+        }
+        // The user's floor is not held: the large result is written at once,
+        // outside the state lock, and parks.
+        let parked_at = tokio::time::Instant::now();
+        let parked = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                let outcome = session
+                    .append_delegation_result(&GptLiveDelegationRef("dlg_big".to_string()), big)
+                    .await;
+                (outcome, parked_at.elapsed())
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !parked.is_finished(),
+            "the large write parks while nothing reads"
+        );
+        // The reader is independent of the parked writer: the user takes the
+        // floor.
+        floor.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(GptLiveBrokerObservation::UserTranscriptFragment { text, .. }) =
+                    session.next_observation().await.unwrap()
+                    && text.contains("done yet")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("frames are still read while the write is parked");
+        // Held behind the user's floor: its finished notice is sent under the
+        // state lock, queued behind the parked write.
+        let held = tokio::time::timeout(
+            REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
+            session.append_delegation_result(
+                &GptLiveDelegationRef("dlg_cue".to_string()),
+                "Table booked for two.",
+            ),
+        )
+        .await
+        .expect("the held result's append returns once the parked write times out");
+        assert!(
+            held.is_ok(),
+            "the result itself is held and owned: {held:?}"
+        );
+        let (outcome, elapsed) = parked.await.expect("parked append task");
+        assert!(
+            matches!(
+                outcome,
+                Err(GptLiveBrokerError::AppendDeliveryAmbiguous { .. })
+            ),
+            "the parked write fails as ambiguous: {outcome:?}"
+        );
+        assert!(
+            elapsed < REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
+            "the parked write fails within the request timeout: {elapsed:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), session.state.lock())
+                .await
+                .is_ok(),
+            "the state lock is free"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match session.next_observation().await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .expect("the observation stream ends once the transport is gone");
+        tracing::info!(?ended, "parked-writer observation stream ended");
+        server.abort();
     }
 
     /// #1820: a finished notice is written while the state lock is held, so
