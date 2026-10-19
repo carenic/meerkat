@@ -34,22 +34,54 @@ fn workflow_yml_path(name: &str) -> PathBuf {
     path
 }
 
-fn read_workflow(path: &Path) -> serde_yaml::Value {
+/// The YAML rules the frontmatter parser uses (meerkat-skills): YAML 1.2
+/// booleans, so the bare `on:` key is the string "on"; `<<` an ordinary key;
+/// duplicate keys and unknown tags refused.
+fn workflow_yaml_options() -> serde_saphyr::Options {
+    let mut options = serde_saphyr::Options::default();
+    options.strict_booleans = true;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.reject_unsupported_tags = true;
+    options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
+    options
+}
+
+fn read_workflow(path: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    serde_yaml::from_str(&text)
+    serde_saphyr::from_str_with_options(&text, workflow_yaml_options())
         .unwrap_or_else(|e| panic!("cannot parse {} as YAML: {e}", path.display()))
 }
 
-fn job_names(doc: &serde_yaml::Value, path: &Path) -> Vec<String> {
+/// Every step's `run` body and `uses:` reference, for content checks that do
+/// not depend on how a YAML emitter would render the job.
+fn job_step_text(job: &serde_json::Map<String, serde_json::Value>) -> String {
+    job.get("steps")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|step| {
+            let run = step
+                .get("run")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let uses = step
+                .get("uses")
+                .and_then(serde_json::Value::as_str)
+                .map(|uses| format!("uses: {uses}"));
+            run.into_iter().chain(uses)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn job_names(doc: &serde_json::Value, path: &Path) -> Vec<String> {
     let jobs = doc
         .get("jobs")
-        .and_then(|j| j.as_mapping())
+        .and_then(|j| j.as_object())
         .unwrap_or_else(|| panic!("{} must have a jobs mapping", path.display()));
-    let mut defined: Vec<String> = jobs
-        .keys()
-        .filter_map(|k| k.as_str().map(str::to_owned))
-        .collect();
+    let mut defined: Vec<String> = jobs.keys().cloned().collect();
     defined.sort_unstable();
     defined
 }
@@ -194,28 +226,28 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
 
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("ci workflow jobs mapping");
     let gate = jobs
-        .get(serde_yaml::Value::String("gate".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("gate")
+        .and_then(serde_json::Value::as_object)
         .expect("gate job");
     assert_eq!(
-        gate.get("name").and_then(serde_yaml::Value::as_str),
+        gate.get("name").and_then(serde_json::Value::as_str),
         Some("CI gate"),
         "branch protection requires the exact context name `CI gate`"
     );
     assert_eq!(
-        gate.get("if").and_then(serde_yaml::Value::as_str),
+        gate.get("if").and_then(serde_json::Value::as_str),
         Some("${{ !cancelled() }}"),
         "a superseded run must surface as cancelled, not as a failed CI gate"
     );
     let gate_needs: Vec<&str> = gate
         .get("needs")
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_json::Value::as_array)
         .expect("gate needs list")
         .iter()
-        .filter_map(serde_yaml::Value::as_str)
+        .filter_map(serde_json::Value::as_str)
         .collect();
     for lane in [
         "changes",
@@ -306,8 +338,8 @@ fn ci_runs_fail_closed_cargo_lanes_on_hosted_runners() {
         assert!(ci.contains(lane), "PR CI must run `{lane}`");
     }
     let fmt_governance = jobs
-        .get(serde_yaml::Value::String("fmt-governance".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("fmt-governance")
+        .and_then(serde_json::Value::as_object)
         .expect("fmt-governance job");
     assert!(
         fmt_governance.get("if").is_none(),
@@ -329,12 +361,12 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
     let doc = read_workflow(&ci_yml);
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("ci workflow jobs mapping");
     let job_if = |job: &str| -> String {
-        jobs.get(serde_yaml::Value::String(job.to_string()))
+        jobs.get(job)
             .and_then(|job| job.get("if"))
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned()
     };
@@ -374,8 +406,8 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
     // gate: neither job (one per wave) nor its lint step may soft-fail.
     for name in ["clippy", "clippy-rest"] {
         let clippy = jobs
-            .get(serde_yaml::Value::String(name.to_string()))
-            .and_then(serde_yaml::Value::as_mapping)
+            .get(name)
+            .and_then(serde_json::Value::as_object)
             .unwrap_or_else(|| panic!("{name} job"));
         assert!(
             clippy.get("continue-on-error").is_none(),
@@ -383,12 +415,12 @@ fn pull_requests_leave_the_chain_and_closure_lanes_to_the_push() {
         );
         let lint_step = clippy
             .get("steps")
-            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(serde_json::Value::as_array)
             .unwrap_or_else(|| panic!("{name} steps"))
             .iter()
             .find(|step| {
                 step.get("run")
-                    .and_then(serde_yaml::Value::as_str)
+                    .and_then(serde_json::Value::as_str)
                     .is_some_and(|run| run.contains("./scripts/repo-cargo clippy"))
             })
             .unwrap_or_else(|| panic!("the {name} lint step"));
@@ -518,11 +550,11 @@ fn cargo_diagnostic_workflow_preserves_the_full_gate_set() {
 
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("cargo workflow jobs mapping");
     let fmt_governance = jobs
-        .get(serde_yaml::Value::String("fmt-governance".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("fmt-governance")
+        .and_then(serde_json::Value::as_object)
         .expect("fmt-governance job");
     assert!(
         fmt_governance.get("if").is_none(),
@@ -530,21 +562,21 @@ fn cargo_diagnostic_workflow_preserves_the_full_gate_set() {
     );
 
     let machine_verify = jobs
-        .get(serde_yaml::Value::String("machine-verify".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("machine-verify")
+        .and_then(serde_json::Value::as_object)
         .expect("machine-verify job");
     let machine_condition = machine_verify
         .get("if")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .expect("machine-verify must have a path-gated condition");
     assert!(machine_condition.contains("machine_authority_changed"));
     let machine_steps = machine_verify
         .get("steps")
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_json::Value::as_array)
         .expect("machine-verify steps");
     assert!(machine_steps.iter().any(|step| {
         step.get("run")
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .is_some_and(|run| run.contains("make machine-verify"))
     }));
     assert!(
@@ -559,9 +591,9 @@ fn cargo_diagnostic_workflow_preserves_the_full_gate_set() {
     assert!(cargo.contains("machine_authority_changed:"));
 
     let gate_needs = jobs
-        .get(serde_yaml::Value::String("gate".to_string()))
+        .get("gate")
         .and_then(|gate| gate.get("needs"))
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_json::Value::as_array)
         .expect("gate needs list");
     assert!(
         gate_needs
@@ -611,11 +643,17 @@ fn nightly_covers_the_deferred_heavy_lanes() {
         .unwrap_or_else(|e| panic!("read {}: {e}", nightly_yml.display()));
     let doc = read_workflow(&nightly_yml);
 
-    // schedule + manual dispatch (serde_yaml parses the bare `on:` key as a
-    // boolean, so assert on the raw text).
-    assert!(nightly.contains("schedule:"), "nightly must run on a cron");
-    assert!(nightly.contains("workflow_dispatch"));
-    drop(doc);
+    // Schedule plus manual dispatch. Read as YAML 1.2, the bare `on:` key is
+    // the string "on" (only YAML 1.1 readers make it the boolean true).
+    let triggers = doc
+        .get("on")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{} must have an `on:` mapping", nightly_yml.display()));
+    assert!(
+        triggers.contains_key("schedule"),
+        "nightly must run on a cron"
+    );
+    assert!(triggers.contains_key("workflow_dispatch"));
 
     // Together with the per-push cargo lane this must cover the complete
     // `make ci` target set — these are the targets deliberately moved off
@@ -655,13 +693,13 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
     let doc = read_workflow(&workflow_yml_path("nightly.yml"));
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("nightly jobs mapping");
     let mut needed_by: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     let mut chain_heads = 0;
     for (name, job) in jobs {
-        let name = name.as_str().expect("job name");
+        let name = name.as_str();
         if name == ROOT {
             assert!(job.get("needs").is_none(), "{ROOT} runs first");
             // A graph-only dispatch (the pre-tag check) runs exactly this job.
@@ -670,7 +708,7 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
             // dispatch always calls it, so a disabled graph fails there
             // instead of finishing green with nothing run.
             assert_eq!(
-                job.get("if").and_then(serde_yaml::Value::as_str),
+                job.get("if").and_then(serde_json::Value::as_str),
                 Some("${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' || inputs.graph_only }}"),
                 "{ROOT} runs on every nightly run while the self-hosted graph is enabled and on every graph-only dispatch"
             );
@@ -678,10 +716,10 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
         }
         let need = job
             .get("needs")
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .unwrap_or_else(|| panic!("nightly job {name} must need exactly one job (a chain)"));
         assert_eq!(
-            job.get("if").and_then(serde_yaml::Value::as_str),
+            job.get("if").and_then(serde_json::Value::as_str),
             Some("${{ !cancelled() && !inputs.graph_only }}"),
             "nightly job {name} must run under !cancelled() so a red predecessor does not skip it, and skip only on a graph-only dispatch"
         );
@@ -697,10 +735,7 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
                 "{need} starts two nightly jobs: chains must not fan out"
             );
         }
-        assert!(
-            jobs.contains_key(serde_yaml::Value::String(need.clone())),
-            "unknown job {need}"
-        );
+        assert!(jobs.contains_key(need.as_str()), "unknown job {need}");
     }
     assert!(
         (1..=MAX_CHAINS).contains(&chain_heads),
@@ -717,14 +752,13 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     let buildbuddy_yml = workflow_yml_path("buildbuddy.yml");
     // The implementation stays workflow_call-only: nightly and the release
     // workflow are its callers, PR CI never is.
-    // (YAML 1.1 parses the bare `on` key as boolean true.)
+    // (Read as YAML 1.2, the bare `on` key is the string "on".)
     let doc = read_workflow(&buildbuddy_yml);
     let triggers = doc
         .get("on")
-        .or_else(|| doc.get(serde_yaml::Value::Bool(true)))
-        .and_then(|t| t.as_mapping())
+        .and_then(|t| t.as_object())
         .unwrap_or_else(|| panic!("{} must have an `on:` mapping", buildbuddy_yml.display()));
-    let mut names: Vec<&str> = triggers.keys().filter_map(|k| k.as_str()).collect();
+    let mut names: Vec<&str> = triggers.keys().map(String::as_str).collect();
     names.sort_unstable();
     assert_eq!(
         names,
@@ -775,12 +809,12 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     // (scripts/test-gcp-buildbuddy-workflow-gate.sh plans every route).
     const GATE_ON: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true'";
     const GATE_OFF: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true'";
-    let job_if = |workflow: &serde_yaml::Value, job: &str| -> String {
+    let job_if = |workflow: &serde_json::Value, job: &str| -> String {
         workflow
             .get("jobs")
             .and_then(|jobs| jobs.get(job))
             .and_then(|job| job.get("if"))
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned()
     };
@@ -820,14 +854,14 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
     let doc = read_workflow(&ci_yml);
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("ci workflow jobs mapping");
     let job = jobs
-        .get(serde_yaml::Value::String("tlc-audits".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("tlc-audits")
+        .and_then(serde_json::Value::as_object)
         .expect("tlc-audits job");
     assert_eq!(
-        job.get("if").and_then(serde_yaml::Value::as_str),
+        job.get("if").and_then(serde_json::Value::as_str),
         Some("${{ needs.changes.outputs.machine_authority == 'true' }}"),
         "the TLC audit lane runs exactly on machine-authority changes"
     );
@@ -835,10 +869,10 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
         .get("strategy")
         .and_then(|strategy| strategy.get("matrix"))
         .and_then(|matrix| matrix.get("part"))
-        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(serde_json::Value::as_array)
         .expect("tlc-audits matrix parts")
         .iter()
-        .filter_map(serde_yaml::Value::as_str)
+        .filter_map(serde_json::Value::as_str)
         .collect();
     assert_eq!(
         parts,
@@ -847,11 +881,11 @@ fn ci_runs_the_bounded_tlc_audits_on_machine_authority_changes() {
     );
     assert_eq!(
         job.get("timeout-minutes")
-            .and_then(serde_yaml::Value::as_u64),
+            .and_then(serde_json::Value::as_u64),
         Some(20),
         "a TLC shard times out at 20 minutes, well over its expected 5-8"
     );
-    let job_text = serde_yaml::to_string(job).expect("render tlc-audits job");
+    let job_text = job_step_text(job);
     for required in [
         "crates/xtask/tests/machine_verify_all_tlc_test.sh",
         "--part \"${{ matrix.part }}\"",
@@ -879,18 +913,18 @@ fn ci_runs_the_typed_governance_gates_on_governance_changes() {
     let doc = read_workflow(&ci_yml);
     let jobs = doc
         .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(serde_json::Value::as_object)
         .expect("ci workflow jobs mapping");
     let job = jobs
-        .get(serde_yaml::Value::String("governance-gates".to_string()))
-        .and_then(serde_yaml::Value::as_mapping)
+        .get("governance-gates")
+        .and_then(serde_json::Value::as_object)
         .expect("governance-gates job");
     assert_eq!(
-        job.get("if").and_then(serde_yaml::Value::as_str),
+        job.get("if").and_then(serde_json::Value::as_str),
         Some("${{ needs.changes.outputs.governance_gates == 'true' }}"),
         "the governance gates run exactly on governance changes"
     );
-    let job_text = serde_yaml::to_string(job).expect("render governance-gates job");
+    let job_text = job_step_text(job);
     assert!(
         job_text.contains(
             "make rmat-audit seam-inventory runtime-authority-bypass machine-authority-docs-gate"

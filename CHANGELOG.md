@@ -162,6 +162,42 @@ them.
   `MobError::AdmissionClosed` (reason
   `MobAdmissionCloseReason::DispatchFailed`) where it granted an owner lease
   on the stopped actor (see Fixed).
+- Behaviour-only (not measured by the gate): `meerkat-skills` parses SKILL.md
+  frontmatter with serde-saphyr 2.0 (pure Rust, no `unsafe`) instead of
+  serde_yaml 0.9, and refuses frontmatter serde_yaml accepted:
+  - a key given twice, at any level: a top-level extension key (however it
+    is spelled) or a metadata key, where serde_yaml kept the last value. A
+    duplicated known field or key inside a structured value was refused
+    already;
+  - a null (`~` or an empty value) as the `description` or a `metadata`
+    value, which serde_yaml stored as the text `~` or an empty string;
+  - an unrecognized tag (`!custom`) anywhere: on a typed field (`name`,
+    `description`, `version`, a `metadata` value, a capability) serde_yaml
+    dropped the tag and kept the value; on an extension value it was refused
+    already;
+  - nesting deeper than 64 levels, or 100 or more aliases that outnumber
+    their anchors more than ten to one: the parser's default budget;
+  - a `...` document end marker line, because serde-saphyr 2.0.0 ignores
+    whatever follows one (malformed text included).
+
+  A block scalar (`|`, `|+`, `>`) that ends the frontmatter now keeps its
+  final line break, as YAML specifies and as it already did anywhere else in
+  the frontmatter: the frontmatter was cut before that line break, so a
+  `description: |` written last lost its trailing newline. Unchanged: YAML
+  1.2 booleans (`yes`, `on` and `off` stay strings), `<<` as an ordinary key,
+  and refusal of a second document. An alias expansion bomb is still
+  refused; ordinary aliases now count against the budget above.
+
+### Security
+
+- No crate in the workspace builds unsafe-libyaml any more: serde_yaml 0.9
+  (deprecated) and the archived unsafe-libyaml it brought in
+  (RUSTSEC-2024-0449, unmaintained) are gone with the move to serde-saphyr,
+  including from the `@rkat/web` wasm module, and `deny.toml` no longer
+  ignores that advisory. serde-saphyr is pinned exactly; its parser
+  granit-parser is held at 2.0.0 by Cargo.lock; Renovate never automerges
+  an update of either (`scripts/ci-action-pins.mjs` fails a configuration
+  that could).
 
 ### Added
 
@@ -287,6 +323,18 @@ them.
   driver signals at its single commit point, and re-read then; the
   5-second settle bound remains only as a hang guard, and a cancellation
   reads the input once more before it reports that bound (#1655).
+- `SkillDocument.extensions` values are a projection of the frontmatter's
+  YAML data, now rendered by serde-saphyr, and the field's doc says so. A
+  structured value's block YAML uses double quotes where a string needs
+  quoting (`'1.10'` is now `"1.10"`), a signed exponent (`6.02e23` is now
+  `6.02e+23`, `1e16` is `1.0e+16`) and a quoted `<<` key; the data is
+  unchanged. Untyped scalars that serde_yaml kept as text, or refused, now
+  resolve as YAML values: `1_000` is `1000`, `017` is `17.0`, an integer past
+  u64 is a float, `1e999` is `.inf`, `tRUE` is `true`, and a `!!binary`
+  value is decoded. Other scalars keep serde_yaml's text (`1.10` is `1.1`,
+  `0x1F` is `31`, `~` is `null`). Quote a value with leading zeros, such as
+  a file mode (`'0755'`), to keep it as text: unquoted, `0755` is `755.0`
+  (upstream serde-saphyr issue #225).
 
 ### Fixed
 
@@ -465,6 +513,16 @@ them.
   read answers the phase its snapshot holds, and the next read answers the
   committed one. Four generated machine invariants pin the stage and
   activation records every custody answer reads (#1606).
+- `make check-rust-release-packaging` no longer checks an archive left by an
+  earlier run. With a persistent `CARGO_TARGET_DIR`, each crate's
+  `package/` directory kept the `.crate` files of earlier runs, so a crate
+  whose `cargo package` wrote no archive at the workspace version was
+  checked (license texts, internal requirements, the facade link smoke)
+  against an earlier run's archive. Each package job now removes its
+  crate's earlier archives first, and such a crate fails as a missing
+  archive. `scripts/test-release-packaging-isolation.sh` reruns the check
+  over a persistent target with one crate writing no archive. Release
+  tooling only.
 
 ## [0.9.3] - 2026-10-18
 
