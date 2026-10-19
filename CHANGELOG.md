@@ -142,6 +142,22 @@ them.
   starts the discard or the unregister only while that use is unchanged,
   reporting `MemberUnregisterState::HandedOver` otherwise. It follows only
   the successor its discard returns as published.
+- The runtime's reload-required discard disposes of a durability-degraded
+  registration that no runtime loop holds (`meerkat-runtime`). It required
+  the exact teardown handoff of the registration's runtime loop, so a
+  registration that never had a loop, or whose loop's teardown had already
+  completed, was refused until a repair nothing could perform: the exact
+  unregister is refused too while the session is degraded (the durability
+  gate refuses its first durable write), so a mob Shutdown reported that
+  member `UnregisterPending` for good, and a later owner's executor
+  registration on the session was refused. When no runtime loop can hold
+  the registration's mutation fence (no pending or committed attachment and
+  no runtime-loop teardown slot), the discard now takes the fence itself and
+  publishes the durability-ready cold successor, which the exact unregister
+  then settles, and a later owner's executor registration cold-reloads such
+  a registration as it does one whose loop handed its executor back. A loop
+  attached without a teardown handoff can still hold the fence, so the
+  discard stays refused for it until it hands the fence back.
 
 ## [0.9.3] - 2026-10-18
 

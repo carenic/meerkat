@@ -430,3 +430,347 @@ async fn a_pending_unregister_never_discards_a_later_owners_degraded_registratio
         "the settlement reports the takeover and unregisters nothing"
     );
 }
+
+/// The no-handoff case: a durability-degraded registration that no runtime
+/// loop ever held has no runtime-loop teardown handoff, and nothing retains
+/// its mutation fence. Its exact unregister is refused while the session is
+/// degraded (the durability gate refuses the unregister's first durable
+/// write), so the reload-required discard is the only way it settles. The
+/// discard takes the fence itself and publishes a durability-ready cold
+/// successor, which Shutdown's teardown and a pending unregister's
+/// settlement each unregister.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_degraded_registration_without_a_teardown_handoff_settles_through_the_discard() {
+    use crate::runtime::provisioner::{DegradedUnregisterStep, MemberSessionDisposalArc};
+
+    async fn degraded_without_a_handoff(
+        adapter: &Arc<MeerkatMachine>,
+    ) -> (
+        SessionId,
+        meerkat_runtime::RuntimeSessionRegistrationWitness,
+    ) {
+        let session = SessionId::new();
+        adapter
+            .register_session(session.clone())
+            .await
+            .expect("register a registration without a runtime loop");
+        assert!(
+            adapter
+                .force_session_durability_reload_required_for_test(&session)
+                .await,
+            "the registration is durability-degraded"
+        );
+        let registration = adapter
+            .current_session_registration_witness(&session)
+            .await
+            .expect("the degraded registration is current");
+        (session, registration)
+    }
+
+    let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(runtime_store, blob_store).expect("construct runtime authority"),
+    );
+
+    // The discard itself.
+    let (session, registration) = degraded_without_a_handoff(&adapter).await;
+    let discard = match MemberSessionDisposalArc::discard_degraded_registration_first(
+        &adapter,
+        None,
+        &registration,
+        None,
+        Instant::now() + STEP,
+    )
+    .await
+    {
+        DegradedUnregisterStep::Replaced { successor, .. } => {
+            let current = adapter.current_session_registration_witness(&session).await;
+            let ready = adapter.durability_reload_required(&session).await.is_none();
+            format!(
+                "replaced (successor current: {}, durability ready: {ready})",
+                successor != registration && current.as_ref() == Some(&successor)
+            )
+        }
+        DegradedUnregisterStep::Unchanged => "unchanged".to_string(),
+        DegradedUnregisterStep::HandedOver => "handed over".to_string(),
+        DegradedUnregisterStep::TimedOut => "timed out".to_string(),
+        DegradedUnregisterStep::Failed(failure) => format!("failed: {failure}"),
+    };
+
+    // Shutdown's teardown.
+    let (teardown_target, _) = degraded_without_a_handoff(&adapter).await;
+    let teardown = match tokio::time::timeout(
+        STEP,
+        crate::runtime::actor::teardown_session(
+            &adapter,
+            &Arc::new(crate::runtime::ops_adapter::MobOpsAdapter::new()),
+            &teardown_target,
+            None,
+            Instant::now() + Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("the teardown returns within its deadline")
+    {
+        ShutdownUnregisterOutcome::Unregistered => "unregistered".to_string(),
+        ShutdownUnregisterOutcome::Pending { stage, .. } => format!("pending at {stage}"),
+        ShutdownUnregisterOutcome::Failed(failure) => format!("failed: {failure}"),
+    };
+    let teardown_left = adapter
+        .current_session_registration_witness(&teardown_target)
+        .await
+        .is_some();
+
+    // A settlement of an unregister Shutdown reported pending.
+    let (settled_session, settled_registration) = degraded_without_a_handoff(&adapter).await;
+    let registration_use = adapter
+        .session_registration_use(&settled_registration)
+        .await;
+    let mut settlement = MemberUnregisterSettlement::new(
+        settled_registration,
+        registration_use,
+        None,
+        &adapter,
+        None,
+    );
+    let settled = settlement
+        .settle_within(Instant::now() + Duration::from_secs(5))
+        .await;
+    let settlement_left = adapter
+        .current_session_registration_witness(&settled_session)
+        .await
+        .is_some();
+
+    assert_eq!(
+        (
+            discard.as_str(),
+            teardown.as_str(),
+            teardown_left,
+            &settled,
+            settlement_left
+        ),
+        (
+            "replaced (successor current: true, durability ready: true)",
+            "unregistered",
+            false,
+            &MemberUnregisterState::Settled,
+            false
+        ),
+        "discard: {discard}; teardown: {teardown} (registration left: {teardown_left}); \
+         settlement: {settled:?} (registration left: {settlement_left})"
+    );
+}
+
+/// The refusal stays for a runtime loop that may still hold the session's
+/// mutation fence: a durability-degraded registration whose runtime loop is
+/// live and has not handed its executor back is not taken over by a later
+/// owner's executor registration (refused until a repair), and its discard
+/// waits for that loop's teardown handoff instead of taking the fence (the
+/// step times out and nothing is replaced).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_degraded_registration_whose_live_loop_holds_the_fence_is_not_taken_over() {
+    use crate::runtime::provisioner::{DegradedUnregisterStep, MemberSessionDisposalArc};
+
+    let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(runtime_store, blob_store).expect("construct runtime authority"),
+    );
+    let session = SessionId::new();
+    adapter
+        .register_session(session.clone())
+        .await
+        .expect("register the session");
+    adapter
+        .ensure_session_with_executor(session.clone(), Box::new(IdleLaterOwnerExecutor))
+        .await
+        .expect("attach a live runtime loop");
+    let registration = adapter
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let attachment = adapter
+        .current_executor_attachment_witness(&session)
+        .await
+        .expect("the runtime loop is attached");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session)
+            .await,
+        "the registration degrades while its loop is live"
+    );
+
+    match adapter
+        .ensure_session_with_executor(session.clone(), Box::new(IdleLaterOwnerExecutor))
+        .await
+    {
+        Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }) => {}
+        other => panic!(
+            "a later owner's executor registration must be refused while the loop holds the fence, got {other:?}"
+        ),
+    }
+    assert!(
+        matches!(
+            MemberSessionDisposalArc::discard_degraded_registration_first(
+                &adapter,
+                None,
+                &registration,
+                None,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+            DegradedUnregisterStep::TimedOut
+        ),
+        "the discard waits for the live loop's teardown handoff"
+    );
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "the degraded registration is not replaced"
+    );
+    assert_eq!(
+        adapter
+            .current_executor_attachment_witness(&session)
+            .await
+            .as_ref(),
+        Some(&attachment),
+        "the live loop stays attached"
+    );
+}
+
+/// A later owner's executor registration cold-reloads a durability-degraded
+/// registration that no runtime loop holds, as it does one whose loop handed
+/// its executor back: the reload-required discard publishes a cold
+/// successor, and the later owner's executor attaches to that successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_owners_executor_cold_reloads_a_degraded_registration_without_a_teardown_handoff() {
+    let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(runtime_store, blob_store).expect("construct runtime authority"),
+    );
+    let session = SessionId::new();
+    adapter
+        .register_session(session.clone())
+        .await
+        .expect("register a registration without a runtime loop");
+    let registration = adapter
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session)
+            .await,
+        "the registration is durability-degraded"
+    );
+
+    adapter
+        .ensure_session_with_executor(session.clone(), Box::new(IdleLaterOwnerExecutor))
+        .await
+        .expect("the later owner's executor registration cold-reloads the degraded registration");
+    let successor = adapter
+        .current_session_registration_witness(&session)
+        .await
+        .expect("a registration of the session is current");
+    assert_ne!(
+        successor, registration,
+        "the executor attached to the cold successor, not to the degraded shell"
+    );
+    assert!(
+        adapter.durability_reload_required(&session).await.is_none(),
+        "the cold successor is durability-ready"
+    );
+    assert!(
+        adapter
+            .current_executor_attachment_witness(&session)
+            .await
+            .is_some(),
+        "the later owner's executor is attached"
+    );
+}
+
+/// The no-handoff discard revalidates under the registration's mutation
+/// gate: a runtime-loop teardown slot that appears after the discard was
+/// admitted and the registration transaction released, and before the
+/// discard takes the gate (injected here: no public path attaches a loop to a
+/// durability-degraded registration), leaves the registration as it is, and
+/// the discard answers `NotCurrent` without discarding anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_handoff_discard_leaves_a_registration_a_loop_reached_before_the_fence() {
+    let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(runtime_store, blob_store).expect("construct runtime authority"),
+    );
+    let session = SessionId::new();
+    adapter
+        .register_session(session.clone())
+        .await
+        .expect("register a registration without a runtime loop");
+    let registration = adapter
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&session)
+            .await,
+        "the registration is durability-degraded"
+    );
+
+    let (reached, release) =
+        adapter.arm_reload_required_discard_before_mutation_gate_test_hook(session.clone());
+    let discarding = {
+        let adapter = Arc::clone(&adapter);
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            adapter
+                .reload_required_registration_settlement_if_current(&registration, None, None)
+                .await
+        })
+    };
+    tokio::time::timeout(STEP, reached)
+        .await
+        .expect("the admitted discard reaches the mutation gate")
+        .expect("the discard paused before the mutation gate");
+    assert!(
+        adapter
+            .install_runtime_loop_teardown_slot_for_test(&session)
+            .await,
+        "a runtime-loop teardown slot appears before the discard takes the gate"
+    );
+    release.send(()).expect("release the paused discard");
+
+    let settled = tokio::time::timeout(STEP, discarding)
+        .await
+        .expect("the discard returns")
+        .expect("the discard task");
+    assert!(
+        matches!(
+            settled,
+            Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotCurrent)
+        ),
+        "the discard leaves a registration a loop reached before the fence: {settled:?}"
+    );
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "nothing was discarded"
+    );
+    assert!(
+        adapter.durability_reload_required(&session).await.is_some(),
+        "the registration is still durability-degraded"
+    );
+}

@@ -4684,10 +4684,14 @@ impl MeerkatMachine {
                         // run arbitrarily long before publishing, and a
                         // handoff mid-claim by another cleanup owner is not
                         // this caller's to consume.
+                        // A registration no runtime loop holds has no
+                        // executor to hand back: its disposal takes the
+                        // mutation fence itself.
                         let degraded_loop_released_its_executor = entry
                             .runtime_loop_teardown
                             .as_ref()
-                            .is_some_and(|slot| slot.exit_handoff_is_settled());
+                            .is_some_and(|slot| slot.exit_handoff_is_settled())
+                            || entry.no_runtime_loop_holds_mutation_fence();
                         // A claim-bound caller is not the registration owner
                         // here: it arrived holding an actor-materialization
                         // claim that disposal would clear underneath it. That
@@ -6267,16 +6271,26 @@ impl MeerkatMachine {
                         ),
                     });
                 }
-                let coordinator_id = uuid::Uuid::new_v4();
-                let teardown_slot = entry.runtime_loop_teardown.clone().ok_or_else(|| {
-                    RuntimeDriverError::RecoveryRepairBlocked {
+                // The discard needs the registration's mutation fence (M). A
+                // runtime loop keeps M until it publishes its teardown
+                // handoff, which the discard then claims. A registration no
+                // runtime loop holds (no pending or committed attachment and
+                // no runtime-loop teardown slot: none was ever attached, or
+                // its teardown completed) has no handoff and nothing retains
+                // its M, so its discard takes M itself. A loop attached
+                // without a teardown slot could still hold M: refused until
+                // it hands M back.
+                let teardown_slot = entry.runtime_loop_teardown.clone();
+                if teardown_slot.is_none() && !entry.no_runtime_loop_holds_mutation_fence() {
+                    return Err(RuntimeDriverError::RecoveryRepairBlocked {
                         evidence_digest: None,
                         reason: format!(
-                            "durability-degraded registration for session {} has no exact runtime-loop teardown handoff that can release its retained mutation fence",
+                            "durability-degraded registration for session {} has a runtime loop attached without a teardown handoff, which may still hold its mutation fence",
                             witness.session_id()
                         ),
-                    }
-                })?;
+                    });
+                }
+                let coordinator_id = uuid::Uuid::new_v4();
                 let (result_tx, result_rx) = crate::tokio::sync::watch::channel(None);
                 entry.reload_required_discard_coordinator =
                     Some(ReloadRequiredDiscardCoordinator {
@@ -6374,7 +6388,7 @@ impl MeerkatMachine {
         witness: &RuntimeSessionRegistrationWitness,
         epoch_id: &meerkat_core::RuntimeEpochId,
         coordinator_id: uuid::Uuid,
-        teardown_slot: Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>,
+        teardown_slot: Option<Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>>,
         operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
     ) -> Result<ReloadRequiredRegistrationUseSettlement, RuntimeDriverError> {
         // A machine-managed stop handoff may retain this registration's M in
@@ -6382,8 +6396,12 @@ impl MeerkatMachine {
         // handoff is the only operation allowed before M: it releases that
         // retained fence without publishing stop, retire, or unregister
         // authority. T admission paired this exact slot with the coordinator.
-        teardown_slot.wait_until_published().await;
-        teardown_slot.discard_after_reload_required().await?;
+        // A registration no runtime loop held at admission has no handoff:
+        // nothing retains its M, which this worker takes below.
+        if let Some(teardown_slot) = teardown_slot.as_ref() {
+            teardown_slot.wait_until_published().await;
+            teardown_slot.discard_after_reload_required().await?;
+        }
         #[cfg(feature = "live")]
         let Some(live_lifecycle_lease) = self
             .acquire_unregister_live_lifecycle_lease(witness.session_id())
@@ -6394,6 +6412,9 @@ impl MeerkatMachine {
         let Some(registration_gate) = witness.registration_gate() else {
             return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_reload_required_discard_before_mutation_gate_test_hook(witness.session_id())
+            .await;
         let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
         {
             let mut sessions = self.sessions.write().await;
@@ -6409,10 +6430,7 @@ impl MeerkatMachine {
                     .is_some_and(|current| {
                         current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
                     })
-                || !entry
-                    .runtime_loop_teardown
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+                || !entry.runtime_loop_teardown_is_as_admitted(teardown_slot.as_ref())
             {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
             }
@@ -6473,10 +6491,7 @@ impl MeerkatMachine {
                     .is_some_and(|current| {
                         current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
                     })
-                || !entry
-                    .runtime_loop_teardown
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+                || !entry.runtime_loop_teardown_is_as_admitted(teardown_slot.as_ref())
             {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
             }
@@ -6612,7 +6627,9 @@ impl MeerkatMachine {
         // teardown slot and surface cleanup handle remain entry-owned, so a
         // failed fallible cleanup can safely clear the coordinator and retry.
         if let Some(current_teardown_slot) = captured_teardown_slot.as_ref()
-            && !Arc::ptr_eq(current_teardown_slot, &teardown_slot)
+            && !teardown_slot
+                .as_ref()
+                .is_some_and(|admitted| Arc::ptr_eq(current_teardown_slot, admitted))
         {
             return Err(RuntimeDriverError::RecoveryRepairBlocked {
                 evidence_digest: None,
@@ -6741,10 +6758,7 @@ impl MeerkatMachine {
                     .is_some_and(|current| {
                         current.epoch_id == *epoch_id && current.coordinator_id == coordinator_id
                     })
-                || !entry
-                    .runtime_loop_teardown
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &teardown_slot))
+                || !entry.runtime_loop_teardown_is_as_admitted(teardown_slot.as_ref())
             {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
             }

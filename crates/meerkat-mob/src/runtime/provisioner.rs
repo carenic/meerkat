@@ -2871,10 +2871,19 @@ pub struct MemberSessionDisposalArc {
 #[cfg(feature = "runtime-adapter")]
 pub(super) enum DegradedUnregisterStep {
     /// Not degraded, or no longer this exact registration: its exact
-    /// unregister proceeds unchanged. Also when the discard is refused until
-    /// a repair (another owner still holds the registration's teardown or
-    /// interrupt dispatch, or its cold recovery cannot run yet): the exact
-    /// unregister then joins that owner or waits within its own deadline.
+    /// unregister proceeds unchanged. Also when the runtime refuses the
+    /// discard until a repair (`RecoveryRepairBlocked`), which it does for
+    /// reasons it does not type apart: another owner still holds the
+    /// registration's teardown (an unregister, stop-cleanup or unregister
+    /// finalization coordinator), a user-interrupt dispatch on it has not
+    /// settled, a runtime loop is attached to it without a teardown handoff
+    /// (the no-handoff case: that loop may still hold the session's mutation
+    /// fence), or its cold recovery cannot run yet. The exact unregister then
+    /// joins that owner, waits within its own deadline, or is refused until
+    /// the repair too, and a settlement retries the discard on its next
+    /// call. A registration that no runtime loop holds (none was ever
+    /// attached, or its teardown completed) is not refused for a missing
+    /// handoff: nothing retains its mutation fence, and the discard takes it.
     Unchanged,
     /// The discard replaced the degraded process shell with `successor`, the
     /// exact cold registration it published, whose use starts at

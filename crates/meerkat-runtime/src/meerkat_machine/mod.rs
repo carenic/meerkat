@@ -6180,6 +6180,28 @@ impl RuntimeSessionEntry {
             .store(stamp, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether no runtime loop can hold this registration's mutation fence:
+    /// no attachment is pending or committed and no runtime-loop teardown
+    /// slot exists (no loop was ever attached, or its teardown completed).
+    fn no_runtime_loop_holds_mutation_fence(&self) -> bool {
+        matches!(self.attachment_slot, RuntimeLoopAttachmentSlot::Empty)
+            && self.runtime_loop_teardown.is_none()
+    }
+
+    /// Whether this registration's runtime-loop teardown is still the one a
+    /// reload-required discard was admitted with: the exact teardown handoff
+    /// slot, or, for a registration no runtime loop held, still none.
+    fn runtime_loop_teardown_is_as_admitted(
+        &self,
+        admitted: Option<&Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>>,
+    ) -> bool {
+        match (self.runtime_loop_teardown.as_ref(), admitted) {
+            (Some(current), Some(admitted)) => Arc::ptr_eq(current, admitted),
+            (None, None) => self.no_runtime_loop_holds_mutation_fence(),
+            _ => false,
+        }
+    }
+
     fn live_attachment_id(&self) -> Option<RuntimeLoopAttachmentId> {
         match &self.attachment_slot {
             RuntimeLoopAttachmentSlot::Pending(attachment)
@@ -7323,6 +7345,54 @@ impl MeerkatMachine {
         (entered_rx, release_tx)
     }
 
+    /// Pause one ReloadRequired discard worker of `session_id` after it
+    /// released the registration transaction and claimed any teardown
+    /// handoff, before it takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_reload_required_discard_before_mutation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "ReloadRequired before-mutation-gate test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// Install a fresh runtime-loop teardown slot on the current registration
+    /// of `session_id`, as a runtime loop attached to it would, when it has
+    /// none. No public path attaches a loop to a durability-degraded
+    /// registration; tests use this to make one appear inside a discard's
+    /// window. `false` when the session is not registered or already has one.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn install_runtime_loop_teardown_slot_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get_mut(session_id) {
+            Some(entry) if entry.runtime_loop_teardown.is_none() => {
+                entry.runtime_loop_teardown =
+                    Some(crate::runtime_loop::RuntimeLoopTeardownSlot::pending());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Force one persistent session's shared durability gate into
     /// ReloadRequired without fabricating a store outcome. Test-only callers
     /// use this to exercise cancellation around the real disposal coordinator.
@@ -7373,6 +7443,31 @@ impl MeerkatMachine {
             .persist_ops_lifecycle(&runtime_id, &snapshot)
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    async fn run_reload_required_discard_before_mutation_gate_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_reload_required_discard_before_mutation_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -10291,6 +10386,17 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate in a ReloadRequired discard worker, after
+    /// the registration transaction was released and any teardown handoff
+    /// claimed, before the worker takes the registration's mutation gate.
+    #[cfg(any(test, feature = "test-support"))]
+    test_reload_required_discard_before_mutation_gate: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// One-shot deterministic gate after a logical control command resolves
     /// its SessionId but before it acquires the current entry's mutation gate.
     /// Tests replace A with B in this window to prove the command captures no
@@ -12076,6 +12182,8 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12311,6 +12419,8 @@ impl MeerkatMachine {
                 test_boundary_cancel_dispatches: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_reload_required_discard_after_successor_publication: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
