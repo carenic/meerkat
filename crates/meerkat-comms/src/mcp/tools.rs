@@ -1958,6 +1958,40 @@ mod tests {
     /// signs into the envelope. `send_message` answers nothing and stamps
     /// nothing.
     #[tokio::test]
+    async fn runtime_send_signs_the_peer_message_in_reply_to_onto_the_wire() {
+        let (_ctx, peer_id, sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
+        let answered = meerkat_core::InteractionId(uuid::Uuid::new_v4());
+
+        CoreCommsRuntime::send(
+            sender.as_ref(),
+            CommsCommand::PeerMessage {
+                to: meerkat_core::comms::PeerRoute::new(peer_id),
+                body: "reply through the runtime".to_string(),
+                blocks: None,
+                content_taint: None,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                objective_id: None,
+                in_reply_to: Some(answered),
+            },
+        )
+        .await
+        .expect("the runtime sends the reply");
+
+        let candidate = finalize.await.expect("finalization task");
+        assert!(
+            matches!(
+                &candidate.interaction.content,
+                meerkat_core::InteractionContent::Message { in_reply_to: Some(id), .. }
+                    if *id == answered
+            ),
+            "the receiver sees the delivery the reply answers: {:?}",
+            candidate.interaction.content
+        );
+    }
+
+    #[tokio::test]
     async fn test_runtime_less_reply_to_peer_names_the_delivery_it_answers() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
             make_runtime_less_inproc_delivery_pair().await;
