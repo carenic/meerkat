@@ -339,11 +339,13 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   keeps Node alive for 5 seconds, and both SDK clients settle on the
   `rkat-rpc` child's exit; public GPT Live sends a finished notice for a
   delegation result held behind the user's question.
-- Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn
-  (it inherits its source's build state); a child 0.9.3 forked that never ran
-  a turn still fails, so fork its source again. Published crates pass
-  `cargo test` in their unpacked packages, and `rkat` builds without default
-  features.
+- Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
+  it gets a build state derived from its source's, with the source's session
+  configuration but without its `shell_env`, MCP attachments or mob operator
+  authority (`docs/api/rpc.mdx`, "What a fork child inherits"). A child 0.9.3
+  forked that never ran a turn still fails, so fork its source again.
+  Published crates pass `cargo test` in their unpacked packages, and `rkat`
+  builds without default features.
 
 ### Checklist
 

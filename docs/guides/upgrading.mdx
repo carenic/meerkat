@@ -382,11 +382,15 @@ last.
   question first sends a finished notice, so the voice model no longer says
   the work is still in progress.
 - **Session forks:** a child of `session/fork_at` or `session/fork_replace`
-  now inherits its source's build state and can run a turn. A source with
-  session metadata but no build state is refused before anything is
-  committed (`INVALID_PARAMS`, data kind `fork_source_build_state_missing`).
-  A child forked by 0.9.3 that never ran a turn still fails `turn/start`
-  with "missing session build state": fork its source again.
+  now gets a build state derived from its source's and can run a turn. It
+  carries the source's session configuration, without the source's
+  `shell_env`, MCP attachments or mob operator authority (see
+  [What a fork child inherits](/api/rpc#what-a-fork-child-inherits)). A
+  source with session metadata but no build state is refused before anything
+  is committed (`INVALID_PARAMS`, data kind
+  `fork_source_build_state_missing`). A child forked by 0.9.3 that never ran
+  a turn still fails `turn/start` with "missing session build state": fork
+  its source again.
 - **`@rkat/sdk`:** a Node process that calls `MeerkatClient.close()` exits as
   soon as it has nothing else to do, instead of about 5 seconds later.
 - **SDK clients and a child that exits:** the TypeScript and Python clients
