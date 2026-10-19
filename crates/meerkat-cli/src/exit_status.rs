@@ -564,7 +564,7 @@ mod mob_tests {
                 Some(ErrorCode::ForkInstructionRefused),
             ),
             (
-                anyhow::Error::new(SessionError::ForkInstructionRefused(
+                anyhow::Error::new(meerkat_core::SessionError::ForkInstructionRefused(
                     meerkat_core::ForkInstructionRefusal::new(
                         meerkat_core::ForkInstructionRefusalCause::PolicyRefuses,
                         Vec::new(),
