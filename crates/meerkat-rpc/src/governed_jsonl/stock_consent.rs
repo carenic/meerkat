@@ -250,7 +250,11 @@ fn issued_presentation(record: &ApprovalRecord) -> Option<ConsentPresentationPar
 
 impl StockConsentSurface for StdioConsentSurface {
     /// An approval is issued only for an operator this pipe can show it to:
-    /// while the pipe is open with its notices attached.
+    /// while the pipe is open with its notices attached. The presented
+    /// requester is that operator, to whom the approval is presented; the
+    /// work's own requester, which for an outcome the stock ingress reports
+    /// is the ingress, is stated in the mandate label
+    /// ([`STOCK_REVIEW_MANDATE_LABEL`]).
     fn present(
         &self,
         _candidate: &ConsentPresentationCandidate<'_>,

@@ -16255,6 +16255,38 @@ async fn test_actor_task_watch_reports_the_destroyed_actors_return() {
     assert_eq!(watch.wait().await, crate::MobActorTaskWait::Returned);
 }
 
+/// A command whose sender reserved channel capacity before the actor exits
+/// still settles: the exiting actor receives it and drops it, so its reply
+/// channel closes. With a bare receiver drop, the write lands after the one
+/// drain pass and stays in the channel, with its reply sender, while any
+/// handle lives.
+#[tokio::test]
+async fn test_a_command_reserved_before_the_actor_exits_still_settles() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let mut watch = handle.actor_task_watch();
+    let permit = handle
+        .command_tx
+        .clone()
+        .reserve_owned()
+        .await
+        .expect("reserve capacity while the actor runs");
+    handle.shutdown().await.expect("shutdown");
+    // A bare drop lets the task end at once; a drain waits for this
+    // reservation. Either way the write below must settle.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), watch.wait()).await;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    permit.send(super::scope_gate::RoutedMobCommand::internal(
+        MobCommand::QueryPhase { reply_tx },
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .is_ok(),
+        "a command written as the actor exited got no reply and no close"
+    );
+    assert_eq!(watch.wait().await, crate::MobActorTaskWait::Returned);
+}
+
 #[tokio::test]
 async fn test_destroy_bulk_scrubs_member_event_cursors() {
     let definition = with_unique_mob_id(sample_definition(), "destroy-cursor-scrub");

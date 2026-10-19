@@ -145,7 +145,7 @@ case "${1:-}" in
     if [[ -n "${NEXTEST_RUN_IGNORED:-}" ]]; then
       run_args+=(--run-ignored "$NEXTEST_RUN_IGNORED")
     fi
-    RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
+    RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
       MEERKAT_WORKSPACE_ROOT="$ROOT" \
       "$NEXTEST_BIN" "${run_args[@]}"
     ;;

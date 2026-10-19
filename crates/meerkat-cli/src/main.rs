@@ -35805,9 +35805,18 @@ supports_reasoning = true
     async fn test_load_config_accepts_released_realm_legacy_model_fallback_default() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_root = temp.path().join("realms");
-        let original = include_str!(
-            "../../meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml"
-        );
+        // This crate's own copy of the released realm's config.toml (so the
+        // test builds from the published package), pinned to the digest the
+        // meerkat-runtime corpus manifest records for it.
+        let original = include_str!("../tests/fixtures/v0_8_10_released_realm/config.toml");
+        {
+            use sha2::Digest as _;
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(original.as_bytes())),
+                "178ba36e6d3b387afb8c6fcb72ca3cc35de5b50b04eaf1fa6a64b3dedeafb351",
+                "the copy differs from the released realm corpus's config.toml"
+            );
+        }
         assert!(original.contains("[model_fallback]\nenabled = true\n"));
         let doc = meerkat_store::realm_paths_in(&state_root, "fixture-realm").config_path;
         std::fs::create_dir_all(doc.parent().expect("realm dir")).expect("mkdir realm");

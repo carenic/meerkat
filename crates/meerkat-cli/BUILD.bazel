@@ -105,8 +105,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
-    ] + [
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -189,6 +188,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -197,7 +197,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/auth_binding_single_parser.rs",
@@ -302,6 +301,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -310,7 +310,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/cli_auth_flow.rs",
@@ -414,6 +413,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -422,7 +422,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/cli_mobpack_live_smoke.rs",
@@ -527,6 +526,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -535,7 +535,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/cli_mobpack_live_smoke.rs",
@@ -649,6 +648,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -657,7 +657,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/cli_mobpack_live_smoke.rs",
@@ -771,6 +770,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -779,7 +779,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/cli_mobpack_live_smoke.rs",
@@ -893,6 +892,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -901,7 +901,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/confinement_report.rs",
@@ -1003,6 +1002,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1011,7 +1011,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/help_mobpack_contract.rs",
@@ -1113,6 +1112,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1121,7 +1121,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/help_without_skills.rs",
@@ -1223,6 +1222,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1231,7 +1231,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/live_smoke_cli.rs",
@@ -1336,6 +1335,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1344,7 +1344,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/live_smoke_cli.rs",
@@ -1458,6 +1457,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1466,7 +1466,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/mcp_convention_roots.rs",
@@ -1568,6 +1567,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1576,7 +1576,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/mcp_oauth_first_login.rs",
@@ -1678,6 +1677,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1686,7 +1686,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/runtime_backed_ingress.rs",
@@ -1790,6 +1789,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1798,7 +1798,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/slim_feature_graph.rs",
@@ -1904,6 +1903,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -1912,7 +1912,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/sqlite_tools_full_reuse.rs",
@@ -2016,6 +2015,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2024,7 +2024,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/storage_doctor.rs",
@@ -2126,6 +2125,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2134,7 +2134,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/storage_migrate.rs",
@@ -2236,6 +2235,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2244,7 +2244,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_export_atif.rs",
@@ -2349,6 +2348,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2357,7 +2357,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_export_atif.rs",
@@ -2470,6 +2469,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2478,7 +2478,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_export_atif.rs",
@@ -2591,6 +2590,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2599,7 +2599,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_init.rs",
@@ -2704,6 +2703,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2712,7 +2712,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_init.rs",
@@ -2825,6 +2824,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2833,7 +2833,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_mcp_pending.rs",
@@ -2938,6 +2937,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -2946,7 +2946,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_mcp_pending.rs",
@@ -3059,6 +3058,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3067,7 +3067,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3170,6 +3169,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3178,7 +3178,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3290,6 +3289,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3298,7 +3298,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3410,6 +3409,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3418,7 +3418,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3530,6 +3529,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3538,7 +3538,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3650,6 +3649,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3658,7 +3658,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3770,6 +3769,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3778,7 +3778,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_realm_mcp.rs",
@@ -3890,6 +3889,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -3898,7 +3898,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_resume.rs",
@@ -4003,6 +4002,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4011,7 +4011,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_cli_resume.rs",
@@ -4124,6 +4123,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4132,7 +4132,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/support/deterministic_mob_provider.rs",
@@ -4239,6 +4238,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4247,7 +4247,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/support/deterministic_mob_provider.rs",
@@ -4362,6 +4361,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4372,7 +4372,6 @@ rust_test(
         "//:docs/reference/mob-architecture.mdx",
         "//crates/meerkat-mob:tests/support/probe.rs",
         "//crates/meerkat-mob:tests/support/probe_shared.rs",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_mob_host_daemon.rs",
@@ -4478,6 +4477,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4488,7 +4488,6 @@ rust_test(
         "//:docs/reference/mob-architecture.mdx",
         "//crates/meerkat-mob:tests/support/probe.rs",
         "//crates/meerkat-mob:tests/support/probe_shared.rs",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/system_mob_host_daemon.rs",
@@ -4602,6 +4601,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4610,7 +4610,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/support/deterministic_mob_provider.rs",
@@ -4717,6 +4716,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4725,7 +4725,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/support/deterministic_mob_provider.rs",
@@ -4840,6 +4839,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4848,7 +4848,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/support/deterministic_mob_provider.rs",
@@ -4963,6 +4962,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
         "//:docs/docs.json",
@@ -4971,7 +4971,6 @@ rust_test(
         "//:docs/guides/mobpack.mdx",
         "//:docs/guides/mobs.mdx",
         "//:docs/reference/mob-architecture.mdx",
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
     ],
     srcs = [
         "tests/wholeblob_repair_cli.rs",
@@ -5045,8 +5044,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
-    ] + [
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -5103,8 +5101,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
-    ] + [
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
@@ -5164,8 +5161,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
-    ] + [
-        "//crates/meerkat-runtime:tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],

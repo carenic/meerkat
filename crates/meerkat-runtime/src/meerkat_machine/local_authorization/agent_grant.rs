@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use meerkat_authorization::clock::LocalAuthorizationClock;
-use meerkat_authorization::grants::{GrantRefusal, LocalGrantAuthority};
+use meerkat_authorization::grants::{GrantRefusal, LineageResolutionRefusal, LocalGrantAuthority};
 use meerkat_authorization::mcp_installation::{
     McpConnectorBound, McpInstallationRef, check_resolved_installation, lineage_connector_bound,
 };
@@ -70,7 +70,7 @@ impl AgentConfiguredMcpProvider {
 impl super::ConfiguredMcpAttachmentProvider for AgentConfiguredMcpProvider {
     fn configured(
         &self,
-        _session_id: &meerkat_core::SessionId,
+        _registration: &crate::meerkat_machine::RuntimeSessionRegistrationWitness,
         agent: SessionAgentBinding,
     ) -> Option<Arc<dyn ConfiguredMcpAttachmentAuthority>> {
         Some(self.grant.for_agent(
@@ -138,7 +138,8 @@ impl AgentInstallationGrant {
     /// lineage for `server`, is unavailable; a lineage
     /// that does not resolve for the bound executor and subject, or that is
     /// revoked, expired or does not name the installation, is denied; a
-    /// publication change during the decision is not current.
+    /// publication change during the decision, including one published
+    /// while the lineage is read, is not current.
     pub fn authorize(
         &self,
         agent: &SessionAgentBinding,
@@ -170,12 +171,20 @@ impl AgentInstallationGrant {
             .ok_or(McpAttachmentRefusal::Unavailable)?;
         let resolved = self
             .grants
-            .resolve_lineage(lineage, mandate.executor(), mandate.represented_subject())
+            .resolve_lineage_observed(lineage, mandate.executor(), mandate.represented_subject())
             .map_err(|refusal| match refusal {
-                GrantRefusal::Denied => McpAttachmentRefusal::Denied,
-                GrantRefusal::ControllerInUse
-                | GrantRefusal::Duplicate
-                | GrantRefusal::Unavailable => McpAttachmentRefusal::Unavailable,
+                // A change published while the lineage is read is a change
+                // during this decision, as one published before `confirm`
+                // is: not current, never an unavailable owner.
+                LineageResolutionRefusal::Changed => McpAttachmentRefusal::NotCurrent,
+                LineageResolutionRefusal::Refused(GrantRefusal::Denied) => {
+                    McpAttachmentRefusal::Denied
+                }
+                LineageResolutionRefusal::Refused(
+                    GrantRefusal::ControllerInUse
+                    | GrantRefusal::Duplicate
+                    | GrantRefusal::Unavailable,
+                ) => McpAttachmentRefusal::Unavailable,
             })?;
         let now_ms = self
             .clock

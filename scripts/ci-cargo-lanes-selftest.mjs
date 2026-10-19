@@ -5,7 +5,7 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +23,7 @@ import {
 } from "./ci-hook-coverage.mjs";
 import {
   GOVERNANCE_DOC_PATTERNS,
+  GUARD_LANE_INPUTS,
   MOB_CHAIN_CLIPPY_HEADS,
   MOB_CHAIN_INVALIDATED,
   ROW_DURATIONS,
@@ -30,10 +31,12 @@ import {
   WAVE_FIRST_SECONDS,
   WAVE_LANES,
   lockScope,
+  nextestDefaultSelection,
   parseCargoLock,
   readRowDurations,
   compiledInDocKeys,
   readerRows,
+  touchesGuardLane,
 } from "./ci-cargo-lanes.mjs";
 import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 import { durationsOf, rowOf } from "./ci-row-durations.mjs";
@@ -241,11 +244,16 @@ function assertEventSplit(plan, label) {
   assert.deepEqual(plan.closure_test_rows, [], `${label}: no closure-tests row in a pull request`);
   assert.deepEqual(plan.feature_check_jobs, [], `${label}: no feature-combination job in a pull request`);
   assert.equal(plan.closure_check, false, `${label}: no closure check in a pull request`);
-  assert.equal(plan.governed_jsonl, false, `${label}: no governed JSONL lane in a pull request`);
-  assert.equal(plan.mcp_confinement_positive, false, `${label}: no confinement lane in a pull request`);
+  // An exact-profile lane runs in a pull request exactly when it touches
+  // that lane's own inputs or changes its definition; otherwise the push
+  // runs it.
+  for (const lane of ["governed_jsonl", "mcp_confinement_positive"]) {
+    const runs =
+      plan.rust_changed && (touchesGuardLane(lane, plan.changed_paths) || plan.guard_definitions_changed.includes(lane));
+    assert.equal(plan[lane], runs, `${label}: ${lane} runs in a pull request only on its own inputs or definition`);
+    assert.equal(deferred[lane], plan.rust_changed && !runs, `${label}: ${lane} deferral`);
+  }
   assert.equal(deferred.closure_check, plan.rust_changed);
-  assert.equal(deferred.governed_jsonl, plan.rust_changed);
-  assert.equal(deferred.mcp_confinement_positive, plan.rust_changed);
   for (const suite of plan.integration_suites) {
     assert.equal(chain(suite.packages[0]), false, `${label}: integration suite ${suite.name} compiles meerkat-mob`);
   }
@@ -277,7 +285,14 @@ function assertEventSplit(plan, label) {
   );
 }
 
-const HOOK_STACK = 32 * 1024 * 1024;
+const HOOK_STACK = 8 * 1024 * 1024;
+// The rows' stack is the one the hook exports for its lanes.
+{
+  const hook = readFileSync(resolve(root, "scripts/pre-push-unit.sh"), "utf8");
+  const exported = [...hook.matchAll(/^export RUST_MIN_STACK="\$\{RUST_MIN_STACK:-(\d+)\}"$/gm)];
+  assert.equal(exported.length, 1, "scripts/pre-push-unit.sh exports one default RUST_MIN_STACK");
+  assert.equal(Number(exported[0][1]), HOOK_STACK, "the hook's lanes run on the closure rows' stack");
+}
 const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
 
 // The closure-tests rows: the deterministic workspace lanes' coverage
@@ -408,10 +423,11 @@ function assertArchivedLanes(plan, label) {
   assert.deepEqual(plan.unit_deferred, []);
   assert.equal(plan.wasm, true, "core is in the wasm runtime closure: the push runs the wasm lanes");
   assert.equal(plan.machine_authority, false);
-  // A pull request runs the wasm lanes only for their own inputs.
+  // Core is a crate the wasm build compiles, so a pull request runs
+  // wasm-check too; the example web suites only for their own inputs.
   const pr = planFor(["crates/meerkat-core/src/lib.rs"], ["--event", "pull_request"]);
-  assert.equal(pr.wasm, false, "a pull request does not run wasm-check for a closure that reaches the runtime");
-  assert.equal(pr.example_web, false, "nor the example web suites");
+  assert.equal(pr.wasm, true, "a pull request runs wasm-check for a crate the web runtime compiles");
+  assert.equal(pr.example_web, false, "but not the example web suites");
   assert.deepEqual(pr.unit_shards.map((shard) => shard.packages), [["meerkat-core"]], "core runs its unit tests in the pull request");
   assertLanes(pr, "core touch (pull request)");
 }
@@ -523,6 +539,130 @@ function assertArchivedLanes(plan, label) {
     "the matrix carries each canary row's partition, and only theirs",
   );
   assertLanes(plan, "workspace with exceptions");
+}
+
+// Exact-profile lanes on a pull request: a change to one of a lane's inputs
+// runs that lane (and the other only on its own inputs); a change elsewhere
+// in the same crates leaves both to the push, which runs them on every Rust
+// change.
+{
+  for (const [lane, inputs] of Object.entries(GUARD_LANE_INPUTS)) {
+    for (const input of inputs) {
+      const path = input.endsWith("/")
+        ? join(input, readdirSync(resolve(root, input)).filter((name) => name.endsWith(".rs")).sort()[0])
+        : input;
+      const plan = planFor([path], ["--event", "pull_request"]);
+      assert.equal(plan[lane], true, `a pull request touching ${path} runs ${lane}`);
+      assert.equal(plan.deferred_to_push[lane], false, `a pull request touching ${path} leaves ${lane} to no push`);
+      for (const other of Object.keys(GUARD_LANE_INPUTS).filter((name) => name !== lane)) {
+        assert.equal(plan[other], touchesGuardLane(other, [path]), `a pull request touching ${path} runs ${other} only on its inputs`);
+      }
+    }
+  }
+  // Their neighbours (unchanged definitions: the working tree is the base)
+  // run neither.
+  for (const path of [
+    "crates/meerkat-rpc/src/lib.rs",
+    "crates/meerkat-mcp/src/connection.rs",
+    "crates/meerkat-sandbox/src/lib.rs",
+    "crates/meerkat-tools/src/builtin/shell/mod.rs",
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request", "--base-tree", root]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(plan[lane], false, `a pull request touching only ${path} leaves ${lane} to the push`);
+      assert.equal(plan.deferred_to_push[lane], true, `a pull request touching only ${path} names ${lane} as deferred`);
+    }
+    const push = planFor([path]);
+    for (const lane of Object.keys(GUARD_LANE_INPUTS)) {
+      assert.equal(push[lane], true, `the push of ${path} runs ${lane}`);
+    }
+  }
+}
+
+// A pull request that changes an exact-profile lane's definition
+// (GUARD_LANE_DEFINITIONS: its ci.yml job, the confinement rule and
+// assignments in the Makefile, a selected module's declaration) runs that
+// lane; an edit elsewhere in the same file, or to a comment or blank line of
+// a lane's job, does not. Each base is the working tree's file with one edit
+// (--base-tree). Without a base copy every listed definition file differs,
+// and without a diff every lane runs.
+{
+  const baseTree = mkdtempSync(join(tmpdir(), "ci-lanes-guard-definitions-"));
+  try {
+    for (const [path, from, to, lanes] of [
+      [".github/workflows/ci.yml", '"governed_jsonl::tests::rpc_runtimes_compose_the_realms_own_schedule_service",\n', "", ["governed_jsonl"]],
+      [".github/workflows/ci.yml", "run: make test-mcp-confinement-positive\n", "run: make test-mcp-confinement-positive || true\n", ["mcp_confinement_positive"]],
+      [".github/workflows/ci.yml", "  bazel-graph:\n    name: ", "  bazel-graph:\n    name: Old ", []],
+      [".github/workflows/ci.yml", "    # Native dependency changes must retain", "    # Native dependency changes keep", []],
+      [".github/workflows/ci.yml", "          # No --nocapture: libtest captures", "          # Without --nocapture libtest captures", []],
+      [".github/workflows/ci.yml", "    # step before the tests prints the restriction", "\n    # step before the tests prints its restriction", []],
+      ["Makefile", "CONFINEMENT_SHELL_POSITIVE_COUNT := 4\n", "CONFINEMENT_SHELL_POSITIVE_COUNT := 3\n", ["mcp_confinement_positive"]],
+      ["Makefile", "--no-tests=fail --no-fail-fast -E", "--no-tests=fail -E", ["mcp_confinement_positive"]],
+      ["Makefile", "test-mob-dense-topology:\n", "test-mob-dense-topology: build\n", []],
+      [".config/nextest.toml", "[profile.default]\n", "[profile.default]\ndefault-filter = 'not test(/confinement/)'\n", ["mcp_confinement_positive"]],
+      [
+        ".config/nextest.toml",
+        "[profile.ci-unit]\n",
+        "[[profile.default.overrides]]\nplatform = 'cfg(target_os = \"linux\")'\ndefault-filter = 'not test(/confinement/)'\n\n[profile.ci-unit]\n",
+        ["mcp_confinement_positive"],
+      ],
+      [".config/nextest.toml", "artifacts)'\nthreads-required = \"num-cpus\"", "artifacts)'\nthreads-required = 2", []],
+      [".config/nextest.toml", "# Archived lanes (ci.yml main-unit", "# Archived lanes (the main-unit job", []],
+      ["crates/meerkat-mcp/src/connection.rs", "#[cfg(test)]\n#[path = \"process_confinement_tests.rs\"]", "#[cfg(all(test, target_os = \"macos\"))]\n#[path = \"process_confinement_tests.rs\"]", ["mcp_confinement_positive"]],
+      ["crates/meerkat-rpc/src/lib.rs", "#[cfg(feature = \"local-authorization\")]\npub mod governed_jsonl;", "pub mod governed_jsonl;", ["governed_jsonl"]],
+      ["crates/meerkat-rpc/src/lib.rs", "pub mod handlers;\n", "pub mod handlers;\npub mod retired_neighbour;\n", []],
+    ]) {
+      const text = readFileSync(resolve(root, path), "utf8");
+      assert.equal(text.split(from).length, 2, `${path} holds ${JSON.stringify(from)} once`);
+      mkdirSync(dirname(join(baseTree, path)), { recursive: true });
+      writeFileSync(join(baseTree, path), text.replace(from, to));
+      const label = `a pull request that edits ${JSON.stringify(from)} in ${path}`;
+      const plan = planFor([path], ["--event", "pull_request", "--base-tree", baseTree]);
+      assert.deepEqual(plan.guard_definitions_changed, lanes, `${label}: changed definitions`);
+      for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(plan[lane], lanes.includes(lane), `${label}: ${lane}`);
+      assertLanes(plan, label);
+    }
+  } finally {
+    rmSync(baseTree, { recursive: true, force: true });
+  }
+  const noBase = planFor(["Makefile"], ["--event", "pull_request"]);
+  assert.deepEqual(noBase.guard_definitions_changed, ["mcp_confinement_positive"], "no base copy: the Makefile's lane");
+  const noDiff = run(["--format", "json", "--event", "pull_request"]);
+  assert.equal(noDiff.status, 0, noDiff.stderr);
+  const unknown = JSON.parse(noDiff.stdout);
+  assert.equal(unknown.diff, "no diff base supplied");
+  assert.deepEqual(unknown.guard_definitions_changed, Object.keys(GUARD_LANE_INPUTS), "no diff: every definition may have changed");
+  for (const lane of Object.keys(GUARD_LANE_INPUTS)) assert.equal(unknown[lane], true, `no diff: ${lane} runs`);
+}
+
+// The default nextest profile's selection in every TOML spelling: a change to
+// it changes the extract the planner compares, and a change elsewhere (another
+// profile, an override's threads, a comment) does not.
+{
+  const filter = "default-filter = 'not test(/confinement/)'";
+  for (const [before, after] of [
+    ["[ profile.default ]\nretries = 1\n", `[ profile.default ]\nretries = 1\n${filter}\n`],
+    ['["profile"."default"]\nretries = 1\n', `["profile"."default"]\nretries = 1\n${filter}\n`],
+    ["profile.default.retries = 1\n", `profile.default.retries = 1\nprofile.default.${filter}\n`],
+    ["[profile]\ndefault.retries = 1\n", `[profile]\ndefault.retries = 1\ndefault.${filter}\n`],
+    ["[profile]\n", `[profile]\ndefault = { ${filter} }\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\n", `[[profile.default.overrides]]\nfilter = 'test(a)'\n  ${filter}\n`],
+    // A value that spans lines: a dotted key's multi-line string or array.
+    ["profile.default.default-filter = '''\nnot test(/a/)\n'''\n", "profile.default.default-filter = '''\nnot test(/b/)\n'''\n"],
+    ['[profile]\ndefault.default-filter = """\nnot test(/a/)\n"""\n', '[profile]\ndefault.default-filter = """\nnot test(/b/)\n"""\n'],
+    ["profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(b)' },\n]\n", "profile.default.overrides = [\n  { filter = 'test(a)', default-filter = 'test(c)' },\n]\n"],
+  ]) {
+    assert.notEqual(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection sees ${JSON.stringify(after)}`);
+  }
+  for (const [before, after] of [
+    ["profile.ci-unit.retries = 1\n", `profile.ci-unit.${filter}\n`],
+    ["profile.ci-unit.default-filter = '''\nnot test(/a/)\n'''\n", "profile.ci-unit.default-filter = '''\nnot test(/b/)\n'''\n"],
+    ["[profile]\nci-unit.retries = 1\n", `[profile]\nci-unit.${filter}\n`],
+    ["[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 2\n", "[[profile.default.overrides]]\nfilter = 'test(a)'\nthreads-required = 4\n"],
+    ["[ profile.default ]\n# one\nretries = 1\n", "[ profile.default ]\n# two\nretries = 1\n"],
+  ]) {
+    assert.equal(nextestDefaultSelection(before), nextestDefaultSelection(after), `the default selection ignores ${JSON.stringify(after)}`);
+  }
 }
 
 // No chain exception: meerkat-rpc's default-feature unit row (its MCP restart
@@ -753,8 +893,8 @@ for (const path of [
   assert.ok(!shardOf("surface-build-fixtures").packages.includes("meerkat-integration-tests"));
   assert.deepEqual(pr.deferred_to_push.integration_suites.sort(), ["gpt-live-replay", "machine-codegen", "rpc-configured-turn-limit"]);
   assert.deepEqual(pr.deferred_to_push.unit_feature_suites.sort(), ["meerkat[experimental-gpt-live]", "meerkat[openai-live]"]);
-  assert.equal(pr.wasm, false, "a workspace pull request runs the wasm lanes only for their own inputs");
-  assert.equal(pr.example_web, false);
+  assert.equal(pr.wasm, true, "a workspace pull request runs wasm-check: the web runtime is one of its packages");
+  assert.equal(pr.example_web, false, "and the example web suites only for their own inputs");
   const github = run(["--format", "github", "--event", "pull_request", "--", "Cargo.toml"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
@@ -832,6 +972,21 @@ for (const path of [
     const web = planFor([path], ["--event", "pull_request"]);
     assert.equal(web.example_web, true, `${path} runs the example web suites in the pull request`);
     if (!path.startsWith("sdks/")) assert.equal(web.wasm, true, `${path} runs wasm-check in the pull request`);
+  }
+  // wasm-check runs for every crate the wasm build compiles (the web
+  // runtime's dependency closure in the cargo graph), the provider crates
+  // included (#1108), and for no crate outside it.
+  for (const [path, wasm] of [
+    ["crates/meerkat-openai/src/lib.rs", true],
+    ["crates/meerkat-anthropic/src/lib.rs", true],
+    ["crates/meerkat-models/src/lib.rs", true],
+    ["crates/meerkat-rest/src/lib.rs", false],
+    ["crates/meerkat-rpc/src/lib.rs", false],
+    ["crates/meerkat-cli/src/main.rs", false],
+  ]) {
+    const plan = planFor([path], ["--event", "pull_request"]);
+    assert.equal(plan.wasm, wasm, `a pull request that changes ${path} ${wasm ? "runs" : "leaves"} wasm-check`);
+    assert.equal(plan.example_web, false, `${path}: the example web suites keep to their own inputs`);
   }
   assert.notEqual(run(["--event", "merge_group", "--", "Cargo.toml"]).status, 0, "an unknown event fails");
 }
@@ -1481,6 +1636,19 @@ for (const path of [
       assert.fail(`${job}: the rest wave differs from the job in ${JSON.stringify(line)} / ${JSON.stringify(twin)}`);
     });
   }
+  // The feature-check rows are compile-only, but a row whose objects are not
+  // in sccache yet runs long: the rkat+6 matrix row hit the 30-minute timeout
+  // on main push run 39186529346 and on release-branch dispatches (projected
+  // 35-38 minutes cold). Both waves allow exactly 45 minutes: room for a cold
+  // row, and no more, so a hung row still fails early.
+  for (const job of ["feature-check", "feature-check-rest"]) {
+    const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: \d+$/.test(line));
+    assert.equal(
+      timeout,
+      "    timeout-minutes: 45",
+      `${job}: ${timeout?.trim() ?? "no timeout-minutes"}, not 45 (a cold feature row needs more than 30 minutes, and a longer cap only delays a hung row)`,
+    );
+  }
   const stagger = jobLines(workflow, "stagger").join("\n");
   assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
   assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
@@ -1524,6 +1692,13 @@ for (const path of [
     "only the changed package's suites join the pull request",
   );
   assert.ok(unitOf(facade).suites.some((suite) => suite.features.includes("openai-live")), "the facade touch runs its GPT Live suite in the pull request");
+  // meerkat-openai's realtime adapter (live.rs, text_adapter.rs) is behind
+  // `realtime`, which neither its default features nor its `live` suite
+  // enable: its own suite runs those tests in the pull request and on main.
+  const openai = planFor(["crates/meerkat-openai/src/live.rs"], ["--event", "pull_request"]);
+  const realtime = (suites) => suites.filter((suite) => suite.packages[0] === "meerkat-openai" && suite.features.includes("realtime"));
+  assert.equal(realtime(unitOf(openai).suites).length, 1, "a pull request that changes meerkat-openai runs its realtime suite");
+  assert.equal(realtime(facade.main_feature_unit_shards).length, 1, "main runs meerkat-openai's realtime suite");
   for (const suite of unitOf(facade).suites) {
     assert.ok(suite.estimated_minutes <= facade.pr_unit_budget_minutes, `${suite.name} fits the pull-request budget`);
   }
@@ -2331,7 +2506,7 @@ for (const path of [
   const mapping = "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: ${{ matrix.rust_min_stack }}\n";
   const remapped = mutated(mapping, "          NO_TESTS: ${{ matrix.no_tests }}\n          MIN_STACK: 1048576\n");
   assert.ok(remapped.some((error) => error.includes("step env MIN_STACK")), "an altered MIN_STACK mapping is refused");
-  const stackExport = '          # The hook ran every lane on a 32 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
+  const stackExport = '          # The hook runs every lane on an 8 MiB test-thread stack.\n          if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi\n';
   const reexported = mutated(stackExport, stackExport.replace('RUST_MIN_STACK="${MIN_STACK}"', "RUST_MIN_STACK=1048576"));
   assert.ok(reexported.some((error) => error.includes("job closure-tests: the step runs")), "an altered RUST_MIN_STACK export is refused");
   const unexported = mutated(stackExport, "");
