@@ -490,6 +490,15 @@ them.
   work in flight and that then retired kept the mob busy for its life:
   admission never closed idle, and `MobBusy` reported runs that did not exist.
   Only identities with a current incarnation count now. Pre-existing in 0.9.3.
+- After a restart, a placed member no longer shows its predecessor's kickoff
+  (`meerkat-mob`). The startup replay applies kickoff updates per identity and
+  installs the current placed incarnation from its committed carrier only after
+  the whole event pass, so the kickoff phase and error of an earlier
+  incarnation of the same identity (a failed kickoff, for example) carried
+  over to a placed incarnation that had no kickoff of its own, although the
+  live spawn commit had cleared them. The replay now clears the identity's
+  kickoff where that incarnation's spawn event sits; the incarnation's own
+  kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

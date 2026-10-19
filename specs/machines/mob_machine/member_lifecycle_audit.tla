@@ -77,6 +77,10 @@
 \*     a new incarnation never starts from its predecessor's progress
 \*     token, last observation, progress clock and event, health class, run
 \*     state or in-flight work.
+\*   AuditMintClearsFailureRecords (action property): a step that mints an
+\*     incarnation leaves the identity no restore failure, restore failure
+\*     code or materialization failure, so a new incarnation never reports
+\*     its predecessor's failure.
 \*   AuditPlacementAbsent and AuditRetiringRuntimeMapped (invariants): no
 \*     member is ever placed, and every Retiring runtime is the one its
 \*     identity maps to. They check the reasons in the not-covered list
@@ -513,6 +517,18 @@ AuditMintClearsExecutionHealth ==
             /\ id \notin DOMAIN member_last_progress_at_ms'
             /\ id \notin DOMAIN member_last_progress_event'
             /\ id \notin DOMAIN member_health_class'
+      ]_vars
+
+\* A step that mints an incarnation leaves the identity no failure record:
+\* either its recorded generation is unchanged, or none of the three
+\* failure maps holds it after the step.
+AuditMintClearsFailureRecords ==
+    [][\A id \in DOMAIN identity_runtime_generations' :
+         \/ /\ id \in DOMAIN identity_runtime_generations
+            /\ identity_runtime_generations'[id] = identity_runtime_generations[id]
+         \/ /\ id \notin DOMAIN member_restore_failures'
+            /\ id \notin DOMAIN member_restore_failure_codes'
+            /\ id \notin DOMAIN member_materialization_failures'
       ]_vars
 
 \* No arm here places a member: the placed archive, retirement-start and

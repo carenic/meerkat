@@ -7533,6 +7533,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.current_placed_spawn_operation_owner_session_ids.insert(agent_identity, operation_owner_session_id);
                 self.member_state_markers.insert(agent_runtime_id, MobMemberState::Active);
                 self.member_restore_failures.remove(agent_identity);
+                self.member_restore_failure_codes.remove(agent_identity);
                 self.member_revival_pending.remove(agent_identity);
                 self.member_materialization_failures.remove(agent_identity);
                 self.topology_epoch += 1;
@@ -7645,6 +7646,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_runtime_modes.insert(agent_identity, runtime_mode);
                 self.member_restore_failures.remove(agent_identity);
                 self.member_restore_failure_codes.remove(agent_identity);
+                self.member_materialization_failures.remove(agent_identity);
                 self.member_revival_pending.remove(agent_identity);
                 self.member_kickoff_pending.remove(agent_identity);
                 self.member_kickoff_starting.remove(agent_identity);
@@ -7952,6 +7954,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_prior_peer_endpoints.remove(agent_identity);
                 self.member_restore_failures.remove(agent_identity);
                 self.member_restore_failure_codes.remove(agent_identity);
+                self.member_materialization_failures.remove(agent_identity);
                 self.member_revival_pending.remove(agent_identity);
                 self.member_kickoff_pending.remove(agent_identity);
                 self.member_kickoff_starting.remove(agent_identity);

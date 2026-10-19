@@ -13,7 +13,7 @@
 # fails otherwise. With the counters left out the reachable space is finite,
 # so each run explores all of it, with no step bound. It checks two runs over
 # their whole space with TLC coverage:
-# - the lifecycle run (AuditSpec) with its two action properties and the two
+# - the lifecycle run (AuditSpec) with its three action properties and the two
 #   invariants that check the reasons of its not-covered list;
 # - the scope run (AuditScopeSpec) with its two RetireAtScope invariants.
 # Each run must finish without an error, reach at least its floor of distinct
@@ -194,7 +194,7 @@ step_index="${view_positions% *}"
 epoch_index="${view_positions#* }"
 
 # usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
-# where <run> is lifecycle (AuditSpec and its action property) or scope
+# where <run> is lifecycle (AuditSpec and its action properties) or scope
 # (AuditScopeSpec and its two invariants).
 write_cfg() {
   local run="$1" cfg="$2" invariants="$3" properties="$4"
@@ -214,7 +214,8 @@ write_cfg() {
       replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
       replace_exact_line "INVARIANTS" "PROPERTIES
   AuditObservationMonotonic
-  AuditMintClearsExecutionHealth${properties}
+  AuditMintClearsExecutionHealth
+  AuditMintClearsFailureRecords${properties}
 INVARIANTS
   AuditPlacementAbsent
   AuditRetiringRuntimeMapped${invariants}" "${cfg}"

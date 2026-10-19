@@ -3714,6 +3714,21 @@ fn seed_mob_authority_sync_from_events(
                     // the exact remote spawn ladder reject its own durable
                     // carrier. The key is incarnation-scoped so older
                     // generations still replay and retain history.
+                    //
+                    // The live membership commit cleared the identity's
+                    // kickoff at this point of the history, so clear it here
+                    // too: the incarnation the carrier installs must not
+                    // surface a predecessor's replayed kickoff. Its own
+                    // kickoff updates follow this event and still replay.
+                    apply_seeded_mob_input(
+                        authority,
+                        mob_dsl::MobMachineInput::KickoffClear {
+                            member_id: mob_dsl::AgentIdentity::from_domain(
+                                &member_spawned.agent_identity,
+                            ),
+                        },
+                        "recover_placed_member_spawned_kickoff_clear",
+                    )?;
                     continue;
                 }
                 apply_seeded_mob_signal(
@@ -13501,6 +13516,113 @@ mod tests {
         assert_eq!(
             authority.state().member_placement.get(&dsl_identity),
             Some(&host)
+        );
+    }
+
+    #[test]
+    fn deferred_placed_spawn_drops_the_predecessors_kickoff() {
+        let definition = MobDefinition::explicit("placed-kickoff-successor");
+        let identity = AgentIdentity::from("placed-kickoff-worker");
+        let generation_zero = Generation::INITIAL;
+        let generation_one = Generation::new(1);
+        let retired_spawn_id = crate::ids::PlacedSpawnId::new();
+        let current_spawn_id = crate::ids::PlacedSpawnId::new();
+        let kickoff_event =
+            |cursor: u64, phase: MobMemberKickoffPhase, error: Option<&str>| MobEvent {
+                cursor,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MemberKickoffUpdated {
+                    member: identity.clone(),
+                    kickoff: MobMemberKickoffSnapshot {
+                        objective_id: None,
+                        phase,
+                        error: error.map(str::to_string),
+                        updated_at: UNIX_EPOCH,
+                    },
+                },
+            };
+        let mut events = vec![
+            MobEvent {
+                cursor: 1,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MobOwnerBridgeSessionBound {
+                    bridge_session_id: meerkat_core::SessionId::new(),
+                    destroy_on_owner_archive: false,
+                    implicit_delegation_mob: false,
+                },
+            },
+            placed_spawned_event(
+                &definition.id,
+                2,
+                &identity,
+                generation_zero,
+                FenceToken::new(7),
+                &retired_spawn_id,
+            ),
+            kickoff_event(
+                3,
+                MobMemberKickoffPhase::Failed,
+                Some("the predecessor's kickoff failed"),
+            ),
+            MobEvent {
+                cursor: 4,
+                timestamp: Utc::now(),
+                mob_id: definition.id.clone(),
+                kind: MobEventKind::MemberRetired {
+                    agent_identity: identity.clone(),
+                    generation: generation_zero,
+                    role: ProfileName::from("worker"),
+                },
+            },
+            placed_spawned_event(
+                &definition.id,
+                5,
+                &identity,
+                generation_one,
+                FenceToken::new(8),
+                &current_spawn_id,
+            ),
+        ];
+        let committed_keys = BTreeSet::from([(
+            identity.as_str().to_string(),
+            generation_one.get(),
+            current_spawn_id,
+        )]);
+        let replay = |events: &[MobEvent]| {
+            let mut authority = seed_mob_authority();
+            seed_mob_authority_sync_from_events(
+                &mut authority,
+                events,
+                &definition,
+                false,
+                &committed_keys,
+            )
+            .expect("placed replay keeps its kickoff history consistent");
+            authority
+        };
+
+        let authority = replay(&events);
+        assert_eq!(
+            authority
+                .state()
+                .kickoff_material_for_member_id(identity.as_str()),
+            None,
+            "the incarnation the carrier installs must not inherit its predecessor's kickoff"
+        );
+
+        events.push(kickoff_event(6, MobMemberKickoffPhase::Started, None));
+        let authority = replay(&events);
+        assert_eq!(
+            authority
+                .state()
+                .kickoff_material_for_member_id(identity.as_str()),
+            Some(mob_dsl::MobMemberKickoffMaterial {
+                phase: mob_dsl::KickoffPhase::Started,
+                error: None,
+            }),
+            "the incarnation's own kickoff, recorded after its spawn, still replays"
         );
     }
 
