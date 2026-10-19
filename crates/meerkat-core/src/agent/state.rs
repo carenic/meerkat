@@ -6007,10 +6007,7 @@ where
         let tool_name = decided.tool_name.clone().unwrap_or_default();
         let dispatched = dispatch_retained_consent_boxed(
             Arc::clone(&self.tools),
-            self.tool_dispatch_context
-                .clone()
-                .with_operation_review(Some(Arc::clone(review)))
-                .with_refusal_observer(self.refusal_observer_binding()),
+            self.observed_tool_dispatch_context(Some(Arc::clone(review))),
             decided.approval_id.clone(),
         )
         .await;
@@ -7843,10 +7840,7 @@ where
         // any other tool execution failure.
         let mut dispatch_results = dispatch_tool_calls_boxed(
             Arc::clone(&self.tools),
-            self.tool_dispatch_context
-                .clone()
-                .with_operation_review(self.operation_review.clone())
-                .with_refusal_observer(self.refusal_observer_binding()),
+            self.observed_tool_dispatch_context(self.operation_review.clone()),
             self.tools_config.default_timeout,
             self.tools_config.tool_timeouts.clone(),
             self.tools_config.max_concurrent.max(1),
@@ -34207,6 +34201,287 @@ mod tests {
             );
         }
 
+        /// The work owner of one R3 action whose permission it can withdraw;
+        /// every other operation stays allowed under R1.
+        #[derive(Default)]
+        struct ConsentOwner {
+            withdrawn: std::sync::atomic::AtomicBool,
+        }
+
+        struct ConsentPolicy(Arc<ConsentOwner>);
+
+        struct ConsentDecision {
+            binding: PreparedAuthorizationBinding,
+            owner: Arc<ConsentOwner>,
+        }
+
+        impl ConsentDecision {
+            fn is_restricted_action(&self) -> bool {
+                matches!(&self.binding.facts().operation,
+                    AuthorizationOperation::Tool(tool) if tool.name == "restricted_action")
+            }
+        }
+
+        impl WorkAuthorization for ConsentPolicy {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn review_operation_context(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<
+                crate::authorization::ReviewOperationContextResolution,
+                crate::OperationAuthorizationError,
+            > {
+                Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+            }
+
+            fn prepare(
+                &self,
+                binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, crate::OperationAuthorizationError>
+            {
+                Ok(Arc::new(ConsentDecision {
+                    binding: binding.clone(),
+                    owner: Arc::clone(&self.0),
+                }))
+            }
+        }
+
+        impl PreparedOperationAuthorization for ConsentDecision {
+            fn review_tier(&self) -> crate::authorization::OperationReviewTier {
+                if self.is_restricted_action() {
+                    crate::authorization::OperationReviewTier::R3
+                } else {
+                    crate::authorization::OperationReviewTier::R1
+                }
+            }
+
+            fn check_current(
+                &self,
+                binding: &PreparedAuthorizationBinding,
+            ) -> Result<(), crate::OperationAuthorizationError> {
+                if !self.binding.same_operation(binding) {
+                    return Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into());
+                }
+                if self.is_restricted_action() && self.owner.withdrawn.load(Ordering::SeqCst) {
+                    return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+                }
+                Ok(())
+            }
+        }
+
+        /// The R3 action, whose review its dispatcher consumes at entry; it
+        /// counts the bodies it runs.
+        #[derive(Default)]
+        struct ConsentedAction(AtomicUsize);
+
+        #[async_trait]
+        impl AgentToolDispatcher for ConsentedAction {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::from([Arc::new(ToolDef::new(
+                    "restricted_action",
+                    "fixture",
+                    serde_json::json!({"type":"object"}),
+                ))])
+            }
+
+            fn review_entry_support(
+                &self,
+                _tool_name: &str,
+            ) -> crate::approval::review::ReviewEntrySupport {
+                crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<crate::ToolDispatchOutcome, ToolError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::new(call.id.into(), "ran".into(), false).into())
+            }
+        }
+
+        /// R3 is never model-reviewed.
+        struct NoModelReview;
+
+        #[async_trait]
+        impl crate::approval::review::OperationReviewer for NoModelReview {
+            async fn review(
+                &self,
+                _candidate: &crate::approval::review::ReviewCandidate<'_>,
+            ) -> Result<
+                crate::approval::review::ReviewVerdict,
+                crate::approval::review::ReviewerFailure,
+            > {
+                Err(crate::approval::review::ReviewerFailure::Unavailable)
+            }
+        }
+
+        /// The host's consent route: it presents every candidate, lets every
+        /// authenticated human decide, and keeps the approvals it was told
+        /// were requested.
+        #[derive(Default)]
+        struct ConsentRoute(Mutex<Vec<crate::ApprovalId>>);
+
+        struct ConsentEligible;
+
+        impl crate::approval::consent::ConsentEligibility for ConsentEligible {
+            fn check_current(&self) -> Result<(), crate::approval::consent::ConsentIneligible> {
+                Ok(())
+            }
+        }
+
+        impl crate::approval::consent::HumanConsentRoute for ConsentRoute {
+            fn present(
+                &self,
+                _candidate: &crate::approval::consent::ConsentPresentationCandidate<'_>,
+            ) -> Result<
+                crate::approval::consent::ConsentPresentation,
+                crate::approval::consent::ConsentRouteUnavailable,
+            > {
+                Ok(crate::approval::consent::ConsentPresentation {
+                    requester: crate::approval::ApprovalPrincipalId::new("human:requester")
+                        .expect("principal"),
+                    risk: crate::approval::ApprovalRisk::High,
+                    metadata: crate::SurfaceMetadata::default(),
+                })
+            }
+
+            fn eligibility(
+                &self,
+                _approver: &crate::approval::consent::AuthenticatedApprover,
+                _approval: &crate::approval::ApprovalRecord,
+            ) -> Result<
+                Arc<dyn crate::approval::consent::ConsentEligibility>,
+                crate::approval::consent::ConsentIneligible,
+            > {
+                Ok(Arc::new(ConsentEligible))
+            }
+
+            fn notice(&self, notice: crate::approval::consent::ConsentNotice) {
+                if notice.kind == crate::approval::consent::ConsentNoticeKind::Requested {
+                    self.0.lock().unwrap().push(notice.approval_id);
+                }
+            }
+        }
+
+        /// The in-run spend of a decided consent reports to the host's
+        /// operation refusal observer: the human approves while the run is
+        /// open, then the owner withdraws the permission, so the run's
+        /// retained attempt of the call is refused at its staging. The host
+        /// observes it once, as the original call's result, with the closed
+        /// kind and the dispatch fact the model's notice carries; no body ran.
+        #[tokio::test]
+        async fn the_host_observes_a_refused_in_run_consent_attempt() {
+            let client = Arc::new(FixtureClient {
+                requests: Mutex::new(Vec::new()),
+                tool_first: true,
+                authorizations: Mutex::new(Vec::new()),
+                hosted_default: false,
+            });
+            let owner = Arc::new(ConsentOwner::default());
+            let approvals = crate::approval::ApprovalService::new();
+            let route = Arc::new(ConsentRoute::default());
+            let review = Arc::new(
+                crate::approval::review::BoundOperationReview::new(
+                    Arc::new(NoModelReview),
+                    approvals.clone(),
+                    std::time::Duration::from_secs(30),
+                )
+                .with_human_consent(route.clone(), std::time::Duration::from_secs(4 * 60 * 60)),
+            );
+            let observer = Arc::new(RecordingObserver::default());
+            let tools = Arc::new(ConsentedAction::default());
+            let mut agent = with_test_turn_state_handle(
+                AgentBuilder::new()
+                    .model("fixture-model")
+                    .with_operation_review(review)
+                    .with_operation_refusal_observer(Arc::clone(&observer) as _),
+            )
+            .build_standalone(client.clone(), tools.clone(), Arc::new(NoopStore))
+            .await;
+            // At the run's next boundary after the call requested consent,
+            // the human approves it, and then the owner withdraws the
+            // permission before the run spends it.
+            let decide = {
+                let route = Arc::clone(&route);
+                let owner = Arc::clone(&owner);
+                move || {
+                    let Some(approval_id) = route.0.lock().unwrap().pop() else {
+                        return;
+                    };
+                    let approver = crate::approval::consent::AuthenticatedApprover::new(
+                        crate::PrincipalRef::in_domain(
+                            crate::PrincipalKind::Human,
+                            "lead-1",
+                            crate::TrustDomainId::new("team").expect("domain"),
+                        )
+                        .expect("principal"),
+                        crate::approval::ApprovalAssurance::PersonAuthenticated,
+                    )
+                    .expect("qualified approver");
+                    approvals
+                        .decide_consent(
+                            &approval_id,
+                            crate::approval::consent::AuthenticatedConsentDecision {
+                                approver,
+                                decision: crate::approval::ApprovalDecision::Approve,
+                                reason: None,
+                            },
+                        )
+                        .expect("approved while the run is open");
+                    owner.withdrawn.store(true, Ordering::SeqCst);
+                }
+            };
+            agent.__test_set_model_preparation_observer(Some(Arc::new(decide)));
+            let (tx, mut rx) = mpsc::channel(128);
+            let result = agent
+                .run_with_events_and_work_authorization(
+                    "try the restricted action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work(
+                        Arc::new(ConsentPolicy(Arc::clone(&owner))),
+                        client.clone(),
+                    )),
+                )
+                .await
+                .expect("a refused consent attempt is local feedback");
+            assert_eq!(result.turns, 2);
+            assert!(
+                owner.withdrawn.load(Ordering::SeqCst),
+                "the consent was requested, approved and withdrawn in the run"
+            );
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0, "no body ran");
+            let observed = observer.observed();
+            assert_eq!(observed.len(), 1, "{observed:?}");
+            let observation = &observed[0];
+            assert_eq!(observation.session_id(), agent.session.id());
+            assert_eq!(
+                observation.surface(),
+                &crate::authorization::OperationRefusalSurface::ToolCall {
+                    tool_use_id: "refused-call".into()
+                }
+            );
+            assert_eq!(
+                observation.outcome(),
+                crate::authorization::OperationRefusalOutcome::Refused {
+                    kind: OperationRefusalKind::Denied,
+                    dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+                }
+            );
+            assert_eq!(
+                observation.disposition(),
+                crate::authorization::OperationRefusalDisposition::ToolResult
+            );
+            assert!(observation.operation_id().is_some());
+            assert_completed_without_failure(&mut rx);
+        }
+
         mod observation_infrastructure_tool_siblings {
             use super::*;
             use crate::authorization::{OperationObservation, OperationObservationError};
@@ -34214,6 +34489,7 @@ mod tests {
             #[derive(Default)]
             struct EntryObserver {
                 authority_unavailable: bool,
+                deny_blocked: bool,
                 failed_entries: AtomicUsize,
                 refused_observations: AtomicUsize,
             }
@@ -34262,6 +34538,12 @@ mod tests {
                         AuthorizationOperation::Tool(tool) if tool.name == "audit_blocked")
                     {
                         return Err(crate::OperationAuthorizationError::Unavailable);
+                    }
+                    if self.observer.deny_blocked
+                        && matches!(&binding.facts().operation,
+                        AuthorizationOperation::Tool(tool) if tool.name == "audit_blocked")
+                    {
+                        return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
                     }
                     Ok(())
                 }
@@ -34642,6 +34924,95 @@ mod tests {
                         .count();
                     assert_eq!(effects, 1);
                     assert_completed_without_failure(&mut rx);
+                }
+            }
+
+            /// The loop's tool batch reports to the host's operation refusal
+            /// observer: the call its owners refuse reaches the host once, as
+            /// that call's result, with the closed kind and the dispatch fact
+            /// its model payload carries, or as unavailable authority when its
+            /// owners could not decide. Its healthy sibling runs and is not
+            /// observed.
+            #[tokio::test]
+            async fn the_host_observes_the_loop_tool_calls_its_owners_refuse() {
+                for (row, deny_blocked, outcome) in [
+                    (
+                        "denied",
+                        true,
+                        crate::authorization::OperationRefusalOutcome::Refused {
+                            kind: OperationRefusalKind::Denied,
+                            dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+                        },
+                    ),
+                    (
+                        "unavailable",
+                        false,
+                        crate::authorization::OperationRefusalOutcome::AuthorityUnavailable,
+                    ),
+                ] {
+                    let entries = Arc::new(EntryObserver {
+                        authority_unavailable: !deny_blocked,
+                        deny_blocked,
+                        ..Default::default()
+                    });
+                    let observer = Arc::new(RecordingObserver::default());
+                    let tools = Arc::new(Siblings::default());
+                    let model = Arc::new(Model {
+                        preparations: AtomicUsize::new(0),
+                        requests: AtomicUsize::new(0),
+                        failed_first: true,
+                    });
+                    let context = WorkAuthorizationContext::new(
+                        Arc::new(Policy(entries.clone())),
+                        crate::exact_operation::OperationExecutionScope::Domain,
+                    )
+                    .with_controller_client(crate::ControllerModelClient::new(
+                        fixture_controller_selection(),
+                        model.clone(),
+                    ))
+                    .unwrap();
+                    let mut agent = with_test_turn_state_handle(
+                        AgentBuilder::new()
+                            .model("fixture-model")
+                            .with_operation_refusal_observer(Arc::clone(&observer) as _),
+                    )
+                    .build_standalone(model.clone(), tools.clone(), Arc::new(NoopStore))
+                    .await;
+                    let (tx, _rx) = mpsc::channel(128);
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        agent.run_with_events_and_work_authorization(
+                            "try both tools".to_string().into(),
+                            vec![],
+                            vec![],
+                            None,
+                            tx,
+                            Some(context),
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .expect(row);
+                    assert_eq!(tools.blocked_bodies.load(Ordering::SeqCst), 0, "{row}");
+                    assert_eq!(tools.healthy_bodies.load(Ordering::SeqCst), 1, "{row}");
+                    let observed = observer.observed();
+                    assert_eq!(observed.len(), 1, "{row}: {observed:?}");
+                    let observation = &observed[0];
+                    assert_eq!(observation.session_id(), agent.session.id(), "{row}");
+                    assert_eq!(
+                        observation.surface(),
+                        &crate::authorization::OperationRefusalSurface::ToolCall {
+                            tool_use_id: "call-audit_blocked".into()
+                        },
+                        "{row}"
+                    );
+                    assert_eq!(observation.outcome(), outcome, "{row}");
+                    assert_eq!(
+                        observation.disposition(),
+                        crate::authorization::OperationRefusalDisposition::ToolResult,
+                        "{row}"
+                    );
+                    assert!(observation.operation_id().is_some(), "{row}");
                 }
             }
 

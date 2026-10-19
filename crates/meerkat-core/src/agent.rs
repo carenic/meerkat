@@ -4605,6 +4605,21 @@ where
             )
         })
     }
+
+    /// The context of a tool dispatch this agent runs itself (its loop's
+    /// tool batch, an external tool call, an in-run consent attempt) under
+    /// `review`, with the installed operation refusal observer bound to this
+    /// agent's session. Each of them takes its context here, so none leaves
+    /// the observer out.
+    pub(crate) fn observed_tool_dispatch_context(
+        &self,
+        review: Option<Arc<crate::approval::review::BoundOperationReview>>,
+    ) -> ToolDispatchContext {
+        self.tool_dispatch_context
+            .clone()
+            .with_operation_review(review)
+            .with_refusal_observer(self.refusal_observer_binding())
+    }
 }
 
 #[derive(Clone)]
@@ -7073,15 +7088,85 @@ mod governed_operation_tests {
         }
     }
 
+    /// A tool application ingress current when the application submitted
+    /// the call, whose custody, checked again after the dispatch's waits
+    /// immediately before entry, is refused.
+    struct CustodyRefusedBeforeEntry;
+
+    impl crate::ToolApplicationIngress for CustodyRefusedBeforeEntry {
+        fn revalidate(&self) -> Result<(), OperationAuthorizationError> {
+            Ok(())
+        }
+
+        fn revalidate_async(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), OperationAuthorizationError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let refused: Result<(), OperationAuthorizationError> =
+                Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+            Box::pin(async move { refused })
+        }
+
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    /// One certified refusal row: its name, the fenced result, how many
+    /// bodies ran, and the closed kind the refusal carries.
+    type CertifiedRow = (
+        &'static str,
+        Result<crate::ops::ToolDispatchOutcome, crate::ToolError>,
+        usize,
+        OperationRefusalKind,
+    );
+
+    /// Every row ended with its operation refusal certified not dispatched:
+    /// the model reads the closed kind with `tool_invoked: false`, and no
+    /// body ran.
+    fn assert_certified_not_dispatched(rows: Vec<CertifiedRow>) {
+        for (row, result, bodies, kind) in rows {
+            let refused = refusal_and_data(&result);
+            assert!(
+                refused.is_some(),
+                "{row}: an operation refusal, not {result:?}"
+            );
+            let (refusal, data) = refused.expect("checked above");
+            assert_eq!(refusal.kind(), kind, "{row}");
+            assert_eq!(
+                refusal.dispatch(),
+                crate::authorization::RefusalDispatch::NotDispatched,
+                "{row}"
+            );
+            assert_eq!(
+                data,
+                serde_json::json!({"kind": kind, "tool_invoked": false}),
+                "{row}"
+            );
+            assert_eq!(bodies, 0, "{row}: no body ran");
+        }
+    }
+
     /// Every operation refusal a fenced entry meets before it invokes the
-    /// dispatcher, and every one the execution policy gate meets before it
-    /// invokes its inner dispatcher, is certified at that component's one
-    /// boundary: the model reads the closed kind with `tool_invoked: false`,
-    /// and no body ran. One row per pre-invocation refusal, on both fenced
-    /// entries and both of the gate's staging paths.
+    /// dispatcher is certified at that entry's one boundary: the model reads
+    /// the closed kind with `tool_invoked: false`, and no body ran. One row
+    /// per pre-invocation refusal, on both fenced entries.
+    /// - The execution policy gate's own staging refusals are certified in
+    ///   `the_policy_gate_certifies_its_own_staging_refusals_not_dispatched`.
+    /// - A retained consent attempt refused at its staging, once its
+    ///   candidate resolved, is certified in
+    ///   `approval::consent::tests::a_refused_consent_attempt_reaches_the_host_observer_as_its_call`,
+    ///   which has the approval owner it needs.
+    /// - A consent attempt's own admission refuses only with review outcomes,
+    ///   never an operation refusal, so it has no row.
     #[tokio::test(start_paused = true)]
     async fn every_pre_invocation_refusal_is_certified_not_dispatched() {
-        let mut rows = Vec::new();
+        let mut rows: Vec<CertifiedRow> = Vec::new();
 
         // A governed comms plan without its owner's target.
         let dispatcher = Arc::new(SourceKindDispatcher::default());
@@ -7134,8 +7219,60 @@ mod governed_operation_tests {
             OperationRefusalKind::ReprepareRequired,
         ));
 
-        // The execution policy gate's own staging, after its consequence
-        // policy revoked the work, on both of its staging paths.
+        // The tool application's custody, checked again immediately before
+        // entry, refused.
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let control = crate::ToolApplicationControlRequest::from_trusted_ingress(
+            crate::types::SessionId::new(),
+            crate::ToolApplicationRequest {
+                tool_call_id: "call-1".into(),
+                extension: "test.app".into(),
+                operation: crate::ToolApplicationOperation::CallTool {
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+            Arc::new(CustodyRefusedBeforeEntry),
+        )
+        .expect("current when submitted");
+        let applied = ToolDispatchContext::default()
+            .with_tool_application_control(control)
+            .with_work_authorization(Some(governed_work()));
+        let result = fenced(&dispatcher, "read_file", &applied).await;
+        rows.push((
+            "tool application custody before entry",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::Denied,
+        ));
+
+        // The retained consent entry, for a context without work.
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let result = crate::dispatch_retained_consent_attempt(
+            &dispatcher,
+            &ToolDispatchContext::default(),
+            &crate::ApprovalId::new(),
+        )
+        .await;
+        rows.push((
+            "consent entry without work",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::MalformedFacts,
+        ));
+
+        assert_certified_not_dispatched(rows);
+    }
+
+    /// The execution policy gate certifies every operation refusal its own
+    /// staging meets before it invokes its inner dispatcher, here after its
+    /// consequence policy revoked the work, on both of its staging paths
+    /// (resolved and lowered). This runs on real time: the policy evaluates
+    /// on its own worker thread, and a paused clock would advance to the
+    /// evaluation deadline while the worker's answer is still on its way.
+    #[tokio::test]
+    async fn the_policy_gate_certifies_its_own_staging_refusals_not_dispatched() {
+        let mut rows: Vec<CertifiedRow> = Vec::new();
         for (row, resolved) in [
             ("policy gate staging (resolved)", true),
             ("policy gate staging (lowered)", false),
@@ -7172,37 +7309,7 @@ mod governed_operation_tests {
                 OperationRefusalKind::Denied,
             ));
         }
-
-        // The retained consent entry, for a context without work.
-        let dispatcher = Arc::new(SourceKindDispatcher::default());
-        let result = crate::dispatch_retained_consent_attempt(
-            &dispatcher,
-            &ToolDispatchContext::default(),
-            &crate::ApprovalId::new(),
-        )
-        .await;
-        rows.push((
-            "consent entry without work",
-            result,
-            dispatcher.0.load(Ordering::SeqCst),
-            OperationRefusalKind::MalformedFacts,
-        ));
-
-        for (row, result, bodies, kind) in rows {
-            let (refusal, data) = refusal_and_data(&result).expect(row);
-            assert_eq!(refusal.kind(), kind, "{row}");
-            assert_eq!(
-                refusal.dispatch(),
-                crate::authorization::RefusalDispatch::NotDispatched,
-                "{row}"
-            );
-            assert_eq!(
-                data,
-                serde_json::json!({"kind": kind, "tool_invoked": false}),
-                "{row}"
-            );
-            assert_eq!(bodies, 0, "{row}: no body ran");
-        }
+        assert_certified_not_dispatched(rows);
     }
 
     /// The host's operation refusal observer: it keeps what it is given.
@@ -7257,22 +7364,25 @@ mod governed_operation_tests {
             &str,
             Arc<dyn AgentToolDispatcher>,
             ToolDispatchContext,
+            crate::authorization::RefusalDispatch,
             serde_json::Value,
         ); 2] = [
             (
                 "refused at the prepared entry",
                 Arc::new(SourceKindDispatcher::default()),
                 denying,
+                crate::authorization::RefusalDispatch::NotDispatched,
                 serde_json::json!(false),
             ),
             (
                 "refused by the dispatcher",
                 Arc::new(RefusingBody::default()),
                 governed.clone(),
+                crate::authorization::RefusalDispatch::Unknown,
                 serde_json::json!("unknown"),
             ),
         ];
-        for (row, dispatcher, context, tool_invoked) in rows {
+        for (row, dispatcher, context, dispatch, tool_invoked) in rows {
             let result = fenced(
                 &dispatcher,
                 "read_file",
@@ -7280,7 +7390,12 @@ mod governed_operation_tests {
             )
             .await;
             let (refusal, data) = refusal_and_data(&result).expect(row);
-            assert_eq!(data["tool_invoked"], tool_invoked, "{row}");
+            assert_eq!(refusal.dispatch(), dispatch, "{row}");
+            assert_eq!(
+                data,
+                serde_json::json!({"kind": "denied", "tool_invoked": tool_invoked}),
+                "{row}"
+            );
             let observed = observer.take();
             assert_eq!(observed.len(), 1, "{row}: {observed:?}");
             let observation = &observed[0];
@@ -7294,8 +7409,11 @@ mod governed_operation_tests {
             );
             assert_eq!(
                 observation.outcome(),
-                crate::authorization::OperationRefusalOutcome::from(refusal),
-                "{row}: the observation reads the payload's refusal"
+                crate::authorization::OperationRefusalOutcome::Refused {
+                    kind: OperationRefusalKind::Denied,
+                    dispatch,
+                },
+                "{row}: the observation carries the payload's kind and dispatch fact"
             );
             assert_eq!(
                 observation.disposition(),

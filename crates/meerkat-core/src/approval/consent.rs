@@ -3966,8 +3966,10 @@ mod tests {
     /// because the owner withdrew the permission after the approval, reaches
     /// the host's operation refusal observer once: as the retained call's
     /// result, under the retained operation, with the dispatch fact its model
-    /// payload carries. The first attempt's consent request is not a refusal
-    /// and is not observed.
+    /// payload carries. The attempt met the refusal at its staging, before the
+    /// retained call's dispatcher ran, so the model reads it certified not
+    /// dispatched (`tool_invoked: false`). The first attempt's consent request
+    /// is not a refusal and is not observed.
     #[tokio::test]
     async fn a_refused_consent_attempt_reaches_the_host_observer_as_its_call() {
         let w = world();
@@ -4037,6 +4039,14 @@ mod tests {
             refusal.dispatch(),
             crate::authorization::RefusalDispatch::NotDispatched
         );
+        assert_eq!(
+            result
+                .as_ref()
+                .err()
+                .map(|error| error.to_error_payload()["data"].clone()),
+            Some(serde_json::json!({"kind": "denied", "tool_invoked": false})),
+            "the model reads the certified refusal"
+        );
         assert_eq!(dispatcher.0.load(Ordering::SeqCst), 0, "no body ran");
         let observed = log.0.lock().clone();
         assert_eq!(observed.len(), 1, "{observed:?}");
@@ -4050,7 +4060,10 @@ mod tests {
         );
         assert_eq!(
             observation.outcome(),
-            crate::authorization::OperationRefusalOutcome::from(refusal)
+            crate::authorization::OperationRefusalOutcome::Refused {
+                kind: OperationRefusalKind::Denied,
+                dispatch: crate::authorization::RefusalDispatch::NotDispatched,
+            }
         );
         assert_eq!(
             observation.disposition(),

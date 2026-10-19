@@ -1252,11 +1252,7 @@ where
         {
             return Ok(crate::ops::terminal_tool_outcome_for_error(call.id, error));
         }
-        let context = self
-            .tool_dispatch_context
-            .clone()
-            .with_operation_review(self.operation_review.clone())
-            .with_refusal_observer(self.refusal_observer_binding());
+        let context = self.observed_tool_dispatch_context(self.operation_review.clone());
         let outcome = self
             .dispatch_host_tool_call(call, timeout_policy, context)
             .await?;
