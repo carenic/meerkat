@@ -568,8 +568,15 @@ fi
 # its watchdog, is ended at once with the signal the script uses, 300 times,
 # inside a shell whose EXIT trap removes its work directory; the directory
 # must survive every time (TERM loses it in a few percent of runs, SIGKILL
-# never).
-watchdog_signal="$(sed -n 's/^  kill -\([A-Z]*\) -- "-\${watchdog_pgid}".*/\1/p' "$cap_script")"
+# never). The probe reads the signal from exactly one kill line, and each
+# run is bounded: a signal this shell cannot send would otherwise leave the
+# run waiting out the subshell's sleep, 300 times.
+watchdog_signals="$(sed -n 's/^  kill -\([A-Z]*\) -- "-\${watchdog_pgid}".*/\1/p' "$cap_script")"
+watchdog_signal_lines="$(printf '%s' "$watchdog_signals" | grep -c . || true)"
+watchdog_signal=""
+if [ "$watchdog_signal_lines" = 1 ]; then
+  watchdog_signal="$watchdog_signals"
+fi
 trap_probe_dir="$(mktemp -d)"
 trap_runs_ok=true
 if [ -z "$watchdog_signal" ]; then
@@ -577,7 +584,7 @@ if [ -z "$watchdog_signal" ]; then
 else
   for _ in $(seq 1 300); do
     trap_work="$(mktemp -d "$trap_probe_dir/work.XXXXXX")"
-    if ! bash -c '
+    if ! timeout 10 bash -c '
         trap "rm -rf \"$1\"" EXIT
         set -m
         ( sleep 120 ) </dev/null >/dev/null 2>&1 &
@@ -595,8 +602,10 @@ fi
 rm -rf "$trap_probe_dir"
 if [ "$trap_runs_ok" = true ]; then
   ok "tlc_run_cap: ending the watchdog with SIG${watchdog_signal} never runs the caller's EXIT trap (an audit's work directory survives 300 immediate ends)"
+elif [ "$watchdog_signal_lines" != 1 ]; then
+  bad "tlc_run_cap: the trap probe reads the watchdog's signal from exactly one kill line; tlc_run_cap.sh has ${watchdog_signal_lines}"
 else
-  bad "tlc_run_cap: ending the watchdog${watchdog_signal:+ with SIG${watchdog_signal}} ran the caller's EXIT trap and deleted an audit's work directory"
+  bad "tlc_run_cap: ending the watchdog with SIG${watchdog_signal} ran the caller's EXIT trap and deleted an audit's work directory, or a run did not finish within 10 s"
 fi
 
 # The audit shards never execute xtask, so the PR lane runs them without an

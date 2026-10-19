@@ -39,7 +39,8 @@ fn repo_root() -> PathBuf {
 }
 
 /// Recursively walk a directory collecting all `*.rs` file paths,
-/// skipping `target/`, `.git/`, and generated-artifact directories.
+/// skipping `target/`, `.git/`, generated-artifact directories and other
+/// checkouts nested below the root.
 fn walk_rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk_rec(root, &mut out);
@@ -61,6 +62,12 @@ fn walk_rec(dir: &Path, out: &mut Vec<PathBuf>) {
                 name,
                 "target" | ".git" | "node_modules" | "generated" | ".cargo" | "dist"
             ) {
+                continue;
+            }
+            // A directory with a `.git` entry of its own is another checkout
+            // (a worktree under the gitignored `.claude/worktrees/`, say):
+            // its sources are another branch's, not this tree's.
+            if path.join(".git").exists() {
                 continue;
             }
             walk_rec(&path, out);
@@ -363,6 +370,49 @@ fn a_deleted_symbol_in_production_code_fails_the_sweep() {
     );
     assert_eq!(*total, 1);
     assert_eq!(hits.len(), 1);
+}
+
+/// Another checkout nested below the root is not swept: the deleted enum in
+/// a directory with its own `.git` entry (a worktree's `.git` file) is no
+/// hit, and the same tree without that entry reports it.
+#[test]
+fn a_nested_checkout_is_not_swept() {
+    let tree = tempfile::tempdir().expect("temp dir");
+    let live = tree.path().join("crates/demo/src");
+    fs::create_dir_all(&live).expect("source dir");
+    fs::write(
+        live.join("lib.rs"),
+        "pub enum LlmProviderErrorKind {\n    Auth,\n}\n",
+    )
+    .expect("source file");
+    let nested = tree.path().join(".claude/worktrees/older");
+    let nested_src = nested.join("crates/demo/src");
+    fs::create_dir_all(&nested_src).expect("nested source dir");
+    fs::write(
+        nested_src.join("lib.rs"),
+        "pub enum LlmProvider {\n    OpenAi,\n}\n",
+    )
+    .expect("nested source file");
+    fs::write(
+        nested.join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/older\n",
+    )
+    .expect("worktree .git file");
+
+    let absent = tree.path().join("absent.rs");
+    assert!(
+        phase6_hits(tree.path(), &absent).is_empty(),
+        "a nested checkout's sources are not swept"
+    );
+
+    fs::remove_file(nested.join(".git")).expect("remove .git file");
+    let failures = phase6_hits(tree.path(), &absent);
+    assert_eq!(
+        failures.len(),
+        1,
+        "without its .git entry the directory is swept"
+    );
+    assert_eq!(failures[0].1, 1);
 }
 
 /// Baseline check: the walker finds a non-trivial number of Rust sources
