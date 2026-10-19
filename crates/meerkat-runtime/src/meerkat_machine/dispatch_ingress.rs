@@ -774,7 +774,10 @@ impl MeerkatMachine {
                                 let _ = release.await;
                             }
                         }
-                        held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+                        held_mutation_gate = self
+                            .lock_live_session_mutation_gate(session_id, &witness.mutation_gate)
+                            .await
+                            .map_err(degraded_gate_wait_refusal)?;
                         continue;
                     }
                     crate::driver::ephemeral::DurableSteerTurn::FollowUp => {
