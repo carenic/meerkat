@@ -90,6 +90,26 @@ them.
   none stays readable by 0.9.3. An input row that carries an owner-scoped
   restriction is written at stored input state 7 (below); a row stamped before
   7 that carries one is rejected.
+- Behaviour-only (not measured by the gate): `meerkat`:
+  `StockGovernance::bind_prompt` binds only a prompt of the local operator
+  (`Input::Prompt`). Any other input, an external event included, is
+  refused with `StockGovernanceError::RequesterUnsupported` before anything
+  is written: no candidate original and no change to the session's
+  destination binding. 0.9.3 bound any input with the operator as its
+  requester. Migration: a host whose one `bind_prompt` call served both the
+  operator's prompts and an administrative outcome its own process reports
+  (for example a connector finalization submitted as an external event of
+  `InputOrigin::External` origin) keeps `bind_prompt` for the prompts and
+  binds the outcome, as a durable event, with
+  `StockGovernance::bind_host_outcome`; the reserved submission, the exact
+  retained input and the rule that an uncertain delivery is resubmitted,
+  never bound again, are unchanged.
+- Behaviour-only (not measured by the gate): `meerkat`: a
+  host-authenticated stock composition refuses its own stock ingress
+  principal (`StockPrincipals::ingress_actor`) as a requester, with a Denied
+  verdict before the host is asked, as it already refused the operator.
+  0.9.3 asked the host about a caller equal to that principal, and could
+  admit it.
 
 ### Added
 
@@ -140,6 +160,20 @@ them.
   under a wildcard), and the review text states it as "owned by" and its
   owners. The shared restriction conformance corpus moves to contract 1.1
   with owner-scoped vectors; the 1.0 vectors are unchanged.
+- `meerkat`: `StockGovernance::bind_host_outcome` binds an external event
+  through which the local operator's own process reports the outcome of an
+  administrative command. The original's requester is the composition's
+  stock ingress itself, a runtime host, never the operator: no person
+  requested the work, and it is not the operator's consent. It runs under
+  the operator's grant-lineage mandate at the operator's own session, with
+  no represented subject, under the labels `host-outcome-<event>`,
+  `host-outcome-events` and `rkat-host-outcome-<event>` (evidence namespace
+  `host-outcome-authentication`). The event's origin must be
+  `InputOrigin::External` and its durability `InputDurability::Durable`;
+  any other origin or durability, and a host-authenticated composition, are
+  refused before anything is written. A turn's identity includes its
+  requester, so an outcome never shares a turn with a queued operator
+  prompt: each outcome runs its own turn.
 
 ### Changed
 
@@ -156,6 +190,21 @@ them.
   subtree (`jni`, `objc2`, `ndk-context` and related crates). The launch-site
   scanner and Clippy's `webbrowser::open` entries stay, so a reintroduced call
   is still caught.
+- `meerkat`: the stock review mandate, which an operation reviewer reads as
+  the current mandate and a person sees as the `stock.review_mandate`
+  consent label, is selected by the work's actual requester. For an outcome
+  bound with `bind_host_outcome` it says that the stock ingress itself
+  requested the work, that no person did and that it is not the operator's
+  consent, that it runs under the operator's grant-lineage mandate, and it
+  attributes the event's content to the ingress rather than asserting it.
+  The texts for an operator's prompt and a host-authenticated caller are
+  unchanged. The stock consent surfaces document that the requester they
+  present is the person the approval is presented to; the work's own
+  requester is in the mandate.
+- `meerkat`: `StockGovernance::bind_prompt` no longer documents itself as
+  binding "one CLI prompt": it binds one prompt of the local operator, from
+  the CLI or a governed JSONL connection, under the prompt labels
+  (`prompt-<event>`, `prompt-events`, `rkat-prompt-<event>`).
 
 ### Fixed
 
