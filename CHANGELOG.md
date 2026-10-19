@@ -157,24 +157,22 @@ them.
   missing, differs from its digest, or does not lay out as the session
   store's rows, or a session the guard below refuses, refuses typed before
   anything is written, so a file the conversion has not pinned stays a
-  WholeBlob database. It then pins the file and
-  seeds each runtime's session that the co-located store holds no row for
-  from its
-  digest-verified WholeBlob body, in the transaction that installs the
-  runtime's authority and completes its activation receipt. It seeds only
-  while the co-located store holds no session beyond the ones the file's
-  completed activations own; any other session refuses that runtime typed
-  (`SessionPersistenceAuthorityConflict`) without seeding, and runtimes to
-  seed convert before runtimes whose session has a row, so a session written
-  into the file before the conversion always refuses. The caller writes no
-  session row into the co-located store before the conversion returns. A
-  stopped conversion finishes on the next call. It returns
-  `StandaloneWholeBlobConversionReport`: per converted runtime, its session,
-  `StandaloneWholeBlobSessionSource` and boundary message count, with
-  `seeded_count` and `derived_count`. The caller
-  asserts that the file is standalone; a SQLite realm never uses it.
-  `new_head_canonical` is unchanged and never seeds a session, so a session
-  deleted from a realm's session store does not come back.
+  WholeBlob database. It then pins the file and seeds each runtime's session
+  that the co-located store holds no row for from its digest-verified WholeBlob
+  body, in the transaction that installs the runtime's authority and completes
+  its activation receipt. It seeds only while the co-located store holds no
+  session beyond the ones the file's completed activations own; any other
+  session refuses that runtime typed (`SessionPersistenceAuthorityConflict`)
+  without seeding, and runtimes to seed convert before runtimes whose session
+  has a row, so a session written into the file before the conversion always
+  refuses. The caller writes no session row into the co-located store before
+  the conversion returns. A stopped conversion finishes on the next call. It
+  returns `StandaloneWholeBlobConversionReport`: per converted runtime, its
+  session, `StandaloneWholeBlobSessionSource` and boundary message count, with
+  `seeded_count` and `derived_count`. The caller asserts that the file is
+  standalone; a SQLite realm never uses it. `new_head_canonical` is unchanged
+  and never seeds a session, so a session deleted from a realm's session store
+  does not come back.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity::registration()` returns the
   member's exact runtime registration, so every
   `MemberRuntimeRegistrationHook` call names the registration it is made
