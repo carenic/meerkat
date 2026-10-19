@@ -97,6 +97,10 @@ struct RunnerScript {
     interrupts: AtomicUsize,
     /// When set, the exact-run interrupt callback fails after counting.
     interrupt_fails: AtomicBool,
+    /// The reply capabilities each prepared durable boundary delivery
+    /// carries, in preparation order.
+    prepared_reply_capabilities:
+        std::sync::Mutex<Vec<Vec<meerkat_core::comms::PeerReplyCapability>>>,
 }
 
 impl RunnerScript {
@@ -124,6 +128,7 @@ impl RunnerScript {
             interrupt_step: std::sync::Mutex::new(Some(RunnerStep::CancelDiscardingImage)),
             interrupts: AtomicUsize::new(0),
             interrupt_fails: AtomicBool::new(false),
+            prepared_reply_capabilities: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -163,6 +168,10 @@ impl RunnerScript {
     fn applied_durable(&self) -> Vec<InputId> {
         self.applied_durable.lock().unwrap().clone()
     }
+
+    fn prepared_reply_capabilities(&self) -> Vec<Vec<meerkat_core::comms::PeerReplyCapability>> {
+        self.prepared_reply_capabilities.lock().unwrap().clone()
+    }
 }
 
 struct DurableSteerBoundaryHandle {
@@ -188,6 +197,13 @@ impl CoreExecutorBoundaryHandle for DurableSteerBoundaryHandle {
         meerkat_core::lifecycle::CoreBoundaryStageOutput,
         meerkat_core::lifecycle::CoreBoundaryStageError,
     > {
+        if let meerkat_core::TurnBoundaryDelivery::DurableAppends(appends) = &delivery {
+            self.script
+                .prepared_reply_capabilities
+                .lock()
+                .unwrap()
+                .push(appends.peer_reply_capabilities().to_vec());
+        }
         let prepared = self
             .state
             .prepare_active_turn_boundary(expected_run_id, delivery)
@@ -2939,4 +2955,155 @@ async fn persistent_peer_steer_applied_then_image_discarded_is_redelivered_exact
 #[tokio::test]
 async fn persistent_crash_after_a_peer_steer_join_recovers_for_exactly_one_follow_up() {
     persistent_crash_after_the_join_of(Duration::ZERO, peer_steer("crash")).await;
+}
+
+/// A peer message from a canonical sender with a delivery id carries its
+/// reply capability into the durable boundary delivery the runtime
+/// prepares; a joined prompt steer carries none.
+#[tokio::test]
+async fn joined_peer_message_carries_its_reply_capability_into_the_boundary() {
+    let rig = DurableSteerRig::ephemeral().await;
+    rig.start_busy_turn().await;
+    let sender = meerkat_core::comms::PeerId::new();
+    let delivery = uuid::Uuid::new_v4();
+    let mut header = steer_header(crate::input::InputOrigin::Peer {
+        peer_id: sender.to_string(),
+        display_identity: Some("sender-member".into()),
+        runtime_id: None,
+    });
+    header.correlation_id = Some(crate::identifiers::CorrelationId(delivery));
+    let peer = Input::Peer(crate::input::PeerInput {
+        directed_interaction_id: None,
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        sender_taint: None,
+        header,
+        convention: Some(crate::input::PeerConvention::Message),
+        content: "answer this".into(),
+        payload: None,
+        handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+        in_reply_to: None,
+    });
+    let expected = crate::input::peer_reply_capability(&peer).expect("a reply capability");
+    assert_eq!(expected.in_reply_to, meerkat_core::InteractionId(delivery));
+    assert_eq!(expected.peer_id, sender);
+    assert_eq!(
+        expected.kind,
+        meerkat_core::comms::PeerReplyDeliveryKind::Message
+    );
+    let peer_id = peer.id().clone();
+    rig.admit(peer).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&peer_id, InputLifecycleState::Staged)
+        .await;
+
+    let prompt = text_prompt_steer("plain text steer");
+    let prompt_id = prompt.id().clone();
+    rig.admit(prompt).await;
+    rig.wait_for_waiting_delivery().await;
+    rig.script.step(RunnerStep::BoundaryThenToolCalls);
+    rig.wait_for_phase(&prompt_id, InputLifecycleState::Staged)
+        .await;
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_phase(&prompt_id, InputLifecycleState::Consumed)
+        .await;
+
+    assert_eq!(
+        rig.script.prepared_reply_capabilities(),
+        vec![vec![expected], Vec::new()],
+        "the peer message's boundary carries its capability, the prompt's carries none"
+    );
+}
+
+/// Many durable peer steers admitted while the running turn opens no
+/// boundary do not wait on one another to be admitted: every admission
+/// returns promptly, one delivery waits for a boundary, the steer lane holds
+/// all of them in arrival order, and when the run ends each is consumed
+/// exactly once, in arrival order, by the follow-up turn.
+#[tokio::test]
+async fn twenty_five_durable_peer_steers_admit_promptly_and_drain_in_order_after_the_run() {
+    const FAN_IN: usize = 25;
+    let rig = DurableSteerRig::ephemeral().await;
+    let batch = rig.start_busy_turn().await;
+    rig.script
+        .step_and_wait(RunnerStep::BoundaryThenStream)
+        .await;
+
+    let adapter = Arc::clone(&rig.adapter);
+    let session_id = rig.session_id.clone();
+    let accepts = (0..FAN_IN).map(|index| {
+        let adapter = Arc::clone(&adapter);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let steer = peer_steer(&format!("fan-in report {index}"));
+            let id = steer.id().clone();
+            let (outcome, _completion) = adapter
+                .accept_input_with_completion(&session_id, steer)
+                .await
+                .expect("durable peer steer admitted");
+            assert!(outcome.is_accepted());
+            id
+        })
+    });
+    let admitted = tokio::time::timeout(Duration::from_secs(5), futures::future::join_all(accepts))
+        .await
+        .expect("a waiting durable delivery must not hold up later admissions");
+    let admitted: std::collections::HashSet<InputId> = admitted
+        .into_iter()
+        .map(|joined| joined.expect("admission task"))
+        .collect();
+    assert_eq!(admitted.len(), FAN_IN);
+
+    rig.wait_for_waiting_delivery().await;
+    let arrival: Vec<InputId> = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("spine snapshot")
+        .inputs
+        .admission_order
+        .iter()
+        .map(|admission| admission.input_id.clone())
+        .filter(|input_id| admitted.contains(input_id))
+        .collect();
+    assert_eq!(arrival.len(), FAN_IN);
+    assert_eq!(
+        rig.steer_queue().await,
+        arrival,
+        "the steer lane holds every waiting steer in arrival order"
+    );
+
+    rig.script.step(RunnerStep::Finish);
+    rig.wait_for_apply_calls(2).await;
+    rig.script.step(RunnerStep::Finish);
+    for input_id in &arrival {
+        rig.wait_for_phase(input_id, InputLifecycleState::Consumed)
+            .await;
+    }
+    rig.wait_for_phase(&batch, InputLifecycleState::Consumed)
+        .await;
+    let primitives = rig.script.primitives();
+    for input_id in &arrival {
+        assert_eq!(
+            contributions(&primitives, input_id),
+            1,
+            "each steer is consumed exactly once"
+        );
+    }
+    let follow_up: Vec<InputId> = primitives
+        .iter()
+        .flatten()
+        .filter(|input_id| admitted.contains(input_id))
+        .cloned()
+        .collect();
+    assert_eq!(
+        follow_up, arrival,
+        "the follow-up takes them in arrival order"
+    );
+    assert!(
+        rig.script.applied_durable().is_empty(),
+        "no boundary opened"
+    );
 }

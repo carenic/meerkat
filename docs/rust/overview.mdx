@@ -496,7 +496,7 @@ match event {
 
     // Provider evidence and peer-content observability
     AgentEvent::ProviderCacheBreakpointsDiscarded { session_id, retained, discarded } => {}
-    AgentEvent::PeerContentIngested { kind, peer, request_id, sender_taint } => {}
+    AgentEvent::PeerContentIngested { kind, peer, request_id, sender_taint, delivery_id } => {}
     AgentEvent::TurnUsageAccountingUnmeasured { session_id, unmeasured } => {}
     AgentEvent::TurnUsageAccountingIdentityDisputed { session_id, dispute } => {}
 

@@ -152,7 +152,8 @@ Host send operations expose a tri-state override:
 Agent tools do not receive this per-send override. They inherit the declaration
 installed by the host. When incoming peer content is committed into session
 context, the runtime emits `peer_content_ingested` with the typed notice kind,
-canonical peer fact, request correlation, and sender declaration. The event is
+canonical peer fact, request correlation, the delivery id of a peer message, and
+sender declaration. The event is
 best-effort observation; the typed transcript block is the durable owner.
 
 ## Delivery And Observation

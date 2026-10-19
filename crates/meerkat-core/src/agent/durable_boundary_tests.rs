@@ -746,6 +746,27 @@ fn peer_reply(
     }
 }
 
+/// A turn-start reply list that does not parse fails the turn's reply context
+/// closed, and a delivery that joins the turn later does not reopen it.
+#[test]
+fn a_malformed_turn_start_reply_list_stays_closed_after_a_boundary_join() {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        meerkat_core::comms::COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY.to_string(),
+        serde_json::json!("not a reply list"),
+    );
+    let mut context = crate::ToolDispatchContext::default().with_turn_metadata(metadata);
+    assert!(matches!(
+        context.peer_reply_deliveries(),
+        Err(meerkat_core::comms::PeerReplyContextError::Malformed(_))
+    ));
+    context.record_boundary_peer_replies([peer_reply(meerkat_core::comms::PeerId::new(), 31)]);
+    assert!(matches!(
+        context.peer_reply_deliveries(),
+        Err(meerkat_core::comms::PeerReplyContextError::Malformed(_))
+    ));
+}
+
 fn durable_peer_message(
     peer_id: meerkat_core::comms::PeerId,
     replies: Vec<meerkat_core::comms::PeerReplyCapability>,

@@ -977,7 +977,8 @@ Incoming comms are persisted as typed `system_notice` blocks with `comms` payloa
 
 At the commit seam, each incoming comms block also projects a
 `peer_content_ingested` event containing the typed comms kind, canonical peer
-fact, request correlation, and the sender's signed content-taint declaration.
+fact, request correlation, the delivery id of a peer message, and the sender's
+signed content-taint declaration.
 This event is best-effort observation. The typed transcript block remains the
 durable owner, and an absent taint declaration remains distinct from `clean`.
 
