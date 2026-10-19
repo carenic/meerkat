@@ -985,6 +985,10 @@ export class MeerkatClient {
   // typed fault instead of writing into the condemned stream. Cleared only by
   // a fresh connect() (new process, new stream).
   private transportFault: MeerkatError | null = null;
+  // Stops failTransport() started without waiting for them. close() waits for
+  // every one still running, so it returns once each child it let go of has
+  // exited.
+  private readonly stoppingChildren = new Set<Promise<void>>();
   private processStderr = "";
   private requestId = 0;
   private _capabilities: Capability[] = [];
@@ -1280,7 +1284,12 @@ export class MeerkatClient {
     // new work while the original child is still being reaped.
     this.rejectPendingRequests(new MeerkatError("CLIENT_CLOSED", "Client closed"));
     this.closeQueues();
-    if (process) await MeerkatClient.stopChild(process);
+    // A child a protocol error already let go of may still be stopping (one
+    // that ignores SIGTERM is killed only after 5 s): wait for it as well.
+    await Promise.all([
+      process ? MeerkatClient.stopChild(process) : undefined,
+      ...this.stoppingChildren,
+    ]);
   }
 
   /**
@@ -1352,7 +1361,10 @@ export class MeerkatClient {
       process.stdin?.destroy();
       // Stopped as close() stops it, without waiting for it here: a child
       // that ignores SIGTERM is killed after 5 s, and its pipes are let go.
-      void MeerkatClient.stopChild(process);
+      // A later close() waits for this stop. stopChild() never rejects.
+      const stopping = MeerkatClient.stopChild(process);
+      this.stoppingChildren.add(stopping);
+      void stopping.then(() => this.stoppingChildren.delete(stopping));
     }
   }
 

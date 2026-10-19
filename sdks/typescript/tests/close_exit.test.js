@@ -216,6 +216,13 @@ ${closeAfterChildExit ? "report.childClosed = await childClosed;" : ""}
 const started = performance.now();
 await client.close();
 report.closeMs = performance.now() - started;
+try {
+  process.kill(child.pid, 0);
+  report.childAliveAfterClose = true;
+} catch (error) {
+  if (error.code !== "ESRCH") throw error;
+  report.childAliveAfterClose = false;
+}
 process.stdout.write(JSON.stringify(report) + "\\n");
 `);
 }
@@ -530,6 +537,7 @@ describe("A protocol error from the child", () => {
       assert.equal(run.later, "PROTOCOL_ERROR");
       assert.equal(run.childClosed, true, "the stopped child must close before close() is called");
       assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      assert.equal(run.childAliveAfterClose, false, "the child must have exited when close() returns");
       // Once for the fault, once more for close(): the child's exit, seen
       // first, adds none.
       assert.deepEqual(run.final, { queueCloses: 2 });
@@ -556,6 +564,7 @@ describe("A protocol error from the child", () => {
       assert.equal(run.later, "PROTOCOL_ERROR");
       assert.equal(run.childClosed, true, "the stopped child must close before close() is called");
       assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      assert.equal(run.childAliveAfterClose, false, "the child must have exited when close() returns");
       // Once for the fault, once more for close(): the child's exit, seen
       // first, adds none.
       assert.deepEqual(run.final, { queueCloses: 2 });
@@ -577,13 +586,18 @@ describe("A protocol error from the child", () => {
       const run = await runFaultProbe(root, writeFixture(root, { stubborn: true, corruptOnRequest: true }));
       assert.equal(run.fault, "PROTOCOL_ERROR");
       assert.equal(run.later, "PROTOCOL_ERROR");
-      assert.ok(run.closeMs < 1_000, `close() took ${Math.round(run.closeMs)} ms`);
+      // close(), called at once after the fault, waits for the stop the fault
+      // started: the stubborn child is killed 5 s after the fault.
+      assert.ok(
+        run.closeMs >= 4_500 && run.closeMs < 9_000,
+        `close() took ${Math.round(run.closeMs)} ms, not until the 5 s kill`,
+      );
+      assert.equal(run.childAliveAfterClose, false, "the stubborn child must be dead when close() returns");
       // Once for the fault, once more for close(): the child's exit adds none.
       assert.deepEqual(run.final, { queueCloses: 2 });
-      // The process lives on until the stubborn child is killed, 5 s after the fault.
       assert.ok(
-        run.lingerMs >= 4_500 && run.lingerMs < 9_000,
-        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned, not until the 5 s kill`,
+        run.lingerMs < 1_000,
+        `the process stayed alive ${Math.round(run.lingerMs)} ms after close() returned`,
       );
       assert.equal(alive(run.pid), false, "the stubborn child must have been killed");
       assert.equal(run.stderr, "");
