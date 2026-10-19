@@ -2565,6 +2565,57 @@ enum ForkSourceBoundary {
     },
 }
 
+/// The execution configuration a durable transcript fork carries from its
+/// source into the child.
+enum ForkSourceExecution {
+    /// The source has canonical session metadata: the child commits the
+    /// sanitized metadata and the build state derived for a fork child.
+    Canonical {
+        metadata: meerkat_core::SessionMetadata,
+        build_state: meerkat_core::SessionBuildState,
+    },
+    /// The source has no canonical session metadata, and the child commits
+    /// neither.
+    Absent,
+}
+
+impl ForkSourceExecution {
+    /// Read the source's execution configuration before anything is
+    /// written. A source with metadata but no build state cannot give a
+    /// child that runs a turn, so the fork is refused here.
+    fn read(source: &Session, source_session_id: &SessionId) -> Result<Self, SessionError> {
+        let metadata = source.try_session_metadata().map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to decode source session metadata while forking session {source_session_id}: {error}"
+            )))
+        })?;
+        let Some(metadata) = metadata else {
+            return Ok(Self::Absent);
+        };
+        let build_state = source.try_build_state().map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to decode source session build state while forking session {source_session_id}: {error}"
+            )))
+        })?;
+        let Some(build_state) = build_state else {
+            return Err(SessionError::fork_source_build_state_missing(
+                source_session_id,
+            ));
+        };
+        Ok(Self::Canonical {
+            metadata,
+            build_state: build_state.fork_child_projection(),
+        })
+    }
+
+    fn metadata(&self) -> Option<&meerkat_core::SessionMetadata> {
+        match self {
+            Self::Canonical { metadata, .. } => Some(metadata),
+            Self::Absent => None,
+        }
+    }
+}
+
 /// What a realtime mutation guard does when the document machine rules the
 /// durable body authoritative over the live actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6451,11 +6502,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             self.source_session_for_transcript_edit_locked(source_session_id)
                 .await?
         };
-        let source_metadata = source.try_session_metadata().map_err(|error| {
-            SessionError::Agent(AgentError::InternalError(format!(
-                "failed to decode source session metadata while forking session {source_session_id}: {error}"
-            )))
-        })?;
+        let source_execution = ForkSourceExecution::read(&source, source_session_id)?;
         let source_head_revision = source.transcript_revision().map_err(|error| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "failed to resolve source transcript revision while forking session {source_session_id}: {error}"
@@ -6482,8 +6529,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 "failed to resolve fork prefix revision while forking session {source_session_id}: {error}"
             )))
         })?;
-        let generic_cache_identity = source_metadata
-            .as_ref()
+        let generic_cache_identity = source_execution
+            .metadata()
             .map(meerkat_core::SessionMetadata::llm_identity);
         let target_cache_identity = match target.as_ref() {
             Some(target) => target.cache_identity.as_ref(),
@@ -6497,7 +6544,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .persist_transcript_fork(
                 source_session_id.clone(),
                 forked,
-                source_metadata,
+                source_execution,
                 tool_access_policy,
                 cache_inheritance,
                 target,
@@ -6516,16 +6563,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         &self,
         source_session_id: SessionId,
         mut forked: Session,
-        source_metadata: Option<meerkat_core::SessionMetadata>,
+        source_execution: ForkSourceExecution,
         requested_tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         cache_inheritance: ForkCacheInheritance,
         target: Option<meerkat_core::DurableSessionForkTarget>,
     ) -> Result<SessionForkResult, SessionError> {
         // Core transcript forks deliberately strip session authority metadata.
         // Rebuild sanitized execution configuration whenever canonical source
-        // metadata exists. `None`/`Inherit` retain the source's effective
-        // policy; a concrete policy replaces it on the branch only.
-        if let Some(mut metadata) = source_metadata {
+        // metadata exists: the metadata, and the build state derived for a
+        // fork child, which the child's own resume requires. `None`/`Inherit`
+        // retain the source's effective policy; a concrete policy replaces it
+        // on the branch only.
+        if let ForkSourceExecution::Canonical {
+            mut metadata,
+            build_state,
+        } = source_execution
+        {
             let effective_policy = match requested_tool_access_policy {
                 Some(meerkat_core::ops::ToolAccessPolicy::Inherit) | None => {
                     metadata.tooling.tool_access_policy.clone()
@@ -6566,6 +6619,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             forked.set_session_metadata(metadata).map_err(|error| {
                 SessionError::Agent(AgentError::InternalError(format!(
                     "failed to persist fork tool authorization for session {source_session_id}: {error}"
+                )))
+            })?;
+            forked.set_build_state(build_state).map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to persist fork build state for session {source_session_id}: {error}"
                 )))
             })?;
             if let Some(target) = target.as_ref() {
@@ -15065,16 +15123,12 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
         let _ = req.running_behavior;
         let _mutation_guard = self.transcript_edit_mutation_guard(id).await?;
         let source = self.source_session_for_transcript_edit_locked(id).await?;
-        let source_metadata = source.try_session_metadata().map_err(|error| {
-            SessionError::Agent(AgentError::InternalError(format!(
-                "failed to decode source session metadata while forking session {id}: {error}"
-            )))
-        })?;
+        let source_execution = ForkSourceExecution::read(&source, id)?;
         let mut forked = source
             .fork_replacing(req.message_index, req.replacement)
             .map_err(meerkat_core::TranscriptEditError::into_session_error)?;
-        let cache_identity = source_metadata
-            .as_ref()
+        let cache_identity = source_execution
+            .metadata()
             .map(meerkat_core::SessionMetadata::llm_identity);
         self.preflight_transcript_fork_blobs(&mut forked).await?;
         let cache_inheritance = Self::prepare_fork_cache_inheritance(
@@ -15087,7 +15141,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceTranscriptEditExt
         self.persist_transcript_fork(
             id.clone(),
             forked,
-            source_metadata,
+            source_execution,
             req.tool_access_policy,
             cache_inheritance,
             None,
@@ -25858,6 +25912,9 @@ mod tests {
                     mob_member_binding: None,
                 })
                 .expect("seed canonical parent metadata");
+            parent
+                .set_build_state(meerkat_core::SessionBuildState::default())
+                .expect("seed the parent build state");
         });
         runtime_store
             .commit_session_snapshot(
@@ -25946,6 +26003,386 @@ mod tests {
                 "None/Inherit must preserve the source session's effective policy"
             );
         }
+    }
+
+    /// Canonical metadata of a fork source, as the runtime writes it at a run
+    /// boundary.
+    fn fork_source_metadata() -> meerkat_core::SessionMetadata {
+        meerkat_core::SessionMetadata {
+            model_fallback: None,
+            schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
+            model: "test".to_string(),
+            max_tokens: 1024,
+            structured_output_retries: 2,
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            tooling: meerkat_core::SessionTooling::default(),
+            keep_alive: false,
+            comms_name: None,
+            peer_meta: None,
+            realm_id: None,
+            instance_id: None,
+            backend: None,
+            config_generation: None,
+            auth_binding: None,
+            mob_member_binding: None,
+        }
+    }
+
+    /// A fork source's build state with every field a fork child inherits
+    /// set, plus the launch environment and MCP attachment requests it does
+    /// not. Only generated mob operator authority may be persisted, so that
+    /// field is left to core's projection test.
+    fn populated_fork_source_build_state() -> meerkat_core::SessionBuildState {
+        meerkat_core::SessionBuildState {
+            output_schema: Some(
+                meerkat_core::OutputSchema::from_json_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}}
+                }))
+                .expect("output schema"),
+            ),
+            hooks_override: meerkat_core::HookRunOverrides {
+                entries: Vec::new(),
+                disable: vec![meerkat_core::HookId::new("disabled-hook")],
+            },
+            budget_limits: Some(meerkat_core::BudgetLimits {
+                max_tokens: Some(55),
+                max_duration: Some(std::time::Duration::from_secs(9)),
+                max_turn_duration: None,
+                max_tool_calls: Some(2),
+            }),
+            recoverable_tool_defs: vec![meerkat_core::ToolDef {
+                audience: Default::default(),
+                name: "inline_tool".into(),
+                description: "recoverable inline tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                provenance: None,
+            }],
+            silent_comms_intents: vec!["peer-b".to_string()],
+            max_inline_peer_notifications: Some(4),
+            app_context: Some(serde_json::json!({"surface": "rpc"})),
+            additional_instructions: Some(vec!["be precise".to_string()]),
+            shell_env: Some(std::collections::HashMap::from([(
+                "MEERKAT_MODE".to_string(),
+                "test".to_string(),
+            )])),
+            shell_timeout_secs: std::num::NonZeroU64::new(7),
+            mob_tool_authority_context: None,
+            call_timeout_override: meerkat_core::CallTimeoutOverride::Value(
+                std::time::Duration::from_secs(42),
+            ),
+            mcp_attachment_intents: vec![meerkat_core::McpSessionAttachmentIntent {
+                descriptor: meerkat_core::McpAttachmentDescriptorIdentity {
+                    server_name: "docs".to_string(),
+                    target: meerkat_core::McpAttachmentTarget::Http {
+                        location: "https://mcp.example.test/docs".to_string(),
+                        withheld: false,
+                        binding: None,
+                    },
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                    connector_account: None,
+                },
+                disposition: meerkat_core::McpAttachmentIntentDisposition::Requested,
+                revision: 3,
+            }],
+            mcp_attachment_intent_revision: 3,
+        }
+    }
+
+    /// Commit the fork source's durable body with canonical metadata and,
+    /// when given, `build_state`, then drop the live session so a fork reads
+    /// that body.
+    async fn seed_fork_source_execution(
+        service: &PersistentSessionService<DummyBuilder>,
+        runtime_store: &Arc<dyn RuntimeStore>,
+        source_id: &SessionId,
+        build_state: Option<meerkat_core::SessionBuildState>,
+    ) {
+        let source = service
+            .load_authoritative_session_base(source_id)
+            .await
+            .expect("load runtime-authoritative source")
+            .expect("source exists");
+        let source = mutate_test_session(source, "run boundary", |source| {
+            source
+                .set_session_metadata(fork_source_metadata())
+                .expect("seed canonical source metadata");
+            if let Some(build_state) = build_state {
+                source
+                    .set_build_state(build_state)
+                    .expect("seed the source build state");
+            }
+        });
+        runtime_store
+            .commit_session_snapshot(
+                &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(source_id),
+                meerkat_runtime::store::SerializedSessionSnapshot {
+                    session_snapshot: (serde_json::to_vec(&source)
+                        .expect("serialize source snapshot"))
+                    .into(),
+                },
+            )
+            .await
+            .expect("commit source snapshot");
+        service
+            .discard_live_session(source_id)
+            .await
+            .expect("force the fork through the durable runtime snapshot");
+    }
+
+    /// The durable fork entry points.
+    #[derive(Debug, Clone, Copy)]
+    enum ForkEntry {
+        At,
+        Replace,
+        MobTarget,
+        TurnBoundary,
+        PlannedIdentity,
+    }
+
+    impl ForkEntry {
+        const ALL: [Self; 5] = [
+            Self::At,
+            Self::Replace,
+            Self::MobTarget,
+            Self::TurnBoundary,
+            Self::PlannedIdentity,
+        ];
+    }
+
+    /// Fork `source_id` after its first exchange through `entry`, returning
+    /// the child's id.
+    async fn fork_through(
+        service: &PersistentSessionService<DummyBuilder>,
+        source_id: &SessionId,
+        entry: ForkEntry,
+    ) -> Result<SessionId, SessionError> {
+        match entry {
+            ForkEntry::At => service
+                .fork_session_at(
+                    source_id,
+                    SessionForkAtRequest {
+                        message_index: 2,
+                        running_behavior: TranscriptEditRunningBehavior::Reject,
+                        tool_access_policy: None,
+                    },
+                )
+                .await
+                .map(|fork| fork.session_id),
+            ForkEntry::Replace => service
+                .fork_session_replace(
+                    source_id,
+                    SessionForkReplaceRequest {
+                        message_index: 2,
+                        replacement: meerkat_core::TranscriptReplacement::Message {
+                            message: Message::User(UserMessage::text("edited follow up")),
+                        },
+                        running_behavior: TranscriptEditRunningBehavior::Reject,
+                        tool_access_policy: None,
+                    },
+                )
+                .await
+                .map(|fork| fork.session_id),
+            ForkEntry::MobTarget => service
+                .fork_durable_session(
+                    source_id,
+                    Some(2),
+                    None,
+                    Some(quiescent_fork_target(
+                        "mob-target",
+                        meerkat_core::DurableForkSourceAdmission::Quiescent,
+                    )),
+                )
+                .await
+                .map(|fork| fork.session_id),
+            ForkEntry::TurnBoundary => match service
+                .fork_durable_session_at_turn_boundary(
+                    source_id,
+                    Some(2),
+                    None,
+                    quiescent_fork_target(
+                        "turn-boundary",
+                        meerkat_core::DurableForkSourceAdmission::Quiescent,
+                    ),
+                    std::time::Duration::from_secs(10),
+                )
+                .await?
+            {
+                meerkat_core::DurableForkAtTurnBoundary::Forked(fork) => Ok(fork.session_id),
+                busy => panic!("an idle source forks at its turn boundary: {busy:?}"),
+            },
+            ForkEntry::PlannedIdentity => service
+                .fork_durable_session_with_planned_identity(
+                    source_id,
+                    Some(2),
+                    SessionId::new(),
+                    None,
+                    None,
+                )
+                .await
+                .map(|forked| forked.fork.session_id),
+        }
+    }
+
+    fn build_state_document(state: &meerkat_core::SessionBuildState) -> serde_json::Value {
+        serde_json::to_value(state).expect("build state document")
+    }
+
+    /// Every durable fork entry point commits its child with the build state
+    /// derived from its source's, through the canonical persist gate, and
+    /// leaves the source's own build state as it was.
+    #[tokio::test]
+    async fn durable_fork_children_commit_the_build_state_derived_from_their_source() {
+        let (service, _store, runtime_store, source_id) = transcript_edit_fixture().await;
+        let source_state = populated_fork_source_build_state();
+        seed_fork_source_execution(
+            &service,
+            &runtime_store,
+            &source_id,
+            Some(source_state.clone()),
+        )
+        .await;
+        let expected = build_state_document(&source_state.clone().fork_child_projection());
+        let sessions_before = service
+            .list(SessionQuery::default())
+            .await
+            .expect("list sessions")
+            .len();
+
+        for entry in ForkEntry::ALL {
+            let child_id = fork_through(&service, &source_id, entry)
+                .await
+                .unwrap_or_else(|error| panic!("{entry:?} forks: {error}"));
+            let child = service
+                .load_authoritative_session_base(&child_id)
+                .await
+                .expect("load the child")
+                .expect("the child is committed");
+            let child_state = child
+                .try_build_state()
+                .expect("the child's build state restores")
+                .unwrap_or_else(|| panic!("{entry:?}: the child commits a build state"));
+            assert_eq!(
+                build_state_document(&child_state),
+                expected,
+                "{entry:?}: the child commits the build state derived from its source's"
+            );
+            assert!(
+                child_state.shell_env.is_none()
+                    && child_state.mcp_attachment_intents.is_empty()
+                    && child_state.mcp_attachment_intent_revision == 0,
+                "{entry:?}: the child inherits no launch environment and no attachment requests"
+            );
+
+            let source = service
+                .load_authoritative_session_base(&source_id)
+                .await
+                .expect("load the source")
+                .expect("source exists");
+            assert_eq!(
+                source
+                    .try_build_state()
+                    .expect("the source's build state restores")
+                    .as_ref()
+                    .map(build_state_document),
+                Some(build_state_document(&source_state)),
+                "{entry:?}: the fork leaves the source's build state as it was"
+            );
+        }
+        assert_eq!(
+            service
+                .list(SessionQuery::default())
+                .await
+                .expect("list sessions")
+                .len(),
+            sessions_before + ForkEntry::ALL.len(),
+            "each entry point committed one child"
+        );
+    }
+
+    /// A source with canonical metadata and no build state cannot give a
+    /// child that runs a turn: every durable fork entry point refuses it with
+    /// the typed refusal and commits nothing.
+    #[tokio::test]
+    async fn durable_fork_of_a_source_without_build_state_is_refused_and_commits_nothing() {
+        let (service, _store, runtime_store, source_id) = transcript_edit_fixture().await;
+        seed_fork_source_execution(&service, &runtime_store, &source_id, None).await;
+        let sessions_before = service
+            .list(SessionQuery::default())
+            .await
+            .expect("list sessions")
+            .len();
+
+        for entry in ForkEntry::ALL {
+            let error = match fork_through(&service, &source_id, entry).await {
+                Ok(child_id) => panic!("{entry:?} committed child {child_id}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is_fork_source_build_state_missing(),
+                "{entry:?}: the typed refusal, got {error}"
+            );
+            assert_eq!(
+                error.structured_data(),
+                Some(serde_json::json!({
+                    "kind": SessionError::FORK_SOURCE_BUILD_STATE_MISSING_KIND,
+                    "source_session_id": source_id.to_string(),
+                })),
+                "{entry:?}: the refusal names its source"
+            );
+        }
+        assert_eq!(
+            service
+                .list(SessionQuery::default())
+                .await
+                .expect("list sessions")
+                .len(),
+            sessions_before,
+            "a refused fork commits no child"
+        );
+    }
+
+    /// Control: a source without canonical metadata forks as before, and its
+    /// child commits neither metadata nor a build state.
+    #[tokio::test]
+    async fn durable_fork_of_a_source_without_metadata_commits_a_child_without_either() {
+        let (service, _store, _runtime_store, source_id) = transcript_edit_fixture().await;
+        let source = service
+            .load_authoritative_session_base(&source_id)
+            .await
+            .expect("load the source")
+            .expect("source exists");
+        assert!(
+            source
+                .try_session_metadata()
+                .expect("decode source metadata")
+                .is_none(),
+            "the control source has no canonical metadata"
+        );
+
+        let child_id = fork_through(&service, &source_id, ForkEntry::At)
+            .await
+            .expect("a source without metadata forks");
+        let child = service
+            .load_authoritative_session_base(&child_id)
+            .await
+            .expect("load the child")
+            .expect("the child is committed");
+        assert!(
+            child
+                .try_session_metadata()
+                .expect("decode child metadata")
+                .is_none()
+        );
+        assert!(
+            child
+                .try_build_state()
+                .expect("decode child build state")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -28927,7 +29364,8 @@ mod tests {
             .expect("create_session should succeed");
         let parent_id = created.session_id;
         // A targeted durable fork copies canonical parent metadata onto the
-        // child, so seed it the way the runtime does at its first boundary.
+        // child and derives its build state, so seed both the way the
+        // runtime does at its first boundary.
         let parent = service
             .load_authoritative_session_base(&parent_id)
             .await
@@ -28956,6 +29394,9 @@ mod tests {
                     mob_member_binding: None,
                 })
                 .expect("seed canonical parent metadata");
+            parent
+                .set_build_state(meerkat_core::SessionBuildState::default())
+                .expect("seed the parent build state");
         });
         runtime_store
             .commit_session_snapshot(
@@ -29053,8 +29494,8 @@ mod tests {
     }
 
     /// Seed a durable fork source the way the runtime does at its first
-    /// boundary (canonical metadata), with `extra` appended to its committed
-    /// transcript.
+    /// boundary (canonical metadata and build state), with `extra` appended
+    /// to its committed transcript.
     async fn seed_quiescent_fork_source(
         service: &PersistentSessionService<BlockingRunBuilder>,
         runtime_store: &Arc<dyn RuntimeStore>,
@@ -29093,6 +29534,9 @@ mod tests {
                     mob_member_binding: None,
                 })
                 .expect("seed canonical parent metadata");
+            parent
+                .set_build_state(meerkat_core::SessionBuildState::default())
+                .expect("seed the parent build state");
             for message in extra {
                 parent.push(message);
             }
@@ -29301,7 +29745,8 @@ mod tests {
             .expect("create_session should succeed");
         let parent_id = created.session_id;
         // A targeted durable fork copies canonical parent metadata onto the
-        // child, so seed it the way the runtime does at its first boundary.
+        // child and derives its build state, so seed both the way the
+        // runtime does at its first boundary.
         let parent = service
             .load_authoritative_session_base(&parent_id)
             .await
@@ -29330,6 +29775,9 @@ mod tests {
                     mob_member_binding: None,
                 })
                 .expect("seed canonical parent metadata");
+            parent
+                .set_build_state(meerkat_core::SessionBuildState::default())
+                .expect("seed the parent build state");
         });
         runtime_store
             .commit_session_snapshot(

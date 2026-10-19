@@ -687,6 +687,12 @@ them.
   host-only: no observation enters the event stream, a wire type or any
   model context. `OperationRefusalSurface`, `OperationRefusalOutcome` and
   `OperationRefusalDisposition` are non-exhaustive.
+- `meerkat-core`: `SessionBuildState::fork_child_projection`, the build state
+  a durable transcript fork commits for its child, and
+  `SessionError::fork_source_build_state_missing`, with
+  `SessionError::FORK_SOURCE_BUILD_STATE_MISSING_KIND` and
+  `SessionError::is_fork_source_build_state_missing`: the typed refusal of a
+  fork whose source has session metadata but no build state (see Fixed).
 
 ### Changed
 
@@ -1200,6 +1206,26 @@ them.
   takes the floor (an instructions append mid-answer can cut the answer
   off), and it is withdrawn, never sent, if the result reaches the session
   first.
+- A session forked with RPC `session/fork_at` or `session/fork_replace` can
+  now run a turn (`meerkat-session`). The fork committed the child with its
+  source's session metadata but without the build state a cold resume
+  requires, so the child's first `turn/start` failed with `INTERNAL_ERROR`
+  "turn abandoned: persisted session <id> is missing session build state".
+  Every durable fork (`fork_at`, `fork_replace`, and the mob member,
+  turn-boundary and planned-identity forks) now commits a child build state
+  derived from the source's. The session configuration is carried: output
+  schema, hook overrides, budget limits, callback tool definitions, comms
+  settings, application context, additional instructions, and the shell and
+  tool call timeouts. The source's shell environment (`shell_env`), its MCP
+  attachment requests and its mob operator authority are not: the source
+  keeps its `shell_env` when it resumes, and MCP servers are attached to the
+  child itself. A source with session metadata but no build state cannot
+  give a child that runs, so every fork entry point now refuses it before
+  committing anything (`INVALID_PARAMS`, data kind
+  `fork_source_build_state_missing` with the `source_session_id`). A child
+  forked by 0.9.3 or earlier that never ran a turn still fails `turn/start`
+  with the error above, because it has no build state to derive one from:
+  fork its source again instead.
 
 ## [0.9.3] - 2026-10-18
 
