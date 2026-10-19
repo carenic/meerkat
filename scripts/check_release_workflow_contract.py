@@ -2071,8 +2071,9 @@ RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # run steps after it.
 SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
 # The (event, ref) runs whose client writes, and those whose client only
-# reads: a dispatch on any other ref (main, a near-miss branch name, a tag)
-# and every other event, on a release branch's ref too.
+# reads: a dispatch on any other ref (main, a near-miss branch name, a tag,
+# a tag named like a release branch) and every other event, on a release
+# branch's ref too.
 SCCACHE_WRITERS = (
     ("push", "refs/heads/main"),
     ("push", "refs/heads/release/next"),
@@ -2089,6 +2090,8 @@ SCCACHE_READERS = (
     ("workflow_dispatch", "refs/heads/rel-next"),
     ("workflow_dispatch", "refs/heads/released"),
     ("workflow_dispatch", "refs/tags/v1.0.0"),
+    ("workflow_dispatch", "refs/tags/rel/next"),
+    ("workflow_dispatch", "refs/tags/release/1.0"),
     ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1"),
     ("workflow_run", "refs/heads/rel/next"),
 )
