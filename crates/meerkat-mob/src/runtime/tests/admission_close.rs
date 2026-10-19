@@ -984,6 +984,143 @@ async fn stop_and_destroy_stay_available_after_a_failed_shutdown() {
         .expect("the destroy is admitted and finishes");
 }
 
+/// Hold the next Shutdown's drain on a member-live task it joins, until the
+/// returned sender is dropped.
+async fn hold_shutdown_drain(handle: &MobHandle) -> tokio::sync::oneshot::Sender<()> {
+    tokio::time::timeout(STEP, handle.hold_shutdown_drain_for_test())
+        .await
+        .expect("the held task is spawned")
+        .expect("spawn the held task")
+}
+
+/// Start a Shutdown and return once it is admitted, so it is draining.
+async fn start_shutdown(handle: &MobHandle) -> tokio::task::JoinHandle<Result<(), MobError>> {
+    let mut admitted = handle.lifecycle_observations.shutdown_admitted.subscribe();
+    let shutdown_handle = handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(STEP, admitted.wait_for(|admitted| *admitted))
+        .await
+        .expect("the Shutdown is admitted")
+        .expect("the observation outlives the test");
+    shutdown
+}
+
+fn assert_shutdown_in_progress<T>(result: Result<T, MobError>, expected: &MobId) {
+    match result {
+        Ok(_) => panic!("a draining Shutdown runs no other request"),
+        Err(MobError::ShutdownInProgress { mob_id }) => assert_eq!(&mob_id, expected),
+        Err(other) => panic!("expected ShutdownInProgress, got {other}"),
+    }
+}
+
+/// While a Shutdown drains its own work, `stop()` is refused at once with
+/// `ShutdownInProgress`: never a closed channel (the actor is alive) and
+/// never a wait for a lifecycle transition. Here the Shutdown then fails, so
+/// the retried Stop runs on the live actor.
+#[tokio::test]
+async fn a_stop_during_a_failing_shutdown_drain_is_refused_at_once_and_runs_on_retry() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-stop-failing-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let release_tx = hold_shutdown_drain(&handle).await;
+    crate::runtime::actor::fail_next_shutdown_drain_for_test(handle.mob_id());
+    let shutdown = start_shutdown(&handle).await;
+
+    let asked = tokio::time::Instant::now();
+    let refused = tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop is answered during the drain");
+    let waited = asked.elapsed();
+    assert_shutdown_in_progress(refused, handle.mob_id());
+    assert!(
+        waited < Duration::from_secs(1),
+        "stop() returned the refusal after {waited:?}"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the Shutdown still joins the held task"
+    );
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect_err("the Shutdown fails in its drain");
+    tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the retried Stop answers")
+        .expect("the retried Stop runs on the live actor");
+    assert_eq!(
+        handle
+            .status()
+            .await
+            .expect("the live actor reports its phase"),
+        MobState::Stopped
+    );
+}
+
+/// The same Stop during a Shutdown drain that then commits is refused the
+/// same way, and once the actor has exited a request finds its command
+/// channel closed.
+#[tokio::test]
+async fn a_stop_during_a_committing_shutdown_drain_is_refused_then_finds_the_actor_gone() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-stop-committing-drain");
+    let (handle, _service) = create_test_mob(definition).await;
+    let release_tx = hold_shutdown_drain(&handle).await;
+    let mut task = handle.actor_task_watch();
+    let shutdown = start_shutdown(&handle).await;
+
+    let refused = tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("the Stop is answered during the drain");
+    assert_shutdown_in_progress(refused, handle.mob_id());
+
+    drop(release_tx);
+    tokio::time::timeout(STEP, shutdown)
+        .await
+        .expect("the Shutdown returns")
+        .expect("join")
+        .expect("the Shutdown finishes");
+    assert_eq!(
+        task.wait().await,
+        crate::runtime::MobActorTaskWait::Returned
+    );
+    match tokio::time::timeout(STEP, handle.stop())
+        .await
+        .expect("a Stop after the exit answers")
+    {
+        Ok(_) => panic!("an exited actor runs no Stop"),
+        Err(MobError::ActorCommandChannelClosed) => {}
+        Err(other) => panic!("expected a closed command channel after the exit, got {other}"),
+    }
+}
+
+/// A recovered placed Reset intent returns once the mob's admission is
+/// closed. The live actor refuses a Reset for the rest of its life, so no
+/// retry could run it; the durable intent stays recorded for the next start.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_recovered_placed_reset_intent_returns_once_admission_is_closed() {
+    let definition = with_unique_mob_id(sample_definition(), "d67-recovered-reset-closed");
+    let (handle, _service) = create_test_mob(definition).await;
+    tokio::time::timeout(
+        STEP,
+        handle.close_admission(MobAdmissionCloseReason::StandDown),
+    )
+    .await
+    .expect("the close answers")
+    .expect("the idle mob closes its admission");
+    tokio::time::timeout(
+        STEP,
+        crate::runtime::builder::drive_recovered_placed_lifecycle_intent(
+            handle.clone(),
+            crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Reset,
+        ),
+    )
+    .await
+    .expect("the recovered Reset intent returns once admission is closed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
     for round in 0..16 {

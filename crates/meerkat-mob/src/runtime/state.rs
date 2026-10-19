@@ -1266,7 +1266,7 @@ pub(super) enum MobCommand {
     },
     /// Test-only: an actor-owned member-live task that ends only once
     /// `release_rx` resolves, so a Shutdown's inline drain joins it until then.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SpawnHeldLiveMutationForTest {
         release_rx: oneshot::Receiver<()>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
@@ -1904,7 +1904,7 @@ impl MobCommand {
             Self::SpawnLiveMutationAwaitingActorForTest { .. } => {
                 ShutdownAnswerClass::CallerRequest
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::SpawnHeldLiveMutationForTest { .. } => ShutdownAnswerClass::CallerRequest,
             #[cfg(test)]
             Self::SpawnLiveMutationSendingCompletionForTest { .. } => {
@@ -2114,7 +2114,7 @@ impl MobCommand {
             Self::SpawnLiveMutationAwaitingActorForTest { .. } => {
                 "SpawnLiveMutationAwaitingActorForTest"
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::SpawnHeldLiveMutationForTest { .. } => "SpawnHeldLiveMutationForTest",
             #[cfg(test)]
             Self::HonourCompletionForTest { .. } => "HonourCompletionForTest",

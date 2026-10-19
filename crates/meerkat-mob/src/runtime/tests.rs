@@ -82448,6 +82448,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
         MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
+        MobError::ShutdownInProgress { .. } => "shutdown_in_progress".to_string(),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
             "identity_convergence_admission_closed".to_string()
         }

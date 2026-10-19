@@ -2387,6 +2387,10 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         }
         // A closed mob refuses the whole batch before any row is provisioned.
         MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        // So does a shutting-down one.
+        MobError::ShutdownInProgress { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         MobError::MemberRetirementInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -8861,9 +8865,12 @@ impl MobHandle {
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
+                // A shutting-down source answers without revoking: the
+                // recovery transport revokes instead, as once it has exited.
                 Err(
                     error @ (MobError::ActorCommandChannelClosed
-                    | MobError::ActorReplyChannelClosed),
+                    | MobError::ActorReplyChannelClosed
+                    | MobError::ShutdownInProgress { .. }),
                 ) => error,
                 Err(error) => return Err(error),
             }
@@ -14633,6 +14640,23 @@ impl MobHandle {
             "member turn admission test gate already armed for this identity and stage"
         );
         (entered_rx, release_tx)
+    }
+
+    /// Hold this mob's next Shutdown in its inline drain: the actor spawns a
+    /// member-live task that the drain joins, and that task ends once the
+    /// returned sender is used or dropped. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn hold_shutdown_drain_for_test(
+        &self,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, MobError> {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.send_actor_command(|reply_tx| MobCommand::SpawnHeldLiveMutationForTest {
+            release_rx,
+            reply_tx,
+        })
+        .await??;
+        Ok(release_tx)
     }
 
     /// Move `identity`'s session binding to `session_id` under its current

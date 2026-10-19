@@ -37,6 +37,9 @@ them.
 
 ### Breaking
 
+- `meerkat-mob`: `MobError` is now `#[non_exhaustive]`, and gains the variant
+  `MobError::ShutdownInProgress { mob_id }`, appended last (see the next
+  entry). A downstream exhaustive `match` on `MobError` needs a wildcard arm.
 - Behaviour-only (not measured by the gate): an admitted `MobHandle::shutdown`
   or `MobHandle::shutdown_with_report` closes the mob's admission before its
   teardown (see Fixed). From the Shutdown's admission (while it drains its own
@@ -48,7 +51,17 @@ them.
   did the other refused commands (for example wiring, a host bind, a live
   commit, resume, reset or reload), which waited for the Shutdown or ran while
   it was parked. `MobHandle::acquire_owner` after the Shutdown's admission is
-  refused the same way where it granted an owner lease.
+  refused the same way where it granted an owner lease. Every other request
+  the actor answers while the Shutdown drains (a Stop, Destroy, Complete or
+  retirement, a read, a status probe) gets the new
+  `MobError::ShutdownInProgress`, where v0.9.3 answered
+  `MobError::ActorCommandChannelClosed`: retryable with the authority
+  retained (wire code `SessionBusy`), returned by `MobHandle::stop` at once.
+  `MobHandle::status` returns it there too, where it returned
+  `MobError::Internal` ("not terminal lifecycle authority").
+  Requests on the actor's internal lane, sent by the tasks the drain joins,
+  keep `ActorCommandChannelClosed`, which otherwise now means the actor has
+  exited or is exiting.
 - Behaviour-only (not measured by the gate): a Shutdown that fails after its
   admission keeps the actor alive as the retry owner with admission closed,
   so the Closing set (spawn, work submission, flows, wiring, a host bind, a
@@ -81,6 +94,22 @@ them.
 
 ### Fixed
 
+- A request a mob's actor answers while a Shutdown drains its own work is
+  refused with the new `MobError::ShutdownInProgress`, no longer with
+  `MobError::ActorCommandChannelClosed`, which a caller could not tell from
+  an exited actor: `MobHandle::stop` reported the mob gone while its Shutdown
+  could still fail and leave the actor serving, and the actor's own recovery
+  retries stopped. A retry now runs on the actor once its Shutdown fails, and
+  finds the channel closed once it finishes. The `meerkat-mob-mcp`
+  stand-down counts a shutting-down mob's admission as closed, and
+  `MobHandle::revoke_forked_participant_with_recovery` revokes through its
+  recovery transport while the source mob shuts down, as both did when the
+  drain answered with a closed channel.
+- The recovery of a durable placed lifecycle intent stops once the mob's
+  admission is closed. A Reset intent, which the Closing state refuses, was
+  retried every 2 s with a warning for the rest of the actor's life after a
+  stand-down or a failed Shutdown. The intent stays recorded, and the next
+  start drives it again.
 - `MobHandle::shutdown` closes the mob's admission, as its contract says
   ("After this, no more commands are accepted"). The actor closes it on its
   serialized admission path when it admits the Shutdown, before any teardown

@@ -270,7 +270,8 @@ impl MobCommand {
 
             #[cfg(any(test, feature = "test-support"))]
             Self::CrashStopPreservingDurableWorkForTest { .. }
-            | Self::RebindMemberSessionForTest { .. } => None,
+            | Self::RebindMemberSessionForTest { .. }
+            | Self::SpawnHeldLiveMutationForTest { .. } => None,
 
             #[cfg(test)]
             Self::AuthorizeMemberTrustCleanupForTest { .. }
@@ -281,7 +282,6 @@ impl MobCommand {
             | Self::LifecycleNotificationBurst { .. }
             | Self::ParkActorForObservationTest { .. }
             | Self::SpawnLiveMutationAwaitingActorForTest { .. }
-            | Self::SpawnHeldLiveMutationForTest { .. }
             | Self::HonourCompletionForTest { .. }
             | Self::SpawnLiveMutationSendingCompletionForTest { .. }
             | Self::SpawnActivationCustodyProbe { .. }
@@ -637,7 +637,7 @@ impl MobCommand {
             Self::SpawnLiveMutationAwaitingActorForTest { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::SpawnHeldLiveMutationForTest { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }

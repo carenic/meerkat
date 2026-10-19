@@ -4233,6 +4233,87 @@ mod mob_seam_for_test_tests {
     }
 }
 
+#[cfg(test)]
+mod shutdown_drain_answer_tests {
+    use super::*;
+
+    const DRAINING: &str = "draining-mob";
+
+    /// Answer one caller request the way a Shutdown's drain does, after the
+    /// Shutdown closed admission.
+    fn answer(routed: RoutedMobCommand) {
+        let mob_id = MobId::from(DRAINING);
+        let closed = (mob_id.clone(), MobAdmissionCloseReason::Shutdown);
+        let mut joined = Vec::new();
+        let mut retained = VecDeque::new();
+        MobActor::answer_while_shutting_down(
+            routed,
+            &mut joined,
+            &mut retained,
+            Some(&closed),
+            &mob_id,
+        );
+        assert!(joined.is_empty(), "a caller request joins no Shutdown");
+        assert!(retained.is_empty(), "a caller request is not retained");
+    }
+
+    fn lanes() -> [CommandAuthority; 3] {
+        [
+            CommandAuthority::principal(MobControlPrincipal::Owner),
+            CommandAuthority::agent_lane(),
+            CommandAuthority::internal(),
+        ]
+    }
+
+    /// Outside the Closing set, principal and agent requests get
+    /// `ShutdownInProgress` at once; internal requests, sent by the tasks the
+    /// drain joins, get the terminal closed channel.
+    #[test]
+    fn a_draining_shutdown_answers_each_lane_at_once() {
+        for authority in lanes() {
+            let lane = authority.kind();
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            answer(RoutedMobCommand {
+                authority,
+                cmd: MobCommand::QueryPhase { reply_tx },
+            });
+            let error = match reply_rx.try_recv() {
+                Ok(Err(error)) => error,
+                other => panic!("{lane:?}: expected an error answered at once, got {other:?}"),
+            };
+            match (lane, error) {
+                (CommandAuthorityKind::Internal, MobError::ActorCommandChannelClosed) => {}
+                (
+                    CommandAuthorityKind::Principal | CommandAuthorityKind::AgentLane,
+                    MobError::ShutdownInProgress { mob_id },
+                ) => assert_eq!(mob_id.as_str(), DRAINING),
+                (lane, error) => panic!("{lane:?}: unexpected drain answer: {error}"),
+            }
+        }
+    }
+
+    /// A command the Closing state refuses gets the close reason, on every
+    /// lane.
+    #[test]
+    fn a_draining_shutdown_refuses_a_closing_set_command_with_the_close_reason() {
+        for authority in lanes() {
+            let lane = authority.kind();
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            answer(RoutedMobCommand {
+                authority,
+                cmd: MobCommand::Reset { reply_tx },
+            });
+            match reply_rx.try_recv() {
+                Ok(Err(MobError::AdmissionClosed { mob_id, reason })) => {
+                    assert_eq!(mob_id.as_str(), DRAINING);
+                    assert_eq!(reason, MobAdmissionCloseReason::Shutdown);
+                }
+                other => panic!("{lane:?}: expected AdmissionClosed, got {other:?}"),
+            }
+        }
+    }
+}
+
 /// Test seam: the actor loop of this mob panics at the top of its next turn.
 #[cfg(test)]
 static PANIC_ACTOR_LOOP_FOR_MOB: MobSeamForTest =
@@ -7940,7 +8021,7 @@ pub(super) enum MemberLiveMutationCompletion {
     /// Test-only task that awaited this actor's reply or a test's release
     /// (see `MobCommand::SpawnLiveMutationAwaitingActorForTest` and
     /// `MobCommand::SpawnHeldLiveMutationForTest`); it owns no effect.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     AwaitedActorForTest,
     Open {
         agent_identity: AgentIdentity,
@@ -16680,6 +16761,10 @@ impl MobActor {
                 work_ref: payload.work_ref.clone(),
                 pump,
             });
+            #[cfg(test)]
+            self.lifecycle_observations
+                .submit_work_pump_dispatches
+                .send_modify(|dispatches| *dispatches += 1);
             return Some(RoutedMobCommand {
                 authority,
                 cmd: MobCommand::SubmitWork { payload, reply_tx },
@@ -19099,6 +19184,7 @@ impl MobActor {
             let mut retained = std::mem::take(&mut self.retained_actor_completions);
             let mut received = 0;
             let closed = self.admission_closed_refusal();
+            let mob_id = self.definition.id.clone();
             let tail = Box::pin(self.shutdown_actor_owned_background_work());
             Self::serve_refusals_while(
                 command_rx,
@@ -19106,6 +19192,7 @@ impl MobActor {
                 &mut retained,
                 &mut received,
                 closed.as_ref(),
+                &mob_id,
                 tail,
             )
             .await;
@@ -22743,27 +22830,25 @@ impl MobActor {
         }
     }
 
-    /// Join barrier for every background task/listener owned directly by the
-    /// actor (as opposed to keyed pending-spawn/flow/autonomous tables).
-    /// Safe to call repeatedly; all task sets and optional handles are drained.
     /// Run `work` (a Shutdown step that joins actor-owned tasks) while still
     /// answering every command that reaches the actor: a Shutdown joins this
-    /// one, a caller request is refused typed, and an actor completion is
-    /// retained in `retained` for the actor to process after the step. A
-    /// command the Closing state refuses gets `AdmissionClosed` with the
-    /// `closed` reason (the Shutdown closed admission before this step), the
-    /// answer it gets once the Shutdown parks; any other caller request gets
-    /// `ActorCommandChannelClosed` (the answer it gets a moment later anyway).
-    /// A joined task may have sent this actor a command and await its reply;
-    /// served this way, it can never wait on the actor that is joining it (in
-    /// production the actor otherwise wedged in an inline Shutdown join until
-    /// SIGKILL).
+    /// one, a caller request is refused typed at once, and an actor
+    /// completion is retained in `retained` for the actor to process after
+    /// the step. A command the Closing state refuses gets `AdmissionClosed`
+    /// with the `closed` reason (the Shutdown closed admission before this
+    /// step), the answer it gets once the Shutdown parks. Any other caller
+    /// request gets `ShutdownInProgress` for `mob_id`: the actor is alive,
+    /// and the Shutdown can still fail and leave it serving. A joined task
+    /// may have sent this actor a command and await its reply; served this
+    /// way, it can never wait on the actor that is joining it (in production
+    /// the actor otherwise wedged in an inline Shutdown join until SIGKILL).
     async fn serve_refusals_while<F>(
         command_rx: &mut mpsc::Receiver<RoutedMobCommand>,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
         received: &mut usize,
         closed: Option<&(MobId, MobAdmissionCloseReason)>,
+        mob_id: &MobId,
         work: F,
     ) -> F::Output
     where
@@ -22779,14 +22864,14 @@ impl MobActor {
                     // before the step ended is retained, not left behind.
                     while let Ok(routed) = command_rx.try_recv() {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained, closed);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed, mob_id);
                     }
                     return output;
                 }
                 routed = command_rx.recv(), if channel_open => match routed {
                     Some(routed) => {
                         *received = received.saturating_add(1);
-                        Self::answer_while_shutting_down(routed, joined, retained, closed);
+                        Self::answer_while_shutting_down(routed, joined, retained, closed, mob_id);
                     }
                     None => channel_open = false,
                 },
@@ -22795,27 +22880,40 @@ impl MobActor {
     }
 
     /// One command reaching the actor while a Shutdown step joins its work:
-    /// a Shutdown joins it, a caller request is refused typed (with the close
-    /// reason when the Closing state refuses it), an actor completion is
-    /// retained for processing (never refused).
+    /// a Shutdown joins it, a caller request is refused typed at once (with
+    /// the close reason when the Closing state refuses it), an actor
+    /// completion is retained for processing (never refused).
+    ///
+    /// A caller request outside the Closing set gets `ShutdownInProgress`,
+    /// except on the internal lane. Internal requests come from the actor's
+    /// own tasks, which this step may be joining: they get the terminal
+    /// `ActorCommandChannelClosed`, so a joined task finishes instead of
+    /// retrying against the actor that waits for it.
     fn answer_while_shutting_down(
         routed: RoutedMobCommand,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
         closed: Option<&(MobId, MobAdmissionCloseReason)>,
+        mob_id: &MobId,
     ) {
+        let lane = routed.authority.kind();
         match routed.cmd {
             MobCommand::Shutdown { reply_tx, .. } => joined.push(LifecycleReplyTx::Unit(reply_tx)),
             cmd => match cmd.shutdown_answer_class() {
                 super::state::ShutdownAnswerClass::CallerRequest => {
                     let error = match closed {
-                        Some((mob_id, reason)) if cmd.refused_while_admission_closed() => {
+                        Some((closed_mob, reason)) if cmd.refused_while_admission_closed() => {
                             MobError::AdmissionClosed {
-                                mob_id: mob_id.clone(),
+                                mob_id: closed_mob.clone(),
                                 reason: *reason,
                             }
                         }
-                        _ => MobError::ActorCommandChannelClosed,
+                        _ if lane == CommandAuthorityKind::Internal => {
+                            MobError::ActorCommandChannelClosed
+                        }
+                        _ => MobError::ShutdownInProgress {
+                            mob_id: mob_id.clone(),
+                        },
                     };
                     cmd.reject_with_error(error);
                 }
@@ -22829,6 +22927,9 @@ impl MobActor {
         }
     }
 
+    /// Join barrier for every background task/listener owned directly by the
+    /// actor (as opposed to keyed pending-spawn/flow/autonomous tables).
+    /// Safe to call repeatedly; all task sets and optional handles are drained.
     async fn shutdown_actor_owned_background_work(&mut self) {
         // #1105: settle owned wiring ledgers first. Aborting them before
         // reconciliation would strand real trust rows with no compensation
@@ -27573,7 +27674,7 @@ impl MobActor {
                     });
                     let _ = reply_tx.send(Ok(()));
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 MobCommand::SpawnHeldLiveMutationForTest {
                     release_rx,
                     reply_tx,
@@ -28560,12 +28661,14 @@ impl MobActor {
                     let mut retained = std::mem::take(&mut self.retained_actor_completions);
                     let mut received = 0;
                     let closed = self.admission_closed_refusal();
+                    let mob_id = self.definition.id.clone();
                     let drained = Self::serve_refusals_while(
                         command_rx,
                         &mut joined,
                         &mut retained,
                         &mut received,
                         closed.as_ref(),
+                        &mob_id,
                         Box::pin(async {
                             self.drain_wiring_io_for_lifecycle().await;
                             self.drain_member_effects_for_lifecycle().await?;
@@ -29219,9 +29322,27 @@ impl MobActor {
                 }
                 // A Shutdown in progress (parked on its members' stops or on
                 // its runtime teardown) admits no new member and no member
-                // work it would then neither stop nor report.
+                // work it would then neither stop nor report. The actor is
+                // alive and the Shutdown can still fail, so the answer is
+                // ShutdownInProgress, never a closed channel. No sender
+                // reaches this today. The Closing state refused every start
+                // above except a member lane's revival, and no revival can be
+                // in flight: a Shutdown passes the deferral gate only while
+                // no lane holds submit-work pump state
+                // (`submit_work_pump_control_is_pending`) and no member
+                // effect runs (`resume_member_control_is_pending`), and after
+                // its admission the Closing state refuses every new
+                // submission. If either guard is narrowed, this refusal
+                // becomes live and the no-spin argument for the lane's pump
+                // must be re-examined.
                 if self.shutdown_in_progress() && cmd.starts_member_work() {
-                    cmd.reject_with_error(MobError::ActorCommandChannelClosed);
+                    #[cfg(test)]
+                    self.lifecycle_observations
+                        .parked_shutdown_member_work_refusals
+                        .send_modify(|refusals| *refusals += 1);
+                    cmd.reject_with_error(MobError::ShutdownInProgress {
+                        mob_id: self.definition.id.clone(),
+                    });
                     continue;
                 }
                 if matches!(
@@ -38770,7 +38891,7 @@ impl MobActor {
         mode: MemberLiveReconcileMode,
     ) -> Result<(), MobError> {
         match completion {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             MemberLiveMutationCompletion::AwaitedActorForTest => Ok(()),
             MemberLiveMutationCompletion::Open {
                 agent_identity,

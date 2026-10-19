@@ -3235,8 +3235,13 @@ impl MobMcpState {
                         tracing::debug!(mob_id = %mob_id, ?busy, "mob closed its admission with work still in flight");
                     }
                 }
-                // A stopped actor admits nothing.
-                Err(MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed) => {}
+                // A stopped actor admits nothing, and a shutting-down one
+                // closed its admission before it began to drain.
+                Err(
+                    MobError::ActorCommandChannelClosed
+                    | MobError::ActorReplyChannelClosed
+                    | MobError::ShutdownInProgress { .. },
+                ) => {}
                 Err(error) => {
                     unsettled.push(format!("mob {mob_id}: admission not closed: {error}"));
                 }
@@ -14978,6 +14983,47 @@ mod tests {
 
     fn far_deadline() -> std::time::Instant {
         std::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    /// A mob whose Shutdown is draining closed its admission when the
+    /// Shutdown was admitted: the close counts it closed, although its actor
+    /// answers the close `ShutdownInProgress` instead of running it.
+    #[tokio::test]
+    async fn close_admission_counts_a_shutting_down_mob_as_closed() {
+        let state = standing_state();
+        let mob_id = state
+            .mob_create_definition(explicit_definition("draining-mob-close"))
+            .await
+            .expect("create the mob");
+        let handle = state.handle_for(&mob_id).await.expect("mob handle");
+        let release = handle
+            .hold_shutdown_drain_for_test()
+            .await
+            .expect("hold the next Shutdown's drain");
+        let mut closed = handle.admission_closed();
+        let shutdown_handle = handle.clone();
+        let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(10), closed.wait_for(Option::is_some))
+            .await
+            .expect("the Shutdown is admitted")
+            .expect("admission watch");
+
+        assert_eq!(
+            state.close_admission(far_deadline()).await,
+            MobStateStandDown::Clean,
+            "a draining mob's admission is already closed"
+        );
+        assert!(
+            !shutdown.is_finished(),
+            "the Shutdown still joins the held task"
+        );
+
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("the Shutdown returns")
+            .expect("join")
+            .expect("the Shutdown finishes");
     }
 
     /// Owned work is joined, never aborted: a stand-down that cannot wait

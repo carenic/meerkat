@@ -390,7 +390,7 @@ impl OrchestratorResumeNotification {
 }
 
 #[cfg(feature = "runtime-adapter")]
-async fn drive_recovered_placed_lifecycle_intent(
+pub(super) async fn drive_recovered_placed_lifecycle_intent(
     handle: MobHandle,
     intent: mob_dsl::PlacedCompletionLifecycleIntentKind,
 ) {
@@ -412,7 +412,12 @@ async fn drive_recovered_placed_lifecycle_intent(
         };
         match result {
             Ok(()) => return,
-            Err(MobError::ActorCommandChannelClosed) => return,
+            // The actor has exited, or it refuses the intent for the rest of
+            // its life: a Reset is in the Closing set, so once admission is
+            // closed (a failed Shutdown, a stand-down) no retry can run it.
+            // The durable intent stays recorded, and the next start drives
+            // it again.
+            Err(MobError::ActorCommandChannelClosed | MobError::AdmissionClosed { .. }) => return,
             Err(error) => {
                 tracing::warn!(
                     mob_id = %handle.mob_id(),

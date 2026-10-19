@@ -898,6 +898,71 @@ async fn placed_revoke_routes_by_capability_owner_host_after_the_source_is_absen
     assert_eq!(repeat, ForkedParticipantRevocationOutcome::Converged);
 }
 
+/// While the source mob's Shutdown drains its own work, its actor answers a
+/// revocation `ShutdownInProgress` without running it. Revocation with
+/// recovery then revokes through the recovery transport, as it does once the
+/// source has exited.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_revoke_uses_the_transport_while_the_source_shuts_down() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let source_host = spawn_scripted_host_peer("fp-draining-source-host").await;
+    let source = create_controlling_mob("fp-draining-source").await;
+    let source_report = source.bind_scripted(&source_host).await;
+    source
+        .spawn_placed("worker", "remote", &source_report.host_id)
+        .await
+        .expect("placed spawn commits");
+    let capability = create(&source, "remote", "req-draining-source")
+        .await
+        .expect("placed create");
+    let transport = create_controlling_mob("fp-draining-transport").await;
+
+    let release = source
+        .handle
+        .hold_shutdown_drain_for_test()
+        .await
+        .expect("hold the source's next Shutdown drain");
+    let mut closed = source.handle.admission_closed();
+    let shutdown_handle = source.handle.clone();
+    let shutdown = tokio::spawn(async move { shutdown_handle.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(10), closed.wait_for(Option::is_some))
+        .await
+        .expect("the source's Shutdown is admitted")
+        .expect("admission watch");
+
+    let recovered = source
+        .handle
+        .revoke_forked_participant_with_recovery(
+            MobControlPrincipal::Owner,
+            Some(&transport.handle),
+            &capability,
+        )
+        .await
+        .expect("a draining source revokes through the recovery transport");
+    assert!(matches!(
+        recovered,
+        ForkedParticipantRevocationOutcome::Revoked { .. }
+    ));
+    assert_eq!(
+        source_host
+            .received_revoke_forked_participant_payloads()
+            .len(),
+        1,
+        "the recovery transport sends exactly one revoke"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the source's Shutdown still drains"
+    );
+
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(30), shutdown)
+        .await
+        .expect("the source's Shutdown returns")
+        .expect("join")
+        .expect("the source's Shutdown finishes");
+}
+
 /// Recovered revocation refuses persisted authority that cannot prove the
 /// capability's exact owner route or V6 support. Neither refusal may send the
 /// bearer capability to a host.
