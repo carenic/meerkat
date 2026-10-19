@@ -378,6 +378,24 @@ them.
   uses `?` or otherwise discards it now gets an `unused_must_use` warning
   and binds or reads it; code that matches `Ok(())` matches `Ok(_)` or
   reads the report.
+- `meerkat-machine-schema`, `meerkat-machine-kernels` and `meerkat-runtime`:
+  the live delegation narration kind `LiveDelegationNarrationKind` gains
+  `FinishedPending`, appended last, in the schema catalog's DSL enum, the
+  kernels' generated copy and the runtime's copy
+  (`meerkat_runtime::live_execution::LiveDelegationNarrationKind`). It is
+  never spoken: the machine authorizes it for a delegation whose work has
+  finished with an eligible result not yet handed to delivery (see Fixed).
+  The enums are exhaustive, so a `match` on one adds the arm.
+- `meerkat-live`: the provider adapter carrier `LiveSidebandProviderCommand`
+  gains `NoteDelegationFinishedContext { binding, attempt, delegation }`,
+  which only `LiveSidebandCommand::note_delegation_finished` produces, from
+  the new one-shot `LiveSidebandFinishedNoticeAuthority`. A provider adapter
+  that matches the carrier lowers or refuses it.
+- `meerkat-openai`: `GptLiveBrokerObservation` gains
+  `InstructionsContextAppendWithdrawn { token }`, appended last: a
+  delegation's finished notice that waited while the model was speaking and
+  was withdrawn unsent because a result of the delegation reached the session
+  first (see Fixed). The enum is exhaustive, so a `match` on it adds the arm.
 
 ### Security
 
@@ -1088,6 +1106,33 @@ them.
   child started that still held those pipes made `close()` wait the full
   5 seconds after the child had exited, or wait forever after the SIGKILL.
   Pre-existing since 0.6.0.
+- `meerkat-openai`: on public GPT Live, a delegation result held behind the
+  user's unanswered question no longer leaves the voice model believing the
+  work is still in progress (#1820). Meerkat holds a result while the user's
+  latest utterance is unanswered, so the model answers that first; the
+  model's only fact about the delegation was then its in-progress
+  instruction, so "is it done yet?" got "Not yet" while the finished result
+  waited behind that very question. A held result now sends a notice at
+  once, always ahead of the result itself, on the instructions lane and
+  bound to its delegation: the work has
+  finished, its result has not reached the model yet, and the model may say
+  it has just finished but must not state, guess or imply the outcome until
+  the result arrives. The notice carries no result content and promises no
+  timing, the result is still released only by the existing triggers, later
+  "still running" lines stop naming that delegation, and the result's cue
+  no longer tells the model that anything it said earlier was said before
+  the work was done. A finished delegation whose result the runtime cannot
+  deliver yet (while another result holds the channel's one result slot, or
+  while results wait for the provider to acknowledge a concurrent
+  historical summary) gets the same notice: the machine authorizes it
+  once, as the narration kind `FinishedPending`, until the result is handed
+  to delivery, and the broker sends it
+  (`PublicLiveBrokerSession::append_delegation_finished_notice`) unless a
+  result of that delegation has already reached the session. While the
+  model is speaking, that notice waits until its response ends or the user
+  takes the floor (an instructions append mid-answer can cut the answer
+  off), and it is withdrawn, never sent, if the result reaches the session
+  first.
 
 ## [0.9.3] - 2026-10-18
 

@@ -1444,6 +1444,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "Completed",
                     "SourceBusy",
                     "Failed",
+                    "FinishedPending",
                 ],
             ),
             NamedTypeBinding::string_enum(

@@ -187,6 +187,13 @@ pub(super) fn narration_text(
         LiveDelegationNarrationKind::Failed => {
             format!("Voice request \"{title}\" could not be completed.")
         }
+        // Never spoken: the provider adapter words its own finished notice
+        // (`note_delegation_finished`). This is its plain description.
+        LiveDelegationNarrationKind::FinishedPending => {
+            format!(
+                "Voice request \"{title}\" has finished; its result has not been delivered yet."
+            )
+        }
     }
 }
 

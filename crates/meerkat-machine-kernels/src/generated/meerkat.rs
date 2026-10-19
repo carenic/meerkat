@@ -4721,6 +4721,8 @@ pub enum LiveDelegationNarrationKind {
     SourceBusy,
     #[serde(rename = "Failed")]
     Failed,
+    #[serde(rename = "FinishedPending")]
+    FinishedPending,
 }
 impl LiveDelegationNarrationKind {
     pub fn as_str(&self) -> &'static str {
@@ -4731,6 +4733,7 @@ impl LiveDelegationNarrationKind {
             Self::Completed => "Completed",
             Self::SourceBusy => "SourceBusy",
             Self::Failed => "Failed",
+            Self::FinishedPending => "FinishedPending",
         }
     }
 }
@@ -4744,6 +4747,7 @@ impl std::convert::TryFrom<&str> for LiveDelegationNarrationKind {
             "Completed" => Ok(Self::Completed),
             "SourceBusy" => Ok(Self::SourceBusy),
             "Failed" => Ok(Self::Failed),
+            "FinishedPending" => Ok(Self::FinishedPending),
             other => Err(format!(
                 "invalid LiveDelegationNarrationKind value `{other}`"
             )),
