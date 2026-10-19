@@ -12596,7 +12596,10 @@ impl SessionRuntime {
                 None => return Ok(()),
             }
         };
-        retirement
+        // A notification registration the retirement left with the process
+        // never reads or writes the store, so the retirement is complete;
+        // the join traced its directory.
+        let _retired = retirement
             .join(bound)
             .await
             .map_err(|incomplete| meerkat_core::SessionError::Store(Box::new(incomplete)))?;

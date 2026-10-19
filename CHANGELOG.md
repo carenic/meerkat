@@ -47,8 +47,9 @@ them.
   `Result<RuntimeDeliveryOwnerRetired, RuntimeDeliveryOwnerRetirementIncomplete>`
   instead of `Result<(), RuntimeDeliveryOwnerRetirementIncomplete>`: the
   report names the store watch's notification registration the retirement
-  left with the process (see Added). Code that uses `?` or discards the
-  value compiles unchanged; code that matches `Ok(())` matches `Ok(_)` or
+  left with the process (see Added). The report is `#[must_use]`: code that
+  uses `?` or otherwise discards it now gets an `unused_must_use` warning
+  and binds or reads it; code that matches `Ok(())` matches `Ok(_)` or
   reads the report.
 - `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` or
   `RefUnwindSafe`: it now carries the member's exact
@@ -201,7 +202,8 @@ them.
   interrupt that platform call (macOS FSEvents can hold it for tens of
   seconds), so the retirement cancels the registration without waiting for
   it, and its thread stays with the process until the call returns, as a
-  mob observer drain reports its own (`retained_registrations`).
+  mob observer drain reports its own (`retained_registrations`). The join
+  traces the retained directory once, as an info event.
   `meerkat-runtime`: `DeliveryStoreWatch::stop` stops a watch as dropping it
   does and returns that registration. `meerkat-sqlite`:
   `SqliteChangeWatch::pending_registration` describes the registration a

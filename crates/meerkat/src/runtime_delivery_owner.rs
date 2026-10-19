@@ -447,9 +447,19 @@ impl OwnerTask {
             }
             // However the task ended, its end dropped the store watch, and
             // with it recorded what the watch's stop left with the process.
-            RuntimeDeliveryOwnerRetired {
+            let retired = RuntimeDeliveryOwnerRetired {
                 notification_registration_retained: retained.get().cloned(),
+            };
+            // The one trace of the report: this future runs once per task,
+            // however many retirements join it.
+            if let Some(registration) = &retired.notification_registration_retained {
+                tracing::info!(
+                    directory = %registration.directory.display(),
+                    "runtime delivery owner retired; its store watch's file notification \
+                     registration stays with the process until the platform call returns"
+                );
             }
+            retired
         }
         .boxed()
         .shared();
@@ -492,9 +502,12 @@ impl RuntimeDeliveryOwnerRetirement {
 /// ([`RuntimeDeliveryOwnerRetirement::join`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
+#[must_use = "the report says what the retirement left with the process"]
 pub struct RuntimeDeliveryOwnerRetired {
     /// The file notification registration of the owner's store watch, when
-    /// the operating system still held it as the owner stopped the watch.
+    /// the operating system still held it as the owner stopped the watch:
+    /// at retirement, or earlier if the watch's thread ended and the owner
+    /// went on without cross-process wake.
     /// Nothing can interrupt that platform call (macOS FSEvents can hold it
     /// for tens of seconds), so the stop cancels the registration without
     /// waiting for it: its thread stays with the process until the call
@@ -598,6 +611,9 @@ struct OwnedStoreWatch {
     retained: Arc<OnceLock<RetainedNotificationRegistration>>,
 }
 
+// Runs in the owner task's teardown, also while a panic unwinds, so it must
+// never block or panic: the stop only requests the watch's stop and reads its
+// registration slot, and dropping the watch does not join its threads.
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for OwnedStoreWatch {
     fn drop(&mut self) {
