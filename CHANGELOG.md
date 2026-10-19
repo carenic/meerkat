@@ -1216,7 +1216,27 @@ them.
   the child's exit instead of on its output pipes closing: a process the
   child started that still held those pipes made `close()` wait the full
   5 seconds after the child had exited, or wait forever after the SIGKILL.
-  Pre-existing since 0.6.0.
+  Requests waiting on a child that exits by itself, a crash for instance,
+  likewise fail with `PROCESS_EXITED` at most about a second after the
+  exit, even when such a process still holds the pipes; before, they and
+  every request sent after the exit waited for the pipes to close, possibly
+  forever. After a protocol error (a reply line that is not JSON), the client
+  now stops the child the way `close()` does, and a later `close()` returns
+  once that child has exited: a child that ignores SIGTERM is killed after 5
+  seconds instead of being left running, and a process the child started can
+  no longer keep the caller's process alive through the child's pipes.
+  Pre-existing since 0.6.0; the protocol-error case since 0.7.0.
+- Python SDK: requests waiting on an `rkat-rpc` child that exits by
+  itself, a crash for instance, now fail with `CONNECTION_CLOSED` and the
+  child's stderr tail at most about a second after the exit, even when a
+  process the child started still holds the child's output pipes; before,
+  they and every request sent after the exit waited for those pipes to
+  close, possibly forever. `MeerkatClient.close()` likewise returns once
+  the child has exited, and lets go of such pipes: on Python 3.11 and
+  3.12, and on 3.13 and 3.14 before the fix for CPython issue 119710,
+  `asyncio`'s `Process.wait()` returns only once the child's pipes have
+  closed, so `close()` waited 5 seconds for a child that had already
+  exited. Pre-existing since 0.3.0.
 - `meerkat-openai`: on public GPT Live, a delegation result held behind the
   user's unanswered question no longer leaves the voice model believing the
   work is still in progress (#1820). Meerkat holds a result while the user's

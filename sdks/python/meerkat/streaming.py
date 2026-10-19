@@ -137,6 +137,14 @@ class _StdoutDispatcher:
     def start(self) -> None:
         self._task = asyncio.get_running_loop().create_task(self._read_loop())
 
+    async def wait_read_loop_done(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for the read loop to end; whether it did."""
+        task = self._task
+        if task is None:
+            return True
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        return bool(done)
+
     async def stop(self) -> None:
         self._closed = True
         if self._task:
