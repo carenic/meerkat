@@ -5,38 +5,28 @@ icon: "shield-check"
 ---
 
 This guide starts with explicitly configured, storeless native Rust sessions
-and describes native persistent composition, including locally tested SQLite
-execution custody.
+and describes native persistent composition, including SQLite execution
+custody.
 The embedding application is trusted code: it authenticates callers, supplies
 current policy owners, and attaches the actual controller and executor. Merely
 enabling a Cargo feature or calling `agent.run(...)` does not establish this
 integration.
 
 <Note>
-Explicit native embedding has bounded acceptance for storeless sessions and
-completed-turn SQLite close/reopen followed by fresh governed work in actual
-separate processes, with
-current host grants, a stable configured provider binding and the real File token
-owner. Cold acceptance was run directly; publication and CI used their
-recorded test inventories. See the
-[implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md)
-for exact source and evidence scope.
-
-Stock CLI, REST, RPC and MCP paths do not acquire governed activation from this
-API. The additive `meerkat_rpc::governed_jsonl` entry provides a fixed-host,
-single-connection profile; it requires `default-features = false` plus
-`local-authorization` and does not activate ordinary RPC constructors. The
-public-entry/notification profile has focused local and published CI acceptance.
-Its fixed-host loopback evidence does not establish ordinary-constructor activation.
-Console projection is not integrated native-plus-Console proof.
-Persistent controller administration, interrupted recovery, human consent and
-full surface/platform coverage remain separate work. The shell composition below
-covers supported macOS requirements. Provider login and Console access
-administration do not grant native operation permission. The measured conditional
-fresh-turn means missed the cheap-default target; full-platform and per-operation
-p99 acceptance remain open. See the
-[acceptance scope](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/acceptance-plan.md)
-for the required coverage. No live-provider coverage is claimed.
+Explicit native embedding supports storeless sessions and persistent sessions
+over the in-memory or SQLite runtime store. After a completed turn, a SQLite
+session reopens in a new process under the host's current grants, configured
+provider binding and credential owner. Stock CLI, REST, RPC and MCP paths do
+not acquire governed activation from this API: the stock `rkat` CLI and
+`rkat-rpc` open a governed realm through their own stock composition (see
+[Governance settings](/concepts/configuration#governance-settings)), and the
+stock REST and MCP servers refuse to start on one. The
+`meerkat_rpc::governed_jsonl` entry, under `meerkat-rpc`'s default
+`local-authorization` feature, provides a fixed-host, single-connection profile
+and does not activate ordinary RPC constructors; a connection not commissioned
+for live MCP attachment needs a build without the `mcp` feature (see below).
+Console projection does not activate native governance. Provider login and Console access administration do
+not grant native operation permission.
 </Note>
 
 ## Install the real owners before sharing the machine
@@ -148,21 +138,18 @@ This selects requested provider capabilities. It does not replace the native
 controller or operation owner checks, and a capability kept enabled still needs
 its own current authorization.
 
-The macOS `e1_policy_control/shell_confinement.rs` fixture passed its bounded E1
-test with authenticated native ingress, actual grants and model HTTP boundaries,
-two authorized shell commands and native audit. The first command enters and
-then receives a nonzero exit with stderr for a denied
-filesystem write; the outside file remains unchanged, a permitted sibling
-executes, and the same run continues to its next model turn. That is returned
-shell feedback from an entered process. A backend or launch refusal happens
-before the command runs. Shell dispatch preserves its exact mechanical cause as
-`confinement_refused` tool feedback, including foreground, background and monitor
-recovery paths. Ordinary IO and custody failures retain their execution error
-class. The member upcall bridge preserves the exact confinement cause and
-settlement companions in tool feedback; malformed causes become an ordinary
-execution failure rather than a fabricated mechanical refusal.
-This bounded scenario does not establish restart,
-performance acceptance or full surface/platform coverage.
+Under required shell confinement, a command that enters and then attempts a
+denied filesystem write receives a nonzero exit with stderr; the outside file
+remains unchanged, a permitted sibling executes, and the same run continues to
+its next model turn. That is returned shell feedback from an entered process. A
+backend or launch refusal happens before the command runs. Shell dispatch
+preserves its exact mechanical cause as `confinement_refused` tool feedback,
+including foreground, background and monitor recovery paths. Ordinary IO and
+custody failures retain their execution error class. The member upcall bridge
+preserves the exact confinement cause and settlement companions in tool
+feedback; malformed causes become an ordinary execution failure rather than a
+fabricated mechanical refusal. Required confinement has backends on macOS and
+Linux; on other platforms a required launch refuses.
 
 The core pre-tool path also accepts a typed `HookEngineError::LaunchRefused`
 from an injected hook engine. It skips that tool and returns the exact
@@ -174,18 +161,16 @@ using `hook_denied` feedback with the exact hook ID, point, reason code and
 optional JSON payload. An absent payload and a present JSON null remain distinct,
 including across the member upcall bridge. The entered deciding hook retains its
 start, completion and denial events; its decision is not a launch failure.
-This core integration does not yet wire required confinement into the native
-command-hook engine or record the refusal in protected audit. Other hook points
-still need their own local-refusal integration.
+`AgentFactory::with_command_hook_confinement` (or `with_host_confinement` for a
+stock host's resolved requirements) applies required confinement to
+automatically composed command hooks: the final command, argv, cwd and explicit
+environment are bound before launch, and ambient environment is not inherited.
+Missing native custody or an unsupported requirement refuses the launch and
+never falls back. A pre-tool launch refusal blocks its tool and becomes local
+feedback; other hook points keep their existing failure disposition.
+`hook_engine_override` cannot be combined with this requirement.
 
 ## Install a bounded model reviewer for R2 tools
-
-<Note>
-This is an unreleased source preview of the model-review, audit-correlation
-and typed reviewer-error APIs. The example is source-checked, not compiled or
-qualified end to end. Use a checkout containing those changes; the earlier
-acceptance results on this page do not qualify this example.
-</Note>
 
 Install review on the trusted host's `AgentFactory`, before constructing the
 `FactoryAgentBuilder`. Your `OperationPolicyOwner` still selects the required
@@ -269,9 +254,7 @@ source/model operation's authorization observations. It follows the existing
 input commit and store durability rules. Optional `BoundOperationReview::with_observer`
 events are live notifications, not durable consent records. Neither those
 events nor recovered audit IDs recreate a live allowance, and review approval
-is not evidence that the tool executed. See the
-[review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
-for the boundary and remaining acceptance scope.
+is not evidence that the tool executed.
 
 Since 0.9.4 a single owner change does not fail an R2 call. When one owner
 publication change lands during the review, at its verdict's commit, or at the
@@ -297,14 +280,9 @@ rebuilds and 6 s of waiting, inside the tool's timeout.
 
 ## Authorize the builtin web_search and its helper
 
-<Note>
-This is an unreleased source preview. Use a checkout containing the builtin
-web_search operation target; earlier releases give the call no target and
-the helper no attribution.
-</Note>
-
-The Meerkat-owned `web_search` builtin is two governed operations. Your
-`OperationPolicyOwner` maps both from typed facts, never from the tool name:
+Since 0.9.2 the Meerkat-owned `web_search` builtin is two governed operations.
+Your `OperationPolicyOwner` maps both from typed facts, never from the tool
+name:
 
 - The call (`AuthorizationOperation::Tool`). Its plan's single owner target,
   `single_tool_operation_target(plan)`, is
@@ -471,19 +449,12 @@ for the lifetime of the process; they do not provide restart durability.
 ### SQLite persistent sessions
 
 <Note>
-Local macOS tests passed for actual backend custody, independent-process
-exclusion and release, same-file case and symlink aliases, upgrade failures,
-and the authenticated native model-tool-model flow with committed Session,
-input and protected audit. Same-process completed-turn close/reopen and actor
-reconstruction also passed, retaining the current trusted host owners and
-proving that stored effects were not replayed. Fresh authenticated work after
-reopen also passed with distinct input/run/tool IDs, local denial feedback,
-a permitted sibling and protected terminal audit. These results qualify this local
-source on the executed filesystem. Published c18's bounded separate-process
-completed-turn case was run directly; its publication and exact-head CI used
-their recorded test inventories. Other
-platforms, interrupted recovery, persistent administration and performance remain
-separate gates.
+A SQLite composition keeps sessions, accepted inputs, original authority
+associations and protected audit across a process restart. After a completed
+turn, closing the service and reopening the same database reconstructs the
+session actor from its stored Session document under the host's current owners.
+Stored effects are not replayed; fresh work needs current grants, ingress
+authentication and a fresh controller pin.
 </Note>
 
 The facade's `session-store` feature already enables its built-in SQLite stores;
@@ -521,8 +492,8 @@ admission through the operating system; SQLite transaction locks alone do not
 supply execution custody. Ordinary backend opening creates no execution lock
 files. Acquiring a claim requires access to that writable lock namespace.
 
-The physical-lock owner targets macOS, Linux and Windows; each target
-requires its own execution qualification. An ordinary
+The physical-lock owner uses descriptor-scoped operating system locks on macOS,
+Linux and Windows; other platforms refuse. An ordinary
 execution owner requests shared custody; a governed owner requests exclusive
 custody before recovering provider authority or publishing handles. Conflicting
 claims refuse locally through the existing `Busy` class. Unsupported scope and
@@ -537,31 +508,22 @@ custody before returning `Busy`; an uncertain unlock or restoration failure
 retains the admission gate and returns `Unavailable` until the failed claim's
 last owner drops. A failed claim does not become governed authority.
 
-This mechanical owner supplies the construction prerequisite for the existing
-ordinary native mixed-turn fixture. It does not establish persistent controller
-administration, grant revocation or complete credential removal, which remain
-unsupported at their separate native owner seams. The close/reopen
-scenario additionally drops the original service and all backend claims before
-opening new stores, then reconstructs the actor using the same actual trusted
-host owners and the stored Session document. Historical serialized authority
-associations remain audit data. They never bootstrap current grant, ingress or
-controller authority. The fresh-work test additionally retains the actual host
-token vault and verifies its original marked credential through the existing
-status owner. Creating an unrelated empty vault requests credential release;
-it does not reconstruct the current provider authority. The new input uses
-current host grants, ingress authentication and a fresh actor pin, then completes
-the native model-tool-model flow with exact audit and no replay of the old work.
-The later completed-turn cold-process case uses separate writer and reader
-processes with the same SQLite database, a real File token store and stable
-host-configured provider binding. The reader restores the marked credential
-through the existing lifecycle owner, issues new current grants and pins the
-reconstructed actor's actual client before fresh authenticated work. An attempt
-carrying the writer's old grant association passes current ingress authentication
-but is refused by current grant authority before model/tool or durable input
-entry. Reader and parent independently verify the original transcript prefix,
-input row and protected audit remain unchanged. This qualifies that fixed-bearer,
-callback fixture, not interrupted recovery, every credential refresh flow,
-persistent administration, performance acceptance or full surface coverage.
+Controller grant administration over this store holds the store's writer
+through the change; see
+[Remove a permission without removing the controller](#remove-a-permission-without-removing-the-controller).
+To reopen after a completed turn, drop the original service and all backend
+claims before opening new stores; the actor is then reconstructed from the
+stored Session document with the host's actual trusted owners. Historical
+serialized authority associations remain audit data. They never bootstrap
+current grant, ingress or controller authority. Keep the host's actual token
+store: its marked credential is restored through the existing lifecycle owner,
+while an unrelated empty store requests credential release and does not
+reconstruct the current provider authority. Fresh work after reopening uses
+current host grants, ingress authentication and a fresh controller pin, and
+does not replay the old work. An input carrying an earlier process's grant
+association passes current ingress authentication but is refused by current
+grant authority before model, tool or durable input entry; the original
+transcript prefix, input row and protected audit stay unchanged.
 
 The low-level equivalent is
 `MeerkatMachine::persistent_with_local_grant_authorization(runtime_store, Some(blob_store), owners)?`.
@@ -638,8 +600,9 @@ use the normal credential lifecycle, not a fabricated Ready flag.
 
 ## Remove a permission without removing the controller
 
-For a storeless machine, use the existing native custody accessor before grant
-revocation. This excerpt assumes the same actual `machine` and `grants` owner,
+Use the native custody accessor before grant revocation, on a storeless machine
+or one over the actual InMemory or SQLite runtime store. This excerpt assumes
+the same actual `machine` and `grants` owner,
 an authenticated administrative `PrincipalRef` named `administrator`, and the
 exact issued `GrantLineageRef` named `grant_to_remove`. Propagate both typed
 custody and grant errors:
@@ -658,12 +621,10 @@ remove the controller. A terminal input can still belong to an unfinished run;
 its original contributor continues to protect that controller.
 
 Busy or unsupported custody is public `ControllerCustodyRefusal::Unavailable`,
-without a permission verdict. The published checkpoint supports storeless
-administration. Candidate `8fe1abcd5` adds SQLite and InMemory store custody:
-the native owner holds the actual store writer and retained original-work
-observations through the change. Those new administration paths and their
-regressions have not been compiled or executed. Completed-turn reopen alone
-does not qualify administrative mutation.
+without a permission verdict. Over an InMemory or SQLite runtime store the
+custody also retains the store's writer and observes stored inputs as well as
+every attached native driver through the change; stored authority it cannot
+decode refuses the mutation until recovery.
 Do not replace the guard with a catalog listing, serialized association or a
 caller-owned assertion of no unfinished work. A host sharing grants with another
 machine or detached owner must include that additional scope in actual custody.
@@ -840,14 +801,6 @@ need a wildcard arm, `Refused` patterns without `..` need the `read` field, and
 
 ## Append external context under current permissions
 
-<Note>
-These APIs are part of source candidate `8fe1abcd5`. The native control path and
-its tests have not been compiled or executed. Concrete Mob, LiveResponses and job
-producer integration remains in progress; a raw governed notification currently
-returns authorization unavailable. This section describes the host contract,
-not completed activation of those producers.
-</Note>
-
 External context needs authority for the exact source and destination as well
 as permission to invoke the control. A `source` annotation, session ID or previous
 run is insufficient. The trusted producer supplies a process-only receipt from
@@ -894,15 +847,6 @@ a persistence failure remains infrastructure failure. Preserve the actual
 result and any settlement error rather than inferring delivery from a log line.
 
 ## Settle job delivery recipients independently
-
-<Note>
-The recipient APIs and projector integration below are candidate source.
-Canonical generated integration is included; executable qualification is pending.
-They implement
-the [local permission and refusal contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-local-governed-default.md),
-without establishing authorization for a producer that has not supplied its
-actual owner-bound evidence.
-</Note>
 
 `JobRuntimeDeliveryApplier` derives the complete recipient manifest from the
 unchanged committed producer payload, including legacy/default-origin targets.
@@ -1037,6 +981,9 @@ let setup = GovernedJsonlSetup {
     mcp_attachment_identity_key_custody: None,
     session_binder: None,
     connector_authority: None,
+    operation_review: None,
+    consent: None,
+    host_confinement: meerkat::HostConfinement::trusted_host(),
 };
 serve_governed_jsonl(reader, writer, setup).await?;
 ```
@@ -1075,64 +1022,30 @@ infrastructure failure and post-effect settlement remain distinct, as described
 below. A later cleanup or settlement failure does not authorize repeating an
 effect.
 
-This first slice supports deferred create, turn execution, callback replies and
+This profile supports deferred create, turn execution, callback replies and
 necessary initialization/cancellation protocol. Dynamic tool registration,
 configuration changes, cold/restarted sessions, public history/observation and
 MCP setup are outside it. For this uncommissioned recipe the constructor rejects
 an MCP-enabled build: it admits one only for a connection commissioned for live
 MCP attachment, and setting the identity-key custody does not commission one. It
 also rejects configurations enabling skills, hooks, built-in tools, shell, comms,
-mobs, scheduling, workgraphs, model fallback or a system-prompt file. Broader
-transport, SQLite/recovery, policy-administration and full ADR coverage remain
-pending.
+mobs, scheduling, workgraphs, model fallback or a system-prompt file.
 
-The focused fixture requires the non-MCP feature profile:
+## Submit governed work from a Console host
 
-```bash
-./scripts/repo-cargo test --locked -p meerkat-rpc --lib \
-  --no-default-features --features local-authorization \
-  governed_jsonl::tests:: -- --test-threads=1
-```
-
-The fixture uses a loopback provider to check authenticated ingress, two model
-requests and one allowed read callback, with zero denied-delete callbacks. It
-also checks retained seed/context/controller ownership, committed audit and the
-saved transcript. These fixture checks do not establish live-provider coverage.
-
-## Acceptance boundary for a Console host adapter
-
-A governed Console submission adapter is still required. A compatible native
-dependency and `local-authorization` feature are prerequisites; enabling them
-or Console access does not commission native owners. Keep the same governed
-bundle, session service, machine and attached controller described above.
-
-Implement this handoff with tests in the existing Console send and native ingress
-modules, after declaring the missing host adapter with unsupported behavior:
-
-1. Thread trusted identity to final admission. Keep `console_send_handler`'s
-   authenticated `agent.send` check, then carry the host-qualified requester,
-   ingress actor, represented subject and authentication evidence through
-   `dispatch_message_to_resolved_member` to the final member input. The browser
-   cannot supply these facts. Obtain the actual actor's controller pin and bind
-   the final input using `NativeIngressContext`, as in `GovernedConnection::bind`.
-   Assert the exact runtime, input, identities and pin seen by native owners;
-   mismatched or missing facts must refuse before model or tool entry.
-2. Exercise a real denied operation alongside a permitted sibling. Extend the
-   existing Console send fixture with the commissioned native owners and a
-   loopback model, retaining the fixed JSONL fixture's real callback, second
-   model-request, transcript and audit assertions. Require zero denied body
-   entries, the permitted result, model-visible refusal and later completion.
-   Transport the actual owner events through SDK and Console projection;
-   decoded synthetic packets alone do not establish this path.
-3. Preserve acceptance and repair boundaries. Extend the existing send-attempt
-   tests for a native input refusal or readiness failure after Console reservation:
-   settle the reserved interaction without reporting that nothing was accepted.
-   A generic HTTP 403 currently means pre-dispatch rejection to this UI. A lost
-   acknowledgement remains outcome-unknown under the frozen idempotency key.
-   Keep operation refusal separate from input readiness, and outcome-audit failure
-   separate from the actual effect; neither infrastructure failure authorizes
-   replaying an effect. Persistent grant or credential administration remains
-   outside this adapter's supported scope.
+Console access controls (Meta's console ABAC) do not commission native owners,
+and neither does a native dependency with `local-authorization` enabled. A host
+that submits governed work from its own UI keeps the governed bundle, session
+service, machine and attached controller described above. It carries the
+host-qualified requester, ingress actor, represented subject and authentication
+evidence from its authenticated send check to the final native input through
+`NativeIngressContext`, as `GovernedConnection` does for JSONL. The browser
+cannot supply these facts, and missing or mismatched facts must refuse before
+model or tool entry. After a native input refusal or readiness failure, settle
+the reserved interaction without reporting that nothing was accepted. Keep
+operation refusal separate from input readiness, and outcome-audit failure
+separate from the actual effect; neither infrastructure failure authorizes
+replaying an effect.
 
 ## Preserve the result and test the actual effect
 
@@ -1159,29 +1072,19 @@ successful effect does not authorize repeating it. Use native input audit
 records for this process-lifetime path. With the persistent composition, the
 normal session/input commits retain the original association and ordered audit
 alongside the committed transcript. Keep authorization checks local and persist
-observations through these existing commit boundaries. This does not prove
-crash-safe recovery.
+observations through these existing commit boundaries.
 Route controller grant/policy removal and credential maintenance through their
-custody-aware owners so unfinished work retains its controller. Persistent
-controller/grant administration in candidate `8fe1abcd5` still requires its own
-executed acceptance; memory-backed admission does not establish that evidence.
+custody-aware owners so unfinished work retains its controller.
 
 The repository fixture
 `crates/meerkat-authorization/tests/native_governed_loop/e1_policy_control.rs`
 shows the complete factory, native admission, loopback HTTP and tool path. Its
-E1/E3 cases distinguish refusal before body entry from diagnostics after an
-effect. The A2/A3/A8 children cover resource-specific permissions, queued work and
-requester revocation. These are deterministic fixtures, not live model or full
-ADR acceptance. The `e1_policy_control/stock_persistent.rs` child exercises the
-stock bundle/service/executor with a committed Session document, native input
-and audit readback. QJ r3 passed all 11 native cases, including six opt-in cases,
-on the tested tree above; candidate and adjacent-owner checks totalled 132
-distinct passing tests from 145 executions. This bounded gate includes the
-actual stock persistent turn and early rejection of the unsupported mixed
-composition. It does not establish release, SQLite, restart, stock transport
-activation, full ADR coverage or performance. For an application, require zero
-forbidden body entries, one permitted effect, the same admitted run's feedback
-and normal completion.
+cases distinguish refusal before body entry from diagnostics after an effect
+and cover resource-specific permissions, queued work and requester revocation;
+the `e1_policy_control/stock_persistent.rs` child uses the stock
+bundle/service/executor with a committed Session document, native input and
+audit readback. For an application, require zero forbidden body entries, one
+permitted effect, the same admitted run's feedback and normal completion.
 
 Read the broader [integration contract](/guides/authorization-integration) and
 [authorization concepts](/concepts/authorization) before extending the protected
