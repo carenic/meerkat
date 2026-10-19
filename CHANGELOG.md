@@ -1084,7 +1084,10 @@ them.
   same occurrences incrementally: the retired base as a
   `session_transcript_retirements` row and rewrite rows for the retained
   generations only, and the synthesized head is the head the migration
-  writes. The in-memory store still refuses such a session typed.
+  writes. A host that reads such a session's head at every committed
+  boundary, like a persistent Meta gateway without a roster, no longer stops
+  accepting work for a member after its fifth compaction. The in-memory store
+  still refuses such a session typed.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved
