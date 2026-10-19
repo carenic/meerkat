@@ -888,6 +888,7 @@ from its content:
 | --- | --- | --- |
 | A content input (a prompt, a peer message, request or lifecycle notice, an external event or a local flow step) whose transcript rows are all `system_notice`, `user` or `injected_context` rows (for example a peer message's comms notice, a text prompt's user row, or a detached job's persisted background-job notice), and whose own turn metadata carries only the handling mode, execution kind, objective and transcript identity | durable | The rows are written into the running turn's transcript after that boundary's tool results and before the next assistant message. The same request and every later request of the run see them, and they commit with the run like tool results. The input is consumed with the run terminal. |
 | A content input carrying any other row (a `system` row), a synthetic refresh-projection notice, turn metadata only a fresh turn can apply, or a directed interaction | follow-up only | Never joins the running turn. |
+| An ordinary continuation that carries a turn append, or a peer response progress notice (inputs with no content row of their own) | request-only | A temporary injected-context row at the tail of exactly one model request; never Session state, and the input is consumed at injection. A continuation steer takes the next open boundary of the running turn (with none open it is normalised to `queue` and runs as one follow-up turn); peer response progress never interrupts a running turn and reaches the next turn that runs. |
 
 Before 0.9.4 a peer message or request steer and a text-only prompt steer were
 request-only: the running turn saw them in exactly one model request and the
@@ -949,7 +950,10 @@ boundary after that one, in the same run. When the run ends first, or a
 boundary refuses the earlier one (for example a structured-output extraction
 boundary), the waiting steers keep their place in the steer lane and the
 follow-up turn delivers them in arrival order, ahead of queued work. Each steer
-is written exactly once.
+is written exactly once. Arrival order holds within each delivery class: a
+follow-up-only steer (for example a directed peer message) admitted before a
+plain peer message still lands after it, because the plain one joins the
+running turn and the directed one takes the follow-up turn.
 
 ### Stopping one run
 

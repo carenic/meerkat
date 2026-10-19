@@ -52,6 +52,59 @@ fn semantics_class_is_durable(
         == Some(crate::ingress_types::LiveBoundaryDeliveryClass::DurableAppend)
 }
 
+/// The disposition of a durable steer that is no longer in the steer lane
+/// once its wait for an earlier durable steer ends, read from the generated
+/// phase as revalidation reads it after a preparation: still queued (in
+/// another lane) takes the queued fallback; staged into or applied by the
+/// current run, consumed by a later one, or resolved without a run is machine
+/// progress that already owns it.
+fn waited_durable_steer_disposition(
+    driver: &DriverEntry,
+    input_id: &InputId,
+) -> Result<LiveBoundaryInputDisposition, RuntimeDriverError> {
+    let current_run_id = driver.current_run_id();
+    let wake_needed = || {
+        current_run_id.is_none() && driver.has_queued_input_outside(std::slice::from_ref(input_id))
+    };
+    let Some(phase) = driver
+        .as_driver()
+        .stored_input_state(input_id)
+        .map(|stored| stored.seed.phase)
+    else {
+        return Ok(LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: wake_needed(),
+        });
+    };
+    let current_run_owns_input =
+        || current_run_id.is_some() && driver.input_last_run_id(input_id) == current_run_id;
+    match phase {
+        InputLifecycleState::Queued => Ok(LiveBoundaryInputDisposition::QueuedFallback),
+        InputLifecycleState::Staged
+        | InputLifecycleState::Applied
+        | InputLifecycleState::AppliedPendingConsumption
+            if current_run_owns_input() =>
+        {
+            Ok(LiveBoundaryInputDisposition::SuccessorClaimed { wake_needed: false })
+        }
+        InputLifecycleState::Consumed
+        | InputLifecycleState::Superseded
+        | InputLifecycleState::Coalesced
+        | InputLifecycleState::Abandoned => Ok(LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: wake_needed(),
+        }),
+        InputLifecycleState::Accepted
+        | InputLifecycleState::Staged
+        | InputLifecycleState::Applied
+        | InputLifecycleState::AppliedPendingConsumption => {
+            Err(RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "durable steer {input_id} left the steer lane while it waited and reached {phase:?} without current-run ownership"
+                ),
+            })
+        }
+    }
+}
+
 enum RetryableLiveBoundaryPreparation {
     Prepared(meerkat_core::lifecycle::CoreBoundaryStageOutput),
     Unavailable { reason: String },
@@ -640,6 +693,29 @@ impl MeerkatMachine {
         let mut durable_work = None;
         let live_boundary_plan = loop {
             let driver = witness.driver.lock().await;
+            if durable_work.is_some()
+                && !driver
+                    .driver_ingress()
+                    .steer_queue()
+                    .iter()
+                    .any(|candidate| candidate == input_id)
+            {
+                // It waited for an earlier durable steer with M released, and
+                // the lane moved on meanwhile: its run ended and the runtime
+                // loop took it into the follow-up run (the loop serves the
+                // steer lane first), or it was queued elsewhere. No boundary
+                // of the run it waited in can take it any more, so it
+                // prepares nothing; the generated phase says who owns it.
+                let disposition = waited_durable_steer_disposition(&driver, input_id)?;
+                drop(driver);
+                tracing::debug!(
+                    session_id = %session_id,
+                    input_id = %input_id,
+                    ?disposition,
+                    "durable steer left the steer lane while it waited; preparing nothing"
+                );
+                return Ok((held_mutation_gate, disposition));
+            }
             let Some(run_id) = driver.current_run_id() else {
                 tracing::debug!(
                     session_id = %session_id,
@@ -673,16 +749,28 @@ impl MeerkatMachine {
             });
             let in_steer_lane = steer_queue.iter().any(|candidate| candidate == input_id);
             if in_steer_lane && candidate_is_durable {
-                let order = ingress.durable_steer_order();
-                let mut settled = std::pin::pin!(order.settled().notified());
+                let work = durable_work
+                    .get_or_insert_with(|| ingress.durable_steer_order().begin(input_id));
+                let mut settled = std::pin::pin!(work.settled().notified());
                 settled.as_mut().enable();
-                let work = durable_work.get_or_insert_with(|| order.begin(input_id));
                 match work.turn(class_head) {
                     crate::driver::ephemeral::DurableSteerTurn::Prepare => {}
                     crate::driver::ephemeral::DurableSteerTurn::Wait => {
                         drop(driver);
                         drop(held_mutation_gate);
                         settled.await;
+                        #[cfg(test)]
+                        {
+                            let test_gate = self
+                                .test_durable_steer_relock_hold
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            if let Some((reached, release)) = test_gate {
+                                let _ = reached.send(());
+                                let _ = release.await;
+                            }
+                        }
                         held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
                         continue;
                     }

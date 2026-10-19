@@ -946,6 +946,96 @@ mod tests {
         }
     }
 
+    /// The transcript a durable in-turn steer leaves when it joins a running
+    /// turn at the boundary after a tool call: the call, its result, the row
+    /// the steer wrote, then the model's next answer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
+        vec![
+            user("start the job"),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "call_1".to_string(),
+                "lookup result".to_string(),
+                false,
+            )]),
+            steer_row,
+            asst("noted"),
+        ]
+    }
+
+    /// Converts `steer_row` after the tool results: the function call, then
+    /// its output with nothing between them, then the steer as a user
+    /// message item of its own, never merged into the call output.
+    fn assert_durable_in_turn_item_order(steer_row: Message, steer_text: &str) {
+        let items = convert_messages(&durable_in_turn_transcript_with(steer_row)).expect("convert");
+        let call_index = items
+            .iter()
+            .position(
+                |item| matches!(item, Item::FunctionCall { call_id, .. } if call_id == "call_1"),
+            )
+            .expect("function_call item");
+        let output_index = items
+            .iter()
+            .position(
+                |item| matches!(item, Item::FunctionCallOutput { call_id, .. } if call_id == "call_1"),
+            )
+            .expect("function_call_output item");
+        assert_eq!(
+            output_index,
+            call_index + 1,
+            "nothing sits between the call and its output"
+        );
+        assert!(
+            matches!(
+                &items[output_index],
+                Item::FunctionCallOutput { output, .. } if !output.contains(steer_text)
+            ),
+            "the steer is never merged into the call output"
+        );
+        let steer = &items[output_index + 1];
+        assert!(
+            matches!(
+                steer,
+                Item::Message {
+                    role: Role::User,
+                    content,
+                    ..
+                } if matches!(
+                    content.as_slice(),
+                    [ContentPart::InputText { text }] if text.contains(steer_text)
+                )
+            ),
+            "the steer's row directly follows the call output as a user message: {steer:?}"
+        );
+    }
+
+    #[test]
+    fn durable_in_turn_notice_after_tool_results_converts_in_order() {
+        assert_durable_in_turn_item_order(
+            Message::SystemNotice(SystemNoticeMessage::new(
+                SystemNoticeKind::Generic,
+                "background job finished",
+            )),
+            "background job finished",
+        );
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_converts_in_order() {
+        assert_durable_in_turn_item_order(
+            user("also check the second file"),
+            "also check the second file",
+        );
+    }
+
     #[test]
     fn convert_messages_preserves_interleaved_systems_exactly() {
         let messages = vec![

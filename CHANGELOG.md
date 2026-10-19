@@ -124,7 +124,10 @@ them.
   per boundary, in arrival order: a steer admitted while an earlier one still
   waits joins the boundary after it, in the same run, instead of falling back
   to the follow-up turn; steers still waiting when the run ends take the
-  follow-up turn in arrival order.
+  follow-up turn in arrival order. Before, every peer or text steer admitted
+  during one boundary reached the next model request; now one durable steer
+  joins per boundary, and the later ones land at later boundaries of the run
+  or in the follow-up turn.
 
 ### Added
 

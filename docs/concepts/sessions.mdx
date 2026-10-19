@@ -69,7 +69,7 @@ conversational-row anchor and does not change the durable `injected_context`
 before-user rule above. A deferred create cannot carry it because no runtime
 input exists yet; attach it to the eventual turn.
 
-A steer is never request-only: its rows (a prompt's user row, a peer
+A content steer is never request-only: its rows (a prompt's user row, a peer
 message's comms notice, an external event's notice) are written into the
 running turn's transcript at the next model boundary and committed with the
 run, or delivered by exactly one follow-up turn when no boundary opens in time.

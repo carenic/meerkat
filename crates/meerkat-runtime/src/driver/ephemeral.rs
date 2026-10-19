@@ -307,16 +307,18 @@ impl DurableSteerOrder {
             input_id: input_id.clone(),
         }
     }
-
-    /// Notified whenever some durable Steer's work settles. Enable the
-    /// `Notified` before [`DurableSteerWork::turn`] reads the order, so a
-    /// settlement after the read still wakes the wait.
-    pub(crate) fn settled(&self) -> &crate::tokio::sync::Notify {
-        &self.settled
-    }
 }
 
 impl DurableSteerWork {
+    /// Notified whenever some durable Steer's work in this work's own order
+    /// settles. A waiter waits here, not on whatever order its session's
+    /// driver holds now, so it waits on the order its blocker signals.
+    /// Enable the `Notified` before [`Self::turn`] reads the order, so a
+    /// settlement after the read still wakes the wait.
+    pub(crate) fn settled(&self) -> &crate::tokio::sync::Notify {
+        &self.order.settled
+    }
+
     /// Decide this work's next step. `oldest` is the oldest durable Steer in
     /// the steer lane, read under the session mutation gate with this input
     /// still in the lane. `Prepare` makes this work the preparing one.
