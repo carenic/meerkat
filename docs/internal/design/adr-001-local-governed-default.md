@@ -44,7 +44,7 @@ It attributes those observable operations to authenticated actors and retained
 work. These guarantees are enforced at the shared owners, across all surfaces.
 
 It does not claim to track the meaning of information through an LLM. An agent
-can read an allowed Elephant document and reproduce its meaning in a limerick,
+can read an allowed knowledge-service document and reproduce its meaning in a limerick,
 a summary, a tool argument or another message without retaining any reference.
 Document IDs, citations, labels and dependency metadata do not prove that such
 an output contains no protected information. Once information enters a model's
@@ -99,7 +99,7 @@ it when someone else asks it to act. For example, Luka's calendar assistant may
 read availability in selected calendars while event deletion remains forbidden,
 even when Luka and the OAuth token can delete those events.
 
-For Elephant and other services we control, the receiving service authenticates
+For the knowledge service and other services we control, the receiving service authenticates
 the acting agent and represented subject together with their scoped delegation
 and enforces the requested operation there. For an external API that recognizes
 only the user's OAuth account, the trusted connector retains the credential and
@@ -304,9 +304,9 @@ workflow, never hide them inside the cheap default authorization cost. Feedback
 uses native audience-safe outcomes; reviewer rationale is not automatically
 forwarded to a requesting model or every console viewer.
 
-## Elephant and existing applications
+## Knowledge service and existing applications
 
-Elephant remains authoritative for its resource attributes, ABAC and query/fetch
+The knowledge service remains authoritative for its resource attributes, ABAC and query/fetch
 permissions. Its existing authenticated request path must receive the actual
 requester/delegation contract or a deliberately scoped service mandate, and keep
 its own enforcement before returning protected data. Meerkat separately checks
@@ -314,7 +314,7 @@ permission to invoke that source/tool and to communicate over its permitted rout
 Shared qualified identities, operation/resource vocabulary and conformance cases
 connect the two systems; neither imports the other's policy database.
 
-A successful Elephant read is an observable authorized access, not a proof that
+A successful knowledge-service read is an observable authorized access, not a proof that
 later model output is safe. The default does not propagate document labels through
 summaries, memory, compaction or arbitrary generated text. Revoking source access
 prevents later governed reads under the source's actual contract; it cannot make
@@ -433,7 +433,7 @@ Reserve a quiet benchmark window after compilation.
    settlement failure. Preserve existing generated lifecycle owners.
 2. Extend those same checks across every built-in execution mode and surface,
    including live/audio, WASM, memory/history, schedules, hosted tools and
-   Elephant. Test actual sink entry and bypass attempts, not just policy helpers.
+   the knowledge service. Test actual sink entry and bypass attempts, not just policy helpers.
    Test optional mandatory gate placement and edited-action rejection separately
    from its model judgment, including a legitimate gated publication that the
    originating agent cannot perform directly and a queue item missing its
@@ -444,7 +444,7 @@ Reserve a quiet benchmark window after compilation.
    Also exercise the same broad external credential with an allowed selected-
    calendar read, refused deletion, refused account switch and a different caller
    who has no delegation from the credential's owner. Verify receiving-service
-   enforcement for Elephant and connector-local enforcement for opaque APIs.
+   enforcement for the knowledge service and connector-local enforcement for opaque APIs.
 3. Run focused adversarial races/fault cases and cost measurements, obtain the
    four independent bus implementation reviews, and create the PR with green CI.
    Review changes from accepted checkpoints; preserve shared build reservations.

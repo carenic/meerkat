@@ -50,6 +50,6 @@ independently rerun the gateway. Raw state, identity configuration and key files
 are excluded from the accepted export.
 
 The next acceptance trace must add authenticated ingress, real attenuation,
-independently enforcing Elephant reads, exact model release and authorized
+independently enforcing knowledge-service reads, exact model release and authorized
 reply, then prove absence of denied effects under revocation, restart, missing
 evidence and uncertain outcomes. The baseline does not close those cases.

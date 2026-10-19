@@ -25,7 +25,7 @@ Source trees inspected:
 
 - Meerkat integrated source: `(operator-retained path)`.
 - MobKit and console: `(operator-retained path)`.
-- Elephant: `(operator-retained path)`.
+- Knowledge service: `(operator-retained path)`.
 - Documentation: this worktree, especially [authorization concepts](../../concepts/authorization.mdx), [integration guide](../../guides/authorization-integration.mdx), [configuration](../../concepts/configuration.mdx), and [auth bindings](../../concepts/auth-and-bindings.mdx).
 
 The design preserves these observed product idioms:
@@ -92,7 +92,7 @@ Retain the existing Access entry for authorized administrators. Within it, organ
 
 - **Agents and requests**: find an agent, inspect effective access, edit a scoped assignment, inspect scheduled/delegated work.
 - **People and connections**: authenticated people/groups/service identities and separately their connections. Connection detail identifies its credential owner, verified external account when known, consuming agents, and permitted uses.
-- **Rules**: advanced canonical policy authoring, templates, and test cases. Owner-specific editors remain owner-specific; no universal flattening of Elephant ABAC into MobKit rules.
+- **Rules**: advanced canonical policy authoring, templates, and test cases. Owner-specific editors remain owner-specific; no universal flattening of knowledge-service ABAC into MobKit rules.
 
 These are related views of existing owners, not three new registries. A compact installation can present them as sections rather than new navigation levels. Reuse **Approvals** for pending decisions and **Activity** for investigation. Do not add a second Gates inbox or an independent security notification feed.
 
@@ -231,7 +231,7 @@ The UI describes this as **Required review route**, not Data cannot leak. Do not
 Use consistent action/resource language across adapters, while preserving each owner:
 
 - **Tools:** visibility and installation are separate from execution. Explain whole-tool grants when an adapter cannot provide trustworthy resource-level controls. Unknown mutation classification is not read-only. New tools do not silently join a named allowlist.
-- **Sources:** select actual source-owned collections/resources. Elephant's space, clearance, level, labels, handling, subject restrictions, and purpose remain Elephant policy. Meerkat separately controls invocation and delegation. A summary can link to source-admin details, but it must not recalculate Elephant permission. Existing copies in memory, blobs, and history have their own ACL/retention; later revocation does not make the model forget.
+- **Sources:** select actual source-owned collections/resources. The knowledge service's space, clearance, level, labels, handling, subject restrictions, and purpose remain knowledge-service policy. Meerkat separately controls invocation and delegation. A summary can link to source-admin details, but it must not recalculate knowledge-service permission. Existing copies in memory, blobs, and history have their own ACL/retention; later revocation does not make the model forget.
 - **Peers:** use the real identity/topology owner to select who can message or delegate to whom. A displayed edge is not an operation grant. Include helpers, session fork, councils, handoffs, and monitoring copies in the same vocabulary.
 - **Schedules/connectors:** show who commissioned the mandate, what it allows, its lifetime and next occurrence. A schedule is not an invisible permanent owner impersonation. Manual invocation and automatic occurrence use their real retained authority.
 - **Confinement:** present `Tool execution limits` beside the tool/connection. Show required versus supported filesystem, network, local socket/IPC, and process guarantees. Advanced detail identifies the backend and environment. Do not reduce the result to a generic sandbox checkbox. A host-trusted tool is clearly distinguished from an OS-confined tool. Revocation of long-lived worker access reports pending/failed cleanup accurately.
@@ -345,7 +345,7 @@ Names in the Required column describe product contracts to implement; they are n
 | Human consent | The pinned 0.9 foundation has `ApprovalService`, generated lifecycle and RPC-wired `FileApprovalStore`; see the [amendment's source boundary](adr-001-model-review-and-consent.md). Existing MobKit gate inbox remains a separate foundation. | Retained candidate, shared conditional consumption, exact presentation, authenticated decision/late delivery, validity-at-use expiry and real sink integration. Earlier prototype `ActionApprovalHost`/`approval/action.rs` observations are not APIs present at the pinned foundation. Existing gate RPC is not proof of this join. |
 | Audit | Native audit sink, typed observation failures, existing timeline projection. | Reader-authorized queries/explanation/export, explicit retention and durable commit/recovery evidence where claimed. |
 | Confinement | Core typed specification plus platform work in progress. | Backend capability and cleanup projections tied to real launched tool families, and platform validation. |
-| Full application execution | Shared native/tool/provider seams and focused tests. | Same contracts on schedules, peers, memory/history, live/audio, browser/WASM, external tools, persistent/detached work, and Elephant. No UI badge substitutes for those joins. |
+| Full application execution | Shared native/tool/provider seams and focused tests. | Same contracts on schedules, peers, memory/history, live/audio, browser/WASM, external tools, persistent/detached work, and the knowledge service. No UI badge substitutes for those joins. |
 
 Server capability advertisements should distinguish not installed, unavailable, read-only, permitted mutation, and unsupported detail. These are observations, not capabilities that the browser can redeem to bypass a later check. Clear cached scope/approval/account data when the authenticated connection or realm changes. A relevant subscription revocation closes that subscription while leaving the agent's run alone.
 
@@ -372,7 +372,7 @@ This slice is more than a visual status card: it repairs action locality and tru
 
 ### Next coherent vertical slice
 
-Anchor the next real agent configuration flow to the existing calendar read/delete native fixture and its credential/account owner, then extend it to Elephant source integration. It must produce the effective summary, editable scoped clauses, an optional backend preview, a generation-checked save, local refusal, a permitted continuation, and typed reasons with safe audit correlation. Owner-provided summaries and concurrent mutation contracts are prerequisites for the full editor; richer why-rule explanations can follow through an authorized owner query and need not block this first vertical slice. Add a real consent-bound action through the existing approval owner rather than a separate demo queue. Connection selection must be the same selection used by the actual prepared operation and controller.
+Anchor the next real agent configuration flow to the existing calendar read/delete native fixture and its credential/account owner, then extend it to knowledge-service source integration. It must produce the effective summary, editable scoped clauses, an optional backend preview, a generation-checked save, local refusal, a permitted continuation, and typed reasons with safe audit correlation. Owner-provided summaries and concurrent mutation contracts are prerequisites for the full editor; richer why-rule explanations can follow through an authorized owner query and need not block this first vertical slice. Add a real consent-bound action through the existing approval owner rather than a separate demo queue. Connection selection must be the same selection used by the actual prepared operation and controller.
 
 ### Completion coverage
 
@@ -386,7 +386,7 @@ The same pattern must cover every row below; special modes may alter presentatio
 | Streaming, live audio, browser/WASM | Same source/action permission and real output destination; no per-chunk authorization UI or global voice/session error for ordinary denial. Unsupported host guarantees are explicit. |
 | Delegation, helpers, forks, councils, peers | Original requester/mandate retained, children narrow, receiver permissions conjoin, no proxy confused-deputy route. |
 | Schedules, connectors, detached/persistent work | Commissioning mandate, real recovery association/controller, current checks each occurrence/entry, truthful uncertainty and retention. |
-| Memory, history, blobs, search and export | Actual resource reader/writer checks and audience-safe result explanations, including Elephant enforcement. No semantic propagation claims. |
+| Memory, history, blobs, search and export | Actual resource reader/writer checks and audience-safe result explanations, including knowledge-service enforcement. No semantic propagation claims. |
 | Shell, MCP, hooks, package/bootstrap and brokers | Real capability/confined-launch status, exact consent where selected, no hidden trusted fallback, cleanup after changes. |
 
 ## Accessibility and test plan
@@ -429,7 +429,7 @@ Root reviewed the complete r1 document at SHA-256 `f23702b1a6718d9be3e4ee384b867
 
 1. **Product model:** the effective agent/request view answers who is asking, what the agent may do, which account it uses, and why an action was refused. Connection setup, particular-action consent, and activity remain distinct, linked experiences. No future endpoint or permission producer is fabricated in the browser.
 2. **First implementation:** typed local feedback and honest administration of existing Console access. The separate implementation agent owns the console and tests; this document's author independently reviews the resulting candidate. The existing MobKit gating UI retains its actual owner and semantics. It must not claim the new native exact-action consent delivery, consumption, or execution behavior.
-3. **Next native configuration slice:** start from the existing calendar read/delete native fixture and credential/account owner, then integrate Elephant sources. The full editor requires actual owner summaries and concurrency-safe mutation contracts, not client reconstruction of effective permission. Rich determining-rule explanations remain a later owner-backed drill-down; typed reason and safe audit correlation are sufficient initially.
+3. **Next native configuration slice:** start from the existing calendar read/delete native fixture and credential/account owner, then integrate knowledge-service sources. The full editor requires actual owner summaries and concurrency-safe mutation contracts, not client reconstruction of effective permission. Rich determining-rule explanations remain a later owner-backed drill-down; typed reason and safe audit correlation are sufficient initially.
 4. **Sequencing:** shared Rust expansion follows the current audit checkpoint. This ordering does not defer or remove the full target scope, including the completion coverage matrix, native consent, recovery, and all execution modes.
 
 These are accepted implementation design decisions, not a request for the end user to re-approve the already authorized security work. Source, executed tests, browser validation, and backend integration still require their own evidence. Acceptance of a wireflow is not acceptance of a working deployment.
@@ -467,6 +467,6 @@ The following are observed source locations, not a promise that the same APIs ar
 | Exact-action consent | Historical research used prototype `crates/meerkat-core/src/approval/action.rs:1-207`; the [0.9 amendment](adr-001-model-review-and-consent.md) records the pinned `approval.rs` foundation and missing integration. |
 | Infrastructure distinction and observation | Meerkat `crates/meerkat-core/src/authorization/audit.rs`, `error.rs`, `crates/meerkat-llm-core/src/http.rs` |
 | Platform requirement data | Meerkat `crates/meerkat-core/src/confinement.rs`, `crates/meerkat-sandbox/` and the separate platform validation plans |
-| Elephant's retained ABAC and identity mapping | Elephant `crates/policy/src/engine.rs:1-205`, `crates/auth/src/claims.rs`, `crates/auth/src/identity.rs:100-154` |
+| The knowledge service's retained ABAC and identity mapping | Knowledge service `crates/policy/src/engine.rs:1-205`, `crates/auth/src/claims.rs`, `crates/auth/src/identity.rs:100-154` |
 
 Configuration precedence is not permission precedence. Final implementation review must verify the concrete joined owners and advertised surface contract, rather than copying a screen from this proposal into a second source of policy truth.

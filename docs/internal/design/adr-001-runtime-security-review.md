@@ -11,7 +11,7 @@ are retained below; design clearance is not implementation acceptance.
 
 ## Artifacts and method
 
-The author inspected PR #1333 and pinned Meerkat, MobKit and Elephant source
+The author inspected PR #1333 and pinned Meerkat, MobKit and knowledge-service source
 baselines recorded in the ADR. Independent reviewers were instructed to seek
 concrete counterexamples, cite the violated authority or information contract,
 and distinguish missing architecture from deferred implementation detail.
@@ -44,7 +44,7 @@ that the current code implements the proposed controls.
 | --- | --- | --- |
 | Authority, lifecycle, revocation and audit | RED | Archived |
 | Identity, information flow and bypass paths | GREEN with precision improvements | Archived |
-| Elephant policy compatibility and federation | RED | Archived |
+| Knowledge-service policy compatibility and federation | RED | Archived |
 
 | Finding | Revision in r2 |
 | --- | --- |
@@ -53,7 +53,7 @@ that the current code implements the proposed controls.
 | A3: policy activation and rollback had no singular owner | Assign one domain authority, durable monotonic activation epochs, immutable revision content and authorized rollback as a new activation. |
 | A4: wording allowed a silently unaudited governed profile | Make durable evidence mandatory in governed; persist and negotiate the profile, and refuse unsupported bootstrap, restore or handoff. |
 | E1: immutable source revision could outlive current restriction or deletion | Require current security state for every transitive dependency or a covering bounded lease. Historical evidence is not fresh authority; deletion revokes retained use absent an explicit surviving grant. |
-| E2: pure requester-read intersection breaks Elephant's privileged wiki service | Specify authorized commissioning and an independent bounded service mandate, preserving causal requester and actor without granting direct access to private intermediates. Publication remains separately authorized. |
+| E2: pure requester-read intersection breaks the knowledge service's privileged wiki service | Specify authorized commissioning and an independent bounded service mandate, preserving causal requester and actor without granting direct access to private intermediates. Publication remains separately authorized. |
 | E3: generic empty-scope rule breaks the subjectless waiver predicate | Preserve None versus Some(empty), named-subject checks, explicit record waiver plus caller clearance, and contributor-wide validity of the permission-bearing exception. |
 | E4: security metadata can itself disclose denied sources or people | Separate protected control envelopes from recipient-visible projections; metadata release requires its own authorization. |
 | N1-N3: explicit ancestor validity, provider-held context and conservative dependency attribution | Require live validity of all necessary grant ancestors, include remote model caches/sessions, and carry the complete observed/control-influencing context into derived outputs. |
@@ -67,7 +67,7 @@ tests are implementation obligations, not tests executed for this document.
 | --- | --- | --- |
 | Authority, lifecycle, revocation and audit | GREEN; A1-A4 retired | Archived |
 | Identity, information flow and bypass paths | GREEN; N1-N3 closed | Archived |
-| Elephant policy compatibility and federation | GREEN; E1-E4 closed | Archived |
+| Knowledge-service policy compatibility and federation | GREEN; E1-E4 closed | Archived |
 
 ## Subagent round 3
 
@@ -130,7 +130,7 @@ evidence-pending state in the existing generated owner. The later exact-candidat
 
 The draft also incorporates source-service disclosure limits, cross-process
 incarnation fencing, receipt group commit, performance budgets and the existing
-generator/WASM compatibility requirements. Independent Elephant fixes remain
+generator/WASM compatibility requirements. Independent knowledge-service fixes remain
 identified follow-up work; this documentation task does not apply them.
 
 ### Downstream-app findings and draft r3 dispositions
@@ -229,14 +229,14 @@ The final delta resolves downstream-app N5 and D1 from its r4 review
 and subsequent clarification, the GCP lead's domain clarification,
 and the operator deployment's profile-applicability precision. Domains are determined for each
 canonical authority and its state. A handle exposing Meerkat-owned grant state
-must use its owner-side fence, while Elephant can retain independent resource
+must use its owner-side fence, while the knowledge service can retain independent resource
 policy and entry authority when it consumes that grant. Reachable governed
 behavior determines profile obligations. The matrix now contains 19 Core and
 13 Profile cases, with explicit admission, destination and domain tests.
 
 The final internal delta review is GREEN
 on both r6 hashes. It initially found that service-wide wording could collapse
-Elephant's independent authority merely because it consumes a Meerkat parent
+the knowledge service's independent authority merely because it consumes a Meerkat parent
 grant. The author applied the fact-scoped repair and the reviewer verified
 closure against the final bytes; both the finding and closure are preserved.
 

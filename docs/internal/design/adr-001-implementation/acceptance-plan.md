@@ -66,7 +66,7 @@ uninstrumented cost results or establish the acceptance gates.
   `codex/security-authorization-adr` at `b4ecf8a10` after the reviewed-document
   checkpoint `f64890fe9`.
 - MobKit inspected base: `e2795b5dbbabe224e2e912256d7b99e480b5c9c9`.
-- Elephant inspected base: `1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a`.
+- Knowledge service inspected base: `1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a`.
 - Existing release branches and production deployments are outside this change.
   The lead requested PRs to main, outside the 0.8.50 release batch.
 - Runtime implementation is opt-in through a governed Cargo feature. The
@@ -90,7 +90,7 @@ be a second work-execution authority.
    live-session work before changing its shared catalog.
 3. Implement feature-owned contract, policy/grant and receipt semantics plus
    actual existing-owner enforcement. Preserve domain policy ownership and
-   independently versioned wire/conformance contracts with Elephant.
+   independently versioned wire/conformance contracts with the knowledge service.
 4. Implement and execute the governed end-to-end slice, then cover every other
    required operation, transport, store, sink and reachable deployment behavior.
    Unsupported initial profiles refuse before effects; this does not remove
@@ -164,7 +164,7 @@ source review nor early refresh closes this item.
 - Requirement inventory with exact requirement-to-source/test mapping and
   explicit missing/incomplete status, including each Core/Profile table row.
 - Native causal tracer, real process restart and sink transcripts.
-- Protocol vectors and Elephant differential results.
+- Protocol vectors and knowledge-service differential results.
 - Race/fault tests and TLC evidence from the same catalog used by production.
 - Latency, throughput, restart and pressure measurements on both host classes.
 - Feature-off, wasm32, schema/codegen, source-break and store-conformance checks.
