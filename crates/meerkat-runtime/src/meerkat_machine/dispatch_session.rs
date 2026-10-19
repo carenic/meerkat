@@ -1591,7 +1591,7 @@ impl MeerkatMachine {
             compaction_runtime_binding,
             allow_late_compaction_binding,
             Arc::clone(&runtime_authority),
-            registration,
+            registration.clone(),
             agent_binding,
             tool_surface_gate,
             mcp_observation,
@@ -1610,6 +1610,10 @@ impl MeerkatMachine {
             || !Arc::ptr_eq(&entry.tool_visibility_owner, &tool_visibility_owner)
             || !Arc::ptr_eq(&entry.dsl_authority, &dsl_authority_shared)
             || !Arc::ptr_eq(&entry.handle_teardown_gate, &handle_teardown_gate)
+            // The bindings are published only to the exact registration they
+            // were assembled for: the entry whose mutation gate the witness
+            // names, never a later registration of the same session.
+            || !registration.matches_entry(entry)
         {
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
