@@ -25,6 +25,11 @@
 //!   shape, duplicate rows, non-positive versions) is refused typed, never
 //!   healed.
 //! - [`json_column`]: the TEXT-or-BLOB tolerant JSON column codec.
+//! - [`lock_profile`]: the process-wide lock profile of the bundled SQLite:
+//!   the one declared `LIBSQLITE3_FLAGS` value that turns off its three
+//!   process-wide mutexes, a read of the profile the process actually runs
+//!   with, and the runtime allocator-statistics switch host binaries call
+//!   first in `main`.
 //! - [`fence`]: the per-operation maintenance-fence guards. Store operations
 //!   take a shared guard; offline migration takes the exclusive side and
 //!   waits for in-flight operations to drain. Stores built on this crate hold
@@ -52,6 +57,7 @@ pub mod error;
 pub mod fence;
 pub mod json_column;
 pub mod ledger;
+pub mod lock_profile;
 pub mod profile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod watch;
@@ -71,6 +77,11 @@ pub use ledger::{
     SchemaPredecessor, apply_domain_migrations, bridge_unledgered_domain, domain_version,
     preflight_domain_version, preflight_schema_eligibility, verify_released_schema_fingerprint,
     verify_released_schema_structure,
+};
+pub use lock_profile::{
+    MemoryStatisticsOutcome, REQUIRED_LIBSQLITE3_FLAGS, SqliteLockProfile,
+    SqliteLockProfileMismatch, check_lock_profile, disable_memory_statistics_at_process_start,
+    memory_statistics_outcome,
 };
 pub use profile::{
     ConnectionProfile, DatabaseFileIdentity, JournalPolicy, OpenOptions, SHARED_BUSY_TIMEOUT,

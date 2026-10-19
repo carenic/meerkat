@@ -184,6 +184,26 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat-sqlite`: the `lock_profile` module, the one declaration of the
+  bundled SQLite's lock profile. `REQUIRED_LIBSQLITE3_FLAGS` is the build
+  setting that turns SQLite's three process-wide locks off (see Changed);
+  `SqliteLockProfile::compiled()` and `effective()` read which locks the
+  process runs with, and `check_lock_profile()` refuses with
+  `SqliteLockProfileMismatch`, naming the setting, when one is on.
+  `disable_memory_statistics_at_process_start()`, an `unsafe fn` for the
+  first statement of `main`, turns allocator statistics off in a build
+  without the setting and records its `MemoryStatisticsOutcome` (`Applied`,
+  `AlreadyOff`, or `TooLate` when SQLite was already in use;
+  `memory_statistics_outcome()` reads it). The first connection
+  `meerkat-sqlite` opens in a process logs a warning naming the setting when
+  a lock is on.
+- `rkat storage doctor` reports the SQLite lock profile of its binary:
+  `StorageDiagnosis::sqlite_lock_profile` (`SqliteLockProfileReport` in
+  `meerkat-core`, with the allocator-statistics switch's
+  `SqliteMemoryStatisticsSwitch`), the `sqlite_lock_profile` object of
+  `--json`, a line of the text report, and the warning finding
+  `sqlite-lock-profile` when a lock is on. The disk diagnosis
+  (`DiskStorageMigrator`) fills it; other diagnosers leave it out.
 
 ### Changed
 
@@ -227,6 +247,24 @@ them.
   opt-in `turn_projection_cost` benchmarks (ignored timing tests in
   `meerkat-runtime` and `meerkat`) a snapshot read takes about 25% less time
   and a whole scripted turn with three tool calls about 23% less.
+- The bundled SQLite is built without its three process-wide locks:
+  allocator statistics, one page cache shared by every connection, and
+  page-cache overflow statistics. Each put a mutex in front of every
+  connection in the process, so concurrent sessions in one host queued on
+  each other: sixteen threads that each opened their own database opened
+  fewer connections per second together than one thread alone. The
+  repository builds set `LIBSQLITE3_FLAGS` to
+  `meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS`
+  (`-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT
+  -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS`): Cargo through
+  `.cargo/config.toml` (forced over a value in the environment) and Bazel
+  through `MODULE.bazel`. Nothing Meerkat calls reads what the locks provided
+  (SQLite's memory statistics, heap limits and `sqlite3_release_memory`). A
+  build outside the repository (`cargo install rkat`, an application that
+  embeds Meerkat) sets the variable itself; see "SQLite Lock Profile" in the
+  deploying guide. Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`,
+  `rkat-mcp`, `rkat-mob-mcp`) turns allocator statistics off as the first
+  statement of `main`, which removes that lock even without the variable.
 
 ### Fixed
 

@@ -110,6 +110,10 @@ mod app {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> std::process::ExitCode {
+    // SAFETY: the first statement of main: no other thread exists yet and
+    // nothing has used SQLite, as the switch requires.
+    #[allow(unsafe_code)]
+    let _ = unsafe { meerkat_sqlite::disable_memory_statistics_at_process_start() };
     // One documented worker-stack budget and worker-count knob for every host
     // binary (`meerkat_runtime::host_stack`); the main future runs on a
     // budgeted thread too, not the platform main thread.

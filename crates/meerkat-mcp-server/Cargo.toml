@@ -33,6 +33,7 @@ meerkat-mob-mcp = { workspace = true, optional = true }
 meerkat-tools = { workspace = true }
 meerkat-comms = { workspace = true, optional = true }
 meerkat-runtime = { workspace = true }
+meerkat-sqlite = { workspace = true }
 async-trait = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 serde = { workspace = true, features = ["derive"] }

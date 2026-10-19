@@ -2030,6 +2030,7 @@ dependencies = [
  "meerkat-mob",
  "meerkat-runtime",
  "meerkat-session",
+ "meerkat-sqlite",
  "schemars",
  "serde",
  "serde_json",

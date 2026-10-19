@@ -59,15 +59,18 @@ use async_trait::async_trait;
 use meerkat_core::SessionId;
 use meerkat_core::session::TRANSCRIPT_HISTORY_FORMAT_CURRENT;
 use meerkat_core::storage_diagnostics::{
-    DatabaseInventory, DiagnoseScope, FindingSeverity, StorageDiagnosis, StorageDiagnosticsError,
-    StorageFinding, StorageInventoryEntry, StorageMigrator,
+    DatabaseInventory, DiagnoseScope, FindingSeverity, SqliteLockProfileReport,
+    SqliteMemoryStatisticsSwitch, StorageDiagnosis, StorageDiagnosticsError, StorageFinding,
+    StorageInventoryEntry, StorageMigrator,
 };
 use meerkat_core::{
     BlobId, ContentBlock, Message, REALM_MANIFEST_FILE_NAME, SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
     Session, SessionMeta, SystemNoticeBlock, sanitize_realm_id,
     validate_current_persisted_transcript_history_slice,
 };
-use meerkat_sqlite::JsonColumnBytes;
+use meerkat_sqlite::{
+    JsonColumnBytes, MemoryStatisticsOutcome, SqliteLockProfile, SqliteLockProfileMismatch,
+};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 
@@ -170,6 +173,10 @@ pub const FINDING_STORAGE_CENSUS_UNMEASURED: &str = "storage-census-unmeasured";
 /// An existing JSONL session-index projection does not match the canonical
 /// per-session JSONL files from which it is rebuildable.
 pub const FINDING_JSONL_SESSION_INDEX_DIVERGED: &str = "jsonl-session-index-diverged";
+/// The diagnosing process runs SQLite with at least one process-wide lock
+/// ([`StorageDiagnosis::sqlite_lock_profile`] says which), so concurrent
+/// connections in a process built the same way queue on it.
+pub const FINDING_SQLITE_LOCK_PROFILE: &str = "sqlite-lock-profile";
 
 /// Cap on individually reported dangling blob references per database; the
 /// remainder is summarized in one finding so doctor stays usable on huge
@@ -278,7 +285,9 @@ pub async fn diagnose_disk_roots(scope: &DiagnoseScope) -> StorageDiagnosis {
 /// The disk implementation of the [`StorageMigrator`] diagnose seam.
 ///
 /// Deliberately a dumb unit struct delegating to [`diagnose_disk_roots`]:
-/// the Phase 4 `RealmStorageProvider` returns it from `migrator()`.
+/// the Phase 4 `RealmStorageProvider` returns it from `migrator()`. It adds
+/// what no root holds: the SQLite lock profile of this process, whose
+/// SQLite the disk stores run on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiskStorageMigrator;
 
@@ -288,7 +297,43 @@ impl StorageMigrator for DiskStorageMigrator {
         &self,
         scope: &DiagnoseScope,
     ) -> Result<StorageDiagnosis, StorageDiagnosticsError> {
-        Ok(diagnose_disk_roots(scope).await)
+        let mut diagnosis = diagnose_disk_roots(scope).await;
+        record_sqlite_lock_profile(
+            &mut diagnosis,
+            SqliteLockProfile::effective(),
+            meerkat_sqlite::memory_statistics_outcome(),
+        );
+        Ok(diagnosis)
+    }
+}
+
+/// Report `effective` (with what the allocator-statistics switch found), and
+/// warn with the build setting that fixes it when it is not the required
+/// profile.
+fn record_sqlite_lock_profile(
+    diagnosis: &mut StorageDiagnosis,
+    effective: SqliteLockProfile,
+    switch: Option<MemoryStatisticsOutcome>,
+) {
+    let mut report = SqliteLockProfileReport::new(
+        effective.memory_statistics,
+        effective.shared_page_cache,
+        effective.page_cache_overflow_statistics,
+    );
+    if let Some(switch) = switch {
+        report = report.with_memory_statistics_switch(match switch {
+            MemoryStatisticsOutcome::Applied => SqliteMemoryStatisticsSwitch::Applied,
+            MemoryStatisticsOutcome::AlreadyOff => SqliteMemoryStatisticsSwitch::AlreadyOff,
+            MemoryStatisticsOutcome::TooLate => SqliteMemoryStatisticsSwitch::TooLate,
+        });
+    }
+    diagnosis.sqlite_lock_profile = Some(report);
+    if !effective.is_required() {
+        diagnosis.findings.push(StorageFinding::new(
+            FindingSeverity::Warning,
+            FINDING_SQLITE_LOCK_PROFILE,
+            SqliteLockProfileMismatch { effective }.to_string(),
+        ));
     }
 }
 
@@ -2902,6 +2947,100 @@ mod tests {
 
     fn codes(diagnosis: &StorageDiagnosis) -> Vec<&str> {
         diagnosis.findings.iter().map(|f| f.code.as_str()).collect()
+    }
+
+    /// The disk diagnosis reports this process's SQLite lock profile,
+    /// whatever the roots hold (an absent root here), and warns exactly when
+    /// the profile is not the required one.
+    #[tokio::test]
+    async fn disk_diagnosis_reports_this_process_sqlite_lock_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let diagnosis = DiskStorageMigrator
+            .diagnose(&scope(&[&temp.path().join("missing")]))
+            .await
+            .unwrap();
+        let effective = SqliteLockProfile::effective();
+        assert_eq!(
+            diagnosis.sqlite_lock_profile,
+            Some(SqliteLockProfileReport::new(
+                effective.memory_statistics,
+                effective.shared_page_cache,
+                effective.page_cache_overflow_statistics,
+            )),
+            "this test process never calls the allocator-statistics switch"
+        );
+        let warnings = diagnosis
+            .findings
+            .iter()
+            .filter(|finding| finding.code == FINDING_SQLITE_LOCK_PROFILE)
+            .count();
+        assert_eq!(
+            warnings,
+            usize::from(!effective.is_required()),
+            "{diagnosis:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_lock_profile_outside_the_required_one_is_a_warning_naming_the_fix() {
+        let mut required = StorageDiagnosis::default();
+        record_sqlite_lock_profile(
+            &mut required,
+            SqliteLockProfile::REQUIRED,
+            Some(MemoryStatisticsOutcome::AlreadyOff),
+        );
+        assert!(required.findings.is_empty(), "{required:?}");
+        assert_eq!(
+            required.sqlite_lock_profile,
+            Some(
+                SqliteLockProfileReport::new(false, false, false)
+                    .with_memory_statistics_switch(SqliteMemoryStatisticsSwitch::AlreadyOff)
+            )
+        );
+
+        let mut shared = StorageDiagnosis::default();
+        let profile = SqliteLockProfile {
+            shared_page_cache: true,
+            page_cache_overflow_statistics: true,
+            ..SqliteLockProfile::REQUIRED
+        };
+        record_sqlite_lock_profile(&mut shared, profile, Some(MemoryStatisticsOutcome::Applied));
+        assert_eq!(
+            shared.sqlite_lock_profile,
+            Some(
+                SqliteLockProfileReport::new(false, true, true)
+                    .with_memory_statistics_switch(SqliteMemoryStatisticsSwitch::Applied)
+            )
+        );
+        assert_eq!(shared.findings.len(), 1, "{shared:?}");
+        let finding = &shared.findings[0];
+        assert_eq!(finding.code, FINDING_SQLITE_LOCK_PROFILE);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert!(
+            finding.message.contains(&format!(
+                "LIBSQLITE3_FLAGS=\"{}\"",
+                meerkat_sqlite::REQUIRED_LIBSQLITE3_FLAGS
+            )),
+            "{finding:?}"
+        );
+        assert!(!shared.has_errors());
+
+        let mut too_late = StorageDiagnosis::default();
+        record_sqlite_lock_profile(
+            &mut too_late,
+            SqliteLockProfile {
+                memory_statistics: true,
+                ..SqliteLockProfile::REQUIRED
+            },
+            Some(MemoryStatisticsOutcome::TooLate),
+        );
+        assert_eq!(
+            too_late
+                .sqlite_lock_profile
+                .and_then(|report| report.memory_statistics_switch),
+            Some(SqliteMemoryStatisticsSwitch::TooLate)
+        );
+        assert_eq!(codes(&too_late), [FINDING_SQLITE_LOCK_PROFILE]);
     }
 
     const SESSIONS_DDL: &str = "CREATE TABLE sessions (

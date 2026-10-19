@@ -238,6 +238,7 @@ pub fn open_with(
     profile: ConnectionProfile,
     options: OpenOptions,
 ) -> Result<Connection, SqliteStoreError> {
+    crate::lock_profile::check_at_first_open();
     if profile == ConnectionProfile::OnlineExistingWriter
         && options
             .busy_timeout
@@ -477,6 +478,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// The first open checks the process's SQLite lock profile (and warns
+    /// when it is not the required one).
+    #[test]
+    fn opening_a_connection_checks_the_lock_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let _conn = open(
+            &dir.path().join("first.sqlite3"),
+            ConnectionProfile::PRIMARY,
+        )
+        .unwrap();
+        assert!(crate::lock_profile::checked_at_first_open());
+    }
 
     /// #1551: an existing database must be a regular file with one name.
     #[test]
