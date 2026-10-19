@@ -665,8 +665,14 @@ offline, through `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`.
 The host first opens `SqliteSessionStore` on the same file: without the
 co-located session schema the conversion refuses typed and leaves the database
 file unchanged.
-The conversion pins the file and seeds each runtime's session that the
-co-located store holds no row for from its digest-verified WholeBlob body, in
+Before it writes, the conversion checks every runtime it would convert, in the
+order it converts them: a WholeBlob body that is missing, differs from its
+digest, or does not lay out as the session store's rows, or a session the
+guard below refuses, refuses typed before anything is written, so a file the
+conversion has not pinned stays a WholeBlob database. The conversion then pins
+the file and seeds each runtime's
+session that the co-located store holds no row for from its digest-verified
+WholeBlob body, in
 the transaction that installs the runtime's authority and completes its
 activation receipt, so the co-located transcript, rewrite history and metadata
 are that body's. A body whose transcript graph retired its oldest occurrences

@@ -152,9 +152,14 @@ them.
   persistent gateway's `runtime.sqlite`; it holds no physical session, so
   `new_head_canonical` refuses it. The conversion requires the session store's
   schema in the file (open `SqliteSessionStore` on it first; without it the
-  conversion refuses typed and leaves the database file unchanged), pins the
-  file, and seeds each
-  runtime's session that the co-located store holds no row for from its
+  conversion refuses typed and leaves the database file unchanged). Before it
+  writes, it checks every runtime it would convert: a WholeBlob body that is
+  missing, differs from its digest, or does not lay out as the session
+  store's rows, or a session the guard below refuses, refuses typed before
+  anything is written, so a file the conversion has not pinned stays a
+  WholeBlob database. It then pins the file and
+  seeds each runtime's session that the co-located store holds no row for
+  from its
   digest-verified WholeBlob body, in the transaction that installs the
   runtime's authority and completes its activation receipt. It seeds only
   while the co-located store holds no session beyond the ones the file's

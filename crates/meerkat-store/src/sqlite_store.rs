@@ -6991,6 +6991,17 @@ pub fn seed_head_canonical_for_runtime_in_txn(
         .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))
 }
 
+/// Lay out `session` as [`seed_head_canonical_for_runtime_in_txn`] would,
+/// and write nothing.
+///
+/// The runtime's standalone WholeBlob conversion checks every body it would
+/// seed with this before it pins its file, so a body this store cannot lay
+/// out refuses while the file is still the WholeBlob database it was.
+#[doc(hidden)]
+pub fn check_runtime_seed_layout(session: &Session) -> Result<(), SessionStoreError> {
+    retained_layout_for_blob_session(session).map(|_| ())
+}
+
 /// Every session this store holds, as a head row or a legacy blob row, read
 /// inside the caller's transaction, which it neither opens nor commits.
 ///
