@@ -464,10 +464,14 @@ impl AgentMobToolSurface {
     /// authority binds no mob, so after a restart this is how a creator
     /// manages the mob it created. The re-derived grant serves this
     /// admission only and is derived again for the next one; nothing is
-    /// written to the session.
+    /// written to the session. The creator's grant follows from its create
+    /// capability, so it is re-derived only while the session may still
+    /// create mobs: once its operator removes that capability, a restart
+    /// leaves it no manage scope over the mobs it created.
     async fn authority_over(&self, mob_id: &MobId, handle: &MobHandle) -> MobToolAuthorityContext {
         let authority = self.authority_context_snapshot();
         if !authority.is_generated_authority_context()
+            || !authority.can_create_mobs()
             || authority.can_manage_mob(mob_id.as_str(), handle.incarnation())
             || !self
                 .state
@@ -6505,7 +6509,8 @@ mod tests {
     /// the mob's creation record (`MobProvenance::Session` naming the
     /// session): the creator lists and manages the mob it created, while
     /// another session gets nothing, and neither does the creator over a mob
-    /// the host created.
+    /// the host created, nor the creator once its operator removed its create
+    /// capability.
     #[tokio::test]
     async fn a_creator_session_manages_its_mob_again_after_a_restart() {
         let state = MobMcpState::new_in_memory();
@@ -6592,6 +6597,28 @@ mod tests {
             .ensure_mob_scope_authority("mob_status", &mob_id)
             .await
             .expect("the creator manages the mob it created after a restart");
+        // The operator removed the session's create capability before the
+        // restart: the creator's grant is not re-derived.
+        let without_create = AgentMobToolSurface::new(
+            Arc::clone(&state),
+            None,
+            meerkat_runtime::mob_operator_authority::set_create_authority(
+                &create_only_authority(),
+                false,
+            )
+            .expect("generated mob authority should disable create scope"),
+            "claude-sonnet-4-5".to_string(),
+            creator.clone(),
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            without_create
+                .ensure_mob_scope_authority("mob_status", &mob_id)
+                .await,
+            Err(ToolError::AccessDenied { .. })
+        ));
         assert!(matches!(
             restarted
                 .ensure_mob_scope_authority("mob_status", &host_mob)

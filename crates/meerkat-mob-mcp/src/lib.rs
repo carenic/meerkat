@@ -2097,6 +2097,12 @@ impl MobMcpState {
     ///
     /// `Host`, `Ambiguous` and `Unrecorded` name no creator session, and a
     /// record that cannot be read proves nothing: every one answers `false`.
+    ///
+    /// Every create with an owner session records that session as the
+    /// creator, including a host's own call of
+    /// [`Self::mob_create_definition_with_owner_bridge_session`] for a
+    /// session that never held a grant over the mob: after a restart that
+    /// session manages the mob too.
     pub(crate) async fn session_is_recorded_creator(
         &self,
         handle: &MobHandle,
@@ -4542,6 +4548,13 @@ impl MobMcpState {
         }
     }
 
+    /// Create `definition` for the caller session `owner_bridge_session_id`.
+    /// The create makes that session the mob's recorded creator (its
+    /// creation record names it as `MobProvenance::Session`, or as the
+    /// creating member's `owner_session` in `MobProvenance::Member`), and
+    /// after a restart the agent mob tools re-derive the creator's manage
+    /// grant for that session from the record
+    /// (`MobMcpState::session_is_recorded_creator`), whoever called this.
     #[doc(hidden)]
     pub async fn mob_create_definition_with_owner_bridge_session(
         &self,
