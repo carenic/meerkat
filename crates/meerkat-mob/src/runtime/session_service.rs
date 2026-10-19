@@ -4173,6 +4173,7 @@ where
                 request.planned_child_session_id,
                 None,
                 None,
+                request.inherited_instructions,
             )
             .await?;
         Ok(crate::forked_participant::PlannedForkOutcome {

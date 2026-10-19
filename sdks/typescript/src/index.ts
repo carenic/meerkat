@@ -146,6 +146,7 @@ export type {
   ForkCacheLoweredRequestProvenance,
   ForkCacheProvider,
   ForkCacheTtl,
+  ForkInstructionPolicy,
   ForkPoint,
   HelpExecutionMode,
   HelpOptions,

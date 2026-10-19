@@ -2479,12 +2479,7 @@ impl CouncilRun {
                 .await;
             let capability = match created {
                 Ok(Ok(capability)) => capability,
-                Ok(Err(error)) => {
-                    return Err(TemporaryCouncilExitReason::ParticipantSeatingFailed {
-                        participant_order: custody.order,
-                        detail: format!("capability creation failed: {error}"),
-                    });
-                }
+                Ok(Err(error)) => return Err(capability_creation_exit(custody.order, error)),
                 Err(_) => return Err(TemporaryCouncilExitReason::DeadlineExceeded),
             };
 
@@ -2752,6 +2747,25 @@ impl CouncilRun {
                 ),
             })
         }
+    }
+}
+
+/// The council's exit for a participant whose capability could not be
+/// created. The one mapping for local and placed sources: a participant fork
+/// that the source host's fork instruction policy refused keeps its typed
+/// refusal; every other failure is a seating failure.
+fn capability_creation_exit(participant_order: u32, error: MobError) -> TemporaryCouncilExitReason {
+    match error {
+        MobError::ForkInstructionRefused { refusal, .. } => {
+            TemporaryCouncilExitReason::ParticipantForkInstructionRefused {
+                participant_order,
+                refusal,
+            }
+        }
+        error => TemporaryCouncilExitReason::ParticipantSeatingFailed {
+            participant_order,
+            detail: format!("capability creation failed: {error}"),
+        },
     }
 }
 

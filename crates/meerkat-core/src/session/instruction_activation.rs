@@ -251,6 +251,139 @@ impl InstructionActivationError {
     }
 }
 
+/// Host policy for the activation rows a durable fork child inherits.
+///
+/// A fork child holds its source's activation rows as historical context and
+/// runs no model turn until each inherited key has an origin-local activation
+/// in the child. The policy says who appends that activation. It belongs to
+/// the host (a mob builder, or an RPC fork request) and is never a tool
+/// argument.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ForkInstructionPolicy {
+    /// The host activates each inherited key on the child before its first
+    /// turn. A fork that leaves no window for that is refused instead (see
+    /// [`ForkInstructionPolicy::effective`]).
+    #[default]
+    RequireExplicitActivation,
+    /// The fork owner re-activates, in the child and before the child is
+    /// committed, every key that was effective in the source at the fork
+    /// boundary.
+    ReactivateInherited,
+    /// A fork whose child would inherit any activation row is refused before
+    /// anything is committed.
+    Refuse,
+}
+
+/// Whether a fork leaves the host a window to activate inherited keys on the
+/// child before the child's first turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ActivationWindow {
+    /// The host drives the child's first turn and can activate before it.
+    HostDriven,
+    /// The fork admits the child's first turn itself, or commits a child the
+    /// host cannot activate before that turn.
+    None,
+}
+
+impl ForkInstructionPolicy {
+    /// The policy a fork applies on a path with `window`.
+    ///
+    /// [`Self::RequireExplicitActivation`] without a window would commit a
+    /// child whose first turn must fail, so it refuses before commit instead.
+    #[must_use]
+    pub const fn effective(self, window: ActivationWindow) -> Self {
+        match (self, window) {
+            (Self::RequireExplicitActivation, ActivationWindow::None) => Self::Refuse,
+            (policy, _) => policy,
+        }
+    }
+}
+
+/// Why a fork that would inherit activation rows was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum ForkInstructionRefusalCause {
+    /// The effective policy refuses a child that inherits activation rows.
+    /// `reactivate_inherited` carries the source's effective activations into
+    /// the child instead.
+    PolicyRefuses,
+    /// Re-activation was asked for, but the last copied row of a key was not
+    /// effective in the source: the source never ran a turn under it.
+    NotEffectiveInSource,
+    /// Re-activating the effective bodies would exceed the retained
+    /// activation-body budget of the lineage.
+    LineageBodyBudgetExceeded { max_bytes: usize },
+    /// The activation rules refused a re-activation row.
+    Activation {
+        code: InstructionActivationErrorCode,
+    },
+    /// The member host that holds a placed source predates the policy and
+    /// refused the request that carried it, so nothing was forked there.
+    MemberHostUnsupported,
+}
+
+/// A durable fork refused before commit because of inherited activation rows.
+/// No child session exists when this is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[error("{}", fork_instruction_refusal_message(.cause, .keys))]
+#[non_exhaustive]
+pub struct ForkInstructionRefusal {
+    pub cause: ForkInstructionRefusalCause,
+    /// The inherited keys the refusal concerns, in (namespace, key) order.
+    pub keys: Vec<(InstructionNamespace, InstructionKey)>,
+}
+
+impl ForkInstructionRefusal {
+    #[must_use]
+    pub fn new(
+        cause: ForkInstructionRefusalCause,
+        keys: Vec<(InstructionNamespace, InstructionKey)>,
+    ) -> Self {
+        Self { cause, keys }
+    }
+}
+
+fn fork_instruction_refusal_message(
+    cause: &ForkInstructionRefusalCause,
+    keys: &[(InstructionNamespace, InstructionKey)],
+) -> String {
+    let keys = keys
+        .iter()
+        .map(|(namespace, key)| format!("{namespace}/{key}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match cause {
+        ForkInstructionRefusalCause::PolicyRefuses => format!(
+            "fork refused: the child would inherit activated instruction keys [{keys}] and the \
+             fork instruction policy refuses them; reactivate_inherited carries them into the \
+             child"
+        ),
+        ForkInstructionRefusalCause::NotEffectiveInSource => format!(
+            "fork refused: instruction keys [{keys}] were inherited but never activated in the \
+             source, so there is no effective activation to carry into the child"
+        ),
+        ForkInstructionRefusalCause::LineageBodyBudgetExceeded { max_bytes } => format!(
+            "fork refused: re-activating instruction keys [{keys}] would exceed the {max_bytes} \
+             byte retained activation-body budget"
+        ),
+        ForkInstructionRefusalCause::Activation { code } => {
+            format!("fork refused: re-activating instruction keys [{keys}] was refused ({code:?})")
+        }
+        ForkInstructionRefusalCause::MemberHostUnsupported => "fork refused: the member host \
+             that holds the source does not support the fork instruction policy, so \
+             reactivate_inherited cannot be carried to it"
+            .to_string(),
+    }
+}
+
 fn json_string(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }

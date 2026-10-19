@@ -1145,6 +1145,7 @@ fn lower_session_fork_at_request(
             .tool_access_policy
             .clone()
             .map(meerkat_contracts::wire::WireToolAccessPolicy::into_core),
+        inherited_instructions: params.inherited_instructions,
     }
 }
 
@@ -1160,6 +1161,7 @@ fn lower_session_fork_replace_request(
             .tool_access_policy
             .clone()
             .map(meerkat_contracts::wire::WireToolAccessPolicy::into_core),
+        inherited_instructions: params.inherited_instructions,
     }
 }
 
@@ -5199,6 +5201,7 @@ mod tests {
                 message_index: 4,
                 running_behavior: Default::default(),
                 tool_access_policy: policy.clone(),
+                inherited_instructions: None,
             };
             let at_request = lower_session_fork_at_request(&at_params);
             assert_eq!(at_request.tool_access_policy, expected);
@@ -5216,6 +5219,7 @@ mod tests {
                 .expect("typed replacement should parse"),
                 running_behavior: Default::default(),
                 tool_access_policy: policy,
+                inherited_instructions: None,
             };
             let replace_request = lower_session_fork_replace_request(
                 &replace_params,

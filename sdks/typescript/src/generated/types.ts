@@ -1055,6 +1055,7 @@ export interface ExportAtifParams {
 }
 
 export interface ForkSessionAtParams {
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   message_index: number;
   running_behavior?: "reject";
   session_id: string;
@@ -1062,6 +1063,7 @@ export interface ForkSessionAtParams {
 }
 
 export interface ForkSessionReplaceParams {
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   message_index: number;
   replacement: WireTranscriptReplacement;
   running_behavior?: "reject";
@@ -1330,6 +1332,7 @@ export interface ScheduleToolsResult {
 export interface SessionForkResult {
   cache_inheritance: Record<string, unknown>;
   message_count: number;
+  reactivated_instruction_count?: number;
   session_id: string;
   session_ref?: string | null;
   source_session_id: string;
@@ -4838,6 +4841,7 @@ export interface BridgeCommandCreateForkedParticipant {
   binding_generation: number;
   command: "create_forked_participant";
   epoch: number;
+  inherited_instructions?: "require_explicit_activation" | "reactivate_inherited" | "refuse" | null;
   prefix_message_count?: number | null;
   protocol_version: BridgeProtocolVersion;
   request_id: string;
@@ -5066,7 +5070,15 @@ export interface BridgeRejectionCauseSessionOwnershipConflict {
   session_ownership_conflict: BridgeRejectionCauseSessionOwnershipConflictPayload;
 }
 
-export type BridgeRejectionCause = "forked_participant_not_found" | "forked_participant_tampered" | "forked_participant_expired" | "forked_participant_revoked" | "forked_participant_exhausted" | "forked_participant_busy" | "forked_participant_source_mismatch" | "forked_participant_route_mismatch" | "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "forked_participant_protocol_unsupported" | "forked_participant_cleanup_debt" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "bind_admission_outcome_unknown" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict;
+export interface BridgeRejectionCauseForkInstructionRefusedPayload {
+  refusal: Record<string, unknown>;
+}
+
+export interface BridgeRejectionCauseForkInstructionRefused {
+  fork_instruction_refused: BridgeRejectionCauseForkInstructionRefusedPayload;
+}
+
+export type BridgeRejectionCause = "forked_participant_not_found" | "forked_participant_tampered" | "forked_participant_expired" | "forked_participant_revoked" | "forked_participant_exhausted" | "forked_participant_busy" | "forked_participant_source_mismatch" | "forked_participant_route_mismatch" | "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "forked_participant_protocol_unsupported" | "forked_participant_cleanup_debt" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "bind_admission_outcome_unknown" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict | BridgeRejectionCauseForkInstructionRefused;
 
 export interface BridgeReplyBindMember {
   address: string;

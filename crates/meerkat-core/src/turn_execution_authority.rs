@@ -256,7 +256,8 @@ impl TurnFailureSourceKind {
             // config class its previous `ConfigError` representation had.
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
-            | AgentError::ControlAppendBlockedByCallbackBatch => Self::ConfigError,
+            | AgentError::ControlAppendBlockedByCallbackBatch
+            | AgentError::InstructionActivation(_) => Self::ConfigError,
         })
     }
 

@@ -555,7 +555,10 @@ impl From<&AgentError> for AgentErrorClass {
             // was previously represented as (a `ConfigError`).
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
-            | AgentError::ControlAppendBlockedByCallbackBatch => Self::Config,
+            | AgentError::ControlAppendBlockedByCallbackBatch
+            // A turn refused by instruction activation history keeps the
+            // config class of its previous `ConfigError` representation.
+            | AgentError::InstructionActivation(_) => Self::Config,
         }
     }
 }

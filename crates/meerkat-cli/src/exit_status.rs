@@ -192,6 +192,7 @@ mod tests {
             ErrorCode::ApprovalConflict => 54,
             ErrorCode::ApprovalCommitUnknown => 55,
             ErrorCode::StaleDeliveryScope => 56,
+            ErrorCode::ForkInstructionRefused => 57,
         }
     }
 

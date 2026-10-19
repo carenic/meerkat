@@ -705,6 +705,16 @@ pub enum TemporaryCouncilExitReason {
         /// The source mob id, which now names the other mob.
         source_mob_id: MobId,
     },
+    /// One participant's fork was refused before any child was committed:
+    /// the child would inherit activated host instructions that the source
+    /// mob host's fork instruction policy does not carry into it. Local and
+    /// placed sources report the same refusal.
+    ParticipantForkInstructionRefused {
+        /// Slot that was refused.
+        participant_order: u32,
+        /// The typed refusal.
+        refusal: meerkat_core::ForkInstructionRefusal,
+    },
 }
 
 impl TemporaryCouncilExitReason {
@@ -727,6 +737,7 @@ impl TemporaryCouncilExitReason {
                 | Self::ExchangeFailed { .. }
                 | Self::CoordinatorInterrupted
                 | Self::ParticipantSourceReplaced { .. }
+                | Self::ParticipantForkInstructionRefused { .. }
         )
     }
 }

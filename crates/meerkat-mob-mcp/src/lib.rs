@@ -1119,6 +1119,9 @@ pub struct MobMcpState {
     /// this surface. Absent is honest fail-closed degradation for mixed-host
     /// edges; surfaces must supply an explicit dialable composition.
     controlling_acceptor: Option<meerkat_mob::ControllingAcceptorConfig>,
+    /// The host's fork instruction policy for every mob this state creates
+    /// or resumes ([`Self::with_fork_instruction_policy`]).
+    fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
     /// The console principal this state serves (phase 5, chokepoint (b) —
     /// DEC-P5E-8). Injected at construction, never ambient (gotcha #19):
     /// every v1 local surface (RPC/REST/stdio/public-MCP/CLI/embedder)
@@ -1249,7 +1252,20 @@ impl MobMcpState {
             realm_skill_sources: BTreeMap::new(),
             member_live_host: std::sync::RwLock::new(None),
             controlling_acceptor: None,
+            fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
         }
+    }
+
+    /// Set the host's fork instruction policy for every mob this state
+    /// creates or resumes ([`meerkat_mob::MobBuilder::with_fork_instruction_policy`]).
+    /// The default refuses a self-starting fork (`fork_off`, a council
+    /// participant) of a member with activated host instructions.
+    pub fn with_fork_instruction_policy(
+        mut self,
+        policy: meerkat_core::ForkInstructionPolicy,
+    ) -> Self {
+        self.fork_instruction_policy = policy;
+        self
     }
 
     /// Install the process-scoped reverse-lane acceptor used by every mob
@@ -2872,7 +2888,7 @@ impl MobMcpState {
         if let Some(acceptor) = &self.controlling_acceptor {
             builder = builder.with_controlling_acceptor(acceptor.clone());
         }
-        builder
+        builder.with_fork_instruction_policy(self.fork_instruction_policy)
     }
 
     fn bind_realm_profile_store(&self, storage: MobStorage) -> MobStorage {

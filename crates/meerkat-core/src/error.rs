@@ -796,6 +796,12 @@ pub enum AgentError {
         hook_id: HookId,
         reason: crate::hooks::HookFailureReason,
     },
+
+    /// The session's instruction activation history refused a model turn,
+    /// typically a fork child whose inherited keys were never activated in
+    /// the child. No model request was made.
+    #[error("instruction activation refused the turn: {0}")]
+    InstructionActivation(crate::InstructionActivationError),
 }
 
 impl From<crate::OperationAuthorizationError> for AgentError {

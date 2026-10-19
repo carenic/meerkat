@@ -504,10 +504,11 @@ pub use service::{
     WorkGraphNamespaceGrant,
 };
 pub use session::{
-    AUDITED_ENDPOINT_WRITE_REFUSAL_PREFIX, AuditedEndpointDivergence,
+    AUDITED_ENDPOINT_WRITE_REFUSAL_PREFIX, ActivationWindow, AuditedEndpointDivergence,
     AuditedEndpointDivergenceKind, AuditedEndpointRelation, AuthorizedSessionToolVisibilityState,
     ConsumedDeferredTurnInputs, DecodedWholeBlobMetadataDocument, DeferredFirstTurnPhase,
-    DeferredToolLoadAuthority, INSTRUCTION_ACTIVATION_RENDER_VERSION_V1,
+    DeferredToolLoadAuthority, ForkInstructionPolicy, ForkInstructionRefusal,
+    ForkInstructionRefusalCause, INSTRUCTION_ACTIVATION_RENDER_VERSION_V1,
     ImportedReleased0810Session, InheritedToolVisibilityAuthority,
     InstructionActivationAdmissionErrorCode, InstructionActivationDisposition,
     InstructionActivationError, InstructionActivationErrorCode, InstructionActivationExpectation,

@@ -280,6 +280,7 @@ from .types import (
     ForkCacheLoweredRequestProvenance,
     ForkCacheProvider,
     ForkCacheTtl,
+    ForkInstructionPolicy,
     ForkPoint,
     HelpExecutionMode,
     InstructionActivationAbsent,
@@ -1898,8 +1899,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session at a transcript message index."""
+        """Fork an idle session at a transcript message index.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -1908,6 +1914,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_at", params
         )
@@ -1921,8 +1929,13 @@ class MeerkatClient:
         *,
         running_behavior: TranscriptEditRunningBehavior | None = None,
         tool_access_policy: WireToolAccessPolicy | dict[str, Any] | None = None,
+        inherited_instructions: ForkInstructionPolicy | None = None,
     ) -> SessionForkResult:
-        """Fork an idle session and apply a typed transcript replacement."""
+        """Fork an idle session and apply a typed transcript replacement.
+
+        ``inherited_instructions`` decides what happens to instruction
+        activations the child would inherit; see ``ForkInstructionPolicy``.
+        """
         params: dict[str, Any] = {
             "session_id": session_id,
             "message_index": message_index,
@@ -1932,6 +1945,8 @@ class MeerkatClient:
             params["running_behavior"] = running_behavior
         if tool_access_policy is not None:
             params["tool_access_policy"] = _wire_value(tool_access_policy)
+        if inherited_instructions is not None:
+            params["inherited_instructions"] = inherited_instructions
         raw: RpcSessionForkResult | dict[str, Any] = await self._request(
             "session/fork_replace", params
         )
@@ -8572,6 +8587,10 @@ class MeerkatClient:
                 data.get("cache_inheritance"),
                 context,
             ),
+            reactivated_instruction_count=MeerkatClient._optional_non_negative_integer_field(
+                data, "reactivated_instruction_count", context
+            )
+            or 0,
         )
 
     @staticmethod

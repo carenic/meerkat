@@ -1352,6 +1352,7 @@ class ForkSessionAtParams:
     """Request payload for `session/fork_at`."""
     message_index: int
     session_id: str
+    inherited_instructions: Optional[Literal['require_explicit_activation', 'reactivate_inherited', 'refuse']] = None
     running_behavior: Optional[Literal['reject']] = None
     tool_access_policy: Optional[WireToolAccessPolicy] = None
 
@@ -1367,6 +1368,7 @@ the emitted JSON schema is the closed replacement enum rather than a bare
     message_index: int
     replacement: WireTranscriptReplacement
     session_id: str
+    inherited_instructions: Optional[Literal['require_explicit_activation', 'reactivate_inherited', 'refuse']] = None
     running_behavior: Optional[Literal['reject']] = None
     tool_access_policy: Optional[WireToolAccessPolicy] = None
 
@@ -1726,6 +1728,7 @@ class SessionForkResult:
     message_count: int
     session_id: str
     source_session_id: str
+    reactivated_instruction_count: Optional[int] = None
     session_ref: Optional[str] = None
 
 
@@ -8575,6 +8578,7 @@ class BridgeCommandCreateForkedParticipant(TypedDict, total=False):
     binding_generation: Required[int]
     command: Required[Literal['create_forked_participant']]
     epoch: Required[int]
+    inherited_instructions: NotRequired[Optional[Literal['require_explicit_activation', 'reactivate_inherited', 'refuse']]]
     prefix_message_count: NotRequired[Optional[int]]
     protocol_version: Required[BridgeProtocolVersion]
     request_id: Required[str]
@@ -8781,7 +8785,13 @@ class BridgeRejectionCauseSessionOwnershipConflictPayload(TypedDict, total=False
 class BridgeRejectionCauseSessionOwnershipConflict(TypedDict, total=False):
     session_ownership_conflict: Required[BridgeRejectionCauseSessionOwnershipConflictPayload]
 
-BridgeRejectionCause = Literal['forked_participant_not_found'] | Literal['forked_participant_tampered'] | Literal['forked_participant_expired'] | Literal['forked_participant_revoked'] | Literal['forked_participant_exhausted'] | Literal['forked_participant_busy'] | Literal['forked_participant_source_mismatch'] | Literal['forked_participant_route_mismatch'] | Literal['not_bound'] | Literal['stale_supervisor'] | Literal['sender_mismatch'] | Literal['already_bound'] | Literal['invalid_bootstrap_token'] | Literal['unsupported_protocol_version'] | Literal['forked_participant_protocol_unsupported'] | Literal['forked_participant_cleanup_debt'] | Literal['invalid_supervisor_spec'] | Literal['invalid_peer_spec'] | Literal['address_mismatch'] | Literal['unsupported'] | Literal['internal'] | Literal['bind_admission_outcome_unknown'] | Literal['stale_fence'] | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | Literal['unavailable'] | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | Literal['spec_digest_mismatch'] | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | Literal['realm_backend_unavailable'] | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | Literal['live_transport_unavailable'] | Literal['live_channel_already_bound'] | Literal['live_channel_not_found'] | BridgeRejectionCauseLiveTransportUnsupported | Literal['resume_session_not_found'] | BridgeRejectionCauseCapabilityMissing | Literal['launch_mode_unsupported'] | Literal['launch_mode_placement_mismatch'] | BridgeRejectionCauseSessionOwnershipConflict
+class BridgeRejectionCauseForkInstructionRefusedPayload(TypedDict, total=False):
+    refusal: Required[dict[str, Any]]
+
+class BridgeRejectionCauseForkInstructionRefused(TypedDict, total=False):
+    fork_instruction_refused: Required[BridgeRejectionCauseForkInstructionRefusedPayload]
+
+BridgeRejectionCause = Literal['forked_participant_not_found'] | Literal['forked_participant_tampered'] | Literal['forked_participant_expired'] | Literal['forked_participant_revoked'] | Literal['forked_participant_exhausted'] | Literal['forked_participant_busy'] | Literal['forked_participant_source_mismatch'] | Literal['forked_participant_route_mismatch'] | Literal['not_bound'] | Literal['stale_supervisor'] | Literal['sender_mismatch'] | Literal['already_bound'] | Literal['invalid_bootstrap_token'] | Literal['unsupported_protocol_version'] | Literal['forked_participant_protocol_unsupported'] | Literal['forked_participant_cleanup_debt'] | Literal['invalid_supervisor_spec'] | Literal['invalid_peer_spec'] | Literal['address_mismatch'] | Literal['unsupported'] | Literal['internal'] | Literal['bind_admission_outcome_unknown'] | Literal['stale_fence'] | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | Literal['unavailable'] | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | Literal['spec_digest_mismatch'] | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | Literal['realm_backend_unavailable'] | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | Literal['live_transport_unavailable'] | Literal['live_channel_already_bound'] | Literal['live_channel_not_found'] | BridgeRejectionCauseLiveTransportUnsupported | Literal['resume_session_not_found'] | BridgeRejectionCauseCapabilityMissing | Literal['launch_mode_unsupported'] | Literal['launch_mode_placement_mismatch'] | BridgeRejectionCauseSessionOwnershipConflict | BridgeRejectionCauseForkInstructionRefused
 
 # A typed reply from a member runtime (or mob host daemon) back to the
 # supervisor, and — for `MemberOperatorReply` — from the controlling host

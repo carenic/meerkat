@@ -142,6 +142,7 @@ pub use import_0810::{
     released_0810_transcript_serialized_rows_digest,
 };
 pub use instruction_activation::{
+    ActivationWindow, ForkInstructionPolicy, ForkInstructionRefusal, ForkInstructionRefusalCause,
     INSTRUCTION_ACTIVATION_RENDER_VERSION_V1, InstructionActivationAdmissionErrorCode,
     InstructionActivationDisposition, InstructionActivationError, InstructionActivationErrorCode,
     InstructionActivationExpectation, InstructionActivationKeyState, InstructionActivationMutation,
