@@ -98,7 +98,8 @@ pub const FINDING_NO_SCHEMA_LEDGER: &str = "no-schema-ledger";
 /// A `*.pre-<version>-<timestamp>` migration backup artifact.
 pub const FINDING_BACKUP_ARTIFACT: &str = "backup-artifact";
 /// A `*.mfence` maintenance-fence lock file (inventory; created by normal
-/// per-operation guards).
+/// per-operation guards), or its `*.mpresence` presence-lock sibling (created
+/// by kept connections and by maintenance at every database it fences).
 pub const FINDING_MAINTENANCE_FENCE_LOCK: &str = "maintenance-fence-lock";
 /// Session hosting lock files under `hosting/` (inventory; derived runtime
 /// files held by the process hosting each session, never durable state).
@@ -2709,8 +2710,8 @@ fn now_unix_secs() -> u64 {
 }
 
 /// Orphan/artifact sweep: stale manifest locks, lease census, `*.mfence`
-/// fence locks, `*.pre-<version>-<timestamp>` backup artifacts, and
-/// `*.corrupt-<timestamp>` index quarantines.
+/// fence locks and their `*.mpresence` siblings, `*.pre-<version>-<timestamp>`
+/// backup artifacts, and `*.corrupt-<timestamp>` index quarantines.
 fn sweep_artifacts(realm_dir: &Path, realm: &str, diagnosis: &mut StorageDiagnosis) {
     // Stale `.realm_manifest.lock` (creation lock; 30s mtime staleness
     // window, mirroring the store's own staleness rule).
@@ -2885,6 +2886,18 @@ fn sweep_artifacts(realm_dir: &Path, realm: &str, diagnosis: &mut StorageDiagnos
                         FINDING_MAINTENANCE_FENCE_LOCK,
                         "maintenance-fence lock file (created by normal per-operation guards; \
                          held exclusively only during offline maintenance)",
+                    )
+                    .with_path(file.clone())
+                    .with_realm(realm),
+                );
+            } else if name.ends_with(".mpresence") {
+                diagnosis.findings.push(
+                    StorageFinding::new(
+                        FindingSeverity::Info,
+                        FINDING_MAINTENANCE_FENCE_LOCK,
+                        "presence lock file (held shared by connections kept open across \
+                         operations; maintenance creates it next to every database it fences \
+                         and holds it exclusively after the fence lock)",
                     )
                     .with_path(file.clone())
                     .with_realm(realm),
@@ -3786,6 +3799,7 @@ mod tests {
         let root = temp.path().join("realms");
         let realm_dir = write_manifest(&root, "artifacts", "sqlite");
         std::fs::write(realm_dir.join("sessions.sqlite3.mfence"), b"").unwrap();
+        std::fs::write(realm_dir.join("runtime.sqlite3.mpresence"), b"").unwrap();
         std::fs::write(
             realm_dir.join("sessions.sqlite3.pre-1-1700000000"),
             b"backup",
@@ -3844,6 +3858,21 @@ mod tests {
         ] {
             assert!(found.contains(&expected), "missing {expected}: {found:?}");
         }
+        // Both lock siblings are inventoried, the presence lock as well as
+        // the fence lock.
+        let lock_files: Vec<_> = diagnosis
+            .findings
+            .iter()
+            .filter(|f| f.code == FINDING_MAINTENANCE_FENCE_LOCK)
+            .filter_map(|f| f.path.clone())
+            .collect();
+        assert_eq!(
+            lock_files,
+            vec![
+                realm_dir.join("runtime.sqlite3.mpresence"),
+                realm_dir.join("sessions.sqlite3.mfence"),
+            ]
+        );
         // Artifact findings are inventory-grade or warnings, never errors.
         assert!(!diagnosis.has_errors(), "{diagnosis:?}");
     }

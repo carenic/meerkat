@@ -6,8 +6,10 @@
 //! neither checkpoints nor unlinks the WAL and shared-memory files by name.
 //! The kept delivery reader relies on that only as a second line: the
 //! maintenance fence waits for it to close first. This control fails if a
-//! SQLite or VFS change reopens the hazard.
+//! SQLite or VFS change reopens the hazard. Unix only: it renames an open
+//! database, and the kept reader runs on unix only.
 
+#![cfg(unix)]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::path::Path;

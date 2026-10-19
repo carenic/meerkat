@@ -729,7 +729,9 @@ impl OwnerLoop {
     }
 
     /// Close the kept reader's connection: once the store has been quiet for
-    /// [`KEPT_DELIVERY_READER_IDLE`], and before a pass delivers.
+    /// [`KEPT_DELIVERY_READER_IDLE`], and before the owner calls into the host
+    /// (a delivery, a round of owed continuations, an address resolution),
+    /// which can wait.
     fn release_generation_reader(&mut self) {
         if let Some(reader) = self.generation_reader.as_mut() {
             reader
@@ -762,6 +764,12 @@ impl OwnerLoop {
             }
         }
         let applies_cold = self.cold.applies_cold_deliveries();
+        // Resolving an address calls into the host, which can wait (it can
+        // revive a member): the kept reader's connection closes first. Routes
+        // read the claim registry and keep it.
+        if self.awaiting.values().any(|wait| wait.via_address) {
+            self.release_generation_reader();
+        }
         let mut due = Vec::new();
         for (runtime_id, wait) in &self.awaiting {
             let recipients = if wait.via_address {
@@ -1110,6 +1118,9 @@ async fn run_pass(
     // `OwedRound`), before the inbox is collected, so the rows it commits
     // drain in this pass.
     if let Some(round) = owner.owed_round.take() {
+        // Projecting owed continuations calls into the host, which can wait:
+        // the kept reader's connection closes first.
+        owner.release_generation_reader();
         let projection = owner
             .host
             .project_owed_continuations(round.after.as_ref(), DELIVERY_PAGE)

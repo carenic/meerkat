@@ -8571,12 +8571,12 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
 ///
 /// - It bounds how long a quiet reader delays maintenance. The maintenance
 ///   fence waits for kept connections to close. An owner closes its reader's
-///   connection when the reader has read nothing for this long, and before a
-///   pass delivers, since deliveries call into the host, which can wait. What
-///   else an owner does with the connection open is store operations, which
-///   the fence refuses, and registry lookups, so a fence deadline longer than
-///   this plus one store tick always gets the database (`rkat storage migrate`
-///   waits 10 s by default).
+///   connection when the reader has read nothing for this long, and before it
+///   calls into the host (a delivery, a round of owed continuations, an address
+///   resolution), which can wait. What it does with the connection open is
+///   store operations, which the fence refuses, and claim-registry reads, so a
+///   fence deadline longer than this plus one store tick always gets the
+///   database (`rkat storage migrate` waits 10 s by default).
 /// - It bounds what a quiet store holds open. An armed delivery owner keeps
 ///   at most one reader, so each runtime delivery inbox holds at most one
 ///   connection (descriptors for the database, its WAL, shared memory and
@@ -8593,7 +8593,7 @@ pub const KEPT_DELIVERY_READER_IDLE: std::time::Duration = std::time::Duration::
 ///
 /// A reader may keep a connection open between reads; its owner releases it
 /// once the store has been quiet for [`KEPT_DELIVERY_READER_IDLE`], and before
-/// it delivers.
+/// it calls into the host.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait DeliveryGenerationReader: Send {

@@ -4939,11 +4939,14 @@ END";
                     .map_err(map_shared_sqlite_error)?;
                 return Ok(0);
             }
-            let Some(presence) = meerkat_sqlite::KeptConnectionPresence::acquire(&self.path) else {
-                return read_delivery_generation_fresh(&self.path);
-            };
+            // The guard first: while maintenance holds the fence the open is
+            // refused before it takes any presence.
             let guard = meerkat_sqlite::OperationGuard::for_database(&self.path)
                 .map_err(map_shared_sqlite_error)?;
+            let Some(presence) = meerkat_sqlite::KeptConnectionPresence::acquire(&self.path) else {
+                drop(guard);
+                return read_delivery_generation_fresh(&self.path);
+            };
             let conn = match meerkat_sqlite::open_with(
                 &self.path,
                 meerkat_sqlite::ConnectionProfile::Primary { create: false },
@@ -4995,6 +4998,12 @@ END";
         /// One guarded read. `Ok(None)`: the connection no longer reads the
         /// database at `path` as its open verified it.
         fn read(&self, path: &Path) -> Result<Option<u64>, RuntimeStoreError> {
+            // A missing database is not the one the open verified. Checked
+            // before the guard, so the read plants no lock file next to it;
+            // the reopen admits it, as the fresh-open path does.
+            if runtime_database_absent(path) {
+                return Ok(None);
+            }
             let _guard = meerkat_sqlite::OperationGuard::for_database(path)
                 .map_err(map_shared_sqlite_error)?;
             // Under the guard no maintenance moves the file, so the identity
@@ -5050,6 +5059,7 @@ END";
     /// Test hooks of the delivery-generation reads (#549b), keyed by database
     /// path, so tests on their own databases do not meet.
     #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     pub mod delivery_generation_test_hooks {
         use std::collections::{HashMap, HashSet};
         use std::path::{Path, PathBuf};
@@ -5085,7 +5095,8 @@ END";
             hooks().verified_opens.get(path).copied().unwrap_or(0)
         }
 
-        /// Run `hook` at each kept read of `path`, just before its guard.
+        /// Run `hook` at the start of each kept read of `path`, before its
+        /// guard (a verified open is not a kept read).
         pub fn before_kept_read_guard(path: &Path, hook: impl FnMut() + Send + 'static) {
             hooks()
                 .before_kept_read
@@ -26458,6 +26469,7 @@ ORDER BY runtime_id";
 }
 
 #[cfg(all(feature = "sqlite-store", any(test, feature = "test-support")))]
+#[doc(hidden)]
 pub use inner::delivery_generation_test_hooks;
 #[cfg(feature = "sqlite-store")]
 pub use inner::{

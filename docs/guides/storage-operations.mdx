@@ -120,11 +120,12 @@ is 10 seconds; change it with `--fence-wait-secs`.
 The one kept connection is a delivery owner's reader of the runtime store's
 delivery generation, on a store other processes share: it stays open between
 store ticks and holds the database's presence lock (`<file>.mpresence`) while
-it does. The fence takes the presence lock after its fence lock. The reader
-closes before its owner delivers anything, at its next read, which the fence
-refuses, or after a second without a read (`KEPT_DELIVERY_READER_IDLE`), so
-the fence gets the database well inside the default wait. A fence wait
-shorter than that second can meet an idle reader and refuse.
+it does. The fence takes the presence lock after its fence lock, and creates
+`<file>.mpresence` next to every database it fences. The reader closes before
+its owner calls into the host, at its next read, which the fence refuses, or
+after a second without a read (`KEPT_DELIVERY_READER_IDLE`), so the fence gets
+the database well inside the default wait. A fence wait shorter than that
+second can meet an idle reader and refuse.
 Windows keeps the fresh-open read path, one verified open per tick, because
 no CI lane runs the kept reader on Windows. Maintenance from a binary older
 than 0.9.4 takes only the fence lock and does not wait for a kept connection:

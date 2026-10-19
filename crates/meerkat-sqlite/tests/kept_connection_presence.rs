@@ -14,6 +14,24 @@ use std::time::{Duration, Instant};
 
 use meerkat_sqlite::{ExclusiveFence, OperationGuard, SqliteStoreError};
 
+/// Wait until the fence thread holds `<db>.mfence`: a guard is refused typed.
+/// A guard admitted before that is dropped at once and tried again.
+fn wait_for_the_fence_lock(db: &Path) {
+    let started = Instant::now();
+    loop {
+        match OperationGuard::for_database(db) {
+            Err(SqliteStoreError::MaintenanceFenceHeld { .. }) => return,
+            Ok(guard) => drop(guard),
+            Err(other) => panic!("unexpected guard error: {other}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the waiting fence never took its fence lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Hold `<db>.mpresence` shared, as a kept connection does.
 fn kept_connection(db: &Path) -> File {
     let mut name = db.file_name().expect("file name").to_os_string();
@@ -68,7 +86,7 @@ fn a_kept_connections_next_read_is_refused_while_the_fence_waits_for_it() {
         let db = db.clone();
         std::thread::spawn(move || ExclusiveFence::acquire(&db, Duration::from_secs(10)))
     };
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_the_fence_lock(&db);
     assert!(
         !waiting.is_finished(),
         "the fence waits for the kept connection to close"

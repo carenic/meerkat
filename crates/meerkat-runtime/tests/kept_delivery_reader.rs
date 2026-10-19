@@ -1,7 +1,10 @@
 //! The kept delivery-generation reader (#549b): one verified open, then one
 //! guarded snapshot read per store tick, closed for maintenance, for a file
-//! replaced at its path, and for a schema or ledger change.
+//! replaced at its path, and for a schema or ledger change. Unix only: the
+//! store keeps the reader on unix, and the replacement tests rename open
+//! files.
 
+#![cfg(unix)]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -14,7 +17,7 @@ use meerkat_runtime::store::{
     DeliveryGenerationReader, RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
     RuntimeStore, RuntimeStoreError, SqliteRuntimeStore,
 };
-use meerkat_sqlite::ExclusiveFence;
+use meerkat_sqlite::{ExclusiveFence, OperationGuard, SqliteStoreError};
 
 /// A store at `dir/runtime.sqlite3` with `commits` delivery commits, so its
 /// delivery generation reads `commits`.
@@ -121,7 +124,21 @@ async fn a_kept_reader_closes_when_maintenance_waits_for_it() {
         let path = path.clone();
         std::thread::spawn(move || ExclusiveFence::acquire(&path, Duration::from_secs(10)))
     };
-    std::thread::sleep(Duration::from_millis(100));
+    // A probe guard of its own, not the reader's: refused once the fence
+    // holds its fence lock and waits for the presence lock.
+    let started = Instant::now();
+    loop {
+        match OperationGuard::for_database(&path) {
+            Err(SqliteStoreError::MaintenanceFenceHeld { .. }) => break,
+            Ok(guard) => drop(guard),
+            Err(other) => panic!("unexpected guard error: {other}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the waiting fence never took its fence lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         !waiting.is_finished(),
         "maintenance waits for the kept connection"
@@ -310,17 +327,31 @@ async fn the_fence_holding_process_reads_fresh_and_never_waits_on_itself() {
     assert!(reader.keeps_connection());
 }
 
-/// The reader keeps nothing for a store that does not exist yet, and reads
-/// zero, as the fresh-open path does.
+/// A database that goes missing under a kept connection (its directory
+/// archived, an empty one left at the path) reads zero, as the fresh-open
+/// path does, keeps nothing, and plants no lock file in the new directory.
 #[tokio::test]
 async fn a_missing_database_reads_zero_and_keeps_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let store = SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3")).expect("open");
-    let path = store.path().to_path_buf();
+    let root = tempfile::tempdir().expect("tempdir");
+    let realm = root.path().join("realm");
+    std::fs::create_dir(&realm).expect("realm");
+    let store = store_with_generation(&realm, 2).await;
     let mut reader = kept_reader(&store);
-    std::fs::remove_file(&path).expect("remove the database");
+    assert_eq!(reader.read().await.expect("first read"), 2);
+    assert!(reader.keeps_connection());
+
+    std::fs::rename(&realm, root.path().join("realm.archived")).expect("archive the directory");
+    std::fs::create_dir(&realm).expect("an empty directory at the path");
     assert_eq!(reader.read().await.expect("read"), 0);
     assert!(!reader.keeps_connection());
+    let planted: Vec<_> = std::fs::read_dir(&realm)
+        .expect("read the new directory")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(
+        planted.is_empty(),
+        "nothing planted next to the missing database: {planted:?}"
+    );
 }
 
 /// T8, numbers only: the cost of one quiet delivery-generation read through

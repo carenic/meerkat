@@ -206,10 +206,7 @@ them.
   (`DiskStorageMigrator`) fills it; other diagnosers leave it out.
 - `meerkat-sqlite`: `KeptConnectionPresence`, the presence lock
   (`<file>.mpresence`, `presence_lock_path`) a connection kept open between
-  operations holds shared for its whole life. `ExclusiveFence` now holds the
-  presence lock as well: `try_acquire` takes both locks or neither, and
-  `acquire` takes the fence lock, then waits for the presence lock within the
-  same deadline, so maintenance waits for kept connections to close.
+  operations holds shared for its whole life.
 - `meerkat-runtime`: `RuntimeStore::delivery_generation_reader`, a defaulted
   method returning an optional `DeliveryGenerationReader` for a delivery
   owner's store ticks (the default, `None`, reads through
@@ -277,6 +274,15 @@ them.
   deploying guide. Every host binary (`rkat`, `rkat-rpc`, `rkat-rest`,
   `rkat-mcp`, `rkat-mob-mcp`) turns allocator statistics off as the first
   statement of `main`, which removes that lock even without the variable.
+- `meerkat-sqlite`: `ExclusiveFence` now holds the presence lock as well and
+  creates `<file>.mpresence` next to each database it fences. `try_acquire`
+  takes both locks or neither, and `acquire` takes the fence lock, then waits
+  for the presence lock within the same deadline, so maintenance waits for
+  kept connections to close.
+- `meerkat-store`: the storage doctor's artifact sweep (`rkat storage
+  doctor`) lists `*.mpresence` presence lock files as
+  `maintenance-fence-lock` findings, as it lists the `*.mfence` fence lock
+  files.
 - A runtime delivery owner on a store other processes share reads the
   store's delivery generation through one kept connection instead of a
   verified open on every store tick (up to one tick per 10 ms on a busy
@@ -288,7 +294,7 @@ them.
   opened and that the schema and the delivery domain's ledger row are
   unchanged, and opens again, verified, when they are not. The maintenance
   fence takes the presence lock after its fence lock, and the reader closes
-  before its owner delivers anything, at its next read, which the fence
+  before its owner calls into the host, at its next read, which the fence
   refuses, or after `KEPT_DELIVERY_READER_IDLE` (1 second) without a read,
   so maintenance gets the database well inside `rkat storage migrate`'s
   default 10-second fence wait. Windows keeps the fresh-open read path

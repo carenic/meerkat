@@ -259,7 +259,8 @@ impl KeptConnectionPresence {
     ///   registry keys it. The holder's own reads pass their guards through
     ///   the registry and keep nothing, so the holder never waits on itself;
     /// - maintenance holds the presence lock;
-    /// - the database file is refused (see
+    /// - the database file is missing (nothing to keep, and no presence file
+    ///   is planted next to it) or refused (see
     ///   [`validate_database_file`](crate::profile::validate_database_file)),
     ///   or the presence lock file cannot be created or locked (a read-only
     ///   medium, a filesystem without locks): presence that cannot be held
@@ -272,9 +273,11 @@ impl KeptConnectionPresence {
         if process_holds_exclusive(&fence_lock_path(db_path)) {
             return None;
         }
-        // Refuse an unsafe database file before planting its presence
-        // sibling, as `OperationGuard::for_database` does for the fence.
-        crate::profile::validate_database_file(db_path).ok()?;
+        // Refuse a missing or unsafe database file before planting its
+        // presence sibling.
+        let Ok(Some(_)) = crate::profile::validate_database_file(db_path) else {
+            return None;
+        };
         let file = open_lock_file(&presence_lock_path(db_path))?;
         file.try_lock_shared().ok()?;
         Some(Self { _lock: file })
@@ -534,12 +537,20 @@ mod tests {
         );
     }
 
+    /// A database file at `dir/db.sqlite3`: presence is only taken for a
+    /// file that exists.
+    fn existing_database(dir: &Path) -> PathBuf {
+        let db = dir.join("db.sqlite3");
+        std::fs::write(&db, b"").expect("database file");
+        db
+    }
+
     /// A kept connection's presence keeps the fence from being taken, and a
     /// refused attempt leaves no lock behind: guarded operations go on.
     #[test]
     fn kept_presence_refuses_the_fence_and_a_refused_fence_holds_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("db.sqlite3");
+        let db = existing_database(dir.path());
         let presence = KeptConnectionPresence::acquire(&db).expect("presence");
         assert!(
             ExclusiveFence::try_acquire(&db).expect("io").is_none(),
@@ -563,7 +574,7 @@ mod tests {
     #[test]
     fn a_waiting_fence_refuses_the_kept_readers_next_read_and_completes_when_it_closes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("db.sqlite3");
+        let db = existing_database(dir.path());
         let presence = KeptConnectionPresence::acquire(&db).expect("presence");
         let waiting = {
             let db = db.clone();
@@ -605,7 +616,7 @@ mod tests {
     #[test]
     fn presence_is_refused_while_the_fence_is_held() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("db.sqlite3");
+        let db = existing_database(dir.path());
         let own = ExclusiveFence::try_acquire(&db)
             .expect("io")
             .expect("own fence");
@@ -637,5 +648,19 @@ mod tests {
         assert!(KeptConnectionPresence::acquire(&db).is_none());
         assert!(!presence_lock_path(&db).exists());
         assert!(KeptConnectionPresence::acquire(Path::new(":memory:")).is_none());
+    }
+
+    /// A missing database has nothing to keep, and gets no presence sibling.
+    #[test]
+    fn presence_plants_nothing_next_to_a_missing_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("db.sqlite3");
+        assert!(KeptConnectionPresence::acquire(&db).is_none());
+        assert!(!presence_lock_path(&db).exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("read dir").count(),
+            0,
+            "nothing planted"
+        );
     }
 }
