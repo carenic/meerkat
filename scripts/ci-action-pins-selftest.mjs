@@ -397,6 +397,11 @@ try {
         "no packageRule turns automerge off for every cargo granit-parser update",
       ],
       [
+        "a parser rule without matchManagers",
+        [...withoutParserRule, { matchPackageNames: yamlParserRule.matchPackageNames, minimumReleaseAge: "7 days", automerge: false }],
+        "no packageRule turns automerge off for every cargo serde-saphyr update",
+      ],
+      [
         "no release age",
         [...withoutParserRule, { matchManagers: ["cargo"], matchPackageNames: ["serde-saphyr", "granit-parser"], automerge: false }],
         "cargo serde-saphyr updates lack a minimumReleaseAge",
