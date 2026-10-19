@@ -1,21 +1,18 @@
 //! Phase 6 T19 — cleanup grep sweep.
 //!
-//! Plan §Top-down integration tests T19 + §Phase 6 slice 6.16 describe
-//! this test as the observable proof for contract C13 ("Phase 6 cleanup
-//! completeness — zero production hits for deleted symbols"). Until
-//! Phase 6 slices 6.1–6.15 ship, this test documents what remains by
-//! emitting a readable diff and asserting the expected zero-count per
-//! symbol.
+//! Plan T19 and Phase 6 slice 6.16 made this test the observable proof for
+//! contract C13 ("Phase 6 cleanup completeness: zero production hits for
+//! deleted symbols"). Phase 6 has shipped, so the sweep now guards the
+//! result: a deleted symbol that comes back fails it wherever this test
+//! binary runs (CI's integration lanes, the pre-push hook's).
 //!
-//! Running the sweep:
+//! Running the sweep alone:
 //!
 //!   cargo test -p meerkat-integration-tests --test phase6_cleanup_sweep \
-//!       -- --ignored --nocapture
+//!       -- --nocapture
 //!
-//! It is `#[ignore]` by default so CI does not red on an in-flight
-//! Phase 6. The test's assertion *is* the plan-defined gate: the gate
-//! will flip green only when each deleted symbol has zero production
-//! hits. Until then, the output is the living punch list.
+//! A needle counts only as a whole token (`token_hits`): a deleted name
+//! that is the prefix of a live identifier is not a hit.
 //!
 //! Uses std::fs directly (no rg dependency) so it runs on every CI
 //! runner whether or not ripgrep is installed.
@@ -73,7 +70,31 @@ fn walk_rec(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn count_substring_hits(
+/// Occurrences of `needle` in `content` that stand as whole tokens. Where the
+/// needle starts (ends) with an identifier character, the character before
+/// (after) the occurrence must not be one: `pub enum LlmProvider` finds the
+/// deleted enum, not `pub enum LlmProviderErrorKind`, while a needle that
+/// ends in punctuation, such as `StaticLease::empty(`, matches whatever
+/// follows it.
+fn token_hits(content: &str, needle: &str) -> usize {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let open_start = needle.starts_with(ident);
+    let open_end = needle.ends_with(ident);
+    content
+        .match_indices(needle)
+        .filter(|&(at, _)| {
+            let joins_before = open_start && content[..at].chars().next_back().is_some_and(ident);
+            let joins_after = open_end
+                && content[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(ident);
+            !(joins_before || joins_after)
+        })
+        .count()
+}
+
+fn count_token_hits(
     sources: &[PathBuf],
     needle: &str,
     skip_self: &Path,
@@ -93,7 +114,7 @@ fn count_substring_hits(
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
-        let count = content.matches(needle).count();
+        let count = token_hits(&content, needle);
         if count > 0 {
             hits.push((path.clone(), count));
         }
@@ -101,10 +122,10 @@ fn count_substring_hits(
     hits
 }
 
-/// Symbols Phase 6 commits to deleting. Each entry is
-/// `(needle, human_label, skip_suffixes)`. Substring match (not regex)
-/// so every needle must be specific enough to avoid false positives —
-/// which all plan-§6 deletion targets are.
+/// Symbols Phase 6 deleted. Each entry is
+/// `(needle, human_label, skip_suffixes)`. A needle matches as a whole
+/// token (`token_hits`, not a regex), so it must still be specific enough
+/// that only the deleted symbol spells it.
 ///
 /// `skip_suffixes` allowlists files whose paths end with any of the
 /// listed suffixes — for cases where a newer, unrelated subsystem
@@ -239,18 +260,10 @@ fn phase6_deletions() -> Vec<(&'static str, &'static str, &'static [&'static str
     ]
 }
 
-// Plan §Phase 6 migration gate. Not a canonical CI test — this is a
-// temporary migration guard, runnable on demand, scoped to detecting
-// regressions in the Phase 6 flat-path deletion set. Do not add to the
-// canonical CI lane. Invoke explicitly:
-//   cargo test -p meerkat-integration-tests --test phase6_cleanup_sweep \
-//       -- --ignored --nocapture
-#[test]
-#[ignore = "plan §Phase 6 migration guard — manual-only, not CI-canonical"]
-fn phase6_deleted_symbols_have_zero_production_hits() {
-    let root = repo_root();
-    let self_path = root.join("tests/integration/tests/phase6_cleanup_sweep.rs");
-    let sources = walk_rust_sources(&root);
+/// Every deleted symbol still present in the Rust sources under `root`
+/// (`self_path` excluded): its label, its total and the files that hold it.
+fn phase6_hits(root: &Path, self_path: &Path) -> Vec<(String, usize, Vec<(PathBuf, usize)>)> {
+    let sources = walk_rust_sources(root);
     assert!(
         !sources.is_empty(),
         "no Rust source files discovered under {}",
@@ -260,17 +273,27 @@ fn phase6_deleted_symbols_have_zero_production_hits() {
     let mut failures: Vec<(String, usize, Vec<(PathBuf, usize)>)> = Vec::new();
 
     for (needle, label, skip_suffixes) in phase6_deletions() {
-        let hits = count_substring_hits(&sources, needle, &self_path, skip_suffixes);
+        let hits = count_token_hits(&sources, needle, self_path, skip_suffixes);
         let total: usize = hits.iter().map(|(_, c)| c).sum();
         println!("\n=== {label} ===\nneedle: {needle}\nhits:   {total}");
         for (path, count) in &hits {
-            let rel = path.strip_prefix(&root).unwrap_or(path);
+            let rel = path.strip_prefix(root).unwrap_or(path);
             println!("  {count:>4}  {}", rel.display());
         }
         if total > 0 {
             failures.push((label.to_string(), total, hits));
         }
     }
+    failures
+}
+
+// The Phase 6 regression guard: every deleted symbol stays at zero
+// production hits.
+#[test]
+fn phase6_deleted_symbols_have_zero_production_hits() {
+    let root = repo_root();
+    let self_path = root.join("tests/integration/tests/phase6_cleanup_sweep.rs");
+    let failures = phase6_hits(&root, &self_path);
 
     if !failures.is_empty() {
         let mut summary =
@@ -282,8 +305,64 @@ fn phase6_deleted_symbols_have_zero_production_hits() {
                 summary.push_str(&format!("        {c:>4}  {}\n", rel.display()));
             }
         }
-        panic!("{summary}\nPhase 6 is not complete until every line above prints 0 hits.");
+        panic!("{summary}\nA deleted Phase 6 symbol is back: every line above must print 0 hits.");
     }
+}
+
+/// Needles match whole tokens: the hits this sweep reported for the live
+/// `LlmProviderError*` enums are gone, while the deleted enum, a deleted
+/// name followed by punctuation, and a needle ending in punctuation still
+/// match.
+#[test]
+fn needles_match_whole_tokens_only() {
+    let needle = "pub enum LlmProvider";
+    assert_eq!(token_hits("pub enum LlmProviderErrorKind {", needle), 0);
+    assert_eq!(
+        token_hits("pub enum LlmProviderErrorRetryability {", needle),
+        0
+    );
+    assert_eq!(token_hits("pub enum LlmProvider {", needle), 1);
+    assert_eq!(token_hits("pub enum LlmProvider\n{", needle), 1);
+    assert_eq!(
+        token_hits("let c = my_ShimCredential;", "ShimCredential"),
+        0
+    );
+    assert_eq!(
+        token_hits("let c = ShimCredential::new();", "ShimCredential"),
+        1
+    );
+    assert_eq!(
+        token_hits("StaticLease::empty(kind)", "StaticLease::empty("),
+        1
+    );
+    assert_eq!(
+        token_hits("StaticLease::empty_lease(kind)", "StaticLease::empty("),
+        0
+    );
+}
+
+/// A deleted symbol in production code still fails the sweep: in a tree
+/// whose one source declares the deleted `LlmProvider` enum beside the live
+/// `LlmProviderErrorKind`, the sweep reports exactly that enum, once.
+#[test]
+fn a_deleted_symbol_in_production_code_fails_the_sweep() {
+    let tree = tempfile::tempdir().expect("temp dir");
+    let src = tree.path().join("crates/demo/src");
+    fs::create_dir_all(&src).expect("source dir");
+    fs::write(
+        src.join("lib.rs"),
+        "pub enum LlmProviderErrorKind {\n    Auth,\n}\n\npub enum LlmProvider {\n    OpenAi,\n}\n",
+    )
+    .expect("source file");
+    let failures = phase6_hits(tree.path(), &tree.path().join("absent.rs"));
+    assert_eq!(failures.len(), 1, "exactly one deleted symbol is reported");
+    let (label, total, hits) = &failures[0];
+    assert!(
+        label.starts_with("LlmProvider enum declaration"),
+        "reported: {label}"
+    );
+    assert_eq!(*total, 1);
+    assert_eq!(hits.len(), 1);
 }
 
 /// Baseline check: the walker finds a non-trivial number of Rust sources
