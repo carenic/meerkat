@@ -102,6 +102,23 @@ call blocks for it instead. There is no default deadline; `max_run_secs` is an
 opt-in autokill. See [Mob tools](/reference/builtin-tools#fork_off-and-council-delivery)
 for the result shapes and the ownership rules.
 
+A fork child holds the instruction activations it copied from its source as
+history only, and runs no model turn until each inherited key is activated in
+the child. The host decides who does that with its fork instruction policy
+(`MobBuilder::with_fork_instruction_policy`, or
+`MobMcpState::with_fork_instruction_policy`); it is never a tool argument or
+part of a mob definition:
+
+- `require_explicit_activation` (the default): the host activates the child
+  after `fork_member`. The forks that start the child's turn themselves
+  (`fork_off`, the bounded and detached member forks, the live delegation's
+  durable fork, and council participants) leave no window for that, so a fork
+  of a member with activated host instructions is refused before anything is
+  committed, with the typed `fork_instruction_refused` error.
+- `reactivate_inherited`: the fork appends the child's own activation of every
+  key that was effective in the source, and the child runs at once.
+- `refuse`: every fork whose child would inherit an activation is refused.
+
 ## Define A Mob
 
 A small mob definition has profiles and optional wiring:

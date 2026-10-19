@@ -451,7 +451,12 @@ pub fn agent_transport_error_code(error: &meerkat_core::AgentError) -> ErrorCode
         AgentError::TokenBudgetExceeded { .. }
         | AgentError::TimeBudgetExceeded { .. }
         | AgentError::ToolCallBudgetExceeded { .. } => ErrorCode::BudgetExhausted,
-        AgentError::ConfigError(_) => ErrorCode::InvalidParams,
+        // A turn refused by its instruction activation history (a fork child
+        // that never activated its inherited keys) keeps the code its former
+        // configuration-string form had.
+        AgentError::ConfigError(_) | AgentError::InstructionActivation(_) => {
+            ErrorCode::InvalidParams
+        }
         AgentError::HookDenied { .. } => ErrorCode::HookDenied,
         AgentError::Llm { .. } | AgentError::BuildError(_) => ErrorCode::ProviderError,
         AgentError::SessionNotFound(_) => ErrorCode::SessionNotFound,
@@ -479,6 +484,18 @@ impl From<meerkat_core::SessionError> for WireError {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A turn refused by instruction activation history is a typed agent
+    /// error; on the wire it keeps the code its configuration-string form had.
+    #[test]
+    fn a_typed_instruction_activation_refusal_keeps_its_wire_code() {
+        let error = meerkat_core::AgentError::InstructionActivation(
+            meerkat_core::InstructionActivationError::InheritedActivationRequiresExplicitActivation {
+                keys: Vec::new(),
+            },
+        );
+        assert_eq!(agent_transport_error_code(&error), ErrorCode::InvalidParams);
+    }
 
     #[test]
     fn settlement_companions_preserve_wire_class_and_readiness_details() {

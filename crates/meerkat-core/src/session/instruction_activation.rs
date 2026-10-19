@@ -3,8 +3,8 @@
 use super::Session;
 use crate::types::{
     InstructionActivationId, InstructionActivationIdentity, InstructionContentDigest,
-    InstructionKey, InstructionNamespace, InstructionRevisionRef, Message, SessionId,
-    SystemMessage, message_timestamp_now,
+    InstructionKey, InstructionNamespace, InstructionRevisionRef, Message, MessageTimestamp,
+    SessionId, SystemMessage, message_timestamp_now,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -384,6 +384,56 @@ fn fork_instruction_refusal_message(
     }
 }
 
+/// Text before the digest of a derived fork re-activation id. Operator
+/// presentation only: no code branches on it. A re-activation row is
+/// recognized by reproducing it ([`Session::fork_reactivation_suffix_len`]).
+const FORK_REACTIVATION_ID_PREFIX: &str = "fork-reactivation:";
+
+/// The activation id of the row that re-activates `head` in the fork child
+/// `child`: `fork-reactivation:` and the first 32 hex digits of
+/// `sha256(child || 0x00 || head)`. It depends on the child and the head
+/// only, so a planned child's bytes are a function of its prefix and its id,
+/// and it hashes the child id, so it cannot collide with an id of the lineage
+/// it re-activates.
+fn fork_reactivation_activation_id(
+    child: &SessionId,
+    head: &InstructionActivationId,
+) -> Result<InstructionActivationId, InstructionActivationError> {
+    use sha2::{Digest as _, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha256::new();
+    hasher.update(child.to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(head.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut id = String::from(FORK_REACTIVATION_ID_PREFIX);
+    for byte in digest.iter().take(16) {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    InstructionActivationId::new(id).map_err(|error| {
+        InstructionActivationError::MalformedHistory(format!(
+            "derived fork re-activation id is invalid: {error}"
+        ))
+    })
+}
+
+fn message_created_at(message: &Message) -> MessageTimestamp {
+    match message {
+        Message::System(system) => system.created_at,
+        Message::SystemNotice(notice) => notice.created_at,
+        Message::User(user) => user.created_at,
+        Message::BlockAssistant(assistant) => assistant.created_at,
+        Message::ToolResults { created_at, .. } => *created_at,
+    }
+}
+
+/// Each key a fork child inherited, with its head row at the fork boundary
+/// (the key's last copied row) and that row's body, in (namespace, key)
+/// order.
+type InheritedActivationHeads =
+    BTreeMap<(InstructionNamespace, InstructionKey), (InstructionActivationIdentity, String)>;
+
 fn json_string(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }
@@ -581,6 +631,161 @@ pub fn inherited_instruction_keys_requiring_activation(
 }
 
 impl Session {
+    /// Apply the host's fork instruction policy to this fork child, before its
+    /// single save, and return how many re-activation rows it appended.
+    ///
+    /// The child holds the activation rows it copied with its prefix as
+    /// history only. [`ForkInstructionPolicy::Refuse`] refuses a child that
+    /// inherits any. [`ForkInstructionPolicy::RequireExplicitActivation`]
+    /// leaves them for the host to activate; callers resolve it first for
+    /// forks that leave no window for that ([`ForkInstructionPolicy::effective`]).
+    /// [`ForkInstructionPolicy::ReactivateInherited`] appends, through the
+    /// ordinary activation rules, one origin-local row per inherited key that
+    /// re-activates the key's head at the fork boundary, provided that head
+    /// was effective in `source_session_id`. The rows follow the prefix in
+    /// (namespace, key) order, carry the last copied message's timestamp and
+    /// derive their ids from the child id and the head, so the child is a
+    /// function of its prefix and its id. A refusal leaves the child unchanged.
+    pub fn apply_fork_instruction_policy(
+        &mut self,
+        source_session_id: &SessionId,
+        policy: ForkInstructionPolicy,
+    ) -> Result<usize, ForkInstructionRefusal> {
+        let heads = self.inherited_activation_heads().map_err(|error| {
+            ForkInstructionRefusal::new(
+                ForkInstructionRefusalCause::Activation { code: error.code() },
+                Vec::new(),
+            )
+        })?;
+        if heads.is_empty() {
+            return Ok(0);
+        }
+        let keys = heads.keys().cloned().collect::<Vec<_>>();
+        match policy {
+            ForkInstructionPolicy::RequireExplicitActivation => Ok(0),
+            ForkInstructionPolicy::Refuse => Err(ForkInstructionRefusal::new(
+                ForkInstructionRefusalCause::PolicyRefuses,
+                keys,
+            )),
+            ForkInstructionPolicy::ReactivateInherited => {
+                let not_effective = heads
+                    .iter()
+                    .filter(|(_, (head, _))| head.origin_session_id != *source_session_id)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                if !not_effective.is_empty() {
+                    return Err(ForkInstructionRefusal::new(
+                        ForkInstructionRefusalCause::NotEffectiveInSource,
+                        not_effective,
+                    ));
+                }
+                let mut child = self.clone();
+                let appended = child.append_fork_reactivations(&heads).map_err(|error| {
+                    let cause = match error {
+                        InstructionActivationError::LineageBodyBudgetExceeded { max_bytes } => {
+                            ForkInstructionRefusalCause::LineageBodyBudgetExceeded { max_bytes }
+                        }
+                        error => ForkInstructionRefusalCause::Activation { code: error.code() },
+                    };
+                    ForkInstructionRefusal::new(cause, keys)
+                })?;
+                *self = child;
+                Ok(appended)
+            }
+        }
+    }
+
+    /// The length of the fork re-activation rows that end this fork child:
+    /// zero, or the trailing origin-local activation rows, verified to be
+    /// exactly the rows [`ForkInstructionPolicy::ReactivateInherited`] derives
+    /// from the messages before them and this child's id. The suffix is
+    /// recognized only by reproducing it, never by the shape of its ids.
+    pub fn fork_reactivation_suffix_len(&self) -> Result<usize, InstructionActivationError> {
+        let suffix = self
+            .messages()
+            .iter()
+            .rev()
+            .take_while(|message| {
+                matches!(
+                    message,
+                    Message::System(system)
+                        if system
+                            .instruction_activation
+                            .as_ref()
+                            .is_some_and(|identity| identity.origin_session_id == *self.id())
+                )
+            })
+            .count();
+        if suffix == 0 {
+            return Ok(0);
+        }
+        let prefix_len = self.messages().len().saturating_sub(suffix);
+        let mut probe = self.clone();
+        probe.messages =
+            super::TranscriptMessages::from_vec(self.messages()[..prefix_len].to_vec());
+        let heads = probe.inherited_activation_heads()?;
+        probe.append_fork_reactivations(&heads)?;
+        if probe.messages() != self.messages() {
+            return Err(InstructionActivationError::MalformedHistory(
+                "the trailing origin-local activation rows are not the fork re-activation of \
+                 the messages before them"
+                    .to_string(),
+            ));
+        }
+        Ok(suffix)
+    }
+
+    fn inherited_activation_heads(
+        &self,
+    ) -> Result<InheritedActivationHeads, InstructionActivationError> {
+        validate_instruction_activation_messages(self.messages())
+            .map_err(InstructionActivationError::MalformedHistory)?;
+        let mut heads = InheritedActivationHeads::new();
+        for message in self.messages() {
+            let Message::System(system) = message else {
+                continue;
+            };
+            let Some(identity) = system.instruction_activation.as_ref() else {
+                continue;
+            };
+            if identity.origin_session_id == *self.id() {
+                continue;
+            }
+            let body = body_from_origin_envelope(identity, &system.content)
+                .map_err(InstructionActivationError::MalformedHistory)?;
+            heads.insert(
+                (
+                    identity.revision.namespace.clone(),
+                    identity.revision.key.clone(),
+                ),
+                (identity.clone(), body.to_string()),
+            );
+        }
+        Ok(heads)
+    }
+
+    /// Append the re-activation row of each head, in key order, through the
+    /// ordinary activation rules.
+    fn append_fork_reactivations(
+        &mut self,
+        heads: &InheritedActivationHeads,
+    ) -> Result<usize, InstructionActivationError> {
+        let Some(created_at) = self.messages().last().map(message_created_at) else {
+            return Ok(0);
+        };
+        for (head, body) in heads.values() {
+            let request = InstructionActivationRequest {
+                revision: head.revision.clone(),
+                activation_id: fork_reactivation_activation_id(self.id(), &head.activation_id)?,
+                expectation: InstructionActivationExpectation::Absent,
+                supersedes: Some(head.activation_id.clone()),
+                body: body.clone(),
+            };
+            self.activate_instruction_at(request, created_at)?;
+        }
+        Ok(heads.len())
+    }
+
     /// Refuse a model request while a fork has inherited historical
     /// instruction rows without an explicit origin-local activation.
     pub fn validate_instruction_activation_turn_readiness(
@@ -690,6 +895,15 @@ impl Session {
     pub fn activate_instruction(
         &mut self,
         request: InstructionActivationRequest,
+    ) -> Result<InstructionActivationMutation, InstructionActivationError> {
+        self.activate_instruction_at(request, message_timestamp_now())
+    }
+
+    /// [`Self::activate_instruction`] with the appended row's timestamp given.
+    fn activate_instruction_at(
+        &mut self,
+        request: InstructionActivationRequest,
+        created_at: MessageTimestamp,
     ) -> Result<InstructionActivationMutation, InstructionActivationError> {
         validate_instruction_activation_messages(self.messages())
             .map_err(InstructionActivationError::MalformedHistory)?;
@@ -844,7 +1058,7 @@ impl Session {
             .count();
         self.messages.push(Message::System(SystemMessage {
             content,
-            created_at: message_timestamp_now(),
+            created_at,
             identity: None,
             prompt_version: None,
             instruction_activation: Some(identity.clone()),
@@ -1068,6 +1282,215 @@ mod tests {
                 .as_ref()
                 .map(InstructionActivationId::as_str),
             Some("child-act-1")
+        );
+    }
+
+    #[test]
+    fn the_effective_policy_refuses_only_without_an_activation_window() {
+        use ForkInstructionPolicy::{ReactivateInherited, Refuse, RequireExplicitActivation};
+        for (policy, window, effective) in [
+            (
+                RequireExplicitActivation,
+                ActivationWindow::HostDriven,
+                RequireExplicitActivation,
+            ),
+            (RequireExplicitActivation, ActivationWindow::None, Refuse),
+            (
+                ReactivateInherited,
+                ActivationWindow::HostDriven,
+                ReactivateInherited,
+            ),
+            (
+                ReactivateInherited,
+                ActivationWindow::None,
+                ReactivateInherited,
+            ),
+            (Refuse, ActivationWindow::HostDriven, Refuse),
+            (Refuse, ActivationWindow::None, Refuse),
+        ] {
+            assert_eq!(
+                policy.effective(window),
+                effective,
+                "{policy:?} with {window:?}"
+            );
+        }
+    }
+
+    fn keyed_request(key: &str, body: &str, activation: &str) -> InstructionActivationRequest {
+        let mut request = request(
+            body,
+            activation,
+            InstructionActivationExpectation::Absent,
+            None,
+        );
+        request.revision.key = InstructionKey::new(key).unwrap();
+        request
+    }
+
+    /// A parent that activated `zeta`, then `alpha`, then `zeta` again, and a
+    /// fork child of it.
+    fn fork_child_of_two_keys() -> (Session, Session) {
+        let mut parent = Session::new();
+        parent
+            .activate_instruction(keyed_request("zeta", "policy z", "z-1"))
+            .unwrap();
+        parent.push(Message::User(UserMessage::text("a turn")));
+        parent
+            .activate_instruction(keyed_request("alpha", "policy a", "a-1"))
+            .unwrap();
+        let mut zeta_again = keyed_request("zeta", "policy z two", "z-2");
+        zeta_again.expectation = InstructionActivationExpectation::Effective(
+            InstructionActivationId::new("z-1").unwrap(),
+        );
+        zeta_again.supersedes = Some(InstructionActivationId::new("z-1").unwrap());
+        parent.activate_instruction(zeta_again).unwrap();
+        parent.push(Message::User(UserMessage::text("another turn")));
+        let child = parent.fork();
+        (parent, child)
+    }
+
+    #[test]
+    fn reactivation_rows_are_a_function_of_the_prefix_and_the_child() {
+        let (parent, child) = fork_child_of_two_keys();
+        let prefix = child.messages().len();
+        let mut first = child.clone();
+        let mut second = child.clone();
+        assert_eq!(
+            first.apply_fork_instruction_policy(
+                parent.id(),
+                ForkInstructionPolicy::ReactivateInherited
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            second.apply_fork_instruction_policy(
+                parent.id(),
+                ForkInstructionPolicy::ReactivateInherited
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            first.messages(),
+            second.messages(),
+            "the same prefix and child give byte-identical rows"
+        );
+        let rows = first.messages()[prefix..]
+            .iter()
+            .map(|message| match message {
+                Message::System(system) => system
+                    .instruction_activation
+                    .clone()
+                    .expect("an activation row"),
+                other => panic!("expected a re-activation row, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|identity| identity.revision.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"],
+            "rows in (namespace, key) order, not activation order"
+        );
+        assert!(
+            rows.iter()
+                .all(|identity| identity.origin_session_id == *first.id())
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|identity| identity
+                    .supersedes
+                    .as_ref()
+                    .map(InstructionActivationId::as_str))
+                .collect::<Vec<_>>(),
+            vec![Some("a-1"), Some("z-2")],
+            "each row re-activates its key's head at the boundary"
+        );
+        assert_eq!(rows[1].revision.revision_id.as_str(), "rev-z-2");
+        first
+            .validate_instruction_activation_turn_readiness()
+            .unwrap();
+        assert_eq!(first.fork_reactivation_suffix_len(), Ok(2));
+        assert_eq!(
+            child.fork_reactivation_suffix_len(),
+            Ok(0),
+            "a child without re-activation has no suffix"
+        );
+    }
+
+    #[test]
+    fn refusals_leave_the_child_unchanged() {
+        let (parent, child) = fork_child_of_two_keys();
+        let mut refused = child.clone();
+        assert_eq!(
+            refused
+                .apply_fork_instruction_policy(parent.id(), ForkInstructionPolicy::Refuse)
+                .unwrap_err()
+                .cause,
+            ForkInstructionRefusalCause::PolicyRefuses
+        );
+        assert_eq!(refused.messages(), child.messages());
+        let mut explicit = child.clone();
+        assert_eq!(
+            explicit.apply_fork_instruction_policy(
+                parent.id(),
+                ForkInstructionPolicy::RequireExplicitActivation
+            ),
+            Ok(0)
+        );
+        assert_eq!(explicit.messages(), child.messages());
+        // A grandchild of an unactivated child: the heads it inherits were
+        // never effective in its source.
+        let mut grandchild = child.fork();
+        let refusal = grandchild
+            .apply_fork_instruction_policy(child.id(), ForkInstructionPolicy::ReactivateInherited)
+            .unwrap_err();
+        assert_eq!(
+            refusal.cause,
+            ForkInstructionRefusalCause::NotEffectiveInSource
+        );
+        assert_eq!(refusal.keys.len(), 2);
+        assert_eq!(grandchild.messages(), child.messages());
+    }
+
+    #[test]
+    fn a_suffix_the_fork_did_not_derive_is_refused() {
+        let (parent, child) = fork_child_of_two_keys();
+        let mut genuine = child.clone();
+        genuine
+            .apply_fork_instruction_policy(parent.id(), ForkInstructionPolicy::ReactivateInherited)
+            .unwrap();
+        // The same rows, except one byte of the second row's id: still valid
+        // origin-local activations, but not the ones the fork derives.
+        let heads = child.inherited_activation_heads().unwrap();
+        let created_at = message_created_at(child.messages().last().unwrap());
+        let mut forged = child.clone();
+        for (index, (head, body)) in heads.values().enumerate() {
+            let mut activation_id =
+                fork_reactivation_activation_id(child.id(), &head.activation_id)
+                    .unwrap()
+                    .as_str()
+                    .to_string();
+            if index == 1 {
+                let last = activation_id.pop().unwrap();
+                activation_id.push(if last == '0' { '1' } else { '0' });
+            }
+            forged
+                .activate_instruction_at(
+                    InstructionActivationRequest {
+                        revision: head.revision.clone(),
+                        activation_id: InstructionActivationId::new(activation_id).unwrap(),
+                        expectation: InstructionActivationExpectation::Absent,
+                        supersedes: Some(head.activation_id.clone()),
+                        body: body.clone(),
+                    },
+                    created_at,
+                )
+                .unwrap();
+        }
+        assert_eq!(genuine.fork_reactivation_suffix_len(), Ok(2));
+        assert!(
+            forged.fork_reactivation_suffix_len().is_err(),
+            "a suffix the fork did not derive is refused"
         );
     }
 

@@ -130,10 +130,18 @@ pub(super) fn create_payload(
         scope: wire_scope(request.scope),
         reuse: wire_reuse(request.reuse),
         ttl_millis: u64::try_from(request.ttl.as_millis()).ok()?,
-        inherited_instructions: (inherited_instructions
-            == meerkat_core::ForkInstructionPolicy::ReactivateInherited)
-            .then_some(inherited_instructions),
+        inherited_instructions: carried_fork_instruction_policy(inherited_instructions),
     })
+}
+
+/// The fork instruction policy a create payload carries to the member host:
+/// `reactivate_inherited` only (see [`create_payload`]). One definition, so
+/// the controller's version-skew mapping and the payload agree on whether a
+/// member host saw the field.
+pub(super) fn carried_fork_instruction_policy(
+    policy: meerkat_core::ForkInstructionPolicy,
+) -> Option<meerkat_core::ForkInstructionPolicy> {
+    (policy == meerkat_core::ForkInstructionPolicy::ReactivateInherited).then_some(policy)
 }
 
 /// Build the V6 revoke payload for one capability.

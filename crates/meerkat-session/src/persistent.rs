@@ -6553,8 +6553,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         requested_tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
         cache_inheritance: ForkCacheInheritance,
         target: Option<meerkat_core::DurableSessionForkTarget>,
-        _inherited_instructions: meerkat_core::ForkInstructionPolicy,
+        inherited_instructions: meerkat_core::ForkInstructionPolicy,
     ) -> Result<SessionForkResult, SessionError> {
+        // The fork instruction policy decides, before anything is committed,
+        // what the child does with the activation rows it copied: refuse the
+        // fork, or append the child's own re-activation rows so the single
+        // save below commits them with the child.
+        let reactivated_instruction_count = forked
+            .apply_fork_instruction_policy(&source_session_id, inherited_instructions)
+            .map_err(SessionError::ForkInstructionRefused)?;
         // Core transcript forks deliberately strip session authority metadata.
         // Rebuild sanitized execution configuration whenever canonical source
         // metadata exists. `None`/`Inherit` retain the source's effective
@@ -6675,7 +6682,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             message_count: saved.messages().len(),
             cache_inheritance,
             session_ref: None,
-            reactivated_instruction_count: 0,
+            reactivated_instruction_count,
         })
     }
 

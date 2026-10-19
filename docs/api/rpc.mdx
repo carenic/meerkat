@@ -1064,6 +1064,8 @@ Create a new idle session whose transcript is the source session prefix ending b
 
 `running_behavior` currently supports `"reject"`, which returns `SESSION_BUSY` if the source session has active work.
 
+`inherited_instructions` decides what the child does with the instruction activations it copies from the prefix. The child is not materialized, so nobody can activate it before its first turn: with the field absent or `"require_explicit_activation"` (the default), and with `"refuse"`, a prefix that carries activation rows is refused before anything is committed with `FORK_INSTRUCTION_REFUSED` (-32037), whose `data` carries `kind: "fork_instruction_refused"` and the typed `fork_instruction_refusal` (`cause`, `keys`). `"reactivate_inherited"` appends the child's own activation of every key that was effective in the source; the result's `reactivated_instruction_count` counts those rows, which `message_count` includes. A prefix without activation rows forks the same way under every value.
+
 ### session/fork_replace
 
 Create a new idle session from the source prefix through `message_index`, replacing the addressed message or block with a typed replacement. Later source messages are intentionally omitted so callers continue from the edited branch instead of replaying stale descendants.
@@ -1101,6 +1103,8 @@ Create a new idle session from the source prefix through `message_index`, replac
 ```
 
 Supported replacement variants are `message`, `user_content_block`, `assistant_block`, and `tool_result_content_block`. Edits always create a new session identity.
+
+`inherited_instructions` works as on `session/fork_at`.
 
 ### session/list
 
@@ -3259,6 +3263,7 @@ and `data`, never on the message text.
 | -32034 | Approval conflict | Another owner changed the approval first; reconcile it before reuse |
 | -32035 | Approval commit unknown | The store cannot confirm the commit; reconcile from the store, never resend |
 | -32036 | Stale delivery scope | A scope-bound mob submit named a session that is no longer the member's; re-capture the delivery scope |
+| -32037 | Fork instruction refused | A fork was refused before commit because its child would inherit activated instructions that the fork instruction policy does not carry into it; `data.fork_instruction_refusal` names the cause and keys. Nothing was committed |
 
 ### comms/send error data
 

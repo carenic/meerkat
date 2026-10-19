@@ -36447,15 +36447,27 @@ impl MobActor {
                     .map_err(Self::forked_participant_refused)
             }
         };
-        created.map_err(|error| Self::forked_participant_create_error(&source_identity, error))
+        let policy_carried = super::forked_participant_routing::carried_fork_instruction_policy(
+            self.fork_instruction_policy,
+        )
+        .is_some();
+        created.map_err(|error| {
+            Self::forked_participant_create_error(&source_identity, policy_carried, error)
+        })
     }
 
     /// Type one capability creation failure. A participant fork that the fork
     /// instruction policy refused is the same [`MobError::ForkInstructionRefused`]
     /// whether its source is local (the source runtime's typed session error)
     /// or placed (the member host's typed bridge rejection).
+    ///
+    /// A member host that predates the policy refuses a create payload that
+    /// carries it (its payload type denies unknown fields) as an unsupported
+    /// command. When `policy_carried`, that rejection is the typed version
+    /// skew [`meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported`].
     fn forked_participant_create_error(
         source_identity: &AgentIdentity,
+        policy_carried: bool,
         error: MobError,
     ) -> MobError {
         match error {
@@ -36475,6 +36487,16 @@ impl MobActor {
             } => MobError::ForkInstructionRefused {
                 source_member_id: source_identity.clone(),
                 refusal,
+            },
+            MobError::BridgeCommandRejected {
+                cause: super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                ..
+            } if policy_carried => MobError::ForkInstructionRefused {
+                source_member_id: source_identity.clone(),
+                refusal: meerkat_core::ForkInstructionRefusal::new(
+                    meerkat_core::ForkInstructionRefusalCause::MemberHostUnsupported,
+                    Vec::new(),
+                ),
             },
             error => error,
         }

@@ -110,6 +110,50 @@ them.
   verdict before the host is asked, as it already refused the operator.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
+- `meerkat-core`: `SessionError` gains `ForkInstructionRefused`: a durable
+  fork refused before commit by the host's fork instruction policy (see
+  Added). Exhaustive matches handle it; on the wire it is
+  `FORK_INSTRUCTION_REFUSED`. `DurableSessionForkTarget` gains
+  `inherited_instructions`, the policy the fork applies, already resolved for
+  its path. `SessionForkAtRequest` and `SessionForkReplaceRequest` gain
+  `inherited_instructions` (`None` is the default policy), and
+  `SessionForkResult` gains `reactivated_instruction_count`. Struct literals
+  set the new fields.
+- `meerkat-session`: `PersistentSessionService::fork_durable_session_with_planned_identity`
+  takes the fork instruction policy of a fork without a target.
+  `meerkat-mob`: `PlannedForkRequest` gains `inherited_instructions`, and
+  `MobError` gains `ForkInstructionRefused { source_member_id, refusal }`.
+  `meerkat-contracts`: `BridgeCreateForkedParticipantPayload` gains
+  `inherited_instructions`, `BridgeRejectionCause` gains
+  `ForkInstructionRefused`, and `ErrorCode` gains `ForkInstructionRefused`.
+  Every `MobSessionService` decorator that forwards planned forks forwards the
+  field.
+- Behaviour (not measured by the gate): forks whose copied prefix carries
+  activated host instructions. Under the default fork instruction policy,
+  `require_explicit_activation`, the forks that start the child's first turn
+  themselves are now refused before anything is committed, with the typed
+  refusal: `fork_off`, `MobHandle::fork_member_then_run_bounded` and
+  `fork_member_then_run_detached`, `fork_member_at_turn_boundary` (and so the
+  live delegation's durable fork), and council participants, local or
+  host-placed. So are the RPC forks `session/fork_at` and `session/fork_replace`,
+  whose child nobody can activate before its first turn. 0.9.3 committed such a
+  child and its first turn failed. `fork_member` keeps the host's activation
+  window. A host that wants the fork to carry the activations sets
+  `reactivate_inherited`; an RPC client passes `inherited_instructions`. Forks of
+  sources without activation rows are unchanged.
+- Behaviour (not measured by the gate): `meerkat-core`: a model turn refused
+  because a fork child never activated its inherited instruction keys fails
+  with `AgentError::InstructionActivation`, carrying the typed activation error,
+  instead of `AgentError::ConfigError(String)`. Its error class and wire code
+  are unchanged.
+- Council records: `TemporaryCouncilExitReason` gains
+  `ParticipantForkInstructionRefused { participant_order, refusal }`. A 0.9.3
+  reader of a record that holds it cannot decode its exit reason.
+- Mixed versions: a 0.9.3 member host does not know the fork instruction
+  policy. A controller with `reactivate_inherited` gets the typed refusal cause
+  `member_host_unsupported` from it; under the other policies the controller
+  sends no field and a 0.9.3 member host forks a participant as before, without
+  re-activation.
 
 ### Added
 
@@ -184,6 +228,30 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat-core`: `ForkInstructionPolicy` (`require_explicit_activation`, the
+  default; `reactivate_inherited`; `refuse`) and `ActivationWindow`, with
+  `ForkInstructionPolicy::effective`, which resolves the default to `refuse`
+  on a fork that leaves the host no activation window. The typed
+  `ForkInstructionRefusal` names its keys and a `ForkInstructionRefusalCause`:
+  `policy_refuses`, `not_effective_in_source`, `lineage_body_budget_exceeded`,
+  `activation` or `member_host_unsupported`.
+  `Session::apply_fork_instruction_policy` applies a policy to a fork child
+  before its save; under `reactivate_inherited` it appends one origin-local
+  activation per inherited key, re-activating the key's head at the fork
+  boundary, in (namespace, key) order and through the ordinary activation
+  rules. `Session::fork_reactivation_suffix_len` verifies those rows by
+  reproducing them, and `SessionForkResult::prefix_message_count()` gives the
+  copied prefix without them.
+- `meerkat-mob`: `MobBuilder::with_fork_instruction_policy`, and
+  `meerkat-mob-mcp`: `MobMcpState::with_fork_instruction_policy`, set the
+  host's policy for every mob built or resumed. It is never a tool argument or
+  part of a mob definition.
+- `meerkat-contracts`: the error code `FORK_INSTRUCTION_REFUSED` (JSON-RPC
+  -32037, HTTP 422, CLI exit 57), whose `data` carries
+  `kind: "fork_instruction_refused"` and the typed `fork_instruction_refusal`.
+  `session/fork_at` and `session/fork_replace` take `inherited_instructions`
+  and report `reactivated_instruction_count`. The Python and TypeScript SDKs
+  take the option on their fork calls and read the count.
 
 ### Changed
 
@@ -330,6 +398,13 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- A fork child of a member or session with activated host instructions no
+  longer commits only to fail its first turn ("forked session must explicitly
+  activate inherited instruction keys"). `fork_off`, council participants, the
+  other self-starting forks and the RPC forks now either carry the source's
+  effective activations into the child (`reactivate_inherited`) or are refused,
+  typed, before commit. Council crash recovery verifies a planned child's
+  re-activation rows exactly and measures its prefix without them.
 
 ## [0.9.3] - 2026-10-18
 

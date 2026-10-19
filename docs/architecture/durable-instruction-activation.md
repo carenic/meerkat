@@ -302,6 +302,36 @@ Activation rows are immutable transcript-boundary anchors.
   turn until it has appended an explicit origin-local activation for every
   inherited effective key. The child activation may name the inherited row in
   `supersedes` while its CAS expectation remains `Absent` for the child origin.
+- The host's fork instruction policy (`ForkInstructionPolicy`) decides who
+  appends that activation, at the durable fork commit, before the child's one
+  save:
+  - `require_explicit_activation`, the default, leaves it to the host. A fork
+    that leaves the host no window to do so is refused instead, before
+    anything is committed, when the copied prefix carries activation rows
+    (`FORK_INSTRUCTION_REFUSED`, cause `policy_refuses`). Those forks start the
+    child's first turn themselves (`fork_off`, the bounded and detached member
+    forks, the live delegation's durable fork, council participants), or commit
+    a child the host cannot activate (`session/fork_at` and
+    `session/fork_replace`, whose child is not materialized).
+  - `refuse` refuses every fork whose child would inherit a row.
+  - `reactivate_inherited` makes the fork append one origin-local row per
+    inherited key, through the ordinary activation rules. Each row
+    re-activates the key's head at the fork boundary: the same revision and
+    body, `supersedes` naming the head, expectation `Absent`. The rows follow
+    the prefix in (namespace, key) order, carry the timestamp of the last copied
+    message, and take the id `fork-reactivation:` plus 32 hex digits of a
+    SHA-256 over the child id and the head's id, so a child is a function of
+    its prefix and its id. The id prefix is presentation only; a verifier
+    recognizes the rows by reproducing them. A head the source only inherited
+    and never activated is refused (`not_effective_in_source`), since
+    re-activating it would grant authority the source never ran under.
+- Re-activation adds each effective body to the lineage again, so it counts
+  against the 1 MiB retained-body budget, and a fork that would cross it is
+  refused (`lineage_body_budget_exceeded`). Nested forks of members with large
+  bodies reach the budget after a few generations.
+- A fork does not repeat the lowering check that activation runs at its source.
+  The child's first model call stays the final fail-closed guard, as it is for
+  the copied historical rows.
 
 Meerkat's current compactor retains System rows. V1 deliberately follows that
 existing rule: every activation anchor and exact body stays in the live ordered

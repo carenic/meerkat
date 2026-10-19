@@ -471,3 +471,270 @@ async fn remote_ambiguous_custody_recovers_and_revokes_after_its_source_disappea
     fixture.teardown().await;
     host.shutdown().await;
 }
+
+const STANDING_BODY: &str = "Always state your uncertainty explicitly.";
+
+/// [`portable_definition`] on a model that can represent an ordered
+/// mid-conversation System activation (instruction activation needs it).
+fn activation_capable_definition(id: &str) -> MobDefinition {
+    let mut definition = portable_definition(id);
+    for binding in definition.profiles.values_mut() {
+        if let Some(profile) = binding.as_inline_mut() {
+            profile.model = "claude-opus-5".to_string();
+        }
+    }
+    definition
+}
+
+/// A source mob with a local source and a host-placed source; one host
+/// instruction is activated on the placed source, on the member host that
+/// holds its session.
+struct PlacedActivatedSource {
+    fixture: CouncilFixture,
+    host: support::HostDaemonFixture,
+    host_calls: Arc<std::sync::atomic::AtomicUsize>,
+    source: meerkat_mob::MobHandle,
+    _host_custody: tempfile::TempDir,
+}
+
+async fn placed_activated_source(
+    policy: Option<meerkat_core::ForkInstructionPolicy>,
+) -> PlacedActivatedSource {
+    use meerkat_mob::MobSessionService as _;
+    let local_gate = TurnGate::new();
+    local_gate.open();
+    let fixture = CouncilFixture::new_with(local_script(local_gate), move |state, _root| {
+        let acceptor = meerkat_mob::ControllingAcceptorConfig::for_session_service(
+            "127.0.0.1:0".parse().expect("loopback controller acceptor"),
+            None,
+            state.session_service(),
+        );
+        let state = state.with_controlling_acceptor(acceptor);
+        match policy {
+            Some(policy) => state.with_fork_instruction_policy(policy),
+            None => state,
+        }
+    });
+    let source_mob_id = fixture.source_mob_id();
+    let source_realm =
+        meerkat_core::mob_realm_id(source_mob_id.as_str()).expect("source mob's exact realm");
+    let host_custody = tempfile::tempdir().expect("host capability custody directory");
+    let host_stores = SqliteMobStores::open(host_custody.path().join("capabilities.sqlite3"))
+        .expect("open host capability custody");
+    let host_capabilities: Arc<dyn ForkedParticipantStore> =
+        Arc::new(host_stores.forked_participant_store());
+    let host_client = Arc::new(ScriptedCouncilClient::new(host_script));
+    let host_calls = host_client.calls();
+    let host = spawn_host_daemon_fixture(HostFixtureOptions {
+        member_llm_client: Some(host_client),
+        ..HostFixtureOptions::named("activated-council-host")
+            .with_member_build()
+            .with_forked_participant_substrate(host_capabilities, source_realm)
+    })
+    .await
+    .expect("real member-build host");
+
+    fixture
+        .state
+        .mob_create_definition_with_owner_bridge_session(
+            activation_capable_definition(source_mob_id.as_str()),
+            meerkat_core::SessionId::new(),
+            false,
+            false,
+        )
+        .await
+        .expect("create source mob");
+    fixture
+        .state
+        .mob_spawn(
+            &source_mob_id,
+            ProfileName::from("participant"),
+            identity("local-source"),
+            Some(MobRuntimeMode::TurnDriven),
+            Some(MobBackendKind::Session),
+            None,
+        )
+        .await
+        .expect("seat local source");
+    let source = fixture
+        .state
+        .handle_for(&source_mob_id)
+        .await
+        .expect("source handle");
+    let source_host = source
+        .bind_host(descriptor_to_bind_request(&host.current_descriptor()))
+        .await
+        .expect("bind host to source mob");
+    fixture
+        .state
+        .mob_spawn(
+            &source_mob_id,
+            ProfileName::from("participant"),
+            identity("host-source"),
+            Some(MobRuntimeMode::TurnDriven),
+            None,
+            Some(source_host.host_id.into()),
+        )
+        .await
+        .expect("seat host-placed source");
+
+    // The placed source's session lives on the member host: activate there,
+    // under the session's runtime turn boundary, as the member door does.
+    let record = host.host_binding_record(source_mob_id.as_str()).await;
+    let session_id = meerkat_core::SessionId::parse(
+        &record
+            .materialized
+            .get("host-source")
+            .expect("the placed source is materialized on the host")
+            .session_id,
+    )
+    .expect("host member session id");
+    let member_service = host
+        .member_service
+        .as_ref()
+        .expect("member-build host session service");
+    let guard = member_service
+        .acquire_runtime_turn_finalization_guard(&session_id)
+        .await
+        .expect("turn boundary");
+    member_service
+        .activate_instruction_under_runtime_turn_boundary(
+            &session_id,
+            meerkat_core::InstructionActivationRequest {
+                revision: meerkat_core::InstructionRevisionRef {
+                    namespace: meerkat_core::InstructionNamespace::new("host.standing").unwrap(),
+                    key: meerkat_core::InstructionKey::new("member").unwrap(),
+                    revision_id: meerkat_core::InstructionRevisionId::new("rev-standing-1")
+                        .unwrap(),
+                    content_sha256: meerkat_core::InstructionContentDigest::for_body(STANDING_BODY),
+                },
+                activation_id: meerkat_core::InstructionActivationId::new("standing-1").unwrap(),
+                expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                supersedes: None,
+                body: STANDING_BODY.to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("the host activates an instruction on the placed source");
+    drop(guard);
+    PlacedActivatedSource {
+        fixture,
+        host,
+        host_calls,
+        source,
+        _host_custody: host_custody,
+    }
+}
+
+fn placed_activated_request(fixture: &CouncilFixture, id: &str) -> TemporaryCouncilRequest {
+    let source_mob_id = fixture.source_mob_id();
+    TemporaryCouncilRequest::new(
+        fixture.council_id(id),
+        activation_capable_definition("template-is-replaced"),
+        vec![
+            TemporaryCouncilParticipantSpec::new(
+                0,
+                "local",
+                source_mob_id.clone(),
+                identity("local-source"),
+                identity("local-branch"),
+                ProfileName::from("participant"),
+            ),
+            TemporaryCouncilParticipantSpec::new(
+                1,
+                "host",
+                source_mob_id,
+                identity("host-source"),
+                identity("host-branch"),
+                ProfileName::from("participant"),
+            ),
+        ],
+        "Prove the placed fork instruction policy.",
+        TemporaryCouncilBounds::relative(Duration::from_secs(120), 1, 1024),
+        MergeBackPolicy::NoMerge,
+    )
+}
+
+/// A participant forked from a host-placed member with an activated host
+/// instruction: under the default policy the member host refuses the fork
+/// before committing a child, and the council ends with the same typed
+/// refusal a local source gives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_source_participant_is_refused_typed_by_default() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let placed = placed_activated_source(None).await;
+    let outcome = placed
+        .fixture
+        .state
+        .temporary_council()
+        .run(placed_activated_request(&placed.fixture, "placed-default"))
+        .await
+        .expect("the council reaches a terminal outcome");
+    match &outcome.result.exit_reason {
+        meerkat_mob::temporary_council::TemporaryCouncilExitReason::ParticipantForkInstructionRefused {
+            participant_order,
+            refusal,
+        } => {
+            assert_eq!(*participant_order, 1, "the placed source's participant");
+            assert_eq!(
+                refusal.cause,
+                meerkat_core::ForkInstructionRefusalCause::PolicyRefuses
+            );
+        }
+        other => panic!("expected the typed participant fork instruction refusal, got {other:?}"),
+    }
+    assert_eq!(
+        placed.host_calls.load(Ordering::SeqCst),
+        0,
+        "no participant turn ran on the member host"
+    );
+    placed
+        .source
+        .shutdown()
+        .await
+        .expect("tear down source mob actor");
+    placed.fixture.teardown().await;
+    placed.host.shutdown().await;
+}
+
+/// With `ReactivateInherited` the member host re-activates the inherited key
+/// in the participant it forks, and the placed participant's council turn
+/// reaches the host's model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_source_participant_runs_when_the_host_opts_in() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let placed = placed_activated_source(Some(
+        meerkat_core::ForkInstructionPolicy::ReactivateInherited,
+    ))
+    .await;
+    let outcome = placed
+        .fixture
+        .state
+        .temporary_council()
+        .run(placed_activated_request(
+            &placed.fixture,
+            "placed-reactivate",
+        ))
+        .await
+        .expect("the council reaches a terminal outcome");
+    assert_eq!(
+        outcome.result.exit_reason,
+        meerkat_mob::temporary_council::TemporaryCouncilExitReason::Completed,
+        "the council completes with the re-activated placed participant"
+    );
+    assert!(
+        outcome.result.exchanges.iter().any(|exchange| exchange
+            .completed_text()
+            .is_some_and(|text| text.contains("host position"))),
+        "the placed participant took its council turn"
+    );
+    assert_eq!(placed.host_calls.load(Ordering::SeqCst), 1);
+    placed
+        .source
+        .shutdown()
+        .await
+        .expect("tear down source mob actor");
+    placed.fixture.teardown().await;
+    placed.host.shutdown().await;
+}

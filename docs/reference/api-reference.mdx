@@ -439,6 +439,7 @@ Every `ErrorCode` maps to a stable string, JSON-RPC code, HTTP status, and CLI e
 | Approval changed in the store first | `APPROVAL_CONFLICT` | -32034 | 409 | 54 |
 | Approval commit outcome unknown (reconciled before reuse) | `APPROVAL_COMMIT_UNKNOWN` | -32035 | 500 | 55 |
 | Mob delivery scope stale (session moved under a current fence; re-capture the scope) | `STALE_DELIVERY_SCOPE` | -32036 | 409 | 56 |
+| Fork refused by the fork instruction policy (the child would inherit activated instructions) | `FORK_INSTRUCTION_REFUSED` | -32037 | 422 | 57 |
 | Invalid params | `INVALID_PARAMS` | -32602 | 400 | 2 |
 | Internal error | `INTERNAL_ERROR` | -32603 | 500 | 1 |
 
