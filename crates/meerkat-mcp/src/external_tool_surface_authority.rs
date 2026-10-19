@@ -251,7 +251,7 @@ pub enum ExternalToolSurfaceEffect {
         operation: SurfaceDeltaOperation,
         phase: SurfaceDeltaPhase,
         cause: Option<CoreExternalToolSurfaceFailureCause>,
-        persisted: bool,
+        settled: bool,
         applied_at_turn: TurnNumber,
     },
     /// Shell should close the connection for this surface.
@@ -857,7 +857,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Add,
                             phase: SurfaceDeltaPhase::Pending,
                             cause: None,
-                            persisted: false,
+                            settled: false,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -914,7 +914,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Reload,
                             phase: SurfaceDeltaPhase::Pending,
                             cause: None,
-                            persisted: false,
+                            settled: false,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -968,7 +968,7 @@ impl ExternalToolSurfaceAuthority {
                                 operation: SurfaceDeltaOperation::Remove,
                                 phase: SurfaceDeltaPhase::Draining,
                                 cause: None,
-                                persisted: false,
+                                settled: false,
                                 applied_at_turn: *applied_at_turn,
                             });
                             Ok((
@@ -1083,7 +1083,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Add,
                             phase: SurfaceDeltaPhase::Applied,
                             cause: None,
-                            persisted: true,
+                            settled: true,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -1121,7 +1121,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Reload,
                             phase: SurfaceDeltaPhase::Applied,
                             cause: None,
-                            persisted: true,
+                            settled: true,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -1207,7 +1207,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Add,
                             phase: SurfaceDeltaPhase::Failed,
                             cause: Some(*cause),
-                            persisted: true,
+                            settled: true,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -1237,7 +1237,7 @@ impl ExternalToolSurfaceAuthority {
                             operation: SurfaceDeltaOperation::Reload,
                             phase: SurfaceDeltaPhase::Failed,
                             cause: Some(*cause),
-                            persisted: true,
+                            settled: true,
                             applied_at_turn: *applied_at_turn,
                         });
                         Ok((
@@ -1402,7 +1402,7 @@ impl ExternalToolSurfaceAuthority {
                     operation: SurfaceDeltaOperation::Remove,
                     phase: SurfaceDeltaPhase::Applied,
                     cause: None,
-                    persisted: true,
+                    settled: true,
                     applied_at_turn: *applied_at_turn,
                 });
 
@@ -1463,7 +1463,7 @@ impl ExternalToolSurfaceAuthority {
                     operation: SurfaceDeltaOperation::Remove,
                     phase: SurfaceDeltaPhase::Forced,
                     cause: None,
-                    persisted: true,
+                    settled: true,
                     applied_at_turn: *applied_at_turn,
                 });
 
@@ -2034,8 +2034,8 @@ mod tests {
         )));
         assert!(t.effects.iter().any(|e| matches!(
             e,
-            ExternalToolSurfaceEffect::EmitExternalToolDelta { phase, persisted, .. }
-                if *phase == SurfaceDeltaPhase::Pending && !persisted
+            ExternalToolSurfaceEffect::EmitExternalToolDelta { phase, settled, .. }
+                if *phase == SurfaceDeltaPhase::Pending && !settled
         )));
         assert_eq!(auth.pending_op(&sid), PendingSurfaceOp::Add);
     }
@@ -2120,8 +2120,8 @@ mod tests {
         assert_eq!(auth.surface_base(&sid), SurfaceBaseState::Active);
         assert!(t.effects.iter().any(|e| matches!(
             e,
-            ExternalToolSurfaceEffect::EmitExternalToolDelta { phase, persisted, .. }
-                if *phase == SurfaceDeltaPhase::Applied && *persisted
+            ExternalToolSurfaceEffect::EmitExternalToolDelta { phase, settled, .. }
+                if *phase == SurfaceDeltaPhase::Applied && *settled
         )));
     }
 

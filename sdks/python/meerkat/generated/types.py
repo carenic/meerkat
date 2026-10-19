@@ -5016,14 +5016,20 @@ class ToolConfigChangedPayload:
     """Payload for tool configuration change notifications.
 
 The typed `status_info` is the sole owner of the change status; display
-text is derived at read time via [`ToolConfigChangedPayload::status_text`]."""
+text is derived at read time via [`ToolConfigChangedPayload::status_text`].
+The lifecycle fact is derived from it too ([`Self::settled`],
+[`ToolConfigChangeStatus::is_settled`]). A payload built here is written
+with that value as `settled`; a decoded payload keeps the bit it was stored
+with ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,
+which carry `persisted`, serialize back unchanged."""
     operation: ToolConfigChangeOperation
-    persisted: bool
     status_info: ToolConfigChangeStatus
     target: str
     applied_at_turn: Optional[int] = None
     deferred_catalog_delta: Optional[DeferredCatalogDelta] = None
     domain: Optional[ToolConfigChangeDomain] = None
+    persisted: Optional[bool] = None
+    settled: Optional[bool] = None
 
 
 @dataclass
@@ -7915,6 +7921,7 @@ class SystemNoticeBlockMcp(TypedDict, total=False):
     persisted: NotRequired[bool]
     phase: NotRequired[Optional[ExternalToolDeltaPhase]]
     server_id: NotRequired[Optional[str]]
+    settled: NotRequired[bool]
     type: Required[Literal['mcp']]
 
 class SystemNoticeBlockBackgroundJob(TypedDict, total=False):

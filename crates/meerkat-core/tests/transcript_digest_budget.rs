@@ -183,7 +183,7 @@ fn synthetic_notice_refresh_branch_digest_budget_is_constant() {
                 server_id: Some(server.to_string()),
                 operation: None,
                 phase: None,
-                persisted: false,
+                lifecycle_bit: meerkat_core::event::ToolConfigLifecycleBit::Settled(false),
                 detail: None,
                 confinement_refusal: None,
                 pending_sources: Vec::new(),

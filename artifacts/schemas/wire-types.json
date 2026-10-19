@@ -6474,7 +6474,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -6492,6 +6492,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -6927,7 +6932,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -6961,6 +6966,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -6973,8 +6983,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -31661,7 +31670,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -31679,6 +31688,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -32114,7 +32128,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -32148,6 +32162,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -32160,8 +32179,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -34088,7 +34106,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -34106,6 +34124,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -34492,7 +34515,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -34526,6 +34549,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -34538,8 +34566,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -47347,7 +47374,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -47365,6 +47392,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -47827,7 +47859,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -47861,6 +47893,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -47873,8 +47910,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -66897,7 +66933,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -66915,6 +66951,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -67505,7 +67546,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -67539,6 +67580,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -67551,8 +67597,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -86398,7 +86443,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -86416,6 +86461,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -86878,7 +86928,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -86912,6 +86962,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -86924,8 +86979,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -99183,7 +99237,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -99201,6 +99255,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -99636,7 +99695,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -99670,6 +99729,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -99682,8 +99746,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -122113,7 +122176,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -122131,6 +122194,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -122517,7 +122585,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -122551,6 +122619,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -122563,8 +122636,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -148201,7 +148273,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -148219,6 +148291,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -148605,7 +148682,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -148639,6 +148716,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -148651,8 +148733,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -160983,7 +161064,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -161001,6 +161082,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -161436,7 +161522,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -161470,6 +161556,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -161482,8 +161573,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -164022,7 +164112,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -164040,6 +164130,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -164426,7 +164521,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -164460,6 +164555,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -164472,8 +164572,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -173171,7 +173270,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -173189,6 +173288,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -173575,7 +173679,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -173609,6 +173713,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -173621,8 +173730,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -181155,7 +181263,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -181173,6 +181281,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -181559,7 +181672,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -181593,6 +181706,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -181605,8 +181723,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -184046,7 +184163,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -184064,6 +184181,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -184450,7 +184572,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -184484,6 +184606,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -184496,8 +184623,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },
@@ -187397,7 +187523,7 @@
                 "type": "array"
               },
               "persisted": {
-                "default": false,
+                "description": "The bit a block stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It reads like `settled`.",
                 "type": "boolean"
               },
               "phase": {
@@ -187415,6 +187541,11 @@
                   "string",
                   "null"
                 ]
+              },
+              "settled": {
+                "default": false,
+                "description": "Whether the block reports a settled lifecycle fact, never whether\nanything was written to configuration. Readers derive it from `phase`\nwhen the block has one and use the stored bit only for a block\nwithout one.",
+                "type": "boolean"
               },
               "type": {
                 "const": "mcp",
@@ -187801,7 +187932,7 @@
         ]
       },
       "ToolConfigChangedPayload": {
-        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].",
+        "description": "Payload for tool configuration change notifications.\n\nThe typed `status_info` is the sole owner of the change status; display\ntext is derived at read time via [`ToolConfigChangedPayload::status_text`].\nThe lifecycle fact is derived from it too ([`Self::settled`],\n[`ToolConfigChangeStatus::is_settled`]). A payload built here is written\nwith that value as `settled`; a decoded payload keeps the bit it was stored\nwith ([`ToolConfigLifecycleBit`]), so rows written by 0.9.3 and earlier,\nwhich carry `persisted`, serialize back unchanged.",
         "properties": {
           "applied_at_turn": {
             "format": "uint32",
@@ -187835,6 +187966,11 @@
             "$ref": "#/$defs/ToolConfigChangeOperation"
           },
           "persisted": {
+            "description": "The bit a payload stored by 0.9.3 and earlier carries instead of\n`settled`, served back unchanged. It was `false` for some changes that\nhad already applied, so derive the fact from `status_info` instead.",
+            "type": "boolean"
+          },
+          "settled": {
+            "description": "Whether the change is settled (not pending or draining), derived from\n`status_info`. Every payload built by 0.9.4 and later carries it.",
             "type": "boolean"
           },
           "status_info": {
@@ -187847,8 +187983,7 @@
         "required": [
           "operation",
           "target",
-          "status_info",
-          "persisted"
+          "status_info"
         ],
         "type": "object"
       },

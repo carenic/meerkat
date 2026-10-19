@@ -949,7 +949,7 @@ fn runtime_effect_from_core(
             operation: surface_delta_operation_from_core(operation),
             phase: surface_delta_phase_from_core(phase),
             cause,
-            persisted: matches!(
+            settled: matches!(
                 phase,
                 ExternalToolSurfaceDeltaPhase::Applied
                     | ExternalToolSurfaceDeltaPhase::Failed

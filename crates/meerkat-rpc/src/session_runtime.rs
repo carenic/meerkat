@@ -13642,17 +13642,14 @@ impl SessionRuntime {
                 ?restore,
                 "did not restore the session's MCP attachment"
             );
-            let _ = lifecycle_tx.send(McpLifecycleAction {
-                target: outcome.server_name,
-                operation: ToolConfigChangeOperation::Add,
-                phase: meerkat_core::ExternalToolDeltaPhase::Failed,
-                persisted: false,
-                applied_at_turn: None,
-                tool_count: None,
-                detail: None,
-                confinement_refusal: None,
-                restore: Some(restore),
-            });
+            let _ = lifecycle_tx.send(
+                McpLifecycleAction::new(
+                    outcome.server_name,
+                    ToolConfigChangeOperation::Add,
+                    meerkat_core::ExternalToolDeltaPhase::Failed,
+                )
+                .with_restore(Some(restore)),
+            );
         }
     }
 

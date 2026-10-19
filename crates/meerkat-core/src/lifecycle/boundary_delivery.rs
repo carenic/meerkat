@@ -480,12 +480,12 @@ mod tests {
         }
     }
 
-    fn mcp_block(persisted: bool) -> SystemNoticeBlock {
+    fn mcp_block(settled: bool) -> SystemNoticeBlock {
         SystemNoticeBlock::Mcp {
             server_id: Some("server".to_string()),
             operation: None,
             phase: None,
-            persisted,
+            lifecycle_bit: crate::event::ToolConfigLifecycleBit::Settled(settled),
             detail: None,
             confinement_refusal: None,
             pending_sources: Vec::new(),

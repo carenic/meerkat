@@ -726,12 +726,20 @@ ToolConfigChangeStatus = (
 
 @dataclass(frozen=True, slots=True)
 class ToolConfigChangedPayload:
-    """Payload for tool configuration change notifications."""
+    """Payload for tool configuration change notifications.
+
+    ``settled`` says whether the change is a settled lifecycle fact rather than
+    a pending or draining step. It is derived from ``status_info`` the way
+    rkat-rpc derives it, so payloads stored by 0.9.3 and earlier read
+    correctly. It says nothing about configuration: whether a change was
+    written there is the ``persisted`` of the ``mcp_add`` / ``mcp_remove``
+    response.
+    """
 
     operation: str | None = None
     target: str | None = None
     status_info: ToolConfigChangeStatus | None = None
-    persisted: bool | None = None
+    settled: bool | None = None
     applied_at_turn: int | None = None
 
 
@@ -1328,6 +1336,44 @@ def _require_bool(raw: dict[str, Any], field_name: str) -> bool:
     return value
 
 
+def _tool_config_settled_field(payload: dict[str, Any]) -> str:
+    """The field that carries a tool config payload's stored lifecycle bit.
+
+    rkat-rpc 0.9.4 and later write ``settled``; 0.9.3 and earlier wrote the
+    bit as ``persisted``, and rkat-rpc serves payloads stored then unchanged.
+    """
+    return "settled" if "settled" in payload else "persisted"
+
+
+_SETTLED_TOOL_CONFIG_STATUS_KINDS = frozenset(
+    {"boundary_applied", "deferred_catalog_delta", "warning_failed_closed"}
+)
+
+
+def _tool_config_settled(payload: dict[str, Any]) -> bool:
+    """A tool config payload's lifecycle fact, derived like rkat-rpc derives it.
+
+    Tool-scope, deferred-catalog and failed-closed changes are settled, and an
+    external tool delta is settled unless it is pending or draining. Only a
+    status this SDK does not know falls back to the stored bit: the
+    ``persisted`` that 0.9.3 and earlier stored was ``False`` for tool-scope,
+    deferred-catalog and failed-closed changes that had already applied.
+    """
+    stored = _require_bool(payload, _tool_config_settled_field(payload))
+    status = payload.get("status_info")
+    if isinstance(status, dict):
+        kind = status.get("kind")
+        if kind in _SETTLED_TOOL_CONFIG_STATUS_KINDS:
+            return True
+        if kind == "external_tool_delta":
+            phase = status.get("phase")
+            if phase in {"applied", "forced", "failed"}:
+                return True
+            if phase in {"pending", "draining"}:
+                return False
+    return stored
+
+
 def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
     if not isinstance(raw, dict):
         raise ValueError("interaction_failed.reason must be object")
@@ -1683,7 +1729,7 @@ def _validate_known_event(event_type: str, raw: dict[str, Any]) -> None:
         if operation not in {"add", "remove", "reload"}:
             raise ValueError("payload.operation must be add, remove, or reload")
         _require_str(payload, "target")
-        _require_bool(payload, "persisted")
+        _require_bool(payload, _tool_config_settled_field(payload))
         return
     if event_type == "turn_completed":
         stop_reason = raw.get("stop_reason")
@@ -1847,7 +1893,7 @@ def parse_event(raw: dict[str, Any]) -> Event:
                     status_info=_parse_tool_config_change_status(
                         payload_raw.get("status_info")
                     ),
-                    persisted=payload_raw["persisted"],
+                    settled=_tool_config_settled(payload_raw),
                     applied_at_turn=(
                         applied_at_turn_raw
                         if isinstance(applied_at_turn_raw, int)

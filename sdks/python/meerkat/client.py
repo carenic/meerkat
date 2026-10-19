@@ -6380,7 +6380,9 @@ class MeerkatClient:
                 "INVALID_RESPONSE",
                 f"{context}: unsupported tool-config operation {operation!r}",
             )
-        MeerkatClient._require_bool_field(payload, "persisted", context)
+        # rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+        settled_field = "settled" if "settled" in payload else "persisted"
+        MeerkatClient._require_bool_field(payload, settled_field, context)
         MeerkatClient._require_present_string_field(payload, "target", context)
         MeerkatClient._validate_tool_config_status(
             payload.get("status_info"),
@@ -6518,7 +6520,9 @@ class MeerkatClient:
                     block["pending_sources"],
                     f"{context}: pending_sources",
                 )
-            MeerkatClient._validate_optional_response_bool(block, "persisted", context)
+            # rkat-rpc 0.9.3 and earlier wrote the lifecycle bit as `persisted`.
+            for field in ("settled", "persisted"):
+                MeerkatClient._validate_optional_response_bool(block, field, context)
             if "phase" in block and block["phase"] is not None:
                 phase = MeerkatClient._require_string_field(block, "phase", context)
                 if phase not in {
