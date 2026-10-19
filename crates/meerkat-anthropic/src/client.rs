@@ -1536,9 +1536,11 @@ impl AnthropicClient {
     /// The terminal outcome of a refusal, with Anthropic's `stop_details`
     /// (policy category and explanation) as the stop's provider detail when
     /// the stream carried it.
-    fn refusal_outcome(details: Option<AnthropicStopDetails>) -> LlmDoneOutcome {
+    fn refusal_outcome(
+        details: Option<(StopDetailsPosition, AnthropicStopDetails)>,
+    ) -> LlmDoneOutcome {
         match details {
-            Some(details) => LlmDoneOutcome::success_with_detail(
+            Some((_, details)) => LlmDoneOutcome::success_with_detail(
                 StopReason::Refusal,
                 ProviderStopDetail::anthropic(details.category, details.explanation),
             ),
@@ -1762,9 +1764,11 @@ impl AnthropicClient {
             let mut last_stop_reason: Option<StopReason> = None;
             // A refusal's `Done` waits for `message_stop` (or the end of the
             // stream), so its `stop_details` is read wherever the stream puts
-            // it: in the stop's `message_delta` or after it.
+            // it: in the stop's `message_delta` or after it. Which one wins
+            // when several carry it: `StopDetailsPosition`.
             let mut refusal_pending = false;
-            let mut refusal_details: Option<AnthropicStopDetails> = None;
+            let mut refusal_details: Option<(StopDetailsPosition, AnthropicStopDetails)> =
+                None;
             // A refusal or a filled context window can cut a tool call
             // mid-input; its parse failure waits for the stop reason that
             // says why (`stop_outcome`).
@@ -2007,13 +2011,16 @@ impl AnthropicClient {
                                 };
                             }
                             let delta = $event.delta;
-                            if let Some(details) = delta
-                                .as_ref()
-                                .and_then(|delta| delta.stop_details.clone())
-                                .or($event.stop_details)
-                            {
-                                refusal_details = Some(details);
-                            }
+                            offer_stop_details(
+                                &mut refusal_details,
+                                StopDetailsPosition::InMessageDelta,
+                                delta.as_ref().and_then(|delta| delta.stop_details.clone()),
+                            );
+                            offer_stop_details(
+                                &mut refusal_details,
+                                StopDetailsPosition::BesideMessageDelta,
+                                $event.stop_details,
+                            );
                             if let Some(finish_reason) = delta.and_then(|d| d.stop_reason) {
                                 let outcome = Self::stop_outcome(
                                     finish_reason.as_str(),
@@ -2053,9 +2060,11 @@ impl AnthropicClient {
                             }
                         }
                         "message_stop" => {
-                            if let Some(details) = $event.stop_details {
-                                refusal_details = Some(details);
-                            }
+                            offer_stop_details(
+                                &mut refusal_details,
+                                StopDetailsPosition::OnMessageStop,
+                                $event.stop_details,
+                            );
                             if !saw_done && refusal_pending {
                                 chunk_yielded.set(true);
                                 yield LlmEvent::Done {
@@ -2712,6 +2721,33 @@ struct AnthropicEvent {
 struct AnthropicStopDetails {
     category: Option<String>,
     explanation: Option<String>,
+}
+
+/// Where a refusal's `stop_details` rode, in precedence order. When more
+/// than one position carries it, the `message_delta` wins: inside its delta
+/// first (where the message's stop fields are updated, as `stop_reason`
+/// is), then beside its delta. `message_stop` only fills in a detail the
+/// `message_delta` lacked. Within one position the first one seen is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StopDetailsPosition {
+    InMessageDelta,
+    BesideMessageDelta,
+    OnMessageStop,
+}
+
+/// Hold `details` read at `position` unless `stop_details` from a position
+/// that ranks before it, or from the same position earlier, is held.
+fn offer_stop_details(
+    held: &mut Option<(StopDetailsPosition, AnthropicStopDetails)>,
+    position: StopDetailsPosition,
+    details: Option<AnthropicStopDetails>,
+) {
+    let Some(details) = details else {
+        return;
+    };
+    if held.as_ref().is_none_or(|(rank, _)| position < *rank) {
+        *held = Some((position, details));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5782,48 +5818,138 @@ mod tests {
         }
     }
 
-    /// R2 (rev-239, #1888): a refusal's `stop_details` (policy category and
-    /// explanation) rides the stop's provider detail wherever the stream
-    /// carries it: inside the stop's `message_delta`, beside its delta, or on
-    /// a later `message_stop`. The refusal's `Done` waits for `message_stop`
-    /// (or the end of the stream), so a late `stop_details` is never dropped.
-    #[tokio::test]
-    async fn refusal_stop_details_ride_the_stop_wherever_the_stream_puts_them() {
-        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#;
-        let details =
-            r#"{"type":"refusal","category":"cyber","explanation":"This request was declined."}"#;
-        let in_delta = format!(
-            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal","stop_sequence":null,"stop_details":{details}}}}}"#
-        );
-        let beside_delta = format!(
-            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal"}},"stop_details":{details}}}"#
-        );
-        let bare_delta = r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal"}}"#;
-        let late_stop = format!(r#"data: {{"type":"message_stop","stop_details":{details}}}"#);
-        let stop = r#"data: {"type":"message_stop"}"#;
-        let expected = ProviderStopDetail::anthropic(
-            Some("cyber".to_string()),
+    const REFUSAL_START: &str = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#;
+    const BARE_REFUSAL_DELTA: &str = r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal"}}"#;
+    const BARE_MESSAGE_STOP: &str = r#"data: {"type":"message_stop"}"#;
+
+    /// `stop_details` of a refusal under `category`.
+    fn refusal_details_json(category: &str) -> String {
+        format!(
+            r#"{{"type":"refusal","category":"{category}","explanation":"This request was declined."}}"#
+        )
+    }
+
+    fn expected_refusal_detail(category: &str) -> ProviderStopDetail {
+        ProviderStopDetail::anthropic(
+            Some(category.to_string()),
             Some("This request was declined.".to_string()),
-        );
-        for (label, lines) in [
-            ("in the delta", vec![start, in_delta.as_str(), stop]),
-            ("beside the delta", vec![start, beside_delta.as_str(), stop]),
-            (
-                "on message_stop",
-                vec![start, bare_delta, late_stop.as_str()],
-            ),
-            ("stream cut after the delta", vec![start, in_delta.as_str()]),
-        ] {
-            let events = stop_reason_fixture_events(&lines).await;
-            match fixture_done(&events) {
-                LlmDoneOutcome::Success {
-                    stop_reason: StopReason::Refusal,
-                    stop_detail,
-                    ..
-                } => assert_eq!(stop_detail.as_deref(), Some(&expected), "{label}"),
-                other => panic!("{label}: expected a refusal, got {other:?}"),
-            }
+        )
+    }
+
+    /// The refusal's `message_delta` with `stop_details` inside its delta.
+    fn refusal_delta_with_details_inside(details: &str) -> String {
+        format!(
+            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal","stop_sequence":null,"stop_details":{details}}}}}"#
+        )
+    }
+
+    /// The refusal's `message_delta` with `stop_details` beside its delta.
+    fn refusal_delta_with_details_beside(details: &str) -> String {
+        format!(
+            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal"}},"stop_details":{details}}}"#
+        )
+    }
+
+    fn message_stop_with_details(details: &str) -> String {
+        format!(r#"data: {{"type":"message_stop","stop_details":{details}}}"#)
+    }
+
+    /// The provider detail of a stream that must end as a refusal.
+    async fn refusal_detail_of(lines: &[&str]) -> Option<ProviderStopDetail> {
+        let events = stop_reason_fixture_events(lines).await;
+        match fixture_done(&events) {
+            LlmDoneOutcome::Success {
+                stop_reason: StopReason::Refusal,
+                stop_detail,
+                ..
+            } => stop_detail.as_deref().cloned(),
+            other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// #1888, synthetic frames, not a live capture:
+    /// `stop_details` inside the refusal's `message_delta` delta, where the
+    /// message's stop fields are updated, rides the stop's provider detail.
+    #[tokio::test]
+    async fn synthetic_refusal_stop_details_inside_the_message_delta() {
+        let delta = refusal_delta_with_details_inside(&refusal_details_json("cyber"));
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &delta, BARE_MESSAGE_STOP]).await,
+            Some(expected_refusal_detail("cyber"))
+        );
+    }
+
+    /// Synthetic frames: `stop_details` beside the delta, on the
+    /// `message_delta` event itself.
+    #[tokio::test]
+    async fn synthetic_refusal_stop_details_beside_the_message_delta() {
+        let delta = refusal_delta_with_details_beside(&refusal_details_json("cyber"));
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &delta, BARE_MESSAGE_STOP]).await,
+            Some(expected_refusal_detail("cyber"))
+        );
+    }
+
+    /// Synthetic frames: `stop_details` on a later `message_stop`. The
+    /// refusal's `Done` waits for it, so a late detail is not dropped.
+    #[tokio::test]
+    async fn synthetic_refusal_stop_details_on_message_stop() {
+        let stop = message_stop_with_details(&refusal_details_json("cyber"));
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, BARE_REFUSAL_DELTA, &stop]).await,
+            Some(expected_refusal_detail("cyber"))
+        );
+    }
+
+    /// Synthetic frames: when positions disagree, the `message_delta` wins,
+    /// inside its delta before beside it, and `message_stop` only fills in a
+    /// detail the `message_delta` lacked.
+    #[tokio::test]
+    async fn synthetic_refusal_stop_details_precedence_when_positions_disagree() {
+        let cyber = refusal_details_json("cyber");
+        let bio = refusal_details_json("bio");
+        let inside = refusal_delta_with_details_inside(&cyber);
+        let beside = refusal_delta_with_details_beside(&cyber);
+        let inside_and_beside = format!(
+            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal","stop_details":{cyber}}},"stop_details":{bio}}}"#
+        );
+        let late = message_stop_with_details(&bio);
+        for (label, lines) in [
+            (
+                "inside the delta over message_stop",
+                vec![REFUSAL_START, inside.as_str(), late.as_str()],
+            ),
+            (
+                "beside the delta over message_stop",
+                vec![REFUSAL_START, beside.as_str(), late.as_str()],
+            ),
+            (
+                "inside the delta over beside it",
+                vec![REFUSAL_START, inside_and_beside.as_str(), BARE_MESSAGE_STOP],
+            ),
+        ] {
+            assert_eq!(
+                refusal_detail_of(&lines).await,
+                Some(expected_refusal_detail("cyber")),
+                "{label}"
+            );
+        }
+    }
+
+    /// Synthetic frames: a refusal whose stream is cut after its stop (no
+    /// `message_stop`, no `[DONE]`) still ends as a refusal, with whatever
+    /// detail was seen, or none.
+    #[tokio::test]
+    async fn synthetic_refusal_cut_after_its_stop_still_ends_as_a_refusal() {
+        let inside = refusal_delta_with_details_inside(&refusal_details_json("cyber"));
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, &inside]).await,
+            Some(expected_refusal_detail("cyber"))
+        );
+        assert_eq!(
+            refusal_detail_of(&[REFUSAL_START, BARE_REFUSAL_DELTA]).await,
+            None
+        );
     }
 
     /// A refusal that maps to no named category carries null category and

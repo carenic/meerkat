@@ -100,7 +100,12 @@ them.
   (#1887), as the Anthropic and Gemini ones do.
 - An Anthropic refusal now carries its `stop_details` (policy category and
   explanation) as the provider detail. Its terminal waits for `message_stop`,
-  so `stop_details` is read wherever the stream puts it.
+  so `stop_details` is read wherever the stream puts it: inside the
+  `message_delta` delta, beside that delta, or on `message_stop`. When more
+  than one carries it, the `message_delta` wins (inside its delta, then
+  beside it), and `message_stop` only fills in a detail it lacked. A refusal
+  whose stream is cut after its stop still ends as a refusal, with whatever
+  detail was seen.
 - A native web search cut at its output cap (`max_tokens`) or paused by the
   provider's server-tool loop (`pause_turn`) keeps its status and answer and
   now says, in its `error`, that the answer may be incomplete (#1887).
