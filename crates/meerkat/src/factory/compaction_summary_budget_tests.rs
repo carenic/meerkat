@@ -59,9 +59,7 @@ impl LlmClient for SummarySourceRecordingClient {
                 ),
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             },
         ];
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
