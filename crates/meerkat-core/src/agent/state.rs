@@ -7331,6 +7331,9 @@ where
             ));
         }
 
+        // The provider's own account of a refusal or filter travels with the
+        // failure as tagged evidence; nothing here reads it.
+        let stop_detail = result.stop_detail().cloned().map(Box::new);
         let (blocks, stop_reason, _raw_usage) = result.into_parts();
         let has_reasoning = blocks
             .iter()
@@ -7369,9 +7372,15 @@ where
                     .and_then(|profile| profile.context_window()),
                 turn_usage.as_ref().map(TurnUsage::normalized_total_tokens),
             )),
-            StopReason::Refusal | StopReason::ContentFilter => Some(AgentError::ContentFiltered {
-                turn: ctx.turn_count,
-            }),
+            StopReason::Refusal | StopReason::ContentFilter => {
+                crate::types::ContentFilteredStop::from_stop_reason(stop_reason).map(|stop| {
+                    AgentError::ContentFiltered {
+                        turn: ctx.turn_count,
+                        stop,
+                        detail: stop_detail,
+                    }
+                })
+            }
             _ => None,
         };
         if let Some(error) = refused_response {

@@ -89024,9 +89024,7 @@ impl meerkat_client::LlmClient for HeadCanonicalQueueGateClient {
                 ),
             };
             yield meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             };
         })
     }

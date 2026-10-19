@@ -82,9 +82,7 @@ impl LlmClient for Client {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::ToolUse),
                 }),
             ])),
             Reply::Answer => Box::pin(stream::iter([
@@ -104,9 +102,7 @@ impl LlmClient for Client {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(StopReason::EndTurn),
                 }),
             ])),
         }

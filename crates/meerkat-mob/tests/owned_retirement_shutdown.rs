@@ -45,9 +45,7 @@ fn done(request: &LlmRequest) -> Vec<LlmEvent> {
             ),
         },
         LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         },
     ]
 }

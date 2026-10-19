@@ -592,6 +592,42 @@ describe("Typed Events", () => {
     }
   });
 
+  it("keeps a content-filtered reason's typed stop and provider detail (#1888)", () => {
+    const detail = {
+      provider: "gemini",
+      stage: "prompt",
+      reason: "BLOCKLIST",
+      blocked_categories: ["HARM_CATEGORY_HARASSMENT"],
+    };
+    const runFailed = (reason) =>
+      parseEvent({
+        type: "run_failed",
+        session_id: "session-1",
+        error_report: { class: "content_filtered", message: "Content filtered on turn 1", reason },
+      });
+
+    const event = runFailed({ reason_type: "content_filtered", stop: "content_filter", detail });
+    assert.equal(event.type, "run_failed");
+    assert.equal(event.errorReport.reason.reasonType, "content_filtered");
+    assert.equal(event.errorReport.reason.stop, "content_filter");
+    assert.deepEqual(event.errorReport.reason.detail, detail);
+
+    for (const malformed of [undefined, "not an object", { stage: "prompt" }]) {
+      const reason = { reason_type: "content_filtered", stop: "refusal" };
+      if (malformed !== undefined) {
+        reason.detail = malformed;
+      }
+      const parsed = runFailed(reason);
+      assert.equal(parsed.errorReport.reason.reasonType, "content_filtered");
+      assert.equal(parsed.errorReport.reason.stop, "refusal");
+      assert.equal(parsed.errorReport.reason.detail, undefined);
+    }
+
+    const unknownStop = runFailed({ reason_type: "content_filtered", stop: "a_future_stop" });
+    assert.equal(unknownStop.errorReport.reason.reasonType, "unknown");
+    assert.equal(unknownStop.errorReport.reason.rawReasonType, "content_filtered");
+  });
+
   it("preserves hook-denied error_report on run_failed", () => {
     const event = parseEvent({
       type: "run_failed",

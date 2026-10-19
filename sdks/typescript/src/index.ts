@@ -625,6 +625,8 @@ export type {
   AgentErrorClass,
   AgentErrorReport,
   AgentErrorReason,
+  ContentFilteredAgentErrorReason,
+  ContentFilteredStopDetail,
   HookFailureReason,
   UnknownHookFailureReason,
   ConfinementRefusal,

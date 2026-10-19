@@ -129,9 +129,7 @@ mod tests {
                 },
                 normalized_openai_usage(request),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 },
             ];
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
@@ -195,9 +193,7 @@ mod tests {
                     },
                     normalized_openai_usage(request),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     },
                 ]
                 .into_iter()
@@ -257,9 +253,7 @@ mod tests {
                     },
                     normalized_openai_usage(request),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     },
                 ]
             } else if self.ordinary_calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -270,9 +264,7 @@ mod tests {
                     },
                     normalized_openai_usage(request),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     },
                 ]
             } else {
@@ -285,9 +277,7 @@ mod tests {
                     },
                     normalized_openai_usage(request),
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     },
                 ]
             };

@@ -14,8 +14,8 @@ use meerkat_core::lifecycle::run_primitive::{ProviderTag, ToolChoice};
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::web_search::{WebSearchRequest, WebSearchResult};
 use meerkat_core::{
-    AssistantBlock, AssistantImageRef, MediaType, Message, OutputSchema, Provider, ServerToolKind,
-    StopReason, ToolDef, ToolResult, Usage,
+    AssistantBlock, AssistantImageRef, MediaType, Message, OutputSchema, Provider,
+    ProviderStopDetail, ServerToolKind, StopReason, ToolDef, ToolResult, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -418,6 +418,37 @@ pub trait WebSearchExecutor: Send + Sync {
     }
 }
 
+/// What the stop reason of a native web-search call says about its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchStop {
+    /// The call answered.
+    Answered,
+    /// The call answered, but its output cap or the provider's server-tool
+    /// loop cut it: the answer may be incomplete. Carries the stop reason's
+    /// wire name.
+    MaybeIncomplete(&'static str),
+    /// The call produced no answer: a refusal, a content filter, a filled
+    /// context window or a cancellation. Carries the stop reason's wire name.
+    Unanswered(&'static str),
+}
+
+/// Classify the stop reason of a native web-search call (#1887). The match
+/// is exhaustive, so a new stop reason has to be placed here, once for every
+/// provider's executor.
+pub fn classify_web_search_stop(stop_reason: StopReason) -> WebSearchStop {
+    match stop_reason {
+        StopReason::EndTurn | StopReason::ToolUse | StopReason::StopSequence => {
+            WebSearchStop::Answered
+        }
+        StopReason::MaxTokens => WebSearchStop::MaybeIncomplete("max_tokens"),
+        StopReason::PauseTurn => WebSearchStop::MaybeIncomplete("pause_turn"),
+        StopReason::Refusal => WebSearchStop::Unanswered("refusal"),
+        StopReason::ContentFilter => WebSearchStop::Unanswered("content_filter"),
+        StopReason::ContextWindowExceeded => WebSearchStop::Unanswered("context_window_exceeded"),
+        StopReason::Cancelled => WebSearchStop::Unanswered("cancelled"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderImageGenerationRequest {
     pub operation_id: meerkat_core::ImageOperationId,
@@ -681,8 +712,44 @@ impl LlmRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LlmDoneOutcome {
-    Success { stop_reason: StopReason },
-    Error { error: LlmError },
+    /// The response ended on `stop_reason`. Built with
+    /// [`LlmDoneOutcome::success`] or [`LlmDoneOutcome::success_with_detail`],
+    /// so a later field touches no producer.
+    #[non_exhaustive]
+    Success {
+        stop_reason: StopReason,
+        /// The provider's own account of a refusal or filter, carried to the
+        /// caller as tagged provider data. An unknown provider or a malformed
+        /// detail decodes as absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "meerkat_core::types::deserialize_lenient_boxed_provider_stop_detail"
+        )]
+        stop_detail: Option<Box<ProviderStopDetail>>,
+    },
+    Error {
+        error: LlmError,
+    },
+}
+
+impl LlmDoneOutcome {
+    /// A response that ended on `stop_reason`, with no provider detail.
+    pub fn success(stop_reason: StopReason) -> Self {
+        Self::Success {
+            stop_reason,
+            stop_detail: None,
+        }
+    }
+
+    /// A response that ended on `stop_reason`, with the provider's own
+    /// account of it.
+    pub fn success_with_detail(stop_reason: StopReason, stop_detail: ProviderStopDetail) -> Self {
+        Self::Success {
+            stop_reason,
+            stop_detail: Some(Box::new(stop_detail)),
+        }
+    }
 }
 
 /// Normalized streaming events from LLM
@@ -949,9 +1016,7 @@ mod tests {
                 ),
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             },
         ];
 
@@ -1208,5 +1273,91 @@ mod tests {
             })),
             Some(ToolChoiceRefusal::ToolNotOffered)
         );
+    }
+
+    /// #1887: one classification for every provider's web-search
+    /// executor, carrying each stop reason's wire name.
+    #[test]
+    fn web_search_stop_classification_carries_wire_names() {
+        for (stop_reason, expected) in [
+            (StopReason::EndTurn, WebSearchStop::Answered),
+            (StopReason::ToolUse, WebSearchStop::Answered),
+            (StopReason::StopSequence, WebSearchStop::Answered),
+            (
+                StopReason::MaxTokens,
+                WebSearchStop::MaybeIncomplete("max_tokens"),
+            ),
+            (
+                StopReason::PauseTurn,
+                WebSearchStop::MaybeIncomplete("pause_turn"),
+            ),
+            (StopReason::Refusal, WebSearchStop::Unanswered("refusal")),
+            (
+                StopReason::ContentFilter,
+                WebSearchStop::Unanswered("content_filter"),
+            ),
+            (
+                StopReason::ContextWindowExceeded,
+                WebSearchStop::Unanswered("context_window_exceeded"),
+            ),
+            (
+                StopReason::Cancelled,
+                WebSearchStop::Unanswered("cancelled"),
+            ),
+        ] {
+            let classified = classify_web_search_stop(stop_reason);
+            assert_eq!(classified, expected, "{stop_reason:?}");
+            if let WebSearchStop::MaybeIncomplete(name) | WebSearchStop::Unanswered(name) =
+                classified
+            {
+                assert_eq!(
+                    serde_json::to_value(stop_reason).expect("stop reason serializes"),
+                    serde_json::json!(name),
+                    "the carried name is the stop reason's wire name"
+                );
+            }
+        }
+    }
+
+    /// A success without detail keeps its pre-detail wire form, a detail
+    /// round-trips, and an unknown or malformed detail decodes as absent.
+    #[test]
+    fn done_outcome_detail_is_optional_and_lenient_on_the_wire() {
+        let plain = LlmDoneOutcome::success(StopReason::EndTurn);
+        assert_eq!(
+            serde_json::to_value(&plain).expect("serialize"),
+            serde_json::json!({"outcome": "success", "stop_reason": "end_turn"})
+        );
+
+        let detailed = LlmDoneOutcome::success_with_detail(
+            StopReason::Refusal,
+            ProviderStopDetail::openai("refusal", Some("No.".to_string())),
+        );
+        let wire = serde_json::to_value(&detailed).expect("serialize");
+        assert_eq!(wire["stop_detail"]["provider"], "open_ai");
+        let back: LlmDoneOutcome = serde_json::from_value(wire).expect("deserialize");
+        assert!(matches!(
+            back,
+            LlmDoneOutcome::Success {
+                stop_reason: StopReason::Refusal,
+                stop_detail: Some(_),
+                ..
+            }
+        ));
+
+        let unknown: LlmDoneOutcome = serde_json::from_value(serde_json::json!({
+            "outcome": "success",
+            "stop_reason": "content_filter",
+            "stop_detail": {"provider": "future_provider"}
+        }))
+        .expect("an unknown detail never fails the outcome");
+        assert!(matches!(
+            unknown,
+            LlmDoneOutcome::Success {
+                stop_reason: StopReason::ContentFilter,
+                stop_detail: None,
+                ..
+            }
+        ));
     }
 }

@@ -54,7 +54,7 @@ mod llm_normalization {
                     got_text_output |= !delta.is_empty();
                 }
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::Success { stop_reason, .. },
                 }) => {
                     // Stop reason should be valid
                     assert!(matches!(

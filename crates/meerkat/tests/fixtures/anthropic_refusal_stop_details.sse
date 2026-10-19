@@ -1,0 +1,8 @@
+event: message_start
+data: {"message":{"container":null,"content":[],"diagnostics":null,"id":"redacted","model":"claude-sonnet-5-5","role":"assistant","stop_details":null,"stop_reason":null,"stop_sequence":null,"type":"message","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":3176},"cache_creation_input_tokens":3176,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":4,"output_tokens":0,"service_tier":"standard","speed":"standard"}},"type":"message_start"}
+
+event: message_delta
+data: {"delta":{"container":null,"stop_details":{"category":"reasoning_extraction","explanation":"This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs. To learn more, visit https://www.anthropic.com/legal/commercial-terms. API integrators: you can reduce refusals for your users by configuring a fallback model \u2014 see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback","type":"refusal"},"stop_reason":"refusal","stop_sequence":null},"type":"message_delta","usage":{"cache_creation_input_tokens":3176,"cache_read_input_tokens":0,"input_tokens":4,"output_tokens":0}}
+
+event: message_stop
+data: {"type":"message_stop"}

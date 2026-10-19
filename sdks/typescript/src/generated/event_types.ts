@@ -72,6 +72,13 @@ import type {
 export type AgentErrorClass = "llm" | "operation_refused" | "store" | "tool" | "policy_indeterminate" | "mcp" | "session_not_found" | "budget" | "max_tokens" | "content_filtered" | "max_turns" | "cancelled" | "invalid_state" | "operation_not_found" | "depth_limit" | "concurrency_limit" | "config" | "internal" | "build" | "auth" | "callback_pending" | "skill" | "structured_output" | "invalid_output_schema" | "hook" | "terminal" | "no_pending_boundary";
 
 /**
+ * The refusing stop a content-filtered run ended on: the closed pair of
+ * [`StopReason`]s that fail a run as
+ * [`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).
+ */
+export type ContentFilteredStop = "refusal" | "content_filter";
+
+/**
  * Typed reason a hook execution failed (engine-level fault, not a guardrail
  * denial).
  *
@@ -117,6 +124,38 @@ export type LlmProviderErrorKind = "invalid_request" | "content_filtered" | "ser
 export type LlmProviderErrorRetryability = "retryable" | "non_retryable";
 
 export type ModelFallbackSkipReason = "provider_boundary" | "auth_unavailable" | "context_fit" | "context_unknown" | "output_budget" | "tool_parity" | "modality_parity" | "request_unsupported" | "admission_unavailable" | "tool_choice_unsupported";
+
+/**
+ * Where Gemini blocked a response.
+ */
+export type GeminiStopStage = "prompt" | "candidate";
+
+/**
+ * A provider's own account of why it refused or filtered a response, held
+ * as tagged provider data.
+ *
+ * The meaning is the [`StopReason`] (and, for a failed run,
+ * [`ContentFilteredStop`]); this is evidence. Its fields are the provider's
+ * raw strings, tagged by provider, and nothing in the agent loop, retry,
+ * error classification or error codes reads them: provider crates build a
+ * detail with the constructors below and core only carries it to the
+ * caller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]
+ * bytes.
+ */
+export type ProviderStopDetail = {
+  category?: string | null;
+  explanation?: string | null;
+  provider: "anthropic";
+} | {
+  provider: "open_ai";
+  reason: string;
+  refusal?: string | null;
+} | {
+  blocked_categories?: string[];
+  provider: "gemini";
+  reason: string;
+  stage: GeminiStopStage;
+};
 
 /**
  * Closed machine-owned classifier for why a turn reached a terminal failure.
@@ -196,6 +235,10 @@ export type AgentErrorReason = {
   hook_id: HookId;
   reason: HookFailureReason;
   reason_type: "hook_launch_refused";
+} | {
+  detail?: ProviderStopDetail | null;
+  reason_type: "content_filtered";
+  stop: ContentFilteredStop;
 };
 
 export type AgentErrorReport = {

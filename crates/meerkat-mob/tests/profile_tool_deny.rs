@@ -45,7 +45,7 @@ fn done_events(
         ),
     });
     events.push(LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success { stop_reason: stop },
+        outcome: LlmDoneOutcome::success(stop),
     });
     events
 }

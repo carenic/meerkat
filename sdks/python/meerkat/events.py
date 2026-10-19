@@ -225,6 +225,10 @@ class AgentErrorReason:
     provider_error_kind: str | None = None
     provider_error_retryability: Literal["retryable", "non_retryable"] | None = None
     provider_error: Any = None
+    # ``content_filtered``: the refusing stop, and the provider's own account
+    # of it (tagged by ``provider``; ``None`` when it sent none).
+    stop: Literal["refusal", "content_filter"] | None = None
+    detail: dict[str, Any] | None = None
 
     def __getitem__(self, key: str) -> Any:
         if key == "reason_type":
@@ -934,6 +938,26 @@ def _parse_agent_error_reason(raw: Any) -> AgentErrorReason | None:
             provider_error_kind=provider_error_kind,
             provider_error_retryability=retryability,
             provider_error=raw["provider_error"],
+        )
+
+    if reason_type == "content_filtered":
+        stop = raw.get("stop")
+        if stop not in ("refusal", "content_filter"):
+            return AgentErrorReason(
+                reason_type="unknown",
+                raw_reason_type=reason_type,
+                raw=dict(raw),
+            )
+        detail = raw.get("detail")
+        # Provider evidence never fails the report: a detail that is not a
+        # provider-tagged object reads as absent, as Core decodes it.
+        if not (isinstance(detail, dict) and isinstance(detail.get("provider"), str)):
+            detail = None
+        return AgentErrorReason(
+            reason_type=reason_type,
+            raw=dict(raw),
+            stop=stop,
+            detail=dict(detail) if detail is not None else None,
         )
 
     if reason_type not in {

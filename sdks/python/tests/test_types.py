@@ -3272,6 +3272,53 @@ def test_parse_turn_completed_with_usage():
     assert event.usage.cache_creation_tokens is None
 
 
+def test_parse_run_failed_content_filtered_reason():
+    """A content-filtered failure keeps its typed stop and the provider's
+    tagged detail; a missing or malformed detail reads as absent, and an
+    unknown stop falls back to an unknown reason (#1888)."""
+    detail = {
+        "provider": "gemini",
+        "stage": "prompt",
+        "reason": "BLOCKLIST",
+        "blocked_categories": ["HARM_CATEGORY_HARASSMENT"],
+    }
+
+    def run_failed(reason):
+        return parse_event(
+            {
+                "type": "run_failed",
+                "session_id": "s1",
+                "error_report": {
+                    "class": "content_filtered",
+                    "message": "Content filtered on turn 1",
+                    "reason": reason,
+                },
+            }
+        )
+
+    event = run_failed(
+        {"reason_type": "content_filtered", "stop": "content_filter", "detail": detail}
+    )
+    assert isinstance(event, RunFailed)
+    assert event.error_report.reason.reason_type == "content_filtered"
+    assert event.error_report.reason.stop == "content_filter"
+    assert event.error_report.reason.detail == detail
+    assert event.error_report.reason["stop"] == "content_filter"
+
+    for raw_detail in (None, "not an object", {"stage": "prompt"}):
+        reason = {"reason_type": "content_filtered", "stop": "refusal"}
+        if raw_detail is not None:
+            reason["detail"] = raw_detail
+        event = run_failed(reason)
+        assert event.error_report.reason.reason_type == "content_filtered"
+        assert event.error_report.reason.stop == "refusal"
+        assert event.error_report.reason.detail is None
+
+    event = run_failed({"reason_type": "content_filtered", "stop": "a_future_stop"})
+    assert event.error_report.reason.reason_type == "unknown"
+    assert event.error_report.reason.raw_reason_type == "content_filtered"
+
+
 def test_parse_run_failed_preserves_policy_stop():
     from meerkat.generated.event_types import LlmProviderErrorKind
 
