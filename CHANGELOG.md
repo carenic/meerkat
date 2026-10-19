@@ -392,6 +392,15 @@ them.
   branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
   action-level `\/`. The Rust kernel already applied this order; only the
   models of MobMachine and the two compositions that embed it change.
+  A bounded TLC audit (`specs/machines/mob_machine/member_lifecycle_audit.sh`,
+  lane shard audits-b) now model-checks the member lifecycle around those
+  guards, which no generated profile checks to the end: roster recovery,
+  session binding, progress observations, the local retire arms, the runtime
+  retirement and archive observations, stop and resume, and the recovery of
+  an archived identity's next incarnation. Every one of those arms must
+  fire, a member's recorded observation time never decreases, and the audit
+  fails when a progress arm loses its guard or the guard is rendered as a
+  plain `<=` again.
 
 ## [0.9.3] - 2026-10-18
 

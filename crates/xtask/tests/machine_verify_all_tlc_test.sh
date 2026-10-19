@@ -381,6 +381,32 @@ if run_part audits-c; then
   TLC_WORKERS="${tlc_workers}" "${generation_highwater_audit}" "${GENERATION_HIGHWATER_AUDIT_MAX_STEPS:-4}" --mutants
 fi
 
+# The MobMachine member lifecycle (roster recovery, session binding, progress
+# observations, the local Retire arms, RetireMember, the session ingress
+# detach, the runtime retirement and archive observations, stop and resume)
+# is empty in the MobMachine ci sweep, whose AgentIdentityValues are {}, and
+# deep.cfg, which has identities, does not finish within the per-run cap:
+# the spawn arms' parameters give a state millions of successors. A
+# hand-written audit over the same generated model gives one identity two
+# runtime ids, two fence tokens, generations 0..1 and two sessions, and
+# drives those arms without spawning, under every generated invariant plus
+# an action property (a member's recorded observation time never
+# decreases). It runs with TLC coverage and requires every listed arm to
+# fire and a floor of distinct states, requires its five witnesses reached
+# (the last recovers an archived identity's next incarnation), and refuses
+# two seeded defects (--mutants): a progress arm without its observation
+# guard, and that guard rendered as a plain `<=` between option records,
+# which TLC cannot evaluate. 6 steps fire every arm and reach every witness.
+member_lifecycle_audit="${workspace_root}/specs/machines/mob_machine/member_lifecycle_audit.sh"
+if [[ ! -x "${member_lifecycle_audit}" ]]; then
+  echo "error: member lifecycle audit runner is missing from workspace runfiles: ${member_lifecycle_audit}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running bounded member lifecycle TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${member_lifecycle_audit}" "${MEMBER_LIFECYCLE_AUDIT_MAX_STEPS:-6}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -436,6 +462,8 @@ run_machine_verify() {
 # peer request maps with --mutants (64 s measured on a local 4-worker run,
 # not yet hosted; the other audits' hosted runs took 1.5-3.1x their local
 # ones, so expect 100-200 s): about 500-600 s (208 s for the shard locally);
+# plus the member lifecycle audit with --mutants (37 s on a local 4-worker
+# run, eight small runs, not yet hosted; expect 55-115 s);
 # audits-c = run-start hold (239 s), live media health (155 s),
 # live-context causal-tail batch with --mutants (112 s): 506 s; plus the
 # generation high-water audit with --mutants (30 s on a local 4-worker run,
