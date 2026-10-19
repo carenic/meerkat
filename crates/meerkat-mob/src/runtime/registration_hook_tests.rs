@@ -573,7 +573,13 @@ async fn attached_recovery_verifies_the_installed_destination() {
 
 /// Each hook call carries the member's exact registration: the fresh
 /// selection names the registration the provision prepared, and an attached
-/// recovery names that same, still current registration.
+/// recovery names that same, still current registration. This pins the
+/// plumbing only, since the member has a single registration here: exactness
+/// rests on the two call sites that read the witness at the call (the prepared
+/// transaction's witness in `create_owned_with_route`, and
+/// `current_session_registration_witness` in the provisioner's attached
+/// recovery), and meerkat-runtime's configured-provider test proves that the
+/// witness tells two registrations of one session apart.
 #[tokio::test]
 async fn each_hook_call_carries_the_members_exact_registration() {
     let (backend, service, machine, host) = backend(false, false);
