@@ -1166,6 +1166,7 @@ impl ValidatedCompactionRewrite {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CompactionSummarySource {
     /// The summarization LLM call: a real provider request.
     ProviderCall {

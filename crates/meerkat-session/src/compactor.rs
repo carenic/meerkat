@@ -383,7 +383,18 @@ fn requests_only_source(messages: &[Message], budget: usize) -> SummarizationSou
 /// fully trimmed falls back to the user requests alone. The original
 /// session messages are never mutated.
 fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> SummarizationSource {
-    let projected_bytes = match serialized_len(&messages) {
+    let projected = serialized_len(&messages);
+    // Unreachable for in-memory messages: every `Message` serializes
+    // infallibly (string-keyed maps, raw JSON that was validated when it was
+    // built, non-finite floats written as null). The branch is defence in
+    // depth: debug builds flag it, and a release build degrades to a note
+    // that carries none of the user requests, which `RequestsOnly { kept: 0 }`
+    // states exactly.
+    debug_assert!(
+        projected.is_ok(),
+        "a compaction source projection always serializes"
+    );
+    let projected_bytes = match projected {
         Ok(projected_bytes) => projected_bytes,
         Err(error) => {
             return SummarizationSource {

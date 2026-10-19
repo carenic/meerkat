@@ -11973,6 +11973,69 @@ mod tests {
         );
     }
 
+    /// A staged compaction reports its completion only when the runtime
+    /// commits it, and that deferred completion carries the summary source
+    /// the staged intent recorded.
+    #[tokio::test]
+    async fn runtime_committed_compaction_completion_carries_the_staged_summary_source() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let client = Arc::new(CompactionTerminalLlmClient::new(
+            PostCompactionOutcome::CallbackPending,
+        ));
+        let session = crate::Session::new();
+        let session_id = session.id().clone();
+        let (event_tx, mut event_rx) = mpsc::channel(4096);
+        let mut agent = with_test_turn_state_handle_for_session(AgentBuilder::new(), session)
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(Arc::new(AllowCompactionCoordinator { session_id }))
+            .with_default_event_tx(event_tx)
+            .build_standalone(
+                client,
+                Arc::new(CallbackPendingTools::new()),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let error = agent.run("second".into()).await.unwrap_err();
+        assert!(matches!(error, AgentError::CallbackPending { .. }));
+        let completions = |event_rx: &mut mpsc::Receiver<crate::event::AgentEvent>| {
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .filter_map(|event| match event {
+                    crate::event::AgentEvent::CompactionCompleted { summary_source, .. } => {
+                        Some(summary_source)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            completions(&mut event_rx).is_empty(),
+            "a staged compaction completes only when the runtime commits it"
+        );
+
+        let intents = agent
+            .session()
+            .validated_compaction_projection_intents()
+            .unwrap();
+        assert_eq!(intents.len(), 1);
+        agent
+            .reconcile_runtime_compaction_projections(&intents)
+            .await
+            .expect("the runtime commit finalizes the staged compaction");
+
+        assert_eq!(
+            completions(&mut event_rx),
+            vec![Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Whole,
+                }
+            )],
+            "the completion the runtime commit emits carries the staged summary source"
+        );
+    }
+
     fn append_abort_test_projection(
         session: &mut crate::Session,
         label: &str,

@@ -44,10 +44,11 @@ them.
   default implementation: every compactor states how it bounds the transcript
   it sends to the model that writes the summary. The budget is that model's
   (`SummarizationSourceBudget::for_summary_model`), `None` when the model
-  declares no context window. `CompactionSummarySource::ProviderCall` carries
-  the call's `source_bound`, and `AgentEvent::CompactionCompleted` and
-  `CompactionProjectionIntent` gain `summary_source`, `None` only for one
-  recorded before this release (on the wire the field is optional). A
+  declares no context window. `CompactionSummarySource` is `#[non_exhaustive]`
+  and its `ProviderCall` variant carries the call's `source_bound`, and
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source`, `None` only for one recorded before this release (on the
+  wire the field is optional). A
   compactor that used the default keeps its old behaviour by returning
   `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
   and ignoring the budget; to fit the summarizing model, it also bounds the
