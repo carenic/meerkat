@@ -54,8 +54,11 @@ A reply sent with `reply_to_peer` names the delivery it answers: the signed
 message carries that delivery id as `in_reply_to`, and the receiver's message
 notice shows it as an `In reply to` line. The id is a label the sender
 declares. Routing and authorization never read it. `send_message` never sets
-it. A 0.9.3 receiver does not know the field and refuses such a reply (its
-signature check fails); every other message is unchanged.
+it. A 0.9.3 receiver that checks signatures (the default, and always at a host
+acceptor) does not know the field and refuses such a reply: its signature check
+fails, the sender sees no acknowledgement, and `reply_to_peer` reports an
+ambiguous delivery outcome, not a failure. A 0.9.3 receiver with peer auth off
+accepts the reply without the label. Every other message is unchanged.
 
 A receiver checks a peer envelope's signature over the envelope as it
 arrived, including fields of its message kind that the receiver does not

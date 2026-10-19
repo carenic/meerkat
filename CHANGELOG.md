@@ -154,12 +154,14 @@ them.
   rows byte for byte, so a 0.9.3 process retrying over a row that 0.9.4 wrote
   would refuse the retry; the stored input state 7 entry above already keeps
   0.9.3 off a runtime store that 0.9.4 wrote.
-- Compatibility (wire): a 0.9.3 receiver refuses a `reply_to_peer` reply from
-  0.9.4. Its message kind does not know `in_reply_to`, so it re-serializes the
-  signed envelope without the field, the signature check fails, and it drops
-  the envelope; the sender gets no acknowledgement and `reply_to_peer` reports
-  the send as undelivered. `send_message` and every other message kind are
-  unchanged, so a 0.9.3 peer still receives them.
+- Compatibility (wire): a 0.9.3 receiver that checks signatures (the default,
+  and always at a host acceptor) refuses a `reply_to_peer` reply from 0.9.4.
+  Its message kind does not know `in_reply_to`, so it re-serializes the signed
+  envelope without the field, the signature check fails, and it drops the
+  envelope; the sender sees no acknowledgement, and `reply_to_peer` reports an
+  ambiguous delivery outcome, not a failure. A 0.9.3 receiver with peer auth
+  off accepts the reply without the label. `send_message` and every other
+  message kind are unchanged, so a 0.9.3 peer still receives them.
 
 ### Added
 

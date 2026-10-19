@@ -582,11 +582,14 @@ impl DurableSteerRig {
     }
 
     async fn admit(&self, input: Input) -> Option<crate::completion::CompletionHandle> {
-        let (outcome, completion) = self
-            .adapter
-            .accept_input_with_completion(&self.session_id, input)
-            .await
-            .expect("steer input accepted");
+        let (outcome, completion) = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.adapter
+                .accept_input_with_completion(&self.session_id, input),
+        )
+        .await
+        .expect("a waiting durable delivery must not hold up later admissions")
+        .expect("steer input accepted");
         assert!(outcome.is_accepted());
         completion
     }

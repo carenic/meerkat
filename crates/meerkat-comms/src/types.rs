@@ -66,9 +66,11 @@ pub enum MessageKind {
         /// The envelope id of the delivery this message answers, set by
         /// `reply_to_peer`. Signed when present, omitted when `None`, so a
         /// message without it keeps the canonical bytes of messages produced
-        /// before the field existed (as `content_taint`). A receiver that
-        /// does not know the field recomputes the signable bytes without it
-        /// and refuses the envelope. Advisory: never routing or authority.
+        /// before the field existed (as `content_taint`). A 0.9.3 receiver
+        /// that checks signatures (the default) does not know the field,
+        /// recomputes the signable bytes without it and refuses the envelope;
+        /// one with peer auth off drops the label. Advisory: never routing or
+        /// authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         in_reply_to: Option<Uuid>,
     },

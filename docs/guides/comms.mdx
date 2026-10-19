@@ -280,6 +280,7 @@ pub enum MessageKind {
         content_taint: Option<SenderContentTaint>,
         handling_mode: Option<HandlingMode>,
         objective_id: Option<ObjectiveId>,
+        in_reply_to: Option<Uuid>,
     },
     #[serde(rename = "incarnation_fenced_message")]
     IncarnationFencedMessage {
@@ -333,6 +334,9 @@ Controlled bridge responders use the correlated path for alternate-authority
 probes whose temporary listener port differs from the peer's durable route.
 
 `objective_id` is optional signed causality metadata for content-bearing kinds.
+On `message`, `in_reply_to` is the delivery a `reply_to_peer` reply answers: it
+is signed when present, omitted when absent, and only a label (routing and
+authorization never read it).
 `incarnation_fenced_message` is internal placed-member routing: the exact
 recipient generation and fence are signed and checked before work admission.
 </Accordion>

@@ -22,9 +22,9 @@ use meerkat_contracts::{
 use meerkat_core::BlobId;
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::{
-    COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY, CommsCommand, InputStreamMode, PeerCapabilitySet,
-    PeerDirectoryEntry, PeerDirectorySource, PeerId, PeerName, PeerReplyCapability,
-    PeerReplyDispatchContext, PeerRoute, PeerSendability, SendError, SendReceipt,
+    CommsCommand, InputStreamMode, PeerCapabilitySet, PeerDirectoryEntry, PeerDirectorySource,
+    PeerId, PeerName, PeerReplyCapability, PeerReplyDispatchContext, PeerRoute, PeerSendability,
+    SendError, SendReceipt,
 };
 use meerkat_core::error::ToolError;
 use meerkat_core::interaction::{InteractionId, ResponseStatus};
@@ -1268,8 +1268,8 @@ mod tests {
         supervisor_bridge_current_protocol_version,
     };
     use meerkat_core::comms::{
-        CommsTrustMutation, PeerAddress, PeerCapabilitySet, PeerDirectorySource, PeerSendability,
-        PeerTransport, TrustedPeerDescriptor,
+        COMMS_PEER_REPLY_DISPATCH_CONTEXT_KEY, CommsTrustMutation, PeerAddress, PeerCapabilitySet,
+        PeerDirectorySource, PeerSendability, PeerTransport, TrustedPeerDescriptor,
     };
     use parking_lot::Mutex;
     use tokio::sync::Notify;
