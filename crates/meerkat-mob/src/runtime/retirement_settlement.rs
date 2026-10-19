@@ -352,7 +352,7 @@ impl MemberUnregisterSettlement {
                 // discard and admits the unregister again.
                 Ok(Some(Err(error))) if unregister_refused_until_repair(&error) => {}
                 Ok(Some(Err(error))) | Err(error) => return self.failed(&error),
-                Ok(Some(Ok(()))) | Ok(None) => {}
+                Ok(Some(Ok(())) | None) => {}
             }
         }
         self.ended_or_pending()

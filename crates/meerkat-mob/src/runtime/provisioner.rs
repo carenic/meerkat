@@ -4154,13 +4154,13 @@ impl MemberSessionDisposalArc {
                     None => DegradedUnregisterStep::Gone,
                 }
             }
-            Ok(Ok(
-                meerkat_runtime::ReloadRequiredRegistrationDisposition::NotDegraded
-                | meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
-            ))
-            | Ok(Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. })) => {
-                DegradedUnregisterStep::Unchanged
-            }
+            Ok(
+                Ok(
+                    meerkat_runtime::ReloadRequiredRegistrationDisposition::NotDegraded
+                    | meerkat_runtime::ReloadRequiredRegistrationDisposition::NotCurrent,
+                )
+                | Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }),
+            ) => DegradedUnregisterStep::Unchanged,
             Ok(Err(error)) => DegradedUnregisterStep::Failed(format!(
                 "durability-reload discard of runtime session {session_id} failed: {error}"
             )),
