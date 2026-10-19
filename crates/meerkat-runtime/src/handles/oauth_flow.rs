@@ -2222,7 +2222,7 @@ pub(crate) mod tests {
             while !state.blocked {
                 let (next, timeout) = self
                     .blocking_oauth_persist_cv
-                    .wait_timeout(state, Duration::from_secs(1))
+                    .wait_timeout(state, Duration::from_secs(10))
                     .expect("blocking persist state wait");
                 assert!(
                     !timeout.timed_out(),

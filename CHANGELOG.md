@@ -1018,6 +1018,14 @@ them.
   real `tool_config_changed` event failed validation against it. It now
   accepts the events the runtime serializes, including those stored by
   0.9.3 and earlier and served with their `persisted` bit.
+- Creating a persistent `MeerkatMachine` over one store no longer waits for
+  another store's OAuth flow rehydration (`meerkat-runtime`). The
+  process-wide provider-auth authority cache held one lock while it built a
+  store's authority, which rehydrates that store's OAuth flows (a store read,
+  and a write back when flows were persisted), so every machine creation in
+  the process queued behind the slowest store. Each store key now has its own
+  slot: the cache lock covers only the slot lookup, and machines over one
+  store still wait for and share one authority, rehydrated once.
 
 ## [0.9.3] - 2026-10-18
 
