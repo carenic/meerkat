@@ -46,6 +46,10 @@ use crate::host::{
     LiveChannelCloseObservation, LiveChannelId, LiveChannelStatusCommitAuthority,
     LiveChannelStatusObservation, ObservationOutcome, ObservationRouting,
 };
+use crate::projection_queue::{
+    LiveProjectionQueue, ProjectionFailureFrame, ProjectionReport, ProjectionRow,
+    observation_writes_session,
+};
 use crate::wire_input::{live_input_chunk_decode_rejection, live_input_chunk_from_wire};
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, close_code};
@@ -1259,12 +1263,23 @@ async fn handle_live_socket(
     // after an observation is consumed (or an error tears the loop down).
     let mut observation_fut = Box::pin(state.host.next_observation_raw(&channel_id));
     let mut close_feedback_recorded = false;
+    // The observations that write the session are applied by this channel's
+    // projection task, in arrival order, so a row waiting for the session's
+    // turn boundary (a running member turn) never stops this loop from
+    // forwarding the assistant's audio or reading the client's input.
+    let mut projection = LiveProjectionQueue::spawn(Arc::clone(&state.host), channel_id.clone());
+    let mut exit_close_reason = meerkat_core::LiveChannelCloseReason::ClientDisconnected;
 
     loop {
         // No `biased;` — fair scheduling prevents continuous mic-audio inbound
         // frames from starving the observation arm (assistant output, tool
         // observations, terminal close).
         tokio::select! {
+            report = projection.next_report() => {
+                if !publish_projection_report(&mut socket, &channel_id, &mut projection, report).await {
+                    break;
+                }
+            }
             client_msg = socket.recv() => {
                 match client_msg {
                     Some(Ok(WsMessage::Text(text))) => {
@@ -1487,6 +1502,12 @@ async fn handle_live_socket(
                         let publish_observation = should_publish_observation(&obs);
 
                         if close_observation {
+                            // The rows observed before a terminal observation
+                            // land before its close, as when this loop applied
+                            // each row itself.
+                            if !drain_projection_before_close(&mut socket, &channel_id, &mut projection).await {
+                                break;
+                            }
                             if !state.close_channel_with_generated_feedback(&channel_id, close_reason_for_observation(&obs)).await {
                                 break;
                             }
@@ -1496,6 +1517,34 @@ async fn handle_live_socket(
                             .await
                         {
                             break;
+                        }
+
+                        // Forward a session-writing row at once; the
+                        // projection task applies it in arrival order. If
+                        // the session refuses it, the channel closes with an
+                        // error frame naming the row and the later rows it
+                        // did not apply. Every other observation writes no
+                        // transcript row and is applied below first, so a
+                        // status can be recorded before rows queued ahead of
+                        // it (a channel fact, not a transcript row).
+                        if !close_observation && observation_writes_session(&obs) {
+                            if publish_observation
+                                && !send_public_observation(&mut socket, &channel_id, &obs).await
+                            {
+                                break;
+                            }
+                            if let Err(error) = projection.enqueue(ProjectionRow::Observation(Box::new(obs))) {
+                                tracing::warn!(
+                                    channel = %channel_id,
+                                    error = %error,
+                                    "live projection queue refused a row; closing channel"
+                                );
+                                let frame = ProjectionFailureFrame::backlog_full(&error);
+                                let _ = socket.send(WsMessage::Text(frame.to_json().into())).await;
+                                exit_close_reason = meerkat_core::LiveChannelCloseReason::Error;
+                                break;
+                            }
+                            continue;
                         }
 
                         // Apply to canonical state and inspect the typed outcome
@@ -1515,27 +1564,8 @@ async fn handle_live_socket(
                             }
                         };
 
-                        let send_ok = if publish_observation {
-                            // Convert only public observations. Besides
-                            // preventing serialization, this avoids cloning
-                            // inline image bytes from the internal canonical
-                            // user-content event into a wire value at all.
-                            match serde_json::to_string(&WireLiveAdapterObservation::from(
-                                obs.clone(),
-                            )) {
-                                Ok(json) => socket.send(WsMessage::Text(json.into())).await.is_ok(),
-                                Err(error) => {
-                                    tracing::warn!(
-                                        channel = %channel_id,
-                                        error = %error,
-                                        "public live observation serialization failed; closing"
-                                    );
-                                    false
-                                }
-                            }
-                        } else {
-                            true
-                        };
+                        let send_ok = !publish_observation
+                            || send_public_observation(&mut socket, &channel_id, &obs).await;
 
                         if !send_ok {
                             break;
@@ -1594,14 +1624,112 @@ async fn handle_live_socket(
         }
     }
 
+    // The close does not wait for a running member turn: rows still queued
+    // land after it, in order, as the projection task outlives this loop.
+    drop(projection);
     tracing::info!(channel = %channel_id, "live WebSocket disconnected");
     if !close_feedback_recorded {
         state
-            .close_channel_with_generated_feedback(
-                &channel_id,
-                meerkat_core::LiveChannelCloseReason::ClientDisconnected,
-            )
+            .close_channel_with_generated_feedback(&channel_id, exit_close_reason)
             .await;
+    }
+}
+
+/// Send one public observation as a JSON text frame. `false` when the socket
+/// is gone or the observation cannot be serialized; the caller closes.
+async fn send_public_observation(
+    socket: &mut WebSocket,
+    channel_id: &LiveChannelId,
+    observation: &LiveAdapterObservation,
+) -> bool {
+    // Convert only public observations. Besides preventing serialization,
+    // this avoids cloning inline image bytes from the internal canonical
+    // user-content event into a wire value at all.
+    match serde_json::to_string(&WireLiveAdapterObservation::from(observation.clone())) {
+        Ok(json) => socket.send(WsMessage::Text(json.into())).await.is_ok(),
+        Err(error) => {
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
+                "public live observation serialization failed; closing"
+            );
+            false
+        }
+    }
+}
+
+/// Act on one report of the channel's projection task. `false` when the
+/// loop must end and close the channel.
+async fn publish_projection_report(
+    socket: &mut WebSocket,
+    channel_id: &LiveChannelId,
+    projection: &mut LiveProjectionQueue,
+    report: Option<ProjectionReport>,
+) -> bool {
+    match report {
+        // Visible only after canonical persistence: the client's barrier for
+        // input that depends on the image.
+        Some(ProjectionReport::UserContentCommitted(receipt)) => {
+            send_public_observation(socket, channel_id, &receipt).await
+        }
+        Some(ProjectionReport::Terminal(code)) => {
+            tracing::info!(
+                channel = %channel_id,
+                ?code,
+                "live WebSocket projection reached a terminal outcome"
+            );
+            false
+        }
+        Some(ProjectionReport::Failed {
+            error,
+            row,
+            item_id,
+        }) => {
+            // Nothing more is queued from here on, so the count is exact.
+            projection.seal();
+            let frame = ProjectionFailureFrame::failed_row(
+                &error,
+                row,
+                item_id,
+                projection.unapplied_rows(),
+            );
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
+                "live projection failed after its frames were published; closing channel"
+            );
+            let _ = socket.send(WsMessage::Text(frame.to_json().into())).await;
+            false
+        }
+        None => {
+            tracing::warn!(channel = %channel_id, "live projection task ended; closing channel");
+            false
+        }
+    }
+}
+
+/// Seal the channel's projection queue and wait until every queued row is
+/// applied, publishing the receipts that arrive meanwhile. `false` when a row
+/// failed or terminalized the channel (the caller closes as for that report).
+async fn drain_projection_before_close(
+    socket: &mut WebSocket,
+    channel_id: &LiveChannelId,
+    projection: &mut LiveProjectionQueue,
+) -> bool {
+    projection.seal();
+    loop {
+        match projection.next_report().await {
+            None => return true,
+            report @ Some(ProjectionReport::UserContentCommitted(_)) => {
+                // A receipt the client cannot be sent does not stop the
+                // close: the channel ends either way.
+                let _ = publish_projection_report(socket, channel_id, projection, report).await;
+            }
+            report => {
+                publish_projection_report(socket, channel_id, projection, report).await;
+                return false;
+            }
+        }
     }
 }
 
@@ -1664,6 +1792,9 @@ mod tests {
     }
     use crate::host::{
         LiveProjectionError, LiveProjectionSink, LiveTranscriptIdentity, NoOpProjectionSink,
+    };
+    use crate::projection_queue::test_support::{
+        GatedRecordingSink, assistant_delta, assistant_final, turn_completed, user_final,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
@@ -2360,75 +2491,366 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn websocket_never_publishes_observation_when_canonical_apply_fails() {
-        use futures::StreamExt as _;
-        use meerkat_core::live_adapter::LiveAdapterObservation;
-        use tokio_tungstenite::tungstenite::Message;
+    /// Adapter fed by the test: observations come from an unbounded channel
+    /// (dropping its sender ends the stream), and every `SendInput` is counted.
+    struct FedAdapter {
+        observations:
+            tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<LiveAdapterObservation>>,
+        inputs: Arc<AtomicUsize>,
+    }
 
-        let sink = Arc::new(TerminalRecordingProjectionSink::default());
-        sink.reject_user_transcript.store(true, Ordering::SeqCst);
-        let sink_for_host: Arc<dyn LiveProjectionSink> = sink;
-        let host = Arc::new(LiveAdapterHost::new(sink_for_host));
-        let session_id = SessionId::new();
-        let channel_id = host
-            .open_channel_with_generated_test_machine_authority(session_id.clone())
-            .await
-            .unwrap();
-        host.attach_adapter(
-            &channel_id,
-            Arc::new(ScriptedAdapter::new(
-                LiveAdapterObservation::UserTranscriptFinal {
-                    provider_item_id: Some("provider-user-1".to_string()),
-                    previous_item_id: None,
-                    content_index: Some(0),
-                    text: "must-not-publish".to_string(),
-                },
-            )),
-        )
-        .await
-        .unwrap();
+    #[async_trait::async_trait]
+    impl meerkat_core::live_adapter::LiveAdapter for FedAdapter {
+        async fn send_command(
+            &self,
+            command: meerkat_core::live_adapter::LiveAdapterCommand,
+        ) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            if matches!(
+                command,
+                meerkat_core::live_adapter::LiveAdapterCommand::SendInput { .. }
+            ) {
+                self.inputs.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
 
-        let authority = ScriptedLiveWsTokenAuthority::admitting(channel_id.clone());
-        let state = Arc::new(test_state_with_authority(host, authority));
-        let token = state
-            .mint_token(&session_id, channel_id.clone())
-            .await
-            .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let ws_state = Arc::clone(&state);
-        let server_handle =
-            tokio::spawn(async move { serve_live_ws_listener(listener, ws_state).await });
+        async fn next_observation(
+            &self,
+        ) -> Result<Option<LiveAdapterObservation>, meerkat_core::live_adapter::LiveAdapterError>
+        {
+            Ok(self.observations.lock().await.recv().await)
+        }
 
-        let url = format!("ws://{addr}{LIVE_WS_PATH}?token={token}&channel={channel_id}");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        let (_write, mut read) = ws_stream.split();
-        let mut saw_uncommitted = false;
-        let disconnected = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(message) = read.next().await {
-                match message {
-                    Ok(Message::Text(text)) => {
-                        if text.contains("must-not-publish") {
-                            saw_uncommitted = true;
-                        }
-                    }
-                    Ok(Message::Close(_)) | Err(_) => return true,
-                    Ok(_) => {}
+        fn status(&self) -> meerkat_core::live_adapter::LiveAdapterStatus {
+            meerkat_core::live_adapter::LiveAdapterStatus::Ready
+        }
+
+        async fn close(&self) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            Ok(())
+        }
+    }
+
+    type TestWsRead = futures::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >;
+    type TestWsWrite = futures::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::Message,
+    >;
+
+    /// A WebSocket live channel whose rows go to a [`GatedRecordingSink`].
+    struct ProjectionFixture {
+        sink: Arc<GatedRecordingSink>,
+        host: Arc<LiveAdapterHost>,
+        channel_id: LiveChannelId,
+        observations: tokio::sync::mpsc::UnboundedSender<LiveAdapterObservation>,
+        inputs: Arc<AtomicUsize>,
+        write: TestWsWrite,
+        read: TestWsRead,
+        server_handle: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    }
+
+    impl ProjectionFixture {
+        async fn connect() -> Self {
+            let sink = Arc::new(GatedRecordingSink::default());
+            let host = Arc::new(LiveAdapterHost::new(
+                Arc::clone(&sink) as Arc<dyn LiveProjectionSink>
+            ));
+            let (observations, observations_rx) = tokio::sync::mpsc::unbounded_channel();
+            let inputs = Arc::new(AtomicUsize::new(0));
+            let (session_id, channel_id) = open_ready_test_channel(
+                &host,
+                Arc::new(FedAdapter {
+                    observations: tokio::sync::Mutex::new(observations_rx),
+                    inputs: Arc::clone(&inputs),
+                }),
+            )
+            .await;
+            let authority = ScriptedLiveWsTokenAuthority::admitting(channel_id.clone());
+            let state = Arc::new(test_state_with_authority(Arc::clone(&host), authority));
+            let token = state
+                .mint_token(&session_id, channel_id.clone())
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_handle =
+                tokio::spawn(async move { serve_live_ws_listener(listener, state).await });
+            let url = format!(
+                "ws://{addr}{LIVE_WS_PATH}?token={token}&channel={channel_id}&format=pcm_24k_mono"
+            );
+            let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let (write, read) = futures::StreamExt::split(ws_stream);
+            Self {
+                sink,
+                host,
+                channel_id,
+                observations,
+                inputs,
+                write,
+                read,
+                server_handle,
+            }
+        }
+
+        fn push(&self, observation: LiveAdapterObservation) {
+            self.observations.send(observation).unwrap();
+        }
+
+        /// The next text frame within `within`, or `None` when the socket
+        /// closed or nothing arrived.
+        async fn next_text(&mut self, within: Duration) -> Option<String> {
+            use futures::StreamExt as _;
+            use tokio_tungstenite::tungstenite::Message;
+            let deadline = tokio::time::Instant::now() + within;
+            loop {
+                let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+                match tokio::time::timeout(remaining, self.read.next()).await {
+                    Ok(Some(Ok(Message::Text(text)))) => return Some(text.to_string()),
+                    Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) | Err(_) => return None,
+                    Ok(Some(Ok(_))) => {}
                 }
             }
-            true
+        }
+
+        /// Read text frames until one contains `needle`; panics after 5 s.
+        async fn expect_frame(&mut self, needle: &str) -> String {
+            let mut seen = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            {
+                match self.next_text(remaining).await {
+                    Some(text) if text.contains(needle) => return text,
+                    Some(text) => seen.push(text),
+                    None => break,
+                }
+            }
+            panic!("no frame containing {needle} within 5 s; saw {seen:?}");
+        }
+
+        async fn wait_for_status(&self, status: meerkat_core::live_adapter::LiveAdapterStatus) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if self
+                        .host
+                        .channel_status(&self.channel_id)
+                        .await
+                        .ok()
+                        .as_ref()
+                        == Some(&status)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("channel never reached {status:?}"));
+        }
+    }
+
+    fn audio_chunk() -> LiveAdapterObservation {
+        LiveAdapterObservation::AssistantAudioChunk {
+            data: vec![0_u8; 480],
+            sample_rate_hz: 24_000,
+            channels: 1,
+            response_id: Some("resp_1".to_string()),
+            item_id: Some("item_assistant".to_string()),
+            content_index: Some(0),
+        }
+    }
+
+    /// The failure this fixes: a transcript row waiting for the session's
+    /// turn boundary (a running member turn) stopped the WebSocket in both
+    /// directions. While the member turn holds the boundary, every frame
+    /// (audio included) still reaches the client and the client's audio still
+    /// reaches the provider; after the turn the rows land in arrival order.
+    #[tokio::test]
+    async fn websocket_keeps_audio_and_input_flowing_while_rows_wait_for_a_member_turn() {
+        use futures::SinkExt as _;
+        let mut fixture = ProjectionFixture::connect().await;
+        let member_turn = Arc::clone(&fixture.sink.gate).lock_owned().await;
+
+        fixture.push(user_final("item_user", "hello"));
+        fixture.push(assistant_delta("item_assistant", "d1", "Hi"));
+        fixture.push(audio_chunk());
+        fixture.push(audio_chunk());
+        fixture.push(assistant_final("item_assistant", "Hi"));
+        fixture.push(audio_chunk());
+        fixture.push(turn_completed("resp_1"));
+        for needle in [
+            "user_transcript_final",
+            "assistant_transcript_delta",
+            "assistant_audio_chunk",
+            "assistant_audio_chunk",
+            "assistant_transcript_final",
+            "assistant_audio_chunk",
+            "turn_completed",
+        ] {
+            fixture.expect_frame(needle).await;
+        }
+        for _ in 0..3 {
+            fixture
+                .write
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    vec![0_u8; 960].into(),
+                ))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.inputs.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         })
         .await
-        .unwrap_or(false);
-
+        .expect("the client's audio reaches the provider while a row waits");
         assert!(
-            disconnected,
-            "canonical apply failure must disconnect the WS"
+            fixture.sink.applied().is_empty(),
+            "no row commits while the member turn holds the boundary"
         );
+
+        drop(member_turn);
+        let applied = fixture.sink.wait_for_applied(4).await;
+        assert_eq!(
+            applied.iter().map(|row| row.row).collect::<Vec<_>>(),
+            [
+                "user_transcript_final",
+                "assistant_transcript_delta",
+                "assistant_transcript_final",
+                "turn_completed",
+            ]
+        );
+        assert_eq!(
+            applied.iter().map(|row| row.under_hold).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        fixture.server_handle.abort();
+    }
+
+    /// A frame reaches the client before its row commits. When the session
+    /// then refuses the row, the channel closes with an error frame naming
+    /// the row and the later rows it did not apply, and nothing is persisted.
+    #[tokio::test]
+    async fn websocket_names_the_refused_row_and_closes_when_a_published_row_fails() {
+        let mut fixture = ProjectionFixture::connect().await;
+        fixture.sink.fail_row("user_transcript_final");
+        let member_turn = Arc::clone(&fixture.sink.gate).lock_owned().await;
+        fixture.push(user_final("provider-user-1", "published-before-commit"));
+        fixture.push(assistant_delta("item_assistant", "d1", "later"));
+        fixture.expect_frame("published-before-commit").await;
+        fixture.expect_frame("assistant_transcript_delta").await;
+        // Both rows are queued once their frames were sent.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        drop(member_turn);
+        let frame = fixture.expect_frame("projection_error").await;
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["reason"], "projection_error");
+        assert_eq!(frame["row"], "user_transcript_final");
+        assert_eq!(frame["item_id"], "provider-user-1");
+        assert_eq!(frame["unapplied_rows"], 1);
+        assert_eq!(
+            fixture.next_text(Duration::from_secs(5)).await,
+            None,
+            "the socket closes after the error frame"
+        );
+        fixture
+            .wait_for_status(meerkat_core::live_adapter::LiveAdapterStatus::Closed)
+            .await;
         assert!(
-            !saw_uncommitted,
-            "provider observation must not publish when canonical apply failed"
+            fixture.sink.applied().is_empty(),
+            "neither the refused row nor the row after it is persisted"
+        );
+        fixture.server_handle.abort();
+    }
+
+    /// The rows observed before a terminal observation land before its close:
+    /// no close is recorded and no terminal frame is sent while they wait.
+    #[tokio::test]
+    async fn websocket_terminal_closes_only_after_the_rows_before_it_land() {
+        let mut fixture = ProjectionFixture::connect().await;
+        let member_turn = Arc::clone(&fixture.sink.gate).lock_owned().await;
+        fixture.push(user_final("item_user", "hello"));
+        fixture.push(assistant_final("item_assistant", "Hi"));
+        fixture.push(LiveAdapterObservation::StatusChanged {
+            status: meerkat_core::live_adapter::LiveAdapterStatus::Closed,
+        });
+        fixture.expect_frame("user_transcript_final").await;
+        fixture.expect_frame("assistant_transcript_final").await;
+        assert_eq!(
+            fixture.next_text(Duration::from_millis(300)).await,
+            None,
+            "no terminal frame while earlier rows wait"
+        );
+        assert_ne!(
+            fixture
+                .host
+                .channel_status(&fixture.channel_id)
+                .await
+                .unwrap(),
+            meerkat_core::live_adapter::LiveAdapterStatus::Closed,
+            "no close is recorded while earlier rows wait"
+        );
+
+        drop(member_turn);
+        fixture.expect_frame("status_changed").await;
+        assert_eq!(
+            fixture.sink.applied_rows(),
+            ["user_transcript_final", "assistant_transcript_final"],
+            "the rows landed before the terminal frame"
+        );
+        fixture
+            .wait_for_status(meerkat_core::live_adapter::LiveAdapterStatus::Closed)
+            .await;
+        fixture.server_handle.abort();
+    }
+
+    /// A client that disconnects while rows wait for a member turn closes the
+    /// channel at once; the queued rows still land, in order, after the turn.
+    #[tokio::test]
+    async fn websocket_client_drop_closes_at_once_and_queued_rows_land_after_the_turn() {
+        let mut fixture = ProjectionFixture::connect().await;
+        let member_turn = Arc::clone(&fixture.sink.gate).lock_owned().await;
+        fixture.push(user_final("item_user", "hello"));
+        fixture.push(assistant_final("item_assistant", "Hi"));
+        fixture.expect_frame("user_transcript_final").await;
+        fixture.expect_frame("assistant_transcript_final").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ProjectionFixture {
+            sink,
+            host,
+            channel_id,
+            write,
+            read,
+            server_handle,
+            observations: _observations,
+            ..
+        } = fixture;
+        drop(write);
+        drop(read);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.channel_status(&channel_id).await.ok()
+                != Some(meerkat_core::live_adapter::LiveAdapterStatus::Closed)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the channel closes without waiting for the member turn");
+        assert!(sink.applied().is_empty());
+
+        drop(member_turn);
+        let applied = sink.wait_for_applied(2).await;
+        assert_eq!(
+            applied.iter().map(|row| row.row).collect::<Vec<_>>(),
+            ["user_transcript_final", "assistant_transcript_final"],
+            "rows queued at the disconnect land after the turn, in order"
         );
         server_handle.abort();
     }

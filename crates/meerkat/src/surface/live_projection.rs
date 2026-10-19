@@ -1133,4 +1133,278 @@ mod tests {
             "the committed row carries the spoken text"
         );
     }
+
+    struct IdleLiveAdapter;
+
+    #[async_trait]
+    impl meerkat_core::live_adapter::LiveAdapter for IdleLiveAdapter {
+        async fn send_command(
+            &self,
+            _command: meerkat_core::live_adapter::LiveAdapterCommand,
+        ) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            Ok(())
+        }
+
+        async fn next_observation(
+            &self,
+        ) -> Result<Option<LiveAdapterObservation>, meerkat_core::live_adapter::LiveAdapterError>
+        {
+            std::future::pending().await
+        }
+
+        fn status(&self) -> meerkat_core::live_adapter::LiveAdapterStatus {
+            meerkat_core::live_adapter::LiveAdapterStatus::Ready
+        }
+
+        async fn close(&self) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            Ok(())
+        }
+    }
+
+    struct LiveFixture {
+        service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        projection: Arc<ServiceLiveProjection>,
+        host: meerkat_live::LiveAdapterHost,
+        session_id: SessionId,
+        channel_id: LiveChannelId,
+        _temp: tempfile::TempDir,
+    }
+
+    /// A materialized realtime session with one open live channel whose
+    /// rows go through [`ServiceLiveProjection`] and the persistent service.
+    async fn live_fixture() -> LiveFixture {
+        let persistence = crate::PersistenceBundle::new(
+            Arc::new(crate::MemoryStore::new()),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .expect("construct runtime authority");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let factory = crate::AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+        let (service, runtime) =
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
+        let service = Arc::new(service);
+        let session = crate::Session::new();
+        let session_id = session.id().clone();
+        let executor_service = Arc::clone(&service);
+        let executor_runtime = Arc::clone(&runtime);
+        Box::pin(crate::surface::materialize_session(
+            &service,
+            &runtime,
+            session,
+            crate::CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "gpt-realtime-2".to_string(),
+                prompt: ContentInput::Text(String::new()),
+                system_prompt: crate::SystemPromptOverride::Disable,
+                max_tokens: None,
+                event_tx: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions::default()),
+                labels: None,
+            },
+            move |materialized_session_id| {
+                crate::surface::default_persistent_executor(
+                    executor_service,
+                    executor_runtime,
+                    materialized_session_id,
+                )
+            },
+        ))
+        .await
+        .expect("materialize live projection fixture session");
+        let projection = Arc::new(ServiceLiveProjection::new(
+            Arc::clone(&service),
+            Arc::clone(&runtime),
+        ));
+        let host = meerkat_live::LiveAdapterHost::new(
+            Arc::clone(&projection) as Arc<dyn LiveProjectionSink>
+        );
+        let channel_id = LiveChannelId::random_uuid();
+        let admission = runtime
+            .resolve_live_open_admission(
+                &session_id,
+                &channel_id,
+                &meerkat_core::SessionLlmIdentity {
+                    model: "gpt-realtime-2".to_string(),
+                    provider: meerkat_core::Provider::OpenAI,
+                    self_hosted_server_id: None,
+                    provider_params: None,
+                    auth_binding: None,
+                },
+            )
+            .await
+            .expect("machine admits the fixture channel");
+        host.open_channel_with_authority(
+            admission
+                .channel_open_authority()
+                .expect("generated host open handoff"),
+        )
+        .await
+        .expect("open live channel");
+        LiveFixture {
+            service,
+            projection,
+            host,
+            session_id,
+            channel_id,
+            _temp: temp,
+        }
+    }
+
+    fn transcript_delta(
+        item: &str,
+        response: &str,
+        delta_id: &str,
+        delta: &str,
+    ) -> LiveAdapterObservation {
+        LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: Some(item.to_string()),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some(response.to_string()),
+            delta_id: Some(delta_id.to_string()),
+            delta: delta.to_string(),
+        }
+    }
+
+    fn completed(response: &str) -> LiveAdapterObservation {
+        LiveAdapterObservation::TurnCompleted {
+            response_id: Some(response.to_string()),
+            stop_reason: StopReason::EndTurn,
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                "facade-live-projection-test",
+                Usage::default(),
+            ),
+        }
+    }
+
+    fn committed_text(session: &crate::Session) -> String {
+        format!("{:?}", session.messages())
+    }
+
+    /// The WebSocket and WebRTC transports apply text and transcript deltas
+    /// under the channel's held turn boundary (the queue's hold): each must
+    /// land through this sink without waiting for the boundary itself, or a
+    /// held channel would wedge. Sibling of the GPT Live row kinds' check.
+    #[tokio::test]
+    async fn live_deltas_land_under_the_channels_held_turn_boundary() {
+        let fixture = live_fixture().await;
+        let hold = fixture
+            .host
+            .hold_projection_boundary(&fixture.channel_id)
+            .await
+            .expect("the boundary is free")
+            .expect("the facade sink holds boundaries");
+        for observation in [
+            LiveAdapterObservation::AssistantTextDelta {
+                provider_item_id: Some("item_text".to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_text".to_string()),
+                delta_id: Some("t1".to_string()),
+                delta: "Shown".to_string(),
+            },
+            transcript_delta("item_spoken", "resp_spoken", "d1", "Hello"),
+            transcript_delta("item_spoken", "resp_spoken", "d2", " under hold."),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                fixture
+                    .host
+                    .apply_observation(&fixture.channel_id, &observation),
+            )
+            .await
+            .expect("a delta lands under the held boundary instead of waiting for it")
+            .expect("the delta applies");
+        }
+        drop(hold);
+        fixture
+            .host
+            .apply_observation(&fixture.channel_id, &completed("resp_spoken"))
+            .await
+            .expect("turn completion materializes the staged speech");
+        let session = fixture
+            .service
+            .load_authoritative_session(&fixture.session_id)
+            .await
+            .expect("session loads")
+            .expect("session exists");
+        assert!(
+            committed_text(&session).contains("Hello under hold."),
+            "the deltas applied under the hold commit: {:?}",
+            session.messages()
+        );
+    }
+
+    /// A transport that closes while rows wait for a member turn does not
+    /// wait for them: they are applied after the close, on the channel's
+    /// tombstone. The session must still commit them.
+    #[tokio::test]
+    async fn rows_applied_after_the_channel_closed_still_commit() {
+        let fixture = live_fixture().await;
+        fixture
+            .host
+            .attach_adapter(&fixture.channel_id, Arc::new(IdleLiveAdapter))
+            .await
+            .expect("attach the transport's adapter");
+        let observation = fixture
+            .host
+            .reserve_channel_close_observation(
+                &fixture.channel_id,
+                meerkat_core::LiveChannelCloseReason::ClientDisconnected,
+            )
+            .await
+            .expect("reserve the close");
+        fixture
+            .host
+            .prepare_channel_physical_close(&observation)
+            .await
+            .expect("physical close");
+        let authority = fixture
+            .projection
+            .record_live_channel_closed(&fixture.channel_id, &observation)
+            .await
+            .expect("generated close authority");
+        fixture
+            .host
+            .commit_channel_close_observation(&observation, &authority)
+            .await
+            .expect("commit the close");
+
+        for observation in [
+            LiveAdapterObservation::UserTranscriptFinal {
+                provider_item_id: Some("item_user_late".to_string()),
+                previous_item_id: None,
+                content_index: Some(0),
+                text: "said before the client left".to_string(),
+            },
+            transcript_delta("item_late", "resp_late", "d1", "Answered before the close."),
+            completed("resp_late"),
+        ] {
+            fixture
+                .host
+                .apply_observation(&fixture.channel_id, &observation)
+                .await
+                .expect("a row queued before the close applies on the tombstone");
+        }
+        let session = fixture
+            .service
+            .load_authoritative_session(&fixture.session_id)
+            .await
+            .expect("session loads")
+            .expect("session exists");
+        let text = committed_text(&session);
+        assert!(
+            text.contains("said before the client left")
+                && text.contains("Answered before the close."),
+            "both late rows commit: {:?}",
+            session.messages()
+        );
+    }
 }
