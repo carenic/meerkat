@@ -1011,15 +1011,17 @@ mod tests {
         let cmd = MobCommand::Retire {
             agent_identity: identity.clone(),
             redrive: false,
-            expected_incarnation: super::super::state::RetireMemberIncarnation {
-                agent_identity: identity.clone(),
-                agent_runtime_id: crate::ids::AgentRuntimeId::new(identity, generation),
-                generation,
-                fence_token: crate::ids::FenceToken::new(1),
-                member_ref: crate::event::MemberRef::from_bridge_session_id(
-                    meerkat_core::SessionId::new(),
-                ),
-            },
+            target: super::super::state::RetireTarget::Exact(
+                super::super::state::RetireMemberIncarnation {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: crate::ids::AgentRuntimeId::new(identity, generation),
+                    generation,
+                    fence_token: crate::ids::FenceToken::new(1),
+                    member_ref: crate::event::MemberRef::from_bridge_session_id(
+                        meerkat_core::SessionId::new(),
+                    ),
+                },
+            ),
             deadline: meerkat_core::time_compat::Instant::now(),
             admission_tx,
             reply_tx,

@@ -66944,13 +66944,13 @@ async fn test_member_reads_bypass_saturated_actor_command_queue() {
             super::state::MobCommand::Retire {
                 agent_identity: queued_identity.clone(),
                 redrive: false,
-                expected_incarnation: super::state::RetireMemberIncarnation {
+                target: super::state::RetireTarget::Exact(super::state::RetireMemberIncarnation {
                     agent_identity: queued_identity.clone(),
                     agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
                     generation: queued_generation,
                     fence_token: FenceToken::new(1),
                     member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
-                },
+                }),
                 deadline: Instant::now(),
                 admission_tx,
                 reply_tx,
@@ -67064,13 +67064,13 @@ async fn test_retire_saturated_actor_queue_reports_not_admitted_without_authorit
             super::state::MobCommand::Retire {
                 agent_identity: queued_identity.clone(),
                 redrive: false,
-                expected_incarnation: super::state::RetireMemberIncarnation {
+                target: super::state::RetireTarget::Exact(super::state::RetireMemberIncarnation {
                     agent_identity: queued_identity.clone(),
                     agent_runtime_id: AgentRuntimeId::new(queued_identity, queued_generation),
                     generation: queued_generation,
                     fence_token: FenceToken::new(1),
                     member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
-                },
+                }),
                 deadline: Instant::now(),
                 admission_tx,
                 reply_tx,
@@ -90332,6 +90332,10 @@ mod member_instruction_gates;
 mod owned_retirement;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod resume_bind_custody;
+/// `MobHandle::retire_at_scope` retires the incarnation its delivery scope
+/// names, admitted in every step's own actor command, or nothing.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod retire_at_scope;
 mod retirement_isolation;
 /// #1814 owned rollbacks release the turn-finalization boundary before they
 /// take the lease a concurrent raw unregister holds into its cleanup.

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::roster::RosterEntry;
-use crate::runtime::state::{MobCommand, RetireMemberIncarnation};
+use crate::runtime::state::{MobCommand, RetireMemberIncarnation, RetireTarget};
 
 struct ReleaseRetirementGate(Arc<TestRuntimeControlBarrier>);
 
@@ -70,13 +70,13 @@ async fn send_exact_retirement(
             cmd: MobCommand::Retire {
                 agent_identity: entry.agent_identity.clone(),
                 redrive,
-                expected_incarnation: RetireMemberIncarnation {
+                target: RetireTarget::Exact(RetireMemberIncarnation {
                     agent_identity: entry.agent_identity.clone(),
                     agent_runtime_id: entry.agent_runtime_id.clone(),
                     generation: entry.generation,
                     fence_token: entry.fence_token,
                     member_ref: entry.member_ref.clone(),
-                },
+                }),
                 deadline: Instant::now() + Duration::from_secs(15),
                 admission_tx,
                 reply_tx,

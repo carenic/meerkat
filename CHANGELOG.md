@@ -236,6 +236,21 @@ them.
   checks both in every state its domains reach and for every scope they can
   name, and that a Current verdict admits a Retire of that incarnation; five
   `meerkat_mob_seam` witnesses reach each verdict.
+- `meerkat-mob`: `MobHandle::retire_at_scope` retires exactly the member
+  incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
+  semantics. Each step, every descendant and the member itself, is admitted
+  by MobMachine's `RetireAtScope` verdict on the scope in the same actor
+  command that retires it, so a successor minted while the call runs is
+  never retired through an older scope. A scope whose incarnation was
+  replaced answers `StaleFenceToken`, a moved session binding
+  `StaleDeliveryScope`, and a completed or destroyed mob
+  `InvalidTransition`; a refusal stops the call. After the member's own
+  step, descendants are retired only while no incarnation of the identity
+  is current. `Ok(())` is `retire`'s barrier:
+  with no incarnation current, the call waits out a retirement the mob still
+  owns for the identity, answers `Ok(())` only once the identity has no
+  roster entry and no stuck retirement, and answers a stuck retirement with
+  `MemberRetirementStuck`.
 
 ### Changed
 

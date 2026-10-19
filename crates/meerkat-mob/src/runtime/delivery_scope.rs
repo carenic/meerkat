@@ -3,8 +3,9 @@
 //!
 //! A [`MemberDeliveryScope`] is captured observationally, persisted by the
 //! host before an effect-bearing submit, and passed back unchanged to
-//! [`MobHandle::submit_work_with_mode_and_delivery_identity_bounded`] and
-//! [`MobHandle::recover_bounded_work_at_scope`]. Runtime id and fence alone do
+//! [`MobHandle::submit_work_with_mode_and_delivery_identity_bounded`],
+//! [`MobHandle::recover_bounded_work_at_scope`] and
+//! [`MobHandle::retire_at_scope`]. Runtime id and fence alone do
 //! not pin a delivery: a member's session binding can move under the same
 //! runtime (session recovery), and the runtime's idempotency key is scoped to
 //! one session's ledger. The scope therefore names the session too, and:
@@ -17,6 +18,10 @@
 //!   the original runtime is unregistered;
 //! * recovery is a history read: the caller's current `ReadHistory` control
 //!   scope is admitted at the actor before any lookup;
+//! * a scoped retire retires only the incarnation the scope names: generated
+//!   MobMachine authority re-checks the scope in each step's own actor
+//!   command, refuses a successor as [`crate::MobError::StaleFenceToken`] and
+//!   a moved session binding as [`crate::MobError::StaleDeliveryScope`];
 //! * before that read, recovery proves from this mob's own durable member
 //!   history (the spawn, reset and session-binding recovery events the owner
 //!   rebuilds its bindings from on restart) that the scope's member

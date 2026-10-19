@@ -40,6 +40,18 @@ impl RetirementReply {
     }
 }
 
+/// What an admitted scoped root step does with the identity's incarnation.
+enum ScopedRootIncarnation {
+    /// Retire the scope's incarnation exactly as `retire` does from
+    /// validation.
+    Retire(super::super::state::RetireMemberIncarnation),
+    /// Answer the identity's stuck retirement as `retire` does.
+    Stuck,
+    /// The identity's retirement settled: `Ok(())` is the barrier.
+    Settled,
+    Refused(MobError),
+}
+
 /// A retirement that durably started and then stopped at a stage. The mob
 /// actor keeps it until a typed re-drive or a Shutdown accounts for it.
 pub(in crate::runtime) struct StuckRetirement {
@@ -2525,6 +2537,15 @@ impl MobActor {
             "retire-projection-cleanup",
             RetirementFenceScope::SelfOnly,
             async move {
+                #[cfg(test)]
+                if let Ok(mut target) = FAIL_RETIREMENT_PROJECTION_CLEANUP_FOR_IDENTITY.lock()
+                    && target.as_ref() == Some(&identity)
+                {
+                    target.take();
+                    return RetirementObservation::ProjectionCleaned(Err(MobError::Internal(
+                        format!("fault-injected projection cleanup failure for {identity}"),
+                    )));
+                }
                 if let Err(error) = metadata
                     .delete_external_binding_overlay(&mob, &identity, generation)
                     .await
@@ -3461,6 +3482,176 @@ impl MobActor {
             .routes
             .extend(self.take_retirement_routes(&continuation.entry));
         self.retirement_observe_route(continuation);
+    }
+
+    /// One step of `MobHandle::retire_at_scope`. MobMachine classifies the
+    /// root scope with `RetireAtScope` in this command, before the step
+    /// retires anything, and the step's kind says which verdict admits it.
+    /// A declined step answers `Ok(())` without retiring anything; the
+    /// caller reads the verdict.
+    pub(super) async fn retire_scoped_step(
+        &mut self,
+        agent_identity: AgentIdentity,
+        step: super::super::state::ScopedRetireStep,
+        deadline: Instant,
+        admission: tokio::sync::watch::Sender<bool>,
+        reply: oneshot::Sender<Result<(), MobError>>,
+    ) {
+        let super::super::state::ScopedRetireStep {
+            root,
+            kind,
+            verdict_tx,
+        } = step;
+        let mut verdict = match self.classify_retire_scope(&root) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        verdict.admitted = kind.admits(verdict.verdict);
+        let admitted = verdict.admitted;
+        let current = verdict.verdict == mob_dsl::RetireAtScopeVerdictKind::Current;
+        let _ = verdict_tx.send(verdict);
+        if !admitted {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        let expected = match kind {
+            super::super::state::ScopedRetireStepKind::DescendantBeforeRoot(expected)
+            | super::super::state::ScopedRetireStepKind::DescendantAfterRoot(expected) => expected,
+            super::super::state::ScopedRetireStepKind::Root => {
+                match self.scoped_root_incarnation(&root, current).await {
+                    ScopedRootIncarnation::Retire(expected) => expected,
+                    ScopedRootIncarnation::Settled => {
+                        let _ = reply.send(Ok(()));
+                        return;
+                    }
+                    ScopedRootIncarnation::Stuck => {
+                        // `start_retirement` answers the stuck retirement
+                        // exactly as it answers an unscoped retire.
+                        self.start_retirement(
+                            agent_identity,
+                            deadline,
+                            Some(admission),
+                            RetirementReply::Retire(reply),
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
+                    ScopedRootIncarnation::Refused(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        };
+        match self.validate_retire_member_incarnation(&expected).await {
+            Ok(()) => {
+                self.start_retirement(
+                    agent_identity,
+                    deadline,
+                    Some(admission),
+                    RetirementReply::Retire(reply),
+                    false,
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+
+    /// MobMachine's `RetireAtScope` verdict on `scope`. The classifier
+    /// changes no state.
+    fn classify_retire_scope(
+        &mut self,
+        scope: &crate::runtime::MemberDeliveryScope,
+    ) -> Result<super::super::state::ScopedRetireVerdict, MobError> {
+        let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(scope.runtime_id());
+        let transition = self.apply_dsl_input_collect_transition(
+            mob_dsl::MobMachineInput::RetireAtScope {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(scope.agent_identity()),
+                agent_runtime_id: dsl_runtime_id.clone(),
+                fence_token: mob_dsl::FenceToken::from_domain(scope.fence_token()),
+                session_id: mob_dsl::SessionId::from_domain(scope.session_id()),
+            },
+            "retire_at_scope",
+        )?;
+        let mob_state = self.state();
+        transition
+            .into_effects()
+            .into_iter()
+            .find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::RetireAtScopeResolved {
+                    agent_runtime_id,
+                    verdict,
+                    expected_fence_token,
+                    current_session_id,
+                    ..
+                } if agent_runtime_id == dsl_runtime_id => {
+                    Some(super::super::state::ScopedRetireVerdict {
+                        verdict,
+                        expected_fence_token: expected_fence_token
+                            .map(|token| FenceToken::new(token.0)),
+                        current_session_id: current_session_id
+                            .and_then(|session| SessionId::parse(&session.0).ok()),
+                        mob_state,
+                        admitted: false,
+                    })
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MobError::Internal("MobMachine classified RetireAtScope without a verdict".into())
+            })
+    }
+
+    /// What an admitted scoped root step retires. This command parks while
+    /// the actor owns a retirement of the identity, so none is owned here.
+    async fn scoped_root_incarnation(
+        &self,
+        root: &crate::runtime::MemberDeliveryScope,
+        current: bool,
+    ) -> ScopedRootIncarnation {
+        let identity = root.agent_identity();
+        let stuck = self.stuck_retirements.contains_key(identity);
+        let entry = self.roster.read().await.get(identity).cloned();
+        let Some(entry) = entry else {
+            return if current {
+                // A current incarnation with no roster anchor: validation
+                // refuses it as an unscoped retire would.
+                ScopedRootIncarnation::Refused(MobError::StaleMemberOperatorAuthority {
+                    member_id: identity.clone(),
+                    reason: "scoped retire found no roster anchor for the current incarnation"
+                        .to_string(),
+                })
+            } else if stuck {
+                ScopedRootIncarnation::Stuck
+            } else {
+                // No incarnation is current, none is listed and none is
+                // stuck: the retirement settled, so this is the barrier.
+                ScopedRootIncarnation::Settled
+            };
+        };
+        if !current && stuck {
+            return ScopedRootIncarnation::Stuck;
+        }
+        if entry.agent_runtime_id != *root.runtime_id() || entry.fence_token != root.fence_token() {
+            return ScopedRootIncarnation::Refused(MobError::StaleMemberOperatorAuthority {
+                member_id: identity.clone(),
+                reason: "scoped retire found a roster anchor for another incarnation".to_string(),
+            });
+        }
+        ScopedRootIncarnation::Retire(super::super::state::RetireMemberIncarnation {
+            agent_identity: entry.agent_identity.clone(),
+            agent_runtime_id: entry.agent_runtime_id.clone(),
+            generation: entry.generation,
+            fence_token: entry.fence_token,
+            member_ref: entry.member_ref.clone(),
+        })
     }
 
     pub(super) async fn start_retirement(
