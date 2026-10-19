@@ -2348,48 +2348,70 @@ async fn pump_observations_to_data_channel(
             break;
         }
 
-        // A session-writing row is forwarded at once and applied by the
-        // projection task in arrival order; if the session refuses it, the
-        // channel closes with an error frame naming the row and the later
-        // rows it did not apply. Every other observation writes no row and is
-        // applied here first, so a terminal observation is still visible
-        // only after its generated close, and a status may be recorded before
-        // rows queued ahead of it (a channel fact, not a transcript row).
-        let projected = !close_observation && observation_writes_session(&observation);
-        let outcome = if projected {
-            None
-        } else {
-            match host.apply_observation(&channel_id, &observation).await {
-                Ok(outcome) => Some(outcome),
-                Err(err) => {
-                    tracing::warn!(channel = %channel_id, error = %err, "apply_observation failed");
-                    break;
-                }
+        // A session-writing row is queued for the projection task, which
+        // applies it in arrival order, and forwarded at once; if the session
+        // refuses it, the channel closes with an error frame naming the row
+        // and the later rows it did not apply. It is queued before it is
+        // forwarded: queueing never waits, and a row observed just before the
+        // peer goes away must still commit, as when this loop applied it
+        // before sending. An interruption or truncation also stops the
+        // assistant's queued voice at once. Every other observation writes no
+        // row and is applied here first, so a terminal observation is still
+        // visible only after its generated close, and a status may be
+        // recorded before rows queued ahead of it (a channel fact, not a
+        // transcript row).
+        if !close_observation && observation_writes_session(&observation) {
+            let interrupts_output = observation_interrupts_output(&observation);
+            let public_json = publish_observation.then(|| observation_json(&observation));
+            let queued = projection.enqueue(ProjectionRow::Observation(Box::new(observation)));
+            let forwarded = match public_json {
+                None => Ok(()),
+                Some(Ok(json)) => send_observation_json(&data_channel, json).await,
+                Some(Err(err)) => Err(err),
+            };
+            if let Err(err) = forwarded {
+                tracing::warn!(channel = %channel_id, error = %err, "failed to send WebRTC data-channel observation");
+                break;
+            }
+            if interrupts_output {
+                let generation = outgoing_audio_control.discard_queued();
+                tracing::debug!(
+                    channel = %channel_id,
+                    generation,
+                    "discarding queued WebRTC output audio after live interruption"
+                );
+            }
+            if let Err(error) = queued {
+                close_feedback_recorded = refuse_projection_backlog(
+                    host.as_ref(),
+                    close_feedback.as_ref(),
+                    &data_channel,
+                    &channel_id,
+                    &error,
+                )
+                .await;
+                break;
+            }
+            continue;
+        }
+        let outcome = match host.apply_observation(&channel_id, &observation).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(channel = %channel_id, error = %err, "apply_observation failed");
+                break;
             }
         };
 
-        // An image's internal byte-bearing transcript event is filtered; its
-        // `user_content_committed` receipt is published from the projection
-        // task's report, only after canonical persistence. WebRTC clients
-        // must wait for that receipt before sending RTP audio that relies on
-        // the image.
+        // An image's internal byte-bearing transcript event is a queued row
+        // and is never published; its `user_content_committed` receipt is
+        // published from the projection task's report, only after canonical
+        // persistence. WebRTC clients must wait for that receipt before
+        // sending RTP audio that relies on the image.
         if publish_observation
             && let Err(err) = forward_observation_json(&data_channel, &observation).await
         {
             tracing::warn!(channel = %channel_id, error = %err, "failed to send WebRTC data-channel observation");
             break;
-        }
-
-        // An interruption or truncation stops the assistant's queued voice at
-        // once; its row reaches the session in order behind the rows before
-        // it.
-        if projected && observation_interrupts_output(&observation) {
-            let generation = outgoing_audio_control.discard_queued();
-            tracing::debug!(
-                channel = %channel_id,
-                generation,
-                "discarding queued WebRTC output audio after live interruption"
-            );
         }
 
         if let LiveAdapterObservation::AssistantAudioChunk {
@@ -2453,22 +2475,6 @@ async fn pump_observations_to_data_channel(
             }
         }
 
-        let Some(outcome) = outcome else {
-            if let Err(error) =
-                projection.enqueue(ProjectionRow::Observation(Box::new(observation)))
-            {
-                close_feedback_recorded = refuse_projection_backlog(
-                    host.as_ref(),
-                    close_feedback.as_ref(),
-                    &data_channel,
-                    &channel_id,
-                    &error,
-                )
-                .await;
-                break;
-            }
-            continue;
-        };
         match outcome {
             ObservationOutcome::UserContentCommitted { observation } => {
                 if let Err(err) = forward_observation_json(&data_channel, &observation).await {
@@ -3004,8 +3010,19 @@ async fn forward_observation_json(
     data_channel: &RTCDataChannel,
     observation: &LiveAdapterObservation,
 ) -> Result<(), LiveWebrtcError> {
+    send_observation_json(data_channel, observation_json(observation)?).await
+}
+
+/// One public observation as its wire JSON.
+fn observation_json(observation: &LiveAdapterObservation) -> Result<String, LiveWebrtcError> {
     let wire = WireLiveAdapterObservation::from(observation.clone());
-    let json = serde_json::to_string(&wire)?;
+    Ok(serde_json::to_string(&wire)?)
+}
+
+async fn send_observation_json(
+    data_channel: &RTCDataChannel,
+    json: String,
+) -> Result<(), LiveWebrtcError> {
     data_channel
         .send_text(json)
         .await

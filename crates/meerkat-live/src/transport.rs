@@ -1276,7 +1276,11 @@ async fn handle_live_socket(
         // observations, terminal close).
         tokio::select! {
             report = projection.next_report() => {
+                let refused = matches!(report, Some(ProjectionReport::Failed { .. }));
                 if !publish_projection_report(&mut socket, &channel_id, &mut projection, report).await {
+                    if refused {
+                        exit_close_reason = meerkat_core::LiveChannelCloseReason::Error;
+                    }
                     break;
                 }
             }
@@ -1506,6 +1510,7 @@ async fn handle_live_socket(
                             // land before its close, as when this loop applied
                             // each row itself.
                             if !drain_projection_before_close(&mut socket, &channel_id, &mut projection).await {
+                                exit_close_reason = meerkat_core::LiveChannelCloseReason::Error;
                                 break;
                             }
                             if !state.close_channel_with_generated_feedback(&channel_id, close_reason_for_observation(&obs)).await {
@@ -1528,12 +1533,30 @@ async fn handle_live_socket(
                         // status can be recorded before rows queued ahead of
                         // it (a channel fact, not a transcript row).
                         if !close_observation && observation_writes_session(&obs) {
-                            if publish_observation
-                                && !send_public_observation(&mut socket, &channel_id, &obs).await
-                            {
+                            // Queue before forwarding: queueing never waits,
+                            // and a row observed just before the client goes
+                            // away must still commit, as when this loop
+                            // applied it before sending.
+                            let public_json = publish_observation.then(|| {
+                                serde_json::to_string(&WireLiveAdapterObservation::from(obs.clone()))
+                            });
+                            let queued = projection.enqueue(ProjectionRow::Observation(Box::new(obs)));
+                            let sent = match public_json {
+                                None => true,
+                                Some(Ok(json)) => socket.send(WsMessage::Text(json.into())).await.is_ok(),
+                                Some(Err(error)) => {
+                                    tracing::warn!(
+                                        channel = %channel_id,
+                                        error = %error,
+                                        "public live observation serialization failed; closing"
+                                    );
+                                    false
+                                }
+                            };
+                            if !sent {
                                 break;
                             }
-                            if let Err(error) = projection.enqueue(ProjectionRow::Observation(Box::new(obs))) {
+                            if let Err(error) = queued {
                                 tracing::warn!(
                                     channel = %channel_id,
                                     error = %error,
