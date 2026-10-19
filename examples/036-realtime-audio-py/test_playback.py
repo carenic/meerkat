@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from main import AudioFormat, TranscriptPrinter, build_arg_parser, live_receiver, speaker_player
+from main import AudioFormat, TranscriptPrinter, build_arg_parser, describe_turn_failure, live_receiver, speaker_player
 from playback import Playback
 
 
@@ -132,6 +132,22 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         await self.exercise(
             {"observation": "turn_interrupted", "response_id": "old"},
             {"response_id": "old", "item_id": "old-item", "content_index": 0},
+        )
+
+    async def test_failed_response_discards_its_queued_audio(self):
+        await self.exercise(
+            {"observation": "turn_failed", "response_id": "old", "failure": {"status": "failed"}},
+            {"response_id": "old", "item_id": "old-item", "content_index": 0},
+        )
+
+    def test_failure_line_names_status_and_diagnostics(self):
+        self.assertEqual(
+            describe_turn_failure({"failure": {"status": "incomplete", "reason": "turn_detected"}}),
+            "response failed (incomplete): turn_detected; nothing of it is kept",
+        )
+        self.assertEqual(
+            describe_turn_failure({"failure": {"status": {"unknown": {"debug": "Cancelled"}}}}),
+            "response failed (unknown); nothing of it is kept",
         )
 
     async def test_truncation_without_interrupt_retains_item_identity(self):
