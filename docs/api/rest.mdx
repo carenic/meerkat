@@ -886,7 +886,7 @@ Event types:
 | `session_loaded` | Emitted on connect with session metadata |
 | `run_started` | Agent execution began |
 | `run_completed` | Agent run finished |
-| `run_failed` | Agent run failed |
+| `run_failed` | Agent run failed; `error_report` carries `class`, `message` and a typed `reason` (since 0.9.4 a `content_filtered` failure carries `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` instead of `null`; see the [RPC event reference](/api/rpc#notifications)) |
 | `turn_started` | New LLM call within the turn; `assistant_message_id` names the assistant message it will commit |
 | `text_delta` | Streaming text chunk from LLM |
 | `text_complete` | Full text for this turn |
@@ -897,7 +897,7 @@ Event types:
 | `tool_execution_completed` | Tool returned a result |
 | `tool_execution_timed_out` | Tool exceeded timeout |
 | `compaction_started` | Context compaction began |
-| `compaction_completed` | Compaction finished |
+| `compaction_completed` | Compaction finished; since 0.9.4 it carries `summary_source` and optional `estimated_history_tokens_after` (see the [RPC event reference](/api/rpc#notifications)) |
 | `compaction_failed` | Compaction failed |
 | `budget_warning` | Approaching resource limits |
 | `retrying` | Retrying after transient error; the retry reuses `assistant_message_id` |

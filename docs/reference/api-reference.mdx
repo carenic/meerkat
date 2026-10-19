@@ -442,6 +442,16 @@ Every `ErrorCode` maps to a stable string, JSON-RPC code, HTTP status, and CLI e
 | Invalid params | `INVALID_PARAMS` | -32602 | 400 | 2 |
 | Internal error | `INTERNAL_ERROR` | -32603 | 500 | 1 |
 
+`INPUT_REFUSED` and `INPUT_NOT_READY` carry the native owner's typed detail
+(`WireInputAdmissionErrorDetail`): `{"type": "refused", "kind": "denied" | "malformed_facts"}`
+or `{"type": "not_ready", "reason": {"kind": ...}}`, where `reason` is a
+`WireControllerReadinessFailure`. Since 0.9.4 its kinds include
+`original_admission_pending`: an original the input or operation relies on is
+still its source owner's submission candidate, whose admission the owner has
+not settled yet. Treat it as unavailable and retry later. A Rust decoder of
+`WireControllerReadinessFailure` built before 0.9.4 rejects the new kind; the
+Python, TypeScript and Web SDKs keep error details as untyped data.
+
 For session-service transport behavior specifically, see the [Capability matrix](/reference/capability-matrix#error-codes).
 
 ## Provider clients
@@ -454,7 +464,7 @@ For session-service transport behavior specifically, see the [Capability matrix]
 
 All implement `AgentLlmClient` and normalize streaming responses to `LlmEvent` (text deltas, tool call deltas, usage updates, done).
 
-Each client maps its provider's stop reason to a typed `StopReason`. A reason the client does not know fails the response with the retryable `IncompleteResponse` instead of ending the turn, and a model fallback policy with the `empty_output` trigger may switch models on that failure before the run fails. An Anthropic stream that carries no stop reason at all, and a Chat Completions stream without a `finish_reason`, still end as `EndTurn`. The agent loop commits nothing of a turn that stops with `Refusal`, `ContentFilter` or `ContextWindowExceeded`, runs none of its tool calls and does not run `PostLlmResponse` hooks for it: the first two fail the run with `AgentError::ContentFiltered`, the last as context exceeded (`LlmFailureReason::ContextExceeded`; its `requested` is the call's reported tokens and can be at or below `max`, so do not compute an overflow from it). A `PauseTurn` turn (a provider server-tool loop reached its iteration limit) commits like an end of turn, and its server-tool blocks go back to the provider as history with the next request.
+Each client maps its provider's stop reason to a typed `StopReason`. A reason the client does not know fails the response with the retryable `IncompleteResponse` instead of ending the turn, and a model fallback policy with the `empty_output` trigger may switch models on that failure before the run fails. An Anthropic stream that carries no stop reason at all, and a Chat Completions stream without a `finish_reason`, still end as `EndTurn`. The agent loop commits nothing of a turn that stops with `Refusal`, `ContentFilter` or `ContextWindowExceeded`, runs none of its tool calls and does not run `PostLlmResponse` hooks for it: the first two fail the run with `AgentError::ContentFiltered`, the last as context exceeded (`LlmFailureReason::ContextExceeded`; its `requested` is the call's reported tokens and can be at or below `max`, so do not compute an overflow from it). Since 0.9.4 `AgentError::ContentFiltered` carries the refusing stop (`stop`: `refusal` or `content_filter`) and, when the provider sent one, its own account of it (`detail`, a `ProviderStopDetail` tagged by provider), and the `run_failed` event carries both as `error_report.reason`. A Gemini prompt blocked before any candidate (`promptFeedback.blockReason`, no `finishReason`) now ends as `ContentFilter` whatever the block reason, `OTHER` and an unknown one included, instead of the retryable `IncompleteResponse`, so the run fails after one provider call. An OpenAI Responses `refusal` output part or a Chat Completions `delta.refusal` ends the response as `Refusal`, even beside text or tool calls; the refusal text travels as the provider detail, never as answer text. A `PauseTurn` turn (a provider server-tool loop reached its iteration limit) commits like an end of turn, and its server-tool blocks go back to the provider as history with the next request.
 
 `LlmError` variants: `RateLimited`, `ServerOverloaded`, `NetworkTimeout`, `ConnectionReset`, `ServerError`, `InvalidRequest`, `RequestTooLarge`, `InvalidInputShape`, `InvalidConfig`, `AuthenticationFailed`, `AuthorizationRouteChanged`, `ContentFiltered`, `PolicyStop`, `ContextLengthExceeded`, `ModelNotFound`, `InvalidApiKey`, `QuotaExhausted`, `Unknown`, `StreamParseError`, `IncompleteResponse`. Use `error.is_retryable()` to check whether the error is retryable, respecting its recovery boundary:
 

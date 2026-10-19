@@ -170,11 +170,25 @@ With `multiprocess`:
   also notices a released claim or cold-delivery lock after a process exits.
   These are wake hints only: who may host or write a session is decided by the
   claims, never by the watch.
+- The sweep is the cross-process wake; file notifications only shorten it.
+  Since 0.9.4 a watch whose notifications cannot be registered (at an inotify
+  watch or instance limit, or with the process at its thread limit) runs on
+  its sweep alone and logs "sqlite change watch notifications are unavailable;
+  the watch runs on its sweep alone", so cross-process wakes take up to one
+  sweep. Registration also no longer delays startup: on macOS, FSEvents
+  registration held the first mob storage open for over 30 seconds in 0.9.3 and
+  earlier. At most 64 registrations run at once in a process; a watch started
+  beyond that runs on its sweep alone. To restore notifications on Linux, raise
+  `fs.inotify.max_user_watches` or `fs.inotify.max_user_instances` and restart
+  the process.
 
 Startup refuses with a typed "multi-process hosting is unavailable" error when
 the realm's stores cannot provide this: an in-memory or external store without
-hosting claims, or a network or userspace filesystem (NFS, SMB, 9P, FUSE and
-similar) where OS locks cannot be trusted. `single_process` does not require
+hosting claims, a network or userspace filesystem (NFS, SMB, 9P, FUSE and
+similar) where OS locks cannot be trusted, or a runtime store whose watch
+cannot start its sweep. Since 0.9.4 it no longer refuses because file
+notifications cannot be registered; 0.9.3 and earlier did, for example at an
+inotify watch limit. `single_process` does not require
 multi-process-capable storage. On stores that provide OS-locked hosting claims,
 session exclusivity still applies in both modes: another runtime cannot
 continue a session while its current host holds the claim. The claim is

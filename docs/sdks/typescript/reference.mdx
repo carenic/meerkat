@@ -538,6 +538,39 @@ Content may be text or content blocks; the continuation variant does not
 fabricate a prompt. `RunFailedEvent` accepts the current `error_report` and
 derives its `errorClass` and `error` display fields from that report.
 
+Since 0.9.4 a run that failed because the provider refused or filtered the
+response (`errorClass` `content_filtered`) carries `errorReport.reason` as a
+`ContentFilteredAgentErrorReason`: `reasonType: "content_filtered"`, `stop`
+(`"refusal"` or `"content_filter"`) and an optional `detail`, the provider's own
+account tagged by `provider` (`anthropic`, `open_ai` or `gemini`). A `detail`
+that is not a provider-tagged object reads as absent, and a `stop` the SDK does
+not know reads as an unknown reason with the wire object in `raw`. SDKs before
+0.9.4 read every such reason as unknown and keep it raw.
+
+```typescript
+interface ContentFilteredAgentErrorReason {
+  readonly reasonType: "content_filtered";
+  readonly stop: "refusal" | "content_filter";
+  readonly detail?: ContentFilteredStopDetail; // { provider: string, ... }
+}
+```
+
+`ToolConfigChangedPayload.settled` replaces `persisted` in 0.9.4 (see
+[Tool config events](#tool-config-events)): the parser derives it from
+`status_info` and uses a stored bit (`settled`, or `persisted` from
+`rkat-rpc` 0.9.3 and earlier) only for a status it does not know. A 0.9.3 SDK
+requires `persisted` and fails on every `tool_config_changed` event from a
+0.9.4 `rkat-rpc`. The binary the SDK downloads always matches it, so this
+happens only with a binary you supply (`MEERKAT_BIN_PATH`, an explicit path,
+or `rkat-rpc` on `PATH`); upgrade the SDK with the binary.
+
+`CompactionCompletedEvent.summarySource` and
+`CompactionCompletedEvent.estimatedHistoryTokensAfter` (see
+[Compaction events](#compaction-events)) are new in 0.9.4. Both are absent on
+completions recorded before 0.9.4; `estimatedHistoryTokensAfter` is also absent
+when the rewritten history could not be measured. A summary source or source
+bound kind the SDK does not know parses to `{ kind: "unknown", rawKind, raw }`.
+
 `RetryingEvent` parses the current wire shape, which carries one typed
 `retry` schedule: `attempt`, `maxAttempts`, `error` and `delayMs` are
 projections of `retry.plan.attempt`, `retry.plan.max_retries`,

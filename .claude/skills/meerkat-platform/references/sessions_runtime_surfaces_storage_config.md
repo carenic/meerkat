@@ -121,7 +121,12 @@ shorten. Since 0.9.4:
   open for over 30 seconds and every other mob storage open waited behind it.
   Registration runs on a thread of its own; at most 64 run at once in a
   process, and a watch started while 64 are pending runs on its sweep alone
-  and logs the same warning.
+  and logs the same warning. Stopping a watch never waits for a registration
+  still in progress: its thread stays with the process until the platform
+  call returns, then discards the result. A retired runtime delivery owner
+  whose watch left one logs (info) "runtime delivery owner retired; its store
+  watch's file notification registration stays with the process until the
+  platform call returns".
 - A registration that cannot start notify's inotify event-loop thread (the
   process at its thread limit) no longer aborts the process; that watch runs
   on its sweep alone.
@@ -198,6 +203,12 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   retained transcript revision, which can take minutes for a session with a
   large retained history ("head-canonical profile activation is required for
   runtime ..." until it completes). Prune such sessions before converting.
+- Since 0.9.4 the SQLite session store lays out a whole-blob session whose
+  transcript graph retired its oldest occurrences (any session compacted more
+  often than `[compaction] history_retained_rewrites`, default 4), so the
+  one-time migration of such a blob row no longer refuses typed; it writes the
+  retired base and rewrite rows for the retained generations only. The
+  in-memory store still refuses such a session.
 
 ## Runtime behaviour you can observe
 
@@ -250,6 +261,10 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - `RKAT_WORKER_THREADS` sets the host's Tokio worker count (default: one per
   available CPU; `TOKIO_WORKER_THREADS` is read when it is unset). Set it
   below a container's pids limit, which counts threads.
+- Since 0.9.4 creating a persistent runtime over one store no longer waits for
+  another store's OAuth flow rehydration: each store has its own slot in the
+  process-wide provider-auth cache, and runtimes over one store still share
+  one authority, rehydrated once.
 
 ## WorkGraph
 
