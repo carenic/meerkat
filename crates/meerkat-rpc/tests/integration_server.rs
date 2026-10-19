@@ -2399,13 +2399,23 @@ mod tcp_callback_ownership {
     /// A mob member's callback tools are the tools registered on the
     /// connection that created its mob: the member sees the tool, loads it
     /// and its call reaches that connection, whether the tool was registered
-    /// before the member was spawned (`register_first`) or after.
+    /// before the member was spawned (`register_first`) or after. Each variant
+    /// names its own mob: the in-process route registry is process-wide, so
+    /// under plain `cargo test` the two variants run side by side.
     #[cfg(feature = "mob")]
     async fn mob_member_case(h: &mut Harness, register_first: bool) {
-        let (prompt, tool) = if register_first {
-            ("mob-register-then-spawn", "early_lookup")
+        let (prompt, tool, mob) = if register_first {
+            (
+                "mob-register-then-spawn",
+                "early_lookup",
+                "callback_mob_early",
+            )
         } else {
-            ("mob-spawn-then-register", "late_lookup")
+            (
+                "mob-spawn-then-register",
+                "late_lookup",
+                "callback_mob_late",
+            )
         };
         h.provider.plan(
             prompt,
@@ -2429,7 +2439,7 @@ mod tcp_callback_ownership {
             .request(
                 5,
                 "mob/create",
-                json!({"definition":{"id":"callback_mob","profiles":{"worker":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}}}),
+                json!({"definition":{"id":mob,"profiles":{"worker":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}}}),
             )
             .await["mob_id"]
             .as_str()
@@ -2567,13 +2577,18 @@ mod tcp_callback_ownership {
     /// re-created, over RPC by B (`over_rpc`) or in-process, and B spawns a
     /// member. That member never reaches A's tool: over RPC it has B's, and
     /// in-process (no creating connection) it has no callback tools at all.
+    /// Each variant names its own mob: the in-process route registry is
+    /// process-wide, so under plain `cargo test` the two variants run side by
+    /// side.
     #[cfg(feature = "mob")]
     async fn mob_recreated_case(h: &mut Harness, over_rpc: bool) {
-        let prompt = if over_rpc {
-            "mob-recreated-over-rpc"
+        let (prompt, session) = if over_rpc {
+            ("mob-recreated-over-rpc", "stale-over-rpc")
         } else {
-            "mob-recreated-in-process"
+            ("mob-recreated-in-process", "stale-in-process")
         };
+        // The id `MobDefinition::implicit(session, ..)` gives.
+        let mob = format!("implicit-{session}");
         if over_rpc {
             h.provider.plan(
                 prompt,
@@ -2596,11 +2611,10 @@ mod tcp_callback_ownership {
         let (_, mut b) = h.connect().await;
         a.register("a_lookup").await;
         b.register("b_lookup").await;
-        let definition = json!({"id":"implicit-stale","profiles":{"delegate":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}});
+        let definition = json!({"id":mob,"profiles":{"delegate":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}});
         a.request(5, "mob/create", json!({ "definition": definition }))
             .await;
-        a.request(6, "mob/destroy", json!({"mob_id":"implicit-stale"}))
-            .await;
+        a.request(6, "mob/destroy", json!({"mob_id":mob})).await;
         if over_rpc {
             b.request(7, "mob/create", json!({ "definition": definition }))
                 .await;
@@ -2609,7 +2623,7 @@ mod tcp_callback_ownership {
                 .mob_state()
                 .expect("the RPC mob state")
                 .mob_create_definition(meerkat_mob::MobDefinition::implicit(
-                    "stale",
+                    session,
                     "claude-sonnet-4-6",
                 ))
                 .await
@@ -2618,10 +2632,10 @@ mod tcp_callback_ownership {
         b.request(
             8,
             "mob/spawn",
-            json!({"mob_id":"implicit-stale","profile":"delegate","agent_identity":"w1","runtime_mode":"turn_driven"}),
+            json!({"mob_id":mob,"profile":"delegate","agent_identity":"w1","runtime_mode":"turn_driven"}),
         )
         .await;
-        b.send(json!({"jsonrpc":"2.0","id":9,"method":"mob/turn_start","params":{"mob_id":"implicit-stale","agent_identity":"w1","prompt":prompt}}))
+        b.send(json!({"jsonrpc":"2.0","id":9,"method":"mob/turn_start","params":{"mob_id":mob,"agent_identity":"w1","prompt":prompt}}))
             .await;
         let initial = h.seen(prompt).await;
         if !over_rpc {

@@ -446,6 +446,46 @@ fn test_credential_store(
     }
 }
 
+/// This crate's unit tests hold an [`AppState`] one test at a time.
+///
+/// Plain `cargo test` runs the unit tests as threads of one process, as many
+/// at once as the host has cores, and nearly every one builds an `AppState`
+/// over SQLite stores. The bundled SQLite counts each allocation under one
+/// process-wide mutex (its memory statistics, on by default), and states
+/// working at once turn that mutex into a convoy. On a 192-core host the
+/// suite passed in 43 s one test at a time; with every test at once, and
+/// still with eight states at once, it took 580 to 1290 s, creates missed
+/// their 10 s bound and explicit stops outlived the runtime's 2 s caller
+/// grace (`RuntimeStopInProgress`). nextest runs each test in its own process
+/// and never shares the mutex. A test thread takes the permit with the first
+/// state it builds and keeps it until the thread exits, so a test that builds
+/// a second state (a restart) never waits on itself.
+#[cfg(test)]
+mod test_state_admission {
+    use std::cell::RefCell;
+
+    use tokio::sync::{Semaphore, SemaphorePermit};
+
+    const CONCURRENT_TEST_STATES: usize = 1;
+
+    static PERMITS: Semaphore = Semaphore::const_new(CONCURRENT_TEST_STATES);
+
+    thread_local! {
+        static HELD: RefCell<Option<SemaphorePermit<'static>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) async fn admit() {
+        if HELD.with(|held| held.borrow().is_some()) {
+            return;
+        }
+        let permit = match PERMITS.acquire().await {
+            Ok(permit) => permit,
+            Err(closed) => unreachable!("the test state permits are never closed: {closed}"),
+        };
+        HELD.with(|held| *held.borrow_mut() = Some(permit));
+    }
+}
+
 impl AppState {
     pub async fn load() -> Result<Self, Box<dyn std::error::Error>> {
         Self::load_with_bootstrap_and_options(RuntimeBootstrap::default(), false).await
@@ -586,6 +626,8 @@ impl AppState {
         confinement: Option<meerkat_core::LaunchConfinement>,
         customize: impl FnOnce(AgentFactory) -> AgentFactory + Send,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        test_state_admission::admit().await;
         let (event_tx, _) = broadcast::channel(256);
         // Realm-id-first dual-root resolution through the storage layout
         // (the single path authority; the layout's realm-root candidates arm
