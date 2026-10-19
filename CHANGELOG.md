@@ -233,8 +233,8 @@ them.
   every test target's test names with the workspace's. Publication does not
   wait for it yet: the release gate on a passing run at the release commit
   returns once a nightly run has passed and its duration is measured.
-  `scripts/release-require-standalone-green` checks that a run passed at a
-  given commit.
+  `scripts/release-require-standalone-green` checks that a run on main passed
+  at a given commit.
 - `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,
   which nothing called any more (a browser opens through
   `HostLaunchExemption::browser_opener`). Builds drop it and its platform
