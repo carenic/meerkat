@@ -193,7 +193,7 @@ async fn prompt_blocked_before_any_candidate_fails_content_filtered_once() {
             }),
             "{block_reason}: the raw block reason reaches the caller"
         );
-        // N1: the blocked prompt was billed, and its tokens stay counted.
+        // The blocked prompt was billed, and its tokens stay counted.
         assert_eq!(
             run.usage.input_tokens, 12,
             "{block_reason}: {:?}",

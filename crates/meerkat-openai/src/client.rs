@@ -7789,7 +7789,7 @@ mod tests {
         }
     }
 
-    /// F1 (rev-239): an OpenAI refusal is never answer text. Streamed refusal
+    /// An OpenAI refusal is never answer text. Streamed refusal
     /// deltas yield no `TextDelta`, and the response ends as a refusal with
     /// its text as the stop's provider detail.
     #[tokio::test]

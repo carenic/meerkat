@@ -312,7 +312,7 @@ async fn refusal_mid_tool_call_fails_content_filtered_and_runs_no_tool() {
             runs.run_failed_class(),
             Some(AgentErrorClass::ContentFiltered)
         );
-        // R1: every content-filtered failure reports its typed stop, with
+        // Every content-filtered failure reports its typed stop, with
         // no provider detail when the stream carried none.
         assert_eq!(
             runs.run_failed_reason(),

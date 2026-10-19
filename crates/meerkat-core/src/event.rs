@@ -4796,7 +4796,7 @@ mod tests {
         );
     }
 
-    /// R1 (rev-239): every content-filtered failure reports its typed stop,
+    /// #1888: every content-filtered failure reports its typed stop,
     /// with the provider's detail when it sent one. The detail is only
     /// carried: class, Display, the turn failure source and the session
     /// error code are the same with and without it.
@@ -4863,7 +4863,7 @@ mod tests {
         );
     }
 
-    /// L1 (rev-239): provider evidence never makes a record undecodable. An
+    /// #1888: provider evidence never makes a record undecodable. An
     /// unknown provider tag or a malformed detail decodes as absent, and the
     /// typed stop survives.
     #[test]

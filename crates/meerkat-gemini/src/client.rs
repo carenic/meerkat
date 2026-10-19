@@ -4661,7 +4661,7 @@ mod tests {
         }
     }
 
-    /// N2 (#1888): a Code Assist-wrapped prompt block unwraps to the same
+    /// #1888: a Code Assist-wrapped prompt block unwraps to the same
     /// response and ends as a content filter with its prompt detail.
     #[tokio::test]
     async fn code_assist_wrapped_prompt_block_ends_as_content_filter() {

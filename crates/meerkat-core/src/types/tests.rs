@@ -3121,7 +3121,7 @@ mod tool_artifact_refusal {
     }
 }
 
-/// L2 (rev-239): provider stop text is capped at a character boundary and
+/// #1888: provider stop text is capped at a character boundary and
 /// ends with the truncation marker; shorter text is kept as it is.
 #[test]
 fn provider_stop_detail_text_is_capped_with_a_marker() {

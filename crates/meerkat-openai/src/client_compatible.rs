@@ -2792,7 +2792,7 @@ mod tests {
         }
     }
 
-    /// F1 (rev-239): a refusal the model streams in `delta.refusal` is never
+    /// A refusal the model streams in `delta.refusal` is never
     /// answer text. It wins over the finish reason and ends the response as a
     /// refusal, its text the stop's provider detail.
     #[tokio::test]

@@ -99,7 +99,7 @@ impl AgentToolDispatcher for NoTools {
     }
 }
 
-/// F1 (rev-239): an OpenAI refusal fails the run as content filtered with
+/// An OpenAI refusal fails the run as content filtered with
 /// the typed stop `refusal` after one request. Nothing of the refused turn
 /// is committed, and the refusal text reaches the caller only as the typed
 /// reason's provider detail.
@@ -182,7 +182,7 @@ async fn openai_refusal_fails_the_run_content_filtered_with_its_text() {
     );
 }
 
-/// #1887 R1 (rev-239): a native search OpenAI refused comes back from the
+/// #1887: a native search OpenAI refused comes back from the
 /// `web_search` executor failed, with no answer, through the real client.
 #[tokio::test]
 async fn refused_native_search_fails_without_its_answer() {

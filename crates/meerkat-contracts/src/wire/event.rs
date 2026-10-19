@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(decoded_identity, identity);
     }
 
-    /// #1888 (rev-239 R1): a content-filtered run failure carries its typed
+    /// #1888: a content-filtered run failure carries its typed
     /// stop and, when the provider sent one, the provider-tagged detail; a
     /// failure without detail still names its stop. Both round-trip.
     #[test]

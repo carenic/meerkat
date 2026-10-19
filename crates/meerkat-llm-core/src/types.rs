@@ -1275,7 +1275,7 @@ mod tests {
         );
     }
 
-    /// #1887 (L2): one classification for every provider's web-search
+    /// #1887: one classification for every provider's web-search
     /// executor, carrying each stop reason's wire name.
     #[test]
     fn web_search_stop_classification_carries_wire_names() {
