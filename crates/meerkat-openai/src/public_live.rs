@@ -1929,6 +1929,15 @@ impl PublicLiveBrokerSession {
     /// Hand one reserved finished notice's fragments to the sender, bound to
     /// its delegation, under the state lock the caller holds. A failed send
     /// fences later appends like any failed send.
+    ///
+    /// The send is awaited with the state lock held, as the frame loop's
+    /// releases of held commentary are, so the frame loop applies no frame
+    /// until the fragments are written. That wait is bounded: the transport
+    /// writes independently of its event queue (a full queue stops it
+    /// reading, never writing), so a frame loop waiting on this lock cannot
+    /// stall the write; and a write that does not complete within the
+    /// client's request timeout fails as ambiguous, the transport rejects
+    /// every queued write and disconnects, and this returns the error.
     async fn send_finished_notice_locked(
         &self,
         state: &mut SessionState,
@@ -10806,6 +10815,147 @@ mod tests {
             finished_notice_pause::Point::AfterReserve,
         )
         .await;
+    }
+
+    /// #1820: a finished notice is written while the state lock is held, so
+    /// the frame loop applies no frame meanwhile. With the transport's event
+    /// queue full and nothing reading it, the notice is still written and
+    /// the append returns; the frame loop then resumes, drains every queued
+    /// frame, and releases the held result after it.
+    #[tokio::test]
+    async fn a_finished_notice_is_written_while_the_provider_event_queue_is_full() {
+        // Several times the transport's event queue, so it is full while
+        // nothing reads it.
+        const PADDING_FRAMES: usize = 64;
+        let capture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let flood = Arc::new(tokio::sync::Notify::new());
+        let server_flood = Arc::clone(&flood);
+        let attach = move |State(capture): State<SharedCapture>, upgrade: WebSocketUpgrade| {
+            let flood = Arc::clone(&server_flood);
+            async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    send_json(&mut socket, json!({"type":"session.started","event_id":"s","session":{"id":"live_fixture","model":"gpt-live-1","status":"active","expires_at":1.0}})).await;
+                    send_json(&mut socket, input_delta("book a table")).await;
+                    send_json(&mut socket, delegation_created("dlg_cue", "client")).await;
+                    send_json(&mut socket, output_delta_span("one moment", 1500.0, 2000.0)).await;
+                    send_json(&mut socket, input_delta_at("is it done yet", 2500.0)).await;
+                    flood.notified().await;
+                    for index in 0..PADDING_FRAMES {
+                        send_json(
+                            &mut socket,
+                            json!({"type":"session.test_padding","event_id":format!("p{index}")}),
+                        )
+                        .await;
+                    }
+                    // Ends the user's floor once the frame loop gets to it.
+                    send_json(&mut socket, delegation_created("dlg_next", "client")).await;
+                    loop {
+                        let event = recv_json(&mut socket, &capture).await;
+                        match event["type"].as_str() {
+                            Some("session.commentary.append") => {
+                                send_json(&mut socket, ack(event["event_id"].as_str())).await;
+                            }
+                            Some("session.thinking.append" | "session.instructions.append") => {
+                                let mut receipt = ack(event["event_id"].as_str());
+                                receipt["type"] = json!(if event["type"] == "session.thinking.append" {
+                                    "session.thinking.appended"
+                                } else {
+                                    "session.instructions.appended"
+                                });
+                                send_json(&mut socket, receipt).await;
+                            }
+                            Some("session.close") => {
+                                send_json(&mut socket, session_closed()).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+            }
+        };
+        let app = Router::new()
+            .route("/v1/live/sessions", post(create_session))
+            .route("/v1/live/sessions/{session_id}/attach", get(attach))
+            .with_state(Arc::clone(&capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_, session) = PublicLiveBrokerFactory::__try_from_target_with_base_url(
+            realtime_target("gpt-live-1", OpenAiBackendKind::OpenAiApi),
+            &format!("http://{address}/v1/"),
+        )
+        .unwrap()
+        .open(PublicLiveOpenConfig::new("v=0", "marin").unwrap())
+        .await
+        .unwrap()
+        .into_parts();
+        loop {
+            if let Some(GptLiveBrokerObservation::UserTranscriptFragment { text, .. }) =
+                session.next_observation().await.unwrap()
+                && text.contains("done yet")
+            {
+                break;
+            }
+        }
+        // Nothing reads observations from here until the append returns:
+        // the padding fills the transport's event queue.
+        flood.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let token = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.append_delegation_result(
+                &GptLiveDelegationRef("dlg_cue".to_string()),
+                "Table booked for two.",
+            ),
+        )
+        .await
+        .expect("the notice is written with the event queue full")
+        .expect("the result is appended and held");
+        // The frame loop resumes, drains the padding, and the floor-ending
+        // delegation releases the held result.
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut padding = 0_usize;
+            loop {
+                match session.next_observation().await.unwrap() {
+                    Some(GptLiveBrokerObservation::UnsupportedProviderEvent) => padding += 1,
+                    Some(GptLiveBrokerObservation::DelegationContextAppendAcknowledged {
+                        token: acked,
+                    }) if acked == token => return padding,
+                    Some(_) => {}
+                    None => {
+                        panic!("the observation stream ended before the result's acknowledgement")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the frame loop resumes after the append");
+        assert_eq!(resumed, PADDING_FRAMES, "every queued frame is applied");
+        session.close().await.expect("close requested");
+        while let Ok(Some(_)) = session.next_observation().await {}
+        server.abort();
+
+        let events = capture.lock().expect("capture lock").client_events.clone();
+        let notice_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.instructions.append"
+                    && event["content"].as_str().is_some_and(|content| {
+                        content.starts_with("This replaces the earlier in-progress instruction")
+                    })
+            })
+            .unwrap_or_else(|| panic!("the finished notice was sent: {events:?}"));
+        let result_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.commentary.append"
+                    && event["content"] == "Table booked for two."
+            })
+            .unwrap_or_else(|| panic!("the result was released: {events:?}"));
+        assert!(notice_at < result_at, "{events:?}");
     }
 
     /// #1820 A2 on the wire: the runtime's finished notice is sent under the
