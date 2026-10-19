@@ -4234,6 +4234,7 @@ mod tests {
                 lifecycle_capabilities: None,
                 non_portable_disabled: None,
                 preview_unavailable,
+                registration_refusal: None,
             }
         };
         let note = |marker: Option<Marker>, run_state: Option<WireMemberRunState>| {
