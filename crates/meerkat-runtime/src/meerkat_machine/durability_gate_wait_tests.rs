@@ -1,5 +1,5 @@
-//! A wait for a session's mutation gate ends typed once the session degrades,
-//! instead of waiting behind a holder that keeps the gate: the
+//! A wait for a session's mutation gate ends typed once the session degrades
+//! (#1222), instead of waiting behind a holder that keeps the gate: the
 //! post-stop fence an exited runtime loop retains after a failed boundary
 //! commit. The tests hold the gate themselves as that holder.
 //!
@@ -376,6 +376,149 @@ async fn a_waiter_that_left_hands_the_settlement_to_a_task_that_cancels_the_exac
     assert!(
         !runtime_loop_attached(&machine, &session_id).await,
         "the settlement detached the runtime loop before it cancelled"
+    );
+    release_apply.notify_one();
+}
+
+/// Callers that keep arriving behind one holder of a degraded session's gate
+/// each end typed at once, and together they leave one settlement task, not
+/// one each. Once the holder releases, the run is cancelled once and the gate
+/// has no pending settlement, so a waiter behind a later holder spawns one
+/// again.
+#[tokio::test]
+async fn waiters_behind_one_holder_leave_one_settlement_task() {
+    const WAITERS: usize = 8;
+    let machine = persistent_machine();
+    let session_id = SessionId::new();
+    let interrupt = Arc::new(RecordingInterrupt::default());
+    let apply_started = Arc::new(Notify::new());
+    let release_apply = Arc::new(Notify::new());
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(HeldRunExecutor {
+                interrupt: Arc::clone(&interrupt),
+                apply_started: Arc::clone(&apply_started),
+                release_apply: Arc::clone(&release_apply),
+            }),
+        )
+        .await
+        .expect("register a session whose run is held");
+    let (outcome, _completion) = crate::SessionServiceRuntimeExt::accept_input_with_completion(
+        machine.as_ref(),
+        &session_id,
+        crate::Input::Prompt(crate::PromptInput::new("held run", None)),
+    )
+    .await
+    .expect("admit the held run");
+    assert!(outcome.is_accepted());
+    tokio::time::timeout(TYPED_END_BOUND, apply_started.notified())
+        .await
+        .expect("the run starts");
+    let run_id = machine
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("run snapshot")
+        .control
+        .current_run_id
+        .expect("current run id");
+    let spawns = || {
+        machine
+            .test_degraded_gate_settlement_spawns
+            .load(Ordering::SeqCst)
+    };
+    let pending_settlements = || {
+        machine
+            .pending_degraded_gate_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    };
+    let wait_once = || {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            machine
+                .lock_current_durability_ready_session_mutation_gate(&session_id)
+                .await
+                .map(|_gate| ())
+        })
+    };
+
+    let fence = hold_mutation_gate(&machine, &session_id).await;
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture degrades the session behind the holder"
+    );
+    let waiters: Vec<_> = (0..WAITERS).map(|_| wait_once()).collect();
+    for waiter in waiters {
+        let result = tokio::time::timeout(TYPED_END_BOUND, waiter)
+            .await
+            .expect("the degradation ends each wait at once")
+            .expect("the waiter task completes");
+        assert!(ended_typed(&result), "each wait ends typed: {result:?}");
+    }
+    assert_eq!(
+        machine
+            .test_degraded_gate_settlement_hand_offs
+            .load(Ordering::SeqCst),
+        WAITERS,
+        "every waiter handed the settlement off as it left"
+    );
+    assert_eq!(spawns(), 1, "one settlement task waits behind the holder");
+    assert_eq!(
+        pending_settlements(),
+        1,
+        "the gate lists its pending settlement"
+    );
+
+    drop(fence);
+    tokio::time::timeout(TYPED_END_BOUND, interrupt.entered.notified())
+        .await
+        .expect("the settlement hard-cancels once the gate frees");
+    tokio::time::timeout(TYPED_END_BOUND, async {
+        while pending_settlements() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the settlement task clears its gate when it ends");
+    assert_eq!(
+        *interrupt
+            .requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_id.clone()],
+        "the one settlement cancels the run once"
+    );
+
+    let fence = hold_mutation_gate(&machine, &session_id).await;
+    let result = tokio::time::timeout(TYPED_END_BOUND, wait_once())
+        .await
+        .expect("a waiter behind a later holder ends at once")
+        .expect("the waiter task completes");
+    assert!(
+        ended_typed(&result),
+        "the later wait ends typed: {result:?}"
+    );
+    assert_eq!(spawns(), 2, "a later holder gets its own settlement task");
+    drop(fence);
+    tokio::time::timeout(TYPED_END_BOUND, async {
+        while pending_settlements() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the later settlement task clears its gate when it ends");
+    assert_eq!(
+        *interrupt
+            .requested_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![run_id],
+        "the later settlement cancels nothing more"
     );
     release_apply.notify_one();
 }

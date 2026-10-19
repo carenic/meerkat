@@ -97,6 +97,13 @@ impl SessionMutationGate {
         Arc::ptr_eq(&self.mutex, &other.mutex)
     }
 
+    /// The gate's address, equal for every copy. Another gate can have it only
+    /// once every copy of this one is gone, so a key held with a copy is this
+    /// gate's alone.
+    pub(crate) fn address(&self) -> usize {
+        Arc::as_ptr(&self.mutex).addr()
+    }
+
     /// Whether [`Self::lock_live`] can end before the gate is free: only a
     /// session with durable state degrades.
     pub(crate) fn ends_on_degradation(&self) -> bool {

@@ -2789,6 +2789,41 @@ async fn settle_durability_gate(
     })
 }
 
+/// A degraded settlement task's entry for its gate in
+/// `MeerkatMachineShared::pending_degraded_gate_settlements`. The task owns it
+/// and removes it when it ends on any outcome, or when it is dropped before it
+/// runs.
+struct PendingDegradedGateSettlement {
+    shared: Arc<MeerkatMachineShared>,
+    gate_address: usize,
+}
+
+impl PendingDegradedGateSettlement {
+    /// List `gate`, or `None` when a settlement task already waits for it.
+    fn claim(shared: &Arc<MeerkatMachineShared>, gate: &SessionMutationGate) -> Option<Self> {
+        let gate_address = gate.address();
+        shared
+            .pending_degraded_gate_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gate_address)
+            .then(|| Self {
+                shared: Arc::clone(shared),
+                gate_address,
+            })
+    }
+}
+
+impl Drop for PendingDegradedGateSettlement {
+    fn drop(&mut self) {
+        self.shared
+            .pending_degraded_gate_settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.gate_address);
+    }
+}
+
 impl MachineCleanupTaskSpawner {
     #[cfg(not(target_arch = "wasm32"))]
     fn acquire() -> Result<Self, RuntimeDriverError> {
@@ -6772,8 +6807,10 @@ impl MeerkatMachine {
     /// Run the degraded settlement for a waiter that left on the degradation
     /// signal: a process-owned task takes the gate once its holder releases it
     /// and settles exactly as a ready-gated caller would, with the same
-    /// detach and hard-cancel dedup. Without a cleanup runtime the next
-    /// ready-gated caller settles inline instead.
+    /// detach and hard-cancel dedup. One task per gate: while one waits, the
+    /// waiters that leave after it spawn nothing, since its settlement is
+    /// theirs too. Without a cleanup runtime the next ready-gated caller
+    /// settles inline instead.
     fn hand_off_degraded_gate_settlement(&self, session_id: &SessionId, gate: SessionMutationGate) {
         #[cfg(test)]
         self.test_degraded_gate_settlement_hand_offs
@@ -6789,9 +6826,16 @@ impl MeerkatMachine {
                 return;
             }
         };
+        let Some(pending) = PendingDegradedGateSettlement::claim(&self.shared, &gate) else {
+            return;
+        };
+        #[cfg(test)]
+        self.test_degraded_gate_settlement_spawns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let shared = Arc::clone(&self.shared);
         let session_id = session_id.clone();
         drop(spawner.spawn(async move {
+            let _pending = pending;
             let gate_guard = gate.lock_settled(SettledGateWait::DegradedSettlement).await;
             let _ = settle_durability_gate(&shared, &session_id, &gate, gate_guard).await;
         }));
@@ -10419,6 +10463,16 @@ pub struct MeerkatMachineShared {
     /// signal and handed the degraded settlement to a process-owned task.
     #[cfg(test)]
     test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize,
+    /// The mutation gates, by address, with a degraded settlement task
+    /// waiting to run. A ready-gated waiter that leaves on the degradation
+    /// signal spawns that task only for a gate that has none, so callers that
+    /// keep arriving behind one holder add no tasks. The task keeps its gate
+    /// alive while the gate is listed, so a listed address is never another
+    /// gate's.
+    pending_degraded_gate_settlements: StdMutex<HashSet<usize>>,
+    /// Test probe: how many degraded settlement tasks were spawned.
+    #[cfg(test)]
+    test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize,
     /// One-shot deterministic gate after a logical control command resolves
     /// its SessionId but before it acquires the current entry's mutation gate.
     /// Tests replace A with B in this window to prove the command captures no
@@ -12212,6 +12266,9 @@ impl MeerkatMachine {
                 test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
+                pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
+                #[cfg(test)]
+                test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
@@ -12452,6 +12509,9 @@ impl MeerkatMachine {
                 test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
+                pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
+                #[cfg(test)]
+                test_degraded_gate_settlement_spawns: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 test_control_command_after_logical_lookup: StdMutex::new(None),
                 #[cfg(test)]
