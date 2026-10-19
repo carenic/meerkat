@@ -2064,7 +2064,20 @@ mod tcp_callback_ownership {
         a.start(&a_session, "warm-a").await;
         a.response(4).await;
         h.seen("warm-a").await;
-        a.start(&a_session, "orphan-a").await;
+        // The session's callbacks stay on A, the connection that created it,
+        // whichever connection starts the turn. T3b starts the orphaned turn
+        // on A itself; this case starts it from a third connection that stays
+        // open. A's EOF also cancels the requests A still has in flight
+        // (issue #1458), and that cancel races the turn's next model request.
+        let mut requester = if require_completion_after_eof {
+            None
+        } else {
+            Some(h.connect().await.1)
+        };
+        match requester.as_mut() {
+            Some(requester) => requester.start(&a_session, "orphan-a").await,
+            None => a.start(&a_session, "orphan-a").await,
+        }
         h.seen("orphan-a").await;
         let old_callback = a.next_significant().await;
         assert_eq!(old_callback["params"]["tool_use_id"], "orphan-call-a");
@@ -2072,7 +2085,7 @@ mod tcp_callback_ownership {
         drop(a);
         h.disconnected(a_index).await;
         // Reaching the next actual model request after EOF proves accepted A work
-        // survived its request/connection owner. Keep its final stream pending.
+        // survived its callback owner. Keep its final stream pending.
         let a_continuation = h.seen("orphan-a").await;
         let (_, mut b) = h.connect().await;
         b.register("b_lookup").await;
