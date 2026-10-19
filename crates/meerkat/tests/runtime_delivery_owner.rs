@@ -1171,6 +1171,113 @@ async fn an_unreadable_owed_enumeration_is_retried_on_the_next_wake_never_in_a_l
     ));
 }
 
+/// A job delivery whose projection into the runtime inbox failed stays
+/// pending and is retried on the next wake of any kind, not only on a job
+/// commit or a reconcile, and never in a loop.
+#[tokio::test(start_paused = true)]
+async fn a_skipped_projection_is_retried_on_the_next_wake_never_in_a_loop() {
+    let fixture = Fixture::new();
+    let (settlements, run_settlements) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_run_settlements(run_settlements)
+        .arm(fixture.host())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+
+    fixture.inbox.fail_next_submits_for_test(1);
+    let job = completed_job(&fixture.jobs, "default", SessionId::new(), "skipped-once").await;
+    let failed = wait_for_pass(&mut passes, "the failed projection", |pass| {
+        !pass.failures.is_empty()
+    })
+    .await;
+    assert_eq!(failed.projected, 0, "{failed:?}");
+
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "the failed projection is not retried in a loop"
+    );
+    assert!(fixture.sink.applied().await.is_empty());
+
+    // Any wake retries it: here a run settlement, which on its own never
+    // projects.
+    settlements.send_modify(|generation| *generation += 1);
+    let retried = wait_for_pass(&mut passes, "the retry pass", |pass| {
+        pass.generation > failed.generation
+    })
+    .await;
+    assert_eq!(retried.projected, 1, "{retried:?}");
+    assert!(retried.failures.is_empty(), "{retried:?}");
+    wait_for_applied(&fixture.sink, &job, &mut passes).await;
+}
+
+/// A job projection that keeps failing is retried on later wakes with a
+/// doubling gap, never on every wake: a busy runtime's run settlements do
+/// not each retry it. A projection that skips nothing clears the gap.
+#[tokio::test(start_paused = true)]
+async fn a_failing_projection_is_retried_with_a_doubling_gap_in_wakes() {
+    let fixture = Fixture::new();
+    let (settlements, run_settlements) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_run_settlements(run_settlements)
+        .arm(fixture.host())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+
+    fixture.inbox.fail_next_submits_for_test(usize::MAX);
+    let job = completed_job(&fixture.jobs, "default", SessionId::new(), "keeps-failing").await;
+    wait_for_pass(&mut passes, "the failed projection", |pass| {
+        !pass.failures.is_empty()
+    })
+    .await;
+    passes.borrow_and_update();
+
+    // Seven settlements, each its own wake: the retries join the 1st, the
+    // 3rd and the 7th.
+    let mut retried_on = Vec::new();
+    for settlement in 1..=7 {
+        settlements.send_modify(|generation| *generation += 1);
+        idle_for_an_hour().await;
+        if passes.has_changed().expect("owner pass channel open") {
+            let pass = passes.borrow_and_update().clone();
+            assert!(!pass.failures.is_empty(), "{pass:?}");
+            retried_on.push(settlement);
+        }
+    }
+    assert_eq!(retried_on, vec![1, 3, 7]);
+    assert!(fixture.sink.applied().await.is_empty());
+
+    // Once it can succeed, the next due retry (8 wakes on) applies it.
+    fixture.inbox.fail_next_submits_for_test(0);
+    for _ in 0..8 {
+        settlements.send_modify(|generation| *generation += 1);
+        idle_for_an_hour().await;
+    }
+    wait_for_applied(&fixture.sink, &job, &mut passes).await;
+
+    // That success cleared the gap: a new failure is retried on the next
+    // wake again.
+    fixture.inbox.fail_next_submits_for_test(1);
+    let next = completed_job(&fixture.jobs, "default", SessionId::new(), "fails-once").await;
+    wait_for_pass(&mut passes, "the new failure", |pass| {
+        !pass.failures.is_empty()
+    })
+    .await;
+    settlements.send_modify(|generation| *generation += 1);
+    wait_for_applied(&fixture.sink, &next, &mut passes).await;
+}
+
 /// A host that owes no continuations keeps the old path: a source change
 /// with nothing blocked runs no pass.
 #[tokio::test]

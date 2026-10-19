@@ -21,7 +21,7 @@
 //                      [--workspace-shards N] [--closure-test-rows N]
 //                      [--lib-row-runner LABEL]
 //                      [--event pull_request|push|workflow_dispatch]
-//                      [--base-lock FILE]
+//                      [--base-lock FILE] [--base-tree DIR]
 //                      [--reuse-release-evidence <commit>:<run id>:<attempt>]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
@@ -40,12 +40,16 @@
 // tag) every lane that needs the meerkat-mob chain or a reverse-dependency
 // sweep: the closure-tests rows, the closure check, the feature-combination
 // checks, the integration suites whose package compiles meerkat-mob, the
-// governed JSONL and confinement-positive lanes, the feature suites marked
+// governed JSONL and confinement-positive lanes (unless it touches their own
+// inputs, GUARD_LANE_INPUTS, or changes their definition,
+// GUARD_LANE_DEFINITIONS, or its diff is unknown), the feature suites marked
 // `pullRequest: false`, the test targets of the mob-chain packages (their
 // pull-request Clippy lints lib and bin targets only; their tests run on
 // main), the whole Clippy of the chain heads in MOB_CHAIN_CLIPPY_HEADS when
 // the change invalidates meerkat-mob's build (always in workspace mode), and
-// the wasm lanes that only the reverse-dependency closure selected. On 4-vCPU hosted runners each of those needs 9-30 minutes
+// the browser example and WASM timer lanes that only the reverse-dependency
+// closure selected (wasm-check runs for every crate the wasm build compiles).
+// On 4-vCPU hosted runners each of those needs 9-30 minutes
 // (meerkat-mob alone compiles for 5-11 minutes whenever it misses the cache),
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
@@ -285,8 +289,10 @@ export const UNIT_SOLO_PACKAGES = ["xtask"];
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Hook-parity rows (see the header). Every row runs on the hook's test-thread
-// stack: scripts/pre-push-unit.sh exports 32 MiB for all of its lanes.
-export const HOOK_TEST_STACK = 32 * 1024 * 1024;
+// stack: scripts/pre-push-unit.sh exports 8 MiB for all of its lanes, the
+// workspace floor of .cargo/config.toml and the hosts' worker stack budget,
+// which every closure-row test fits in a debug build (#301).
+export const HOOK_TEST_STACK = 8 * 1024 * 1024;
 export const CLOSURE_TESTS_PER_ROW = 12;
 // Nested-Cargo canaries: the tests .config/nextest.toml puts in this test
 // group each build a fixture crate with a nested `cargo` and run one at a time
@@ -320,9 +326,10 @@ const LIB_TARGET_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]
 // instead of silently dropping the suite.
 //
 // 22 of the facade's GPT Live tests overflow the 8 MiB test-thread stack that
-// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33);
-// they pass at the 32 MiB the pre-push hook and the BuildBuddy unit lane use.
-// Their rows carry that stack until the frames fit 8 MiB.
+// .cargo/config.toml gives every lane (debug build, measured on 82fddfc33)
+// and pass at 32 MiB. Their rows, like the --all-features test lane
+// (scripts/run-build-backend-lane test-all), carry that stack until the
+// frames fit 8 MiB.
 //
 // A suite with `pullRequest: false` runs on the push only: the facade's two
 // GPT Live suites compile its lib test under the realtime features, 1089 s
@@ -599,6 +606,160 @@ export const MOB_CHAIN_CLIPPY_HEADS = ["rkat", "meerkat-integration-tests", "mee
 export const MOB_CHAIN_INVALIDATED = "mob chain invalidated";
 export const CLIPPY_PACKED_SHARDS = 5;
 
+// The inputs of the two exact-profile lanes, which select exact lists of
+// tests (the governed JSONL step in ci.yml, the CONFINEMENT_* filters and
+// counts of `make test-mcp-confinement-positive`): the files that define the
+// selected cases and the manifests whose features compile them in or out.
+// A pull request that touches one runs that lane, so an added or removed
+// case fails its exact selection there, not on the push after the merge (the
+// v0.9.3 release merge added cases both push-only guards then refused). An
+// entry ending in "/" is a directory. scripts/ci-guard-lane-inputs-selftest.mjs
+// maps every selected case to the file defining it and fails when that file
+// is missing here.
+export const GUARD_LANE_INPUTS = {
+  governed_jsonl: [
+    "crates/meerkat-rpc/Cargo.toml",
+    "crates/meerkat-rpc/src/governed_jsonl.rs",
+    "crates/meerkat-rpc/src/governed_jsonl/",
+  ],
+  mcp_confinement_positive: [
+    "crates/meerkat-mcp/Cargo.toml",
+    "crates/meerkat-mcp/src/process_confinement_tests.rs",
+    "crates/meerkat-sandbox/Cargo.toml",
+    "crates/meerkat-sandbox/tests/compiled_confinement.rs",
+    "crates/meerkat-sandbox/tests/process_confinement.rs",
+    "crates/meerkat-tools/Cargo.toml",
+    "crates/meerkat-tools/src/builtin/shell/confinement_tests.rs",
+    "crates/meerkat/Cargo.toml",
+    "crates/meerkat/src/process_custody.rs",
+    "crates/meerkat/tests/command_hook_confinement.rs",
+  ],
+};
+
+export function touchesGuardLane(lane, paths) {
+  const inputs = GUARD_LANE_INPUTS[lane];
+  if (!inputs) throw new Error(`unknown exact-profile lane ${lane}`);
+  return paths.some((path) =>
+    inputs.some((input) => (input.endsWith("/") ? path.startsWith(input) : path === input)),
+  );
+}
+
+// The two lanes' definitions, beside their inputs: each lane's job in ci.yml,
+// the confinement lane's CONFINEMENT_* assignments and recipe in the
+// Makefile and the selection of the default nextest profile it runs, and the
+// module declarations (the `mod` item and its attributes) that compile the
+// selected cases in. A pull request that changes one
+// between its base and head runs that lane. [path, extract]: extract(text) is
+// the part of the file that defines the lane.
+// scripts/ci-guard-lane-inputs-selftest.mjs reads the selections from these
+// extracts and pins the declarations.
+export const GUARD_LANE_DEFINITIONS = {
+  governed_jsonl: [
+    [".github/workflows/ci.yml", (text) => workflowJob(text, "governed-jsonl")],
+    ["crates/meerkat-rpc/src/lib.rs", (text) => moduleDeclarations(text, "governed_jsonl")],
+  ],
+  mcp_confinement_positive: [
+    [".github/workflows/ci.yml", (text) => workflowJob(text, "mcp-confinement-positive")],
+    ["Makefile", confinementMakeDefinition],
+    [".config/nextest.toml", nextestDefaultSelection],
+    ["crates/meerkat-mcp/src/connection.rs", (text) => moduleDeclarations(text, "process_confinement_tests")],
+    ["crates/meerkat-tools/src/builtin/shell/mod.rs", (text) => moduleDeclarations(text, "confinement_tests")],
+    ["crates/meerkat/src/lib.rs", (text) => moduleDeclarations(text, "process_custody")],
+  ],
+};
+
+// A workflow job: its `  id:` line up to the next job or top-level key,
+// without blank lines and comment lines (those of its run scripts included),
+// so an edit to a comment alone changes no definition.
+export function workflowJob(text, id) {
+  const lines = text.split("\n");
+  const start = lines.indexOf(`  ${id}:`);
+  if (start < 0) return null;
+  const end = lines.findIndex((line, index) => index > start && /^ {0,2}\S/.test(line));
+  return lines
+    .slice(start, end < 0 ? lines.length : end)
+    .filter((line) => !/^\s*(#.*)?$/.test(line))
+    .join("\n");
+}
+
+// The confinement lane in the Makefile: every CONFINEMENT_* assignment and
+// the test-mcp-confinement-positive rule with its recipe.
+export function confinementMakeDefinition(text) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.startsWith("test-mcp-confinement-positive:"));
+  if (start < 0) return null;
+  const end = lines.findIndex((line, index) => index > start && !line.startsWith("\t"));
+  const assignments = lines.filter((line) => /^CONFINEMENT_\w+\s*[:?+]?=/.test(line));
+  return [...assignments, ...lines.slice(start, end < 0 ? lines.length : end)].join("\n");
+}
+
+// What decides the default nextest profile's selection: its
+// [profile.default] table, every default override that sets a (platform)
+// default-filter, and the whole [profile] table or top-level section once
+// one of its keys reaches the default profile (so a dotted key's multi-line
+// string or array keeps its continuation lines), whatever the spelling
+// (whitespace or quotes in headers and keys, indented keys), without comment
+// and blank lines.
+export function nextestDefaultSelection(text) {
+  const bare = (part) => part.replace(/#.*/, "").replace(/["'\s]/g, "");
+  const key = (line) => bare(line.split("=")[0]);
+  const sections = [{ header: "", lines: [] }];
+  for (const line of text.split("\n")) {
+    if (/^\s*\[\[?[\w.\s"'-]+\]\]?\s*(#.*)?$/.test(line)) sections.push({ header: bare(line), lines: [line] });
+    else sections.at(-1).lines.push(line);
+  }
+  const reachesDefault = { "[profile]": /^default(\.|$)/, "": /^profile(\.default(\.|$)|$)/ };
+  return sections
+    .flatMap(({ header, lines }) => {
+      if (header === "[profile.default]") return lines;
+      if (header === "[[profile.default.overrides]]") return lines.some((line) => key(line) === "default-filter") ? lines : [];
+      if (Object.hasOwn(reachesDefault, header)) return lines.some((line) => reachesDefault[header].test(key(line))) ? lines : [];
+      return [];
+    })
+    .filter((line) => !/^\s*(#.*)?$/.test(line))
+    .join("\n");
+}
+
+// Every declaration of module `name` in a Rust source: the `mod` line and the
+// attribute lines directly above it (up to a blank or comment line, or a line
+// that ends an item or opens a block).
+export function moduleDeclarations(text, name) {
+  const lines = text.split("\n");
+  const item = new RegExp(`^\\s*(pub(\\([^)]*\\))?\\s+)?mod\\s+${name}\\b`);
+  return lines
+    .flatMap((line, at) => {
+      if (!item.test(line)) return [];
+      let start = at;
+      while (start > 0 && !/^\s*(\/\/.*)?$|[;{}]\s*$/.test(lines[start - 1])) start -= 1;
+      return [lines.slice(start, at + 1).join("\n")];
+    })
+    .join("\n");
+}
+
+// The exact-profile lanes whose definition differs between the diff's base
+// and head; a side that cannot be read differs. An explicit path list
+// compares --base-tree's copy (without one, every listed definition file
+// differs) with the working tree.
+function changedGuardDefinitions(args, changedPaths) {
+  const read = (side, path) => {
+    if (args.explicitPaths) {
+      const file = side === "head" ? resolve(root, path) : args.baseTree && resolve(args.baseTree, path);
+      return file && existsSync(file) ? readFileSync(file, "utf8") : null;
+    }
+    const result = spawnSync("git", ["show", `${args[side]}:${path}`], { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return result.status === 0 ? result.stdout : null;
+  };
+  return Object.entries(GUARD_LANE_DEFINITIONS)
+    .filter(([, parts]) =>
+      parts.some(([path, extract]) => {
+        if (!changedPaths.includes(path)) return false;
+        const [base, head] = [read("base", path), read("head", path)];
+        return base === null || head === null || extract(base) !== extract(head);
+      }),
+    )
+    .map(([lane]) => lane);
+}
+
 function parseBazelFeatureSets(pkg) {
   const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
   if (!existsSync(buildPath)) {
@@ -766,6 +927,7 @@ function parseArgs(argv) {
     workspacePlanRequested: false,
     event: "push",
     baseLock: "",
+    baseTree: "",
     rowDurations: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -788,6 +950,9 @@ function parseArgs(argv) {
     } else if (arg === "--base-lock") {
       args.baseLock = argv[++i] ?? "";
       if (!args.baseLock) throw new Error("--base-lock requires a file");
+    } else if (arg === "--base-tree") {
+      args.baseTree = argv[++i] ?? "";
+      if (!args.baseTree) throw new Error("--base-tree requires a directory");
     } else if (arg === "--max-shards") {
       args.maxShards = Number.parseInt(argv[++i] ?? "", 10);
       if (!Number.isInteger(args.maxShards) || args.maxShards < 1) {
@@ -829,7 +994,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--event pull_request|push|workflow_dispatch] [--base-lock FILE] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--event pull_request|push|workflow_dispatch] [--base-lock FILE] [--base-tree DIR] [--reuse-release-evidence <commit>:<run id>:<attempt>] [--workspace-plan-requested] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -2046,7 +2211,8 @@ function plan(args) {
     result.reason = workspaceReason;
     result.packages = allNames;
     result.closure = allNames;
-    // A pull request runs the wasm lanes for their own inputs only.
+    // A push runs every wasm lane; a pull request runs wasm-check (below),
+    // and the example lanes for their own inputs only.
     if (!deferToPush) result.wasm = true;
   } else if (seeds.size > 0) {
     result.rust_changed = true;
@@ -2083,6 +2249,14 @@ function plan(args) {
   if (!deferToPush && result.closure.includes("meerkat-web-runtime")) {
     result.wasm = true;
     result.example_web = true;
+  }
+  // wasm-check compiles the web runtime and every workspace crate it links
+  // (its dependency closure, which the wasm32 target does not narrow), so a
+  // pull request that changes one of them runs it too (#1108): a provider
+  // crate that stops compiling for wasm32 fails before the merge.
+  const wasmBuild = closures.get("meerkat-web-runtime");
+  if (result.packages.some((name) => name === "meerkat-web-runtime" || wasmBuild?.has(name))) {
+    result.wasm = true;
   }
 
   if (result.rust_changed) {
@@ -2274,13 +2448,25 @@ function plan(args) {
   // The compile-only checks of the closure, and the two exact-profile lanes
   // (governed JSONL compiles meerkat-rpc's lib test, the confinement lane
   // the facade's lib test under every feature: 866 and 863 s on run
-  // 38859112297), run on the push only.
+  // 38859112297), run on the push. A pull request also runs an exact-profile
+  // lane when it touches that lane's own inputs (GUARD_LANE_INPUTS) or
+  // changes its definition (GUARD_LANE_DEFINITIONS), so a case added or
+  // removed there meets the lane's exact selection before the merge rather
+  // than on the push after it. Without a diff every definition may have
+  // changed.
+  result.guard_definitions_changed = !deferToPush
+    ? []
+    : changed === null
+      ? Object.keys(GUARD_LANE_DEFINITIONS)
+      : changedGuardDefinitions(args, changedPaths);
+  const guardRuns = (lane) =>
+    !deferToPush || touchesGuardLane(lane, changedPaths) || result.guard_definitions_changed.includes(lane);
   result.closure_check = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && !deferToPush;
-  result.mcp_confinement_positive = result.rust_changed && !deferToPush;
+  result.governed_jsonl = result.rust_changed && guardRuns("governed_jsonl");
+  result.mcp_confinement_positive = result.rust_changed && guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
-  deferred.governed_jsonl = result.rust_changed && deferToPush;
-  deferred.mcp_confinement_positive = result.rust_changed && deferToPush;
+  deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
+  deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;
 
   // Hook-parity rows for the test scope. scripts/ci-hook-coverage.mjs checks
   // them against the hook's own selection; a gap fails the plan.
