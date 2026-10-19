@@ -218,7 +218,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Mixed versions: a 0.9.3 peer that checks signatures drops a 0.9.4
   `reply_to_peer` reply (the sender sees an ambiguous outcome; other message
   kinds still reach it), and mob member hosts must be upgraded before their
-  controller (fork instruction policy). A temporary council record holding a
+  controller (fork instruction policy; a controller set to
+  `reactivate_inherited` gets `member_host_unsupported` from a 0.9.3 member
+  host). A temporary council record holding a
   participant refused by that policy cannot be read by 0.9.3.
 - Upgrade the Python and TypeScript SDKs with `rkat-rpc`: a 0.9.3 SDK fails on
   every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds, and does not

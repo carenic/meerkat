@@ -285,7 +285,9 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
 - **Mixed versions:** a 0.9.3 member host does not know the policy. Upgrade
   member hosts before their controller: until then a 0.9.3 member host forks
   participants without the policy, and a participant whose source has
-  activated host instructions fails its first turn.
+  activated host instructions fails its first turn. A controller set to
+  `reactivate_inherited` gets the typed refusal cause
+  `member_host_unsupported` from a 0.9.3 member host.
 - **Do (Rust):** `SessionError` gains `ForkInstructionRefused` and `MobError`
   gains `ForkInstructionRefused { source_member_id, refusal }` (exhaustive
   matches need the arms). `SessionForkAtRequest`, `SessionForkReplaceRequest`,
