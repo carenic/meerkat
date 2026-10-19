@@ -88,7 +88,8 @@ Playback has one device owner. Interruptions, and responses the provider
 fails (`turn_failed`), discard queued audio for the affected response, reject
 its late chunks, and abort buffered device output without waiting for an
 in-progress write. A failed response is printed as a status line; the channel
-stays open and nothing of the response is kept. Item-scoped truncations affect only
+stays open and nothing of the response is kept.
+Item-scoped truncations affect only
 that item/content. Missing identities conservatively suppress anonymous late
 audio; subsequent identified output still plays. Samples already heard cannot be recalled.
 Written transcript display is independent of playback.
