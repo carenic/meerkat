@@ -16487,6 +16487,22 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
     async fn session_fork_replace_refuses_an_activated_source_by_default() {
         let (router, _notif_rx) = test_router().await;
         let (session_id, _message_count) = activated_rpc_session(&router).await;
+        // A turn after the activation, so the replaced message follows the
+        // activation row and the fork's prefix carries it.
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "prompt": "Follow up",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "the source runs a turn after the activation: {turn_resp:?}"
+        );
         let history = router
             .dispatch(make_request(
                 "session/history",
@@ -16498,7 +16514,7 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             .as_array()
             .unwrap()
             .iter()
-            .position(|message| message["role"] == "user")
+            .rposition(|message| message["role"] == "user")
             .expect("a user message to replace");
         let sessions_before = rpc_session_count(&router).await;
 

@@ -2925,9 +2925,21 @@ async fn a_participant_of_an_activated_member_ends_the_council_with_the_typed_re
         calls_before,
         "no participant reached the model"
     );
+    // The refused slot's create call was issued, so cleanup keeps the
+    // council's conservative reconciliation debt for it, as for any failed
+    // create; nothing else is owed and the temporary mob is gone.
     assert!(
-        outcome.cleanup.settled(),
-        "cleanup debt: {:?}",
+        outcome.cleanup.temporary_mob_destroyed,
+        "cleanup: {:?}",
+        outcome.cleanup
+    );
+    assert!(
+        outcome
+            .cleanup
+            .debts
+            .iter()
+            .all(|debt| debt.subject.ends_with(":p0")),
+        "only the refused slot's create is reconciled: {:?}",
         outcome.cleanup
     );
     fixture.teardown().await;
