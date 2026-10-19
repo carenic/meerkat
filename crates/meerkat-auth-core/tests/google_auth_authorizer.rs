@@ -493,9 +493,12 @@ async fn released_and_reacquired_auth_lease_invalidates_private_token_cache() {
         }) as Arc<dyn Fn(&str) -> Option<String> + Send + Sync>
     };
     let handle = Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new());
+    // The binding is this test's own: `release_lease` below try-locks the
+    // process-wide lifecycle exclusion, which the other tests' authorizers
+    // hold for the shared `gemini` binding while they run.
     let lease_key = LeaseKey::new(
         RealmId::parse("dev").unwrap(),
-        BindingId::parse("gemini").unwrap(),
+        BindingId::parse("gemini-released").unwrap(),
         Some(ProfileId::parse("google_adc").unwrap()),
     );
     let lease_handle = generated_auth_lease_handle_for_test(Arc::clone(&handle));

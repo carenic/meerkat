@@ -6,8 +6,9 @@ use serde_json::{Value, json};
 
 use super::DerivedChildRestrictions;
 use crate::constraints::{
-    ActionRef, DelegationDepth, DelegationFailure, DepthBound, ExactRestriction,
-    ExecutionRestrictions, LifetimeBound, LifetimeRestriction, SetBound, UnresolvedConstraint,
+    ActionRef, DelegationDepth, DelegationFailure, DepthBound, DomainRestriction, ExactRestriction,
+    ExecutionRestrictions, LifetimeBound, LifetimeRestriction, ResourceDomain, SetBound,
+    UnresolvedConstraint,
 };
 
 fn action(name: &str) -> ActionRef {
@@ -20,7 +21,7 @@ fn action(name: &str) -> ActionRef {
 fn operands() -> (ExecutionRestrictions, ExecutionRestrictions) {
     let parent = ExecutionRestrictions {
         actions: ExactRestriction::exact([action("read"), action("write")]),
-        resource_domains: ExactRestriction::exact([]),
+        resource_domains: DomainRestriction::exact([]),
         processors: ExactRestriction::exact([]),
         audiences: ExactRestriction::exact([]),
         lifetime: LifetimeRestriction::window(100, 300),
@@ -56,7 +57,7 @@ fn retains_exact_operands_and_literal_expected_attenuation() {
     assert_eq!(result.requested(), &requested);
     let expected = ExecutionRestrictions {
         actions: ExactRestriction::exact([action("read")]),
-        resource_domains: ExactRestriction::exact([]),
+        resource_domains: DomainRestriction::exact([]),
         processors: ExactRestriction::exact([]),
         audiences: ExactRestriction::exact([]),
         lifetime: LifetimeRestriction::window(150, 300),
@@ -347,4 +348,42 @@ fn readonly_view_is_detached_from_checked_value_and_wire_has_no_wrapper() {
     assert_ne!(view.effective, *derived.effective());
     assert_eq!(serde_json::to_value(&derived).expect("encode"), before);
     assert!(before.get("view").is_none());
+}
+
+/// An owner-scoped parent attenuates to the child's own domains; a stored
+/// effective bound that keeps the parent's owner bound, or names another
+/// domain, is not the attenuation result and refuses.
+#[test]
+fn decode_refuses_a_tampered_owner_scoped_effective() {
+    let app = meerkat_core::auth::PrincipalRef::new(
+        meerkat_core::auth::PrincipalKind::ServiceAccount,
+        "app",
+    )
+    .expect("principal");
+    let session = |namespace: &str| ResourceDomain {
+        authority: app.clone(),
+        namespace: namespace.into(),
+    };
+    let (mut parent, mut requested) = operands();
+    parent.resource_domains = DomainRestriction::owned_by([app.clone()]);
+    requested.resource_domains = DomainRestriction::exact([session("s1")]);
+    let derived = DerivedChildRestrictions::new(parent, requested).expect("child");
+    assert_eq!(
+        derived.effective().resource_domains,
+        DomainRestriction::exact([session("s1")])
+    );
+    let value = serde_json::to_value(&derived).expect("wire");
+    assert_eq!(
+        serde_json::from_value::<DerivedChildRestrictions>(value.clone()).expect("exact roundtrip"),
+        derived
+    );
+    for bound in [
+        json!({"bound": "owned_by", "values": [serde_json::to_value(&app).expect("principal")]}),
+        json!({"bound": "exact", "values": [serde_json::to_value(session("s2")).expect("domain")]}),
+        json!({"bound": "unrestricted"}),
+    ] {
+        let mut tampered = value.clone();
+        tampered["effective"]["resource_domains"]["bound"] = bound;
+        rejected(tampered);
+    }
 }

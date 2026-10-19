@@ -15,7 +15,8 @@ use meerkat_authorization_contracts::constraints::AudienceRef;
 use meerkat_authorization_contracts::constraints::ExecutionRestrictions;
 use meerkat_authorization_contracts::constraints::LifetimeRestriction;
 use meerkat_authorization_contracts::constraints::{
-    ActionRef, DelegationDepth, ExactRestriction, ProcessorRef, SetBound, UnresolvedConstraint,
+    ActionRef, DelegationDepth, DomainBound, DomainRestriction, ExactRestriction, ProcessorRef,
+    SetBound, UnresolvedConstraint,
 };
 use meerkat_authorization_contracts::evidence::EvidenceId;
 use meerkat_authorization_contracts::work_association::GrantLineageRef;
@@ -1332,7 +1333,7 @@ fn bounds(
 ) -> ExecutionRestrictions {
     ExecutionRestrictions {
         actions: ExactRestriction::exact(actions.iter().copied().map(report_action)),
-        resource_domains: ExactRestriction::exact(sessions.iter().copied().map(session_of)),
+        resource_domains: DomainRestriction::exact(sessions.iter().copied().map(session_of)),
         processors: ExactRestriction::exact(processors.iter().map(processor_of)),
         ..ExecutionRestrictions::unrestricted()
     }
@@ -1444,7 +1445,7 @@ fn another_executors_contributor_narrows_the_operation_to_the_intersection() {
     );
     assert_eq!(
         allowance.restrictions.resource_domains.bound(),
-        &SetBound::Exact([session_of("helper")].into())
+        &DomainBound::Exact([session_of("helper")].into())
     );
     assert_eq!(
         allowance.restrictions.processors.bound(),
@@ -1913,6 +1914,38 @@ fn the_contributor_ceilings_narrow_the_review_material() {
     );
 }
 
+/// An owner-scoped resource bound is stated as its owners, each in its
+/// serialized form, never as "any". It never permits nothing by itself; met
+/// with another authority's exact domain it does, and is refused as at
+/// authorization.
+#[test]
+fn the_review_bounds_text_states_an_owner_scoped_resource_bound() {
+    let owner = principal("owner");
+    let owned = ExecutionRestrictions {
+        resource_domains: DomainRestriction::owned_by([owner.clone()]),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    assert_eq!(
+        review_bounds_text(&owned, u64::MAX, 100),
+        Ok(format!(
+            "actions any; resources owned by {}; processors any; audiences any; effective \
+             until no expiry.",
+            json(&[owner])
+        ))
+    );
+    let foreign = ExecutionRestrictions {
+        resource_domains: owned
+            .resource_domains
+            .conjoin(&DomainRestriction::exact([session_of("someone-else")])),
+        ..ExecutionRestrictions::unrestricted()
+    };
+    assert!(matches!(
+        review_bounds_text(&foreign, u64::MAX, 100),
+        Err(meerkat_core::OperationAuthorizationError::Refused(refusal))
+            if refusal.kind() == OperationRefusalKind::Denied
+    ));
+}
+
 /// The bounds text states every bounded value exactly, in its serialized
 /// form, and the effective expiry, the earlier of the given expiry and the
 /// lifetime window's end; bounds that permit nothing now, or carry an
@@ -1931,7 +1964,7 @@ fn the_review_bounds_text_states_exact_bounds_and_refuses_bounds_that_permit_not
     );
     let bounded = ExecutionRestrictions {
         actions: ExactRestriction::exact([report_action("write"), report_action("read")]),
-        resource_domains: ExactRestriction::exact([session_of("owner")]),
+        resource_domains: DomainRestriction::exact([session_of("owner")]),
         processors: ExactRestriction::exact([ProcessorRef::Route {
             authority: owner.clone(),
             route_id: "model-a".into(),

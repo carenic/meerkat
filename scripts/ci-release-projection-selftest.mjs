@@ -716,6 +716,14 @@ if (args[0] === "api") {
 const fs = require("node:fs");
 const fixture = JSON.parse(fs.readFileSync(${JSON.stringify(budgetFixture)}, "utf8"));
 const path = process.argv[process.argv.length - 1];
+if (process.env.FAKE_GH_CALLS) fs.appendFileSync(process.env.FAKE_GH_CALLS, path + "\\n");
+const failures = process.env.FAKE_GH_FAILURES ? JSON.parse(fs.readFileSync(process.env.FAKE_GH_FAILURES, "utf8")) : {};
+if (failures[path] && failures[path].count > 0) {
+  failures[path].count -= 1;
+  fs.writeFileSync(process.env.FAKE_GH_FAILURES, JSON.stringify(failures));
+  process.stderr.write(failures[path].message + "\\n");
+  process.exit(1);
+}
 if (!(path in fixture)) { process.stderr.write("gh: Not Found (HTTP 404)\\n"); process.exit(1); }
 process.stdout.write(JSON.stringify(fixture[path]));
 `,
@@ -725,7 +733,7 @@ process.stdout.write(JSON.stringify(fixture[path]));
   const job = (name, created, started, completed) => ({
     name, created_at: at(created), started_at: at(started), completed_at: at(completed), conclusion: "success",
   });
-  const runBudget = (attemptStarts, jobs) => {
+  const runBudget = (attemptStarts, jobs, extraEnv = {}) => {
     const run = `/repos/${REPOSITORY}/actions/runs/${RUN_ID}`;
     const pages = { [`${run}/attempts/${attemptStarts.length}/jobs?per_page=100`]: [{ jobs }] };
     attemptStarts.forEach((start, index) => {
@@ -740,7 +748,7 @@ process.stdout.write(JSON.stringify(fixture[path]));
         GITHUB_REPOSITORY: REPOSITORY, GITHUB_RUN_ID: String(RUN_ID), GITHUB_RUN_ATTEMPT: String(attemptStarts.length),
         MAX_EXEC_SECONDS: workflowSeconds("CI_MAX_EXEC_SECONDS"), MAX_TERMINAL_SECONDS: workflowSeconds("CI_MAX_TERMINAL_SECONDS"),
         QUEUE_WARN_SECONDS: workflowSeconds("CI_QUEUE_WARN_SECONDS"), ENFORCE_BUDGET: "true",
-        GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: "",
+        GITHUB_OUTPUT: outputFile, GITHUB_STEP_SUMMARY: "", ...extraEnv,
       },
       encoding: "utf8",
     });
@@ -784,6 +792,39 @@ process.stdout.write(JSON.stringify(fixture[path]));
   assert.equal(budget.status, 1, `a rest-wave row over the execution budget fails: ${budget.stdout}`);
   assert.equal(budget.outputs.exec_path_seconds, "1081", "1046 s of the row, 30 s of classification, 5 s of stagger");
   assert.equal(budget.outputs.budget_verdict, "exec_over_budget");
+
+  // A GitHub API server error (5xx) is retried after each API_RETRY_DELAYS
+  // delay. It fails an enforced measurement only after the last retry, and
+  // any other error fails it at once, as before.
+  assert.equal(budgetEnv.API_RETRY_DELAYS, "5 10 20", "the budget retries a server error three times");
+  const jobsPath = `/repos/${REPOSITORY}/actions/runs/${RUN_ID}/attempts/1/jobs?per_page=100`;
+  const failuresFile = join(scratch, "budget-failures.json");
+  const callsFile = join(scratch, "budget-calls");
+  const flaky = (count, message, extraEnv = {}) => {
+    writeFileSync(failuresFile, JSON.stringify({ [jobsPath]: { count, message } }));
+    writeFileSync(callsFile, "");
+    const run = runBudget([0], busy, {
+      API_RETRY_DELAYS: "0 0 0", FAKE_GH_FAILURES: failuresFile, FAKE_GH_CALLS: callsFile, ...extraEnv,
+    });
+    const jobCalls = readFileSync(callsFile, "utf8").split("\n").filter((line) => line === jobsPath).length;
+    return { ...run, jobCalls };
+  };
+  const badGateway = "gh: Server Error (HTTP 502)";
+  budget = flaky(2, badGateway);
+  assert.equal(budget.status, 0, `two server errors are retried: ${budget.stdout}${budget.stderr}`);
+  assert.equal(budget.jobCalls, 3, "a try and two retries");
+  assert.match(budget.stdout, /GitHub API server error for \S+ \(gh: Server Error \(HTTP 502\)\); retrying in 0 s/);
+  assert.equal(budget.outputs.budget_verdict, "queue_delayed", "the measurement completes after the retries");
+  budget = flaky(4, badGateway);
+  assert.equal(budget.status, 1, `a server error after the last retry fails an enforced measurement: ${budget.stdout}`);
+  assert.equal(budget.jobCalls, 4, "a try and three retries");
+  assert.match(budget.stdout, /::error::could not measure the lane execution budget: gh: Server Error \(HTTP 502\)/);
+  budget = flaky(1, "gh: Not Found (HTTP 404)");
+  assert.equal(budget.status, 1, `a client error is not retried: ${budget.stdout}`);
+  assert.equal(budget.jobCalls, 1, "a single try");
+  budget = flaky(4, badGateway, { ENFORCE_BUDGET: "false" });
+  assert.equal(budget.status, 0, `an unenforced measurement only warns: ${budget.stdout}`);
+  assert.match(budget.stdout, /::warning::lane execution budget report unavailable \(budget not enforced\): gh: Server Error \(HTTP 502\)/);
 
   // The gate verifies the evidence after the lanes and records it.
   const verifyStep = extractStepRun(workflow, "Verify reused release-projection evidence");

@@ -384,7 +384,6 @@ pub fn schema_metadata() -> super::MachineSchemaMetadata {
     ];
     for (name, value) in [
         ("GrantActionBounds", "ActionRef"),
-        ("GrantResourceBounds", "ResourceDomain"),
         ("GrantProcessorBounds", "ProcessorRef"),
         ("GrantAudienceBounds", "AudienceRef"),
     ] {
@@ -393,6 +392,12 @@ pub fn schema_metadata() -> super::MachineSchemaMetadata {
             format!("{restrictions}::ExactRestriction<{restrictions}::{value}>"),
         ));
     }
+    // Resource domains carry their own bound kinds (exact domains or the
+    // owning authorities); the machine compares the value opaquely.
+    bindings.push(N::type_path(
+        "GrantResourceBounds",
+        format!("{restrictions}::DomainRestriction"),
+    ));
     super::machine_schema_metadata(bindings, vec![]).with_tlc_model(tlc_fixtures::model())
 }
 
