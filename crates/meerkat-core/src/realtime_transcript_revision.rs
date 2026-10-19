@@ -2864,6 +2864,7 @@ mod completion_records_staged_text_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod failed_terminal_decision_tests {
     use super::{RealtimeTranscriptStopReasonKind, resolve_realtime_event};
 
