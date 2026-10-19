@@ -17,7 +17,7 @@ use crate::store::{
     current_definition_authority,
 };
 use crate::{
-    MobDefinition, MobError,
+    MemberBindingHistory, MemberBindingHistoryReadError, MobDefinition, MobError,
     error::MobDefinitionProjectionMismatchKind,
     event::{MobEvent, MobEventKind, NewMobEvent},
 };
@@ -337,6 +337,38 @@ impl MobStorage {
         Ok(destroy_admitted
             || crate::runtime::recovered_lifecycle_quiesce_intent(&mob_events)
                 == Some(crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Destroy))
+    }
+
+    /// Read the member binding history of the persistent mob store at
+    /// `path` with no running mob: the history
+    /// [`crate::MobHandle::member_binding_history`] reads for a running mob,
+    /// folded the same way from the same journal and identity intent rows,
+    /// read together in one read transaction.
+    ///
+    /// It opens the file read-only and never creates, migrates or otherwise
+    /// writes it. A missing file is
+    /// [`MemberBindingHistoryReadError::StoreMissing`]; a file that is not a
+    /// mob store this build reads (no mob schema, a schema from a newer
+    /// build, an unrecognized schema) is
+    /// [`MemberBindingHistoryReadError::ForeignSchema`]. A store that holds
+    /// no mob answers an empty history.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn read_member_binding_history(
+        path: impl AsRef<Path>,
+    ) -> Result<MemberBindingHistory, MemberBindingHistoryReadError> {
+        let mut read =
+            crate::store::read_member_binding_store_at(path.as_ref().to_path_buf()).await?;
+        let mob_id = Self::current_definition_snapshot_for_log(&read.events)?
+            .map(|snapshot| snapshot.definition.id);
+        let intent_rows = mob_id
+            .as_ref()
+            .and_then(|mob_id| read.intent_rows.remove(mob_id))
+            .unwrap_or_default();
+        Ok(MemberBindingHistory::from_journal(
+            &read.events,
+            intent_rows,
+            mob_id.as_ref(),
+        ))
     }
 
     /// Read the canonical definition together with its sealed resume precondition.

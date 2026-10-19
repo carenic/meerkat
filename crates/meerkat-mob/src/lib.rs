@@ -342,8 +342,10 @@ pub use runtime::{
     DeliveryUnknownCause,
 };
 pub use runtime::{
-    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope,
-    ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState, WorkAdmissionStage,
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberBinding, MemberBindingHistory,
+    MemberBindingHistoryReadError, MemberBindingState, MemberDeliveryScope,
+    MemberIdentityManagement, ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
+    WorkAdmissionStage,
 };
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{
