@@ -1715,6 +1715,35 @@ pub trait MobProvisioner: Send + Sync {
     ) -> Result<(), MobError> {
         Ok(())
     }
+    /// Stage a run-start hold that the member's next runtime registration
+    /// applies (#1500), without holding the registration that is current: a
+    /// mob Stop stages `MobStop` this way and then holds the member with
+    /// [`Self::stop_member_runtime`], so a registration that replaces the
+    /// held one while the mob is Stopped (a reload) is held too. The reason
+    /// stays staged until [`Self::release_member_run_starts`] releases it or
+    /// [`Self::unstage_member_registration_run_start_hold`] removes it. Only
+    /// a runtime this process hosts is staged; the default stages nothing.
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
+    /// Remove a run-start hold staged for the member's runtime registration
+    /// (#1500), and nothing more: a hold the current registration already
+    /// applies stays in place. For a member that is gone for good (retired,
+    /// torn down by Shutdown, disposed by destroy), so that a later
+    /// registration of the same session is not held for it, and for a
+    /// restore that drops a `MobStop` an earlier incarnation staged before
+    /// any member registers. The default removes nothing.
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        _member_ref: &MemberRef,
+        _reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
     async fn hard_cancel_member(
         &self,
         member_ref: &MemberRef,
@@ -2835,6 +2864,44 @@ pub struct MemberSessionDisposalArc {
     /// executor-residency sidecar map (ADJ-23) so disposal clears the same
     /// entries the materializer registered.
     runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
+}
+
+/// What a durability-degraded registration became ahead of its exact
+/// unregister ([`MemberSessionDisposalArc::discard_degraded_registration_first`]).
+#[cfg(feature = "runtime-adapter")]
+pub(super) enum DegradedUnregisterStep {
+    /// Not degraded, or no longer this exact registration: its exact
+    /// unregister proceeds unchanged. Also when the runtime refuses the
+    /// discard until a repair (`RecoveryRepairBlocked`), which it does for
+    /// reasons it does not type apart: another owner still holds the
+    /// registration's teardown (an unregister, stop-cleanup or unregister
+    /// finalization coordinator), a user-interrupt dispatch on it has not
+    /// settled, or its cold recovery cannot run yet. It also refuses an
+    /// attachment without a teardown slot, which only guards the invariant
+    /// that every attachment has one. The exact unregister then joins that
+    /// owner, waits within its own deadline, or is refused until the repair
+    /// too, and a settlement retries the discard on its next call. A
+    /// registration whose runtime loop is still attached keeps its fence
+    /// until that loop hands it back, and the discard waits for that
+    /// handoff. A registration that no runtime loop holds (none was ever
+    /// attached, or its teardown completed) is not refused for a missing
+    /// handoff: nothing retains its mutation fence, and the discard takes it.
+    Unchanged,
+    /// The discard replaced the degraded process shell with `successor`, the
+    /// exact cold registration it published, whose use starts at
+    /// `successor_use`. The successor's exact unregister follows.
+    Replaced {
+        successor: RuntimeSessionRegistrationWitness,
+        successor_use: meerkat_runtime::RuntimeSessionRegistrationUse,
+    },
+    /// The registration was handed to another user after its expected use
+    /// was read. Nothing was discarded, and the registration is not the
+    /// caller's to unregister.
+    HandedOver,
+    /// The deadline passed before the discard settled.
+    TimedOut,
+    /// The discard failed.
+    Failed(String),
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -4075,6 +4142,88 @@ impl MemberSessionDisposalArc {
                 "durability-reload disposal failed for {session_id}: {error}"
             ))
         })
+    }
+
+    /// Before an exact unregister: discard `registration` first when its
+    /// session is durability-degraded, bounded by `deadline`.
+    ///
+    /// A failed boundary commit leaves the session `ReloadRequired`, and its
+    /// exited runtime loop can keep the session's mutation fence in its
+    /// published handoff. Only the reload-required discard releases that
+    /// fence; an exact unregister admitted first waits on it for good. The
+    /// discard replaces the degraded process shell with a cold successor
+    /// recovered from durable authority, retaining the member's bound
+    /// operation as retire's discard does, and the caller unregisters that
+    /// successor: the exact registration the discard returns as published,
+    /// never the session's registration read after the discard returned,
+    /// which can already be a later owner's.
+    ///
+    /// With `expected_use`, the discard runs only while the registration's
+    /// use is still that one: a caller that handed the registration back
+    /// passes the use it had then. Any other use means a later owner took the
+    /// registration over, which is reported as
+    /// [`DegradedUnregisterStep::HandedOver`] without discarding.
+    pub(super) async fn discard_degraded_registration_first(
+        adapter: &Arc<MeerkatMachine>,
+        ops_adapter: Option<&Arc<super::ops_adapter::MobOpsAdapter>>,
+        registration: &RuntimeSessionRegistrationWitness,
+        expected_use: Option<meerkat_runtime::RuntimeSessionRegistrationUse>,
+        deadline: Instant,
+    ) -> DegradedUnregisterStep {
+        let session_id = registration.session_id();
+        if adapter
+            .durability_reload_required(session_id)
+            .await
+            .is_none()
+        {
+            return DegradedUnregisterStep::Unchanged;
+        }
+        let prior_ops_binding = match Self::recoverable_ops_binding_witness(ops_adapter, session_id)
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                return DegradedUnregisterStep::Failed(format!(
+                    "durability-reload discard of runtime session {session_id} could not capture its bound operation: {error}"
+                ));
+            }
+        };
+        let discarded = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            adapter.reload_required_registration_settlement_if_current(
+                registration,
+                expected_use,
+                prior_ops_binding
+                    .as_ref()
+                    .map(|witness| witness.retention_request()),
+            ),
+        )
+        .await;
+        match discarded {
+            Err(_) => DegradedUnregisterStep::TimedOut,
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Discarded {
+                successor,
+                successor_use,
+            })) => DegradedUnregisterStep::Replaced {
+                successor,
+                successor_use,
+            },
+            Ok(Ok(meerkat_runtime::ReloadRequiredRegistrationUseSettlement::Changed)) => {
+                DegradedUnregisterStep::HandedOver
+            }
+            Ok(
+                Ok(
+                    meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotDegraded
+                    | meerkat_runtime::ReloadRequiredRegistrationUseSettlement::NotCurrent,
+                )
+                | Err(meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }),
+            ) => DegradedUnregisterStep::Unchanged,
+            Ok(Ok(settlement)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} answered an unknown settlement: {settlement:?}"
+            )),
+            Ok(Err(error)) => DegradedUnregisterStep::Failed(format!(
+                "durability-reload discard of runtime session {session_id} failed: {error}"
+            )),
+        }
     }
 
     pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter_until(
@@ -14110,6 +14259,30 @@ impl MobProvisioner for SessionBackend {
             })
     }
 
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "stage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.stage_registration_run_start_hold_only(&session_id, reason);
+        }
+        Ok(())
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "unstage run-start hold")?;
+        if let Some(adapter) = &self.runtime_adapter {
+            adapter.unstage_registration_run_start_hold(&session_id, reason);
+        }
+        Ok(())
+    }
+
     async fn hard_cancel_member(
         &self,
         member_ref: &MemberRef,
@@ -17912,6 +18085,38 @@ impl MobProvisioner for MultiBackendProvisioner {
             _ => {
                 self.session
                     .stage_member_registration_run_start_hold(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn stage_member_registration_run_start_hold_only(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .stage_member_registration_run_start_hold_only(member_ref, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn unstage_member_registration_run_start_hold(
+        &self,
+        member_ref: &MemberRef,
+        reason: meerkat_runtime::RunStartHoldReason,
+    ) -> Result<(), MobError> {
+        match member_ref {
+            // A remote member's runtime registers on its host, not here.
+            MemberRef::BackendPeer { session_id, .. } if session_id.is_none() => Ok(()),
+            _ => {
+                self.session
+                    .unstage_member_registration_run_start_hold(member_ref, reason)
                     .await
             }
         }

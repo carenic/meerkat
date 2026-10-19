@@ -414,6 +414,10 @@ them.
   refuse such a session with "unsupported realtime event schema 4", so a
   session cannot be opened by an older binary once a failed realtime response
   has been recorded in it.
+- `meerkat-mob`: `MemberShutdownOutcome::UnregisterPending` carries
+  `settlement: MemberUnregisterSettlement` and is `#[non_exhaustive]`: match
+  it with `{ stage, .. }`. The settlement follows the exact registration's
+  runtime unregister after Shutdown returns.
 
 ### Security
 
@@ -731,6 +735,50 @@ them.
   provider either reported the response's usage or it did not. The Python and
   TypeScript SDKs type `turn_failed.failure` as `WireLiveResponseFailure` and
   export it and `WireLiveResponseFailureStatus` from their package roots.
+- `meerkat-mob`: `MemberUnregisterSettlement` and `MemberUnregisterState`
+  (`Settled`, `Pending`, `Failed`, `HandedOver`; non-exhaustive). A
+  settlement reads its state without waiting (`try_state`) or waits for it
+  until a deadline (`settle_within`), also after the mob's actor exited. It
+  joins the runtime's unregister coordinator for the member's exact
+  registration, admits that unregister through the same exact-registration
+  path when Shutdown's deadline passed before it was admitted, and holds the
+  mob's runtime handle only weakly: a dropped handle settles only once the
+  registration has provably ended. It admits that unregister, or the
+  reload-required discard before it, only while nobody has taken the
+  registration over since Shutdown returned; otherwise it reports the
+  terminal `HandedOver` and touches nothing, leaving the registration to its
+  new owner.
+- `meerkat-runtime`: `RuntimeSessionRegistrationWitness::has_ended`, whether
+  an exact registration has ended for good (no runtime holds its entry).
+- `meerkat-runtime`: `RuntimeSessionRegistrationUse` and
+  `MeerkatMachine::session_registration_use`. A registration can be handed to
+  a new user without being replaced, keeping its witness: a
+  `register_session` that reuses it as it is, an executor attachment or an
+  actor materialization that adopts it in place. Each such adoption stamps
+  the registration with a fresh use, so a use read earlier differs from the
+  current one once anyone has taken the registration since. Opaque; compare
+  for equality only.
+- `meerkat-runtime`: `MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`
+  and `RuntimeSessionUnregisterUseAdmission` (`Admitted`, `Changed`;
+  non-exhaustive): the exact unregister admission of
+  `observe_unregister_session_registration_if_current`, started or joined
+  only while the registration's use is the one the caller read, and
+  answering `Changed` without starting or joining anything otherwise.
+- `meerkat-runtime`: `MeerkatMachine::reload_required_registration_settlement_if_current`
+  and `ReloadRequiredRegistrationUseSettlement` (`NotCurrent`, `NotDegraded`,
+  `Discarded { successor, successor_use }`, `Changed`; non-exhaustive): the
+  reload-required discard of an exact registration, answering with the exact
+  successor it published and the use that successor starts at, read where it
+  is published. With an expected use, it starts or joins the discard only
+  while the registration's use is still that one, and answers `Changed`
+  without discarding otherwise.
+- `meerkat-runtime`: `MeerkatMachine::stage_registration_run_start_hold_only`
+  and `MeerkatMachine::unstage_registration_run_start_hold`. The first stages
+  a run-start hold that the session's next registration applies, without
+  trying to hold the registration that is current; the second removes a
+  staged reason and leaves a hold the current registration applies in place.
+  A runtime unregister keeps staged reasons, so a registration that replaces
+  the session's (a reload) applies them.
 
 ### Changed
 
@@ -885,6 +933,21 @@ them.
   returns once a nightly run has passed and its duration is measured.
   `scripts/release-require-standalone-green` checks that a run passed at a
   given commit.
+- `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
+  holds the member, so a member reloaded while the mob is Stopped stays held
+  until Resume; a member spawned into a Stopped mob, or held again after a
+  failed Resume, stages it too. A restore drops a `MobStop` that an earlier
+  incarnation in the same process staged before any member registers, so a
+  mob reopened with released run starts (after a Stop that fail-stopped)
+  does not come up held; a restored Stopped mob stages it again. Retire,
+  Shutdown and destroy drop it for the members they dispose of, so a later
+  registration of the same session is not held for them.
+- `meerkat-mob`: a runtime refusal of a member's unregister until its
+  registration's durability is repaired
+  (`RuntimeDriverError::RecoveryRepairBlocked`) is reported
+  `UnregisterPending` at the stage `durability_reload_discard`, not as a
+  Shutdown teardown failure: its settlement runs the reload-required discard
+  and admits the unregister again.
 
 ### Fixed
 
@@ -1360,6 +1423,56 @@ them.
   that waits for MCP servers. They are now gated on `session-store`, and a
   build without it no longer warns about the session code it leaves out.
   Pre-existing in 0.9.3.
+- A mob Shutdown's runtime teardown, and the settlement it reports,
+  unregister a member whose runtime registration is durability-degraded
+  (`meerkat-mob`). A failed boundary commit leaves the session
+  `ReloadRequired`, and its exited runtime loop can keep the session's
+  mutation fence, which only the runtime's reload-required discard releases.
+  The teardown's exact unregister admission waited on that fence, so the
+  member was reported `UnregisterPending` and stayed registered until the
+  process exited. The teardown and the settlement now run the discard first,
+  as retire and destroy do, and unregister the cold successor it publishes.
+  An unregister coordinator admitted before the session degraded still waits
+  on the fence; its settlement stays pending, bounded by each call's
+  deadline.
+- A pending member unregister that a mob Shutdown reported no longer
+  unregisters a registration that a later owner took over (`meerkat-mob`,
+  `meerkat-runtime`). When Shutdown's deadline passed before a member's
+  exact unregister was admitted, its settlement admitted that unregister
+  later through the member's exact registration witness. A later owner can
+  take a registration over in place under the same witness: a mob
+  reconstructed in-process over the same stores prepares its members'
+  bindings on the registrations the old incarnation left, a
+  `register_session` reuses a registration as it is, an executor
+  registration takes over a registration's live runtime loop as it is, and
+  an executor attachment or actor materialization adopts a registration
+  without a runtime loop. The settlement then unregistered the later
+  owner's live registration, or ran the reload-required discard on it once
+  it degraded.
+  It also followed whatever registration of the session was current once
+  its discard returned, which a later owner could already have replaced.
+  The runtime now stamps a registration's use at every adoption, Shutdown
+  reads it when it hands the member's registration back, and the settlement
+  starts the discard or the unregister only while that use is unchanged,
+  reporting `MemberUnregisterState::HandedOver` otherwise. It follows only
+  the successor its discard returns as published.
+- The runtime's reload-required discard disposes of a durability-degraded
+  registration that no runtime loop holds (`meerkat-runtime`). It required
+  the exact teardown handoff of the registration's runtime loop, so a
+  registration that never had a loop, or whose loop's teardown had already
+  completed, was refused until a repair nothing could perform: the exact
+  unregister is refused too while the session is degraded (the durability
+  gate refuses its first durable write), so a mob Shutdown reported that
+  member `UnregisterPending` for good, and a later owner's executor
+  registration on the session was refused. When no runtime loop can hold
+  the registration's mutation fence (no pending or committed attachment and
+  no runtime-loop teardown slot), the discard now takes the fence itself and
+  publishes the durability-ready cold successor, which the exact unregister
+  then settles, and a later owner's executor registration cold-reloads such
+  a registration as it does one whose loop handed its executor back. A
+  registration whose runtime loop is still attached keeps its fence until
+  that loop hands it back, and the discard waits for that handoff, as
+  before.
 
 ## [0.9.3] - 2026-10-18
 

@@ -14553,7 +14553,8 @@ impl MobHandle {
     /// `options.deadline` is the caller's own bound (for example below a
     /// process supervisor's termination grace period): when it elapses,
     /// every member Shutdown is still waiting on is reported (an unfinished
-    /// runtime unregister as `UnregisterPending`) and Shutdown returns.
+    /// runtime unregister as `UnregisterPending`, whose settlement follows
+    /// the member's exact registration afterwards) and Shutdown returns.
     /// Without a deadline the member lifecycle hang guard is the failure
     /// bound. Durable state stays re-drivable on the next start either way.
     pub async fn shutdown_with_report(

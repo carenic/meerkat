@@ -512,10 +512,12 @@ pub use reconcile::{
     ReconcileStage,
 };
 pub use recovery::RestoreIncompatible;
-pub(crate) use retirement_settlement::{ActorTaskEnd, MemberLifecycleObservations};
+pub(crate) use retirement_settlement::{
+    ActorTaskEnd, MemberLifecycleObservations, unregister_refused_until_repair,
+};
 pub use retirement_settlement::{
-    MemberShutdownOutcome, MobShutdownReport, RetirementSettlement, RetirementSettlementWatch,
-    RetirementStage, ShutdownOptions,
+    MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, MobShutdownReport,
+    RetirementSettlement, RetirementSettlementWatch, RetirementStage, ShutdownOptions,
 };
 use roster_authority::{RosterAuthority, RosterMutator};
 #[cfg(not(target_arch = "wasm32"))]
