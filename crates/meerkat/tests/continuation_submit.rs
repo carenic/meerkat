@@ -178,7 +178,7 @@ impl ContinuationAddressResolver for MemberResolver {
         let Some(generation) = *self.generation.lock().expect("lock") else {
             return Ok(None);
         };
-        member_delivery_address(mob_id, identity, generation)
+        member_delivery_address(mob_id, team_incarnation(), identity, generation)
             .map(Some)
             .map_err(|error| error.to_string())
     }
@@ -243,7 +243,7 @@ async fn a_member_key_keeps_its_first_incarnation_across_respawn_and_retirement(
         .expect("commit at generation 1");
     assert_eq!(
         first.address,
-        member_delivery_address("team", "lead", 1)
+        member_delivery_address("team", team_incarnation(), "lead", 1)
             .expect("address")
             .0
     );
@@ -263,7 +263,7 @@ async fn a_member_key_keeps_its_first_incarnation_across_respawn_and_retirement(
         .expect("a new key binds the new generation");
     assert_eq!(
         second.address,
-        member_delivery_address("team", "lead", 2)
+        member_delivery_address("team", team_incarnation(), "lead", 2)
             .expect("address")
             .0
     );
@@ -734,4 +734,11 @@ async fn a_status_read_observes_the_owner_and_never_serves_it() {
         0,
         "no read asked the resolver to serve the owner"
     );
+}
+
+/// The incarnation of the mob `team` these tests address members of.
+fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "6a1d3c58-2f0e-4b7a-9c41-8e5d2b0f7a13"
+        .parse()
+        .expect("canonical mob incarnation id")
 }

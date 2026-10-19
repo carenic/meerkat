@@ -1,9 +1,12 @@
 //! Original-task continuations addressed to mob members.
 //!
 //! A member continuation is delivered to the member's incarnation, not to a
-//! session: the incarnation (`identity` at `generation`) survives a repoint to
-//! a successor session, and a respawn under the same identity is a new
-//! generation that never receives an older incarnation's rows.
+//! session: the incarnation (`identity` at `generation`, in one incarnation of
+//! its mob) survives a repoint to a successor session, and a respawn under the
+//! same identity is a new generation that never receives an older
+//! incarnation's rows. A mob destroyed and created again under the same id is
+//! a new mob incarnation whose generations start over, so its members never
+//! receive the rows of the old mob's members either.
 
 use std::sync::Arc;
 
@@ -11,6 +14,7 @@ use meerkat::{
     AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationOwner,
 };
 use meerkat_core::SessionId;
+use meerkat_core::service::MobIncarnationId;
 use meerkat_runtime::LogicalRuntimeId;
 
 use crate::ids::{AgentIdentity, MobId};
@@ -65,9 +69,14 @@ impl ContinuationAddressResolver for MobContinuationResolver {
         let Some(entry) = roster.get_by_identity(&AgentIdentity::from(identity.as_str())) else {
             return Ok(None);
         };
-        meerkat::member_delivery_address(mob_id, identity, entry.generation.get())
-            .map(Some)
-            .map_err(|error| error.to_string())
+        meerkat::member_delivery_address(
+            mob_id,
+            handle.incarnation(),
+            identity,
+            entry.generation.get(),
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
     }
 
     async fn resolve_address(
@@ -92,6 +101,18 @@ impl ContinuationAddressResolver for MobContinuationResolver {
             // its members' rows wait rather than strand.
             return Ok(AddressResolution::NotServed);
         };
+        match handle
+            .serves_member_address_incarnation(member.incarnation)
+            .await
+        {
+            Ok(true) => {}
+            // The addressed member belonged to an earlier mob under this id,
+            // destroyed since: it never serves again.
+            Ok(false) => return Ok(AddressResolution::Retired),
+            // Whether this mob serves an address from before 0.9.4 cannot
+            // be read now: its rows wait.
+            Err(_) => return Ok(AddressResolution::NotServed),
+        }
         let roster = handle.roster().await;
         let Some(entry) = roster.get_by_identity(&AgentIdentity::from(member.identity.as_str()))
         else {
@@ -133,6 +154,7 @@ impl ContinuationAddressResolver for MobContinuationResolver {
             if let Some(entry) = roster.find_by_bridge_session_id(session_id) {
                 return meerkat::member_delivery_address(
                     mob_id.as_str(),
+                    handle.incarnation(),
                     entry.agent_identity.as_str(),
                     entry.generation.get(),
                 )
@@ -144,12 +166,14 @@ impl ContinuationAddressResolver for MobContinuationResolver {
     }
 
     /// Observed from the roster and the mob's published lifecycle only, with
-    /// nothing revived: an incarnation is retired when its identity left the
-    /// roster or was respawned at another generation, or when its mob
-    /// completed or was destroyed. A completed mob can be reset, but a reset
-    /// first retires every member incarnation, so an incarnation addressed in
-    /// a completed mob never serves again. A mob this host does not manage
-    /// now may still be registered, so its members are not proven retired.
+    /// nothing revived: an incarnation is retired when the mob under its id
+    /// is another mob incarnation (its own mob was destroyed and created
+    /// again), when its identity left the roster or was respawned at another
+    /// generation, or when its mob completed or was destroyed. A completed
+    /// mob can be reset, but a reset first retires every member incarnation,
+    /// so an incarnation addressed in a completed mob never serves again. A
+    /// mob this host does not manage now may still be registered, so its
+    /// members are not proven retired.
     async fn observe_address(
         &self,
         address: &LogicalRuntimeId,
@@ -169,6 +193,13 @@ impl ContinuationAddressResolver for MobContinuationResolver {
         else {
             return Ok(AddressObservation::MayServe);
         };
+        if !handle
+            .serves_member_address_incarnation(member.incarnation)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(AddressObservation::Retired);
+        }
         let roster = handle.roster().await;
         let Some(entry) = roster.get_by_identity(&AgentIdentity::from(member.identity.as_str()))
         else {
@@ -185,6 +216,21 @@ impl ContinuationAddressResolver for MobContinuationResolver {
 }
 
 impl MobHandle {
+    /// Whether this mob serves the members of a delivery address that names
+    /// mob incarnation `incarnation`: only the one it runs at. An address
+    /// minted before 0.9.4 names none (`None`), and only the incarnation a
+    /// mob created before 0.9.4 got at its first resume serves it; a mob
+    /// created since is a later incarnation under its id.
+    pub(crate) async fn serves_member_address_incarnation(
+        &self,
+        incarnation: Option<MobIncarnationId>,
+    ) -> Result<bool, crate::MobError> {
+        match incarnation {
+            Some(incarnation) => Ok(incarnation == self.incarnation()),
+            None => self.incarnation_is_migrated().await,
+        }
+    }
+
     /// Submit a continuation for one of this mob's members, by identity.
     ///
     /// The member's incarnation current at the key's first submission is

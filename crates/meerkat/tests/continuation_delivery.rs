@@ -979,7 +979,8 @@ async fn an_older_row_without_an_identity_under_the_live_key_is_a_conflict() {
 async fn an_unserved_member_address_is_applied_when_an_attachment_serves_it() {
     let fixture = Fixture::new();
     let sink = Arc::new(RecordingSink::default());
-    let address = meerkat::member_delivery_address("team", "lead", 1).expect("address");
+    let address =
+        meerkat::member_delivery_address("team", team_incarnation(), "lead", 1).expect("address");
     let session = SessionId::new();
     let submission = meerkat_runtime::RuntimeDeliverySubmission::new(
         RuntimeDeliveryId::new("continuation:member").expect("id"),
@@ -1839,7 +1840,8 @@ impl meerkat::ContinuationAddressResolver for ServedBy {
 async fn a_member_row_before_the_host_binds_stays_blocked_until_a_wake_after_binding() {
     let fixture = Fixture::new();
     let sink = Arc::new(RecordingSink::default());
-    let address = meerkat::member_delivery_address("team", "lead", 1).expect("address");
+    let address =
+        meerkat::member_delivery_address("team", team_incarnation(), "lead", 1).expect("address");
     let submission = meerkat_runtime::RuntimeDeliverySubmission::new(
         RuntimeDeliveryId::new("continuation:member-window").expect("id"),
         meerkat_runtime::RuntimeDeliveryKind::Continuation,
@@ -2252,7 +2254,8 @@ async fn dropped_bindings_end_their_source_hint_and_the_owner_keeps_serving() {
 #[tokio::test]
 async fn a_stale_or_blind_continuation_rebind_is_refused() {
     let bindings = meerkat::ContinuationHostBindings::default();
-    let member = meerkat::member_delivery_address("team", "lead", 1).expect("address");
+    let member =
+        meerkat::member_delivery_address("team", team_incarnation(), "lead", 1).expect("address");
     let (a, b) = (SessionId::new(), SessionId::new());
     let first = bindings
         .bind(Arc::new(ServedBy(a.clone())), Arc::new(FakeJobs::default()))
@@ -2741,7 +2744,8 @@ mod hosting {
         SessionHostingAuthority,
         HostingClaim,
     ) {
-        let address = meerkat::member_delivery_address("team", "lead", 1).expect("address");
+        let address = meerkat::member_delivery_address("team", team_incarnation(), "lead", 1)
+            .expect("address");
         let (a, b) = (SessionId::new(), SessionId::new());
         let elsewhere = SessionHostingAuthority::new(capability.clone(), HostingOwner::mint());
         let a_claim = elsewhere.grant(&a).expect("another owner hosts A");
@@ -3004,4 +3008,11 @@ async fn a_continuation_behind_a_job_row_on_a_session_address_is_admitted_into_t
         0,
         "the job row ahead of it was applied too"
     );
+}
+
+/// The incarnation of the mob `team` these tests address members of.
+fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "6a1d3c58-2f0e-4b7a-9c41-8e5d2b0f7a13"
+        .parse()
+        .expect("canonical mob incarnation id")
 }

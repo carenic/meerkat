@@ -48,6 +48,16 @@ them.
   without reading any session. Consumers that persist scopes keep their
   version-1 scopes; a 0.9.3 build refuses a version-2 scope as an
   unsupported version.
+- `meerkat-runtime`: `MemberDeliveryAddress` gains the field
+  `incarnation: Option<MobIncarnationId>`, the incarnation of the mob the
+  member belongs to. `LogicalRuntimeId::for_member` writes an address that
+  names one as `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`,
+  and `LogicalRuntimeId::member_address` reads that form as well as the
+  `rt:member:{mob}:{identity}:{generation}` form minted before 0.9.4 (as
+  `incarnation: None`). `meerkat::member_delivery_address` takes the mob
+  incarnation as its second argument: pass the incarnation of the live mob
+  (`handle.incarnation()`). A 0.9.3 build does not read an
+  `rt:mob-member:` address as a member address.
 - `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
   `retained_registrations: usize`: notification registrations of the
   drained observer's change watches that were still running when the drain
@@ -480,6 +490,20 @@ them.
   audits-c). It also reaches both replay histories above, refuses three
   seeded defects, and checks that restoring the exact-successor replay rule
   makes those histories unreachable.
+- A continuation or detached-job delivery owed to a mob member is no longer
+  delivered to the member of the same identity in a mob destroyed and
+  created again under the same id (`meerkat-mob`). A member's delivery
+  address named the mob id, the identity and the generation only, and the
+  new mob's generations start over, so the new member served the rows owed
+  to the old one. The address now names the mob incarnation too
+  (`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`): the
+  address of a destroyed mob's member resolves as retired, and its rows
+  strand (`ContinuationStatus::Stranded` with `OwnerRetired`). An address
+  minted before 0.9.4 names no mob incarnation, and only a mob created
+  before 0.9.4, whose incarnation was assigned at its first 0.9.4 resume,
+  serves it. A continuation key submitted again for a member after its mob
+  was created again still replays its first receipt, bound to the old
+  member's address.
 
 ## [0.9.3] - 2026-10-18
 

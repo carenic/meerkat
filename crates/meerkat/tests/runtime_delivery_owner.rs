@@ -1629,7 +1629,8 @@ async fn a_member_jobs_deliveries_reach_the_member_after_a_repoint() {
     let fixture = Fixture::new();
     let superseded = SessionId::new();
     let successor = SessionId::new();
-    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let member = meerkat::member_delivery_address("team", team_incarnation(), "worker", 1)
+        .expect("member address");
     let sink = Arc::new(RecipientSink::default());
     let handle = fixture
         .owner()
@@ -1662,7 +1663,8 @@ async fn a_member_jobs_deliveries_reach_the_member_after_a_repoint() {
 async fn a_job_without_a_member_address_reaches_its_origin_session() {
     let fixture = Fixture::new();
     let origin = SessionId::new();
-    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let member = meerkat::member_delivery_address("team", team_incarnation(), "worker", 1)
+        .expect("member address");
     let sink = Arc::new(RecipientSink::default());
     let handle = fixture
         .owner()
@@ -1753,7 +1755,8 @@ async fn a_bundles_job_store_records_the_submitting_members_address() {
     )
     .expect("persistence bundle");
     let member_session = SessionId::new();
-    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let member = meerkat::member_delivery_address("team", team_incarnation(), "worker", 1)
+        .expect("member address");
     let _binding = bundle
         .continuation_bindings()
         .bind(
@@ -1852,7 +1855,8 @@ async fn a_replay_through_the_producer_store_keeps_its_admitted_origin_member() 
     )
     .expect("persistence bundle");
     let member_session = SessionId::new();
-    let member = meerkat::member_delivery_address("team", "worker", 1).expect("member address");
+    let member = meerkat::member_delivery_address("team", team_incarnation(), "worker", 1)
+        .expect("member address");
     let resolver = Arc::new(RepointableMember {
         current: std::sync::Mutex::new(member_session.clone()),
         address: member.clone(),
@@ -1912,4 +1916,11 @@ async fn a_replay_through_the_producer_store_keeps_its_admitted_origin_member() 
         ),
         Some(member.0)
     );
+}
+
+/// The incarnation of the mob `team` these tests address members of.
+fn team_incarnation() -> meerkat_core::service::MobIncarnationId {
+    "6a1d3c58-2f0e-4b7a-9c41-8e5d2b0f7a13"
+        .parse()
+        .expect("canonical mob incarnation id")
 }

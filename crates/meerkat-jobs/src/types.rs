@@ -53,10 +53,12 @@ string_id!(JobFailureCode, "job failure code");
 string_id!(
     /// The mob member a detached job was started for
     /// ([`JobSpec::origin_member_id`]). A host that runs mobs records the
-    /// member delivery address `rt:member:{mob}:{identity}:{generation}` of
-    /// the member whose current session submitted the job, and the job's
-    /// runtime deliveries then follow that member incarnation across a
-    /// repoint to a successor session. Any other value is an opaque id.
+    /// member delivery address
+    /// `rt:mob-member:{mob}:{incarnation}:{identity}:{generation}` (before
+    /// 0.9.4, `rt:member:{mob}:{identity}:{generation}`) of the member whose
+    /// current session submitted the job, and the job's runtime deliveries
+    /// then follow that member incarnation across a repoint to a successor
+    /// session. Any other value is an opaque id.
     OriginMemberId,
     "origin member id"
 );
@@ -340,7 +342,8 @@ pub struct JobSpec {
     pub origin_session_id: SessionId,
     /// The mob member the job was started for. A host that runs mobs
     /// records here the member delivery address
-    /// (`rt:member:{mob}:{identity}:{generation}`) of the member whose
+    /// (`rt:mob-member:{mob}:{incarnation}:{identity}:{generation}`; before
+    /// 0.9.4, `rt:member:{mob}:{identity}:{generation}`) of the member whose
     /// current session submitted the job: the job's runtime deliveries are
     /// then addressed to that member incarnation, which survives a repoint
     /// to a successor session, instead of to the origin session. Any other
