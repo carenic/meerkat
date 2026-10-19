@@ -6,8 +6,9 @@
 # the release commit (release.yml, workflow_dispatch, main, this repository,
 # a successful "Release prebuild gate", downloadable critical artifacts), as
 # soon as that gate passed even while the run's trailing lanes still build,
-# prefer the newest, wait for a gate that has not concluded, and fail loudly
-# when the API fails instead of reporting "no prebuild".
+# prefer the newest, wait for a gate that has not concluded unless a job it
+# needs already failed, and fail loudly when the API fails instead of
+# reporting "no prebuild".
 
 set -euo pipefail
 
@@ -96,6 +97,7 @@ runs() {
 }
 
 # jobs <run id> <prebuild gate conclusion, "pending" or "absent"> [variant suffix]
+#      [another job's name and conclusion, as JSON members]
 jobs() {
   local gate=""
   case "$2" in
@@ -103,7 +105,7 @@ jobs() {
     pending) gate=', {"name": "Release prebuild gate", "conclusion": null}' ;;
     *) gate=", {\"name\": \"Release prebuild gate\", \"conclusion\": \"$2\"}" ;;
   esac
-  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": null}%s]}\n' "${gate}" \
+  printf '{"jobs": [{"name": "Release binary build gate", "conclusion": null}%s%s]}\n' "${gate}" "${4:+, {$4\}}" \
     >"${FIXTURES}/$(key_for "repos/${REPO}/actions/runs/$1/jobs?per_page=100")${3:-}.json"
 }
 
@@ -137,7 +139,8 @@ lookup() {
   local label="$1" expected="$2" expected_status="$3" output status
   set +e
   output="$(PATH="${TEST_ROOT}/bin:${PATH}" FIXTURES="${FIXTURES}" GITHUB_REPOSITORY="${REPO}" \
-    MEERKAT_PREBUILD_POLL_SECONDS=0 MEERKAT_PREBUILD_WAIT_SECONDS="${WAIT_SECONDS:-600}" \
+    MEERKAT_PREBUILD_POLL_SECONDS=0 \
+    MEERKAT_PREBUILD_WAIT_SECONDS="$([[ "${WAIT_SECONDS:-}" == default ]] || echo "${WAIT_SECONDS:-600}")" \
     "${LOOKUP}" "${SHA}" 2>"${TEST_ROOT}/${label}.err")"
   status=$?
   set -e
@@ -248,6 +251,27 @@ jobs 402 success
 artifacts 402 "${critical_only[@]}" "rkat-web-package:false"
 lookup critical-ready-while-trailing-run "402 2" 0
 
+# 8b. A gate that has not concluded is not waited for once a job it needs
+#     failed, timed out or was cancelled; a trailing job's failure does not
+#     stop the wait.
+for ended in '"name": "Build Web SDK package", "conclusion": "failure"' \
+  '"name": "Build and package surface binaries with GitHub-hosted runners (rkat, aarch64-apple-darwin)", "conclusion": "cancelled"' \
+  '"name": "Release critical binary build gate", "conclusion": "timed_out"'; do
+  reset
+  runs "" "$(run_json 451 in_progress)"
+  jobs 451 pending "" "${ended}"
+  WAIT_SECONDS=120 lookup critical-job-ended "" 0
+  [[ "$(cat "${FIXTURES}/.calls-$(key_for "${runs_url}")")" -eq 1 ]] ||
+    fail "critical-job-ended: waited for a gate that cannot pass (${ended})"
+done
+reset
+runs "" "$(run_json 452 in_progress)"
+trailing='"name": "Cross-compile and package Windows surface binaries on Linux", "conclusion": "failure"'
+jobs 452 pending ".1" "${trailing}"
+jobs 452 success ".2" "${trailing}"
+complete_artifacts 452
+lookup trailing-job-failed "452 2" 0
+
 # 9. A run whose gate has not concluded past the wait budget is not waited
 #    for forever.
 reset
@@ -255,6 +279,23 @@ runs "" "$(run_json 501 in_progress .github/workflows/release.yml workflow_dispa
   "$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)")"
 jobs 501 pending
 WAIT_SECONDS=600 lookup stale-running "" 0
+
+# 9b. The default budget outlasts the slowest measured prebuild gate on the
+#     tag's backend (v0.9.2's BuildBuddy gate concluded after 94.7 minutes,
+#     past v0.9.3's former 100-minute default): a run 110 minutes old is still
+#     waited for, and one 145 minutes old is not.
+reset
+runs "" "$(run_json 502 in_progress .github/workflows/release.yml workflow_dispatch main "${SHA}" "${REPO}" \
+  "$(date -u -d '-110 minutes' +%Y-%m-%dT%H:%M:%SZ)")"
+jobs 502 pending ".1"
+jobs 502 success ".2"
+complete_artifacts 502
+WAIT_SECONDS=default lookup default-budget-waits "502 2" 0
+reset
+runs "" "$(run_json 503 in_progress .github/workflows/release.yml workflow_dispatch main "${SHA}" "${REPO}" \
+  "$(date -u -d '-145 minutes' +%Y-%m-%dT%H:%M:%SZ)")"
+jobs 503 pending
+WAIT_SECONDS=default lookup default-budget-ends "" 0
 
 # 10. An API failure fails the lookup instead of reading as "no prebuild".
 reset
@@ -271,5 +312,35 @@ status=$?
 set -e
 [[ "${status}" -eq 2 ]] || fail "malformed commit: expected status 2, got ${status}"
 echo "ok: malformed-commit"
+
+# 12. The lookup's PREBUILD_GATE_JOB and every CRITICAL_JOBS pattern name a
+#     job of release.yml: a renamed gate would leave every run's gate absent,
+#     so no prebuild would ever be accepted, and a renamed critical job would
+#     silently stop the lookup from giving up on a prebuild whose gate can no
+#     longer pass.
+job_names="$(sed -n 's/^    name: //p' "${REPO_ROOT}/.github/workflows/release.yml" | sed 's/^"\(.*\)"$/\1/')"
+gate_job="$(sed -n 's/^PREBUILD_GATE_JOB="\(.*\)"$/\1/p' "${LOOKUP}")"
+[[ -n "${gate_job}" ]] || fail "critical-job-names: no PREBUILD_GATE_JOB in ${LOOKUP}"
+grep -Fxq -- "${gate_job}" <<<"${job_names}" || fail "critical-job-names: PREBUILD_GATE_JOB '${gate_job}' names no job of release.yml"
+patterns="$(sed -n '/^CRITICAL_JOBS=(/,/^)/s/^  "\(.*\)"$/\1/p' "${LOOKUP}")"
+[[ -n "${patterns}" ]] || fail "critical-job-names: no CRITICAL_JOBS patterns in ${LOOKUP}"
+# Every entry is read: one written with other quoting or indentation would
+# otherwise skip the check below. Bash itself counts the array.
+# shellcheck disable=SC2016 # expanded by the inner shell
+critical_count="$(bash -c 'eval "$(sed -n "/^CRITICAL_JOBS=(/,/^)/p" "$1")" && echo "${#CRITICAL_JOBS[@]}"' _ "${LOOKUP}")"
+pattern_count="$(grep -c '' <<<"${patterns}")"
+[[ "${pattern_count}" == "${critical_count}" ]] || fail "critical-job-names: read ${pattern_count} of the ${critical_count:-?} CRITICAL_JOBS entries"
+while IFS= read -r pattern; do
+  matched=false
+  while IFS= read -r job_name; do
+    # shellcheck disable=SC2053 # the pattern is a glob
+    if [[ "${job_name}" == ${pattern} ]]; then
+      matched=true
+      break
+    fi
+  done <<<"${job_names}"
+  [[ "${matched}" == true ]] || fail "critical-job-names: CRITICAL_JOBS pattern '${pattern}' names no job of release.yml"
+done <<<"${patterns}"
+echo "ok: critical-job-names"
 
 echo "release-find-prebuild contract holds"

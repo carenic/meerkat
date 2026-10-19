@@ -16,8 +16,9 @@ const SHA = "0123456789abcdef0123456789abcdef01234567";
 const IMAGE_DIGEST = `sha256:${"ab".repeat(32)}`;
 const goodRenovate = {
   extends: ["config:recommended", "helpers:pinGitHubActionDigests"],
+  vulnerabilityAlerts: { automerge: false },
   packageRules: [
-    { matchUpdateTypes: ["patch"], automerge: true },
+    { matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "7 days" },
     { matchManagers: ["github-actions"], matchUpdateTypes: ["digest"], dependencyDashboardApproval: true },
     { matchManagers: ["github-actions"], automerge: false, minimumReleaseAge: "7 days" },
   ],
@@ -234,12 +235,12 @@ try {
     ["global automerge", { ...goodRenovate, automerge: true }, "automerge is on for every update"],
     [
       "the old github-actions automerge rule",
-      { ...goodRenovate, packageRules: [{ matchManagers: ["github-actions"], automerge: true }] },
+      { ...goodRenovate, packageRules: [{ matchManagers: ["github-actions"], automerge: true, minimumReleaseAge: "7 days" }] },
       "no packageRule turns automerge off",
     ],
     [
       "a patch automerge after the off rule",
-      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchUpdateTypes: ["patch"], automerge: true }] },
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "7 days" }] },
       "can turn automerge on",
     ],
     [
@@ -247,7 +248,7 @@ try {
       {
         ...goodRenovate,
         packageRules: [
-          { matchUpdateTypes: ["patch"], automerge: true },
+          { matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "7 days" },
           { matchManagers: ["github-actions"], matchUpdateTypes: ["major"], automerge: false, minimumReleaseAge: "7 days" },
         ],
       },
@@ -255,8 +256,11 @@ try {
     ],
     [
       "no cooldown",
-      { ...goodRenovate, packageRules: [{ matchUpdateTypes: ["patch"], automerge: true }, { matchManagers: ["github-actions"], automerge: false }] },
-      "minimumReleaseAge",
+      {
+        ...goodRenovate,
+        packageRules: [{ matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "7 days" }, { matchManagers: ["github-actions"], automerge: false }],
+      },
+      "github-actions updates lack a minimumReleaseAge",
     ],
     [
       "digest updates not held",
@@ -281,6 +285,41 @@ try {
     ["automerge for vulnerability fixes", { ...goodRenovate, vulnerabilityAlerts: { automerge: true } }, "vulnerabilityAlerts.automerge turns automerge on"],
     ["automerge for an update type", { ...goodRenovate, digest: { automerge: true } }, "digest.automerge turns automerge on"],
     ["automerge for lock file maintenance", { ...goodRenovate, lockFileMaintenance: { enabled: true, automerge: true } }, "lockFileMaintenance.automerge"],
+    [
+      "a patch automerge without the release age",
+      { ...goodRenovate, packageRules: [{ matchUpdateTypes: ["patch"], automerge: true }, ...goodRenovate.packageRules.slice(1)] },
+      'packageRules[0] turns automerge on without a minimumReleaseAge of "7 days"',
+    ],
+    [
+      "an automerge rule with a shorter release age",
+      { ...goodRenovate, packageRules: [{ matchUpdateTypes: ["patch"], automerge: true, minimumReleaseAge: "3 days" }, ...goodRenovate.packageRules.slice(1)] },
+      'packageRules[0] turns automerge on without a minimumReleaseAge of "7 days"',
+    ],
+    [
+      "a later rule that shortens the release age",
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchPackageNames: ["serde"], minimumReleaseAge: "1 day" }] },
+      "packageRules[3] can shorten the release age of updates packageRules[0] automerges",
+    ],
+    [
+      "a later rule that clears the release age",
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["npm"], minimumReleaseAge: null }] },
+      "packageRules[3] can shorten the release age of updates packageRules[0] automerges",
+    ],
+    [
+      "a preset whose rules the check cannot read",
+      { ...goodRenovate, extends: [...goodRenovate.extends, ":automergeMinor"] },
+      'extends names ":automergeMinor"',
+    ],
+    [
+      "the legacy spelling of the release age",
+      { ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["npm"], stabilityDays: 0 }] },
+      "packageRules[3].stabilityDays",
+    ],
+    [
+      "vulnerability fixes left to the patch automerge",
+      Object.fromEntries(Object.entries(goodRenovate).filter(([key]) => key !== "vulnerabilityAlerts")),
+      "vulnerabilityAlerts does not turn automerge off",
+    ],
   ]) {
     const problems = renovateProblems(config);
     assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);
@@ -306,9 +345,21 @@ try {
       assert.ok(problems.some((problem) => problem.includes(message)), `${label}: ${problems.join("; ")}`);
     }
   }
-  // A rule for other managers may automerge after the github-actions rule.
+  // A rule for other managers may automerge after the github-actions rule,
+  // with the release age; a later rule may lengthen the age, turn automerge
+  // off for some packages, or shorten the age of updates it turns automerge
+  // off for.
   assert.deepEqual(
-    renovateProblems({ ...goodRenovate, packageRules: [...goodRenovate.packageRules, { matchManagers: ["cargo"], automerge: true }] }),
+    renovateProblems({
+      ...goodRenovate,
+      packageRules: [
+        ...goodRenovate.packageRules,
+        { matchManagers: ["cargo"], automerge: true, minimumReleaseAge: "7 days" },
+        { matchPackageNames: ["serde"], minimumReleaseAge: "14 days" },
+        { matchPackageNames: ["serde-saphyr", "granit-parser"], automerge: false },
+        { matchPackageNames: ["hyper"], automerge: false, minimumReleaseAge: "1 day" },
+      ],
+    }),
     [],
   );
 } finally {

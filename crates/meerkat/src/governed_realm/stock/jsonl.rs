@@ -155,6 +155,9 @@ fn jsonl_input(
     input: Input,
     original: PendingOriginal,
 ) -> Result<StockJsonlInput, StockGovernanceError> {
+    // Defence in depth: the governed JSONL connection binds only the prompt
+    // of a turn it starts, and `bind_prompt` already refuses any other input
+    // before anything is written, so no non-prompt reaches this check today.
     let Input::Prompt(prompt) = &input else {
         return Err(StockGovernanceError::Binding(
             "a governed JSONL input is a prompt".into(),
