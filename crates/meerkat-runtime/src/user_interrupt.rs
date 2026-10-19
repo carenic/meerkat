@@ -32,7 +32,7 @@ impl MeerkatMachine {
         session_id: &SessionId,
         dispatch_id: uuid::Uuid,
         expected_run_id: &meerkat_core::RunId,
-        captured_gate: &Arc<crate::tokio::sync::Mutex<()>>,
+        captured_gate: &crate::meerkat_machine::SessionMutationGate,
         captured_authority: &Arc<
             std::sync::Mutex<crate::meerkat_machine::dsl::MeerkatMachineAuthority>,
         >,
@@ -52,12 +52,22 @@ impl MeerkatMachine {
             {
                 Ok(lease) => Some(lease),
                 Err(_) => {
-                    let _guard = Arc::clone(captured_gate).lock_owned().await;
-                    let mut sessions = self.sessions.write().await;
                     let result = Ok(false);
+                    // The member is no longer current, so the answer does not
+                    // need the gate; only clearing the dispatch slot does. A
+                    // session that degraded while another holder keeps the
+                    // gate keeps the slot until it is reloaded.
+                    let Ok(_guard) = self
+                        .lock_live_session_mutation_gate(session_id, captured_gate)
+                        .await
+                    else {
+                        result_tx.send_replace(Some(result.clone()));
+                        return result;
+                    };
+                    let mut sessions = self.sessions.write().await;
                     result_tx.send_replace(Some(result.clone()));
                     if let Some(entry) = sessions.get_mut(session_id)
-                        && Arc::ptr_eq(&entry.mutation_gate, captured_gate)
+                        && entry.mutation_gate.same_gate(captured_gate)
                         && entry
                             .pending_user_interrupt_dispatch
                             .as_ref()
@@ -70,9 +80,21 @@ impl MeerkatMachine {
             },
             None => None,
         };
-        let gate_guard = match member_lease.as_ref() {
-            Some(lease) => Arc::clone(&lease.session_mutation_gate).lock_owned().await,
-            None => Arc::clone(captured_gate).lock_owned().await,
+        let gate = match member_lease.as_ref() {
+            Some(lease) => &lease.session_mutation_gate,
+            None => captured_gate,
+        };
+        let gate_guard = match self.lock_live_session_mutation_gate(session_id, gate).await {
+            Ok(guard) => guard,
+            Err(required) => {
+                // The session degraded while another holder keeps its gate:
+                // the dispatch cannot be reconciled with its exact attachment
+                // before the session is reloaded. The degraded settlement
+                // hard-cancels the exact run instead.
+                let result = Err(super::degraded_gate_wait_refusal(required));
+                result_tx.send_replace(Some(result.clone()));
+                return result;
+            }
         };
 
         let exact_current = {
@@ -89,7 +111,7 @@ impl MeerkatMachine {
             let handle_matches = entry
                 .interrupt_handle()
                 .is_some_and(|current| Arc::ptr_eq(&current, interrupt_handle));
-            let attachment_matches = Arc::ptr_eq(&entry.mutation_gate, captured_gate)
+            let attachment_matches = entry.mutation_gate.same_gate(captured_gate)
                 && Arc::ptr_eq(&entry.dsl_authority, captured_authority)
                 && entry.live_attachment_id() == attachment_id
                 && entry.provisional_materialization_claim_id == provisional_claim_id

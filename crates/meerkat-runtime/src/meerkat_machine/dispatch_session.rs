@@ -1567,7 +1567,7 @@ impl MeerkatMachine {
                     Arc::downgrade(&self.shared),
                     session_id.clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 ),
                 entry.agent_binding.clone(),
                 entry.tool_surface_gate.clone(),
@@ -1715,14 +1715,17 @@ impl MeerkatMachine {
             None => None,
         };
         let gate_guard = if let Some(lease) = &member_lease {
-            let guard = Arc::clone(&lease.session_mutation_gate).lock_owned().await;
+            let guard = self
+                .lock_live_session_mutation_gate(session_id, &lease.session_mutation_gate)
+                .await
+                .map_err(degraded_gate_wait_refusal)?;
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: "user interrupt runtime session disappeared".to_string(),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &lease.session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&lease.session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: "user interrupt runtime session was replaced".to_string(),
                 });
@@ -1734,19 +1737,26 @@ impl MeerkatMachine {
                 // current gate. Session absence/replacement means the expected run
                 // is already no longer current, which is the level-triggered
                 // terminal condition rather than a cancellation error.
-                Some(_) => match self.lock_current_session_mutation_gate(session_id).await {
+                Some(_) => match self
+                    .lock_current_live_session_mutation_gate(session_id)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?
+                {
                     Some(guard) => guard,
                     None => return Ok(false),
                 },
                 None => {
                     let gate = self.session_mutation_gate(session_id).await;
                     match gate {
-                        Some(g) => match Arc::clone(&g).try_lock_owned() {
+                        Some(g) => match g.try_lock() {
                             Ok(guard) => guard,
                             Err(_) if self.generated_stop_deferred(session_id).await => {
                                 return Ok(false);
                             }
-                            Err(_) => g.lock_owned().await,
+                            Err(_) => self
+                                .lock_live_session_mutation_gate(session_id, &g)
+                                .await
+                                .map_err(degraded_gate_wait_refusal)?,
                         },
                         None => return Ok(false),
                     }
@@ -1805,7 +1815,7 @@ impl MeerkatMachine {
                 return Err(RuntimeDriverError::NotReady { state: phase });
             };
             (
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 Arc::clone(&entry.dsl_authority),
                 entry.live_attachment_id(),
                 entry.provisional_materialization_claim_id,
@@ -1945,7 +1955,7 @@ impl MeerkatMachine {
             let Some(entry) = sessions.get_mut(session_id) else {
                 return Ok(false);
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &captured_gate)
+            if !entry.mutation_gate.same_gate(&captured_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_authority)
                 || entry.live_attachment_id() != attachment_id
                 || entry.provisional_materialization_claim_id != provisional_claim_id

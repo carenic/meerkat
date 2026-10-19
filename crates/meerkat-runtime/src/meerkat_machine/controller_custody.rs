@@ -409,15 +409,11 @@ impl MeerkatMachine {
         let mut mutations = Vec::with_capacity(ordered.len());
         let mut drivers = Vec::with_capacity(ordered.len());
         for (_, entry) in &ordered {
-            mutations.push(
-                Arc::clone(&entry.mutation_gate)
-                    .try_lock_owned()
-                    .map_err(|_| {
-                        crate::meerkat_machine::credential_custody::unavailable(
-                            crate::traits::ControllerReadinessFailure::Busy,
-                        )
-                    })?,
-            );
+            mutations.push(entry.mutation_gate.try_lock().map_err(|_| {
+                crate::meerkat_machine::credential_custody::unavailable(
+                    crate::traits::ControllerReadinessFailure::Busy,
+                )
+            })?);
         }
         for (_, entry) in &ordered {
             drivers.push(Arc::clone(&entry.driver).try_lock_owned().map_err(|_| {

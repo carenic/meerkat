@@ -8805,9 +8805,9 @@ async fn quiescent_close_busy_leaves_the_owner_serving_its_queued_input() {
 /// mutation gate this test holds. While it waits, the ingress owns two
 /// references to the gate: the one it read from the registry and the one its
 /// lock acquisition consumed.
-async fn await_ingress_waiting_on_gate<T>(gate: &Arc<T>, before: usize) {
+async fn await_ingress_waiting_on_gate(gate: &SessionMutationGate, before: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(gate) < before + 2 {
+        while gate.copy_count() < before + 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -8840,16 +8840,10 @@ async fn quiescent_close_that_wins_the_mutation_gate_refuses_ingress_queued_behi
         .current_session_registration_witness(&session_id)
         .await
         .expect("a registered runtime exposes its exact registration");
-    let mutation_gate = {
-        let sessions = machine.sessions.read().await;
-        Arc::clone(
-            &sessions
-                .get(&session_id)
-                .expect("registered session entry")
-                .mutation_gate,
-        )
-    };
-    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+    let mutation_gate = sessions_mutation_gate(&machine, &session_id).await;
+    let held_gate = mutation_gate
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
 
     let close = machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
     tokio::pin!(close);
@@ -8871,7 +8865,7 @@ async fn quiescent_close_that_wins_the_mutation_gate_refuses_ingress_queued_behi
     }
 
     // Ingress queues on the same gate, behind the waiting close.
-    let before_ingress = Arc::strong_count(&mutation_gate);
+    let before_ingress = mutation_gate.copy_count();
     let ingress = {
         let machine = Arc::clone(&machine);
         let session_id = session_id.clone();
@@ -8938,19 +8932,13 @@ async fn quiescent_close_queued_behind_ingress_that_won_the_mutation_gate_answer
         .current_session_registration_witness(&session_id)
         .await
         .expect("a registered runtime exposes its exact registration");
-    let mutation_gate = {
-        let sessions = machine.sessions.read().await;
-        Arc::clone(
-            &sessions
-                .get(&session_id)
-                .expect("registered session entry")
-                .mutation_gate,
-        )
-    };
-    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+    let mutation_gate = sessions_mutation_gate(&machine, &session_id).await;
+    let held_gate = mutation_gate
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
 
     // Ingress reaches the gate first and waits behind this test.
-    let before_ingress = Arc::strong_count(&mutation_gate);
+    let before_ingress = mutation_gate.copy_count();
     let won = make_prompt("wins the gate");
     let won_id = won.id().clone();
     let ingress = {
@@ -19678,13 +19666,15 @@ mod stop_teardown_coordinator_class {
                 .get(&session_id)
                 .expect("attached session must remain registered");
             (
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 entry.wake_sender().expect("attached loop wake sender"),
                 Arc::clone(&entry.completions),
             )
         };
         let completion = completions.lock().await.register(input_id);
-        let mutation_guard = mutation_gate.lock_owned().await;
+        let mutation_guard = mutation_gate
+            .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+            .await;
 
         let stop = machine.stop_runtime_executor(&session_id, "linearized stop ownership");
         tokio::pin!(stop);
@@ -22628,7 +22618,10 @@ mod stop_under_gate_deadlock_class {
 
         let mutation_guard = tokio::time::timeout(
             Duration::from_secs(1),
-            machine.lock_current_session_mutation_gate(&session_id),
+            machine.lock_current_settled_session_mutation_gate(
+                &session_id,
+                crate::meerkat_machine::SettledGateWait::TestFixture,
+            ),
         )
         .await
         .expect("surface cleanup must not retain the machine mutation gate")
@@ -39449,7 +39442,10 @@ async fn unregister_retains_live_lifecycle_gate_through_entry_removal() {
         .await
         .expect("registered session has a live/lifecycle gate");
     let mutation_guard = machine
-        .lock_current_session_mutation_gate(&session_id)
+        .lock_current_settled_session_mutation_gate(
+            &session_id,
+            crate::meerkat_machine::SettledGateWait::TestFixture,
+        )
         .await
         .expect("registered session has a mutation gate");
 
@@ -39532,9 +39528,15 @@ async fn stale_live_lifecycle_lease_cannot_target_same_id_replacement() {
 
     assert!(
         machine
-            .lock_session_mutation_gate_for_live_lifecycle_lease(&session_id, &stale_lease)
+            .lock_session_mutation_gate_for_live_lifecycle_lease(
+                &session_id,
+                &stale_lease,
+                crate::meerkat_machine::SessionMutationGateWait::Settled(
+                    crate::meerkat_machine::SettledGateWait::TestFixture
+                ),
+            )
             .await
-            .is_none(),
+            .is_ok_and(|guard| guard.is_none()),
         "an old live gate must not authorize mutation of a same-ID replacement"
     );
     assert!(
@@ -41519,7 +41521,7 @@ async fn recovered_predecessor_inputs_are_silently_abandoned_before_attachment_s
 /// a waiter (a runtime loop it lets serve) queues a [`GateReleaseWitness`]
 /// first, and its tells are then classified by that witness's grant instead.
 struct RunlessTerminalTells {
-    gate: Arc<tokio::sync::Mutex<()>>,
+    gate: SessionMutationGate,
     with_gate_free: Arc<AtomicUsize>,
     under_gate: Arc<AtomicUsize>,
     told: Arc<Notify>,
@@ -41562,7 +41564,7 @@ impl RunlessTerminalTells {
         let witness_queued = Arc::new(AtomicBool::new(false));
         let witness_granted = Arc::new(AtomicBool::new(false));
         machine.set_runless_input_terminal_hint(Arc::new({
-            let gate = Arc::clone(&gate);
+            let gate = gate.clone();
             let with_gate_free = Arc::clone(&with_gate_free);
             let under_gate = Arc::clone(&under_gate);
             let told = Arc::clone(&told);
@@ -41598,9 +41600,11 @@ impl RunlessTerminalTells {
     fn queue_release_witness(&self) -> GateReleaseWitness {
         // Unconstrained: an exhausted coop budget would return Pending
         // without queueing, and wake the flag.
-        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(
-            Arc::clone(&self.gate).lock_owned(),
-        ));
+        let gate = self.gate.clone();
+        let mut waiter: GateWaiter = Box::pin(tokio::task::unconstrained(async move {
+            gate.lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+                .await
+        }));
         let waker = std::task::Waker::from(Arc::new(GrantFlag(Arc::clone(&self.witness_granted))));
         let queued =
             std::future::Future::poll(waiter.as_mut(), &mut std::task::Context::from_waker(&waker))
@@ -44065,7 +44069,7 @@ async fn cancelled_executor_setup_caller_leaves_process_owned_claim_to_commit() 
     let (driver, mutation_gate) = {
         let sessions = adapter.sessions.read().await;
         let entry = sessions.get(&session_id).expect("registered session entry");
-        (entry.driver.clone(), Arc::clone(&entry.mutation_gate))
+        (entry.driver.clone(), entry.mutation_gate.clone())
     };
 
     // Hold the driver lock to park setup while the session mutation gate is
@@ -44091,7 +44095,7 @@ async fn cancelled_executor_setup_caller_leaves_process_owned_claim_to_commit() 
                     state.lifecycle_phase == mm_dsl::MeerkatPhase::Attached
                         && state.registration_phase == mm_dsl::RegistrationPhase::Active
                 });
-            if claim_is_staged && Arc::clone(&mutation_gate).try_lock_owned().is_err() {
+            if claim_is_staged && mutation_gate.try_lock().is_err() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -53914,14 +53918,23 @@ async fn dead_runtime_loop_session_count_sees_a_real_corpse_and_not_a_clean_shut
 async fn registration_shell_identity(
     machine: &Arc<MeerkatMachine>,
     session_id: &SessionId,
-) -> Arc<crate::tokio::sync::Mutex<()>> {
-    let sessions = machine.sessions.read().await;
-    Arc::clone(
-        &sessions
-            .get(session_id)
-            .expect("registered session entry")
-            .mutation_gate,
-    )
+) -> SessionMutationGate {
+    sessions_mutation_gate(machine, session_id).await
+}
+
+/// A copy of the registered entry's mutation gate.
+async fn sessions_mutation_gate(
+    machine: &MeerkatMachine,
+    session_id: &SessionId,
+) -> SessionMutationGate {
+    machine
+        .sessions
+        .read()
+        .await
+        .get(session_id)
+        .expect("registered session entry")
+        .mutation_gate
+        .clone()
 }
 
 /// A durability skew is a condition to recover from, not a life sentence.
@@ -54030,7 +54043,7 @@ async fn degraded_non_mob_registration_cold_reloads_instead_of_bricking() {
 
     let reloaded_shell = registration_shell_identity(&machine, &session_id).await;
     assert!(
-        !Arc::ptr_eq(&bricked_shell, &reloaded_shell),
+        !bricked_shell.same_gate(&reloaded_shell),
         "recovery must publish a replacement registration cold-loaded from durable truth, not \
          republish the unreadable shell as healthy"
     );

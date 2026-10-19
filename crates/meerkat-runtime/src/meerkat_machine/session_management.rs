@@ -280,13 +280,10 @@ pub(super) fn machine_lifecycle_has_runtime_archive_residue(
 
 #[derive(Clone)]
 struct UnregisterEntryIncarnationWitness {
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     ops_lifecycle: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
     #[cfg(feature = "live")]
     live_lifecycle_gate: Arc<Mutex<()>>,
-    /// The entry's durability gate, whose degradation ends the saga's waits
-    /// for the mutation gate before its durable finalization.
-    durability_health: Option<super::DurabilityHealthHandle>,
 }
 
 /// How an unregister saga step waits for the exact session mutation gate.
@@ -307,7 +304,7 @@ enum UnregisterGateWait {
 
 impl UnregisterEntryIncarnationWitness {
     fn matches(&self, entry: &RuntimeSessionEntry) -> bool {
-        if !Arc::ptr_eq(&entry.mutation_gate, &self.mutation_gate)
+        if !entry.mutation_gate.same_gate(&self.mutation_gate)
             || !Arc::ptr_eq(&entry.ops_lifecycle, &self.ops_lifecycle)
         {
             return false;
@@ -1596,7 +1593,7 @@ impl MeerkatMachine {
                     Arc::downgrade(&self.shared),
                     session_id.clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 ),
                 coordinator.coordinator_id,
                 coordinator.result_rx.clone(),
@@ -2076,7 +2073,7 @@ impl MeerkatMachine {
             Arc::downgrade(&self.shared),
             session_id.clone(),
             session_entry.epoch_id.clone(),
-            Arc::downgrade(&session_entry.mutation_gate),
+            session_entry.mutation_gate.downgrade(),
         );
         let owner_loss = match self.reserve_consent_owner_loss(&session_entry._hosting_claim) {
             Ok(owner_loss) => owner_loss,
@@ -2404,7 +2401,7 @@ impl MeerkatMachine {
             owner_loss_proof: None,
             archive_recovered_registration: false,
             archive_recovered_from_quiescent: false,
-            mutation_gate: Arc::new(Mutex::new(())),
+            mutation_gate: SessionMutationGate::new(None),
             durability_health: None,
             #[cfg(feature = "live")]
             live_lifecycle_gate: Arc::new(Mutex::new(())),
@@ -2601,7 +2598,7 @@ impl MeerkatMachine {
             owner_loss_proof: None,
             archive_recovered_registration: false,
             archive_recovered_from_quiescent: false,
-            mutation_gate: Arc::new(Mutex::new(())),
+            mutation_gate: SessionMutationGate::new(None),
             durability_health: None,
             #[cfg(feature = "live")]
             live_lifecycle_gate: Arc::new(Mutex::new(())),
@@ -2820,12 +2817,13 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
-        let Some((claim, gate)) = self.sessions.read().await.get(session_id).map(|entry| {
-            (
-                entry._hosting_claim.clone(),
-                Arc::clone(&entry.mutation_gate),
-            )
-        }) else {
+        let Some((claim, gate)) = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| (entry._hosting_claim.clone(), entry.mutation_gate.clone()))
+        else {
             return Ok(());
         };
         let Some(reservation) = self.reserve_consent_owner_loss(&claim)? else {
@@ -2833,7 +2831,7 @@ impl MeerkatMachine {
         };
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(session_id) {
-            Some(entry) if Arc::ptr_eq(&entry.mutation_gate, &gate) => {
+            Some(entry) if entry.mutation_gate.same_gate(&gate) => {
                 entry.complete_owner_loss(Some(reservation));
                 Ok(())
             }
@@ -2993,7 +2991,7 @@ impl MeerkatMachine {
             owner_loss_proof: None,
             archive_recovered_registration: false,
             archive_recovered_from_quiescent: false,
-            mutation_gate: Arc::new(Mutex::new(())),
+            mutation_gate: SessionMutationGate::new(durability_health.clone()),
             durability_health: durability_health.clone(),
             #[cfg(feature = "live")]
             live_lifecycle_gate: Arc::new(Mutex::new(())),
@@ -4112,7 +4110,10 @@ impl MeerkatMachine {
         >,
         turn_finalization_boundary_already_held: bool,
     ) -> Result<bool, RuntimeDriverError> {
-        let Some(gate_guard) = self.lock_current_session_mutation_gate(session_id).await else {
+        let Some(gate_guard) = self
+            .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::PreInstall)
+            .await
+        else {
             return Ok(false);
         };
         let (rollback_registration, provisional_cleanup_attachment_id) = {
@@ -4171,10 +4172,11 @@ impl MeerkatMachine {
                 else {
                     return Ok(false);
                 };
-                let Some(gate_guard) = self
+                let Ok(Some(gate_guard)) = self
                     .lock_session_mutation_gate_for_live_lifecycle_lease(
                         session_id,
                         &live_lifecycle_lease,
+                        SessionMutationGateWait::Settled(SettledGateWait::PreInstall),
                     )
                     .await
                 else {
@@ -4264,7 +4266,10 @@ impl MeerkatMachine {
                 self.complete_post_stop_cleanup_if_needed(session_id, attachment_id, false)
                     .await?;
             }
-            let Some(gate_guard) = self.lock_current_session_mutation_gate(session_id).await else {
+            let Some(gate_guard) = self
+                .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::PreInstall)
+                .await
+            else {
                 return Ok(false);
             };
             gate_guard
@@ -4565,7 +4570,7 @@ impl MeerkatMachine {
                 witness: RuntimeSessionRegistrationWitness,
             },
             Claimed {
-                gate: Arc<Mutex<()>>,
+                gate: SessionMutationGate,
                 driver: SharedDriver,
                 completions: SharedCompletionRegistry,
                 ops_lifecycle: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
@@ -4604,12 +4609,15 @@ impl MeerkatMachine {
                 .await;
             let existing = loop {
                 if let Some(gate) = self.session_mutation_gate(&session_id).await {
-                    let gate_guard = Arc::clone(&gate).lock_owned().await;
+                    let gate_guard = self
+                        .lock_live_session_mutation_gate(&session_id, &gate)
+                        .await
+                        .map_err(degraded_gate_wait_refusal)?;
                     let mut sessions = self.sessions.write().await;
                     let Some(entry) = sessions.get_mut(&session_id) else {
                         continue;
                     };
-                    if !Arc::ptr_eq(&entry.mutation_gate, &gate) {
+                    if !entry.mutation_gate.same_gate(&gate) {
                         continue;
                     }
                     let unregister_settlement_required = entry
@@ -4698,7 +4706,7 @@ impl MeerkatMachine {
                                 Arc::downgrade(&self.shared),
                                 session_id.clone(),
                                 entry.epoch_id.clone(),
-                                Arc::downgrade(&entry.mutation_gate),
+                                entry.mutation_gate.downgrade(),
                             ),
                         };
                     }
@@ -4904,8 +4912,10 @@ impl MeerkatMachine {
                     return Err(err);
                 }
                 let owner_loss = self.reserve_consent_owner_loss(&hosting_claim)?;
-                let mutation_gate = Arc::new(Mutex::new(()));
-                let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
+                let mutation_gate = SessionMutationGate::new(durability_health.clone());
+                let gate_guard = mutation_gate
+                    .lock_settled(SettledGateWait::PreInstall)
+                    .await;
                 let mut sessions = self.sessions.write().await;
                 if sessions.contains_key(&session_id) {
                     continue;
@@ -4945,7 +4955,7 @@ impl MeerkatMachine {
                         owner_loss_proof,
                         archive_recovered_registration: false,
                         archive_recovered_from_quiescent: false,
-                        mutation_gate: Arc::clone(&mutation_gate),
+                        mutation_gate: mutation_gate.clone(),
                         durability_health: durability_health.clone(),
                         #[cfg(feature = "live")]
                         live_lifecycle_gate: Arc::new(Mutex::new(())),
@@ -5137,7 +5147,7 @@ impl MeerkatMachine {
                     state: RuntimeState::Destroyed,
                 })?;
             if entry.epoch_id != epoch_id
-                || !Arc::ptr_eq(&entry.mutation_gate, &registration_gate)
+                || !entry.mutation_gate.same_gate(&registration_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &dsl_authority)
                 || !Arc::ptr_eq(&entry.driver, &driver)
             {
@@ -5383,7 +5393,7 @@ impl MeerkatMachine {
                     entry.clear_dead_attachment();
                     if entry.physical_attachment_is_live() {
                         false
-                    } else if !Arc::ptr_eq(&entry.mutation_gate, &registration_gate)
+                    } else if !entry.mutation_gate.same_gate(&registration_gate)
                         || !Arc::ptr_eq(&entry.dsl_authority, &dsl_authority)
                         || !Arc::ptr_eq(&entry.driver, &driver)
                         || !Arc::ptr_eq(&entry.completions, &completions)
@@ -5487,7 +5497,21 @@ impl MeerkatMachine {
                 let _ = release.await;
             }
         }
-        let pending_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let pending_guard = match self
+            .lock_live_session_mutation_gate(&session_id, &registration_gate)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(required) => {
+                let _ = self
+                    .cleanup_unserved_executor_attachment(
+                        &witness,
+                        turn_finalization_boundary_already_held,
+                    )
+                    .await;
+                return Err(degraded_gate_wait_refusal(required));
+            }
+        };
         // `should_wake` was read before the runtime loop took the registration
         // gate for startup recovery. Input admitted after the loop released it
         // and before `pending_guard` reacquired it found the slot Pending, so
@@ -5505,7 +5529,7 @@ impl MeerkatMachine {
             let sessions = self.sessions.read().await;
             sessions.get(&session_id).is_some_and(|entry| {
                 entry.epoch_id == witness.epoch_id
-                    && Arc::ptr_eq(&entry.mutation_gate, &registration_gate)
+                    && entry.mutation_gate.same_gate(&registration_gate)
                     && Arc::ptr_eq(&entry.dsl_authority, &dsl_authority)
                     && Arc::ptr_eq(&entry.driver, &driver)
                     && Arc::ptr_eq(&entry.completions, &completions)
@@ -5643,7 +5667,7 @@ impl MeerkatMachine {
             Arc::downgrade(&self.shared),
             session_id.clone(),
             entry.epoch_id.clone(),
-            Arc::downgrade(&entry.mutation_gate),
+            entry.mutation_gate.downgrade(),
         );
         if entry.require_durability_ready().is_err() {
             return RuntimeSessionAttachmentState::ReloadRequired {
@@ -5759,7 +5783,7 @@ impl MeerkatMachine {
             Arc::downgrade(&self.shared),
             session_id.clone(),
             entry.epoch_id.clone(),
-            Arc::downgrade(&entry.mutation_gate),
+            entry.mutation_gate.downgrade(),
         ))
     }
 
@@ -5778,7 +5802,7 @@ impl MeerkatMachine {
                     Arc::downgrade(&self.shared),
                     session_id.clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 )
             })
             .collect()
@@ -5807,7 +5831,7 @@ impl MeerkatMachine {
             Arc::downgrade(&self.shared),
             bindings.session_id().clone(),
             entry.epoch_id.clone(),
-            Arc::downgrade(&entry.mutation_gate),
+            entry.mutation_gate.downgrade(),
         ))
     }
 
@@ -5925,7 +5949,7 @@ impl MeerkatMachine {
                         Arc::downgrade(&self.shared),
                         session_id.clone(),
                         entry.epoch_id.clone(),
-                        Arc::downgrade(&entry.mutation_gate),
+                        entry.mutation_gate.downgrade(),
                     ))
                 }
                 _ => Observed::InFlight(Arc::clone(&state.changed)),
@@ -6044,7 +6068,10 @@ impl MeerkatMachine {
         let Some(gate) = witness.registration_gate() else {
             return Ok(RuntimeOwnerlessRegistrationAdmission::NotCurrent);
         };
-        let mutation_guard = gate.lock_owned().await;
+        let mutation_guard = self
+            .lock_live_session_mutation_gate(witness.session_id(), &gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         if self
             .current_session_registration_witness(witness.session_id())
             .await
@@ -6305,7 +6332,9 @@ impl MeerkatMachine {
         let Some(registration_gate) = witness.registration_gate() else {
             return Ok(ReloadRequiredRegistrationSettlement::NotCurrent);
         };
-        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let mutation_guard = registration_gate
+            .lock_settled(SettledGateWait::AfterSettle)
+            .await;
         {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(witness.session_id()) else {
@@ -6361,7 +6390,9 @@ impl MeerkatMachine {
         // No non-clone process owner is consumed until physical live-channel
         // absence is proven. A retry after failure above therefore retains
         // every exact join obligation in the entry.
-        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let mutation_guard = registration_gate
+            .lock_settled(SettledGateWait::AfterSettle)
+            .await;
         let (
             runtime_loop,
             captured_teardown_slot,
@@ -6637,7 +6668,9 @@ impl MeerkatMachine {
         else {
             return Ok(ReloadRequiredRegistrationSettlement::NotCurrent);
         };
-        let mutation_guard = Arc::clone(&registration_gate).lock_owned().await;
+        let mutation_guard = registration_gate
+            .lock_settled(SettledGateWait::AfterSettle)
+            .await;
         let (replaced, successor) = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get(witness.session_id()) else {
@@ -6730,7 +6763,7 @@ impl MeerkatMachine {
                 Arc::downgrade(&self.shared),
                 recovered_session_id.clone(),
                 recovered_entry.epoch_id.clone(),
-                Arc::downgrade(&recovered_entry.mutation_gate),
+                recovered_entry.mutation_gate.downgrade(),
             );
             (
                 sessions.insert(recovered_session_id, recovered_entry),
@@ -6842,8 +6875,9 @@ impl MeerkatMachine {
         }
         let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
         let Some(guard) = self
-            .lock_current_session_mutation_gate(witness.session_id())
+            .lock_current_live_session_mutation_gate(witness.session_id())
             .await
+            .map_err(degraded_gate_wait_refusal)?
         else {
             return Ok(false);
         };
@@ -6908,8 +6942,9 @@ impl MeerkatMachine {
         }
         let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
         let Some(mutation_guard) = self
-            .lock_current_session_mutation_gate(witness.session_id())
+            .lock_current_live_session_mutation_gate(witness.session_id())
             .await
+            .map_err(degraded_gate_wait_refusal)?
         else {
             return Ok(None);
         };
@@ -7162,7 +7197,7 @@ impl MeerkatMachine {
     where
         F: FnOnce(
             &RuntimeExecutorAttachmentWitness,
-            Arc<crate::tokio::sync::Mutex<()>>,
+            SessionMutationGate,
         ) -> Result<(), RuntimeDriverError>,
     {
         if !witness.belongs_to(self) {
@@ -7243,7 +7278,7 @@ impl MeerkatMachine {
                     ),
                 });
             }
-            let session_mutation_gate = Arc::clone(&entry.mutation_gate);
+            let session_mutation_gate = entry.mutation_gate.clone();
             let mut attachment = match std::mem::replace(
                 &mut entry.attachment_slot,
                 RuntimeLoopAttachmentSlot::Empty,
@@ -7560,7 +7595,10 @@ impl MeerkatMachine {
         {
             return Ok(RuntimeSessionQuiescentClose::AlreadyClosing);
         }
-        let mutation_guard = registration_gate.lock_owned().await;
+        let mutation_guard = self
+            .lock_live_session_mutation_gate(session_id, &registration_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         let (driver, finalization_pending) = {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
@@ -8023,7 +8061,11 @@ impl MeerkatMachine {
         session_id: &SessionId,
         observed_teardown_slot: &Arc<crate::runtime_loop::RuntimeLoopTeardownSlot>,
     ) -> Result<Option<meerkat_core::RuntimeEpochId>, RuntimeDriverError> {
-        let Some(mutation_guard) = self.lock_current_session_mutation_gate(session_id).await else {
+        let Some(mutation_guard) = self
+            .lock_current_live_session_mutation_gate(session_id)
+            .await
+            .map_err(degraded_gate_wait_refusal)?
+        else {
             return Ok(None);
         };
         let (observed_epoch, registration_phase) = {
@@ -8260,7 +8302,11 @@ impl MeerkatMachine {
         // linearization point: once the coordinator is visible, no ordinary
         // queued batch or revival can claim the old epoch first.
         let coordinator_gate = match self.session_mutation_gate(session_id).await {
-            Some(gate) => Some(gate.lock_owned().await),
+            Some(gate) => Some(
+                self.lock_live_session_mutation_gate(session_id, &gate)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?,
+            ),
             None if caller == RuntimeStopCleanupCaller::RuntimeLoopWatcher => {
                 return Ok(RuntimeStopCleanupJoin::Completed(Ok(())));
             }
@@ -8489,7 +8535,14 @@ impl MeerkatMachine {
         let Some(mutation_gate) = self.session_mutation_gate(session_id).await else {
             return;
         };
-        let _mutation_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        // A session that degrades while another holder keeps the gate keeps
+        // its shell for the reload-required discard.
+        let Ok(_mutation_guard) = self
+            .lock_live_session_mutation_gate(session_id, &mutation_gate)
+            .await
+        else {
+            return;
+        };
         let retired_attachment = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
@@ -8500,7 +8553,7 @@ impl MeerkatMachine {
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, teardown_slot));
             if entry.epoch_id != *epoch_id
-                || !Arc::ptr_eq(&entry.mutation_gate, &mutation_gate)
+                || !entry.mutation_gate.same_gate(&mutation_gate)
                 || !exact_slot_is_current
             {
                 return;
@@ -8531,7 +8584,14 @@ impl MeerkatMachine {
         let Some(mutation_gate) = self.session_mutation_gate(session_id).await else {
             return;
         };
-        let _mutation_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        // A session that degrades while another holder keeps the gate keeps
+        // its shell for the reload-required discard.
+        let Ok(_mutation_guard) = self
+            .lock_live_session_mutation_gate(session_id, &mutation_gate)
+            .await
+        else {
+            return;
+        };
         let retired_shell = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
@@ -8548,7 +8608,7 @@ impl MeerkatMachine {
                 .state()
                 .registration_phase;
             if entry.epoch_id != *epoch_id
-                || !Arc::ptr_eq(&entry.mutation_gate, &mutation_gate)
+                || !entry.mutation_gate.same_gate(&mutation_gate)
                 || !exact_slot_is_current
                 || registration_phase != crate::meerkat_machine::dsl::RegistrationPhase::Queuing
                 || entry.runtime_stop_cleanup_coordinator.is_some()
@@ -8664,7 +8724,10 @@ impl MeerkatMachine {
                 state: RuntimeState::Destroyed,
             });
         };
-        let gate_guard = Arc::clone(&gate).lock_owned().await;
+        let gate_guard = self
+            .lock_live_session_mutation_gate(session_id, &gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         let staged = match self
             .stage_session_dsl_transition_typed(
                 session_id,
@@ -8706,7 +8769,7 @@ impl MeerkatMachine {
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            if !Arc::ptr_eq(&entry.mutation_gate, &gate) {
+            if !entry.mutation_gate.same_gate(&gate) {
                 return Err(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 });
@@ -8897,7 +8960,11 @@ impl MeerkatMachine {
                 match expected_registration
                     .and_then(RuntimeSessionRegistrationWitness::registration_gate)
                 {
-                    Some(gate) => Some(gate.lock_owned().await),
+                    Some(gate) => Some(
+                        self.lock_live_session_mutation_gate(session_id, &gate)
+                            .await
+                            .map_err(degraded_gate_wait_refusal)?,
+                    ),
                     None => None,
                 }
             } else {
@@ -9285,8 +9352,9 @@ impl MeerkatMachine {
         attachment_id: RuntimeLoopAttachmentId,
     ) -> Result<MachineManagedPostStopFence, RuntimeDriverError> {
         let gate_guard = self
-            .lock_current_session_mutation_gate(session_id)
+            .lock_current_live_session_mutation_gate(session_id)
             .await
+            .map_err(degraded_gate_wait_refusal)?
             .ok_or(RuntimeDriverError::NotReady {
                 state: RuntimeState::Destroyed,
             })?;
@@ -10113,11 +10181,10 @@ impl MeerkatMachine {
             (
                 entry.pending_unregister_finalization.clone(),
                 UnregisterEntryIncarnationWitness {
-                    mutation_gate: Arc::clone(&entry.mutation_gate),
+                    mutation_gate: entry.mutation_gate.clone(),
                     ops_lifecycle: Arc::clone(&entry.ops_lifecycle),
                     #[cfg(feature = "live")]
                     live_lifecycle_gate: Arc::clone(&entry.live_lifecycle_gate),
-                    durability_health: entry.durability_health.clone(),
                 },
             )
         };
@@ -11355,31 +11422,21 @@ Ok::<(), RuntimeDriverError>(())
         entry_incarnation: &UnregisterEntryIncarnationWitness,
         wait: UnregisterGateWait,
     ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
-        let health = match (wait, entry_incarnation.durability_health.as_ref()) {
-            (UnregisterGateWait::EndsOnDegradation, Some(health)) => health,
-            _ => {
-                return Ok(Arc::clone(&entry_incarnation.mutation_gate)
-                    .lock_owned()
-                    .await);
-            }
-        };
-        let degradation = health.subscribe_degradation();
-        #[cfg(any(test, feature = "test-support"))]
-        self.note_mutation_gate_wait_for_test(session_id, &entry_incarnation.mutation_gate);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let _ = session_id;
-        let mut lock = std::pin::pin!(Arc::clone(&entry_incarnation.mutation_gate).lock_owned());
-        let mut fired = std::pin::pin!(degradation.fired());
-        crate::tokio::select! {
-            biased;
-            guard = &mut lock => Ok(guard),
-            required = &mut fired => Err(RuntimeDriverError::RecoveryRepairBlocked {
-                evidence_digest: None,
-                reason: format!(
-                    "unregister cannot take the mutation gate of a durability-degraded session; \
-                     reload it first: {required}"
-                ),
-            }),
+        match wait {
+            UnregisterGateWait::EndsOnDegradation => self
+                .lock_live_session_mutation_gate(session_id, &entry_incarnation.mutation_gate)
+                .await
+                .map_err(|required| RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "unregister cannot take the mutation gate of a durability-degraded session; \
+                         reload it first: {required}"
+                    ),
+                }),
+            UnregisterGateWait::UntilFree => Ok(entry_incarnation
+                .mutation_gate
+                .lock_settled(SettledGateWait::StagedUnregister)
+                .await),
         }
     }
 
@@ -11538,7 +11595,7 @@ Ok::<(), RuntimeDriverError>(())
             if !entry_incarnation.matches(entry) {
                 return Ok(None);
             }
-            match Arc::clone(&entry_incarnation.mutation_gate).try_lock_owned() {
+            match entry_incarnation.mutation_gate.try_lock() {
                 Ok(mutation_guard) => return Ok(Some((sessions, mutation_guard))),
                 Err(_) => {
                     drop(sessions);
@@ -11608,15 +11665,16 @@ Ok::<(), RuntimeDriverError>(())
                     continue;
                 }
             };
-            match Arc::clone(&entry_incarnation.mutation_gate).try_lock_owned() {
+            match entry_incarnation.mutation_gate.try_lock() {
                 Ok(mutation_guard) => {
                     return Some((sessions, registration_guard, mutation_guard));
                 }
                 Err(_) => {
                     drop(registration_guard);
                     drop(sessions);
-                    let mutation_guard = Arc::clone(&entry_incarnation.mutation_gate)
-                        .lock_owned()
+                    let mutation_guard = entry_incarnation
+                        .mutation_gate
+                        .lock_settled(SettledGateWait::StagedUnregister)
                         .await;
                     drop(mutation_guard);
                 }
@@ -12722,7 +12780,7 @@ Ok::<(), RuntimeDriverError>(())
                 entry.runtime_id.clone(),
                 entry.driver.clone(),
                 entry.completions.clone(),
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 entry.publication_handle(),
             )
         };
@@ -12903,7 +12961,7 @@ Ok::<(), RuntimeDriverError>(())
             (
                 entry.runtime_id.clone(),
                 entry.completions.clone(),
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 entry.publication_handle(),
                 Arc::clone(&entry.dsl_authority),
             )

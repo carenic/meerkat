@@ -353,6 +353,22 @@ them.
   unregister that waits for the gate before it stages its final unregister
   also ends typed and releases its teardown coordinator, so the
   reload-required discard can run.
+- The other waits for a session's mutation gate that serve live work now end
+  the same way instead of waiting for a holder of the gate once the session's
+  durability degrades: an exact-run interrupt and its reconciliation, the
+  recover and destroy control commands (`RuntimeControlPlaneError::StoreError`
+  carrying the refusal, as their durability-ready wait answers), a comms abort
+  (an abort of every session skips such a session and aborts the others),
+  unregistering or retiring an executor attachment, an explicit stop and its
+  post-stop fence, installing an unregister coordinator, closing an idle
+  registration, input admission, the return to the gate after a boundary
+  callback, a member effect, the admitted-original read
+  (`AdmittedOriginalRefusal::Unavailable`), registering an executor over an
+  existing entry, and the runless terminal publication task. A session that
+  has already degraded refuses such a wait whenever another holder keeps the
+  gate. Waits that run only once the degraded holder has released the gate
+  (the reload-required discard) or before any runtime loop exists keep
+  waiting.
 
 ## [0.9.3] - 2026-10-18
 

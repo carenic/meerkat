@@ -1,11 +1,14 @@
-//! A wait for a session's mutation gate ends typed once the session degrades
-//! (#336(a)), instead of waiting behind a holder that keeps the gate: the
+//! A wait for a session's mutation gate ends typed once the session degrades,
+//! instead of waiting behind a holder that keeps the gate: the
 //! post-stop fence an exited runtime loop retains after a failed boundary
 //! commit. The tests hold the gate themselves as that holder.
 //!
 //! Covered waits: the ready-gated wait (the ingress detach a destroy's retire
-//! takes, the mob Shutdown's run-start hold) and the unregister saga's exact
-//! gate waits before its final `UnregisterSession` is staged.
+//! takes, the mob Shutdown's run-start hold), the unregister saga's exact
+//! gate waits before its final `UnregisterSession` is staged, and one waiter
+//! of each class that took the gate plainly before it went through the live
+//! accessor: the run-fenced interrupt, a control command, a comms
+//! abort, an executor attachment's unregister and an explicit stop.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use super::*;
@@ -133,7 +136,7 @@ async fn hold_mutation_gate(
         .session_mutation_gate(session_id)
         .await
         .expect("registered session gate")
-        .lock_owned()
+        .lock_settled(SettledGateWait::TestFixture)
         .await
 }
 
@@ -567,4 +570,168 @@ async fn a_refused_waiter_on_a_free_degraded_session_leaves_it_to_the_discard() 
         0,
         "a waiter on a free gate settles the session itself"
     );
+}
+
+/// Run `operation` behind a holder of `session_id`'s mutation gate, degrade
+/// the session once the operation parks behind that holder, and return what
+/// it answered. It must answer within the bound, without the gate.
+async fn degrade_during_live_gate_wait<T>(
+    machine: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+    operation: impl std::future::Future<Output = T> + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
+    let fence = hold_mutation_gate(machine, session_id).await;
+    let parked = machine.arm_mutation_gate_wait_observer_for_test(session_id.clone());
+    let waiter = tokio::spawn(operation);
+    tokio::time::timeout(TYPED_END_BOUND, parked)
+        .await
+        .expect("the operation parks behind the held gate")
+        .expect("the wait observer stays armed until the wait");
+    assert!(
+        !waiter.is_finished(),
+        "a ready session's operation waits for the gate"
+    );
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(session_id)
+            .await,
+        "the fixture degrades the session during the wait"
+    );
+    let answered = tokio::time::timeout(TYPED_END_BOUND, waiter)
+        .await
+        .expect("the degradation ends the wait")
+        .expect("the operation completes");
+    drop(fence);
+    answered
+}
+
+async fn registered(machine: &MeerkatMachine) -> SessionId {
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register a persistent session");
+    session_id
+}
+
+async fn registered_with_runtime_loop(machine: &Arc<MeerkatMachine>) -> SessionId {
+    let session_id = SessionId::new();
+    machine
+        .register_session_with_executor(session_id.clone(), Box::new(IdleExecutor))
+        .await
+        .expect("register a session with a runtime loop");
+    assert!(
+        runtime_loop_attached(machine, &session_id).await,
+        "the fixture needs an attached runtime loop"
+    );
+    session_id
+}
+
+/// A run-fenced interrupt (the bridge's exact hard cancel) waits for the
+/// gate live. Behind a holder it ends typed once the session degrades; it
+/// took the gate plainly before and waited for the holder.
+#[tokio::test]
+async fn a_run_fenced_interrupt_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered(&machine).await;
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .hard_cancel_run_if_current(&session_id, &RunId::new(), "interrupt behind a holder")
+                .await
+        }
+    })
+    .await;
+    assert!(ended_typed(&result), "the interrupt ends typed: {result:?}");
+}
+
+/// A control command (recover) waits for the gate live and answers the
+/// repair-blocked refusal the ready-gated control wait reports.
+#[tokio::test]
+async fn a_control_command_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered(&machine).await;
+    let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        async move { crate::traits::RuntimeControlPlane::recover(&*machine, &runtime_id).await }
+    })
+    .await;
+    match result {
+        Err(crate::traits::RuntimeControlPlaneError::StoreError(reason)) => assert!(
+            reason.contains("repair-blocked"),
+            "the refusal names the repair block: {reason}"
+        ),
+        other => panic!("the recover ends with the typed control refusal: {other:?}"),
+    }
+}
+
+/// A comms abort waits for the gate live.
+#[tokio::test]
+async fn a_comms_abort_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered(&machine).await;
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .execute_meerkat_machine_drain_local_command(MeerkatMachineCommand::Abort {
+                    session_id,
+                })
+                .await
+        }
+    })
+    .await;
+    assert!(ended_typed(&result), "the abort ends typed: {result:?}");
+}
+
+/// Unregistering an executor attachment waits for the gate live, so a
+/// retire of a degraded session goes to the reload instead of waiting for
+/// the holder.
+#[tokio::test]
+async fn an_attachment_unregister_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered_with_runtime_loop(&machine).await;
+    let witness = machine
+        .current_executor_attachment_witness(&session_id)
+        .await
+        .expect("the attached runtime loop has a witness");
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        async move {
+            machine
+                .unregister_executor_attachment_if_current(&witness)
+                .await
+        }
+    })
+    .await;
+    assert!(
+        ended_typed(&result),
+        "the unregister ends typed: {result:?}"
+    );
+}
+
+/// An explicit stop waits for the gate live, like every path to the
+/// post-stop fence except the reload-required discard's own.
+#[tokio::test]
+async fn an_explicit_stop_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered_with_runtime_loop(&machine).await;
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .stop_runtime_executor(&session_id, "stop behind a holder")
+                .await
+        }
+    })
+    .await;
+    assert!(ended_typed(&result), "the stop ends typed: {result:?}");
 }

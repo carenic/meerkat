@@ -319,9 +319,13 @@ impl MeerkatMachine {
         if association.candidate().controller_model.as_ref() != Some(controller.selection()) {
             return Err(Conflict);
         }
-        // M: this exact registration's own mutation gate.
+        // M: this exact registration's own mutation gate. A registration that
+        // degrades while another holder keeps it is Unavailable.
         let gate = registration.registration_gate().ok_or(Unavailable)?;
-        let _registration_guard = gate.lock_owned().await;
+        let _registration_guard = self
+            .lock_live_session_mutation_gate(registration.session_id(), &gate)
+            .await
+            .map_err(|_| Unavailable)?;
         let driver = {
             let sessions = self.sessions.read().await;
             let entry = owned_entry(

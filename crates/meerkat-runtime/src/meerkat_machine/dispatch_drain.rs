@@ -382,7 +382,23 @@ impl MeerkatMachine {
                     let Some(gate) = self.session_mutation_gate(&session_id).await else {
                         continue;
                     };
-                    let _gate_guard = gate.lock().await;
+                    // A session that degrades while another holder keeps its
+                    // gate keeps its producers until it is reloaded, instead
+                    // of holding up every other session's abort.
+                    let _gate_guard = match self
+                        .lock_live_session_mutation_gate(&session_id, &gate)
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(required) => {
+                            tracing::warn!(
+                                %session_id,
+                                reason = %required,
+                                "comms abort skipped a durability-degraded session whose gate is held"
+                            );
+                            continue;
+                        }
+                    };
                     let _ = self
                         .stop_and_abort_session_comms_producers(&session_id, true)
                         .await;
@@ -401,7 +417,10 @@ impl MeerkatMachine {
                         state: RuntimeState::Destroyed,
                     });
                 };
-                let _gate_guard = gate.lock().await;
+                let _gate_guard = self
+                    .lock_live_session_mutation_gate(&session_id, &gate)
+                    .await
+                    .map_err(degraded_gate_wait_refusal)?;
                 let _ = self
                     .stop_and_abort_session_comms_producers(&session_id, true)
                     .await;
