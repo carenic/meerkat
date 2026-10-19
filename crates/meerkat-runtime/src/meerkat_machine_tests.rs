@@ -1843,7 +1843,7 @@ fn persistent_oauth_release_prunes_durable_payload_snapshot_for_sqlite_store() {
     let machine = MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
         .expect("persistent machine");
     let redirect_uri = "http://127.0.0.1/callback";
-    let target = oauth_target();
+    let target = oauth_target_with_binding("persistent_release_prune");
     let browser_provider = meerkat_auth_core::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt;
     let device_provider = meerkat_auth_core::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist;
     let state = machine
