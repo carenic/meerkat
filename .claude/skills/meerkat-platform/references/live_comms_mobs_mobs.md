@@ -140,6 +140,19 @@ hand out an owner lease on a stopped actor.
   identity (live or retired) since the latest reset, without the actor queue.
   `MobStorage::read_member_binding_history(path)` reads a stopped mob's store
   read-only. Details in `references/mobs.md`.
+- Since 0.9.4 a host refusal of a restored member's registration removes
+  that registration and leaves the member Broken with
+  `MemberRegistrationRefused` (member status `registration_refusal`) until
+  repaired; retire, respawn and destroy still work. A destination the runtime
+  did not install is `MemberDestinationNotInstalled` (failure class
+  `runtime_rejected`, was `mob_rejected`). Rust
+  `MobHandle::retire_at_scope(&scope)` retires exactly the incarnation a
+  delivery scope names, never a successor.
+- Since 0.9.4 a respawned member starts its own execution-health record, an
+  idle close no longer counts a retired member's last observed work, a placed
+  member no longer shows its predecessor's kickoff after a restart, and a
+  destroy reloads a member whose boundary commit failed and retries its
+  retirement once (`reloaded_members`).
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
@@ -202,6 +215,14 @@ hand out an owner lease on a stopped actor.
   job ... finished" entry.
 - The agent loop's default tool deadline does not cut `fork_off` or
   `council`; an explicit `tools.tool_timeouts.<tool>` still does.
+- Since 0.9.4 forking a member with activated host instructions follows the
+  host's fork instruction policy (`MobBuilder::with_fork_instruction_policy`).
+  By default `fork_off`, the self-starting member forks and council
+  participants are refused before commit (`fork_instruction_refused`, -32037;
+  a council ends `participant_fork_instruction_refused`) instead of
+  committing a child whose first turn failed; `reactivate_inherited`
+  re-activates the source's keys in the child. Upgrade member hosts before
+  their controller. Details in `references/mobs.md`.
 - `delegate` and `mob_spawn_member` accept `tooling`: `{mode:
   "inherit_parent"}` (default, with optional `allow_overlay` and
   `deny_overlay`), `{mode: "minimal"}` (comms tools only) or `{mode:
@@ -388,7 +409,7 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
 | `HOST_UNAVAILABLE` | -32026 | 503 | Member host unreachable |
 | `STALE_CURSOR` | -32027 | 410 | Re-read events from a fresh cursor |
 | `STALE_FENCE` | -32028 | 409 | Re-resolve the member |
-| `MEMBER_RELOAD_REQUIRED` | -32029 | 409 | Registration durability-degraded; needs `reload_member_registration` (Rust) |
+| `MEMBER_RELOAD_REQUIRED` | -32029 | 409 | Registration durability-degraded; needs `reload_member_registration` (Rust); since 0.9.4 also from `mob/force_cancel` and `cancel_all_work` |
 | `SESSION_RUNTIME_UNAVAILABLE` | -32032 | 503 | Runtime not available (for example a held child mob) |
 | `STALE_DELIVERY_SCOPE` | -32036 | 409 | Member session moved; re-capture the delivery scope |
 
