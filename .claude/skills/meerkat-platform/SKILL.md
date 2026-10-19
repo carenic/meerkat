@@ -29,7 +29,7 @@ This guide is an overview. The reference documents below carry the detail; read 
 - `references/live_comms_mobs_comms.md` - agent-to-agent comms: transports, `[comms]` config, `rkat run --comms-*` flags, comms tools, `comms/send` on every surface and its delivery outcomes, remote signed peers.
 - `references/mobs.md` - multi-agent orchestration in depth.
 - `references/live_comms_mobs_mobs.md` - mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy, member lifetime, helpers, `fork_off`, council, profile keys, flows and runs, multi-host mobs, mobpacks and deploy, error codes.
-- `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes).
+- `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes), and 0.9.3 to 0.9.4.
 - `references/migration_0_5.md` - only if you're upgrading from 0.5 (`host_mode` → `keep_alive`, etc.).
 
 ## Realm-first model
@@ -317,6 +317,24 @@ for live messages.
 For platform integration answers in this checkout, assume the current branch
 surface, not the old live-adapter/docs-refresh snapshot:
 
+- **0.9.4 (2026-10-20).** Breaking changes and a checklist are in the last
+  section of `references/migration_0_9.md`. In short:
+  - No downgrade to 0.9.3 after 0.9.4 writes a runtime store (stored input
+    state version 7); upgrade every process that shares one together.
+  - SKILL.md frontmatter is parsed by serde-saphyr and refuses duplicated
+    keys, null `description`/`metadata` values, custom tags and `...` lines.
+  - An admitted mob Shutdown closes admission at once (`AdmissionClosed`,
+    reason `shutdown`); requests during its drain get the retryable
+    `MobError::ShutdownInProgress`; destroy, durability fail-stop, actor loss
+    and dispatch failure also end owner leases. `MobError` is non-exhaustive.
+  - Provider refusals and content filters fail the run as `content_filtered`
+    with a typed stop and detail (`error_report.reason` is an object); refusal
+    text is never committed as an answer.
+  - Compaction sizes the summary source for the summarizing model and reports
+    it (`summary_source`, `estimated_history_tokens_after`); custom
+    `Compactor`s implement the new `prepare_for_summarization`.
+  - Governed realms: `bind_prompt` binds only operator prompts; host-reported
+    outcomes use `bind_host_outcome`.
 - **0.9.0 (2026-10-13).** Breaking changes and an upgrade checklist are in
   `references/migration_0_9.md`. In short:
   - MobKit is now Meta in Core's public surface, with no aliases: JSON-RPC
@@ -508,7 +526,7 @@ surface, not the old live-adapter/docs-refresh snapshot:
   invoke the provider without another user call. Turn-driven members and
   recovery-suppressed kickoff paths are distinct; see the mobs reference.
 - Mob persistence is SQLite/WAL-backed (`MobStorage::persistent()` opens `SqliteMobStores`). In-memory storage is used for tests, WASM and `rkat mob deploy`. The previous exclusive-handle mob store has been removed.
-- Rust hosts: a mob closes admission once the last exported `MobHandle` clone drops and it is idle (`MobError::AdmissionClosed` for later spawns, work, flows, wiring and resume; stop, destroy, retirement and reads stay available), so keep a handle for as long as the mob must admit work. A destroy removes the mob's database files only after its actor ended and its observer drained; while a handle or store in the process still holds it, every surface answers the retryable `mob_destroy_incomplete` and keeps the files: drop the handles and retry.
+- Rust hosts: a mob closes admission once the last exported `MobHandle` clone drops and it is idle (`MobError::AdmissionClosed` for later spawns, work, flows, wiring and resume; stop, destroy, retirement and reads stay available), so keep a handle for as long as the mob must admit work. Since 0.9.4 an admitted Shutdown, an admitted destroy, a durability fail-stop, a lost actor and a dispatch failure close admission too (reasons `shutdown`, `destroyed`, `durability fail-stop`, `actor lost`, `dispatch failure`), and `acquire_owner` is refused after any of them; while a Shutdown drains, other requests get the retryable `MobError::ShutdownInProgress`. A destroy removes the mob's database files only after its actor ended and its observer drained; while a handle or store in the process still holds it, every surface answers the retryable `mob_destroy_incomplete` and keeps the files: drop the handles and retry.
 - Prefabs are gone. All mob creation uses `MobDefinition` only (CLI, REST, RPC, MCP, SDKs).
 - `AgentMobToolSurface` in `meerkat-mob-mcp` has thirteen base definitions:
   `delegate`, `conclude_objective`, `mob_create`, `mob_destroy`,
@@ -1049,7 +1067,7 @@ For detailed surface schemas and examples, also load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
-- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9, or 0.9.3 to 0.9.4)
 - Sessions and storage: `references/sessions_runtime_surfaces_sessions.md`, `references/sessions_runtime_surfaces_storage_config.md`, `references/sessions_runtime_surfaces_api_changes.md`
 - Providers and auth: `references/providers_and_auth_models.md`, `references/providers_and_auth_credentials.md`
 - Security: `references/security.md`, `references/security_governance.md`
@@ -1623,7 +1641,7 @@ For complete method signatures and multi-surface examples, load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
-- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9, or 0.9.3 to 0.9.4)
 - `references/migration_0_5.md` (only if migrating from 0.5)
 - Sessions and storage: `references/sessions_runtime_surfaces_sessions.md`, `references/sessions_runtime_surfaces_storage_config.md`, `references/sessions_runtime_surfaces_api_changes.md`
 - Providers and auth: `references/providers_and_auth_models.md`, `references/providers_and_auth_credentials.md`

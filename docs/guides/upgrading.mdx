@@ -19,7 +19,7 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
   patch connects without complaint. Upgrade `rkat-rpc`, `meerkat-sdk`,
   `@rkat/sdk` and `@rkat/web` together.
 - **Bump Rust pins together.** The `meerkat*` crates are versioned in lock
-  step: move every `=0.8.x` pin at once.
+  step: move every `=0.9.x` pin at once.
 - **Expect one-way migrations.** A release can migrate durable state forward
   the first time it opens it, after which older binaries refuse it. Each
   release section below says whether it does.
@@ -54,6 +54,213 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
 - `rkat doctor` passes.
 - `rkat storage doctor` reports no new problems.
 - An SDK `connect()` succeeds.
+
+## Upgrading to 0.9.4
+
+This section is for systems running 0.9.3. The full list of changes is in
+the CHANGELOG under `## [0.9.4]`.
+
+### Before you upgrade
+
+- **There is no downgrade to 0.9.3 once 0.9.4 has written to a runtime
+  store.** 0.9.4 writes stored input state at version 7, including any input
+  row it read at an older version, and a 0.9.3 or older binary refuses a
+  version 7 row (it leaves the stored bytes in place). 0.9.4 still reads rows
+  that 0.9.0 to 0.9.3 wrote (version 6).
+- **Other records 0.9.3 cannot read back:**
+  - a session event log that holds a content-filtered `run_failed` event
+    (see [Refusals and content filters](#refusals-and-content-filters));
+  - an authorization grant journal that holds an owner-scoped resource-domain
+    restriction (0.9.3 refuses to restore that grant owner with
+    `RestartRequired`).
+- **Upgrade every process that shares a runtime store together**, and take a
+  backup first (step 2 of [How to upgrade](#how-to-upgrade)).
+
+### Breaking changes and what to do
+
+#### Skill frontmatter
+
+`SKILL.md` frontmatter is parsed by a new YAML parser (serde-saphyr), which
+refuses frontmatter the old parser accepted:
+
+- a key given twice, at any level (a top-level extension key or a `metadata`
+  key; the old parser kept the last value);
+- a null `description` or `metadata` value (`~` or an empty value);
+- an unrecognized tag such as `!custom`, anywhere;
+- nesting deeper than 64 levels, or very alias-heavy documents;
+- a `...` document end marker line.
+
+**Do:** remove duplicate keys, give `description` and every `metadata` key a
+value, drop custom tags and `...` lines. A block scalar (`|`, `>`) that ends
+the frontmatter now keeps its final line break. Extension values read back
+through `SkillDocument.extensions` are re-rendered (for example `'1.10'` is
+now `"1.10"`); the data is unchanged.
+
+#### Mobs
+
+- **`MobHandle::shutdown` now closes the mob's admission** before its
+  teardown, as its contract says. From the moment a Shutdown is admitted, a
+  spawn, respawn, work submission, flow run, wiring change, host bind, live
+  commit, resume, reset, reload or owner lease is refused with
+  `MobError::AdmissionClosed` (reason `shutdown`). If the Shutdown later
+  fails, those commands stay refused for the actor's life; Stop, Shutdown and
+  Destroy stay available.
+- **Other requests during a Shutdown's drain** (Stop, Destroy, Complete, a
+  read, a status probe) get the new `MobError::ShutdownInProgress` instead of
+  `MobError::ActorCommandChannelClosed`. It is retryable, with the authority
+  retained (wire code `SessionBusy`). `ActorCommandChannelClosed` now means
+  the actor has exited or is exiting.
+- **Owner leases end with the mob.** `MobHandle::acquire_owner` is refused
+  with `MobError::AdmissionClosed` once a destroy is admitted (reason
+  `destroyed`), after a durability fail-stop (`durability fail-stop`), after
+  the actor task is lost (`actor lost`), and after a composition dispatch
+  failure stops the actor (`dispatch failure`). A mob restored with a durable
+  destroy marker starts with admission closed.
+- **Do:** treat `AdmissionClosed` as final for that mob and retry
+  `ShutdownInProgress` later. `MobError` is now `#[non_exhaustive]`: add a
+  wildcard arm to any exhaustive match on it. `MobAdmissionCloseReason` gains
+  `Shutdown`, `Destroyed`, `DurabilityFailStop`, `ActorLost` and
+  `DispatchFailed`.
+
+#### Refusals and content filters
+
+- **A provider refusal or content filter now fails the run as
+  `content_filtered`**, with the stop the provider ended on (`refusal` or
+  `content_filter`) and the provider's own detail when it sent one. An OpenAI
+  refusal is no longer committed as the answer, an Anthropic refusal carries
+  its `stop_details`, and a Gemini prompt blocked before any candidate fails
+  after one call instead of being retried.
+- **Wire change:** `error_report.reason` of a content-filtered `run_failed`
+  event is now `{"reason_type": "content_filtered", "stop": ..., "detail":
+  ...}` (it was `null`; `detail` is omitted when the provider sent none).
+  SDKs older than 0.9.4 keep it as an unknown, raw reason.
+- **`web_search`:** a search the provider refused or filtered, one that filled
+  its context window and a cancelled one now come back `failed`, naming the
+  stop reason, with no answer.
+- **Do (Rust):** build `LlmDoneOutcome::Success` with
+  `LlmDoneOutcome::success(stop_reason)` or `success_with_detail(..)` and match
+  it with `Success { stop_reason, .. }`; `AgentError::ContentFiltered` gains
+  `stop` and `detail`, and `AgentErrorReason` gains `ContentFiltered`.
+
+#### Changing the model of a running session
+
+`Agent::replace_client`, `Agent::replace_client_with_request_policy` and the
+ephemeral service's `SessionService::set_session_client` no longer change the
+session's model: a client for another provider or model is refused with
+`AgentError::ClientModelChangeRequiresHotSwap` before anything changes.
+
+**Do:** change the model with `Agent::hot_swap_llm_identity` or
+`SessionService::hot_swap_session_llm_identity`. A replacement client for the
+same model is accepted as before.
+
+#### Custom compactors
+
+`Compactor::prepare_for_summarization` takes the summarizing model's source
+budget and returns the source with its bound:
+`(messages: &[Message], budget: Option<SummarizationSourceBudget>) ->
+SummarizationSource`. It has no default implementation.
+
+**Do:** to keep the old behaviour, return
+`SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+and ignore the budget. To fit the summarizing model, bound the source by the
+budget and report the bound, as `DefaultCompactor` does. A
+`CompactionContext` built by hand sets `last_rewrite_history_tokens: None`.
+
+#### Governed realms and authorization (Rust hosts)
+
+- `StockGovernance::bind_prompt` binds only a prompt of the local operator
+  (`Input::Prompt`); any other input is refused with
+  `StockGovernanceError::RequesterUnsupported` before anything is written.
+  **Do:** bind an outcome your own process reports (for example a connector
+  finalization submitted as an external event) with the new
+  `StockGovernance::bind_host_outcome`.
+- A host-authenticated stock composition refuses its own stock ingress
+  principal as a requester, as it already refused the operator.
+- `SessionAgentMandate::new` drops its `catalog` argument
+  (`new(executor, servers, represented_subject)`) and must select at least one
+  MCP server (`AgentMandateError::NoSelection` otherwise).
+  `SessionAgentMandate::catalog_lineage` and `AgentGrantRefs::catalog_lineage`
+  are removed.
+- `ExecutionRestrictions.resource_domains` is a `DomainRestriction`: build it
+  with `DomainRestriction::{unrestricted, exact, owned_by, unresolved}` and
+  read it with `DomainRestriction::bound`. Exact and unrestricted bounds keep
+  their wire bytes.
+- `AuditObservation` is `#[non_exhaustive]`, `AuditObservation::Refused`
+  gains `read`, and `AuditPolicyRead` gains `publication_instance`.
+
+#### Runtime and registration (Rust hosts)
+
+- `ConfiguredMcpAttachmentProvider::configured` and
+  `NativeWorkAuthorizationHost::configured_mcp_attachment_for_agent` take the
+  session's exact `RuntimeSessionRegistrationWitness` instead of its
+  `SessionId`; read the id with `registration.session_id()`.
+- `AuthenticatedOriginalSource::retained_original` is replaced by
+  `retained_custody`, which returns `RetainedCustody` (`Retained`,
+  `AdmissionPending` or `NotRetained`). Answer `NotRetained` where you
+  answered `None`.
+- `ContinuationAdmitError` and `BlockedDeliveryReason` gain
+  `NotReady(ControllerReadinessFailure)`; `ContinuationAdmitError` is
+  `#[non_exhaustive]`. The wire `WireControllerReadinessFailure` gains
+  `original_admission_pending`, which a Rust decoder built before 0.9.4
+  rejects.
+- `meerkat-mob`: `MemberRuntimeBuildIdentity` is no longer `UnwindSafe` (wrap
+  it in `std::panic::AssertUnwindSafe` to move it into `catch_unwind`), and
+  `SqliteMobObserverDrainReport` gains `retained_registrations`.
+
+#### Generated machine types
+
+Struct literals and exhaustive matches over generated machine types need the
+new fields and variants: `SessionPersistenceVersionAuthorityMachineState`
+gains `stored_input_state_migration_v6`; `MobMachineState` and the kernel
+`State` gain `identity_generation_highwater` and
+`identity_generation_highwater_sealed`; the mob machine signals and kernel
+transition ids gain the identity generation high-water variants, appended
+last.
+
+### Other behaviour changes
+
+- **Compaction is sized for the model that writes the summary.** The summary
+  source may take two bytes per token of that model's context window left
+  after `max_summary_tokens` (at least 4 KiB), instead of a quarter of the
+  compaction threshold. With the default threshold that is about ten times
+  more, so a summary call can cost more input tokens on a large window; it
+  never costs more than the history being compacted plus the compaction
+  prompt.
+- **Compaction no longer pays for a summary at every boundary** when no
+  rewrite can get the history under the threshold (for example when the
+  System rows alone exceed an explicit `auto_compact_threshold`). It waits for
+  its cadence and logs a warning that names the remedies.
+- The `compaction_completed` event reports the summary's source
+  (`summary_source`) and the estimated history left
+  (`estimated_history_tokens_after`).
+- **Multiprocess hosting** no longer refuses a runtime store whose file
+  notifications cannot be registered (an inotify watch limit, for example):
+  the store watch's sweep is the cross-process wake.
+- **Work that names an original its source owner has not settled yet** is
+  reported not ready (`ControllerReadinessUnavailable` with
+  `original_admission_pending`) and stays retryable, instead of being refused
+  as malformed or denied.
+- **Fixed known issue:** stores no longer refuse to open with "schema domain
+  ... has no ledger row but already owns objects" when another process
+  creates the same schema domain at that moment.
+- **macOS:** starting a SQLite change watch no longer waits for FSEvents
+  registration, which held the first mob storage open for over 30 seconds.
+
+### Upgrade checklist
+
+1. Back up the realm state root; there is no downgrade to 0.9.3 after 0.9.4
+   writes to it.
+2. Stop every 0.9.3 process that shares a runtime store, then start 0.9.4 on
+   all of them together.
+3. Fix `SKILL.md` frontmatter the new parser refuses (duplicate keys, null
+   values, custom tags, `...` lines).
+4. Handle `MobError::AdmissionClosed` and `MobError::ShutdownInProgress`, and
+   add wildcard arms for the non-exhaustive mob errors.
+5. Read `content_filtered` run failures with their typed reason, and stop
+   treating refusal text as an answer.
+6. Move model changes on a running session to `hot_swap_llm_identity`.
+7. Update custom compactors for the new `prepare_for_summarization`.
+8. Governed hosts: bind host-reported outcomes with `bind_host_outcome`.
 
 ## Upgrading to 0.8.51
 

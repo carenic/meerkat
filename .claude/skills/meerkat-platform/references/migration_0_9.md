@@ -5,6 +5,7 @@
 > `CHANGELOG.md` (`### Breaking`, `### Changed`, `### Known issues`); read it
 > for the full list. Coming from 0.8.50 or earlier, also follow the per-release
 > sections of `docs/guides/upgrading.mdx` first.
+> The last section covers moving a 0.9.3 system to 0.9.4.
 
 ## Before you upgrade
 
@@ -195,3 +196,93 @@ under `### Breaking`. The common ones:
    connector approvals.
 6. Rust hosts: keep a `MobHandle` clone while a mob must admit work, retry
    `mob_destroy_incomplete`, and update struct literals and matches.
+
+## 0.9.3 -> 0.9.4 (2026-10-20)
+
+The source is the `## [0.9.4]` section of `CHANGELOG.md`; the operator steps
+are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
+
+### Before you upgrade
+
+- No downgrade to 0.9.3 once a 0.9.4 binary has written to a runtime store:
+  stored input state is now version 7 (0.9.4 reads versions 3-6 and writes
+  every row it stores at 7; 0.9.3 refuses a version 7 row and leaves the bytes
+  in place). Stop every process that shares a runtime store and start 0.9.4 on
+  all of them together.
+- 0.9.3 also cannot read back a session event log that holds a
+  content-filtered `run_failed` event, or restore a grant owner whose journal
+  holds an owner-scoped resource-domain restriction (`RestartRequired`).
+
+### Breaking changes
+
+- Skill frontmatter: the YAML parser is serde-saphyr. It refuses a duplicated
+  key at any level, a null `description` or `metadata` value, an unrecognized
+  tag (`!custom`), nesting deeper than 64 levels, alias-heavy documents and a
+  `...` end marker line. A block scalar ending the frontmatter keeps its final
+  line break. Extension values re-render (`'1.10'` becomes `"1.10"`).
+- Mobs: an admitted `MobHandle::shutdown` closes admission before teardown
+  (`MobError::AdmissionClosed`, reason `shutdown`): spawn, respawn, work,
+  flows, wiring, host binds, live commits, resume, reset, reload and owner
+  leases are refused, and stay refused if the Shutdown fails. Other requests
+  during the drain get the retryable `MobError::ShutdownInProgress` (wire code
+  `SessionBusy`). `acquire_owner` is also refused after an admitted destroy,
+  a durability fail-stop, a lost actor or a dispatch failure (reasons
+  `destroyed`, `durability fail-stop`, `actor lost`, `dispatch failure`).
+  `MobError` is `#[non_exhaustive]`.
+- Refusals and content filters fail the run as `content_filtered` with a
+  typed stop (`refusal` or `content_filter`) and the provider's detail;
+  `error_report.reason` of that `run_failed` event is an object
+  (`reason_type: content_filtered`), no longer `null`. OpenAI refusal text is
+  never committed as an answer. `web_search` reports a refused, filtered,
+  context-full or cancelled search as `failed`.
+- Rust: `LlmDoneOutcome::Success` is non-exhaustive (build it with
+  `LlmDoneOutcome::success(..)` / `success_with_detail(..)`);
+  `AgentError::ContentFiltered` gains `stop` and `detail`; `AgentErrorReason`
+  gains `ContentFiltered`.
+- `Agent::replace_client` and `SessionService::set_session_client` refuse a
+  client for another model (`AgentError::ClientModelChangeRequiresHotSwap`);
+  change models with `hot_swap_llm_identity` /
+  `hot_swap_session_llm_identity`.
+- Custom compactors: `Compactor::prepare_for_summarization(messages, budget)`
+  returns a `SummarizationSource` and has no default. Return
+  `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+  to keep the old behaviour.
+- Governed realms (Rust hosts): `StockGovernance::bind_prompt` binds only
+  operator prompts (`StockGovernanceError::RequesterUnsupported` otherwise);
+  bind host-reported outcomes with `StockGovernance::bind_host_outcome`. The
+  stock ingress principal is refused as a requester.
+  `SessionAgentMandate::new(executor, servers, represented_subject)` must
+  select an MCP server. `ExecutionRestrictions.resource_domains` is a
+  `DomainRestriction` (`unrestricted`, `exact`, `owned_by`, `unresolved`).
+  `AuditObservation` is non-exhaustive.
+- Runtime (Rust hosts): MCP attachment providers take the exact
+  `RuntimeSessionRegistrationWitness`; `retained_original` becomes
+  `retained_custody` (`RetainedCustody`); `ContinuationAdmitError` and
+  `BlockedDeliveryReason` gain `NotReady(..)`; the wire readiness failure gains
+  `original_admission_pending`. New fields on generated machine state structs
+  (`stored_input_state_migration_v6`, `identity_generation_highwater`,
+  `identity_generation_highwater_sealed`).
+
+### Other behaviour changes
+
+- Compaction sizes its summary source for the summarizing model's context
+  window and stops paying for a summary at every boundary when no rewrite can
+  get under the threshold. `compaction_completed` carries `summary_source` and
+  `estimated_history_tokens_after`.
+- Multiprocess hosting accepts a store whose file notifications cannot be
+  registered (the sweep is the wake).
+- Work naming an original whose admission is still pending reports
+  `original_admission_pending` and stays retryable.
+- Fixed: the 0.9.3 known issue "First concurrent durable delivery" (a store
+  refusing to open while another process creates the same schema domain);
+  macOS FSEvents registration no longer stalls the first mob storage open.
+
+### Checklist
+
+1. Back up, stop every process that shares a runtime store, and upgrade
+   everything together.
+2. Fix skill frontmatter the new parser refuses.
+3. Handle `AdmissionClosed` and `ShutdownInProgress`; add wildcard arms.
+4. Read `content_filtered` failures by their typed reason.
+5. Use `hot_swap_llm_identity` for model changes; update custom compactors.
+6. Governed hosts: use `bind_host_outcome` for host-reported outcomes.
