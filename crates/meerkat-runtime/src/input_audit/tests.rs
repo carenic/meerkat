@@ -512,12 +512,13 @@ fn observation_infrastructure_reserve_error_injection_is_not_policy_denial() {
 
 /// A mandatory-hook withholding staged on the actual row persists through the
 /// existing atomic input commit with its candidate id and retained
-/// contributors, is written as stored input state v6, and cannot appear in a
-/// row stamped with an older version.
+/// contributors, is written at the current stored input state version, and
+/// cannot appear in a row stamped before v6.
 #[tokio::test]
-async fn mandatory_hook_withholding_persists_on_the_actual_row_as_v6() {
+async fn mandatory_hook_withholding_persists_on_the_actual_row_at_the_current_version() {
     use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
     use crate::store::{InMemoryRuntimeStore, RuntimeStore};
+    use meerkat_core::generated::session_persistence_version_authority::stored_input_state_version;
     let store = InMemoryRuntimeStore::new();
     let runtime = crate::identifiers::LogicalRuntimeId::new("audit-hook-withholding");
     let (audit, sink) = fixture();
@@ -554,7 +555,10 @@ async fn mandatory_hook_withholding_persists_on_the_actual_row_as_v6() {
         .unwrap()
         .unwrap();
     let stored = serde_json::to_value(&committed).unwrap();
-    assert_eq!(stored["stored_input_state_version"], 6);
+    assert_eq!(
+        stored["stored_input_state_version"],
+        stored_input_state_version()
+    );
     let records = serde_json::to_value(&committed.state.authorization_audit).unwrap();
     assert_eq!(records.as_array().unwrap().len(), 1);
     assert_eq!(

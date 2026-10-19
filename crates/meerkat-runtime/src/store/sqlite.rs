@@ -735,10 +735,11 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     .ok_or("stored_input_state_version is not an unsigned integer")?;
                 match version {
                     3 => {}
-                    // A row a 0.8.11 to 0.8.51 binary wrote is carried to the
-                    // current encoding through the generic decode, re-encode
-                    // and loss check below; only its version stamp changes.
-                    5 if target_current => {}
+                    // A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0
+                    // to 0.9.3 binary wrote (v6), is carried to the current
+                    // encoding through the generic decode, re-encode and loss
+                    // check below; only its version stamp changes.
+                    5 | 6 if target_current => {}
                     version
                         if target_current
                             && version
@@ -3776,8 +3777,8 @@ END";
         }
 
         #[test]
-        fn maintenance_prepare_refuses_v4_and_preexisting_v5_at_source_boundary() {
-            for version in [4, 5] {
+        fn maintenance_prepare_refuses_v4_and_preexisting_v5_and_v6_at_source_boundary() {
+            for version in [4, 5, 6] {
                 let mut conn = Connection::open_in_memory().expect("open");
                 conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
                     .expect("runtime v1 schema");
@@ -3954,6 +3955,75 @@ END";
             );
             tx.commit().expect("rerun commit");
             assert_eq!(load_row(&conn, "runtime", &input_id), successor);
+        }
+
+        /// A row a 0.8.11 to 0.8.52 binary wrote (v5), or a 0.9.0 to 0.9.3
+        /// binary wrote (v6), is carried to the current encoding at a target
+        /// ledger: only its stamp changes, and a rerun leaves it alone.
+        #[test]
+        fn maintenance_prepare_target_v2_carries_v5_and_v6_rows_to_the_current_encoding() {
+            // The current canonical encoding of one row, as the bridge itself
+            // writes it from a legacy row.
+            let (input_id, canonical) = {
+                let mut conn = Connection::open_in_memory().expect("open");
+                conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                    .expect("runtime v1 schema");
+                let (input_id, source) = legacy_prompt_row();
+                insert_row(&conn, "runtime", &input_id, &source);
+                let tx = conn.transaction().expect("tx");
+                assert_eq!(
+                    prepare_pre_0_8_10_runtime_input_states(&tx)
+                        .expect("prepare")
+                        .changed,
+                    1
+                );
+                tx.commit().expect("commit");
+                let canonical = load_row(&conn, "runtime", &input_id);
+                (input_id, canonical)
+            };
+            for version in [5, 6] {
+                let mut stamped: serde_json::Value =
+                    serde_json::from_slice(&canonical).expect("canonical json");
+                stamped["stored_input_state_version"] = serde_json::json!(version);
+                let stamped = serde_json::to_vec(&stamped).expect("stamped bytes");
+                let mut conn = Connection::open_in_memory().expect("open");
+                conn.execute_batch(CREATE_RUNTIME_SCHEMA_SQL)
+                    .expect("runtime v1 schema");
+                conn.execute_batch(
+                    "CREATE TABLE meerkat_schema (
+                         domain TEXT PRIMARY KEY,
+                         version INTEGER NOT NULL
+                     );
+                     INSERT INTO meerkat_schema (domain, version)
+                     VALUES ('runtime-store', 2);",
+                )
+                .expect("target ledger");
+                insert_row(&conn, "runtime", &input_id, &stamped);
+
+                let tx = conn.transaction().expect("tx");
+                let report = prepare_pre_0_8_10_runtime_input_states(&tx).expect("prepare");
+                assert_eq!(
+                    report.changed, 1,
+                    "a v{version} row is carried forward: {:?}",
+                    report.refused
+                );
+                tx.commit().expect("commit");
+                assert_eq!(
+                    load_row(&conn, "runtime", &input_id),
+                    canonical,
+                    "only the stamp of a v{version} row changes"
+                );
+
+                let tx = conn.transaction().expect("rerun tx");
+                assert_eq!(
+                    prepare_pre_0_8_10_runtime_input_states(&tx)
+                        .expect("rerun")
+                        .changed,
+                    0
+                );
+                tx.commit().expect("rerun commit");
+                assert_eq!(load_row(&conn, "runtime", &input_id), canonical);
+            }
         }
 
         #[test]
