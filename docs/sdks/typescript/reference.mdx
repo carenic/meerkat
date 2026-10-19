@@ -233,6 +233,15 @@ Every ordered System message must fit. Runtime context and complete image identi
 tombstone, and accounting sidecars remain outside the window. Any truncation
 reports degraded continuity, and the server rejects zero.
 
+`MeerkatClient.parseLiveObservation(raw)` types a frame from the live transport
+as a `WireLiveAdapterObservation`. Since 0.9.4 the union includes `turn_failed`,
+a response the provider ended without completing. Its `failure` is a
+`WireLiveResponseFailure`: route on `status` (`"failed"`, `"incomplete"`,
+`"in_progress"`, or `{ unknown: { debug } }` for a status without a wire name);
+`reason`, `code` and `message` are diagnostics only. `WireLiveResponseFailure`
+and `WireLiveResponseFailureStatus` are exported from `@rkat/sdk`. See the
+[realtime guide](/guides/realtime) for what the channel does next.
+
 ### Usage
 
 Token usage. All fields are camelCase - there is no `total_tokens` field.
@@ -919,6 +928,8 @@ class BinaryIntegrityError extends MeerkatError {
 | `BINARY_DOWNLOAD_FAILED` | The release download failed (a transport fault or a cut-off body), or redirected to a non-HTTPS URL |
 | `BINARY_DOWNLOAD_TOO_LARGE` | The release archive is over 256 MiB, far above any `rkat-rpc` release archive |
 | `UNKNOWN_EVENT_TYPE` | Streamed event `type` not in the generated known-event inventory |
+| `PROCESS_EXITED` | The `rkat-rpc` child exited before replying (a crash, for example). Since 0.9.4 pending requests fail with it at most about a second after the exit, even while a process the child started still holds its pipes |
+| `PROTOCOL_ERROR` | A reply line was not JSON, so the stream can no longer be trusted. Since 0.9.4 the client then stops the child the way `close()` does |
 
 ### Typed comms/send errors
 

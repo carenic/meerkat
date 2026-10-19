@@ -239,6 +239,12 @@ await client.update_system_prompt(session_id, key, content)
 await client.restore_session_transcript_revision(session_id, revision_id, reason)
 ```
 
+A fork child runs under its source's session configuration, without the
+source's shell environment, MCP attachments or mob operator authority; see
+[what a fork child inherits](/api/rpc#what-a-fork-child-inherits). Since 0.9.4
+a fork child can run turns. A child forked by 0.9.3 or earlier that never ran a
+turn cannot: fork its source again.
+
 ## Additional client wrappers
 
 The Python SDK also exposes:
@@ -406,6 +412,16 @@ ICE gathering to complete, then send `peer.localDescription.sdp`. The protocol
 has no candidate-trickle RPC. Install the returned `answer_sdp` as the browser
 peer's remote description before sending live input.
 
+`MeerkatClient.parse_live_observation(raw)` type-narrows a frame from the live
+transport against `WireLiveAdapterObservation`. Since 0.9.4 that union includes
+`turn_failed`, a response the provider ended without completing. Its `failure`
+is a `WireLiveResponseFailure`: route on `status` (`"failed"`, `"incomplete"`,
+`"in_progress"`, or `{"unknown": {"debug": ...}}` for a status without a wire
+name); `reason`, `code` and `message` are diagnostics only.
+`WireLiveResponseFailure` and `WireLiveResponseFailureStatus` are exported from
+`meerkat`. See the [realtime guide](/guides/realtime) for what the channel does
+next.
+
 ## Event compatibility note
 
 The parser raises `MeerkatError` with code `UNKNOWN_EVENT_TYPE` only when a
@@ -564,6 +580,16 @@ transport fault (a detected cut-off body included): a transport fault the SDK
 can detect is never reported as tamper. `BINARY_DOWNLOAD_TOO_LARGE` is an archive over
 256 MiB. See
 [The rkat-rpc binary](/sdks/python/overview#the-rkat-rpc-binary).
+
+When the `rkat-rpc` child exits by itself (a crash, for example), pending and
+later requests fail with `CONNECTION_CLOSED`, keeping the child's stderr tail.
+Since 0.9.4 they fail at most about a second after the exit, even while a
+process the child started still holds its output pipes; before, they could
+wait until those pipes closed. `MeerkatClient.close()` likewise returns once
+the child has exited: it terminates the child, waits up to 5 seconds, then
+kills it. On Python 3.11 and 3.12, and on 3.13 and 3.14 before the fix for
+CPython issue 119710, `close()` used to wait the full 5 seconds for a child
+that had already exited.
 
 A failed `session.send(...)` carries the server's typed `CommsSendErrorData`
 in `MeerkatError.details`, tagged on `code` (`peer_not_found_or_not_trusted`,

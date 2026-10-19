@@ -196,7 +196,22 @@ Changed in 0.9.4 (event wire and SDK types):
   exits (it ends stdin, signals the child, waits up to 5 seconds, then sends
   SIGKILL); before 0.9.4 its timer kept Node alive for about 5 seconds, and a
   grandchild holding the pipes could make it wait the full 5 seconds or, after
-  the SIGKILL, forever.
+  the SIGKILL, forever. Requests waiting on a child that exits by itself (a
+  crash) fail with `PROCESS_EXITED` at most about a second after the exit, even
+  while a grandchild holds the pipes; before, they could wait forever. After a
+  `PROTOCOL_ERROR` (a reply line that is not JSON) the client stops the child
+  the way `close()` does.
+- Python: requests waiting on a child that exits by itself fail with
+  `CONNECTION_CLOSED` (with the stderr tail) at most about a second after the
+  exit, and `MeerkatClient.close()` returns once the child has exited, even
+  while a grandchild holds the pipes (on Python 3.11 and 3.12, and 3.13 or 3.14
+  before the fix for CPython issue 119710, `close()` used to wait 5 seconds).
+- Live observations: `turn_failed` (a response the provider ended without
+  completing) carries `failure`, typed as `WireLiveResponseFailure`: `status`
+  `failed`, `incomplete`, `in_progress` or `{"unknown": {"debug": ...}}`, plus
+  diagnostic `reason`, `code` and `message`. Python and TypeScript export
+  `WireLiveResponseFailure` and `WireLiveResponseFailureStatus` from the package
+  root; `parse_live_observation` / `parseLiveObservation` type it.
 
 Added since 0.8.40:
 
@@ -385,6 +400,27 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   of a transcript graph, including one that retired its oldest occurrences,
   and returns `RetainedStrandLayout`; `strand_layout_for_history` still refuses
   a re-anchored graph.
+- Forks: `SessionBuildState::fork_child_projection` is the build state a
+  durable fork commits for its child; `SessionError::fork_source_build_state_missing`
+  (`FORK_SOURCE_BUILD_STATE_MISSING_KIND`, `is_fork_source_build_state_missing`)
+  is the typed refusal of a source with metadata but no build state.
+- Runtime registrations: `RuntimeSessionRegistrationWitness::has_ended` (no
+  runtime holds the exact registration any more);
+  `MeerkatMachine::session_registration_use` returns an opaque
+  `RuntimeSessionRegistrationUse`, freshly stamped whenever a registration is
+  handed to a new user in place (a reusing `register_session`, an executor
+  attachment, an actor materialization), so compare uses for equality only;
+  `observe_unregister_session_registration_if_use_unchanged` starts or joins
+  the exact unregister only while the use is unchanged
+  (`RuntimeSessionUnregisterUseAdmission`: `Admitted`, `Changed`);
+  `reload_required_registration_settlement_if_current`
+  (`ReloadRequiredRegistrationUseSettlement`: `NotCurrent`, `NotDegraded`,
+  `Discarded { successor, successor_use }`, `Changed`) discards a
+  reload-required registration and names its successor;
+  `stage_registration_run_start_hold_only` stages a run-start hold for the
+  session's next registration, and `unstage_registration_run_start_hold`
+  removes a staged reason (a runtime unregister keeps staged reasons, so a
+  reload applies them).
 
 ## Removed or renamed
 

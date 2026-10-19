@@ -412,7 +412,10 @@ still read. A 0.9.3 or older binary refuses a version 7 row before installing
 any state and leaves the stored bytes in place, so once a 0.9.4 process has
 written an input row there is no downgrade to 0.9.3. Snapshot the realm's
 durable stores before the upgrade, keep the snapshot with the 0.9.3 binary,
-and upgrade every process that shares a runtime store together.
+and upgrade every process that shares a runtime store together. The same holds
+for a HeadCanonical session that has recorded a failed realtime response: it
+writes realtime sidecar event schema 4, and 0.9.3 and earlier refuse that
+session with "unsupported realtime event schema 4".
 
 0.9.3 and earlier could log a one-time error when two processes used durable
 delivery over the same store for the first time at the same moment: "schema
