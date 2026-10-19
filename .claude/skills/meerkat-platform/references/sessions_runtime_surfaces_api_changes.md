@@ -1,9 +1,11 @@
 Covers: Meerkat 0.9 API surface changes: JSON-RPC methods and REST routes
 added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32036)
-with HTTP status, and real `rkat` exit codes; Python, TypeScript and Web SDK changes
-(RunInput, CONNECTION_CLOSED stderr tail, wasm stack); prebuilt binaries,
-`cargo install` and low-memory builds; Rust embedding (`crates/<name>`
-layout, path dependencies, `[patch]`); removals.
+with HTTP status, input readiness kinds (`original_admission_pending`), and
+real `rkat` exit codes; Python, TypeScript and Web SDK changes (RunInput,
+CONNECTION_CLOSED stderr tail, wasm stack, 0.9.4 `run_failed` content-filtered
+reason and compaction event fields); prebuilt binaries, `cargo install` and
+low-memory builds; Rust embedding (`crates/<name>` layout, path dependencies,
+`[patch]`, 0.9.4 host API changes); removals.
 
 # API Changes, Error Codes, SDKs and Binaries (Meerkat 0.9)
 
@@ -75,6 +77,22 @@ SDK call raises (Python) or rejects with (TypeScript) a `MeerkatError` that has
 `code`, `message` and `details`; `details` keeps the structured payload
 (0.8.35).
 
+`INPUT_REFUSED` and `INPUT_NOT_READY` carry the native owner's typed detail
+as `error.data`: `{"type": "refused", "kind": "denied" | "malformed_facts"}`
+or `{"type": "not_ready", "reason": {"kind": ...}}`. Readiness kinds:
+`policy_unavailable`, `executor_unavailable`, `facts_unavailable`, `busy`,
+`authority_unavailable`, `authority_changed`, `unsupported_scope`,
+`credential_unusable` (with `disposition`), `credential_preparation_failed`
+(with `cause`), `policy_changed`, `replacement_not_empty`, `unknown`, and
+since 0.9.4 `original_admission_pending`: an original the input or operation
+relies on is still its source owner's submission candidate, whose admission
+the owner has not settled yet. 0.9.3 and earlier refused such work as
+malformed or denied; it is now unavailable and nothing waits, so retry later
+(a retained resume stays retryable until the owner settles the original; a
+cancelled original is still refused). A Rust decoder of
+`WireControllerReadinessFailure` built before 0.9.4 rejects the new kind; the
+Python, TypeScript and Web SDKs keep error details as untyped data.
+
 `rkat` exit codes (0.9.1). The first typed error in a failure's cause chain
 decides, with its `ErrorCode::cli_exit_code()` number (the code JSON-RPC
 reports); a failure with no typed owner exits 1.
@@ -126,6 +144,35 @@ Python (`meerkat-sdk`, import `meerkat`), TypeScript (`@rkat/sdk`) and
 `@rkat/web` are released with the binaries; pin all three to the same
 release as `rkat-rpc`. The handshake accepts a server with the same major and
 minor contract version (any 0.9.x).
+
+Changed in 0.9.4 (event wire and SDK types):
+
+- `run_failed` with error class `content_filtered` (the provider refused or
+  filtered the response) now carries `error_report.reason`
+  `{"reason_type": "content_filtered", "stop": "refusal" | "content_filter",
+  "detail": {...}}` instead of `null`; `detail` is the provider's own account,
+  tagged by `provider` (`anthropic`, `open_ai` or `gemini`), and is omitted when
+  the provider sent none. Python reads it as `AgentErrorReason` with
+  `reason_type == "content_filtered"`, `stop` and `detail`; TypeScript as
+  `ContentFilteredAgentErrorReason` (`reasonType`, `stop`, `detail?`). SDKs
+  before 0.9.4 read it as an unknown reason and keep it raw. A 0.9.3 binary
+  cannot read a session event log that holds such a line, so a realm whose
+  sessions recorded one cannot go back to 0.9.3.
+- `compaction_completed` carries `summary_source`: `{"kind":
+  "provider_call", "source_bound": {...}}` (bound `whole`, `trimmed` with
+  `through` = `tool_results`, `context` or `user_requests`, or `requests_only`
+  with `kept` and `of`), `{"kind": "host_curator"}` or
+  `{"kind": "mechanical_fallback"}`. Python
+  `CompactionCompleted.summary_source` (`CompactionSummarySource`), TypeScript
+  `CompactionCompletedEvent.summarySource`; a kind the SDK does not know parses
+  to `unknown` with the wire object (`raw_kind`/`raw`, `rawKind`/`raw`). It is
+  absent on completions recorded before it was reported.
+- `compaction_completed` carries optional `estimated_history_tokens_after`,
+  the history the rewrite left in the unit of `compaction_started`'s
+  `estimated_history_tokens` (Python
+  `CompactionCompleted.estimated_history_tokens_after`, TypeScript
+  `CompactionCompletedEvent.estimatedHistoryTokensAfter`); absent for older
+  completions or when the history could not be measured.
 
 Added since 0.8.40:
 
@@ -262,6 +309,38 @@ meerkat-core = { path = "../meerkat/crates/meerkat-core" }
 - Your own root `Cargo.toml` owns `[profile.*]`. Meerkat's workspace profile
   (only an `opt-level = 1` pin for `meerkat-machine-schema`) applies to builds
   run inside its checkout, never to `cargo install` or to your binary.
+
+Rust host API changes in 0.9.4 (hosts that embed the crates):
+
+- Source owners: `AuthenticatedOriginalSource::retained_original` is replaced
+  by `retained_custody`, returning `RetainedCustody` (`Retained`,
+  `AdmissionPending` or `NotRetained`; non-exhaustive). Answer
+  `AdmissionPending` only for a submission candidate you will promote or
+  withdraw yourself within your own bound, withdraw any candidate you cannot
+  settle (it answers `NotRetained` from then on), and answer `NotRetained`
+  where you returned `None`. Work naming a pending original reports
+  `ControllerReadinessFailure::OriginalAdmissionPending` (new).
+- `meerkat::ContinuationAdmitError` gains `NotReady(ControllerReadinessFailure)`
+  and is `#[non_exhaustive]` (add a wildcard arm); such a continuation stays
+  pending and is retried. `BlockedDeliveryReason` gains the same `NotReady`
+  variant, so its variants no longer have defined discriminants; the job drain
+  reports it from the new `JobOutboxProjectionError::NotReady`.
+- `MeerkatMachine::durable_admitted_original` (and
+  `SessionServiceRuntimeExt::durable_admitted_original`, default `Unavailable`)
+  reads a keyed governed original's historical admission from the session's
+  durable runtime store after the session retired, with no live state:
+  `DurableAdmittedOriginal` (input id, retained association, durable phase,
+  terminal outcome, last run, attempt count) or `DurableAdmittedOriginalRefusal`
+  (`Conflict`, `NotAdmitted`, `UnknownRuntime`, `Unavailable`).
+- `meerkat_sqlite::preflight_domain_version` runs the schema eligibility check
+  and returns the ledger version it verified (`None` for a fresh domain).
+- `TurnStateHandle` gains provided methods `turn_phase`,
+  `apply_turn_input_observing_phase` and `scalars` (`TurnStateScalars`);
+  existing implementors keep working.
+- `MeerkatMachine::cancel_input_if_present` and
+  `cancel_tracked_input_for_member_incarnation` wait for an in-between input's
+  next committed lifecycle step instead of re-reading it every 25 ms; the
+  5-second bound is only a hang guard.
 
 ## Removed or renamed
 

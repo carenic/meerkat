@@ -630,7 +630,7 @@ the exit codes `rkat` returns (since 0.9.1 the first typed error decides, with i
 - Agent: `PROVIDER_ERROR` -32010, `BUDGET_EXHAUSTED` -32011, `HOOK_DENIED` -32012, `AGENT_ERROR` -32013
 - Capabilities, skills, schedules: `CAPABILITY_UNAVAILABLE` -32020, `SKILL_NOT_FOUND` -32021, `SKILL_RESOLUTION_FAILED` -32022, `SCHEDULE_NOT_FOUND` -32023
 - Mob: `SUPERVISOR_ROTATION_INCOMPLETE` -32024, `SCOPE_DENIED` -32025, `HOST_UNAVAILABLE` -32026, `STALE_CURSOR` -32027, `STALE_FENCE` -32028 (also session write-fence conflicts), `MEMBER_RELOAD_REQUIRED` -32029, `STALE_DELIVERY_SCOPE` -32036 (new in 0.9.0: the member session moved under a current fence; re-capture the delivery scope)
-- Native input: `INPUT_REFUSED` -32030, `INPUT_NOT_READY` -32031
+- Native input: `INPUT_REFUSED` -32030, `INPUT_NOT_READY` -32031 (`data` is `{"type": "not_ready", "reason": {"kind": ...}}`; since 0.9.4 the kind `original_admission_pending` means an original the input names is still waiting on its source owner: retry later)
 - Approvals (new in 0.9.0): `APPROVAL_STORE_UNAVAILABLE` -32033, `APPROVAL_CONFLICT` -32034, `APPROVAL_COMMIT_UNKNOWN` -32035
 - Generic: `INVALID_PARAMS` -32602, `INTERNAL_ERROR` -32603
 
