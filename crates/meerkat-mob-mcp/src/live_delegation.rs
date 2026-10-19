@@ -5144,6 +5144,57 @@ impl ExperimentalLiveDelegationCoordinator {
         Some(LiveDelegationResultAnnouncement::new(authority, text))
     }
 
+    /// Tell the provider session that `retained`'s work finished while its
+    /// result could not be released (#1820), under the machine's
+    /// `FinishedPending` narration authority: granted only while the work
+    /// is completed and its result unreleased, and at most once in a row.
+    /// Best effort: the result's own release is unaffected either way.
+    /// Returns whether the machine authorized it; once authorized it is not
+    /// asked again, whatever its delivery.
+    async fn note_finished_pending(&self, retained: &RetainedDelegation) -> bool {
+        let subject = NarrationSubject::from_retained(retained);
+        if let Err(skip) = self
+            .runtime
+            .live_delegation_narration_eligibility(&subject.runtime_binding)
+            .await
+        {
+            tracing::debug!(%skip, "live delegation finished notice skipped");
+            return false;
+        }
+        let authority = match self
+            .runtime
+            .authorize_live_delegation_narration(
+                &subject.runtime_binding,
+                &subject.operation,
+                LiveDelegationNarrationKind::FinishedPending,
+            )
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::debug!(%error, "live delegation finished notice was not authorized");
+                return false;
+            }
+        };
+        match subject
+            .control
+            .note_delegation_finished(authority, subject.delegation.clone())
+            .await
+        {
+            Ok(_dispatch) => {
+                tracing::info!(
+                    operation_id = %retained.operation.operation_id(),
+                    "live delegation finished while its result waits to be released; the session was told"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%error, "live delegation finished notice was not delivered");
+                true
+            }
+        }
+    }
+
     async fn narrate_on_held_lane(
         &self,
         subject: &NarrationSubject,
@@ -5897,6 +5948,9 @@ impl ExperimentalLiveDelegationCoordinator {
                 .runtime
                 .subscribe_session_machine_commits(&session_id)
                 .await;
+            // Set once the session has been told this delegation's work
+            // finished while its result waits (#1820).
+            let mut finished_noted = false;
             loop {
                 if task_retained.result.lock().await.terminal_ineligible
                     || task_retained.close_signal.is_cancelled()
@@ -5948,6 +6002,13 @@ impl ExperimentalLiveDelegationCoordinator {
                         .merge_result_after_channel_close(&task_retained)
                         .await;
                     break;
+                }
+                // The work is finished but its result is refused for now
+                // (another result holds the channel's one result slot, for
+                // example): the session must not keep telling the voice the
+                // work is still running while the result waits.
+                if !finished_noted {
+                    finished_noted = coordinator.note_finished_pending(&task_retained).await;
                 }
                 tracing::debug!(%error, %task_operation_id, "owned live result release refused; waiting for the session machine to commit");
                 let advanced = match commits.as_mut() {
@@ -8967,6 +9028,9 @@ mod tests {
         /// Narration kinds dispatched as their own provider event (never an
         /// announcement carried by a result release).
         separate_narration_kinds: Mutex<Vec<LiveDelegationNarrationKind>>,
+        /// Finished notices, as the delegation adapter key each named, in
+        /// dispatch order.
+        finished_notes: Mutex<Vec<String>>,
         /// The provider transport has been retired: every release and
         /// narration reports `ActiveBindingUnavailable`, as the real control
         /// plane does between the physical close and the machine's close.
@@ -9174,6 +9238,25 @@ mod tests {
                     authority.kind(),
                     text,
                 ));
+            Ok(ExperimentalGptLiveNarrationDispatch::Resolved(
+                meerkat_core::LiveAppendDeliveryOutcome::Acknowledged,
+            ))
+        }
+
+        async fn note_delegation_finished(
+            &self,
+            authority: meerkat_runtime::live_execution::LiveDelegationNarrationAuthority,
+            delegation: LiveSidebandDelegationRef,
+        ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError> {
+            assert_eq!(
+                authority.kind(),
+                LiveDelegationNarrationKind::FinishedPending,
+                "a finished notice is authorized only as FinishedPending"
+            );
+            self.finished_notes
+                .lock()
+                .await
+                .push(delegation.adapter_key().to_string());
             Ok(ExperimentalGptLiveNarrationDispatch::Resolved(
                 meerkat_core::LiveAppendDeliveryOutcome::Acknowledged,
             ))
@@ -10208,6 +10291,14 @@ mod tests {
             control.releases.lock().await.is_empty(),
             "B is refused while A holds the channel's result slot"
         );
+        // #1820: while B's result waits behind A's, the session is told B's
+        // work has finished, once, so the voice never answers "still
+        // working on it" for finished work.
+        assert_eq!(
+            control.finished_notes.lock().await.clone(),
+            vec!["delegation:two-results-b".to_string()],
+            "B's refused result tells the session its work finished, once"
+        );
         let delivery_task = coordinator
             .result_delivery_tasks
             .lock()
@@ -10236,6 +10327,11 @@ mod tests {
             control.releases.lock().await.clone(),
             vec![("delegation:two-results-b".to_string(), text_b.clone())],
             "B's result reached the provider once"
+        );
+        assert_eq!(
+            control.finished_notes.lock().await.len(),
+            1,
+            "B's release sends no second finished notice"
         );
         Ok(())
     }

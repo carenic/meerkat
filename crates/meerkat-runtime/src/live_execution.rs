@@ -25,8 +25,8 @@ use meerkat_core::{
 };
 #[cfg(feature = "live")]
 use meerkat_live::{
-    LiveSidebandAppendAuthority, LiveSidebandDelegationRef, LiveSidebandNarrationAuthority,
-    LiveSidebandReleaseAuthority, ProviderWebrtcBinding,
+    LiveSidebandAppendAuthority, LiveSidebandDelegationRef, LiveSidebandFinishedNoticeAuthority,
+    LiveSidebandNarrationAuthority, LiveSidebandReleaseAuthority, ProviderWebrtcBinding,
 };
 use sha2::{Digest, Sha256};
 #[cfg(feature = "live")]
@@ -3663,15 +3663,14 @@ impl LiveDelegationNarrationAuthority {
         self.kind
     }
 
-    /// Convert into the one-shot provider sideband narration authority. The
-    /// delegation reference must be the exact provider delegation this
-    /// operation was admitted for.
+    /// Check the provider binding and delegation of one provider dispatch
+    /// and spend this authority's single conversion.
     #[cfg(feature = "live")]
-    pub fn into_sideband_narration_authority(
+    fn claim_provider_dispatch(
         &self,
-        binding: ProviderWebrtcBinding,
+        binding: &ProviderWebrtcBinding,
         delegation: &LiveSidebandDelegationRef,
-    ) -> Result<LiveSidebandNarrationAuthority, LiveExecutionAuthorityError> {
+    ) -> Result<String, LiveExecutionAuthorityError> {
         let correlation = self.operation.domain_correlation();
         if self.session_id != *binding.session_id()
             || correlation.channel_id() != binding.channel_id()
@@ -3684,32 +3683,70 @@ impl LiveDelegationNarrationAuthority {
         self.provider_dispatch_consumed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| LiveExecutionAuthorityError::ProviderDispatchAlreadyConverted)?;
-        LiveSidebandNarrationAuthority::__from_generated_narration_authority(
-            binding,
-            format!(
-                "{}:{}",
-                self.operation.operation_id(),
-                match self.kind {
-                    LiveDelegationNarrationKind::Queued => "queued",
-                    LiveDelegationNarrationKind::Claimed => "claimed",
-                    LiveDelegationNarrationKind::Blocked => "blocked",
-                    LiveDelegationNarrationKind::Completed => "completed",
-                    LiveDelegationNarrationKind::SourceBusy => "source-busy",
-                    LiveDelegationNarrationKind::Failed => "failed",
-                }
-            ),
-        )
-        .map(|authority| {
-            // A Failed narration is the delegation's last word: it ends
-            // without a result, so the provider session stops naming it as
-            // still running.
-            if self.kind == LiveDelegationNarrationKind::Failed {
-                authority.__ending_the_delegation()
-            } else {
-                authority
+        Ok(format!(
+            "{}:{}",
+            self.operation.operation_id(),
+            match self.kind {
+                LiveDelegationNarrationKind::Queued => "queued",
+                LiveDelegationNarrationKind::Claimed => "claimed",
+                LiveDelegationNarrationKind::Blocked => "blocked",
+                LiveDelegationNarrationKind::Completed => "completed",
+                LiveDelegationNarrationKind::SourceBusy => "source-busy",
+                LiveDelegationNarrationKind::Failed => "failed",
+                LiveDelegationNarrationKind::FinishedPending => "finished-pending",
             }
-        })
+        ))
+    }
+
+    /// Convert into the one-shot provider sideband finished-notice
+    /// authority: this delegation's work finished while its result has not
+    /// been released. Only a `FinishedPending` authority converts; the
+    /// delegation reference must be the exact provider delegation this
+    /// operation was admitted for.
+    #[cfg(feature = "live")]
+    pub fn into_sideband_finished_notice_authority(
+        &self,
+        binding: ProviderWebrtcBinding,
+        delegation: &LiveSidebandDelegationRef,
+    ) -> Result<LiveSidebandFinishedNoticeAuthority, LiveExecutionAuthorityError> {
+        if self.kind != LiveDelegationNarrationKind::FinishedPending {
+            return Err(LiveExecutionAuthorityError::CorrelationMismatch);
+        }
+        let narration_id = self.claim_provider_dispatch(&binding, delegation)?;
+        LiveSidebandFinishedNoticeAuthority::__from_generated_finished_notice_authority(
+            binding,
+            narration_id,
+        )
         .ok_or(LiveExecutionAuthorityError::CorrelationMismatch)
+    }
+
+    /// Convert into the one-shot provider sideband narration authority. The
+    /// delegation reference must be the exact provider delegation this
+    /// operation was admitted for. A `FinishedPending` authority is not
+    /// spoken narration and never converts here
+    /// ([`Self::into_sideband_finished_notice_authority`]).
+    #[cfg(feature = "live")]
+    pub fn into_sideband_narration_authority(
+        &self,
+        binding: ProviderWebrtcBinding,
+        delegation: &LiveSidebandDelegationRef,
+    ) -> Result<LiveSidebandNarrationAuthority, LiveExecutionAuthorityError> {
+        if self.kind == LiveDelegationNarrationKind::FinishedPending {
+            return Err(LiveExecutionAuthorityError::CorrelationMismatch);
+        }
+        let narration_id = self.claim_provider_dispatch(&binding, delegation)?;
+        LiveSidebandNarrationAuthority::__from_generated_narration_authority(binding, narration_id)
+            .map(|authority| {
+                // A Failed narration is the delegation's last word: it ends
+                // without a result, so the provider session stops naming it as
+                // still running.
+                if self.kind == LiveDelegationNarrationKind::Failed {
+                    authority.__ending_the_delegation()
+                } else {
+                    authority
+                }
+            })
+            .ok_or(LiveExecutionAuthorityError::CorrelationMismatch)
     }
 }
 
@@ -6269,6 +6306,85 @@ mod tests {
                 kind == LiveDelegationNarrationKind::Failed,
                 "{kind:?}"
             );
+        }
+    }
+
+    /// A `FinishedPending` authority is not spoken narration (#1820): it
+    /// converts only into the finished-notice authority, whose command
+    /// lowers to the provider's finished notice for that delegation, and a
+    /// spoken kind never converts into one. A refused conversion spends
+    /// nothing.
+    #[cfg(feature = "live")]
+    #[test]
+    fn only_a_finished_pending_authority_converts_into_a_finished_notice() {
+        use meerkat_live::{LiveSidebandCommand, LiveSidebandProviderCommand};
+        for kind in [
+            LiveDelegationNarrationKind::Queued,
+            LiveDelegationNarrationKind::Claimed,
+            LiveDelegationNarrationKind::Blocked,
+            LiveDelegationNarrationKind::Completed,
+            LiveDelegationNarrationKind::SourceBusy,
+            LiveDelegationNarrationKind::Failed,
+            LiveDelegationNarrationKind::FinishedPending,
+        ] {
+            let session_id = session(1);
+            let operation = exact_operation("channel-a", "provider-turn-secret", 11);
+            let correlation = operation.domain_correlation();
+            let effect = MeerkatMachineEffect::LiveDelegationNarrationAuthorized {
+                channel_id: correlation.channel_id().to_string(),
+                interaction_id: correlation.interaction_id().to_string(),
+                operation_id: DslOperationId::from_domain(operation.operation_id()),
+                provider_turn_correlation: correlation.provider().user_turn_id().to_owned(),
+                kind,
+            };
+            let authority = LiveDelegationNarrationAuthority::from_generated_effect(
+                &session_id,
+                &operation,
+                kind,
+                &effect,
+            )
+            .expect("narration effect")
+            .expect("matching narration effect");
+            let binding = ProviderWebrtcBinding::new(
+                correlation.channel_id().clone(),
+                session_id,
+                meerkat_live::LiveRuntimeBindingGeneration::new(7),
+                meerkat_live::LiveRuntimeBindingFence::new(9),
+            );
+            let delegation = LiveSidebandDelegationRef::__from_provider_observation(
+                "delegation-secret".to_string(),
+                "private-provider-delegation-id".to_string(),
+            )
+            .expect("delegation");
+            if kind == LiveDelegationNarrationKind::FinishedPending {
+                assert!(matches!(
+                    authority.into_sideband_narration_authority(binding.clone(), &delegation),
+                    Err(LiveExecutionAuthorityError::CorrelationMismatch)
+                ));
+                let sideband = authority
+                    .into_sideband_finished_notice_authority(binding, &delegation)
+                    .expect("the refused narration conversion spent nothing");
+                let command = LiveSidebandCommand::note_delegation_finished(sideband, delegation)
+                    .expect("finished notice command");
+                assert!(!command.is_spoken(), "a finished notice is never spoken");
+                assert!(matches!(
+                    command.__into_provider_command(),
+                    LiveSidebandProviderCommand::NoteDelegationFinishedContext { delegation, .. }
+                        if delegation.adapter_key() == "delegation-secret"
+                ));
+            } else {
+                assert!(
+                    matches!(
+                        authority
+                            .into_sideband_finished_notice_authority(binding.clone(), &delegation),
+                        Err(LiveExecutionAuthorityError::CorrelationMismatch)
+                    ),
+                    "{kind:?}"
+                );
+                authority
+                    .into_sideband_narration_authority(binding, &delegation)
+                    .expect("a spoken kind still converts into narration");
+            }
         }
     }
 

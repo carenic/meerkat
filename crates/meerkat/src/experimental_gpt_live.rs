@@ -1874,6 +1874,21 @@ pub trait ExperimentalGptLiveControlPlane: Send + Sync {
         text: String,
     ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError>;
 
+    /// Client-context capability only. Tell the provider session that one
+    /// exact delegation's work finished while its result has not been
+    /// released, under the generated `FinishedPending` narration authority
+    /// (#1820). Quiet and bound to the delegation: it carries no text and
+    /// no result, and it is not held behind the user's turn. Compositions
+    /// without a provider session refuse it.
+    async fn note_delegation_finished(
+        &self,
+        authority: LiveDelegationNarrationAuthority,
+        delegation: LiveSidebandDelegationRef,
+    ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError> {
+        let _ = (authority, delegation);
+        Err(ExperimentalGptLiveBridgeError::ContextAuthorityRejected)
+    }
+
     /// The canonical commit of one continuation the provider marked on this
     /// binding's channel (`continuation_id` is the item id its user row
     /// commits under), resolved when the row commits or the channel's
@@ -2882,6 +2897,18 @@ trait ExperimentalGptLiveBrokerSession: Send + Sync {
         self.append_delegation_context(delegation, text).await
     }
 
+    /// The finished notice of a delegation whose result waits to be
+    /// released (#1820). Only a session that tells its model which
+    /// delegations are in progress has an instruction to supersede; the
+    /// others refuse it.
+    async fn append_delegation_finished_notice(
+        &self,
+        delegation: &GptLiveDelegationRef,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        let _ = delegation;
+        Err(GptLiveBrokerError::MissingContext)
+    }
+
     /// An executor result for one delegation. Sessions without a distinct
     /// result path append it as delegation context.
     async fn append_delegation_result(
@@ -3011,6 +3038,13 @@ impl ExperimentalGptLiveBrokerSession for PublicLiveBrokerSession {
         text: String,
     ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
         PublicLiveBrokerSession::append_terminal_delegation_narration(self, delegation, text).await
+    }
+
+    async fn append_delegation_finished_notice(
+        &self,
+        delegation: &GptLiveDelegationRef,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        PublicLiveBrokerSession::append_delegation_finished_notice(self, delegation).await
     }
 
     async fn append_delegation_result(
@@ -6597,6 +6631,63 @@ impl ExperimentalGptLiveWebrtcTransport {
         self.dispatch_delegation_result(authority, command).await
     }
 
+    /// Tell the provider session that one exact delegation's work finished
+    /// while its result has not been released (#1820). Unlike a narration it
+    /// is quiet, so it never waits for the user to stop speaking: the user
+    /// asking whether the work is done is exactly when it matters.
+    pub async fn note_delegation_finished(
+        &self,
+        authority: LiveDelegationNarrationAuthority,
+        delegation: LiveSidebandDelegationRef,
+    ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError> {
+        let binding = self
+            .active_binding(authority.session_id())
+            .await
+            .filter(|binding| {
+                binding.channel_id() == authority.operation().domain_correlation().channel_id()
+            })
+            .ok_or(ExperimentalGptLiveBridgeError::ActiveBindingUnavailable)?;
+        let channel_id = binding.channel_id().clone();
+        let sideband = authority
+            .into_sideband_finished_notice_authority(binding, &delegation)
+            .map_err(|_| ExperimentalGptLiveBridgeError::ContextAuthorityRejected)?;
+        let command = LiveSidebandCommand::note_delegation_finished(sideband, delegation)
+            .map_err(|_| ExperimentalGptLiveBridgeError::ContextAuthorityRejected)?;
+        let attempt = command.attempt();
+        let (resolution_tx, resolution_rx) = oneshot::channel();
+        self.pending_deliveries.lock().await.insert(
+            attempt.clone(),
+            PendingExperimentalGptLiveDelivery::DelegationNarration {
+                channel_id,
+                resolution_tx,
+            },
+        );
+        let outcome = match self.send_authorized_command(command).await {
+            Ok(LiveSidebandCommandDelivery::Accepted) => {
+                return Ok(
+                    ExperimentalGptLiveNarrationDispatch::AwaitingAcknowledgement(
+                        ExperimentalGptLiveNarrationWaiter { resolution_rx },
+                    ),
+                );
+            }
+            Ok(LiveSidebandCommandDelivery::AmbiguousTerminal) => {
+                meerkat_core::LiveAppendDeliveryOutcome::Ambiguous
+            }
+            Err(ProviderWebrtcBrokerError::Rejected) => {
+                meerkat_core::LiveAppendDeliveryOutcome::Rejected
+            }
+            Err(_) => meerkat_core::LiveAppendDeliveryOutcome::Ambiguous,
+        };
+        let pending = self.pending_deliveries.lock().await.remove(&attempt);
+        if pending.is_none() {
+            return resolution_rx
+                .await
+                .map(ExperimentalGptLiveNarrationDispatch::Resolved)
+                .map_err(|_| ExperimentalGptLiveBridgeError::ActiveBindingUnavailable);
+        }
+        Ok(ExperimentalGptLiveNarrationDispatch::Resolved(outcome))
+    }
+
     pub async fn narrate_delegation(
         &self,
         authority: LiveDelegationNarrationAuthority,
@@ -7482,6 +7573,15 @@ impl ExperimentalGptLiveControlPlane for ExperimentalGptLiveWebrtcTransport {
         text: String,
     ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError> {
         ExperimentalGptLiveWebrtcTransport::narrate_delegation(self, authority, delegation, text)
+            .await
+    }
+
+    async fn note_delegation_finished(
+        &self,
+        authority: LiveDelegationNarrationAuthority,
+        delegation: LiveSidebandDelegationRef,
+    ) -> Result<ExperimentalGptLiveNarrationDispatch, ExperimentalGptLiveBridgeError> {
+        ExperimentalGptLiveWebrtcTransport::note_delegation_finished(self, authority, delegation)
             .await
     }
 
@@ -9297,6 +9397,33 @@ impl ProviderWebrtcSidebandSession for ExperimentalGptLiveSideband {
                         .append_delegation_context(&provider_delegation, text)
                         .await
                 };
+                self.lower_append_delivery(reservation, result).await
+            }
+            LiveSidebandProviderCommand::NoteDelegationFinishedContext {
+                attempt,
+                delegation,
+                ..
+            } => {
+                let provider_delegation = self
+                    .correlations
+                    .lock()
+                    .await
+                    .delegations
+                    .get(delegation.__provider_opaque_value())
+                    .cloned()
+                    .ok_or(ProviderWebrtcBrokerError::Rejected)?;
+                // The notice is an instructions append at the provider: quiet,
+                // never held behind the user's turn.
+                let reservation = self
+                    .correlations
+                    .lock()
+                    .await
+                    .appends
+                    .reserve(SidebandAppendLane::Instructions, attempt)?;
+                let result = self
+                    .session
+                    .append_delegation_finished_notice(&provider_delegation)
+                    .await;
                 self.lower_append_delivery(reservation, result).await
             }
         }
@@ -13040,6 +13167,11 @@ mod tests {
             /// must wait for the response to end, 1600 ms of output silence on
             /// the provider's output audio frames.
             pub(super) frontier_result: bool,
+            /// The runtime tells the session the delegation finished before
+            /// its result is released (#1820): one instructions append bound
+            /// to the delegation, between its in-progress notice and its
+            /// result.
+            pub(super) finished_notice: bool,
             pub(super) create_body: Option<Value>,
             pub(super) create_authorization: Option<String>,
             pub(super) attach_authorization: Option<String>,
@@ -13213,6 +13345,17 @@ mod tests {
             assert_eq!(notice["type"], "session.instructions.append");
             assert_eq!(notice["delegation_id"], DELEGATION_ID);
             send_json(&mut socket, json!({"type":"session.instructions.appended","event_id":"n1","start_ms":1.0,"end_ms":1.0,"client_event_id":notice["event_id"]})).await;
+            if capture.lock().expect("capture lock").finished_notice {
+                let finished = recv_json(&mut socket, &capture).await;
+                assert_eq!(finished["type"], "session.instructions.append");
+                assert_eq!(finished["delegation_id"], DELEGATION_ID);
+                assert!(
+                    finished["content"].as_str().is_some_and(|content| content
+                        .starts_with("This replaces the earlier in-progress instruction")),
+                    "the finished notice supersedes the in-progress instruction: {finished}"
+                );
+                send_json(&mut socket, json!({"type":"session.instructions.appended","event_id":"n2","start_ms":1.0,"end_ms":1.0,"client_event_id":finished["event_id"]})).await;
+            }
             let release = recv_json(&mut socket, &capture).await;
             assert_eq!(release["type"], "session.commentary.append");
             assert_eq!(release["delegation_id"], DELEGATION_ID);
@@ -13427,7 +13570,14 @@ mod tests {
     #[cfg(feature = "test-realtime-fixtures")]
     #[tokio::test]
     async fn public_broker_defers_a_frontier_result_cue_until_the_response_ends_end_to_end() {
-        run_public_broker_seed_end_to_end_with(PublicSeedCase::Canonical, false, true, false).await;
+        run_public_broker_seed_end_to_end_with(
+            PublicSeedCase::Canonical,
+            false,
+            true,
+            false,
+            false,
+        )
+        .await;
     }
 
     #[cfg(feature = "test-realtime-fixtures")]
@@ -13799,7 +13949,7 @@ mod tests {
 
     #[cfg(feature = "test-realtime-fixtures")]
     async fn run_public_broker_seed_end_to_end(seed_case: PublicSeedCase, late_tail: bool) {
-        run_public_broker_seed_end_to_end_with(seed_case, late_tail, false, false).await;
+        run_public_broker_seed_end_to_end_with(seed_case, late_tail, false, false, false).await;
     }
 
     /// The Completed narration that introduces a result reaches the provider
@@ -13811,7 +13961,31 @@ mod tests {
     #[cfg(feature = "test-realtime-fixtures")]
     #[tokio::test]
     async fn public_broker_releases_an_announced_result_as_one_event() {
-        run_public_broker_seed_end_to_end_with(PublicSeedCase::Canonical, false, false, true).await;
+        run_public_broker_seed_end_to_end_with(
+            PublicSeedCase::Canonical,
+            false,
+            false,
+            true,
+            false,
+        )
+        .await;
+    }
+
+    /// #1820 A2 end to end: the runtime's finished-notice command lowers to
+    /// the public broker's finished notice for exactly the provider
+    /// delegation, on the instructions lane ahead of the result, and the
+    /// provider's receipt acknowledges the command's own attempt.
+    #[cfg(feature = "test-realtime-fixtures")]
+    #[tokio::test]
+    async fn public_broker_tells_the_session_a_delegation_finished_before_its_result() {
+        run_public_broker_seed_end_to_end_with(
+            PublicSeedCase::Canonical,
+            false,
+            false,
+            false,
+            true,
+        )
+        .await;
     }
 
     async fn run_public_broker_seed_end_to_end_with(
@@ -13819,10 +13993,17 @@ mod tests {
         late_tail: bool,
         frontier_result: bool,
         announced: bool,
+        finished_notice: bool,
     ) {
         let summarized = seed_case != PublicSeedCase::Canonical;
         let (base_url, capture, server) =
-            public_wire::local_server_with(late_tail, frontier_result).await;
+            public_wire::local_server_capturing(public_wire::Capture {
+                late_tail,
+                frontier_result,
+                finished_notice,
+                ..public_wire::Capture::default()
+            })
+            .await;
         let realm = meerkat_core::RealmId::parse("voice").expect("realm");
         let target = public_fixture_target(&realm);
         let identity = target.identity().clone();
@@ -14165,6 +14346,33 @@ mod tests {
             ));
         }
 
+        if finished_notice {
+            // The runtime's finished notice lowers to one instructions append
+            // bound to the delegation and its exact acknowledgement.
+            let authority =
+                meerkat_live::LiveSidebandFinishedNoticeAuthority::__from_generated_finished_notice_authority(
+                    binding.clone(),
+                    "public-live-finished-pending".to_string(),
+                )
+                .expect("generated finished-notice authority");
+            let command =
+                LiveSidebandCommand::note_delegation_finished(authority, delegation.clone())
+                    .expect("finished notice command");
+            let attempt = command.attempt();
+            assert_eq!(
+                sideband
+                    .send_command(command)
+                    .await
+                    .expect("finished notice delivered"),
+                LiveSidebandCommandDelivery::Accepted
+            );
+            assert!(matches!(
+                next().await.kind(),
+                LiveSidebandObservationKind::AppendAcknowledged { attempt: acked }
+                    if *acked == attempt
+            ));
+        }
+
         // Releasing executor context for the delegation lowers to one
         // delegation-scoped commentary append and its exact acknowledgement.
         let release =
@@ -14271,12 +14479,18 @@ mod tests {
         }
         assert!(next_semantic_observation(sideband.as_ref()).await.is_none());
 
-        let events = capture.lock().expect("capture lock").client_events.clone();
-        assert_eq!(events.len(), 5);
-        // The created delegation's in-progress notice, its result, the
-        // result's cue, then the close.
+        let mut events = capture.lock().expect("capture lock").client_events.clone();
+        assert_eq!(events.len(), 5 + usize::from(finished_notice));
+        // The created delegation's in-progress notice, its finished notice
+        // when the runtime sent one, its result, the result's cue, then the
+        // close.
         assert_eq!(events[0]["type"], "session.instructions.append");
         assert_eq!(events[0]["delegation_id"], public_wire::DELEGATION_ID);
+        if finished_notice {
+            let finished = events.remove(1);
+            assert_eq!(finished["type"], "session.instructions.append");
+            assert_eq!(finished["delegation_id"], public_wire::DELEGATION_ID);
+        }
         assert_eq!(events[1]["type"], "session.commentary.append");
         assert_eq!(events[1]["delegation_id"], public_wire::DELEGATION_ID);
         if announced {

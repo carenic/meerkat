@@ -1692,6 +1692,40 @@ impl PublicLiveBrokerSession {
             .await
     }
 
+    /// Tell the model that a delegation's work finished while the runtime
+    /// cannot release its result yet (#1820): the channel's one result slot
+    /// is held by another result, or another release guard refuses it for
+    /// now. The notice is the finished notice of a result held behind the
+    /// user's floor ([`delegation_finished_pending_notice_sections`]), bound
+    /// to the delegation and sent at once on the instructions lane under the
+    /// state lock, like that one: it carries no result content, so it is
+    /// never held, and a result of the delegation appended later can only
+    /// follow it. It replaces a still-due in-progress notice, the delegation
+    /// leaves later still-running lines, and its result cue takes the
+    /// after-notice head. Unlike the broker's own notices, its receipt is the
+    /// caller's.
+    ///
+    /// Refused with [`GptLiveBrokerError::MissingContext`] when there is no
+    /// in-progress instruction of running work to replace: the delegation is
+    /// not outstanding, already had its finished notice, or a result of it
+    /// has reached this session (a held result has its own notice, and a
+    /// notice must never follow a result handed to the sender).
+    pub async fn append_delegation_finished_notice(
+        &self,
+        delegation: &GptLiveDelegationRef,
+    ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
+        let mut state = self.state.lock().await;
+        let (token, fragments) = state.reserve_finished_notice(&delegation.0)?;
+        self.send_finished_notice_locked(&mut state, token, &delegation.0, fragments)
+            .await?;
+        drop(state);
+        tracing::info!(
+            delegation_id = %delegation.0,
+            "public Live delegation finished notice sent while its result waits to be released"
+        );
+        Ok(token)
+    }
+
     /// Append the narration that ends a delegation without a result (its
     /// work failed or could not start), exactly like
     /// [`Self::append_delegation_context`], and stop naming it as still
@@ -1874,31 +1908,51 @@ impl PublicLiveBrokerSession {
                     return;
                 }
             };
-            #[cfg(test)]
-            finished_notice_pause::at(finished_notice_pause::Point::AfterReserve).await;
-            for (index, content) in fragments.into_iter().enumerate() {
-                let event = ClientEvent {
-                    event_id: Field::Value(instructions_event_id(token, index)),
-                    command: Command::InstructionsAppend {
-                        content,
-                        delegation_id: Nullable(Some(delegation_id.clone())),
-                    },
-                };
-                self.instrument_outgoing_append(&event);
-                if self.sender.send(event).await.is_err() {
-                    state.append_delivery_ambiguous = true;
-                    tracing::warn!(
-                        delegation_id = %delegation_id,
-                        "public Live finished notice could not be sent; the transport is gone"
-                    );
-                    return;
-                }
+            if self
+                .send_finished_notice_locked(state, token, &delegation_id, fragments)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    delegation_id = %delegation_id,
+                    "public Live finished notice could not be sent; the transport is gone"
+                );
+                return;
             }
             tracing::info!(
                 delegation_id = %delegation_id,
                 "public Live delegation finished notice sent"
             );
         }
+    }
+
+    /// Hand one reserved finished notice's fragments to the sender, bound to
+    /// its delegation, under the state lock the caller holds. A failed send
+    /// fences later appends like any failed send.
+    async fn send_finished_notice_locked(
+        &self,
+        state: &mut SessionState,
+        token: GptLiveAppendToken,
+        delegation_id: &str,
+        fragments: Vec<String>,
+    ) -> Result<(), GptLiveBrokerError> {
+        #[cfg(test)]
+        finished_notice_pause::at(finished_notice_pause::Point::AfterReserve).await;
+        for (index, content) in fragments.into_iter().enumerate() {
+            let event = ClientEvent {
+                event_id: Field::Value(instructions_event_id(token, index)),
+                command: Command::InstructionsAppend {
+                    content,
+                    delegation_id: Nullable(Some(delegation_id.to_owned())),
+                },
+            };
+            self.instrument_outgoing_append(&event);
+            if self.sender.send(event).await.is_err() {
+                state.append_delivery_ambiguous = true;
+                return Err(GptLiveBrokerError::AppendDeliveryAmbiguous { token });
+            }
+        }
+        Ok(())
     }
 
     /// Send the in-progress notices of created client delegations, each
@@ -2896,6 +2950,46 @@ impl SessionState {
             .push_back(delegation_id.to_owned());
     }
 
+    /// The finished notice of `delegation_id`, packed as fragments.
+    fn finished_notice_fragments(&self, delegation_id: &str) -> Vec<String> {
+        let label = self
+            .outstanding_delegations
+            .iter()
+            .find(|(outstanding, _)| outstanding.as_str() == delegation_id)
+            .map(|(_, label)| label.as_str());
+        pack_sections(delegation_finished_pending_notice_sections(label))
+    }
+
+    /// Reserve the finished notice of running work whose result has not
+    /// reached this session, as a caller-owned instructions append bound to
+    /// the delegation. It supersedes the delegation's in-progress notice
+    /// still due, and it is the delegation's one finished notice. Refused
+    /// when there is no such work: the delegation is not outstanding, its
+    /// finished notice went out, or a result of it is known here (held, it
+    /// has its own notice; handed to the sender, a notice would follow it).
+    fn reserve_finished_notice(
+        &mut self,
+        delegation_id: &str,
+    ) -> Result<(GptLiveAppendToken, Vec<String>), GptLiveBrokerError> {
+        let outstanding = self
+            .outstanding_delegations
+            .iter()
+            .any(|(outstanding, _)| outstanding == delegation_id);
+        let result_known = self
+            .result_cue_candidates
+            .values()
+            .any(|candidate| candidate == delegation_id);
+        if !outstanding || result_known || self.finished_notice_sent.contains(delegation_id) {
+            return Err(GptLiveBrokerError::MissingContext);
+        }
+        let fragments = self.finished_notice_fragments(delegation_id);
+        let token = self.reserve_instructions_append(fragments.len())?;
+        self.due_progress_notices.retain(|due| due != delegation_id);
+        self.due_finished_notices.retain(|due| due != delegation_id);
+        self.finished_notice_sent.insert(delegation_id.to_owned());
+        Ok((token, fragments))
+    }
+
     /// Reserve the next due finished notice as a broker-owned instructions
     /// append bound to its delegation.
     fn reserve_due_finished_notice(
@@ -2904,12 +2998,7 @@ impl SessionState {
         let Some(delegation_id) = self.due_finished_notices.pop_front() else {
             return Ok(None);
         };
-        let label = self
-            .outstanding_delegations
-            .iter()
-            .find(|(outstanding, _)| *outstanding == delegation_id)
-            .map(|(_, label)| label.as_str());
-        let fragments = pack_sections(delegation_finished_pending_notice_sections(label));
+        let fragments = self.finished_notice_fragments(&delegation_id);
         let token = match self.reserve_instructions_append(fragments.len()) {
             Ok(token) => token,
             Err(error) => {
@@ -8856,6 +8945,111 @@ mod tests {
         assert!(result_cue_text(&wording).starts_with(LIVE_RESULT_UNREPORTED_CUE_HEAD));
     }
 
+    /// #1820 A2: the runtime's finished notice for work whose result it
+    /// cannot release yet (the channel's one result slot is held by another
+    /// result) is the caller's own instructions append, bound to the
+    /// delegation, and there is one per delegation. It replaces the
+    /// in-progress notice still due, and a result of that delegation held
+    /// later makes no second notice due.
+    #[test]
+    fn a_runtime_finished_notice_is_the_callers_once_and_replaces_the_in_progress_notice() {
+        let mut state = SessionState::default();
+        state
+            .apply_frame(frame(input_delta("book a table")))
+            .unwrap();
+        state
+            .apply_frame(frame(delegation_created("dlg_cue", "client")))
+            .unwrap();
+        assert_eq!(state.due_progress_notices, ["dlg_cue"]);
+        let (token, fragments) = state
+            .reserve_finished_notice("dlg_cue")
+            .expect("running work without a result");
+        assert_eq!(
+            fragments.join(" "),
+            delegation_finished_pending_notice(Some("book a table"))
+        );
+        assert!(
+            state.due_progress_notices.is_empty(),
+            "the in-progress notice still due is replaced"
+        );
+        assert!(
+            state
+                .pending_appends
+                .iter()
+                .any(|pending| pending.token == token
+                    && pending.lane == PendingAppendLane::Instructions
+                    && pending.internal.is_none()),
+            "the caller's: its receipt is reported to the caller"
+        );
+        assert!(
+            matches!(
+                state.reserve_finished_notice("dlg_cue"),
+                Err(GptLiveBrokerError::MissingContext)
+            ),
+            "one finished notice per delegation"
+        );
+        state
+            .apply_frame(frame(output_delta_span("one moment", 1500.0, 2000.0)))
+            .unwrap();
+        state
+            .apply_frame(frame(input_delta_at("is it done yet", 2500.0)))
+            .unwrap();
+        let (result, event) = result_append(&mut state, "dlg_cue");
+        assert!(
+            state.hold_or_send_commentary(result, event).is_none(),
+            "held behind the unanswered question"
+        );
+        assert!(
+            state.due_finished_notices.is_empty(),
+            "the delegation already had its finished notice"
+        );
+    }
+
+    /// #1820 A2: no runtime finished notice once a result of the delegation
+    /// has reached the session (handed to the sender, the notice would
+    /// follow it; held, it has its own notice), once its outcome reached the
+    /// model, or for a delegation this session is not running.
+    #[test]
+    fn a_runtime_finished_notice_is_refused_once_a_result_reached_the_session() {
+        let refused = |state: &mut SessionState, delegation: &str| {
+            matches!(
+                state.reserve_finished_notice(delegation),
+                Err(GptLiveBrokerError::MissingContext)
+            )
+        };
+        let mut sent = state_with_spoken_delegation();
+        let (result, event) = result_append(&mut sent, "dlg_cue");
+        assert!(sent.hold_or_send_commentary(result, event).is_some());
+        assert!(
+            refused(&mut sent, "dlg_cue"),
+            "a notice must never follow its result"
+        );
+
+        let mut held = state_with_spoken_delegation();
+        held.apply_frame(frame(input_delta_at("is it done yet", 2500.0)))
+            .unwrap();
+        let (result, event) = result_append(&mut held, "dlg_cue");
+        assert!(held.hold_or_send_commentary(result, event).is_none());
+        assert!(refused(&mut held, "dlg_cue"));
+        assert_eq!(
+            held.due_finished_notices,
+            ["dlg_cue"],
+            "the held result's own notice stays due"
+        );
+
+        let mut acknowledged = state_with_spoken_delegation();
+        acknowledge_result(&mut acknowledged, "dlg_cue", 2400.0);
+        assert!(
+            refused(&mut acknowledged, "dlg_cue"),
+            "the outcome reached the model"
+        );
+
+        assert!(
+            refused(&mut state_with_spoken_delegation(), "dlg_unknown"),
+            "not a delegation this session is running"
+        );
+    }
+
     /// S103 run 1 (soak 35728bf0): the model said "I'll use Friday" 5 ms
     /// before the Friday result arrived, then took the old cue's "if you
     /// already have, do not repeat it" as satisfied and never voiced the
@@ -10612,6 +10806,180 @@ mod tests {
             finished_notice_pause::Point::AfterReserve,
         )
         .await;
+    }
+
+    /// #1820 A2 on the wire: the runtime's finished notice is sent under the
+    /// state lock, so a result of the same delegation appended while the
+    /// notice is reserved but not yet sent still reaches the provider after
+    /// it, and the notice's receipt is reported to its caller.
+    #[tokio::test]
+    async fn a_runtime_finished_notice_precedes_a_result_appended_while_it_is_sent() {
+        let capture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let attach = move |State(capture): State<SharedCapture>, upgrade: WebSocketUpgrade| async move {
+            upgrade.on_upgrade(move |mut socket| async move {
+                send_json(&mut socket, json!({"type":"session.started","event_id":"s","session":{"id":"live_fixture","model":"gpt-live-1","status":"active","expires_at":1.0}})).await;
+                send_json(&mut socket, input_delta("book a table")).await;
+                send_json(&mut socket, delegation_created("dlg_cue", "client")).await;
+                send_json(&mut socket, output_delta_span("one moment", 1500.0, 2000.0)).await;
+                loop {
+                    let event = recv_json(&mut socket, &capture).await;
+                    match event["type"].as_str() {
+                        Some("session.commentary.append") => {
+                            send_json(&mut socket, ack(event["event_id"].as_str())).await;
+                        }
+                        Some("session.thinking.append" | "session.instructions.append") => {
+                            let mut receipt = ack(event["event_id"].as_str());
+                            receipt["type"] = json!(if event["type"] == "session.thinking.append" {
+                                "session.thinking.appended"
+                            } else {
+                                "session.instructions.appended"
+                            });
+                            send_json(&mut socket, receipt).await;
+                        }
+                        Some("session.close") => {
+                            send_json(&mut socket, session_closed()).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        };
+        let app = Router::new()
+            .route("/v1/live/sessions", post(create_session))
+            .route("/v1/live/sessions/{session_id}/attach", get(attach))
+            .with_state(Arc::clone(&capture));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_, session) = PublicLiveBrokerFactory::__try_from_target_with_base_url(
+            realtime_target("gpt-live-1", OpenAiBackendKind::OpenAiApi),
+            &format!("http://{address}/v1/"),
+        )
+        .unwrap()
+        .open(PublicLiveOpenConfig::new("v=0", "marin").unwrap())
+        .await
+        .unwrap()
+        .into_parts();
+        let session = Arc::new(session);
+        loop {
+            if let Some(GptLiveBrokerObservation::AssistantTranscriptFragment { text, .. }) =
+                session.next_observation().await.unwrap()
+                && text.contains("one moment")
+            {
+                break;
+            }
+        }
+        let (observations_tx, mut observations) = tokio::sync::mpsc::unbounded_channel();
+        let observer = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                while let Ok(Some(observation)) = session.next_observation().await {
+                    if observations_tx.send(observation).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let delegation = GptLiveDelegationRef("dlg_cue".to_string());
+        let pause = Arc::new(finished_notice_pause::Pause::new(
+            finished_notice_pause::Point::AfterReserve,
+        ));
+        let notice = tokio::spawn({
+            let session = Arc::clone(&session);
+            let pause = Arc::clone(&pause);
+            let delegation = delegation.clone();
+            async move {
+                finished_notice_pause::PAUSE
+                    .scope(pause, async move {
+                        session.append_delegation_finished_notice(&delegation).await
+                    })
+                    .await
+            }
+        });
+        pause.paused.notified().await;
+        // The result is appended while the notice is reserved but not sent.
+        let result = tokio::spawn({
+            let session = Arc::clone(&session);
+            let delegation = delegation.clone();
+            async move {
+                session
+                    .append_delegation_result(&delegation, "Table booked for two.")
+                    .await
+            }
+        });
+        let result_sent = || {
+            capture
+                .lock()
+                .expect("capture lock")
+                .client_events
+                .iter()
+                .any(|event| {
+                    event["type"] == "session.commentary.append"
+                        && event["content"] == "Table booked for two."
+                })
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !result_sent() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        pause.resume.notify_one();
+        let notice_token = notice
+            .await
+            .expect("notice task")
+            .expect("the finished notice is sent");
+        let result_token = result
+            .await
+            .expect("result task")
+            .expect("the result is appended");
+        let mut notice_acked = false;
+        let mut result_acked = false;
+        while !(notice_acked && result_acked) {
+            match observations.recv().await {
+                Some(GptLiveBrokerObservation::InstructionsContextAppendAcknowledged { token })
+                    if token == notice_token =>
+                {
+                    notice_acked = true
+                }
+                Some(GptLiveBrokerObservation::DelegationContextAppendAcknowledged { token })
+                    if token == result_token =>
+                {
+                    result_acked = true;
+                }
+                Some(_) => {}
+                None => panic!("the observation stream ended before both receipts"),
+            }
+        }
+        session.close().await.expect("close requested");
+        observer.await.expect("observer task");
+        server.abort();
+
+        let events = capture.lock().expect("capture lock").client_events.clone();
+        let notice_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.instructions.append"
+                    && event["delegation_id"] == "dlg_cue"
+                    && event["content"].as_str().is_some_and(|content| {
+                        content.starts_with("This replaces the earlier in-progress instruction")
+                    })
+            })
+            .unwrap_or_else(|| panic!("the finished notice was sent: {events:?}"));
+        let result_at = events
+            .iter()
+            .position(|event| {
+                event["type"] == "session.commentary.append"
+                    && event["content"] == "Table booked for two."
+            })
+            .unwrap_or_else(|| panic!("the result was sent: {events:?}"));
+        assert!(
+            notice_at < result_at,
+            "the finished notice reaches the provider before the result: {events:?}"
+        );
     }
 
     /// result that says "I asked", and the result's cue is the awaiting cue.

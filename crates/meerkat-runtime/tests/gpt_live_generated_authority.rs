@@ -7490,6 +7490,79 @@ fn narration_follows_the_schedule_state_and_releases_each_kind_once() {
     );
 }
 
+/// #1820 A2: the session is told a delegation finished while its result
+/// waits (`FinishedPending`) only while the item's work is completed and its
+/// result is not released (another result holds the channel's one result
+/// slot), and never twice in a row.
+#[test]
+fn finished_pending_is_authorized_only_for_completed_work_whose_result_waits() {
+    let mut authority = opened_authority();
+    bind_only(&mut authority);
+    admit_parallel_delegation(&mut authority, 1);
+    admit_parallel_delegation(&mut authority, 2);
+    let finished_pending = |authority: &mut mm::MeerkatMachineAuthority, index: usize| {
+        narrate(
+            authority,
+            index,
+            mm::LiveDelegationNarrationKind::FinishedPending,
+        )
+    };
+    let release = |authority: &mut mm::MeerkatMachineAuthority, index: usize| {
+        apply(
+            authority,
+            mm::MeerkatMachineInput::AuthorizeLiveDelegationResultRelease {
+                channel_id: CHANNEL.to_string(),
+                runtime_id: runtime_id(),
+                fence_token: fence(),
+                generation: generation(),
+                interaction_id: channel_interaction(index),
+                operation_id: channel_operation(index),
+                provider_turn_correlation: channel_provider_turn(index),
+            },
+        )
+    };
+    assert!(
+        finished_pending(&mut authority, 1).is_err(),
+        "a queued item has not finished"
+    );
+    start_parallel_worker(&mut authority, 1);
+    start_parallel_worker(&mut authority, 2);
+    assert!(
+        finished_pending(&mut authority, 1).is_err(),
+        "a running item has not finished"
+    );
+    for index in [1, 2] {
+        record_parallel_terminal(
+            &mut authority,
+            index,
+            &channel_worker(index),
+            mm::LiveDelegationWorkerTerminalKind::Completed,
+        );
+    }
+    release(&mut authority, 1).expect("the first result takes the channel's result slot");
+    assert!(
+        release(&mut authority, 2).is_err(),
+        "the second result waits while the slot is held"
+    );
+    let noted = finished_pending(&mut authority, 2).expect("finished work whose result waits");
+    assert!(noted.effects().iter().any(|effect| matches!(
+        effect,
+        mm::MeerkatMachineEffect::LiveDelegationNarrationAuthorized {
+            kind: mm::LiveDelegationNarrationKind::FinishedPending,
+            operation_id,
+            ..
+        } if operation_id == &channel_operation(2)
+    )));
+    assert!(
+        finished_pending(&mut authority, 2).is_err(),
+        "never twice in a row"
+    );
+    assert!(
+        finished_pending(&mut authority, 1).is_err(),
+        "a released result no longer waits"
+    );
+}
+
 #[test]
 fn busy_source_start_failure_requeues_without_abandoning_the_interaction() {
     let mut authority = opened_authority();

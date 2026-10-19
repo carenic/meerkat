@@ -1870,6 +1870,11 @@ pub enum LiveDelegationScheduleState {
 
 /// Templated executor state narration the machine releases for one exact
 /// delegation. A kind is released at most once per schedule pass.
+///
+/// `FinishedPending` is not spoken: it tells the provider session that the
+/// delegation's work finished while its result has not been released (the
+/// channel's one result slot is held by another result, for example), so
+/// the session never keeps an in-progress instruction for finished work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum LiveDelegationNarrationKind {
     #[default]
@@ -1879,6 +1884,7 @@ pub enum LiveDelegationNarrationKind {
     Completed,
     SourceBusy,
     Failed,
+    FinishedPending,
 }
 
 /// Generated phase of one channel's provider-affecting authority.
@@ -29201,6 +29207,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                             == Some(LiveDelegationScheduleState::Failed)
                         || self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
                             == Some(LiveDelegationScheduleState::Cancelled)))
+                || (kind == LiveDelegationNarrationKind::FinishedPending
+                    && self.live_delegation_schedule_state_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationScheduleState::Completed)
+                    && !self.live_result_released_operations.contains(operation_id))
             }
             guard "narration_advances" {
                 self.live_delegation_last_narration_by_operation.get_copied(operation_id) != Some(kind)
