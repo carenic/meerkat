@@ -89,6 +89,7 @@ Primary crates:
 - `.notify_orchestrator_on_resume(bool)` (a notification that fails after the resume returned is recorded as an `OrchestratorResumeNotificationFailed` mob event once its input has failed terminally, after the runtime's bounded retries; one a retry delivers records nothing; the mob keeps running. The event is recorded in process: a crash before the input's terminal loses it)
 - `.with_default_llm_client(client)` — override LLM client (primarily for testing)
 - `.register_tool_bundle(name, dispatcher)` / `.register_tool_bundle_with_account(name, account, dispatcher)` (states the `OperationAccount` the bundle's operations act with)
+- `.with_member_runtime_registration_hook(hook)` (`runtime-adapter`) - the host selects each member's destination and agent mandate. Since 0.9.4 `MemberRuntimeBuildIdentity::registration()` names the exact registration a call is for (a new member's prepared one, or a recovered member's current one): bind decisions to it, not to the session id or labels. The identity is no longer `UnwindSafe`; wrap it in `AssertUnwindSafe` to move it into `catch_unwind`
 - `.create().await`
 - `.resume().await`
 
@@ -114,7 +115,16 @@ live opens, wiring and host binds with `MobError::AdmissionClosed { mob_id,
 reason }`; stop, shutdown, destroy, retirement, cancellation and reads stay
 available, and admitted work is never stopped. Keep a `MobHandle` clone for
 as long as the mob must keep admitting work. `close_if_idle()` answers
-`Closed`, `AlreadyClosed(reason)` or `Busy(MobBusy)`.
+`Closed`, `AlreadyClosed(reason)` or `Busy(MobBusy)`. Since 0.9.4 every actor
+exit closes admission first, with a typed `MobAdmissionCloseReason` (an
+earlier close keeps its reason): an admitted Shutdown (`Shutdown`) or destroy
+(`Destroyed`; a mob restored with an unfinished destroy starts closed), a
+durability fail-stop (`DurabilityFailStop`), a lost actor task (`ActorLost`)
+or a composition dispatch failure (`DispatchFailed`), besides `IdleClose`,
+`LastOwnerReleased` and `StandDown`. While a Shutdown drains, a request the
+close does not refuse gets the retryable `MobError::ShutdownInProgress`
+(wire `SESSION_BUSY`); `ActorCommandChannelClosed` means the actor has exited
+or is exiting. `MobError` is `#[non_exhaustive]`.
 
 Delivery scope: a host that persists effect-bearing deliveries captures the
 member's `MemberDeliveryScope` (runtime incarnation, fence and session; it
@@ -333,7 +343,12 @@ held by another `MobMcpState`), it keeps the files and answers
 (JSON-RPC and MCP: internal-error data; REST session archive: HTTP 500). Drop
 those handles and retry as the same caller; the retry continues the owed
 cleanup and answers the canonical report. Creating, restoring or inserting a
-mob under that id is refused until the cleanup is done.
+mob under that id is refused until the cleanup is done. An admitted destroy
+closes the mob's admission first (`MobAdmissionCloseReason::Destroyed`). A
+host that drains observers itself reads a `SqliteMobObserverDrainReport`;
+since 0.9.4 its `retained_registrations` counts change-watch notification
+registrations still running when the drain stopped them (a struct literal
+must set it).
 
 ## External members
 

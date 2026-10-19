@@ -1,13 +1,13 @@
-Covers: Meerkat mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy,
-admission close, cancelling member work, member lifetime, helpers, fork_off,
-council, profile keys (tools.deny hides tools), flows and runs (run-flow
-waits, --detach), multi-host mobs, mobpacks and deploy (budgets, known issues),
-error codes. Live: live_comms_mobs_live.md. Comms:
+Covers: Meerkat mob changes since 0.8.40 (through 0.9.4): stop, shutdown
+(ShutdownInProgress), destroy, admission close reasons, cancelling member work,
+member lifetime, reset and re-spawn, helpers, fork_off, council, profile keys,
+flows and runs (run-flow waits, --detach), multi-host mobs, mobpacks and
+deploy budgets, error codes. Live: live_comms_mobs_live.md. Comms:
 live_comms_mobs_comms.md.
 
 # Mob Changes Since 0.8.40 (0.9)
 
-The 0.9.0 guide to what changed for mobs since 0.8.40. `references/mobs.md`
+What changed for mobs since 0.8.40, through 0.9.4. `references/mobs.md`
 stays the baseline for mob definitions, flows and agent mob tools; where
 they disagree, this file wins. Member live channels are in
 live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
@@ -34,17 +34,29 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   A spawn that finishes into a stopped mob leaves it stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. While a mob shuts down, a command its closed
-  admission refuses (a spawn, work, a flow, wiring) fails with
-  `AdmissionClosed`, and while the Shutdown drains its own work other
-  commands fail with the retryable `ShutdownInProgress`. Once the actor has
-  exited, commands fail with `ActorCommandChannelClosed`.
+  and reports each member. Since 0.9.4 an admitted Shutdown closes the mob's
+  admission before any teardown (reason `Shutdown`). While it runs, a command
+  the closed admission refuses (spawn, respawn, work, a flow run, wiring, a
+  host bind, a live commit, resume, reset, reload, an owner lease) fails with
+  `AdmissionClosed`, and every other request (stop, destroy, complete,
+  retirement, reads, `status()`) gets `MobError::ShutdownInProgress`:
+  retryable, wire `SESSION_BUSY`, data kind `mob_shutdown_in_progress`;
+  `stop()` returns it at once. 0.9.3 and earlier answered these with
+  `ActorCommandChannelClosed`, which now means only that the actor has
+  exited or is exiting. A Shutdown that fails keeps the actor serving with
+  admission closed: Stop, Shutdown and Destroy stay available. A command sent
+  while the actor exits after a shutdown now fails instead of waiting
+  forever. `MobError` is `#[non_exhaustive]` since 0.9.4.
 - Destroy deletes the mob's database files only after its actor ended and its
   observer drained. Until then it answers `mob_destroy_incomplete` with
   `destroy_report` and `retryable: true` (JSON-RPC and MCP: internal error
   data; REST session archive: HTTP 500). Drop every `MobHandle` or store in
   your process and retry as the same caller. The mob id cannot be re-created
-  until the cleanup finishes.
+  until the cleanup finishes. Since 0.9.4 an admitted destroy (its durable
+  marker written) closes admission first (reason `Destroyed`); an incomplete
+  destroy keeps it closed while the retry stays available, and a mob restored
+  with an unfinished destroy starts with admission closed, so nothing is
+  spawned into it.
 
 ## Admission close (Rust hosts)
 
@@ -57,6 +69,17 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
 `close_if_idle()` (`Closed`, `AlreadyClosed` or `Busy`) or
 `close_admission(reason)`, and watch `admission_closed()`. Mobs managed by
 `rkat-rpc`, `rkat-rest` or `rkat-mcp` stay owned by the server's registry.
+
+Since 0.9.4 admission also closes, before the actor stops, when a Shutdown is
+admitted (`Shutdown`), a destroy is admitted (`Destroyed`), the actor
+fail-stops on an uncertain durable write or a failed durable recovery
+(`DurabilityFailStop`), the actor task is lost to a panic or abort
+(`ActorLost`), or a composition dispatch failure stops it (`DispatchFailed`).
+These are `MobAdmissionCloseReason` variants next to `IdleClose`,
+`LastOwnerReleased` and `StandDown`, and an earlier close keeps its reason.
+No actor exit leaves admission open: `acquire_owner()` is refused and
+`admission_closed()` names the reason, where 0.9.3 and earlier could still
+hand out an owner lease on a stopped actor.
 
 ## Stopping and cancelling member work
 
@@ -91,6 +114,11 @@ and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
   re-drives it once per request.
 - `rkat mob respawn <MOB_ID> <AGENT_IDENTITY> [--initial-message <MSG>]`
   (RPC `mob/respawn`) replaces the member under a new runtime binding.
+- Since 0.9.4 a mob that was reset and then re-spawned a member under an
+  identity it had before the reset resumes after a restart (0.9.3 and earlier
+  failed that resume with an internal error), and the re-spawned member always
+  gets a generation above every earlier one, so it never reuses its pre-reset
+  runtime id or member address.
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
@@ -262,6 +290,9 @@ rkat --realm team mob hosts <MOB_ID> --json
   env or headers are refused.
 - Also: `rkat mob revoke-host`, `member-history` and `route-installs`
   (pending external trust installs show as `outstanding_external`).
+- Since 0.9.4 a recorded placed lifecycle intent (such as a Reset) is not
+  retried while the mob's admission is closed (0.9.3 and earlier retried it
+  every 2 s with a warning); it stays recorded and the next start drives it.
 - Grants for delegated principals: `rkat mob grant <MOB_ID> <PRINCIPAL>
   --scope <SCOPE>... [--expires-at-ms N | --expires-in 30m]`, `revoke-grant`
   (no `--scope` revokes all) and `grants`. The scopes are `list`,
@@ -322,7 +353,7 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
 
 | Code | JSON-RPC | HTTP | Meaning |
 |---|---|---|---|
-| `SESSION_BUSY` | -32002 | 409 | Retry later (also a full 256-entry member lane, a retirement or teardown in progress) |
+| `SESSION_BUSY` | -32002 | 409 | Retry later (also a full 256-entry member lane, a retirement or teardown in progress, a Shutdown draining: `mob_shutdown_in_progress`) |
 | `CAPABILITY_UNAVAILABLE` | -32020 | 501 | Feature not available here |
 | `SUPERVISOR_ROTATION_INCOMPLETE` | -32024 | 409 | Finish supervisor rotation |
 | `SCOPE_DENIED` | -32025 | 403 | Principal lacks a control scope |
