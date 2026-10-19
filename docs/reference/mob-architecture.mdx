@@ -39,7 +39,7 @@ Mob member identity has two layers:
 | `AgentIdentity` | Stable member identity. Public mob APIs, wiring, delegation, status, and profiles use this. |
 | `AgentRuntimeId` | Runtime binding identity. It can rotate on respawn or binding replacement. |
 | `FenceToken` | Monotonic binding epoch used to reject stale runtime effects. |
-| `Generation` | Member generation counter, incremented on respawn. It never repeats for an identity, across mob resets and restarts too. |
+| `Generation` | Member generation counter, incremented on respawn. Since 0.9.4 a spawn never reuses a generation for an identity, across mob resets and restarts too. |
 | `HostId` | Canonical bound-host identity used for placement. It is not member identity. |
 
 Use `AgentIdentity` for facts that survive respawn. Use `AgentRuntimeId` only
@@ -49,7 +49,9 @@ Since 0.9.4 resume recovers each identity's highest generation from the whole
 event log, every reset epoch included, before it replays the events after the
 last `MobReset`, and every spawn takes its generation from the MobMachine. A
 member re-spawned after a reset and a restart therefore never reuses its
-pre-reset runtime id or member address.
+pre-reset runtime id or member address. A store written before 0.9.4 whose
+last epoch already reused a generation still resumes, and that identity's
+next spawn goes above the recovered high-water.
 
 ### Member binding history
 

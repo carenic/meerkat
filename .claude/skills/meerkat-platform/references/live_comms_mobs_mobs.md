@@ -118,7 +118,9 @@ hand out an owner lease on a stopped actor.
   identity it had before the reset resumes after a restart (0.9.3 and earlier
   failed that resume with an internal error), and the re-spawned member always
   gets a generation above every earlier one, so it never reuses its pre-reset
-  runtime id or member address.
+  runtime id or member address. A store written before 0.9.4 whose last epoch
+  already reused a generation still resumes; that identity's next spawn goes
+  above the recovered high-water.
 - Since 0.9.4 a Rust host can read which member incarnation held which
   session: `MobHandle::member_binding_history()` (also on `read_handle()`;
   needs `ControlScope::List`) answers per session across mob resets, and per

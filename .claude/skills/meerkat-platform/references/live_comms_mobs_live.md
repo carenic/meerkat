@@ -167,6 +167,21 @@ Minimal WebSocket flow:
   the server judges them. `media_fault` (no audible frame and a peak below
   0.002) closes the channel before the reply. `reopen_recommended` is true
   only for a session's first media fault.
+- Failed responses (since 0.9.4): a provider response that ends without
+  completing arrives as a `turn_failed` observation. Route on
+  `failure.status` (`failed`, `incomplete` or `in_progress`; a status without
+  a wire name arrives as `{"unknown": {"debug": ...}}`); the provider's
+  `reason`, `code` and `message` are diagnostics only. `incomplete` for
+  `max_output_tokens` or `content_filter` keeps its earlier mapping. A failed
+  response is not terminal: the channel stays open, Meerkat neither cancels
+  nor retries it, nothing of it is committed (the transcript records
+  `assistant_turn_failed`), and a WebRTC peer stops the audio still queued
+  for it. Reported usage is charged; without it the session event stream
+  carries `turn_usage_accounting_unmeasured`. 0.9.3 and earlier committed the
+  partial text as a finished `end_turn` reply, and a failed response without
+  usage closed the channel. Upgrade SDKs with the server: older SDKs reject
+  the new observation. A session that recorded a failed response cannot be
+  opened by 0.9.3 (realtime sidecar event schema 4).
 
 ### Transcript rows in session history
 
