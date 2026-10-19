@@ -458,12 +458,16 @@ check made by the CLI itself, exits 1.
 | 10 | Session not found |
 | 11 | Session busy, including a session another runtime owner hosts |
 | 12 | Session not runnable: a durable resume hold |
+| 13 | Duplicate input (`DUPLICATE_INPUT`) |
 | 14 | Request cancelled: the turn was interrupted |
 | 20 | Provider error |
 | 21 | Budget exhausted |
 | 22 | Hook denied |
+| 30 | Agent error (`AGENT_ERROR`) |
 | 40 | Capability unavailable |
+| 41 | Skill not found (`SKILL_NOT_FOUND`) |
 | 42 | Skill resolution failed |
+| 43 | Schedule not found (`SCHEDULE_NOT_FOUND`) |
 | 44 | Supervisor rotation incomplete |
 | 45 | Mob control scope denied |
 | 46 | Mob member host unavailable |
@@ -473,7 +477,11 @@ check made by the CLI itself, exits 1.
 | 50 | Input refused: the governed realm's owner declined the prompt |
 | 51 | Input readiness unavailable |
 | 52 | Session runtime unavailable |
+| 53 | Approval store committed nothing (`APPROVAL_STORE_UNAVAILABLE`) |
+| 54 | Approval changed in the store first (`APPROVAL_CONFLICT`) |
+| 55 | Approval commit outcome unknown (`APPROVAL_COMMIT_UNKNOWN`) |
 | 56 | Mob delivery scope is stale |
+| 57 | Fork refused by the host's fork instruction policy (`FORK_INSTRUCTION_REFUSED`, since 0.9.4) |
 
 A mob error with a typed console detail (codes 45-48 and 56) also prints one
 `detail:` line with that detail as JSON. Inspect the diagnostic or an
