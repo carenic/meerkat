@@ -41,6 +41,9 @@ struct SelectingHost {
     release: Semaphore,
     pause: bool,
     refuse: AtomicBool,
+    /// `Some` refuses the destination of this one member only, as `refuse`
+    /// refuses every member's.
+    refuse_member: std::sync::Mutex<Option<String>>,
 }
 
 impl SelectingHost {
@@ -64,7 +67,25 @@ impl SelectingHost {
             release: Semaphore::new(0),
             pause,
             refuse: AtomicBool::new(refuse),
+            refuse_member: Default::default(),
         })
+    }
+
+    /// A host that refuses the destination of `member` only.
+    fn refusing_member(member: &str) -> Arc<Self> {
+        let host = Self::new(false, false);
+        *host.refuse_member.lock().unwrap() = Some(member.to_owned());
+        host
+    }
+
+    /// How many times this host was asked to select `member`'s destination.
+    fn selections_of(&self, member: &AgentIdentity) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|identity| identity.member().member == member.as_str())
+            .count()
     }
 
     fn selection(identity: &MemberRuntimeBuildIdentity) -> MemberDestinationSelection {
@@ -105,7 +126,10 @@ impl crate::MemberRuntimeRegistrationHook for SelectingHost {
         if self.pause {
             self.release.acquire().await.unwrap().forget();
         }
-        if self.refuse.load(Ordering::SeqCst) {
+        let refused_member = self.refuse_member.lock().unwrap().clone();
+        if self.refuse.load(Ordering::SeqCst)
+            || refused_member.is_some_and(|member| member == identity.member().member)
+        {
             return Err(MobError::WiringError(
                 "host deliberately refused the member".into(),
             ));
@@ -2416,6 +2440,197 @@ async fn an_explicit_resume_refused_by_the_host_leaves_the_member_broken_with_th
     RebootedMob::assert_refused(&again);
     RebootedMob::assert_host_reason(&again);
     let _ = rebooted.resumed.stop().await;
+}
+
+/// The members of [`recreated_mob`]. The refusal tests refuse the first.
+const RECREATED: [&str; 2] = ["recreated-worker-a", "recreated-worker-b"];
+
+/// Two hooked members of a running mob on a session service that keeps no
+/// durable sessions, a cold restart, and the mob resumed with `second_boot`
+/// as its host on a fresh such service. With no durable session to restore,
+/// the boot recreates each member on a fresh session, asking `second_boot`
+/// about its registration.
+struct RecreatedMob {
+    resumed: MobHandle,
+    machine: Arc<MeerkatMachine>,
+    /// The session each member ran on before the restart.
+    first_sessions: HashMap<AgentIdentity, SessionId>,
+}
+
+async fn recreated_mob(second_boot: Arc<SelectingHost>) -> RecreatedMob {
+    let service = Arc::new(MockSessionService::new());
+    service.keep_no_durable_sessions();
+    let _first_machine = governed_machine(&service);
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .with_member_runtime_registration_hook(SelectingHost::new(false, false))
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .unwrap();
+    let mut first_sessions = HashMap::new();
+    for member in RECREATED {
+        let member = AgentIdentity::from(member);
+        let spawned = handle
+            .spawn_with_options(
+                ProfileName::from("worker"),
+                member.clone(),
+                None,
+                Some(crate::MobRuntimeMode::TurnDriven),
+                None,
+            )
+            .await
+            .unwrap();
+        first_sessions.insert(member, spawned.bridge_session_id().unwrap().clone());
+    }
+    let restarted = Arc::new(MockSessionService::new());
+    restarted.keep_no_durable_sessions();
+    let machine = governed_machine(&restarted);
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(restarted)
+    .with_member_runtime_registration_hook(second_boot)
+    .allow_ephemeral_sessions(true)
+    .resume()
+    .await
+    .expect("the boot recreates every member; a host refusal breaks only the member refused");
+    RecreatedMob {
+        resumed,
+        machine,
+        first_sessions,
+    }
+}
+
+impl RecreatedMob {
+    /// `member` is live, with no refusal, on the registration `host` selected
+    /// for it at the restart: a fresh session, not the one it ran on before.
+    async fn assert_live_on_its_selected_registration(
+        &self,
+        host: &SelectingHost,
+        member: &AgentIdentity,
+    ) {
+        self.resumed
+            .ensure_member_live(member)
+            .await
+            .expect("the host accepted the recreated member");
+        let selected = host
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|identity| identity.member().member == member.as_str())
+            .cloned()
+            .expect("the host selected the recreated member");
+        let session = selected.registration().session_id().clone();
+        assert_ne!(
+            Some(&session),
+            self.first_sessions.get(member),
+            "the boot recreated the member on a fresh session"
+        );
+        assert_eq!(
+            self.machine
+                .current_session_registration_witness(&session)
+                .await
+                .as_ref(),
+            Some(selected.registration()),
+            "the member is live on the registration the host selected"
+        );
+        let status = self.resumed.member_status(member).await.unwrap();
+        assert_eq!(status.status, MobMemberStatus::Active);
+        assert_eq!(status.registration_refusal, None);
+    }
+}
+
+/// After a cold restart on a session service that keeps no durable sessions,
+/// the boot recreates each member on a fresh session, and the host refuses
+/// one of them. The resume succeeds: only the refused member is Broken, with
+/// the typed refusal in its status, and the other is live on the registration
+/// the host selected. Asking for the refused member answers the same refusal
+/// without asking the host again.
+#[tokio::test]
+async fn a_member_its_host_refuses_when_the_boot_recreates_it_is_broken_alone() {
+    let second_boot = SelectingHost::refusing_member(RECREATED[0]);
+    let recreated = recreated_mob(second_boot.clone()).await;
+    let refused = AgentIdentity::from(RECREATED[0]);
+    assert_eq!(
+        second_boot.selections_of(&refused),
+        1,
+        "the boot asks the host about the member it recreates once"
+    );
+    assert_eq!(recreated.resumed.status().await.unwrap(), MobState::Running);
+
+    let status = recreated.resumed.member_status(&refused).await.unwrap();
+    assert_eq!(status.status, MobMemberStatus::Broken);
+    assert_eq!(
+        status.registration_refusal,
+        Some(crate::MemberRegistrationHookCall::SelectDestination),
+        "the member's status carries the typed refusal"
+    );
+    let refusal = recreated
+        .resumed
+        .ensure_member_live(&refused)
+        .await
+        .expect_err("the host refused the recreated member");
+    RebootedMob::assert_refused(&refusal);
+    assert_eq!(
+        second_boot.selections_of(&refused),
+        1,
+        "asking for the refused member again does not ask the host"
+    );
+
+    recreated
+        .assert_live_on_its_selected_registration(&second_boot, &AgentIdentity::from(RECREATED[1]))
+        .await;
+    let _ = recreated.resumed.stop().await;
+}
+
+/// The control: a host that accepts both members the boot recreates gets
+/// each live on the fresh registration it selected, with no refusal.
+#[tokio::test]
+async fn members_the_boot_recreates_are_live_on_the_registrations_their_host_selected() {
+    let second_boot = SelectingHost::new(false, false);
+    let recreated = recreated_mob(second_boot.clone()).await;
+
+    for member in RECREATED {
+        recreated
+            .assert_live_on_its_selected_registration(&second_boot, &AgentIdentity::from(member))
+            .await;
+    }
+    let _ = recreated.resumed.stop().await;
+}
+
+/// A member its host refused when the boot recreated it is retired like any
+/// member. Its pre-restart session does not exist on the fresh service, so
+/// the retirement's archive finds it already gone.
+#[tokio::test]
+async fn a_member_refused_when_the_boot_recreates_it_can_be_retired() {
+    let recreated = recreated_mob(SelectingHost::refusing_member(RECREATED[0])).await;
+    let refused = AgentIdentity::from(RECREATED[0]);
+
+    recreated
+        .resumed
+        .retire(refused.clone())
+        .await
+        .expect("the refused member is retired");
+
+    assert!(
+        recreated
+            .resumed
+            .list_members()
+            .await
+            .iter()
+            .all(|entry| entry.agent_identity != refused),
+        "the retired member leaves the roster"
+    );
+    let _ = recreated.resumed.stop().await;
 }
 
 /// A hooked member live in a running mob, over the governed machine its

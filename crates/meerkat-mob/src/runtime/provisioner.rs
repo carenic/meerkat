@@ -435,10 +435,12 @@ pub(crate) enum RuntimeRevivalIntent {
     #[default]
     None,
     MissingLiveMaterialization,
-    /// `MobBuilder::resume` restoring a durable member at boot. It provisions
-    /// as `None` does; a host refusal of the registration it prepared comes
-    /// back typed (`MobError::MemberRegistrationRefused`), and the
-    /// transaction's own rollback removes that registration.
+    /// `MobBuilder::resume` restoring a member at boot: on its durable session,
+    /// or on a fresh one (as when the session service keeps no durable
+    /// sessions).
+    /// It provisions as `None` does; a host refusal of the registration it
+    /// prepared comes back typed (`MobError::MemberRegistrationRefused`), and
+    /// the transaction's own rollback removes that registration.
     ColdRestore,
 }
 
