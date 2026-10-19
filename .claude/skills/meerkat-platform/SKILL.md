@@ -1510,9 +1510,11 @@ retired (it stays in the roster and can take new turns). It converges
 idempotently: with nothing left to cancel (an idle member, a run that already
 ended, a member already retiring or no longer live) it is a no-op success,
 never an `invalid state transition` error, and no cancel is left behind for a
-later run. Only an identity the roster has never seen is refused, as
-`MemberNotFound`. For an immediate, run-fenced stop use `mob/stop_member_run`
-(or `mob/hard_cancel_member` for host-level immediate cancel).
+later run. An identity the roster has never seen is refused, as
+`MemberNotFound`. Since 0.9.4 a member whose runtime needs a durability reload
+is refused, as `MemberReloadRequired`, until its registration is reloaded. For
+an immediate, run-fenced stop use `mob/stop_member_run` (or
+`mob/hard_cancel_member` for host-level immediate cancel).
 
 Spawned/forked members can be capability-contained: pass `tool_access_policy` (`allow_list` / `deny_list` / `read_only` / `inherit`) on the spawn spec / `HelperOptions` / `AgentBuildConfig`. Since 0.8.52 (#1807) tools an allow or deny list (or a mob profile `tools.deny`) makes unreachable by name are hidden from the model's tool list as well as refused at call time; a denied call returns an ordinary `access_denied` tool error and the run continues. Conditional policy stays visible and is refused at call time, by three separate gates: `read_only` intent (decided per call on each tool's declared mutation class; `access_denied`), the application tool (consequence) policy (`policy_denied` or `policy_indeterminate`), and dispatch admission. `inherit` (and omitting the policy) composes the PARENT member's effective policy, so a restricted member cannot shed its restrictions by spawning helpers. Provider-native tools need no separate step: under any restricting `tool_access_policy`, a governing application tool policy or dispatch admission, the build turns off every provider-native tool (native web search included); an explicit web-search enable then gets the ordinary `web_search` tool.
 

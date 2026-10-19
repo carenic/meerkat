@@ -1030,6 +1030,16 @@ them.
   `UnregisterPending` at the stage `durability_reload_discard`, not as a
   Shutdown teardown failure: its settlement runs the reload-required discard
   and admits the unregister again.
+- `MobHandle::force_cancel_member` on a member whose runtime requires a
+  durability reload answers `MobError::MemberReloadRequired` at once, naming
+  the member, where it failed with `MobError::Internal` wrapping the
+  runtime's repair-blocked error. `MobHandle::cancel_all_work` answers the
+  same. On the wire this is the dedicated `MEMBER_RELOAD_REQUIRED` error:
+  JSON-RPC `-32029` from `mob/force_cancel`, HTTP 409 from
+  `POST /mob/{id}/members/{agent_identity}/cancel`, and exit 49 from
+  `rkat mob force-cancel`. Reload the member with
+  `MobHandle::reload_member_registration`, then cancel again. This was a
+  0.9.3 known limitation.
 
 ### Fixed
 
@@ -1576,6 +1586,19 @@ them.
   matches deliveries of two different senders in one turn, the tool refuses
   with `ambiguous_reply`, names each sender and sends nothing; before, it
   answered the first. Pre-existing in 0.9.3.
+- A mob destroy whose member's boundary commit fails while the destroy
+  waits on that member's ingress detach now reloads the member, retries its
+  retirement once, and names it in `reloaded_members`. It answered
+  `MobDestroyError::Incomplete`; 0.9.3 listed this as a known limitation.
+- A wait for a session's durability-ready mutation gate now ends with the
+  typed `RuntimeDriverError::RecoveryRepairBlocked` as soon as the session's
+  durability degrades, even while another holder keeps the gate. The exited
+  runtime loop of a member whose boundary commit failed keeps the gate until
+  a reload, so such a wait lasted until the member was reloaded. This
+  includes the run-start hold a mob Shutdown takes on each member. An
+  unregister that waits for the gate before it stages its final unregister
+  also ends typed and releases its teardown coordinator, so the
+  reload-required discard can run.
 
 ## [0.9.3] - 2026-10-18
 

@@ -87379,6 +87379,44 @@ fn a_member_cancel_whose_delivery_outcome_is_unknown_reports_the_recorded_cancel
     );
 }
 
+/// A member work cancel the runtime refused with the typed
+/// `RecoveryRepairBlocked` answers the member's `MemberReloadRequired`, whose
+/// repair is `MobHandle::reload_member_registration`. Any other refusal stays
+/// internal.
+#[test]
+fn a_member_cancel_refused_for_a_durability_reload_answers_member_reload_required() {
+    use super::provisioner::member_work_cancel_error;
+    let member = AgentIdentity::from("cancelled-member");
+    let refused = member_work_cancel_error(
+        &member,
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked {
+            evidence_digest: None,
+            reason: "durability reload required after `atomic_apply`: outcome unknown".to_string(),
+        },
+        || "abandoning the queued input failed".to_string(),
+    );
+    match refused {
+        MobError::MemberReloadRequired { member_id, reason } => {
+            assert_eq!(member_id, member);
+            assert!(reason.contains("durability reload required"), "{reason}");
+        }
+        other => panic!("a reload-required refusal answers MemberReloadRequired: {other:?}"),
+    }
+    let other = member_work_cancel_error(
+        &member,
+        meerkat_runtime::RuntimeDriverError::Internal("boom".to_string()),
+        || "abandoning the queued input failed".to_string(),
+    );
+    assert!(
+        matches!(
+            &other,
+            MobError::Internal(text)
+                if text.contains("abandoning the queued input failed") && text.contains("boom")
+        ),
+        "{other:?}"
+    );
+}
+
 /// #1500: a turn-driven member's running turn is not cancelled by Stop; the
 /// report names that run, and the member's run starts are held.
 #[tokio::test]
