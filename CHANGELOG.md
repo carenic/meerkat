@@ -62,7 +62,8 @@ them.
 - `meerkat-core`: `ProviderStopDetail`, the provider's own account of why it
   refused or filtered a response, held as provider-tagged data (`anthropic`:
   the refusal's `stop_details` category and explanation; `open_ai`: the filter
-  reason, or `refusal` with the refusal text; `gemini`: the raw
+  reason of a Responses, Chat Completions or realtime text turn, or `refusal`
+  with the refusal text; `gemini`: the raw
   `promptFeedback.blockReason` or candidate `finishReason` with the safety
   categories marked `blocked`). Nothing in core reads it; each text field is
   capped at 4 KiB, and an unknown provider or a malformed detail decodes as

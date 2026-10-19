@@ -27,7 +27,8 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
-    AssistantBlock, ContentBlock, ImageData, Message, OutputSchema, StopReason, Usage,
+    AssistantBlock, ContentBlock, ImageData, Message, OutputSchema, ProviderStopDetail, StopReason,
+    Usage,
 };
 use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream};
 
@@ -492,10 +493,11 @@ fn build_tools(request: &LlmRequest) -> Result<Vec<Tool>, LlmError> {
 /// The terminal outcome of one text turn's `response.done`.
 ///
 /// Read as the Responses adapter reads it: an incomplete response names its
-/// reason (`max_output_tokens`, `content_filter`) and a cancelled one ends as
-/// cancelled. A failed response, an incomplete one with any other reason, and
-/// one still in progress refuse the turn with the retryable
-/// `IncompleteResponse` instead of reading it as a finished turn.
+/// reason (`max_output_tokens`, `content_filter`, which carries that raw
+/// reason as the provider detail) and a cancelled one ends as cancelled. A
+/// failed response, an incomplete one with any other reason, and one still
+/// in progress refuse the turn with the retryable `IncompleteResponse`
+/// instead of reading it as a finished turn.
 fn text_turn_done_outcome(response: &Response, completed_stop: StopReason) -> LlmDoneOutcome {
     let details = response.status_details.as_ref();
     let stop_reason = match response.status {
@@ -503,7 +505,12 @@ fn text_turn_done_outcome(response: &Response, completed_stop: StopReason) -> Ll
         ResponseStatus::Cancelled => StopReason::Cancelled,
         ResponseStatus::Incomplete => match details.and_then(|details| details.reason.as_deref()) {
             Some("max_output_tokens") => StopReason::MaxTokens,
-            Some("content_filter") => StopReason::ContentFilter,
+            Some(reason @ "content_filter") => {
+                return LlmDoneOutcome::success_with_detail(
+                    StopReason::ContentFilter,
+                    ProviderStopDetail::openai(reason, None),
+                );
+            }
             other => {
                 return LlmDoneOutcome::Error {
                     error: LlmError::IncompleteResponse {
@@ -716,8 +723,20 @@ mod tests {
             ),
         ] {
             match text_turn_done_outcome(&done_response(status, reason), completed_stop) {
-                LlmDoneOutcome::Success { stop_reason, .. } => {
+                LlmDoneOutcome::Success {
+                    stop_reason,
+                    stop_detail,
+                    ..
+                } => {
                     assert_eq!(stop_reason, expected, "{status:?} {reason:?}");
+                    // Only a filter carries the provider's raw reason.
+                    let expected_detail = (expected == StopReason::ContentFilter)
+                        .then(|| ProviderStopDetail::openai("content_filter", None));
+                    assert_eq!(
+                        stop_detail.as_deref(),
+                        expected_detail.as_ref(),
+                        "{status:?} {reason:?}"
+                    );
                 }
                 other => panic!("{status:?} {reason:?}: expected Success, got {other:?}"),
             }
