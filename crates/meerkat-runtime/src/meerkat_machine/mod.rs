@@ -8103,7 +8103,7 @@ impl MeerkatMachine {
             {
                 let _ = outcomes.send((
                     outcome_input_id,
-                    dispatched.as_ref().map(|_| ()).map_err(ToString::to_string),
+                    dispatched.as_ref().copied().map_err(ToString::to_string),
                 ));
             }
             if let Err(error) = dispatched {

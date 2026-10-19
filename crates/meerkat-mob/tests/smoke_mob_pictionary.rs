@@ -902,6 +902,7 @@ fn pictionary_history_page(texts: Vec<(&str, &str)>) -> meerkat_core::SessionHis
                             text: text.to_string(),
                         }],
                         delivery_id: None,
+                        in_reply_to: None,
                     },
                 ),
             )

@@ -20296,6 +20296,7 @@ mod tests {
                                 objective_id: None,
                                 system_prompts: Vec::new(),
                                 injected_context: Vec::new(),
+                                in_reply_to: None,
                             })
                         } else {
                             meerkat_runtime::Input::Prompt(prompt)

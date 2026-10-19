@@ -2259,7 +2259,7 @@ mod tests {
     fn reply_selector_routes_distinct_ids_to_their_own_senders() {
         let first = reply_capability(PeerId::new(), 51);
         let second = reply_capability(PeerId::new(), 52);
-        let deliveries = [first.clone(), second.clone()];
+        let deliveries = [first, second];
         let dispatch_context = reply_dispatch_context(deliveries.to_vec());
         for capability in &deliveries {
             let selector = capability.in_reply_to.to_string();
