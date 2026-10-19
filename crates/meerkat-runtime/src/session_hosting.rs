@@ -154,14 +154,25 @@ mod native {
         pub fn subscribe_ticks(&self) -> crate::tokio::sync::watch::Receiver<u64> {
             self.ticks.clone()
         }
+
+        /// Where the watch's file notification registration stands.
+        #[cfg(all(test, feature = "sqlite-store"))]
+        pub(crate) fn notification_registration(
+            &self,
+        ) -> meerkat_sqlite::watch::SqliteWatchRegistration {
+            self._watch.registration()
+        }
     }
 
     /// Start the wake watch over `capability`'s store database, ticking at
     /// least every `sweep`. `Ok(None)` for a store without cross-process
-    /// hosting; an error when the watch cannot be established (including a
-    /// build without this crate's `sqlite-store` feature), which an owner
-    /// reports as unavailable cross-process wake and explicit multi-process
-    /// startup refuses.
+    /// hosting; an error when the watch's sweep cannot start (no database
+    /// file named, an unresolvable directory, no thread, or a build without
+    /// this crate's `sqlite-store` feature), which an owner reports as
+    /// unavailable cross-process wake and explicit multi-process startup
+    /// refuses. It never waits for file notifications: they register on a
+    /// thread of their own, and a store whose notifications cannot be
+    /// registered still ticks every `sweep`.
     pub fn watch_delivery_store(
         capability: &meerkat_core::session_hosting::HostingCapability,
         sweep: std::time::Duration,
@@ -242,11 +253,28 @@ mod tests {
         let watch = watch_delivery_store(&capability, DELIVERY_STORE_SWEEP)
             .expect("watch starts")
             .expect("an OsLock store is watched");
+        // File notifications register after the watch starts. Once they
+        // have, the write must tick through its notification, well before
+        // the first sweep could.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while watch.notification_registration()
+            == meerkat_sqlite::watch::SqliteWatchRegistration::Pending
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the notification registration ends within the hang guard"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            watch.notification_registration(),
+            meerkat_sqlite::watch::SqliteWatchRegistration::Registered
+        );
         let mut ticks = watch.subscribe_ticks();
         std::fs::write(&database, b"commit").expect("write");
-        tokio::time::timeout(std::time::Duration::from_secs(10), ticks.changed())
+        tokio::time::timeout(DELIVERY_STORE_SWEEP / 2, ticks.changed())
             .await
-            .expect("the write is observed within the hang guard")
+            .expect("the write is observed through its notification, before any sweep")
             .expect("watch open");
     }
 
