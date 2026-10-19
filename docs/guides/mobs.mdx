@@ -545,6 +545,17 @@ behavior, not durable configuration: re-supply it from a
 `SpawnMemberCustomizer` after restart. Remote placement rejects it before
 materialization instead of dropping the override.
 
+A trusted host that decides each member's destination or agent mandate
+installs a `MemberRuntimeRegistrationHook` with
+`MobBuilder::with_member_runtime_registration_hook` (`runtime-adapter`). Since
+0.9.4 each call carries the member's exact registration
+(`MemberRuntimeBuildIdentity::registration()`): the one prepared for a new
+member, or the current one of a member whose actor is recovered. Bind what the
+host decides to that registration, not to an identity derived from the
+member's session id or labels; a later registration of the same session is a
+different one. The identity is no longer `UnwindSafe`, so wrap it in
+`std::panic::AssertUnwindSafe` to move it into `catch_unwind`.
+
 ## Identity And Respawn
 
 Mobs separate stable member identity from runtime binding details:
@@ -558,6 +569,13 @@ Mobs separate stable member identity from runtime binding details:
 
 Use `AgentIdentity` for facts that survive respawn, such as wiring and durable
 configuration. Runtime IDs and fence tokens protect the lower-level binding.
+
+A member's generation only grows, across mob resets and restarts too. Since
+0.9.4 resume recovers each identity's highest generation from the whole event
+log, so a member re-spawned after a reset and a restart never reuses its
+pre-reset runtime id or member address, and a mob that was reset and then
+re-spawned a member under a pre-reset identity resumes after a restart (0.9.3
+and earlier failed that resume with an internal error).
 
 ### Durable role migration
 
@@ -1057,6 +1075,47 @@ Retirement, respawn, and registration reload wait behind the affected member's
 in-flight resume work. Cleanup failures retain exact retry authority; an
 unproven cleanup is not a successful cancellation. Compensation preserves
 durable session documents and refuses to remove a successor attachment.
+
+### Shutdown, destroy and admission (Rust hosts)
+
+Every exported `MobHandle` clone shares one owner token. A mob whose admission
+is closed refuses new work with `MobError::AdmissionClosed` and a
+`MobAdmissionCloseReason`, while stop, shutdown, destroy, retirement,
+cancellation and reads keep working. Since 0.9.4 no mob actor exit leaves
+admission open:
+
+| Event | Close reason |
+|-------|--------------|
+| `MobHandle::shutdown` or `shutdown_with_report` is admitted | `Shutdown` |
+| A destroy is admitted (its durable destroy marker is written) | `Destroyed` |
+| A durable write's outcome stays uncertain, or a durable recovery fails | `DurabilityFailStop` |
+| The actor task ends without its loop returning (a panic or an abort) | `ActorLost` |
+| A composition dispatch failure stops the actor | `DispatchFailed` |
+
+An earlier close (`IdleClose`, `LastOwnerReleased`, `StandDown` or one of the
+above) keeps its reason. After any of them `acquire_owner()` is refused and
+`admission_closed()` reports the reason; 0.9.3 and earlier could still hand out
+an owner lease on a shut-down, destroyed or lost actor.
+
+While a Shutdown drains, a command the close refuses (spawn, respawn, work, a
+flow run, wiring, a host bind, a live commit, resume, reset or reload) fails
+with `AdmissionClosed`, and every other request the actor answers (stop,
+destroy, complete, retirement, reads, `MobHandle::status`) fails with
+`MobError::ShutdownInProgress`: retryable, authority retained, wire code
+`SESSION_BUSY`. `MobHandle::stop` returns it at once. Retry once the Shutdown
+has finished, after which requests get `ActorCommandChannelClosed` (the actor
+has exited or is exiting), or has failed: a failed Shutdown keeps the actor
+serving with admission closed for its life, and Stop, Shutdown and Destroy stay
+available. 0.9.3 and earlier answered all of these with
+`ActorCommandChannelClosed`. A command sent while the actor exits after a
+Shutdown now fails instead of waiting forever.
+
+A mob restored with an unfinished destroy starts with admission closed before
+`MobBuilder::resume` returns its handle, so nothing is spawned into it while the
+destroy is retried. A recorded placed lifecycle intent, such as a Reset, is not
+retried while admission is closed; it stays recorded and the next start drives
+it. `MobError` is `#[non_exhaustive]` since 0.9.4: an exhaustive `match` needs a
+wildcard arm.
 
 ### Admission in custom Rust session services
 

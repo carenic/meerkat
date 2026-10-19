@@ -39,11 +39,17 @@ Mob member identity has two layers:
 | `AgentIdentity` | Stable member identity. Public mob APIs, wiring, delegation, status, and profiles use this. |
 | `AgentRuntimeId` | Runtime binding identity. It can rotate on respawn or binding replacement. |
 | `FenceToken` | Monotonic binding epoch used to reject stale runtime effects. |
-| `Generation` | Member generation counter, incremented on respawn. |
+| `Generation` | Member generation counter, incremented on respawn. It never repeats for an identity, across mob resets and restarts too. |
 | `HostId` | Canonical bound-host identity used for placement. It is not member identity. |
 
 Use `AgentIdentity` for facts that survive respawn. Use `AgentRuntimeId` only
 for per-binding runtime facts.
+
+Since 0.9.4 resume recovers each identity's highest generation from the whole
+event log, every reset epoch included, before it replays the events after the
+last `MobReset`, and every spawn takes its generation from the MobMachine. A
+member re-spawned after a reset and a restart therefore never reuses its
+pre-reset runtime id or member address.
 
 ### One-shot durable role migration
 
@@ -244,6 +250,18 @@ distributed execution does not create replicated WorkGraph authority.
 Persistent mob state is SQLite/WAL-backed through `SqliteMobStores`.
 In-memory storage is used for tests and WASM. The previous exclusive-handle mob
 store is gone.
+
+### Admission and actor exit
+
+Every exit of a mob actor closes the mob's admission first, with a typed
+`MobAdmissionCloseReason`: `Shutdown` (an admitted Shutdown), `Destroyed` (an
+admitted destroy; a mob restored with an unfinished destroy starts closed),
+`DurabilityFailStop`, `ActorLost` and `DispatchFailed`, besides `IdleClose`,
+`LastOwnerReleased` and `StandDown`. An earlier close keeps its reason. While a
+Shutdown drains, requests the close does not refuse get the retryable
+`MobError::ShutdownInProgress` (wire `SESSION_BUSY`), and
+`ActorCommandChannelClosed` means the actor has exited or is exiting. The mobs
+guide's Persistence section has the full rules.
 
 ### Durable definition updates
 
