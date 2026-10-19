@@ -11093,7 +11093,7 @@ mod tests {
                 Some(GptLiveBrokerObservation::InstructionsContextAppendAcknowledged { token })
                     if token == notice_token =>
                 {
-                    notice_acked = true
+                    notice_acked = true;
                 }
                 Some(GptLiveBrokerObservation::DelegationContextAppendAcknowledged { token })
                     if token == result_token =>
