@@ -11,9 +11,11 @@
 //!
 //! - the original's ingress namespace is the installed ingress domain;
 //! - the host adapter still holds that original
-//!   ([`AuthenticatedOriginalSource::retained_original`], the same custody
+//!   ([`AuthenticatedOriginalSource::retained_custody`], the same custody
 //!   that constrains every operation of work naming it) and its current
-//!   mandate is the retained one;
+//!   mandate is the retained one. While the adapter has not settled its
+//!   admission yet, the resume is not ready (the carrying delivery stays
+//!   pending), never refused;
 //! - the same host invocation policy still lets the original requester invoke
 //!   the executor and represented-subject mandate, and a grant-lineage
 //!   mandate still resolves in the actual grant owner;
@@ -42,8 +44,8 @@ use meerkat_core::{OperationRefusalKind, OperationRefused};
 
 use super::local_authorization::NativeRetainedResumeCheck;
 use super::scoped_original::{
-    AuthenticatedOriginalSource, ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner,
-    require_contributor_live,
+    AuthenticatedOriginalSource, CustodyClass, ScopedGrantComposition, ScopedInvocation,
+    ScopedMandateOwner, classify_custody, require_contributor_live,
 };
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::Input;
@@ -162,16 +164,25 @@ impl ScopedRetainedResume {
         Ok(())
     }
 
-    /// An original the adapter no longer holds has no current authority.
+    /// An original the adapter no longer holds has no current authority. One
+    /// whose admission it has not settled yet is not ready: the carrying
+    /// delivery stays pending until the owner promotes or withdraws it.
     fn held(
         &self,
         namespace: &QualifiedIngressNamespace,
         original: &OriginalWorkRef,
     ) -> Result<WorkAuthorityBasis, RetainedResumeError> {
-        self.originals
-            .retained_original(namespace, original)
+        match classify_custody(self.originals.as_ref(), namespace, original)
             .map_err(RetainedResumeError::Readiness)?
-            .ok_or_else(|| refused(OperationRefusalKind::Denied))
+        {
+            CustodyClass::Retained(basis) => Ok(basis),
+            CustodyClass::Pending => Err(RetainedResumeError::Readiness(
+                ControllerReadinessFailure::OriginalAdmissionPending,
+            )),
+            CustodyClass::Cancelled | CustodyClass::NotRetained => {
+                Err(refused(OperationRefusalKind::Denied))
+            }
+        }
     }
 
     fn resolve_basis(

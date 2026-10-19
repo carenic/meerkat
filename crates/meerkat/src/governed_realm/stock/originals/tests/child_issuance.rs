@@ -814,3 +814,61 @@ fn a_further_grant_lower_bound_survives_a_wall_rollback() {
         "before the grant's lower bound after a rollback"
     );
 }
+
+/// RED-3 (R4): a further original that is still its owner's pending
+/// candidate leaves the child unissued and the issuance unavailable
+/// (retried), never refused; once the owner promotes it, the child is
+/// issued. CONTROL-cancelled (R4): cancelled while pending, it is refused.
+#[test]
+fn a_pending_further_original_leaves_the_child_unissued_and_unavailable() {
+    use meerkat_authorization::work::FurtherOriginals;
+    use meerkat_core::authorization::OperationReviewTier;
+    use meerkat_runtime::meerkat_machine::SourceOriginalBasis;
+
+    let f = Fixture::new();
+    let issue = |source: &str, child: &str| {
+        let further = FurtherOriginals {
+            originals: Arc::from([retained_original(source)]),
+            source: Arc::new(SourceOriginalBasis::new(f.ledger.clone())),
+        };
+        f.context.authorization().issue_child_if_current_within(
+            f.setup.binding(),
+            f.setup.validity().as_ref(),
+            &further,
+            &f.intent(child),
+            OperationReviewTier::R1,
+        )
+    };
+    let pending_s = f
+        .ledger
+        .record_candidate(&namespace("s"), &principal("requester"), original("s"))
+        .expect("recorded");
+    assert!(
+        matches!(
+            issue("s", "while-pending"),
+            Err(meerkat_core::OperationAuthorizationError::Unavailable)
+        ),
+        "a pending further original is not yet, never refused"
+    );
+    assert!(f.issued("while-pending").is_none(), "nothing was issued");
+    pending_s.admit().expect("promoted");
+    assert!(issue("s", "once-promoted").is_ok(), "issued once promoted");
+    assert!(f.issued("once-promoted").is_some());
+
+    let _pending_t = f
+        .ledger
+        .record_candidate(&namespace("t"), &principal("requester"), original("t"))
+        .expect("recorded");
+    f.ledger
+        .cancel_operations(&namespace("t"), &work("t"), evidence("cancel-t"))
+        .expect("a pending candidate can be cancelled");
+    assert!(
+        matches!(
+            issue("t", "cancelled"),
+            Err(meerkat_core::OperationAuthorizationError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::Denied
+        ),
+        "a cancellation wins over a pending admission"
+    );
+    assert!(f.issued("cancelled").is_none());
+}

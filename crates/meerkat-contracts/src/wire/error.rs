@@ -178,6 +178,10 @@ pub enum WireControllerReadinessFailure {
     ReplacementNotEmpty {},
     /// A future native readiness cause without an available public projection.
     Unknown {},
+    /// An original the input or operation relies on is still its source
+    /// owner's submission candidate: the owner has not settled its admission
+    /// yet.
+    OriginalAdmissionPending {},
 }
 
 impl From<meerkat_core::authorization::ControllerReadinessFailure>
@@ -203,6 +207,9 @@ impl From<meerkat_core::authorization::ControllerReadinessFailure>
             }
             ControllerReadinessFailure::PolicyChanged => Self::PolicyChanged {},
             ControllerReadinessFailure::ReplacementNotEmpty => Self::ReplacementNotEmpty {},
+            ControllerReadinessFailure::OriginalAdmissionPending => {
+                Self::OriginalAdmissionPending {}
+            }
             _ => Self::Unknown {},
         }
     }
@@ -641,6 +648,7 @@ mod native_admission_wire_tests {
             WireControllerReadinessFailure::PolicyChanged {},
             WireControllerReadinessFailure::UnsupportedScope {},
             WireControllerReadinessFailure::ReplacementNotEmpty {},
+            WireControllerReadinessFailure::OriginalAdmissionPending {},
             WireControllerReadinessFailure::CredentialUnusable {
                 disposition: WireCredentialUseDisposition::ReauthRequired,
             },
@@ -658,6 +666,29 @@ mod native_admission_wire_tests {
                 })
             );
         }
+    }
+
+    /// A pending original keeps its own readiness kind on the wire instead
+    /// of `unknown`, and decodes back to it.
+    #[test]
+    fn a_pending_original_keeps_its_own_readiness_kind() {
+        let reason = WireControllerReadinessFailure::from(
+            meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending,
+        );
+        assert_eq!(
+            reason,
+            WireControllerReadinessFailure::OriginalAdmissionPending {}
+        );
+        let detail = WireInputAdmissionErrorDetail::NotReady { reason };
+        let encoded = serde_json::to_value(detail).unwrap();
+        assert_eq!(
+            encoded,
+            json!({"type":"not_ready","reason":{"kind":"original_admission_pending"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<WireInputAdmissionErrorDetail>(encoded).unwrap(),
+            detail
+        );
     }
 
     #[test]

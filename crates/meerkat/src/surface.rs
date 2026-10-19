@@ -3004,6 +3004,10 @@ mod native_admission_projection_tests {
                 Ready::ReplacementNotEmpty,
                 WireReady::ReplacementNotEmpty {},
             ),
+            (
+                Ready::OriginalAdmissionPending,
+                WireReady::OriginalAdmissionPending {},
+            ),
         ] {
             let error = RuntimeDriverError::ControllerReadinessUnavailable { reason: actual };
             assert_eq!(

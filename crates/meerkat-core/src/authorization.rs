@@ -73,6 +73,11 @@ pub enum ControllerReadinessFailure {
     PolicyChanged,
     #[error("replacement controller authority must be an empty owner")]
     ReplacementNotEmpty,
+    /// An original the input or operation relies on is still its source
+    /// owner's submission candidate: the owner has not settled its admission
+    /// yet and will promote or withdraw it within its own bound.
+    #[error("an original's admission is not yet settled by its source owner")]
+    OriginalAdmissionPending,
 }
 
 /// A domain owner's external resource or physical destination coordinates.

@@ -152572,6 +152572,20 @@
           "kind"
         ],
         "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "An original the input or operation relies on is still its source\nowner's submission candidate: the owner has not settled its admission\nyet.",
+        "properties": {
+          "kind": {
+            "const": "original_admission_pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireControllerReadinessFailure"
@@ -165728,6 +165742,20 @@
             "properties": {
               "kind": {
                 "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An original the input or operation relies on is still its source\nowner's submission candidate: the owner has not settled its admission\nyet.",
+            "properties": {
+              "kind": {
+                "const": "original_admission_pending",
                 "type": "string"
               }
             },

@@ -1133,7 +1133,7 @@ mod scoped_original;
 pub use mcp_attachment::scoped_destination_target;
 #[cfg(feature = "local-authorization")]
 pub use scoped_original::{
-    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition,
+    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition, RetainedCustody,
     ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner, ScopedOriginalIngress,
     SourceOriginalBasis, bind_scoped_original, original_operation_grant, require_active_original,
     require_source_original_live, review_bounds_text,

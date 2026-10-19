@@ -207,6 +207,31 @@ them.
   `SealIdentityGenerationHighwaterDestroyed`, also appended last, so no
   existing variant's discriminant moves. Exhaustive matches must add the
   arms.
+- `meerkat-runtime`: `AuthenticatedOriginalSource::retained_original` is
+  replaced by `retained_custody`, which returns `RetainedCustody`
+  (`Retained`, `AdmissionPending` or `NotRetained`; non-exhaustive) instead of
+  `Option<WorkAuthorityBasis>`. An implementor answers `AdmissionPending` only
+  for a submission candidate that it will promote or withdraw itself, within
+  its own bound; it withdraws any candidate it cannot settle, and a withdrawn
+  candidate answers `NotRetained` from then on (see the method
+  documentation). A candidate the implementor has not enrolled in such a
+  settlement answers `NotRetained`, the earlier `None`.
+- `meerkat`: `ContinuationAdmitError` gains `NotReady(ControllerReadinessFailure)`
+  and is now `#[non_exhaustive]`. `retained_admission_outcome` maps a runtime
+  that is not ready to admit a retained continuation, for a typed cause, to
+  it: the continuation stays pending and is retried, as for `Failed`, and
+  keeps the cause the runtime named.
+- `meerkat`: `BlockedDeliveryReason` gains `NotReady(ControllerReadinessFailure)`,
+  its first variant that carries data, so its variants no longer have defined
+  discriminants. The drain blocks a continuation row the runtime is not ready
+  to admit with it, and the delivery owner's pass failure line names the cause
+  (for example `NotReady(OriginalAdmissionPending)`).
+- `meerkat-contracts`: `WireControllerReadinessFailure` gains
+  `OriginalAdmissionPending` (kind `original_admission_pending`), which
+  `ControllerReadinessFailure::OriginalAdmissionPending` now maps to instead
+  of `Unknown`. A Rust decoder of this type built before it rejects the new
+  kind; the Python, TypeScript and Web SDKs keep error details as untyped
+  data.
 
 ### Security
 
@@ -292,6 +317,15 @@ them.
   working unchanged. `RuntimeTurnStateHandle` reads all three from the
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
+- `meerkat-core`: `ControllerReadinessFailure::OriginalAdmissionPending`: an
+  original that an input or operation relies on is still its source owner's
+  submission candidate, whose admission the owner has not settled yet.
+- `meerkat-runtime`: `RetainedCustody`, a source owner's custody of one
+  original: retained with its mandate, admission pending, or not retained.
+- `meerkat`: `JobOutboxProjectionError::NotReady` carries that cause for a
+  continuation row the runtime is not ready to admit; the drain reports it as
+  `BlockedDeliveryReason::NotReady` (above). Nothing is stored; the cause is
+  read again on every retry.
 
 ### Changed
 
@@ -572,6 +606,17 @@ them.
   audits-c). It also reaches both replay histories above, refuses three
   seeded defects, and checks that restoring the exact-successor replay rule
   makes those histories unreachable.
+- Work that names an original whose admission its source owner has not
+  settled yet is no longer refused as malformed or denied
+  (`meerkat-runtime`). Native admission of input that names such a
+  contributor, `require_source_original_live` and a retained resume report
+  `ControllerReadinessUnavailable` with `OriginalAdmissionPending`; operation
+  authorization of work that names it, the further originals of a helper
+  admission or child issuance, and the controller-grant mutation check report
+  it unavailable, and none of them waits. A retained resume therefore stays
+  retryable until the owner settles the original, instead of being refused
+  for good. A cancelled original is still refused, and the controller-grant
+  mutation check no longer counts such a contributor as unreferenced.
 
 ## [0.9.3] - 2026-10-18
 
