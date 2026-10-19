@@ -582,7 +582,9 @@ and its CI must be green before a release tag (`require_ci_green`):
 - Long rows first: `clippy`, `main-unit`, `closure-tests` and
   `feature-check` run in two waves (`<lane>` and `<lane>-rest`, a copy the
   lanes self-test checks); rows measured at 8 minutes or more
-  (`scripts/ci-row-durations.json`), or never measured, start first, and the
+  (`scripts/ci-row-durations.json`, keyed by a row's name without a packed
+  row's member count, so a repack keeps the measurement while the bin's
+  heaviest member stays the same), or never measured, start first, and the
   rest and the short lanes wait for the `stagger` job. A red main run is
   a failed `CI gate` on the main commit and blocks `require_ci_green`.
 - `gate` (`CI gate`, the only required context): fail-closed aggregate; on
