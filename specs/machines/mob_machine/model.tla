@@ -9,6 +9,11 @@ CONSTANTS AdaptiveDecisionKindValues, AdaptiveLayerAdmissionKindValues, Adaptive
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
 
+OptionLt(a, b) == IF b.tag = "none" THEN FALSE ELSE IF a.tag = "none" THEN TRUE ELSE a.value < b.value
+OptionLe(a, b) == IF a.tag = "none" THEN TRUE ELSE IF b.tag = "none" THEN FALSE ELSE a.value <= b.value
+ASSUME ~OptionLt(None, None) /\ OptionLt(None, Some(0)) /\ ~OptionLt(Some(0), None) /\ OptionLt(Some(0), Some(1)) /\ ~OptionLt(Some(1), Some(1)) /\ ~OptionLt(Some(1), Some(0))
+ASSUME OptionLe(None, None) /\ OptionLe(None, Some(0)) /\ ~OptionLe(Some(0), None) /\ OptionLe(Some(0), Some(1)) /\ OptionLe(Some(1), Some(1)) /\ ~OptionLe(Some(1), Some(0))
+
 ExternalPeerEdgeValuesCi == {}
 ExternalPeerKeyValuesCi == {}
 ExternalRouteObligationValuesCi == {}
@@ -1241,7 +1246,7 @@ ClassifyMemberWaitRuntimeMaterialPresentRunning(agent_identity) ==
 
 ObserveMemberProgressChangedOpenRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) # Some(progress_token))
     /\ (run_open = TRUE)
     /\ phase' = "Running"
@@ -1258,7 +1263,7 @@ ObserveMemberProgressChangedOpenRunning(agent_identity, run_open, in_flight_work
 
 ObserveMemberProgressChangedIdleRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) # Some(progress_token))
     /\ (run_open = FALSE)
     /\ phase' = "Running"
@@ -1275,7 +1280,7 @@ ObserveMemberProgressChangedIdleRunning(agent_identity, run_open, in_flight_work
 
 ObserveMemberProgressUnchangedIdleRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) = Some(progress_token))
     /\ (run_open = FALSE)
     /\ phase' = "Running"
@@ -1290,7 +1295,7 @@ ObserveMemberProgressUnchangedIdleRunning(agent_identity, run_open, in_flight_wo
 
 ObserveMemberProgressUnchangedOpenHealthyRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) = Some(progress_token))
     /\ (run_open = TRUE)
     /\ ((agent_identity \in DOMAIN member_last_progress_at_ms) /\ ((observed_at_ms - (member_last_progress_at_ms)[agent_identity]) < 60000))
@@ -1306,7 +1311,7 @@ ObserveMemberProgressUnchangedOpenHealthyRunning(agent_identity, run_open, in_fl
 
 ObserveMemberProgressUnchangedOpenDegradedRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) = Some(progress_token))
     /\ (run_open = TRUE)
     /\ (((agent_identity \in DOMAIN member_last_progress_at_ms) /\ (IF ~(((observed_at_ms - (member_last_progress_at_ms)[agent_identity]) >= 60000)) THEN TRUE ELSE (agent_identity \in DOMAIN member_last_progress_at_ms))) /\ (((observed_at_ms - (member_last_progress_at_ms)[agent_identity]) >= 60000) /\ ((observed_at_ms - (member_last_progress_at_ms)[agent_identity]) < 300000)))
@@ -1322,7 +1327,7 @@ ObserveMemberProgressUnchangedOpenDegradedRunning(agent_identity, run_open, in_f
 
 ObserveMemberProgressUnchangedOpenWedgedRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) <= Some(observed_at_ms))
+    /\ OptionLe((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None), Some(observed_at_ms))
     /\ ((IF (agent_identity \in DOMAIN member_progress_tokens) THEN Some((IF agent_identity \in DOMAIN member_progress_tokens THEN member_progress_tokens[agent_identity] ELSE "None")) ELSE None) = Some(progress_token))
     /\ (run_open = TRUE)
     /\ ((agent_identity \in DOMAIN member_last_progress_at_ms) /\ ((observed_at_ms - (member_last_progress_at_ms)[agent_identity]) >= 300000))
@@ -1338,7 +1343,7 @@ ObserveMemberProgressUnchangedOpenWedgedRunning(agent_identity, run_open, in_fli
 
 ObserveMemberProgressStaleRunning(agent_identity, run_open, in_flight_work, progress_token, observed_at_ms) ==
     /\ phase = "Running"
-    /\ ((IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None) > Some(observed_at_ms))
+    /\ OptionLt(Some(observed_at_ms), (IF (agent_identity \in DOMAIN member_last_observed_at_ms) THEN Some((IF agent_identity \in DOMAIN member_last_observed_at_ms THEN member_last_observed_at_ms[agent_identity] ELSE 0)) ELSE None))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_6442c4792a0a93bc

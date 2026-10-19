@@ -379,6 +379,19 @@ them.
   audits-c). It also reaches both replay histories above, refuses three
   seeded defects, and checks that restoring the exact-successor replay rule
   makes those histories unreachable.
+- Generated TLA+ models now evaluate ordering comparisons between optional
+  values. The renderer wrote MobMachine's member progress guards
+  (`get_copied(id) <= Some(observed_at_ms)` and its `>` twin) as a plain `<=`
+  or `>` between option records, which TLC cannot evaluate, so any MobMachine
+  run with members stopped at the first state where a member progress
+  observation could fire: the deep profile stopped after nine states, before
+  any member transition was checked. Such comparisons now render with Rust's
+  `Option` order (`None` below every `Some`, two `Some`s by their values)
+  through `OptionLt` / `OptionLe`, which a model defines only when it uses
+  them, with ASSUMEs that re-check the order on every TLC run. The operators
+  branch with `IF`, not `\/`, because TLC evaluates every disjunct of an
+  action-level `\/`. The Rust kernel already applied this order; only the
+  models of MobMachine and the two compositions that embed it change.
 
 ## [0.9.3] - 2026-10-18
 
