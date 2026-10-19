@@ -403,9 +403,11 @@ graph.
   sccache through `mozilla-actions/sccache-action` (with a pinned
   `version`), by design: they use its GitHub Actions cache backend, which
   needs the token the action exports.
-- A CI lane that cannot download the pinned sccache release (every try
-  answered 403, say) runs without sccache, with a warning that names the
-  cause: it compiles cold, and a pull request's gate still holds it to the
+- A CI lane downloads the pinned sccache release with the job's own token
+  first (`gh release download`) and from the anonymous release URL only
+  when that fails. A lane that cannot download it either way (every try
+  answered 403, say) runs without sccache, with a warning that names both
+  causes: it compiles cold, and a pull request's gate still holds it to the
   lane execution budget. A download whose sha256 does not match the pin
   still fails the lane.
 - A release job whose checkout can be an older tag runs its setup action

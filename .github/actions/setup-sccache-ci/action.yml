@@ -45,19 +45,24 @@ runs:
     # exports the job's Actions cache token, which neither backend below uses.
     # Renovate proposes a new SCCACHE_VERSION (renovate.json); SCCACHE_SHA256
     # changes with it, or this check fails. The backend is selected below.
-    # A download that fails leaves the lane without sccache instead of failing
-    # it (the release host answered one lane's nine tries with 403 while the
-    # run's other lanes downloaded it): an empty RUSTC_WRAPPER, which Cargo
-    # reads as no wrapper, replaces the job's sccache wrapper, and the steps
-    # below are skipped. A download that completes is used only once its
-    # sha256 matches; a mismatch still fails the lane, so no unverified binary
-    # ever reaches PATH or runs.
+    # The release is fetched with the job's own token first (gh release
+    # download, an authenticated API request) and from the anonymous release
+    # URL, with its retries, only when that fails: the release host once
+    # answered one lane's nine anonymous tries with 403 while the run's other
+    # lanes downloaded it. The token is unset before anything else runs. A
+    # download that fails both ways leaves the lane without sccache instead of
+    # failing it: an empty RUSTC_WRAPPER, which Cargo reads as no wrapper,
+    # replaces the job's sccache wrapper, and the steps below are skipped. An
+    # archive from either path is used only once its sha256 matches; a
+    # mismatch still fails the lane, so no unverified binary ever reaches PATH
+    # or runs.
     - name: Install sccache
       id: install
       shell: bash
       env:
         SCCACHE_VERSION: v0.18.0
         SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         if [[ "${RUNNER_OS}/${RUNNER_ARCH}" != "Linux/X64" ]]; then
@@ -68,16 +73,33 @@ runs:
         dir="${RUNNER_TEMP}/sccache-install"
         archive="${dir}/${name}.tar.gz"
         mkdir -p "${dir}/bin"
+        gh_status=skipped
+        if [[ -n "${GH_TOKEN:-}" ]]; then
+          gh_status=0
+          gh release download "${SCCACHE_VERSION}" -R mozilla/sccache -p "${name}.tar.gz" \
+            -O "${archive}" --clobber 2> "${dir}/gh.err" || gh_status=$?
+          cat "${dir}/gh.err" >&2
+        fi
+        unset GH_TOKEN
         status=0
-        curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors -o "${archive}" \
-          "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz" \
-          2> "${dir}/curl.err" || status=$?
-        cat "${dir}/curl.err" >&2
+        if [[ "${gh_status}" != 0 ]]; then
+          rm -f "${archive}"
+          curl -fsSL --retry 8 --retry-delay 10 --retry-all-errors -o "${archive}" \
+            "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz" \
+            2> "${dir}/curl.err" || status=$?
+          cat "${dir}/curl.err" >&2
+        fi
         if (( status != 0 )); then
           rm -f "${archive}"
-          cause="$(tail -n 1 "${dir}/curl.err" | sed 's/^curl: ([0-9]*) //')"
+          gh_cause="no token"
+          if [[ "${gh_status}" != skipped ]]; then
+            gh_error="$(tail -n 1 "${dir}/gh.err")"
+            gh_cause="exit ${gh_status}: ${gh_error:-no message}"
+          fi
+          curl_cause="$(tail -n 1 "${dir}/curl.err" | sed 's/^curl: ([0-9]*) //')"
+          cause="gh ${gh_cause}; curl exit ${status}: ${curl_cause:-no message}"
           cause="${cause//%/%25}"
-          echo "::warning::sccache ${SCCACHE_VERSION} download failed (curl exit ${status}: ${cause:-no message}); this job compiles without sccache"
+          echo "::warning::sccache ${SCCACHE_VERSION} download failed (${cause}); this job compiles without sccache"
           echo "RUSTC_WRAPPER=" >> "${GITHUB_ENV}"
           echo "installed=false" >> "${GITHUB_OUTPUT}"
           exit 0
