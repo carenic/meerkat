@@ -7709,6 +7709,7 @@ mod tests {
         primary: ToolError,
         expected_code: &str,
         expected_message: &str,
+        expected_data: Option<serde_json::Value>,
     ) {
         let session_id = test_session_id();
         let sink = Arc::new(RecordingProjectionSink::default());
@@ -7794,13 +7795,14 @@ mod tests {
         assert!(affected.is_error);
         let text = meerkat_core::types::text_content(&affected.content);
         let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(
-            payload,
-            serde_json::json!({
-                "error": expected_code,
-                "message": expected_message,
-            })
-        );
+        let mut expected = serde_json::json!({
+            "error": expected_code,
+            "message": expected_message,
+        });
+        if let Some(data) = expected_data {
+            expected["data"] = data;
+        }
+        assert_eq!(payload, expected);
         // Core separates primary semantic feedback from ordered settlement
         // diagnostics. The accepted live carrier keeps the latter typed.
         assert_eq!(
@@ -7831,6 +7833,7 @@ mod tests {
             ToolError::OperationAuthorizationUnavailable,
             "operation_authorization_unavailable",
             "operation authorization unavailable",
+            None,
         )
         .await;
     }
@@ -7845,6 +7848,8 @@ mod tests {
             },
             "operation_refused",
             "operation unavailable under current authorization",
+            // The closed kind, and no claim about whether the tool ran.
+            Some(serde_json::json!({"kind": "denied", "tool_invoked": "unknown"})),
         )
         .await;
     }

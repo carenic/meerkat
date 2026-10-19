@@ -195,7 +195,7 @@ pub use authorization::{
     OperationAuthorizationFacts, OperationEntryBoundary, OperationRefusalKind, OperationRefused,
     OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
     PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
-    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
+    PublicationRecipient, RefusalDispatch, SourceAuthorizationFacts, SourceAuthorizationTarget,
     SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
     WorkAuthorizationContext,
 };

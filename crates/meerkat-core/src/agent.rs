@@ -2168,6 +2168,14 @@ pub trait AgentOwnedRelease: Send + Sync {
 }
 
 /// Trait for tool dispatchers
+///
+/// An operation refusal certified
+/// [`crate::authorization::RefusalDispatch::NotDispatched`] speaks only for
+/// the tool code below the core component that certified it (the fenced
+/// dispatch, or the execution policy gate for its inner dispatcher). A
+/// dispatcher layer that runs tool code of its own before delegating to such
+/// a component forwards the refusal as `OperationRefused::new(refusal.kind())`,
+/// which makes no claim.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait AgentToolDispatcher: Send + Sync {
@@ -2674,12 +2682,41 @@ fn staging_wait_site(boundary: crate::authorization::OperationEntryBoundary) -> 
 /// context's work authorization, the run's own, which reports such a change
 /// through every wrapper; an exact-control work reports none, so its refusal
 /// takes the ordinary path.
+///
+/// An operation refusal met before the dispatcher is invoked is certified
+/// [`crate::authorization::RefusalDispatch::NotDispatched`] at this entry's
+/// one boundary ([`FencedOutcome`]). What the dispatcher returns is
+/// forwarded unchanged: its tool code may have produced an effect before a
+/// later governed step refused.
 pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
     context: &ToolDispatchContext,
     plan: &crate::ResolvedToolExecutionPlan,
 ) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    fenced_dispatch(dispatcher, call, context, plan)
+        .await
+        .unwrap_or_else(|refused| Err(refused.not_dispatched()))
+}
+
+/// How one fenced entry ended, before its certification boundary. `Ok`
+/// carries the result of a dispatch whose dispatcher ran, the dispatcher's
+/// own, forwarded unchanged. `Err` is a refusal or failure met before any
+/// dispatcher code ran: the entry's one boundary certifies such an operation
+/// refusal [`crate::authorization::RefusalDispatch::NotDispatched`].
+type FencedOutcome = Result<
+    Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>,
+    crate::error::ToolError,
+>;
+
+/// [`dispatch_tool_execution_plan_fenced`] before its certification
+/// boundary.
+async fn fenced_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    call: ToolCallView<'_>,
+    context: &ToolDispatchContext,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> FencedOutcome {
     let deadline = DispatchDeadline::start(plan);
     validate_fenced_root_dispatch(dispatcher, call, context, plan)?;
     // Retain one binding with the actual resolved call. Its generation is
@@ -2764,7 +2801,8 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
                     .with_review_entry(review_entry)
                     .with_staging_wait(staging_wait);
                 match dispatch_admitted_plan(dispatcher, call, &governed, plan).await {
-                    Admitted::Dispatched(result) => return result,
+                    Admitted::Dispatched(result) => return Ok(result),
+                    Admitted::Refused(error) => return Err(error),
                     Admitted::Superseded(superseded) => superseded,
                 }
             }
@@ -2797,11 +2835,28 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
 /// decision once immediately before its body. A refusal anywhere settles this
 /// attempt locally with zero entry; a failure before entry leaves the consent
 /// spendable. The decision itself never executes anything.
+///
+/// As at [`dispatch_tool_execution_plan_fenced`], an operation refusal met
+/// before the dispatcher is invoked is certified
+/// [`crate::authorization::RefusalDispatch::NotDispatched`] at this entry's
+/// one boundary, and the dispatcher's own result is forwarded unchanged.
 pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
 ) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    retained_consent_dispatch(dispatcher, context, approval_id)
+        .await
+        .unwrap_or_else(|refused| Err(refused.not_dispatched()))
+}
+
+/// [`dispatch_retained_consent_attempt`] before its certification boundary
+/// ([`FencedOutcome`]).
+async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    context: &ToolDispatchContext,
+    approval_id: &crate::ApprovalId,
+) -> FencedOutcome {
     let malformed = || crate::ToolError::AuthorizationRefused {
         refusal: crate::authorization::OperationRefused::new(
             crate::authorization::OperationRefusalKind::MalformedFacts,
@@ -2848,25 +2903,30 @@ pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized +
     .await
     {
         Ok(admitted) => admitted.settled(),
-        Err(_) => Err(crate::error::ToolError::timeout(call.name, timeout_ms)),
+        // The timeout may have ended a running dispatcher: no claim.
+        Err(_) => Ok(Err(crate::error::ToolError::timeout(call.name, timeout_ms))),
     }
 }
 
 /// How the common tail of one admitted fenced dispatch ended.
 enum Admitted {
-    /// Dispatched, or settled before or after its dispatcher ran.
+    /// Its dispatcher ran: the dispatcher's own result, settled.
     Dispatched(Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>),
+    /// Refused or failed before any dispatcher code ran.
+    Refused(crate::error::ToolError),
     /// Its root staging found the retained model review superseded by a
     /// completed owner publication change, before any dispatcher code ran.
     Superseded(Box<crate::approval::review::SupersededReview>),
 }
 
 impl Admitted {
-    /// The result where no supersession decision follows: a superseded
-    /// review settles with its own settlement.
-    fn settled(self) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    /// The outcome where no supersession decision follows: a superseded
+    /// review settles with its own settlement, before any dispatcher code
+    /// ran.
+    fn settled(self) -> FencedOutcome {
         match self {
-            Self::Dispatched(result) => result,
+            Self::Dispatched(result) => Ok(result),
+            Self::Refused(error) => Err(error),
             Self::Superseded(superseded) => Err(superseded.into_settled()),
         }
     }
@@ -2874,9 +2934,9 @@ impl Admitted {
 
 /// The common tail of a fenced dispatch whose review admission is settled:
 /// entry staging and the check point, the body, the outcome observation, and
-/// the dispatch-lifetime review guard. A retained model review superseded at
-/// the root staging ends it before any dispatcher code ran
-/// ([`Admitted::Superseded`]).
+/// the dispatch-lifetime review guard. A refusal before the dispatcher runs
+/// ends it as [`Admitted::Refused`], and a retained model review superseded
+/// at the root staging as [`Admitted::Superseded`].
 async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
@@ -2964,7 +3024,7 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
     if let Some(guard) = review_guard {
         guard.complete();
     }
-    outcome.unwrap_or_else(|error| Admitted::Dispatched(Err(error)))
+    outcome.unwrap_or_else(Admitted::Refused)
 }
 
 /// Compute whether the current exact catalog should stay inline or switch to deferred mode.
@@ -6207,10 +6267,38 @@ mod governed_operation_tests {
             refuse_first: usize,
             begin_after_checks: Option<usize>,
         ) -> Arc<Self> {
+            Self::settling_after(
+                tier,
+                refuse_first,
+                begin_after_checks,
+                std::time::Duration::from_millis(30),
+            )
+        }
+
+        /// A work whose changes stay in progress for an hour, past every
+        /// owner-change wait bound.
+        fn held(
+            tier: crate::authorization::OperationReviewTier,
+            begin_after_checks: Option<usize>,
+        ) -> Arc<Self> {
+            Self::settling_after(
+                tier,
+                0,
+                begin_after_checks,
+                std::time::Duration::from_secs(3600),
+            )
+        }
+
+        fn settling_after(
+            tier: crate::authorization::OperationReviewTier,
+            refuse_first: usize,
+            begin_after_checks: Option<usize>,
+            settle: std::time::Duration,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 tier,
-                settle: std::time::Duration::from_millis(30),
+                settle,
                 refuse_first: std::sync::atomic::AtomicUsize::new(refuse_first),
                 begin_after_checks: std::sync::Mutex::new(begin_after_checks),
                 prepares: std::sync::atomic::AtomicUsize::new(0),
@@ -6503,5 +6591,218 @@ mod governed_operation_tests {
             1,
             "the body ran once"
         );
+    }
+
+    /// The operation refusal a fenced dispatch result carries, with the
+    /// `data` its model payload renders; `None` for any other result.
+    fn refusal_and_data(
+        result: &Result<crate::ops::ToolDispatchOutcome, crate::ToolError>,
+    ) -> Option<(OperationRefused, serde_json::Value)> {
+        let Err(error) = result else {
+            return None;
+        };
+        let crate::ToolError::AuthorizationRefused { refusal } = error.primary_error() else {
+            return None;
+        };
+        Some((*refusal, error.to_error_payload()["data"].clone()))
+    }
+
+    /// The source-kind tools, whose bodies count their effect and then
+    /// refuse, as a body whose later governed step refused does.
+    #[derive(Default)]
+    struct RefusingBody(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for RefusingBody {
+        fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
+            SourceKindDispatcher::default().tools()
+        }
+
+        async fn dispatch(
+            &self,
+            _call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(crate::ToolError::AuthorizationRefused {
+                refusal: OperationRefused::new(OperationRefusalKind::Denied),
+            })
+        }
+    }
+
+    /// Every operation refusal a fenced entry meets before it invokes the
+    /// dispatcher, and every one the execution policy gate meets before it
+    /// invokes its inner dispatcher, is certified at that component's one
+    /// boundary: the model reads the closed kind with `tool_invoked: false`,
+    /// and no body ran. One row per pre-invocation refusal, on both fenced
+    /// entries and both of the gate's staging paths.
+    #[tokio::test(start_paused = true)]
+    async fn every_pre_invocation_refusal_is_certified_not_dispatched() {
+        let mut rows = Vec::new();
+
+        // A governed comms plan without its owner's target.
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let governed =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        let result = fenced(&dispatcher, "send_message", &governed).await;
+        rows.push((
+            "owner target",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::MalformedFacts,
+        ));
+
+        // The prepared entry's denial.
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let denied = ToolDispatchContext::default().with_work_authorization(Some(
+            crate::WorkAuthorizationContext::new(
+                Arc::new(Work(Arc::new(AtomicBool::new(true)))),
+                crate::OperationExecutionScope::Domain,
+            ),
+        ));
+        let result = fenced(&dispatcher, "read_file", &denied).await;
+        rows.push((
+            "prepared entry",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::Denied,
+        ));
+
+        // The prepared entry's refusal to rebuild once its free rebuilds
+        // are spent.
+        let work = ChurnWork::new(crate::authorization::OperationReviewTier::R1, 10, None);
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let result = fenced(&dispatcher, "read_file", &churn_context(&work)).await;
+        rows.push((
+            "prepared entry past its wait bounds",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::ReprepareRequired,
+        ));
+
+        // The root staging's refusal to rebuild past its wait bound.
+        let work = ChurnWork::held(crate::authorization::OperationReviewTier::R1, Some(1));
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let result = fenced(&dispatcher, "read_file", &churn_context(&work)).await;
+        rows.push((
+            "root staging past its wait bound",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::ReprepareRequired,
+        ));
+
+        // The execution policy gate's own staging, after its consequence
+        // policy revoked the work, on both of its staging paths.
+        for (row, resolved) in [
+            ("policy gate staging (resolved)", true),
+            ("policy gate staging (lowered)", false),
+        ] {
+            let revoked = Arc::new(AtomicBool::new(false));
+            let revoke = Arc::clone(&revoked);
+            let policy = crate::tool_execution_policy::tests::allowing_consequence_policy_running(
+                move || revoke.store(true, Ordering::SeqCst),
+            );
+            let inner = Arc::new(SourceKindDispatcher::default());
+            let gated: Arc<dyn AgentToolDispatcher> = Arc::new(
+                crate::ExecutionPolicyGatedDispatcher::new(
+                    Arc::clone(&inner),
+                    crate::ToolExecutionPolicy::unrestricted(),
+                )
+                .with_consequence_policy(policy),
+            );
+            let root: Arc<dyn AgentToolDispatcher> = if resolved {
+                gated
+            } else {
+                Arc::new(Lowering(gated))
+            };
+            let context = ToolDispatchContext::default().with_work_authorization(Some(
+                crate::WorkAuthorizationContext::new(
+                    Arc::new(Work(revoked)),
+                    crate::OperationExecutionScope::Domain,
+                ),
+            ));
+            let result = fenced(&root, "read_file", &context).await;
+            rows.push((
+                row,
+                result,
+                inner.0.load(Ordering::SeqCst),
+                OperationRefusalKind::Denied,
+            ));
+        }
+
+        // The retained consent entry, for a context without work.
+        let dispatcher = Arc::new(SourceKindDispatcher::default());
+        let result = crate::dispatch_retained_consent_attempt(
+            &dispatcher,
+            &ToolDispatchContext::default(),
+            &crate::ApprovalId::new(),
+        )
+        .await;
+        rows.push((
+            "consent entry without work",
+            result,
+            dispatcher.0.load(Ordering::SeqCst),
+            OperationRefusalKind::MalformedFacts,
+        ));
+
+        for (row, result, bodies, kind) in rows {
+            let (refusal, data) = refusal_and_data(&result).expect(row);
+            assert_eq!(refusal.kind(), kind, "{row}");
+            assert_eq!(
+                refusal.dispatch(),
+                crate::authorization::RefusalDispatch::NotDispatched,
+                "{row}"
+            );
+            assert_eq!(
+                data,
+                serde_json::json!({"kind": kind, "tool_invoked": false}),
+                "{row}"
+            );
+            assert_eq!(bodies, 0, "{row}: no body ran");
+        }
+    }
+
+    /// What the dispatcher returns is forwarded with no claim: its body may
+    /// have produced an effect before a later governed step refused, so the
+    /// model reads `tool_invoked: "unknown"`, under the fenced entry and
+    /// through the execution policy gate on both of its paths.
+    #[tokio::test]
+    async fn a_refusal_the_dispatcher_returned_stays_unknown() {
+        let governed =
+            ToolDispatchContext::default().with_work_authorization(Some(governed_work()));
+        let body = Arc::new(RefusingBody::default());
+        let gated: Arc<dyn AgentToolDispatcher> =
+            Arc::new(crate::ExecutionPolicyGatedDispatcher::new(
+                Arc::clone(&body),
+                crate::ToolExecutionPolicy::unrestricted(),
+            ));
+        let roots: [(&str, Arc<dyn AgentToolDispatcher>); 3] = [
+            (
+                "fenced entry",
+                Arc::clone(&body) as Arc<dyn AgentToolDispatcher>,
+            ),
+            ("policy gate (resolved)", Arc::clone(&gated)),
+            ("policy gate (lowered)", Arc::new(Lowering(gated))),
+        ];
+        for (row, root) in roots {
+            let before = body.0.load(Ordering::SeqCst);
+            let result = fenced(&root, "read_file", &governed).await;
+            let (refusal, data) = refusal_and_data(&result).expect(row);
+            assert_eq!(
+                refusal.dispatch(),
+                crate::authorization::RefusalDispatch::Unknown,
+                "{row}"
+            );
+            assert_eq!(
+                data,
+                serde_json::json!({"kind": "denied", "tool_invoked": "unknown"}),
+                "{row}"
+            );
+            assert_eq!(
+                body.0.load(Ordering::SeqCst),
+                before + 1,
+                "{row}: the body ran"
+            );
+        }
     }
 }

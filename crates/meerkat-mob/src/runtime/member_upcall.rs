@@ -361,6 +361,10 @@ impl UpcallToolOutcome {
                 data: error.structured_data(),
                 settlement_failures: Vec::new(),
             },
+            // The wire keeps the bare kind, so a 0.9.3 peer decodes it as
+            // before. Whether the tool ran does not cross: it is certified
+            // only inside the core process that saw it, and the receiving
+            // side renders it unknown.
             ToolError::AuthorizationRefused { refusal } => UpcallToolError {
                 class: UpcallToolErrorClass::AuthorizationRefused,
                 message: refusal.to_string(),
@@ -584,15 +588,15 @@ impl UpcallToolError {
                         "member upcall carried malformed hook_launch_refused data",
                     )
                 }),
-            UpcallToolErrorClass::AuthorizationRefused => ToolError::AuthorizationRefused {
-                refusal: meerkat_core::authorization::OperationRefused::new(
-                    self.data
-                        .and_then(|data| serde_json::from_value(data).ok())
-                        .unwrap_or(
-                            meerkat_core::authorization::OperationRefusalKind::MalformedFacts,
-                        ),
-                ),
-            },
+            // A missing or unknown kind is no verdict the peer gave: it keeps
+            // the typed no-verdict class, never a final refusal.
+            UpcallToolErrorClass::AuthorizationRefused => self
+                .data
+                .and_then(|data| serde_json::from_value(data).ok())
+                .map(|kind| ToolError::AuthorizationRefused {
+                    refusal: meerkat_core::authorization::OperationRefused::new(kind),
+                })
+                .unwrap_or(ToolError::OperationAuthorizationUnavailable),
             UpcallToolErrorClass::OperationObservationUnavailable => {
                 ToolError::OperationObservationUnavailable
             }
@@ -1756,6 +1760,105 @@ mod tests {
             let actual =
                 meerkat_core::ops::terminal_tool_outcome_for_error("call-refused", restored);
             assert_eq!(actual.result, expected.result);
+        }
+    }
+
+    /// The 0.9.3 member-side decoder of an upcall refusal, verbatim: a bare
+    /// kind, and anything else as malformed facts.
+    fn decode_093_refusal(
+        data: Option<serde_json::Value>,
+    ) -> meerkat_core::authorization::OperationRefusalKind {
+        data.and_then(|data| serde_json::from_value(data).ok())
+            .unwrap_or(meerkat_core::authorization::OperationRefusalKind::MalformedFacts)
+    }
+
+    /// The upcall keeps carrying the bare refusal kind, a certified refusal
+    /// included: a 0.9.3 peer decodes each kind as itself, so a transient
+    /// refusal never turns final. Whether the tool ran does not cross: the
+    /// receiving side restores the kind with no claim, and its model reads
+    /// `tool_invoked: "unknown"`.
+    #[test]
+    fn an_upcall_refusal_carries_the_bare_kind_and_no_dispatch_fact() {
+        use meerkat_core::authorization::{
+            OperationRefusalKind, OperationRefused, RefusalDispatch,
+        };
+        for kind in [
+            OperationRefusalKind::ReprepareRequired,
+            OperationRefusalKind::Denied,
+            OperationRefusalKind::MalformedFacts,
+        ] {
+            for refusal in [
+                OperationRefused::new(kind),
+                OperationRefused::new(kind).certified_not_dispatched_for_test(),
+            ] {
+                let envelope =
+                    UpcallToolOutcome::from_tool_error(&ToolError::AuthorizationRefused {
+                        refusal,
+                    });
+                let UpcallToolOutcome::ToolError(error) = &envelope else {
+                    panic!("an operation refusal crosses as a tool error");
+                };
+                assert_eq!(error.data, Some(json!(kind)), "the bare kind");
+                assert_eq!(
+                    decode_093_refusal(error.data.clone()),
+                    kind,
+                    "a 0.9.3 peer reads the same kind"
+                );
+                let wire = WireOpaqueJson::from_value(&serde_json::to_value(&envelope).unwrap());
+                let back: UpcallToolOutcome =
+                    serde_json::from_value(wire.to_value().unwrap()).unwrap();
+                let restored = back
+                    .into_dispatch_outcome("call-refused", "shell_execute")
+                    .unwrap_err();
+                let ToolError::AuthorizationRefused { refusal: restored } =
+                    restored.primary_error()
+                else {
+                    panic!("restored as an operation refusal: {restored:?}");
+                };
+                assert_eq!(restored.kind(), kind);
+                assert_eq!(restored.dispatch(), RefusalDispatch::Unknown);
+            }
+        }
+    }
+
+    /// An older member's bare kind decodes as that kind with no claim; data
+    /// that is absent or names no known kind is no verdict the peer gave and
+    /// decodes as the typed no-verdict class, never as a final refusal.
+    #[test]
+    fn an_upcall_refusal_without_a_known_kind_decodes_as_unavailable() {
+        use meerkat_core::authorization::{OperationRefusalKind, RefusalDispatch};
+        let decode = |data| {
+            UpcallToolError {
+                class: UpcallToolErrorClass::AuthorizationRefused,
+                message: "operation unavailable under current authorization".into(),
+                name: None,
+                timeout_ms: None,
+                unavailable_reason: None,
+                data,
+                settlement_failures: Vec::new(),
+            }
+            .into_tool_error("shell_execute")
+        };
+        let error = decode(Some(json!("reprepare_required")));
+        assert!(
+            matches!(
+                &error,
+                ToolError::AuthorizationRefused { refusal }
+                    if refusal.kind() == OperationRefusalKind::ReprepareRequired
+                        && refusal.dispatch() == RefusalDispatch::Unknown
+            ),
+            "{error:?}"
+        );
+        for data in [
+            None,
+            Some(json!("unknown_kind")),
+            Some(json!({"kind": "denied", "tool_invoked": false})),
+        ] {
+            assert_eq!(
+                decode(data),
+                ToolError::OperationAuthorizationUnavailable,
+                "no verdict"
+            );
         }
     }
 

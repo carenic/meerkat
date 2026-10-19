@@ -923,7 +923,12 @@ pub enum OperationReviewTier {
     R3,
 }
 
-/// Internal disposition of the affected operation, not a turn/run disposition.
+/// Owner- and model-facing disposition of the affected operation, not a
+/// turn/run disposition. One of three closed values that carries no private
+/// fact: it names no class, source, principal, sink or policy text, and no
+/// audit record. It is no permission either: a typed reason never grants
+/// replay after entry, and a new call is a new operation with fresh
+/// admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -933,20 +938,74 @@ pub enum OperationRefusalKind {
     MalformedFacts,
 }
 
-/// Audience-safe refusal with a typed owner-facing disposition.
-/// No private class, source, principal, sink or policy explanation is carried.
+/// Whether the tool code a refusal's certifier guards ran for the refused
+/// call. Only a core component that sees its own refusal happen before it
+/// invokes that code certifies [`Self::NotDispatched`]; every other refusal
+/// is [`Self::Unknown`]. Like the kind, neither value is a permission.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalDispatch {
+    /// No code of the tool that the certifying core component guards ran
+    /// for this call: the fenced dispatch refused before it invoked the
+    /// dispatcher, or the execution policy gate before it invoked its inner
+    /// dispatcher. The certification covers only the code below its
+    /// certifier: a dispatcher layer that runs tool code of its own before
+    /// delegating forwards such a refusal as
+    /// `OperationRefused::new(refusal.kind())`, which is [`Self::Unknown`].
+    NotDispatched,
+    /// No certification: the tool code may or may not have run.
+    Unknown,
+}
+
+/// Audience-safe refusal with a typed owner- and model-facing disposition
+/// and whether the guarded tool code ran ([`RefusalDispatch`]).
+/// No private class, source, principal, sink or policy explanation is
+/// carried, and neither fact grants replay after entry. Equality compares
+/// both facts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct OperationRefused {
     kind: OperationRefusalKind,
+    dispatch: RefusalDispatch,
 }
 
 impl OperationRefused {
+    /// A refusal that makes no claim about whether tool code ran
+    /// ([`RefusalDispatch::Unknown`]).
     pub const fn new(kind: OperationRefusalKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            dispatch: RefusalDispatch::Unknown,
+        }
+    }
+
+    /// This refusal certified by the core component that met it before it
+    /// invoked the tool code it guards.
+    #[must_use]
+    pub(crate) const fn not_dispatched(self) -> Self {
+        Self {
+            dispatch: RefusalDispatch::NotDispatched,
+            ..self
+        }
+    }
+
+    /// Test-only: this refusal as a fenced dispatch certifies it, so a test
+    /// outside core can build what a certified refusal looks like
+    /// downstream.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn certified_not_dispatched_for_test(self) -> Self {
+        self.not_dispatched()
     }
 
     pub const fn kind(self) -> OperationRefusalKind {
         self.kind
+    }
+
+    /// Whether the guarded tool code ran for the refused call; see
+    /// [`RefusalDispatch`].
+    pub const fn dispatch(self) -> RefusalDispatch {
+        self.dispatch
     }
 }
 

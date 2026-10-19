@@ -15183,7 +15183,8 @@ mod tests {
                         .expect("refused provider function output must be valid JSON"),
                     serde_json::json!({
                         "error": "operation_refused",
-                        "message": "operation unavailable under current authorization"
+                        "message": "operation unavailable under current authorization",
+                        "data": {"kind": "denied", "tool_invoked": "unknown"}
                     })
                 );
                 assert_response_create_requests_audio(&sent[1]);

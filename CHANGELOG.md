@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `OperationRefused` equality now
+  includes whether the refused call's tool code ran
+  (`OperationRefused::dispatch`, see Added). A refusal the fenced dispatch or
+  the execution policy gate certifies as not dispatched is no longer equal to
+  `OperationRefused::new(kind)` of the same kind. Compare `kind()` and
+  `dispatch()` instead.
+
 ### Added
 
 - `meerkat_core::authorization::OwnerChangeChurn`, with `OwnerChangeWait`,
@@ -51,6 +60,34 @@ them.
   dispatch has left, measured from its start against its plan's effective
   timeout, for a tool that waits inside its body. The `web_search` helper's
   owner-change wait is bounded by it.
+- `meerkat_core::authorization::RefusalDispatch` (`NotDispatched`, `Unknown`;
+  non-exhaustive) and `OperationRefused::dispatch`: whether the tool code
+  that the certifying core component guards ran for a refused call. The
+  fenced dispatch (and the retained consent attempt) certifies
+  `NotDispatched` for every operation refusal it meets before it invokes the
+  dispatcher, and the execution policy gate for every one it meets before it
+  invokes its inner dispatcher. Every other refusal, one a dispatcher
+  returns included, is `Unknown`, which makes no claim. A dispatcher layer
+  that runs tool code of its own before delegating to a certifying
+  component forwards `OperationRefused::new(refusal.kind())`.
+
+### Changed
+
+- The model-facing payload of an `operation_refused` tool result now
+  carries `data` with exactly the closed refusal kind and whether the tool
+  ran: `{"kind": "reprepare_required" | "denied" | "malformed_facts",
+  "tool_invoked": false | "unknown"}`. `tool_invoked` is always present, so
+  its absence never reads as not invoked. The kind carries no policy detail,
+  owner data or audit content, and neither field is a permission: a typed
+  reason never grants replay after entry, and a new call is a new operation
+  with fresh admission. The message, `Display`, `Debug` and tracing stay
+  uniform. The mob member upcall keeps carrying the bare kind, so a 0.9.3
+  peer decodes it as before; whether the tool ran does not cross it, and
+  the receiving side's model reads `"unknown"`.
+- A mob member upcall refusal whose data is absent or names no known kind
+  now decodes as `operation_authorization_unavailable` instead of
+  `operation_refused` with `malformed_facts`: it is no verdict the peer
+  gave.
 
 ### Fixed
 

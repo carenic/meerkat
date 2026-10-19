@@ -640,6 +640,12 @@ mod tests {
             },
             "refusal must not flatten into ExecutionFailed"
         );
+        // The helper's refusal came from inside the tool's body, after the
+        // dispatch entered it: the model reads no claim that it did not run.
+        assert_eq!(
+            error.to_error_payload()["data"],
+            serde_json::json!({"kind": "denied", "tool_invoked": "unknown"})
+        );
         assert_eq!(*executor.authorized.lock().await, vec![true]);
     }
 
