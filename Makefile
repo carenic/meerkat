@@ -784,8 +784,10 @@ check-crate-license-files:
 # ci/standalone-workspace-only.toml) and runs on every pull request; the
 # census packages, unpacks and tests every release crate one at a time and
 # compares its test names with the workspace's (nightly and before a release).
+# Both run `cargo` from PATH, or the binary CARGO_BIN names. CARGO_BIN must be
+# a real cargo: scripts/repo-cargo itself execs CARGO_BIN.
 check-published-crates-standalone-guard:
-	@CARGO_BIN=$(CARGO) $(PYTHON) scripts/published_crates_standalone.py guard
+	@$(PYTHON) scripts/published_crates_standalone.py guard
 
 published-crates-standalone-selftest:
 	@$(PYTHON) scripts/test_published_crates_standalone.py
