@@ -44,11 +44,11 @@ them.
   teardown), a command the Closing state refuses is refused with
   `MobError::AdmissionClosed` (reason `MobAdmissionCloseReason::Shutdown`): a
   spawn, respawn, work submission or flow run got
-  `MobError::ActorCommandChannelClosed` there, and the other refused commands
-  (for example wiring, a host bind, a live commit, resume, reset or reload)
-  waited for the Shutdown or ran. `MobHandle::acquire_owner` after the
-  Shutdown's admission is refused the same way where it granted an owner
-  lease.
+  `MobError::ActorCommandChannelClosed` there; while the Shutdown drained, so
+  did the other refused commands (for example wiring, a host bind, a live
+  commit, resume, reset or reload), which waited for the Shutdown or ran while
+  it was parked. `MobHandle::acquire_owner` after the Shutdown's admission is
+  refused the same way where it granted an owner lease.
 - Behaviour-only (not measured by the gate): a Shutdown that fails after its
   admission keeps the actor alive as the retry owner with admission closed,
   so the Closing set (spawn, work submission, flows, wiring, a host bind, a
@@ -106,9 +106,9 @@ them.
   no owner lease is granted, while its destroy is unfinished.
 - A durability fail-stop (a durable mutation whose outcome stayed uncertain,
   or a durable recovery that fails before the actor admits a command) closes
-  the mob's admission before the actor quiesces and exits, with the new
-  `MobAdmissionCloseReason::DurabilityFailStop` (it displays as "durability
-  fail-stop"); an earlier close keeps its reason.
+  the mob's admission before the actor exits (a mutation's fail-stop before it
+  quiesces), with the new `MobAdmissionCloseReason::DurabilityFailStop` (it
+  displays as "durability fail-stop"); an earlier close keeps its reason.
 - A lost mob actor task (one that ends without its loop returning, as on a
   panic or an abort) closes the mob's admission from its spawn wrapper,
   before the task is reported lost, with the new
