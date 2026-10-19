@@ -46,8 +46,9 @@ name: CI
 #                     non-Rust input (scripts/ci-non-rust-readers.json)
 #                     where no other lane of the plan runs them
 #   wasm-check      - wasm32 check of meerkat-web-runtime: every push with a
-#                     Rust change, and PRs that change the web runtime, the
-#                     contracts or the CLI web template
+#                     Rust change, and PRs that change the web runtime or a
+#                     crate it compiles (its dependency closure) or the CLI
+#                     web template, or plan the whole workspace
 #   example-web     - sdks/web wasm runtime build, the Web SDK type and unit
 #                     tests, plus the example 031, 032 and 033 browser
 #                     suites; every push, and PRs that touch the runtime, its
@@ -1116,7 +1117,7 @@ jobs:
     timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
-      RUST_MIN_STACK: "33554432"
+      RUST_MIN_STACK: "8388608"
       CARGO_TERM_COLOR: never
     steps:
       - name: Checkout
@@ -1543,7 +1544,7 @@ jobs:
           # the test-thread stack.
           # shellcheck disable=SC2206
           selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}" "${partition_args[@]}")
-          # The hook ran every lane on a 32 MiB test-thread stack.
+          # The hook runs every lane on an 8 MiB test-thread stack.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
           # Tests of crates that dev-depend on mcp-test-server spawn this exact
           # fixture and fail without it (mcp_test_server::fixture_binary).
@@ -2223,10 +2224,11 @@ jobs:
     name: wasm32 check
     needs: changes
     # Every push with a Rust change, and pull requests that change the web
-    # runtime, the contracts or the CLI web template (the classifier's `wasm`
-    # flag; the push also sets it for every change that reaches
-    # meerkat-web-runtime): the wasm32 clippy of the web runtime and the
-    # provider crates it links caught breaks only after merge before (#1108).
+    # runtime, a workspace crate it compiles (its dependency closure, the
+    # provider crates included) or the CLI web template, or that plan the
+    # whole workspace (the classifier's `wasm` flag): the wasm32 clippy of
+    # the web runtime and the provider crates it links caught breaks only
+    # after merge before (#1108).
     if: ${{ (github.event_name == 'push' && needs.changes.outputs.rust_changed == 'true') || needs.changes.outputs.wasm == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -2927,8 +2929,9 @@ jobs:
             fi
           else
             forbid_failure "Main unit tests" "${MAIN_UNIT_RESULT}"
-            # Pull requests run the wasm32 check when a changed package
-            # reaches the web runtime.
+            # Pull requests run the wasm32 check when the plan's `wasm` flag
+            # is set: a changed crate the web runtime compiles, its own
+            # inputs, or a whole-workspace plan.
             if [[ "${WASM}" == "true" ]]; then
               require_ran "wasm32 check" "${WASM_CHECK_RESULT}"
             else

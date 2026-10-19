@@ -39,7 +39,7 @@ TRAILING_PASS="PASS Linux and macOS arm64 assets publish without waiting for the
 TRAILING_FAIL="FAIL The trailing Intel macOS and Windows lanes must not gate the critical assets, and no upload may replace a published asset"
 WEB_TOOLS_PASS="PASS The Web SDK release build checks every download's sha256 and wasm-pack installs nothing: wasm-bindgen (Cargo.lock's version) and wasm-opt are pinned"
 TOKEN_PASS="PASS Release workflow token is read-only except for the jobs that attest or publish, which never persist it in a checkout; no workflow passes every secret to a reusable workflow"
-CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job restores a cache on any event but the semver gate's measurement, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
+CACHES_PASS="PASS GitHub Actions caches in release.yml jobs, the local actions they call and, on a tag, the reusable workflows they call are never saved on a dispatch and never cache ~/.cargo/bin; token jobs restore none, no release job or semver readiness run restores a cache on any event, OIDC or attesting jobs restore none that a dispatch-like run of any workflow saves, and no dispatch-like run saves the Bazel repository cache (reusable workflows never run on a dispatch); a workflow that produces what a tag trusts or checks out a ref its inputs choose saves no cache on a dispatch-like run; only push and schedule runs set CI's sccache client to write its bucket (a client-side setting), and CI installs a sha256-pinned sccache release without sccache-action, which would export the Actions cache token to its run steps"
 CACHES_FAIL="FAIL A release cache can be saved on a dispatch, cache ~/.cargo/bin, reach a token, OIDC or attesting job, or be restored by a release job, or a workflow a tag trusts saves a cache on a dispatch-like run, or a run other than a push or schedule sets CI's sccache client to write, or CI installs sccache through sccache-action or without a pinned sha256"
 
 fail() {
@@ -802,8 +802,29 @@ elif name == "semver-readiness-dispatch-save":
     # The pre-review semver measurement saved its rust-cache on a dispatch.
     replace_once(
         ".github/workflows/release-semver-readiness.yml",
-        "          save-if: ${{ github.event_name == 'push' }}\n",
-        "",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache Cargo\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          cache-bin: \"false\"\n\n      - name: Install cargo-semver-checks\n",
+    )
+elif name == "semver-gate-cache":
+    # The pre-0.9.4 semver gate restored a rust-cache on its dispatch
+    # measurement, whose target directory the build never used.
+    replace_once(
+        ".github/workflows/release.yml",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache cargo\n        if: ${{ github.event_name == 'workflow_dispatch' }}\n"
+        "        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          save-if: ${{ github.event_name != 'workflow_dispatch' }}\n          cache-bin: \"false\"\n\n"
+        "      - name: Install cargo-semver-checks\n",
+    )
+elif name == "semver-readiness-restore":
+    # A restore-only rust-cache back in the readiness measurement: it saves
+    # on no run, and its build never reads a target cache.
+    replace_once(
+        ".github/workflows/release-semver-readiness.yml",
+        "      - name: Install cargo-semver-checks\n",
+        "      - name: Cache Cargo\n        uses: Swatinem/rust-cache@v2\n        with:\n"
+        "          save-if: \"false\"\n          cache-bin: \"false\"\n\n      - name: Install cargo-semver-checks\n",
     )
 elif name == "ci-dispatch-save":
     # A CI lane that saves its rust-cache on a dispatch.
@@ -1172,6 +1193,12 @@ expect_tree_fail_named sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches
+mutate_tree semver-gate-cache "${TEST_ROOT}/semver-gate-cache"
+expect_tree_fail_named semver-gate-cache "${TEST_ROOT}/semver-gate-cache" \
+  "job \`release_semver_gate\` restores \`v0-rust-release_semver_gate\` on a dispatch; a release job restores no cache" release-caches
+mutate_tree semver-readiness-restore "${TEST_ROOT}/semver-readiness-restore"
+expect_tree_fail_named semver-readiness-restore "${TEST_ROOT}/semver-readiness-restore" \
+  "release-semver-readiness.yml job \`semver\` restores \`v0-rust-semver\` on a push run; the semver measurement restores no cache" release-caches
 mutate_tree ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save"
 expect_tree_fail_named ci-dispatch-save "${TEST_ROOT}/ci-dispatch-save" \
   "ci.yml job \`fmt-governance\` saves a cache on a workflow_dispatch run" release-caches

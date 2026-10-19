@@ -504,8 +504,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   workspace and name only their targets, so they compile the hook's own
   units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
   profile, the fast selection), `e2e-fast`, and HeadCanonical with the
-  hook's own package-scoped command, all on the hook's 32 MiB test-thread
-  stack. The lib tests get no row: one
+  hook's own package-scoped command, all on the hook's 8 MiB test-thread
+  stack (the workspace floor of `.cargo/config.toml`). The lib tests get no
+  row: one
   `--workspace --lib` row (filtered to the scope's packages) is planned only
   with `--lib-row-runner LABEL`, for a runner that builds it in time (a
   hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
@@ -559,11 +560,13 @@ and its CI must be green before a release tag (`require_ci_green`):
   metadata, so a renamed feature fails the plan.
 - `wasm-check` (`make wasm-check`: wasm32 check and clippy of the web
   runtime and the crates it links): every Rust-relevant push, and pull
-  requests that change the web runtime, `meerkat-contracts` or the CLI web
-  template (a push also for every change whose closure reaches
-  `meerkat-web-runtime`). `example-web` and `wasm-timers` follow the same
-  rule for their own inputs (`sdks/web/`, the runtime, the contracts,
-  examples 031-033); `example-web` also runs the Web SDK's `npm test` (type
+  requests that change the web runtime or a workspace crate it compiles
+  (its dependency closure in the cargo graph, the provider crates
+  included), plan the whole workspace, or change the CLI web template.
+  `example-web` and `wasm-timers` run on a pull request only for their
+  own inputs (`sdks/web/`, the runtime, the contracts, examples 031-033),
+  and on a push also for every change whose closure reaches
+  `meerkat-web-runtime`; `example-web` also runs the Web SDK's `npm test` (type
   tests over the generated events, node unit suites).
 - `push: main` only (no budget): `main-unit` over the whole workspace (the
   unit lane's rows verbatim, then the rest of the workspace in packed

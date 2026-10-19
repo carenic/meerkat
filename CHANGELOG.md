@@ -35,6 +35,14 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
+  `retained_registrations: usize`: notification registrations of the
+  drained observer's change watches that were still running when the drain
+  stopped them (see Fixed). Code that builds the report with a struct
+  literal sets it.
+
 ### Added
 
 - `LocalGrantAuthority::resolve_lineage_observed`,
@@ -63,6 +71,16 @@ them.
   check that `preflight_schema_eligibility` runs and returns the ledger
   version it verified (`None` for a fresh domain), read in the same snapshot
   as the check.
+
+### Changed
+
+- `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
+  no longer refuses when the runtime store's file notifications cannot be
+  registered (at an inotify watch limit, for example). The store watch's
+  sweep, every 5 seconds by default, is the cross-process wake;
+  notifications only shorten it. It still refuses when the sweep cannot
+  start. A runtime delivery owner on such a store keeps its store watch on
+  the sweep alone instead of reporting cross-process wake unavailable.
 
 ### Fixed
 
@@ -124,6 +142,34 @@ them.
   retried it, so it could stay pending until the process restarted. This
   was the retry half of the 0.9.3 known issue "First concurrent durable
   delivery".
+- `meerkat-sqlite`: starting a SQLite change watch no longer waits for the
+  operating system to register file notifications. On macOS, FSEvents
+  registration held the first mob storage open for over 30 seconds, with
+  the process-wide mob observer registry locked, so every other mob storage
+  open waited too. The bounded sweep worker now starts first, and the
+  registration runs on a thread of its own: `SqliteChangeWatch::registration`
+  reports where it stands (`SqliteWatchRegistration`). Stopping a watch
+  cancels a registration still running without waiting for it: its thread
+  discards its result when the platform call returns, and is never
+  detached. It stays with the watch and, once the watch is dropped, with
+  the process (`meerkat_sqlite::watch::retained_registrations`). A mob
+  observer drain counts such registrations
+  (`SqliteMobObserverDrainReport::retained_registrations`). This covers
+  `MobStorage::persistent`, `SqliteMobStores::open`, arming a runtime
+  delivery owner and the multi-process hosting check. At most 64
+  registrations run at once in a process, so a long FSEvents stall cannot
+  use up its threads: a watch started while 64 are pending runs on its
+  sweep alone for the rest of its life and logs one warning.
+- `meerkat-sqlite`: a change watch whose notification registration fails
+  (at an inotify instance or watch limit, for example) keeps its sweep.
+  Before, the watch did not start at all, and a mob event observer then ran
+  with no cross-process catch-up.
+- `meerkat-sqlite`: registering a change watch's notifications no longer
+  aborts the process when notify's inotify event-loop thread could not
+  start (the process at its thread limit). notify 8.2.0 ignores that failed
+  spawn, then panics in `watch()` and again in its `Drop` while the first
+  panic unwinds. The registration now contains the panic, leaks that
+  watcher instead of dropping it, and leaves the watch on its sweep.
 
 ## [0.9.3] - 2026-10-18
 
