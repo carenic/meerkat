@@ -19,19 +19,23 @@ repos:
         types: [rust]
         pass_filenames: false
 
-  # On commit: regenerate Bazel BUILD files when an input of the generator
-  # changes: Cargo metadata, a Rust source under crates/ or tests/ (a test's
-  # data and srcs follow its source text, and a new module file joins srcs),
-  # or the generator and the files it reads. CI rejects stale generated
-  # BUILDs; pre-commit refreshes them before the commit lands and pre-commit
-  # re-stages the diff. No network; a run takes about 5 seconds.
+  # On commit: regenerate Bazel BUILD files when the commit changes an input
+  # of the generator: Cargo metadata, a Rust source under crates/ or tests/
+  # (a test's data and srcs follow its source text, and a new module file
+  # joins srcs), or the generator and the files it reads. CI rejects stale
+  # generated BUILDs; the hook refreshes them and fails so they can be staged.
+  # The hook runs on every commit and reads the staged paths itself, since
+  # pre-commit leaves deletions out of the files it matches; it refuses a
+  # commit while a Rust file under crates/ or tests/ is not in the index,
+  # which the generator would read from disk. No network; a run of the
+  # generator takes about 5 seconds.
   - repo: local
     hooks:
       - id: buildbuddy-generate-fix
         name: regenerate Bazel BUILD files (auto-fix)
-        entry: node scripts/generate-bazel-rust-builds.mjs
+        entry: node scripts/precommit-build-hook.mjs
         language: system
-        files: '(^Cargo\.toml$|^Cargo\.lock$|^(crates/[^/]+|tests/integration|tests/fixtures/[^/]+)/Cargo\.toml$|^MODULE\.bazel$|^(crates|tests)/.+\.rs$|^scripts/(generate-bazel-rust-builds|rust-source-text|rust-test-selector)\.mjs$|^scripts/non-shipping-features\.json$)'
+        always_run: true
         pass_filenames: false
 
   # On commit: keep the bundled dogma docs inside the repo-local skill synced

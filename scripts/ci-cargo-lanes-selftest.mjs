@@ -1917,7 +1917,7 @@ for (const path of [
   assert.equal(plan.examples_browser, false);
 }
 {
-  for (const path of ["MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", "tools/bazel/defs.bzl", "tools/buildbuddy/README.md", "scripts/generate-bazel-rust-builds.mjs", "scripts/rust-source-text.mjs", "Cargo.lock"]) {
+  for (const path of ["MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", "tools/bazel/defs.bzl", "tools/buildbuddy/README.md", "scripts/generate-bazel-rust-builds.mjs", "scripts/rust-source-text.mjs", "scripts/rust-test-selector.mjs", "scripts/non-shipping-features.json", "Cargo.lock"]) {
     assert.equal(planFor([path]).bazel_graph, true, `${path} selects the Bazel graph check`);
   }
 }
