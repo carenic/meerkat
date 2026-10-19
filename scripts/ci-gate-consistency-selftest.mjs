@@ -90,9 +90,19 @@ function readJobs(text) {
     if (needs) {
       const value = needs[1].trim();
       if (value === "") {
-        for (let next = index + 1; next < lines.length && /^ {6}- /.test(lines[next]); next += 1) {
-          job.needs.push(lines[next].replace(/^ {6}- /, "").trim());
+        // A block list: every line deeper than the key is an item, a
+        // comment or blank, so a comment between items does not end the
+        // list and anything else fails.
+        let next = index + 1;
+        for (; next < lines.length; next += 1) {
+          if (lines[next].trim() === "" || /^\s*#/.test(lines[next])) continue;
+          if (lines[next].search(/\S/) <= 4) break;
+          const item = lines[next].match(/^ {6}- ([A-Za-z0-9_-]+)\s*$/);
+          assert.ok(item, `${job.name}: this selftest reads a needs: list of "- <job>" lines only, not ${lines[next].trim()} (line ${next + 1})`);
+          job.needs.push(item[1]);
         }
+        assert.ok(job.needs.length > 0, `${job.name}: needs: has no items (line ${index + 1})`);
+        index = next - 1;
       } else if (value.startsWith("[")) {
         assert.match(value, /^\[[A-Za-z0-9_, -]*\]$/, `${job.name}: needs: ${value} (line ${index + 1})`);
         job.needs = value.slice(1, -1).split(",").map((name) => name.trim()).filter(Boolean);
@@ -150,12 +160,22 @@ function readStep(text, jobName, stepName) {
     const indent = lines[index].search(/\S/);
     if (indent >= 0 && indent <= stepIndent) break;
     if (/^\s+env:\s*$/.test(lines[index])) {
+      // Each value is read verbatim, so it must be one line: a block scalar
+      // (KEY: >- or |) or a line deeper than the entries fails, where it
+      // would otherwise render as its indicator.
       const envIndent = indent;
+      let entryIndent = -1;
       for (index += 1; index < lines.length; index += 1) {
-        const entryIndent = lines[index].search(/\S/);
-        if (entryIndent >= 0 && entryIndent <= envIndent) break;
-        const entry = lines[index].match(/^\s+([A-Z0-9_]+): (.*)$/);
-        if (entry) env[entry[1]] = entry[2];
+        const line = lines[index];
+        if (line.trim() === "" || /^\s*#/.test(line)) continue;
+        const lineIndent = line.search(/\S/);
+        if (lineIndent <= envIndent) break;
+        if (entryIndent < 0) entryIndent = lineIndent;
+        assert.equal(lineIndent, entryIndent, `step ${stepName}: env line ${line.trim()} is not an entry: this selftest reads one-line values only (line ${index + 1})`);
+        const entry = line.match(/^\s+([A-Z0-9_]+): (.*)$/);
+        assert.ok(entry, `step ${stepName}: cannot read env entry ${line.trim()} (line ${index + 1})`);
+        assert.ok(!/^[>|]/.test(entry[2]), `step ${stepName}: env ${entry[1]} is a block scalar: this selftest reads one-line values only (line ${index + 1})`);
+        env[entry[1]] = entry[2];
       }
       index -= 1;
       continue;
@@ -380,6 +400,20 @@ assert.equal(evaluate("github.event_name == 'PUSH' && !cancelled()", contextFor(
 assert.equal(evaluate("'a' == 'b' || 'c'", contextFor("push", new Map(), new Map(), new Map())), "c");
 assert.throws(() => evaluate("github.ref == 'x'", contextFor("push", new Map(), new Map(), new Map())), /does not model github\.ref/);
 assert.throws(() => evaluate("contains('a', 'b')", contextFor("push", new Map(), new Map(), new Map())), /does not model contains/);
+// A comment between needs: items does not end the list; any other line in
+// it, or a list with no item, fails.
+const knownJobs = (needs) => `jobs:\n  a:\n    runs-on: x\n  b:\n    runs-on: x\n  c:\n    needs:\n${needs}    runs-on: x\n`;
+assert.deepEqual(readJobs(knownJobs("      - a\n      # b is read too\n\n      - b\n"))[2].needs, ["a", "b"]);
+assert.throws(() => readJobs(knownJobs("      - a\n      b: x\n")), /reads a needs: list of "- <job>" lines only/);
+assert.throws(() => readJobs(knownJobs("    - a\n")), /needs: has no items/);
+// An env value is one line: a block scalar, a deeper line or an entry this
+// reader cannot read fails.
+const knownStep = (env) => `jobs:\n  gate:\n    steps:\n      - name: Check\n        env:\n${env}        run: |\n          true\n`;
+assert.deepEqual(readStep(knownStep("          A: ${{ x }}\n          # a comment\n          B: two\n"), "gate", "Check").env, { A: "${{ x }}", B: "two" });
+assert.throws(() => readStep(knownStep("          A: >-\n            folded\n"), "gate", "Check"), /env A is a block scalar/);
+assert.throws(() => readStep(knownStep("          A: |\n          B: two\n"), "gate", "Check"), /env A is a block scalar/);
+assert.throws(() => readStep(knownStep("          A: one\n            two\n"), "gate", "Check"), /env line two is not an entry/);
+assert.throws(() => readStep(knownStep("          A: one\n          lower: two\n"), "gate", "Check"), /cannot read env entry lower: two/);
 
 const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
 const jobs = readJobs(workflow);
