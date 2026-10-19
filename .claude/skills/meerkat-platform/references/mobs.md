@@ -220,6 +220,19 @@ Insert a mob's handle before its members run turns. Lookups:
 `MobHandle::member_of_session`, `MobStorage::stored_member_of_session` and
 `stored_members_by_session`, `MobMcpState::session_member_matches`.
 
+Unresumable stores at restore (since 0.9.4): one persisted mob whose resume is
+refused no longer fails `MobMcpState`'s whole restore (0.9.3 then failed every
+mob verb and brought no mob back). That mob is left unrestored with its store
+kept as found (`MobMcpState::unrestored_mobs`, not in `mob_list`), a lookup or
+create of its id answers its refusal (`IncarnationInconsistent` and
+`IncarnationDestroyed` keep their variants, any other refusal is `Internal`
+with its message), and the other mobs restore. Its stored roster still counts
+for provenance, so a create by a session it names is refused with
+`ProvenanceUnavailable`. An empty store whose creation record is not finalized
+is kept the same way (`IncarnationInconsistent`, `RecordWithoutCreation`;
+`MobStorage::unfinalized_creation_mob` reads it). A transport or persistence
+fault, or a store that names no mob, still fails the restore.
+
 Retire at scope (since 0.9.4): `retire_at_scope(&scope)` retires exactly the
 incarnation a `MemberDeliveryScope` names, with `retire`'s process-tree
 semantics. MobMachine admits every step (each descendant and the member) on

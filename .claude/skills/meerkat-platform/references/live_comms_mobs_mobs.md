@@ -69,7 +69,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   which 0.9.3 refuses: back up mob stores before upgrading. A store whose
   creation record disagrees with its log, or that holds a finished destroy,
   refuses resume (`IncarnationInconsistent`, `IncarnationDestroyed`), and a
-  delivery scope from an earlier incarnation gets `IncarnationMismatch`.
+  delivery scope from an earlier incarnation gets `IncarnationMismatch`. Such
+  a store no longer stops a server's other mobs from restoring.
 
 ## Admission close (Rust hosts)
 
