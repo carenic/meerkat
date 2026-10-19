@@ -57,6 +57,19 @@ declares. Routing and authorization never read it. `send_message` never sets
 it. A 0.9.3 receiver does not know the field and refuses such a reply (its
 signature check fails); every other message is unchanged.
 
+A receiver checks a peer envelope's signature over the envelope as it
+arrived, including fields of its message kind that the receiver does not
+know, and drops such a field only after the check, so it never changes
+behaviour. A sender may therefore add an optional field to a signed message
+kind without newer receivers refusing it (0.9.3 receivers still re-encode
+before checking). A field whose meaning a receiver must understand needs a
+new message kind instead: a receiver refuses a kind it does not know. An
+envelope whose encoding holds the same map key twice, at any depth, is
+refused. One check still uses the decoded envelope: a request's TCP callback
+endpoint is granted only when the envelope verifies as this build decodes it,
+so a request that carries a field this build does not know is delivered
+without its callback route.
+
 `send_request` and `send_response` are not general task-tracking tools. The
 agent-facing request intent vocabulary is closed to `checksum_token` and
 `supervisor.bridge`, each with typed params and a typed result; the closure is

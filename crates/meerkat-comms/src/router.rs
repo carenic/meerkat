@@ -668,7 +668,7 @@ impl Router {
                     // Validate ACK: signature, sender, recipient, and in_reply_to
                     if let MessageKind::Ack { in_reply_to } = frame.envelope.kind {
                         if self.require_peer_auth {
-                            if !frame.envelope.verify() {
+                            if !frame.verify_signature() {
                                 return Err(SendError::PeerOffline);
                             }
                             if frame.envelope.from != sent_to {

@@ -178,6 +178,47 @@ impl MessageKind {
     }
 }
 
+/// Sort every CBOR map in `value` by canonical key order (RFC 8949),
+/// recursively. It never removes or merges entries: a map that holds a key
+/// twice keeps both, so a repeated key changes the encoded bytes instead of
+/// disappearing from them.
+pub(crate) fn canonicalize_cbor(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_cbor(item);
+            }
+        }
+        Value::Map(entries) => {
+            for (key, val) in entries.iter_mut() {
+                canonicalize_cbor(key);
+                canonicalize_cbor(val);
+            }
+
+            entries.sort_by(|(k1, _), (k2, _)| match (k1, k2) {
+                (Value::Text(a), Value::Text(b)) => match a.len().cmp(&b.len()) {
+                    std::cmp::Ordering::Equal => a.cmp(b),
+                    ord => ord,
+                },
+                _ => CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone())),
+            });
+        }
+        Value::Tag(_, inner) => canonicalize_cbor(inner),
+        _ => {}
+    }
+}
+
+/// The canonical CBOR encoding of `value` (see [`canonicalize_cbor`]); empty
+/// when it cannot be encoded.
+pub(crate) fn canonical_cbor_bytes(mut value: Value) -> Vec<u8> {
+    canonicalize_cbor(&mut value);
+    let mut buf = Vec::new();
+    if ciborium::into_writer(&value, &mut buf).is_err() {
+        return Vec::new();
+    }
+    buf
+}
+
 /// A signed message envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -210,48 +251,12 @@ impl Envelope {
     /// RFC 8949 edge-case fix must land in BOTH; the contracts side pins the
     /// semantics with a known-answer vector test.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        fn canonicalize(value: &mut Value) {
-            match value {
-                Value::Array(items) => {
-                    for item in items {
-                        canonicalize(item);
-                    }
-                }
-                Value::Map(entries) => {
-                    for (key, val) in entries.iter_mut() {
-                        canonicalize(key);
-                        canonicalize(val);
-                    }
-
-                    entries.sort_by(|(k1, _), (k2, _)| match (k1, k2) {
-                        (Value::Text(a), Value::Text(b)) => match a.len().cmp(&b.len()) {
-                            std::cmp::Ordering::Equal => a.cmp(b),
-                            ord => ord,
-                        },
-                        _ => {
-                            CanonicalValue::from(k1.clone()).cmp(&CanonicalValue::from(k2.clone()))
-                        }
-                    });
-                }
-                Value::Tag(_, inner) => canonicalize(inner),
-                _ => {}
-            }
-        }
-
         // Create a tuple of (id, from, to, kind) for signing.
         let signable = (&self.id, &self.from, &self.to, &self.kind);
-
-        let mut value = match Value::serialized(&signable) {
-            Ok(value) => value,
-            Err(_) => return Vec::new(),
-        };
-        canonicalize(&mut value);
-
-        let mut buf = Vec::new();
-        if ciborium::into_writer(&value, &mut buf).is_err() {
-            return Vec::new();
+        match Value::serialized(&signable) {
+            Ok(value) => canonical_cbor_bytes(value),
+            Err(_) => Vec::new(),
         }
-        buf
     }
 
     /// Sign the envelope with the given keypair, updating the sig field.
@@ -343,6 +348,19 @@ mod tests {
         } else {
             panic!("Expected Message variant");
         }
+    }
+
+    #[test]
+    fn canonicalization_keeps_every_entry_of_a_map_with_a_repeated_key() {
+        let entry =
+            |key: &str, value: i64| (Value::Text(key.to_string()), Value::Integer(value.into()));
+        let mut value = Value::Map(vec![entry("b", 1), entry("a", 2), entry("b", 3)]);
+        canonicalize_cbor(&mut value);
+        assert_eq!(
+            value,
+            Value::Map(vec![entry("a", 2), entry("b", 1), entry("b", 3)]),
+            "sorted, nothing merged or dropped"
+        );
     }
 
     #[test]
