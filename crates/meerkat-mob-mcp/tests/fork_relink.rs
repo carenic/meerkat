@@ -2538,6 +2538,87 @@ async fn a_boundary_commit_that_fails_during_the_destroy_detach_is_reloaded_and_
     );
 }
 
+/// Force-cancelling a member whose runtime needs a durability reload answers
+/// the typed `MemberReloadRequired`, naming the member, at once: it neither
+/// waits on the member session's gates nor fails untyped behind them. A
+/// cancel of all of its work answers the same. The repair it names,
+/// `reload_member_registration`, then lets the cancel run, and the member's
+/// durable input ends terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn force_cancelling_a_member_that_needs_a_reload_answers_typed_until_it_is_reloaded() {
+    let degraded = fork_child_whose_boundary_commit_failed("cancelled-child").await;
+    let handle = degraded
+        .fixture
+        .state
+        .handle_for(&degraded.fixture.source_mob_id())
+        .await
+        .unwrap();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.force_cancel_member(degraded.child.clone()),
+    )
+    .await
+    .expect("the cancel answers at once");
+    match refused {
+        Err(meerkat_mob::MobError::MemberReloadRequired { member_id, .. }) => {
+            assert_eq!(member_id, degraded.child, "the refusal names the member");
+        }
+        other => panic!("a degraded member's cancel answers MemberReloadRequired: {other:?}"),
+    }
+    let entry = handle
+        .get_member(&degraded.child)
+        .await
+        .expect("the roster answers")
+        .expect("the degraded member stays in the roster");
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token),
+    )
+    .await
+    .expect("the cancel of all its work answers at once");
+    match refused {
+        Err(meerkat_mob::MobError::MemberReloadRequired { member_id, .. }) => {
+            assert_eq!(member_id, degraded.child, "the refusal names the member");
+        }
+        other => panic!(
+            "a degraded member's cancel of all its work answers MemberReloadRequired: {other:?}"
+        ),
+    }
+
+    handle
+        .reload_member_registration(&degraded.child)
+        .await
+        .expect("the named repair reloads the member");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.force_cancel_member(degraded.child.clone()),
+    )
+    .await
+    .expect("the cancel answers")
+    .expect("the reloaded member's cancel runs");
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&degraded.child_session);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let inputs = meerkat_runtime::RuntimeStore::load_input_states_strict(
+                degraded.store.as_ref(),
+                &runtime_id,
+            )
+            .await
+            .expect("the child's durable inputs");
+            if !inputs.is_empty()
+                && inputs
+                    .iter()
+                    .all(|stored| stored.seed.terminal_outcome.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the member's durable input ends terminal");
+}
+
 /// A receipt that lands while the ceiling-deciding status read is held is
 /// the job's outcome: before delivering `restart_interrupted` at the ceiling
 /// the re-link reads the exact receipt once more. (Review P1: without that

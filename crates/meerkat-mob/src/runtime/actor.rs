@@ -10879,9 +10879,10 @@ impl MobActor {
 
     /// #1102 fast rejection: a local runtime-backed member whose persistent
     /// runtime shell is `ReloadRequired` refuses every input at admission
-    /// (`RecoveryRepairBlocked`), so deliveries to it must not be dispatched.
-    /// Reads the same per-session gate the runtime ingress path consults and
-    /// returns the typed `MemberReloadRequired` before any dispatch work.
+    /// (`RecoveryRepairBlocked`), so deliveries to it must not be dispatched,
+    /// and a force cancel must not wait on its gates. Reads the same
+    /// per-session gate the runtime ingress path consults and returns the
+    /// typed `MemberReloadRequired` before any dispatch work.
     async fn ensure_member_runtime_durability_ready(
         &self,
         entry: &RosterEntry,
@@ -10900,7 +10901,7 @@ impl MobActor {
                 agent_identity = %entry.agent_identity,
                 session_id = %bridge_session_id,
                 operation = %required.operation,
-                "rejecting delivery: member runtime registration requires a cold reload"
+                "refusing member work: member runtime registration requires a cold reload"
             );
             return Err(MobError::MemberReloadRequired {
                 member_id: entry.agent_identity.clone(),
@@ -35771,12 +35772,21 @@ impl MobActor {
                 roster.get(&agent_identity).cloned()
             };
             if let Some(entry) = entry {
+                // A member whose runtime needs a durability reload answers
+                // typed before the cancel takes its session's gates. The
+                // cancel point's own typed refusal stays the authority for a
+                // runtime that degrades after this read.
+                self.ensure_member_runtime_durability_ready(&entry).await?;
                 let member_ref = self.machine_member_ref_for_behavior(&entry, "force cancel")?;
                 let expected_member = placed
                     .then(|| self.placed_member_incarnation(&entry))
                     .transpose()?;
                 self.provisioner
-                    .cancel_member_admitted_work(&member_ref, expected_member.as_ref())
+                    .cancel_member_admitted_work(
+                        &member_ref,
+                        &entry.agent_identity,
+                        expected_member.as_ref(),
+                    )
                     .await?;
             } else {
                 tracing::warn!(
@@ -54771,7 +54781,11 @@ impl MobActor {
         let machine_member_ref =
             self.machine_member_ref_for_behavior(&entry, "cancel all work interrupt")?;
         self.provisioner
-            .cancel_member_admitted_work(&machine_member_ref, expected_member.as_ref())
+            .cancel_member_admitted_work(
+                &machine_member_ref,
+                &entry.agent_identity,
+                expected_member.as_ref(),
+            )
             .await
     }
 

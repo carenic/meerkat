@@ -35,6 +35,19 @@ them.
 
 ## [Unreleased]
 
+### Changed
+
+- `MobHandle::force_cancel_member` on a member whose runtime requires a
+  durability reload answers `MobError::MemberReloadRequired` at once, naming
+  the member, where it failed with `MobError::Internal` wrapping the
+  runtime's repair-blocked error. `MobHandle::cancel_all_work` answers the
+  same. On the wire this is the dedicated `MEMBER_RELOAD_REQUIRED` error:
+  JSON-RPC `-32029` from `mob/force_cancel`, HTTP 409 from
+  `POST /mob/{id}/members/{agent_identity}/cancel`, and exit 49 from
+  `rkat mob force-cancel`. Reload the member with
+  `MobHandle::reload_member_registration`, then cancel again. This was a
+  0.9.3 known limitation.
+
 ### Fixed
 
 - A mob destroy whose member's boundary commit fails while the destroy

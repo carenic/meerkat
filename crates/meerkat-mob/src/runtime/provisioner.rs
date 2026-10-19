@@ -1458,6 +1458,27 @@ pub(super) enum MemberRunCancelOutcome {
     },
 }
 
+/// The answer for a member work cancel its runtime refused. The runtime's
+/// typed `RecoveryRepairBlocked` from the cancel point is the authority that
+/// the member needs a durability reload: it answers the member's
+/// `MemberReloadRequired`, whose repair is
+/// `MobHandle::reload_member_registration`. Any other refusal stays internal.
+pub(super) fn member_work_cancel_error(
+    member_identity: &AgentIdentity,
+    error: meerkat_runtime::RuntimeDriverError,
+    context: impl FnOnce() -> String,
+) -> MobError {
+    match error {
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { reason, .. } => {
+            MobError::MemberReloadRequired {
+                member_id: member_identity.clone(),
+                reason,
+            }
+        }
+        error => MobError::Internal(format!("{}: {error}", context())),
+    }
+}
+
 /// Classify an exact-run cancel's result for the cancel verbs, by type.
 ///
 /// `InterruptDispatchOutcomeUnknown` is a cancel the runtime accepted and
@@ -1685,11 +1706,13 @@ pub trait MobProvisioner: Send + Sync {
     /// (force cancel, cancel all work): its current run, exactly that run, at
     /// its next boundary, and the input it held queued. Input admitted after
     /// the cancel is untouched. `Ok(())` means the member has no admitted work
-    /// left that this cancel is responsible for. The default interrupts the
-    /// member.
+    /// left that this cancel is responsible for. A member runtime that needs a
+    /// durability reload refuses typed as `member_identity`'s
+    /// [`MobError::MemberReloadRequired`]. The default interrupts the member.
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        _member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         self.interrupt_member(member_ref, expected_member).await
@@ -5042,6 +5065,7 @@ impl SessionBackend {
     async fn cancel_member_admitted_work_exact(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         let session_id = Self::require_session(member_ref, "cancel")?;
@@ -5052,9 +5076,9 @@ impl SessionBackend {
             .abandon_queued_inputs_at_cancel_point(&session_id, "member work cancelled")
             .await
             .map_err(|error| {
-                MobError::Internal(format!(
-                    "abandoning the queued input of '{session_id}' failed: {error}"
-                ))
+                member_work_cancel_error(member_identity, error, || {
+                    format!("abandoning the queued input of '{session_id}' failed")
+                })
             })?;
         let Some(admitted) = admitted else {
             // An unregistered runtime has no queue and no run.
@@ -5069,9 +5093,9 @@ impl SessionBackend {
                 run_id,
             )
             .map_err(|error| {
-                MobError::Internal(format!(
-                    "cancelling the current run of '{session_id}' failed: {error}"
-                ))
+                member_work_cancel_error(member_identity, error, || {
+                    format!("cancelling the current run of '{session_id}' failed")
+                })
             })?,
         };
         let outcome = MemberWorkCancelOutcome {
@@ -14063,9 +14087,10 @@ impl MobProvisioner for SessionBackend {
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
-        self.cancel_member_admitted_work_exact(member_ref, expected_member)
+        self.cancel_member_admitted_work_exact(member_ref, member_identity, expected_member)
             .await
     }
 
@@ -17806,6 +17831,7 @@ impl MobProvisioner for MultiBackendProvisioner {
     async fn cancel_member_admitted_work(
         &self,
         member_ref: &MemberRef,
+        member_identity: &AgentIdentity,
         expected_member: Option<&super::bridge_protocol::BridgeMemberIncarnation>,
     ) -> Result<(), MobError> {
         match member_ref {
@@ -17817,7 +17843,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             }
             _ => {
                 self.session
-                    .cancel_member_admitted_work(member_ref, expected_member)
+                    .cancel_member_admitted_work(member_ref, member_identity, expected_member)
                     .await
             }
         }
