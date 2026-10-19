@@ -50,6 +50,14 @@ but be forbidden to delete events. A connected OAuth token with delete access
 does not widen the assistant's grant. Another person using the same assistant
 does not inherit the account owner's authority either.
 
+A host process that tells an agent the outcome of an administrative command,
+for example that a connector installation finished, is not the person who ran
+that command. Since 0.9.4 the stock governed realm binds such an outcome as its
+own input whose requester is the host's ingress: no person requested it and it
+is not anyone's consent. It runs under the operator's mandate in a turn of its
+own, and a reviewer or approver sees that requester in the mandate text. Only
+the operator's own prompts name the operator as their requester.
+
 ## Grants narrow authority
 
 A root grant states the authority given to an agent. A child grant can narrow
@@ -65,6 +73,11 @@ Batching work does not union contributors' permissions.
 Rules also preserve their combinations. A rule allowing **read calendar A** and
 another allowing **delete calendar B** do not allow **delete calendar A** merely
 because both the action and calendar appear somewhere in the policy.
+
+A resource bound names exact resources, or since 0.9.4 every resource owned by
+one of a set of owners. A parent grant can then fix the application while each
+child grant names the exact session resource it needs; a child that names a
+resource of another owner permits nothing.
 
 ## Check the operation that will actually run
 
@@ -101,6 +114,22 @@ Infrastructure failure is different:
 
 Detailed policy, source, principal, and account information belongs in protected
 records. Public error text must not disclose it to an audience that cannot read it.
+
+## A changing policy is a stale read, not a denial
+
+Owners publish every change (a grant issued or revoked, a policy, identity,
+destination or account change) through one local publication. An operation that
+reads the policy while a change is being published is refused to rebuild: its
+read is stale, which says nothing about whether the operation is permitted.
+Since 0.9.4 the agent waits for such a change to complete before it rebuilds a
+model request, a tool call, a hosted search helper or a compaction summary,
+within fixed bounds (at most 2 seconds and 3 extra rebuilds per wait, inside the
+tool's timeout and the run's budget). Past the bounds the refusal takes its
+ordinary path; a refusal the owners decided is never waited on. A model-reviewed
+tool call superseded only by such a change is reviewed once more instead of
+failing. The protected audit records which kind each refusal was: an owner
+answer, a publication that changed under the attempt, or a change still in
+progress.
 
 ## Keep the controller usable
 
