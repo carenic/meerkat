@@ -63,7 +63,9 @@ pub(crate) enum SettledGateWait {
     /// The waiter's own entry is not published yet, or it aborts a
     /// materialization claim, which exists only while no executor of the
     /// entry is attached: no runtime loop or boundary commit of the session
-    /// can keep the gate.
+    /// can keep the gate. (An attached actor recovery's claim is the
+    /// exception, and its bindings never reach the abort: they own no
+    /// rollback.)
     PreInstall,
     /// The waiter runs only after the holders a degradation can strand have
     /// released the gate: the reload-required discard's own stop of the

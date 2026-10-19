@@ -860,6 +860,141 @@ async fn an_attachment_unregister_behind_a_holder_ends_typed_once_the_session_de
     );
 }
 
+/// The startup owner of a new runtime loop whose live wait for the gate ends
+/// typed (the session degraded while another holder keeps the gate) releases
+/// the parked loop without the gate. The loop exits unserved, so the
+/// reload-required discard completes once the holder lets go; before, it
+/// waited for a loop parked on its serving release.
+#[tokio::test]
+async fn an_unserved_runtime_loop_is_released_when_its_startup_owner_ends_typed() {
+    let machine = persistent_machine();
+    let session_id = registered(&machine).await;
+    let (regate_reached_tx, regate_reached) = tokio::sync::oneshot::channel();
+    let (release_regate, release_regate_rx) = tokio::sync::oneshot::channel();
+    *machine
+        .test_pending_attachment_before_regate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((regate_reached_tx, release_regate_rx));
+    let ensure = tokio::spawn({
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .ensure_session_with_executor_factory(session_id, |_| {
+                    Box::new(IdleExecutor) as Box<dyn CoreExecutor>
+                })
+                .await
+                .map(|_| ())
+        }
+    });
+    tokio::time::timeout(TYPED_END_BOUND, regate_reached)
+        .await
+        .expect("the loop starts and its owner reaches the gap before M")
+        .expect("the seam stays armed");
+    let fence = hold_mutation_gate(&machine, &session_id).await;
+    let parked = machine.arm_mutation_gate_wait_observer_for_test(session_id.clone());
+    release_regate
+        .send(())
+        .expect("release the owner to take M again");
+    tokio::time::timeout(TYPED_END_BOUND, parked)
+        .await
+        .expect("the owner parks behind the held gate")
+        .expect("the wait observer stays armed until the wait");
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the fixture degrades the session during the wait"
+    );
+    let result = tokio::time::timeout(TYPED_END_BOUND, ensure)
+        .await
+        .expect("the degradation ends the owner's wait")
+        .expect("the owner task completes");
+    assert!(ended_typed(&result), "the attach ends typed: {result:?}");
+
+    drop(fence);
+    let witness = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the degraded registration has a witness");
+    let disposition = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.recover_or_discard_reload_required_registration_if_current(&witness),
+    )
+    .await
+    .expect("the discard does not wait for a parked loop")
+    .expect("the discard runs");
+    assert_eq!(
+        disposition,
+        ReloadRequiredRegistrationDisposition::Discarded,
+        "the reload-required discard replaces the registration"
+    );
+}
+
+/// A runtime loop's owned stop request waits for the gate live: behind a
+/// holder it ends typed once the session degrades.
+#[tokio::test]
+async fn an_owned_runtime_stop_request_behind_a_holder_ends_typed_once_the_session_degrades() {
+    let machine = persistent_machine();
+    let session_id = registered_with_runtime_loop(&machine).await;
+    let epoch_id = machine
+        .sessions
+        .read()
+        .await
+        .get(&session_id)
+        .expect("registered session entry")
+        .epoch_id
+        .clone();
+    let result = degrade_during_live_gate_wait(&machine, &session_id, {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .dispatch_owned_runtime_stop_request_for_test(
+                    &session_id,
+                    &epoch_id,
+                    "stop request behind a holder".to_string(),
+                )
+                .await
+        }
+    })
+    .await;
+    assert!(
+        ended_typed(&result),
+        "the stop request ends typed: {result:?}"
+    );
+}
+
+/// The bindings of an attached actor recovery own no rollback: the
+/// bindings-owned unregister answers false at once, without waiting for the
+/// gate the recovery lease holds.
+#[tokio::test]
+async fn attached_recovery_bindings_roll_back_nothing_while_the_lease_holds_the_gate() {
+    let machine = persistent_machine();
+    let session_id = registered_with_runtime_loop(&machine).await;
+    let attachment = machine
+        .current_executor_attachment_witness(&session_id)
+        .await
+        .expect("the attached runtime loop has a witness");
+    let recovery = machine
+        .prepare_attached_session_actor_recovery(&attachment)
+        .await
+        .expect("actor-only recovery under the exact attachment");
+    let unregistered = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.unregister_session_if_bindings_owned_registration(recovery.bindings()),
+    )
+    .await
+    .expect("the bindings do not wait for the gate the lease holds")
+    .expect("the bindings answer");
+    assert!(
+        !unregistered,
+        "attached recovery bindings unregister nothing"
+    );
+    drop(recovery);
+}
+
 /// An explicit stop waits for the gate live, like every path to the
 /// post-stop fence except the reload-required discard's own.
 #[tokio::test]

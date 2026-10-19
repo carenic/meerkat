@@ -868,7 +868,10 @@ impl MeerkatMachine {
                     // later carrier must first increment requested_generation,
                     // forcing this task to scan again before acknowledging it.
                     // A session that degrades while another holder keeps M
-                    // ends the dispatch typed instead of waiting for it.
+                    // ends the dispatch typed instead of waiting for it. The
+                    // task holds the gate, not the session id, so this live
+                    // waiter is deliberately not reported to the test wait
+                    // observer.
                     let gate_guard = match mutation_gate.lock_live().await {
                         Ok(guard) => guard,
                         Err(required) => break Err(degraded_gate_wait_refusal(required)),
@@ -906,7 +909,8 @@ impl MeerkatMachine {
 
             // Without M once the session degrades while another holder keeps
             // it: a carrier that holder commits later finds no slot and starts
-            // a dispatch of its own, which scans again.
+            // a dispatch of its own, which scans again. Not reported to the
+            // test wait observer, like the dispatch's wait above.
             let gate_guard = mutation_gate.lock_live().await.ok();
             let mut pending = machine
                 .pending_runless_terminal_publications

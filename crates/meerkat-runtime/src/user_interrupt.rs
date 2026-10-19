@@ -89,8 +89,9 @@ impl MeerkatMachine {
             Err(required) => {
                 // The session degraded while another holder keeps its gate:
                 // the dispatch cannot be reconciled with its exact attachment
-                // before the session is reloaded. The degraded settlement
-                // hard-cancels the exact run instead.
+                // before the session is reloaded. The run's next
+                // ready-gated wait starts the degraded settlement, which
+                // hard-cancels the exact run.
                 let result = Err(super::degraded_gate_wait_refusal(required));
                 result_tx.send_replace(Some(result.clone()));
                 return result;

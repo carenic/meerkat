@@ -388,7 +388,8 @@ them.
   durability degrades: an exact-run interrupt and its reconciliation, the
   recover and destroy control commands (`RuntimeControlPlaneError::StoreError`
   carrying the refusal, as their durability-ready wait answers), a comms abort
-  (an abort of every session skips such a session and aborts the others),
+  (an abort of every session aborts the others, then answers the typed
+  refusal naming the sessions it skipped),
   unregistering or retiring an executor attachment, an explicit stop and its
   post-stop fence, installing an unregister coordinator, closing an idle
   registration, input admission, the return to the gate after a boundary

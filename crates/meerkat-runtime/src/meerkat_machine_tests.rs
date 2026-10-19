@@ -6513,6 +6513,76 @@ async fn non_respawnable_drain_exit_quiesces_rotation_carrier_before_clearing_ru
     );
 }
 
+/// AbortAll aborts every session whose gate it can take, and then answers
+/// the typed refusal naming the durability-degraded session whose gate
+/// another holder keeps, instead of answering Ok as if it aborted them all.
+#[tokio::test]
+async fn abort_all_aborts_the_others_and_names_a_degraded_session_it_skipped() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(store, memory_blob_store()).expect("persistent machine"),
+    );
+    let degraded = SessionId::new();
+    adapter
+        .register_session(degraded.clone())
+        .await
+        .expect("register the session that degrades");
+    let aborted = SessionId::new();
+    adapter
+        .register_session(aborted.clone())
+        .await
+        .expect("register the session that is aborted");
+    let runtime: Arc<dyn CommsRuntime> = Arc::new(FakeDrainRuntime::idle());
+    assert!(
+        adapter
+            .update_peer_ingress_context(&aborted, true, Some(Arc::clone(&runtime)))
+            .await
+            .expect("attach drain runtime")
+    );
+    let carrier_dropped = install_test_rotation_carrier(
+        &adapter,
+        &aborted,
+        Arc::clone(&runtime),
+        "abort-all-skip-carrier",
+    )
+    .await;
+    let held = adapter
+        .session_mutation_gate(&degraded)
+        .await
+        .expect("registered session gate")
+        .lock_settled(SettledGateWait::TestFixture)
+        .await;
+    assert!(
+        adapter
+            .force_session_durability_reload_required_for_test(&degraded)
+            .await,
+        "the fixture degrades the session behind the holder"
+    );
+
+    let refusal = tokio::time::timeout(Duration::from_secs(5), adapter.abort_comms_drains())
+        .await
+        .expect("AbortAll does not wait for the held gate")
+        .expect_err("AbortAll reports the session it skipped");
+    match refusal {
+        RuntimeDriverError::RecoveryRepairBlocked { reason, .. } => {
+            assert!(
+                reason.contains(&degraded.to_string()),
+                "the refusal names the skipped session: {reason}"
+            );
+            assert!(
+                !reason.contains(&aborted.to_string()),
+                "the refusal names only skipped sessions: {reason}"
+            );
+        }
+        other => panic!("expected the typed repair-blocked refusal, got {other:?}"),
+    }
+    assert!(
+        carrier_dropped.load(Ordering::SeqCst),
+        "AbortAll still aborts the session whose gate it takes"
+    );
+    drop(held);
+}
+
 #[tokio::test]
 async fn abort_all_quiesces_rotation_carriers_with_drain_tasks() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());

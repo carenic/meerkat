@@ -3702,15 +3702,13 @@ impl MeerkatMachine {
                 state.phase = crate::RuntimeActorMaterializationClaimPhase::Prepared;
             }
             let claim_state = Arc::clone(&entry.materialization_claim_state);
-            let runtime_authority = crate::session_runtime_bindings_authority(
+            let runtime_authority = crate::attached_actor_recovery_bindings_authority(
                 witness.session_id().clone(),
                 entry.epoch_id.clone(),
                 Arc::clone(&entry.dsl_authority),
                 Arc::clone(&entry.handle_teardown_gate),
-                Some(claim_id),
+                claim_id,
                 Arc::clone(&claim_state),
-                None,
-                false,
             );
             let bindings = match entry.canonical_runtime_bindings.as_ref() {
                 Some(canonical) => canonical.__clone_with_runtime_authority(runtime_authority),
@@ -4065,6 +4063,12 @@ impl MeerkatMachine {
         let Some(claim_id) = authority.materialization_claim_id else {
             return Ok(false);
         };
+        if authority.attached_actor_recovery {
+            // An attached actor recovery owns no registration or attachment
+            // rollback: its lease reverts the claim when it drops, and the
+            // abort below would wait for the gate that lease holds.
+            return Ok(false);
+        }
         let exact_claim = {
             let mut state = authority
                 .materialization_claim_state
@@ -4172,13 +4176,14 @@ impl MeerkatMachine {
                 else {
                     return Ok(false);
                 };
-                let Ok(Some(gate_guard)) = self
+                let Some(gate_guard) = self
                     .lock_session_mutation_gate_for_live_lifecycle_lease(
                         session_id,
                         &live_lifecycle_lease,
                         SessionMutationGateWait::Settled(SettledGateWait::PreInstall),
                     )
                     .await
+                    .map_err(degraded_gate_wait_refusal)?
                 else {
                     return Ok(false);
                 };
@@ -5513,13 +5518,26 @@ impl MeerkatMachine {
         {
             Ok(guard) => guard,
             Err(required) => {
-                let _ = self
+                // Another holder keeps M, so the cleanup below, which takes
+                // M, refuses as well. Release the parked loop first, without
+                // M, or it waits on its serving release for good and the
+                // reload-required discard waits for it.
+                self.release_unserved_runtime_loop(&witness, &registration_gate)
+                    .await;
+                let mut refusal = degraded_gate_wait_refusal(required);
+                if let Err(cleanup_error) = self
                     .cleanup_unserved_executor_attachment(
                         &witness,
                         turn_finalization_boundary_already_held,
                     )
-                    .await;
-                return Err(degraded_gate_wait_refusal(required));
+                    .await
+                    && let RuntimeDriverError::RecoveryRepairBlocked { reason, .. } = &mut refusal
+                {
+                    *reason = format!(
+                        "{reason}; the unserved runtime-loop attachment's cleanup also refused: {cleanup_error}"
+                    );
+                }
+                return Err(refusal);
             }
         };
         // `should_wake` was read before the runtime loop took the registration
@@ -5587,6 +5605,40 @@ impl MeerkatMachine {
             pending.settle_interrupted_tool_evidence(evidence).await?;
         }
         Ok(EnsureRuntimeExecutorAttachment::Pending(pending))
+    }
+
+    /// Release a started runtime loop that was never served, without M: drop
+    /// its exact pending attachment's serving release, so the loop exits as
+    /// unserved and publishes its teardown handoff. The dead pending slot
+    /// stays for the reload-required discard to take. For a startup owner
+    /// whose live wait for M ended typed: M is held elsewhere, so nothing
+    /// that needs M can release the loop until a reload, and the reload
+    /// waits for the loop.
+    async fn release_unserved_runtime_loop(
+        &self,
+        witness: &RuntimeExecutorAttachmentWitness,
+        registration_gate: &SessionMutationGate,
+    ) {
+        let serving_release = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(witness.session_id()) else {
+                return;
+            };
+            if entry.epoch_id != witness.epoch_id
+                || !entry.mutation_gate.same_gate(registration_gate)
+            {
+                return;
+            }
+            match &mut entry.attachment_slot {
+                RuntimeLoopAttachmentSlot::Pending(attachment)
+                    if attachment.id == witness.attachment_id =>
+                {
+                    attachment.serving_release.take()
+                }
+                _ => None,
+            }
+        };
+        drop(serving_release);
     }
 
     /// Retire a candidate that exited before its serving gate opened.
@@ -8721,6 +8773,20 @@ impl MeerkatMachine {
             (Err(error), _) => Err(error),
             (Ok(()), Err(error)) => Err(error),
         }
+    }
+
+    /// [`Self::dispatch_owned_runtime_stop_request`] for gate-wait tests,
+    /// which see only whether it answered.
+    #[cfg(test)]
+    pub(super) async fn dispatch_owned_runtime_stop_request_for_test(
+        &self,
+        session_id: &SessionId,
+        epoch_id: &meerkat_core::RuntimeEpochId,
+        reason: String,
+    ) -> Result<(), RuntimeDriverError> {
+        self.dispatch_owned_runtime_stop_request(session_id, epoch_id, reason)
+            .await
+            .map(|_| ())
     }
 
     async fn dispatch_owned_runtime_stop_request(
