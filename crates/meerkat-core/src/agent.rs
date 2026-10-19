@@ -2552,7 +2552,11 @@ fn require_owner_target_for_targeted_sources<T: AgentToolDispatcher + ?Sized>(
 
 /// When one fenced dispatch's tool timeout ends, measured from the dispatch's
 /// start against its plan's effective timeout. Waits for an owner change in a
-/// dispatch end before it, so a wait never turns a refusal into a timeout.
+/// dispatch end before it, so a wait never turns a refusal into the tool's
+/// timeout. A streaming tool's inactivity window is not part of this
+/// deadline: the execution policy gate stages inside the streaming
+/// supervisor, so a gate wait longer than the window left ends as the tool's
+/// inactivity timeout.
 #[derive(Debug, Clone, Copy)]
 struct DispatchDeadline {
     ends: Option<crate::time_compat::DeadlineInstant>,

@@ -72,17 +72,22 @@ them.
   `ReprepareRequired` refusal. A governed tool dispatch waits at its prepared
   entry and again at its body entry, and when the call-level execution
   policy gate stages the call again after its own awaits (dispatch admission,
-  consequence policy), inside the tool's timeout; the review check point
-  runs on the decision prepared after the wait, so a reviewed tool whose
+  consequence policy), inside the tool's timeout. At the body entry the review
+  check point runs on the decision checked after the wait; a reviewed tool whose
   decision changed meanwhile is reviewed once more (see below) and no review
   is reused. The `web_search` tool's helper model request asks again under
   the same delegate operation. A compaction summary waits within the same
   bounds, and past them the refusal still fails its compaction. When the
   body entry or the gate's staging waits out a change after recording its
   `Entry` record, it records another for the decision checked after the
-  wait. The debug event names the site (`model_request`,
-  `compaction_summary`, `tool_dispatch`, `tool_entry`, `tool_policy_entry`,
-  `web_search_delegate`).
+  wait. The gate's check point also runs on the decision checked after its
+  wait, but the gate's own code already ran: a reviewed tool whose decision
+  changed while the gate waited settles as `review_unsatisfied`
+  (`context_changed`) and is not reviewed again. A streaming tool's gate
+  wait also counts against its inactivity window, and past that window the
+  call ends as the tool's inactivity timeout. The debug event names the
+  site (`model_request`, `compaction_summary`, `tool_dispatch`,
+  `tool_entry`, `tool_policy_entry`, `web_search_delegate`).
 - A governed helper admission fence and a helper child issuance answer
   `Unavailable` instead of `Denied` when their check refuses to rebuild
   (`ReprepareRequired`), on the prepared path and on the dispatch path alike:
