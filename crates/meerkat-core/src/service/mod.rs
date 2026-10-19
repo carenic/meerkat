@@ -1570,18 +1570,21 @@ impl MobToolAuthorityContext {
 
     /// Raw, atomic observation: whether the operator holds manage scope over
     /// the mob `mob_id` at `incarnation`, the incarnation of the live mob the
-    /// caller resolved. A grant for a destroyed mob never matches a later
-    /// mob under the same id.
+    /// caller resolved, never a value decoded from input. A grant for a
+    /// destroyed mob never matches a later mob under the same id, but a
+    /// decoded stale id would match a grant bound to that destroyed mob.
     pub fn can_manage_mob(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
         self.managed_mob_scope().contains(mob_id) && self.scope_bound_to(mob_id, incarnation)
     }
 
     /// Raw, atomic observation: whether the operator holds a non-empty
-    /// spawn-profile scope for the mob `mob_id` at `incarnation`. This is one
-    /// of the two pure facts the spawn-tool shell feeds to MobMachine's
-    /// `ResolveSpawnToolAdmission` (alongside [`Self::can_manage_mob`]); the
-    /// machine - not the shell - composes the disjunction into the
-    /// Allow/Deny verdict. This is NOT a pre-reduced admission conclusion.
+    /// spawn-profile scope for the mob `mob_id` at `incarnation`, the
+    /// incarnation of the live mob the caller resolved, never a value decoded
+    /// from input. This is one of the two pure facts the spawn-tool shell
+    /// feeds to MobMachine's `ResolveSpawnToolAdmission` (alongside
+    /// [`Self::can_manage_mob`]); the machine - not the shell - composes the
+    /// disjunction into the Allow/Deny verdict. This is NOT a pre-reduced
+    /// admission conclusion.
     pub fn spawn_profile_scope_present(&self, mob_id: &str, incarnation: MobIncarnationId) -> bool {
         self.scope_bound_to(mob_id, incarnation)
             && self
@@ -1599,7 +1602,9 @@ impl MobToolAuthorityContext {
     /// `manage_scope_present || profile_scope_contains` disjunction into the
     /// Allow/Deny verdict. This is a RAW per-profile set-membership fact, NOT a
     /// pre-reduced admission conclusion (it does not OR in manage scope). Like
-    /// the other scope observations it holds only at the bound `incarnation`.
+    /// the other scope observations it holds only at the bound `incarnation`:
+    /// the incarnation of the live mob the caller resolved, never a value
+    /// decoded from input.
     pub fn spawn_profile_scope_contains(
         &self,
         mob_id: &str,

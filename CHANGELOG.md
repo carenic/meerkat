@@ -144,7 +144,10 @@ them.
   Pass `handle.live_incarnation()` where `handle.incarnation()` was passed.
   The scope readers (`MobToolAuthorityContext::can_manage_mob`,
   `spawn_profile_scope_present` and `spawn_profile_scope_contains`) still
-  take a `MobIncarnationId`. The witness's constructor is public but hidden
+  take a `MobIncarnationId`: pass them the incarnation of the live mob the
+  caller resolved (`handle.incarnation()`), never a value decoded from
+  input, because a decoded stale id matches a grant bound to a destroyed mob
+  under the same id. The witness's constructor is public but hidden
   and disallowed by the workspace `clippy.toml`; a downstream workspace that
   wants the same fence adds the entry
   `meerkat_core::service::LiveMobIncarnation::witnessed` to its own
