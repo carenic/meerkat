@@ -71,6 +71,12 @@
 \*     that keep it so order optional values, which TLC evaluates only
 \*     through the generated OptionLt / OptionLe: a renderer regression
 \*     there fails this audit when TLC evaluates them.
+\*   AuditMintClearsExecutionHealth (action property): a step that mints an
+\*     incarnation (the identity's recorded generation is new or changes)
+\*     leaves the identity no entry in the seven execution-health maps, so
+\*     a new incarnation never starts from its predecessor's progress
+\*     token, last observation, progress clock and event, health class, run
+\*     state or in-flight work.
 \*   AuditPlacementAbsent and AuditRetiringRuntimeMapped (invariants): no
 \*     member is ever placed, and every Retiring runtime is the one its
 \*     identity maps to. They check the reasons in the not-covered list
@@ -112,7 +118,9 @@
 \* fence guards of
 \* RetireAtScopeCurrentRunning and requires AuditRetireAtScopeCoherent to
 \* fail, and drops the mapped guard of RetireAtScopeStaleFenceTokenRunning
-\* and requires AuditRetireAtScopeExactlyOne to fail.
+\* and requires AuditRetireAtScopeExactlyOne to fail, and keeps the
+\* predecessor's execution-health entries in RecoverRosterMemberRunning and
+\* requires AuditMintClearsExecutionHealth to fail.
 \*
 \* Not covered:
 \*   states reachable only through BeginSpawnExec* (spawn phases, spawn
@@ -489,6 +497,22 @@ AuditObservationMonotonic ==
     [][\A id \in DOMAIN member_last_observed_at_ms :
          id \in DOMAIN member_last_observed_at_ms' =>
              member_last_observed_at_ms'[id] >= member_last_observed_at_ms[id]
+      ]_vars
+
+\* A step that mints an incarnation leaves the identity no execution-health
+\* entry: either its recorded generation is unchanged, or none of the seven
+\* maps holds it after the step.
+AuditMintClearsExecutionHealth ==
+    [][\A id \in DOMAIN identity_runtime_generations' :
+         \/ /\ id \in DOMAIN identity_runtime_generations
+            /\ identity_runtime_generations'[id] = identity_runtime_generations[id]
+         \/ /\ id \notin DOMAIN member_run_open'
+            /\ id \notin DOMAIN member_in_flight_work'
+            /\ id \notin DOMAIN member_progress_tokens'
+            /\ id \notin DOMAIN member_last_observed_at_ms'
+            /\ id \notin DOMAIN member_last_progress_at_ms'
+            /\ id \notin DOMAIN member_last_progress_event'
+            /\ id \notin DOMAIN member_health_class'
       ]_vars
 
 \* No arm here places a member: the placed archive, retirement-start and

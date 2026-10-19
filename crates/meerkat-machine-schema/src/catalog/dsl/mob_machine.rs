@@ -6172,6 +6172,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.topology_epoch += 1;
                 // Phase ladder: Opened -> MembershipCommitted.
                 self.spawn_exec_phase.insert(agent_identity, SpawnExecPhase::MembershipCommitted);
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
             emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: Some(generation), session_id: bridge_session_id.get("value") }
@@ -6251,6 +6261,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.topology_epoch += 1;
                 // Phase ladder: Opened -> MembershipCommitted.
                 self.spawn_exec_phase.insert(agent_identity, SpawnExecPhase::MembershipCommitted);
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
             emit AppendLifecycleJournal {
@@ -6393,6 +6413,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.topology_epoch += 1;
                 // Phase ladder: MaterializePending -> MembershipCommitted.
                 self.spawn_exec_phase.insert(agent_identity, SpawnExecPhase::MembershipCommitted);
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
             emit CommitPlacedSpawnCarrier {
@@ -7506,6 +7536,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_revival_pending.remove(agent_identity);
                 self.member_materialization_failures.remove(agent_identity);
                 self.topology_epoch += 1;
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
         }
@@ -7619,6 +7659,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_placed_kickoff_outcome_errors.remove(agent_identity);
                 self.member_placed_kickoff_closure_kinds.remove(agent_identity);
                 self.topology_epoch += 1;
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
         }
@@ -7916,6 +7966,16 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_placed_kickoff_outcome_errors.remove(agent_identity);
                 self.member_placed_kickoff_closure_kinds.remove(agent_identity);
                 self.topology_epoch += 1;
+                // A new incarnation starts without an execution-health
+                // history: the previous incarnation's raw snapshot, progress
+                // clock, last event and health class do not carry over.
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
             }
             to Running
         }

@@ -472,6 +472,24 @@ them.
     before.
   The member lifecycle audit, which now drives every replay arm, fails on
   either gap.
+- A respawned member no longer starts from its predecessor's execution-health
+  record (`meerkat-machine-schema`, `meerkat-mob`). MobMachine kept each
+  identity's run state, in-flight work, progress token, last observation,
+  last progress time and event, and health class across incarnations, because
+  no arm removed them: until the new incarnation's session answered an
+  execution snapshot, its status reported the predecessor's in-flight work and
+  last progress time, and a first snapshot equal to the predecessor's last one
+  read as unchanged at the predecessor's progress time. Every arm that mints an
+  incarnation (spawn commit, placed and roster recovery, roster reset) now
+  clears that record, so a new incarnation's progress clock starts at its
+  first observation.
+- An idle close no longer counts a retired member's last observed work
+  (`meerkat-mob`). `close_if_idle` and the latched close after the last owner
+  releases summed the in-flight work of every identity's last execution
+  observation, retired ones included, so a member whose last status read saw
+  work in flight and that then retired kept the mob busy for its life:
+  admission never closed idle, and `MobBusy` reported runs that did not exist.
+  Only identities with a current incarnation count now. Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

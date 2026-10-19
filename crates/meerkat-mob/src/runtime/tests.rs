@@ -69925,6 +69925,72 @@ async fn test_failed_execution_snapshot_takes_run_state_from_runtime_machine() {
     handle.shutdown().await.expect("shutdown test mob");
 }
 
+/// A respawned member does not inherit its predecessor's execution health:
+/// the first status read of the new incarnation is progress at that read's
+/// time, even when the new session reports the same raw snapshot the
+/// predecessor last reported.
+#[tokio::test]
+async fn test_respawned_member_status_starts_a_fresh_progress_clock() {
+    let (handle, service) = create_test_mob(with_unique_mob_id(
+        sample_definition(),
+        "respawn-progress-clock",
+    ))
+    .await;
+    let member_id = AgentIdentity::from("respawn-progress-clock-worker");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the first incarnation");
+    // One open run whose raw snapshot never changes, so both incarnations
+    // report the same progress token.
+    let open = test_member_execution_snapshot(1, 0);
+    service.set_execution_snapshots(std::iter::repeat_n(open.clone(), 4));
+    let first = handle
+        .member_status(&member_id)
+        .await
+        .expect("status of the first incarnation")
+        .progress
+        .expect("a local member's status carries progress");
+    assert_eq!(
+        first.last_progress_event,
+        super::handle::MemberProgressEvent::ExecutionAdvanced
+    );
+
+    handle
+        .respawn(member_id.clone(), None)
+        .await
+        .expect("respawn the member");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let respawned_at_ms =
+        super::actor::member_status_wall_clock_ms().expect("member-status wall clock");
+    service.set_execution_snapshots(std::iter::repeat_n(open, 4));
+    let second = handle
+        .member_status(&member_id)
+        .await
+        .expect("status of the respawned incarnation")
+        .progress
+        .expect("a local member's status carries progress");
+    assert_eq!(
+        second.last_progress_event,
+        super::handle::MemberProgressEvent::ExecutionAdvanced,
+        "the new incarnation's first observation is progress, not its predecessor's unchanged run"
+    );
+    assert_eq!(second.health, super::handle::MemberHealthClass::Healthy);
+    assert!(
+        second.last_progress_at_ms >= respawned_at_ms,
+        "the progress clock starts at the new incarnation's first observation: {} < {}",
+        second.last_progress_at_ms,
+        respawned_at_ms
+    );
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
 /// `wait_all` over several members never refuses itself and never competes
 /// with itself for the mob's status capacity: one poller reads one member at
 /// a time, even while a member's read is slow.

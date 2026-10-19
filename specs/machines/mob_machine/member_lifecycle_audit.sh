@@ -13,7 +13,7 @@
 # fails otherwise. With the counters left out the reachable space is finite,
 # so each run explores all of it, with no step bound. It checks two runs over
 # their whole space with TLC coverage:
-# - the lifecycle run (AuditSpec) with its action property and the two
+# - the lifecycle run (AuditSpec) with its two action properties and the two
 #   invariants that check the reasons of its not-covered list;
 # - the scope run (AuditScopeSpec) with its two RetireAtScope invariants.
 # Each run must finish without an error, reach at least its floor of distinct
@@ -23,7 +23,7 @@
 # space once per reachability witness, with that witness's negation as an
 # extra invariant (a state goal) or action property (a step goal), and
 # requires TLC to report exactly that violation, so the properties are not
-# vacuous. With --mutants it then seeds six defects into a copy of the
+# vacuous. With --mutants it then seeds seven defects into a copy of the
 # generated model and requires TLC to refuse each: a progress arm without its
 # observation_monotonic guard (AuditObservationMonotonic); the same guard
 # rendered as a plain `<=` between option records, which TLC cannot evaluate
@@ -38,7 +38,9 @@
 # RetireAtScope Current arm without its runtime and fence guards
 # (AuditRetireAtScopeCoherent); and the StaleFenceToken arm without its
 # mapped guard, which then overlaps NoCurrentIncarnation
-# (AuditRetireAtScopeExactlyOne). An anchor this script
+# (AuditRetireAtScopeExactlyOne); and the roster recovery keeping the
+# predecessor's execution-health entries (AuditMintClearsExecutionHealth).
+# An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
 # INCOMPLETE.
@@ -211,7 +213,8 @@ write_cfg() {
     lifecycle)
       replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditSpec" "${cfg}"
       replace_exact_line "INVARIANTS" "PROPERTIES
-  AuditObservationMonotonic${properties}
+  AuditObservationMonotonic
+  AuditMintClearsExecutionHealth${properties}
 INVARIANTS
   AuditPlacementAbsent
   AuditRetiringRuntimeMapped${invariants}" "${cfg}"
@@ -481,6 +484,23 @@ mapped = [i for i, line in enumerate(lines)
 assert len(mapped) == 1, "expected one mapped guard in RetireAtScopeStaleFenceTokenRunning"
 del lines[mapped[0]]
 text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle mint_keeps_execution_health "Error: Action property AuditMintClearsExecutionHealth is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^RecoverRosterMemberRunning\(.*?\n\n", text, re.S | re.M)
+assert block, "RecoverRosterMemberRunning not found"
+body = block.group(0)
+for field in ("member_run_open", "member_in_flight_work", "member_progress_tokens",
+              "member_last_observed_at_ms", "member_last_progress_at_ms",
+              "member_last_progress_event", "member_health_class"):
+    clear = "    /\\ " + field + "' = MapRemove(" + field + ", agent_identity)"
+    assert body.count(clear) == 1, "expected one clear of " + field + " in RecoverRosterMemberRunning"
+    body = body.replace(clear, "    /\\ " + field + "' = " + field)
+text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY
 fi

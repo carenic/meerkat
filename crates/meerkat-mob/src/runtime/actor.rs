@@ -18396,10 +18396,14 @@ impl MobActor {
             .saturating_add(usize::from(self.pending_shutdown_teardown.is_some()))
             .saturating_add(usize::from(self.shutdown_exit.is_some()))
             .saturating_add(self.identity_reconcile_queue.len());
+        // Only a current incarnation holds work. An identity whose member
+        // retired keeps its last execution observation until its next
+        // incarnation is minted, and that observation is not work in flight.
         let member_work = state
             .member_in_flight_work
-            .values()
-            .fold(0_u64, |total, work| total.saturating_add(*work));
+            .iter()
+            .filter(|(identity, _)| state.identity_to_runtime.contains_key(*identity))
+            .fold(0_u64, |total, (_, work)| total.saturating_add(*work));
         let runs = self
             .run_tasks
             .len()

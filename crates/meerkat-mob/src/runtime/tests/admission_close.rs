@@ -133,6 +133,40 @@ async fn await_closed(handle: &MobHandle) -> MobAdmissionCloseReason {
     }
 }
 
+/// A retired member's last execution observation is not work in flight: a
+/// status read that saw an open run, then the member's retirement, leaves the
+/// mob idle, so an idle close closes.
+#[tokio::test]
+async fn idle_close_ignores_a_retired_members_last_observed_work() {
+    let (handle, service) = create_test_mob(with_unique_mob_id(
+        sample_definition(),
+        "d67-retired-observed-work",
+    ))
+    .await;
+    let member = AgentIdentity::from("d67-retired-observed-work");
+    handle
+        .spawn_spec(worker_spec("d67-retired-observed-work"))
+        .await
+        .expect("spawn worker");
+    // The status read observes an open run: one unit of in-flight work.
+    service.set_execution_snapshots(std::iter::repeat_n(test_member_execution_snapshot(1, 0), 4));
+    let progress = handle
+        .member_status(&member)
+        .await
+        .expect("member status")
+        .progress
+        .expect("a local member's status carries progress");
+    assert_eq!(progress.in_flight_work, 1);
+    service.set_execution_snapshots(std::iter::empty());
+
+    handle.retire(member).await.expect("retire worker");
+    assert_eq!(
+        handle.close_if_idle().await.expect("close if idle"),
+        CloseIfIdleOutcome::Closed,
+        "a retired member's last observed work must not keep the mob busy"
+    );
+}
+
 #[tokio::test]
 async fn idle_close_closes_admission_and_refuses_later_mutation() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
