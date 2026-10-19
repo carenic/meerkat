@@ -6812,8 +6812,6 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     assert get_args(failed_hints["observation"]) == ("turn_failed",)
     # #1883: the failure is typed by name, so a client routes on
     # `failure.status`; an unrecognized status arrives as `unknown.debug`.
-    from typing import Literal, get_origin
-
     from meerkat import WireLiveResponseFailure, WireLiveResponseFailureStatus
 
     assert failed_hints["failure"] is WireLiveResponseFailure

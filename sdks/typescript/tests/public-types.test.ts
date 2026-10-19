@@ -1645,6 +1645,7 @@ void liveObsUntyped;
 void readAudioIdentity;
 void readRejectionCode;
 void readFailedResponseId;
+void readFailureStatus;
 void readCommittedImageIdentity;
 
 // The root transcript alias is the public-safe wire union. Its variants can

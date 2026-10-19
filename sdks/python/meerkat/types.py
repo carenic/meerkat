@@ -215,6 +215,8 @@ from .generated.types import (
     WireLiveAdapterObservationError as WireLiveAdapterObservationError,
     WireLiveAdapterObservationCommandRejected as WireLiveAdapterObservationCommandRejected,
     WireLiveAdapterObservationTurnFailed as WireLiveAdapterObservationTurnFailed,
+    WireLiveResponseFailure as WireLiveResponseFailure,
+    WireLiveResponseFailureStatus as WireLiveResponseFailureStatus,
     WireLiveAdapterStatus as WireLiveAdapterStatus,
     WireLiveAdapterErrorCode as WireLiveAdapterErrorCode,
     WireLiveConfigRejectionReason as WireLiveConfigRejectionReason,
