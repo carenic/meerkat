@@ -90,6 +90,10 @@ The package exports more than the core session lifecycle. The `MeerkatClient` al
   list/get/download artifacts
 - projected event recovery: `latestEventCursor`, `listEventsSince`,
   `eventSnapshot` when host event projection is enabled
+- live-channel helpers: `liveOpen`, `liveStatus`, `liveClose`, `liveSendInput`,
+  `liveSendInputImage`, `liveSendInputVideoFrame`, `liveCommitInput`,
+  `liveWebrtcAnswer`, `liveInterrupt`, `liveTruncate`, `liveRefresh`, and
+  `parseLiveObservation`
 
 `forkSessionAt` and `forkSessionReplace` take `inheritedInstructions` in their
 options, the fork instruction policy for the instruction activations the
@@ -102,10 +106,6 @@ refused before anything is committed with `FORK_INSTRUCTION_REFUSED`, whose
 was effective in the source, and `SessionForkResult.reactivatedInstructionCount`
 counts those rows. A child runs under its source's session configuration; see
 [what a fork child inherits](/api/rpc#what-a-fork-child-inherits).
-- live-channel helpers: `liveOpen`, `liveStatus`, `liveClose`, `liveSendInput`,
-  `liveSendInputImage`, `liveSendInputVideoFrame`, `liveCommitInput`,
-  `liveWebrtcAnswer`, `liveInterrupt`, `liveTruncate`, `liveRefresh`, and
-  `parseLiveObservation`
 
 Approval calls maintain audit records only; they do not automatically gate,
 authorize, or execute an action. Records persist when the RPC persistence
