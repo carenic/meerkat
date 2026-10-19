@@ -49,10 +49,18 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(200);
 /// Cargo and nextest advertise the crate's own binary to its integration
 /// tests through the runtime environment. Resolving it there (never at compile
 /// time) keeps the test valid inside a nextest archive, where the binary lives
-/// at a different path than it did when the test was compiled.
-fn rkat_rpc_binary() -> Option<PathBuf> {
-    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc").map(PathBuf::from)?;
-    advertised.exists().then_some(advertised)
+/// at a different path than it did when the test was compiled. Both always
+/// advertise it, so a missing binary fails the test instead of skipping it.
+fn rkat_rpc_binary() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rpc")
+        .map(PathBuf::from)
+        .expect("cargo advertises CARGO_BIN_EXE_rkat-rpc to the crate's integration tests");
+    assert!(
+        advertised.exists(),
+        "CARGO_BIN_EXE_rkat-rpc names a missing binary: {}",
+        advertised.display()
+    );
+    advertised
 }
 
 struct Exit {
@@ -154,12 +162,7 @@ fn run_rkat_rpc(binary: &Path, project: &Path, state_root: &Path, user_root: &Pa
 
 #[test]
 fn head_config_with_agent_provider_params_refuses_rkat_rpc_startup() {
-    let Some(binary) = rkat_rpc_binary() else {
-        eprintln!(
-            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
-        );
-        return;
-    };
+    let binary = rkat_rpc_binary();
 
     let temp = TempDir::new().expect("temp dir");
     let project = temp.path().join("project");

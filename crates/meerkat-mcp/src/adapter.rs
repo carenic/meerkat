@@ -1919,7 +1919,7 @@ impl meerkat_core::McpOperationObserver for McpRouterAdapter {
 #[path = "shutdown_observer_tests.rs"]
 mod shutdown_observer_tests;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "workspace-tests"))]
 #[path = "stdio_diagnostics_tests.rs"]
 mod stdio_diagnostics_tests;
 
@@ -1935,6 +1935,7 @@ mod tests {
     use crate::connection::McpConnection;
     use meerkat_core::ExternalToolSurfacePendingOp;
     use meerkat_core::mcp_attachment::McpAttachmentRefusal;
+    #[cfg(feature = "workspace-tests")]
     use meerkat_runtime::RuntimeExternalToolSurfaceHandle;
     use std::collections::HashMap;
     use std::path::Path;
@@ -1953,10 +1954,12 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_surface_handle() -> Arc<dyn ExternalToolSurfaceHandle> {
         Arc::new(RuntimeExternalToolSurfaceHandle::ephemeral())
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_surface_router() -> McpRouter {
         McpRouter::new_with_surface_handle_and_stdio_profile(
             generated_surface_handle(),
@@ -2180,6 +2183,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn governed_control_is_staged_with_its_payload_and_asked_only_at_physical_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -2203,6 +2207,7 @@ mod tests {
         assert!(!marker.exists(), "a refused entry never spawns the server");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_allowed_entry_is_asked_exactly_once() {
         let adapter = McpRouterAdapter::new(generated_surface_router());
@@ -2220,6 +2225,7 @@ mod tests {
         assert_eq!(control.apply_checks.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_same_name_replacement_never_applies_under_the_earlier_control() {
         let dir = tempfile::tempdir().unwrap();
@@ -2248,6 +2254,7 @@ mod tests {
         assert!(!marker_a.exists() && !marker_b.exists());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_governed_name_never_changes_without_a_control() {
         let adapter = McpRouterAdapter::new(generated_surface_router());
@@ -2271,6 +2278,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn governed_add_refuses_a_control_for_another_descriptor() {
         let adapter = McpRouterAdapter::new(generated_surface_router());
@@ -2290,6 +2298,7 @@ mod tests {
         assert_eq!(control.apply_checks.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_staged_removal_keeps_a_withdrawn_governed_add_governed_until_its_boundary() {
         let mut router = generated_surface_router();
@@ -2435,6 +2444,7 @@ mod tests {
         go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl GatedSurface {
         fn new(
             gate_on: fn(&ExternalToolSurfaceInput) -> bool,
@@ -2563,6 +2573,7 @@ mod tests {
     /// A bind racing an owned router's shutdown waits for the shutdown's
     /// claim: the shutdown reaches only the router's own private surface,
     /// never the registration surface the bind publishes.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bind_racing_an_owned_shutdown_waits_for_its_claim() {
         let (private, entered, go) =
@@ -2619,6 +2630,7 @@ mod tests {
     /// A bind racing a borrowed router's lineage release waits for the
     /// release's claim: the release consumes exactly the lineages the router
     /// held on the surface it claimed, and the rebound surface is untouched.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bind_racing_a_borrowed_release_waits_for_its_claim() {
         let (claimed, entered, go) =
@@ -2688,6 +2700,7 @@ mod tests {
     /// A bind that began re-deriving its pre-bind facts before the router
     /// ended its hold publishes nothing afterwards and releases what it
     /// staged on the registration surface.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bind_finishing_after_the_router_ended_publishes_nothing() {
         let adapter = Arc::new(McpRouterAdapter::new(
@@ -2732,6 +2745,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_rejected_removal_boundary_keeps_the_governed_name() {
         let handle = Arc::new(StaleRemovalBoundary {
@@ -2774,6 +2788,7 @@ mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn an_active_governed_server_keeps_its_requirement_until_its_removal_finalizes() {
         let server_path = mcp_test_server::fixture_binary();
@@ -2833,6 +2848,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn the_immediate_add_path_refuses_a_governed_name() {
         let mut router = generated_surface_router();
@@ -2848,6 +2864,7 @@ mod tests {
         router.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_resolved_mcp_plan_carries_its_registration_and_raw_operation() {
         let server_path = mcp_test_server::fixture_binary();
@@ -2942,6 +2959,7 @@ mod tests {
     /// declaration) a plan resolved before the change is no longer the live
     /// router's and is not dispatched, while a fresh plan states the new
     /// binding's account. Nothing else records the account.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_changed_binding_changes_the_operations_account_and_retires_old_plans() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3112,6 +3130,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn default_router_fails_closed_until_external_surface_handle_is_bound() {
         let mut router =
@@ -3160,6 +3179,7 @@ mod tests {
     /// failed with "surface is poisoned … refusing to replay handwritten
     /// snapshot". Pre-bind facts must instead re-derive onto the session
     /// authority and calls must keep working after the bind.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn adapter_late_bind_rederives_pre_bind_facts_instead_of_poisoning() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3223,6 +3243,7 @@ mod tests {
             .expect("post-bind stage_add must not be poisoned");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn adapter_bind_external_surface_handle_failure_poisons_existing_owner() {
         let mut router = generated_surface_router();
@@ -3261,6 +3282,7 @@ mod tests {
         assert_eq!(snapshot.entries[0].surface_id, "planner");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn adapter_bind_external_surface_handle_allows_post_bind_pending_state() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3364,6 +3386,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn router_stage_add_fires_connect_pending_on_bound_lifecycle_handle() {
         let mut router = generated_surface_router();
@@ -3393,6 +3416,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn adapter_bind_seeds_pre_bind_pending_servers_into_dsl() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3424,6 +3448,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn filtered_adapter_forwards_mcp_lifecycle_handle_to_retained_router() {
         let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
@@ -3454,6 +3479,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn router_lifecycle_handle_none_is_noop() {
         // Router without a bound MCP lifecycle mirror: external surface
@@ -3519,6 +3545,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn wait_until_ready_returns_notices_when_server_connects() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3556,6 +3583,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn wait_until_ready_pending_at_deadline_is_typed_mcp_not_ready() {
         // K14: a server still connecting at the deadline must surface as the
@@ -3597,6 +3625,7 @@ mod tests {
     /// stopping test runtime then skipped the deferred kill entirely and left
     /// the child holding the test's stderr. After the join, the kill was still
     /// fire-and-forget, so the child outlived shutdown.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_kills_a_stdio_server_still_connecting() {
@@ -3627,6 +3656,7 @@ mod tests {
     /// so the real server is a grandchild. Shutdown terminates the server's
     /// whole process group, so the grandchild cannot be orphaned.
     /// (Fails-old: only the direct child was killed.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_kills_a_wrapped_stdio_servers_whole_process_group() {
@@ -3665,6 +3695,7 @@ mod tests {
     /// terminated with its whole process group once its close grace ends, and
     /// has exited when shutdown returns. (Fails-old: rmcp gave the wrapper up
     /// to 3 s after EOF from a detached task, then killed only the wrapper.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_kills_an_established_wrapped_stdio_servers_process_group() {
@@ -3701,6 +3732,7 @@ mod tests {
     /// cut that work short, and a later shutdown waits for the same work
     /// before returning. (Fails-old: the later call found no router and
     /// returned while the servers were still in their close grace.)
+    #[cfg(feature = "workspace-tests")]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_repeated_shutdown_joins_the_dropped_one() {
@@ -3741,6 +3773,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stage_reload_all_returns_typed_report_and_fails_closed_on_shutdown() {
         let server_path = mcp_test_server::fixture_binary();
@@ -3832,6 +3865,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_after_shutdown_is_router_closed_and_reinstalls_nothing() {
         let (router, target, resolver, _server) =
@@ -3849,6 +3883,7 @@ mod tests {
         assert!(snapshot.servers_awaiting_authorization().await.is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_staged_before_shutdown_is_discarded_by_shutdown() {
         let (router, target, resolver, _server) =
@@ -3870,6 +3905,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stage_add_rejected_lifecycle_mirror_propagates_and_leaves_shell_unchanged() {
         // K14: a rejected lifecycle mirror apply is a typed `McpError::
@@ -3916,6 +3952,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn bind_seed_rejection_poisons_lifecycle_mirror_fail_closed() {
         // K14: a rejected pre-bind seed apply poisons the lifecycle mirror —
@@ -3963,6 +4000,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn connected_adapter_reports_exact_catalog_support_with_deferred_entries() {
         let server_path = mcp_test_server::fixture_binary();
@@ -4007,6 +4045,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn mcp_reload_rebuild_requires_fresh_live_resolution() {
         let server_path = mcp_test_server::fixture_binary();
@@ -4103,6 +4142,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn lifecycle_action_reload_invalidates_plan_resolved_while_connection_was_pending() {
         let server_path = mcp_test_server::fixture_binary();
@@ -4202,6 +4242,7 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn adapter_fails_closed_instead_of_authorizing_cached_contract_under_router_contention() {
         let adapter = McpRouterAdapter::new(generated_surface_router());
@@ -4267,6 +4308,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_tool_surface_snapshot_reflects_staged_surface_state() {
         let mut router = generated_surface_router();
@@ -4355,6 +4397,7 @@ mod tests {
         /// Usable only once the attempt's own connection is installed, and
         /// only for an operation its published routes serve; the lifecycle
         /// notice of that install is still delivered to the normal poll.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn an_installed_attempt_is_usable_only_for_its_routed_operation() {
             let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
@@ -4393,6 +4436,7 @@ mod tests {
 
         /// A connection that never completes the handshake is the attempt's
         /// own accepted failure, never usable.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_failed_attempt_is_failed_and_never_usable() {
             let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
@@ -4408,6 +4452,7 @@ mod tests {
 
         /// An attempt replaced before its boundary is superseded, and stays
         /// so when the replacement's same-name connection becomes usable.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn an_attempt_replaced_before_its_boundary_is_superseded() {
             let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
@@ -4431,6 +4476,7 @@ mod tests {
         /// The wait deadline bounds router lock acquisition too: a router
         /// held elsewhere answers Pending at the deadline instead of waiting
         /// on the lock.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_wait_deadline_bounds_router_lock_acquisition() {
             let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
@@ -4461,6 +4507,7 @@ mod tests {
         /// While a newer same-name attempt is still connecting, the older
         /// current connection serves the operation; it does not satisfy the
         /// newer attempt, which stays pending.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_current_same_name_connection_does_not_satisfy_a_newer_attempt() {
             let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));

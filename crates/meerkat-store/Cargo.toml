@@ -11,6 +11,13 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # checks the packaged corpus copy against its owner in meerkat-runtime, which the package cannot reach
+    "tests/released_0810_corpus_copy.rs",
+]
 
 [dependencies]
 meerkat-core = { workspace = true }

@@ -47,7 +47,7 @@ pub mod originals;
 pub mod policy;
 pub mod review;
 
-#[cfg(all(test, feature = "mcp"))]
+#[cfg(all(test, feature = "mcp", feature = "workspace-tests"))]
 mod checked_route_tests;
 
 use std::path::{Path, PathBuf};

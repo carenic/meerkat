@@ -4553,6 +4553,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
 
+    #[cfg(feature = "workspace-tests")]
     fn test_auth_lease() -> GeneratedAuthLeaseHandle {
         let handle = Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new());
         meerkat_runtime::protocol_auth_lease_lifecycle_publication::generated_auth_lease_handle(
@@ -4760,6 +4761,7 @@ mod tests {
     /// A realm host resolves only its realm's credential: one stored in
     /// another realm, or in the realm-less pre-realm slot, is not used (the
     /// realm needs its own login); its logout leaves both of them in place.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_realm_host_uses_and_clears_only_its_own_mcp_credential() {
         let (base, _state) = spawn_oauth_fixture().await;
@@ -4828,6 +4830,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_http_releases_only_lifecycle_guard() {
         let (base, state) = spawn_oauth_fixture().await;
@@ -4884,6 +4887,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_refresh_save_refusal_survives_successful_rollback() {
         use crate::auth_store::TokenStoreError;
@@ -5069,6 +5073,7 @@ mod tests {
 
     /// A refused read while a fresh owner rehydrates the stored credential
     /// keeps the typed store cause through the real admission.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_refused_rehydration_read_keeps_its_typed_cause() {
         use meerkat_core::auth::TokenStoreRefusal;
@@ -5117,6 +5122,7 @@ mod tests {
     /// this owner began instead of leaving AuthMachine in `Refreshing`. The
     /// stored credential and its exact bytes survive, so a later use through
     /// the same authority refreshes again once the store answers.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_refused_post_exchange_reread_closes_the_begun_refresh() {
         use meerkat_core::auth::TokenStoreRefusal;
@@ -5222,6 +5228,7 @@ mod tests {
         assert_eq!(refresh_exchanges(), 2, "exactly one additional exchange");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_stale_success_and_failure_preserve_replacement() {
         let mut observations = Vec::new();
@@ -5421,6 +5428,7 @@ mod tests {
         published
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_newer_legacy_marker_cannot_replace_reauth_or_absent_owner() {
         for absent in [false, true] {
@@ -5514,6 +5522,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_matching_legacy_marker_normalizes_and_refreshes() {
         for closed_in_memory in [false, true] {
@@ -5591,6 +5600,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ce_mcp_nonlegacy_newer_and_cold_restore_remain_supported() {
         for absent in [false, true] {
@@ -5685,6 +5695,7 @@ mod tests {
     /// typed and before any request reaches the endpoint; the same credential
     /// refreshes through the profile's own client once its endpoint is
     /// deliberately admitted.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_required_egress_profile_refuses_an_unadmitted_refresh_endpoint_unsent() {
         let (base, state) = spawn_oauth_fixture().await;
@@ -5739,6 +5750,7 @@ mod tests {
 
     /// Discovery is admitted URL by URL: a protected resource outside the
     /// profile is refused typed before any well-known request is sent.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_required_egress_profile_refuses_discovery_outside_it_before_any_arrival() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5802,6 +5814,7 @@ mod tests {
     /// refresh is refused typed through the coordinator, nothing reaches the
     /// endpoint, and the credential is never invalidated; deliberate local
     /// authority then refreshes the same credential.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_resolver_refused_refresh_is_typed_and_never_invalidates_the_credential() {
         let (base, state) = spawn_oauth_fixture().await;

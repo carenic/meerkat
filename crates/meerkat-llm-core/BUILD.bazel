@@ -49,7 +49,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-llm-core"),
     crate_name = "meerkat_llm_core",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "workspace-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -79,7 +84,12 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-llm-core"),
     crate_name = "meerkat_llm_core",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = select({
+        "//tools/bazel:release_build": [],
+        "//conditions:default": [
+            "workspace-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -117,7 +127,9 @@ rust_test(
     ),
     crate_name = "meerkat_llm_core",
     crate_root = "src/lib.rs",
-    crate_features = [],
+    crate_features = [
+        "workspace-tests",
+    ],
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -150,6 +162,7 @@ rust_test(
     deps = [
         "//crates/meerkat-contracts:meerkat_contracts",
         "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
         "//crates/meerkat-models:meerkat_models",
     ] + all_crate_deps(
         package_name = "crates/meerkat-llm-core",

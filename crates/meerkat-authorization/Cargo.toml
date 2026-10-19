@@ -11,9 +11,28 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # needs meerkat and meerkat-runtime, which depend on this crate
+    "tests/native_cost.rs",
+    # support modules of tests/native_cost.rs
+    "tests/native_cost",
+    # needs meerkat and meerkat-runtime, which depend on this crate
+    "tests/native_governed_loop.rs",
+    # support modules of tests/native_governed_loop.rs
+    "tests/native_governed_loop",
+]
 
 [features]
 integration-real-tests = []
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [dependencies]
 indexmap.workspace = true
@@ -27,6 +46,9 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-authorization = { path = ".", features = ["workspace-tests"] }
 axum.workspace = true
 meerkat-core = { workspace = true, features = ["test-support"] }
 meerkat-anthropic = { workspace = true, default-features = false }

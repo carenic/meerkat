@@ -25,18 +25,19 @@ const pathSpecific = (paths) =>
     .filter((row) => row.reads.length > 0);
 const has = (rows, pkg, target) => rows.some((row) => row.package === pkg && row.target === target);
 
-// A docs-only change selects the rkat doc-example test, xtask's docs readers
-// and the machine-schema docs alignment test.
+// A docs-only change selects the rkat doc-example fixture test, xtask's docs
+// readers and the machine-schema docs alignment test.
 {
   const packages = readerPackagesFor(["docs/guides/skills.mdx"], inventory);
   for (const name of ["rkat", "xtask", "meerkat-machine-schema"]) {
     assert.ok(packages.includes(name), `a docs-only change selects ${name}: ${packages.join(" ")}`);
   }
   const rows = pathSpecific(["docs/guides/skills.mdx"]);
-  const rkat = rows.find((row) => row.package === "rkat" && row.target === "bin:rkat");
-  assert.ok(rkat, "the rkat binary's doc-example test reads docs/");
-  assert.deepEqual(rkat.tests, ["fenced_rkat_doc_examples_parse_against_clap"], "only the doc-example test, not the whole binary suite");
+  const rkat = rows.find((row) => row.package === "rkat" && row.target === "test:doc_examples_fixture");
+  assert.ok(rkat, "the rkat doc-example fixture test reads docs/ and fails when its fixture drifts");
+  assert.equal(rkat.tests, null, "the fixture test target runs whole");
   assert.equal(rkat.scope, "target");
+  assert.ok(!has(rows, "rkat", "bin:rkat"), "the rkat binary parses its packaged fixture, not docs/");
   assert.ok(has(rows, "meerkat-machine-schema", "test:docs_machine_authority_alignment"));
   assert.ok(has(rows, "xtask", "test:buildbuddy_static_lanes"));
   assert.ok(!has(rows, "rkat", "test:help_mobpack_contract"), "help_mobpack_contract reads seven named docs, not this one");
@@ -46,8 +47,8 @@ const has = (rows, pkg, target) => rows.some((row) => row.package === pkg && row
 {
   const rows = pathSpecific(["docs/guides/mobpack.mdx"]);
   assert.ok(has(rows, "rkat", "test:help_mobpack_contract"));
-  // The doc-example walk and the static lane walk read it too.
-  assert.ok(has(rows, "rkat", "bin:rkat"));
+  // The doc-example fixture walk and the static lane walk read it too.
+  assert.ok(has(rows, "rkat", "test:doc_examples_fixture"));
 }
 
 // An sdks/ change selects its readers: xtask's version-parity and
@@ -96,12 +97,12 @@ const has = (rows, pkg, target) => rows.some((row) => row.package === pkg && row
 {
   const deleted = pathSpecific(["docs/docs.json"]);
   assert.ok(has(deleted, "rkat", "test:help_mobpack_contract"), "deleting docs/docs.json selects its include_str! reader");
-  const renamed = pathSpecific(["tests/fixtures/hooks/run_override.json", "tests/fixtures/hooks/run_override_renamed.json"]);
-  for (const [pkg, target] of [["rkat", "bin:rkat"], ["meerkat-core", "test:hooks_contracts"], ["meerkat-mcp-server", "lib"], ["meerkat-rest", "lib"]]) {
-    assert.ok(has(renamed, pkg, target), `renaming the hooks fixture away selects ${pkg} ${target}`);
+  const renamed = pathSpecific(["tests/fixtures/live_smoke/support.rs", "tests/fixtures/live_smoke/support_renamed.rs"]);
+  for (const [pkg, target] of [["meerkat-mcp-server", "test:live_mcp_matrix"], ["meerkat-rest", "test:live_rest_matrix"], ["meerkat-rpc", "test:live_rpc_regression"], ["meerkat-rpc", "test:live_smoke_rpc"]]) {
+    assert.ok(has(renamed, pkg, target), `renaming the live smoke support module away selects ${pkg} ${target}`);
   }
-  const row = renamed.find((candidate) => candidate.package === "meerkat-core");
-  assert.deepEqual(row.paths, ["tests/fixtures/hooks/run_override.json"], "the selecting path is the old side");
+  const row = renamed.find((candidate) => candidate.package === "meerkat-rest");
+  assert.deepEqual(row.paths, ["tests/fixtures/live_smoke/support.rs"], "the selecting path is the old side");
 }
 
 // Cross-crate inputs select the reader, not only the owning crate.

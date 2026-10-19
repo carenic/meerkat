@@ -264,6 +264,25 @@ function isPublishable(pkg) {
   }
 }
 
+// Workspace-only unit tests. A published crate whose unit tests need a
+// crate its package cannot depend on (a cyclic or unpublished dev-dependency)
+// gates those test modules on its own `workspace-tests` feature, which only a
+// path-only self dev-dependency enables: `cargo package` strips that edge, so
+// the published package compiles them out, while the workspace and this graph
+// (whose union follows every dev edge) compile them in. Fail generation when a
+// crate declares the feature but the union does not carry it: its Bazel test
+// targets would otherwise drop those tests without a word.
+const WORKSPACE_TESTS_FEATURE = "workspace-tests";
+for (const pkg of localPackages.values()) {
+  if (!Object.hasOwn(pkg.features ?? {}, WORKSPACE_TESTS_FEATURE)) continue;
+  if (!activeFeatures.get(pkg.id).has(WORKSPACE_TESTS_FEATURE)) {
+    throw new Error(
+      `${pkg.name} declares ${WORKSPACE_TESTS_FEATURE}, but no path-only self dev-dependency enables it; `
+        + "its workspace-only tests would compile out of every Bazel test target",
+    );
+  }
+}
+
 // Production feature union: the same closure without the non-shipping
 // features, so nothing they forward is enabled unless an ordinary feature
 // enables it too. Production rust_library and rust_binary targets build with

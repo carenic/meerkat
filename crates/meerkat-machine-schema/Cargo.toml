@@ -11,6 +11,13 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # pins the repository's docs/reference tables against the registry
+    "tests/docs_machine_authority_alignment.rs",
+]
 
 [dependencies]
 indexmap = { version = "2", default-features = false, features = ["std"] }

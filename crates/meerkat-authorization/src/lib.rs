@@ -7,6 +7,15 @@
 //! operating-system confinement. The only persistence is the grant owner's
 //! optional restart custody; prepared decisions are never persisted.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 mod audit;
 pub mod clock;
 pub mod grant_policy;

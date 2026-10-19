@@ -5,6 +5,15 @@
 //! own the canonical config-store, config-runtime, path-layout, and maintenance
 //! fence primitives, so this crate is not a blanket no-I/O layer.
 
+// Without `workspace-tests` (the published package: `cargo package` strips
+// the self dev-dependency that enables it) the unit tests that need the
+// workspace compile out, and the test helpers only they use go unused. The
+// workspace build turns the feature on and keeps both lints.
+#![cfg_attr(
+    all(test, not(feature = "workspace-tests")),
+    allow(dead_code, unused_imports)
+)]
+
 // All WASM Tokio users share these host adapters. Time and cooperative yields
 // own cancellable JavaScript resources here; spawning retains the upstream
 // scheduler but boxes every future it hands it (`wasm_task`). Native code

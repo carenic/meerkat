@@ -1019,6 +1019,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox_with_runtime() -> (
         Inbox,
         crate::InboxSender,
@@ -1037,6 +1038,7 @@ mod tests {
         (inbox, sender, Arc::new(finalizer))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_runtime_finalization(
         inbox: Arc<Inbox>,
         finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
@@ -1205,6 +1207,7 @@ mod tests {
     /// peer registered ONLY in namespace B must NOT be delivered — the
     /// configured `inproc_namespace` is the delivery authority, not a
     /// cross-namespace pubkey lookup.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn inproc_send_does_not_cross_namespace() {
         use crate::classify::test_support;
@@ -1287,6 +1290,7 @@ mod tests {
     ///
     /// One bound, one meaning across both transports: the stream lane already
     /// caps its wait on the receiver at `ack_timeout_secs`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn inproc_send_bounds_the_park_with_ack_timeout_and_reports_unconfirmed() {
         use crate::classify::test_support;
@@ -1376,6 +1380,7 @@ mod tests {
     /// in-namespace inbox (and never on the foreign one). The former
     /// precheck-then-re-resolve shape failed closed on this ambiguity and
     /// opened a re-registration window between check and delivery.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn inproc_send_delivers_to_own_namespace_when_pubkey_live_elsewhere_too() {
         use crate::classify::test_support;
@@ -1615,6 +1620,7 @@ mod tests {
     /// Ask 5 gate: the router is the single outbound taint-stamping choke
     /// point. The runtime-level declaration is inherited when the per-send
     /// override is absent; `Undeclared` strips it; `Declare(taint)` sets it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_with_id_stamps_outbound_content_taint_declaration() {
         use crate::types::MessageKind;

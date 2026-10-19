@@ -1466,6 +1466,7 @@ mod tests {
         crate::tool_scope::generated_test_tool_visibility_owner_from(owner)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn explicit_test_visibility_owner() -> GeneratedToolVisibilityOwner {
         generated_visibility_owner_from(Arc::new(
             crate::tool_scope::GeneratedTestToolVisibilityOwner::new(),
@@ -1559,11 +1560,13 @@ mod tests {
         serde_json::from_value(raw).expect("session should deserialize with raw metadata")
     }
 
+    #[cfg(feature = "workspace-tests")]
     struct RestoreFailingVisibilityOwner {
         fallback_state: crate::tool_scope::GeneratedTestToolVisibilityOwner,
         replace_calls: AtomicUsize,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RestoreFailingVisibilityOwner {
         fn new() -> Self {
             Self {
@@ -1577,6 +1580,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl ToolVisibilityOwner for RestoreFailingVisibilityOwner {
         fn visibility_state(
             &self,
@@ -1742,6 +1746,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn builder_fails_closed_when_canonical_visibility_restore_fails() {
         let client = Arc::new(MockClient);
@@ -2024,6 +2029,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_restore_failure_returns_error_and_keeps_owner_state() {
         let client = Arc::new(MockClient);
@@ -2077,6 +2083,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_rejects_malformed_canonical_visibility_state() {
         let client = Arc::new(MockClient);
@@ -2136,6 +2143,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_ignores_legacy_local_visibility_metadata() {
         let client = Arc::new(MockClient);
@@ -2163,6 +2171,7 @@ mod tests {
         assert_eq!(state.staged_filter, ToolFilter::All);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_rejects_legacy_inherited_visibility_metadata() {
         let client = Arc::new(MockClient);
@@ -2195,6 +2204,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_rejects_name_only_canonical_inherited_visibility_state() {
         let client = Arc::new(MockClient);
@@ -2232,6 +2242,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_restores_canonical_inherited_visibility_state() {
         let client = Arc::new(MockClient);
@@ -2274,6 +2285,7 @@ mod tests {
 
     /// A ceiling handed to a resumed session narrows its durable inherited
     /// ceiling: a broader new parent snapshot never replaces it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn resumed_builder_narrows_the_durable_inherited_ceiling_with_a_handoff() {
         let client = Arc::new(MockClient);
@@ -2331,6 +2343,7 @@ mod tests {
 
     /// A conflicting handoff cannot reinterpret a retained identity or
     /// discard unrelated inherited tools that are still permitted.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn resumed_builder_keeps_a_retained_witness_against_a_conflicting_handoff() {
         for include_sibling in [false, true] {
@@ -2423,6 +2436,7 @@ mod tests {
     /// first stays hidden at every later boundary while the rest of the
     /// ceiling stays usable, and the witnessed tool lists once a projection
     /// from its own source arrives.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_pending_ceiling_name_stays_hidden_from_a_same_name_tool_of_another_source() {
         let client = Arc::new(MockClient);
@@ -2505,6 +2519,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_builder_does_not_seed_execution_kind() {
         let client = Arc::new(MockClient);
@@ -2524,6 +2539,7 @@ mod tests {
         assert!(agent.runtime_execution_kind_required);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_run_rejects_missing_execution_kind() {
         let client = Arc::new(MockClient);
@@ -2550,6 +2566,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_run_pending_rejects_missing_execution_kind() {
         let client = Arc::new(MockClient);
@@ -2580,6 +2597,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_run_consumes_execution_kind_stamp() {
         let client = Arc::new(MockClient);
@@ -2612,6 +2630,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dropped_run_cancel_observes_generated_terminal_without_erasing_identity() {
         use crate::TurnStateHandle;
@@ -2669,6 +2688,7 @@ mod tests {
         assert_ne!(completed.terminal_run_id, terminal.terminal_run_id);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stamped_dropped_run_cancel_observes_generated_terminal_and_returns_run_failed() {
         use crate::TurnStateHandle;
@@ -2742,6 +2762,7 @@ mod tests {
         assert!(error.to_string().contains("runtime_execution_kind not set"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dropped_run_cancel_without_started_run_publishes_no_terminal() {
         let handle = Arc::new(crate::agent::test_turn_state_handle::TestTurnStateHandle::new());
@@ -2757,6 +2778,7 @@ mod tests {
         assert!(agent.cancel_dropped_run().is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_test_builder_without_turn_authority_keeps_best_effort_cancel_contract() {
         let mut agent = AgentBuilder::new()
@@ -2789,6 +2811,7 @@ mod tests {
         assert!(error.to_string().contains("runtime_execution_kind not set"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_backed_cancel_consumes_execution_kind_stamp() {
         let client = Arc::new(MockClient);
@@ -2818,6 +2841,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_builder_event_tap_receives_turn_started_without_primary_event_tx() {
         let client = Arc::new(MockClient);

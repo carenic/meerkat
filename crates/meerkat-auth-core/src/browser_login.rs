@@ -535,7 +535,7 @@ async fn rollback_commit(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;

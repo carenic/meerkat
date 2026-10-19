@@ -11,10 +11,37 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# This test pins the CLI's mobpack help against the repository's docs/, which
-# no crate packages, so it runs in the repository only and stays out of the
-# published package (whose other tests build standalone).
-exclude = ["tests/help_mobpack_contract.rs"]
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # pins the CLI's mobpack help against the repository's docs/, which no crate packages
+    "tests/help_mobpack_contract.rs",
+    # extracts the rkat examples from the repository's docs/, which no crate packages; pins tests/fixtures/doc_examples.txt to them
+    "tests/doc_examples_fixture.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/cli_mobpack_live_smoke.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_smoke_cli.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_cli_export_atif.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_cli_init.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_cli_mcp_pending.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_cli_realm_mcp.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_cli_resume.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_mob_cli_verbs.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_mob_host_daemon.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_mob_run_custody.rs",
+    # workspace feature-graph gate over the repository's manifests
+    "tests/slim_feature_graph.rs",
+]
 
 [[bin]]
 name = "rkat"
@@ -171,6 +198,8 @@ skills = ["meerkat/skills"]
 integration-real-tests = []
 
 [dev-dependencies]
+# The hook run-override fixture (meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON).
+meerkat-core = { workspace = true, features = ["test-support"] }
 # OAuth-protected MCP fixture for the MCP OAuth canaries (test-only).
 meerkat = { workspace = true, features = ["test-mcp-oauth-fixtures"] }
 meerkat-mob = { workspace = true, features = ["test-support"] }

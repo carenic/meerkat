@@ -11,6 +11,19 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_continue_tmp.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_rest_matrix.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_rest_regression.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/system_rest_resume.rs",
+]
 
 [[bin]]
 name = "rkat-rest"
@@ -79,6 +92,8 @@ workgraph = ["meerkat/workgraph"]
 integration-real-tests = []
 
 [dev-dependencies]
+# The hook run-override fixture (meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON).
+meerkat-core = { workspace = true, features = ["test-support"] }
 # OAuth-protected MCP fixture for the MCP OAuth canaries (test-only).
 meerkat = { workspace = true, features = ["test-mcp-oauth-fixtures"] }
 hyper = { workspace = true }
