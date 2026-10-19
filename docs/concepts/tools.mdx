@@ -205,6 +205,8 @@ MCP servers can be added, removed, or reloaded on a running session via JSON-RPC
 
 All mutations are staged and applied at the next turn boundary. Set `persisted: true` to write the change to disk config so it survives restart. See the [RPC reference](/api/rpc#mcp-methods) for full parameter details.
 
+Since 0.9.4 the `tool_config_changed` event that reports the outcome carries `settled`, which says whether the change is a settled lifecycle fact rather than a pending or draining step; it never said whether anything was written to config. Events and notices stored by 0.9.3 and earlier carry `persisted` in its place, so a reader should accept either key. The `persisted` field of `mcp/add`, `mcp/remove` and `mcp/reload` keeps its name and meaning.
+
 ### Surface availability
 
 | Surface | Live MCP | External tool filter |
