@@ -17,6 +17,9 @@
 #   that stops answering mid-job degrades a compile to plain rustc;
 # - a server that does not start leaves the lane without sccache too, and the
 #   stats lines the start step prints never fail it;
+# - the start step takes the client's read/write mode from the backend
+#   selection, which hands it over for the GCS backend, so the two cannot
+#   disagree about which runs restart a server that came up ReadOnly;
 # - every later step of the action runs only once sccache is installed.
 set -euo pipefail
 
@@ -47,6 +50,12 @@ if "Start the sccache server" not in names:
     sys.exit(f"{contract.SCCACHE_ACTION} has no `Start the sccache server` step (steps: {names})")
 start = steps[names.index("Start the sccache server")]
 (out / "start.sh").write_text(start.raw_run, encoding="utf-8")
+(out / "start-rw-mode").write_text(start.env.get("RW_MODE", "") + "\n", encoding="utf-8")
+if "Select the sccache backend" not in names:
+    sys.exit(f"{contract.SCCACHE_ACTION} has no `Select the sccache backend` step (steps: {names})")
+select = steps[names.index("Select the sccache backend")]
+(out / "select.sh").write_text(select.raw_run, encoding="utf-8")
+(out / "select-id").write_text(select.fields.get("id", "") + "\n", encoding="utf-8")
 with (out / "later-steps.tsv").open("w", encoding="utf-8") as handle:
     for step in steps[at + 1 :]:
         handle.write(f"{step.name}\t{step.condition or ''}\n")
@@ -344,6 +353,36 @@ check "start other-stats: stats in another format fail nothing" exit_is 0
 check "start other-stats: no warning" no_warning
 check "start other-stats: RUSTC_WRAPPER is left to the job" lacks_prefix github-env "RUSTC_WRAPPER="
 
+# The backend selection, run as written: with the GCS identity it sets the
+# client to the run's mode and hands that mode to the start step; without
+# it, the local cache, and no mode for either.
+run_select() {
+  local label="$1" outcome="$2" rw_mode="$3"
+  case_dir="$TEST_ROOT/select-$label"
+  mkdir -p "$case_dir"
+  : > "$case_dir/github-env"
+  : > "$case_dir/github-output"
+  echo '{}' > "$case_dir/credentials.json"
+  local rc=0
+  env -i PATH="$PATH" GITHUB_ENV="$case_dir/github-env" GITHUB_OUTPUT="$case_dir/github-output" \
+    RUNNER_TEMP="$case_dir" BUCKET=bucket KEY_PREFIX=sccache/test GCP_OUTCOME="$outcome" \
+    CREDENTIALS_FILE="$case_dir/credentials.json" RW_MODE="$rw_mode" \
+    bash --noprofile --norc -eo pipefail "$TEST_ROOT/select.sh" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr" || rc=$?
+  echo "$rc" > "$case_dir/rc"
+}
+
+for mode in READ_WRITE READ_ONLY; do
+  run_select "gcs-$mode" success "$mode"
+  check "select gcs $mode: the step succeeds" exit_is 0
+  check "select gcs $mode: the client gets the run's mode" has_line github-env "SCCACHE_GCS_RW_MODE=$mode"
+  check "select gcs $mode: the start step gets the same mode" has_line github-output "rw_mode=$mode"
+done
+run_select local failure READ_WRITE
+check "select local: the step succeeds" exit_is 0
+check "select local: the client gets no GCS mode" lacks_prefix github-env "SCCACHE_GCS_RW_MODE="
+check "select local: the start step gets no mode" lacks_prefix github-output "rw_mode="
+
 # The token is the job's own, and every later step (authentication, backend
 # selection, server start) runs only once sccache is installed.
 case_dir="$TEST_ROOT/structure"
@@ -355,6 +394,10 @@ install_step_has_id() { [[ "$(cat "$TEST_ROOT/install-id")" == "install" ]]; }
 check "the install step has id install" install_step_has_id
 token_is_the_jobs() { [[ "$(cat "$TEST_ROOT/install-token")" == '${{ github.token }}' ]]; }
 check "the install step's GH_TOKEN is the job's own token" token_is_the_jobs
+select_step_has_id() { [[ "$(cat "$TEST_ROOT/select-id")" == "select" ]]; }
+check "the backend selection step has id select" select_step_has_id
+start_takes_select_mode() { [[ "$(cat "$TEST_ROOT/start-rw-mode")" == '${{ steps.select.outputs.rw_mode }}' ]]; }
+check "the start step takes its mode from the backend selection" start_takes_select_mode
 later_steps=0
 while IFS=$'\t' read -r step condition; do
   later_steps=$((later_steps + 1))
