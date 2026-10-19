@@ -669,9 +669,17 @@ The conversion pins the file and seeds each runtime's session that the
 co-located store holds no row for from its digest-verified WholeBlob body, in
 the transaction that installs the runtime's authority and completes its
 activation receipt, so the co-located transcript, rewrite history and metadata
-are that body's. A conversion stopped part way finishes on the next call, and
-a converted file opens with `new_head_canonical`. The caller asserts that the
-file is standalone: the conversion is never used on a realm database.
+are that body's. It seeds only while the co-located store holds no session
+beyond the ones the file's completed activations own: any other session
+refuses that runtime typed without seeding, and runtimes to seed convert
+before runtimes whose session already has a row, so a session the store held
+before the conversion always refuses. The host therefore writes no session row
+into the file before the conversion returns. A conversion stopped part way
+finishes on the next call, and a converted file opens with
+`new_head_canonical`. The caller asserts that the file is standalone: the
+conversion is never used on a realm database, and the guard cannot tell a
+realm whose remaining sessions all completed activation from a standalone
+file.
 
 ### Durable-tail recovery
 

@@ -6863,7 +6863,10 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
 /// `session` as the exact store-issued WholeBlob body. The body is laid out
 /// as this store's physical session through the same one-time full-history
 /// layout as a released blob, and the head comes back exactly as
-/// [`ensure_head_canonical_for_runtime_in_txn`] returns it. The seam refuses
+/// [`ensure_head_canonical_for_runtime_in_txn`] returns it. The runtime
+/// seeds only while this store holds no session beyond the ones its completed
+/// activations own, which it reads with [`held_session_ids_in_txn`] in the
+/// same transaction. The seam refuses
 /// ([`SessionStoreError::Internal`]: the caller seeds only a session this
 /// store holds no row for) when this store already holds a head or blob row
 /// for the session, and it neither opens nor commits a transaction.
@@ -6885,6 +6888,34 @@ pub fn seed_head_canonical_for_runtime_in_txn(
     lay_out_blob_session_in_txn(tx, id, session)?;
     ensure_head_canonical_for_runtime_in_txn(tx, id)?
         .ok_or_else(|| SessionStoreError::Corrupted(id.clone()))
+}
+
+/// Every session this store holds, as a head row or a legacy blob row, read
+/// inside the caller's transaction, which it neither opens nor commits.
+///
+/// The runtime's standalone WholeBlob conversion reads it in the transaction
+/// that would seed a session through
+/// [`seed_head_canonical_for_runtime_in_txn`], and seeds only while every
+/// session named here belongs to one of its completed activations.
+#[doc(hidden)]
+pub fn held_session_ids_in_txn(
+    tx: &Transaction<'_>,
+) -> Result<BTreeSet<SessionId>, SessionStoreError> {
+    let mut statement = tx
+        .prepare("SELECT session_id FROM session_heads UNION SELECT session_id FROM sessions")
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?;
+    let raw_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+        .map_err(into_session_store_error)?;
+    raw_ids
+        .into_iter()
+        .map(|raw| parse_session_id(raw).map_err(into_session_store_error))
+        .collect()
 }
 
 /// Cross one persisted SQLite HeadCanonical representation and return the
@@ -10006,6 +10037,79 @@ mod tests {
                 Err(SessionStoreError::Internal(detail)) if detail.contains("holds no row")
             ),
             "seeding over a released blob row: {refusal:?}"
+        );
+    }
+
+    /// The standalone conversion's guard reads every session the store
+    /// holds, each once: a seeded head row, a released blob row, and a blob
+    /// row kept beside the head it migrated into.
+    #[tokio::test]
+    async fn held_session_ids_name_head_and_blob_sessions_once() {
+        let (_dir, store) = temp_store();
+        assert!(
+            store
+                .in_write_txn(held_session_ids_in_txn)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut seeded = Session::new();
+        seeded.push(user("seeded from a runtime body"));
+        let seed = seeded.clone();
+        store
+            .in_write_txn(move |tx| seed_head_canonical_for_runtime_in_txn(tx, &seed))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.path()).unwrap();
+        let mut released_ids = Vec::new();
+        for text in [
+            "held as a released blob row",
+            "migrated from a released blob row",
+        ] {
+            let mut released = Session::new();
+            released.push(user(text));
+            conn.execute(
+                "INSERT INTO sessions (
+                     session_id, created_at_ms, updated_at_ms, message_count,
+                     total_tokens, metadata_json, session_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    released.id().to_string(),
+                    system_time_millis(released.created_at()),
+                    system_time_millis(released.updated_at()),
+                    1_i64,
+                    0_i64,
+                    "{}",
+                    serde_json::to_vec(&released).unwrap(),
+                ],
+            )
+            .unwrap();
+            released_ids.push(released.id().clone());
+        }
+        drop(conn);
+        let migrated = released_ids[1].clone();
+        let migrated_head = store
+            .in_write_txn(move |tx| ensure_head_canonical_for_runtime_in_txn(tx, &migrated))
+            .await
+            .unwrap();
+        assert!(migrated_head.is_some(), "the blob row migrates into a head");
+        let blob_rows_kept: i64 = Connection::open(store.path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            blob_rows_kept, 2,
+            "the migrated blob row stays beside its head"
+        );
+
+        let held = store.in_write_txn(held_session_ids_in_txn).await.unwrap();
+        assert_eq!(
+            held,
+            BTreeSet::from([
+                seeded.id().clone(),
+                released_ids[0].clone(),
+                released_ids[1].clone(),
+            ])
         );
     }
 
