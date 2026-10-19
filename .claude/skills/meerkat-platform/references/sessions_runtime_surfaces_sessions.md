@@ -2,8 +2,10 @@ Covers: Meerkat 0.9 sessions on every surface (CLI, JSON-RPC, REST, Python,
 TypeScript): create, continue, `rkat run --resume`, list, read, history and
 summaries, archive; per-turn `turn/start` fields and refused build settings;
 turn queueing and the 3-attempt retry cap; interrupt versus `turn/stop_run`;
-forks, transcript edits and retention; system prompts; events, cursor replay,
-ATIF export; durable resume holds, repair-wholeblob, tool-process recovery.
+forks, transcript edits and retention; system prompts; events (0.9.4
+content-filtered `run_failed` reason, compaction summary source), cursor
+replay, ATIF export; durable resume holds, repair-wholeblob, tool-process
+recovery.
 
 # Sessions on Every Surface (Meerkat 0.9)
 
@@ -41,6 +43,11 @@ API changes, error codes, SDKs, prebuilt binaries and Rust embedding:
   turn completes. `SESSION_BUSY` (-32002) means the session cannot take the
   request now: it is still being materialized, served by another process, or
   tearing down.
+- `INPUT_NOT_READY` (-32031) means the runtime did not admit the input now;
+  `error.data.reason.kind` says why. Since 0.9.4 the kind
+  `original_admission_pending` means the input names an original whose
+  source owner has not settled its admission yet: retry later (0.9.3 and
+  earlier refused it as malformed or denied).
 - A turn that keeps failing is attempted back to back at most 3 times in
   total within one wake (about three times the model spend), then its input
   ends abandoned:
@@ -242,6 +249,18 @@ settings before the turn, so REST can change build settings that RPC refuses.
   carry `runtime_origin {session_id, run_id, input_id, append_ordinal}` in
   history, revision exports and live boundary events (0.8.44); rewrites strip
   it and content digests exclude it.
+- Since 0.9.4 a `run_failed` event of error class `content_filtered` (the
+  provider refused or filtered the response) carries `error_report.reason`
+  `{"reason_type": "content_filtered", "stop": "refusal" | "content_filter",
+  "detail": {...}}` (`detail` only when the provider gave its own account)
+  instead of `null`. `compaction_completed` carries `summary_source` (who
+  wrote the summary: `provider_call` with how much history it saw,
+  `host_curator` or `mechanical_fallback`) and
+  `estimated_history_tokens_after` (compare with `compaction_started`'s
+  `estimated_history_tokens`). Shapes and SDK names:
+  `references/sessions_runtime_surfaces_api_changes.md`. A 0.9.3 binary
+  cannot read a session event log that holds a content-filtered `run_failed`
+  line.
 - ATIF export: `rkat session export-atif <id>` writes
   `<state-root>/<realm>/trajectories/<session_id>.json` unless `--output` is
   given; `rkat run --export-atif` (also with `--resume`) writes one to the
