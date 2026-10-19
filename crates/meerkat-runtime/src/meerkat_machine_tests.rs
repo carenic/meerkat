@@ -1508,6 +1508,183 @@ fn oauth_target_with_binding(binding: &str) -> meerkat_core::AuthCredentialIdent
     })
 }
 
+/// Releases a held store's OAuth snapshot write on every path out of a test,
+/// so no machine creation stays parked behind it.
+#[cfg(not(target_arch = "wasm32"))]
+struct ReleaseHeldRehydration(Arc<crate::handles::FailingOAuthSnapshotStore>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ReleaseHeldRehydration {
+    fn drop(&mut self) {
+        self.0.release_blocked_oauth_persist();
+    }
+}
+
+/// The bound on a machine creation that must not wait for a held OAuth flow
+/// rehydration, and on any creation once the hold is released.
+#[cfg(not(target_arch = "wasm32"))]
+const HELD_REHYDRATION_BOUND: Duration = Duration::from_secs(5);
+
+/// How long a machine creation over the held store itself is watched: it
+/// waits for that store's rehydration, so it never returns inside this
+/// window while the hold lasts.
+#[cfg(not(target_arch = "wasm32"))]
+const SAME_STORE_WAIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// A store holding one persisted OAuth flow, with its next snapshot write
+/// held: the next machine over it rehydrates that flow, writes the snapshot
+/// back and stays there until the hold is released.
+#[cfg(not(target_arch = "wasm32"))]
+fn store_with_held_rehydration(binding: &str) -> Arc<crate::handles::FailingOAuthSnapshotStore> {
+    let store = Arc::new(crate::handles::FailingOAuthSnapshotStore::default());
+    let store_dyn: Arc<dyn crate::store::RuntimeStore> = store.clone();
+    let flows = crate::handles::RuntimeOAuthFlowHandle::new_with_persistent_store_and_auth_lease(
+        Duration::from_secs(600),
+        Arc::new(crate::handles::RuntimeAuthLeaseHandle::new()),
+        &store_dyn,
+    );
+    flows
+        .start(
+            oauth_target_with_binding(binding),
+            meerkat_auth_core::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
+            "http://127.0.0.1/callback".to_string(),
+            "persisted-verifier".to_string(),
+        )
+        .expect("the store persists one OAuth flow");
+    drop(flows);
+    store.block_next_oauth_persist();
+    store
+}
+
+/// One store's OAuth flow rehydration, held inside its snapshot write, holds
+/// no machine creation over another store.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_held_auth_rehydration_does_not_hold_machine_creation_over_another_store() {
+    let held = store_with_held_rehydration("held-rehydration-other-store");
+    let release = ReleaseHeldRehydration(Arc::clone(&held));
+    let held_store: Arc<dyn crate::store::RuntimeStore> = held.clone();
+    let creating_held = std::thread::spawn(move || {
+        MeerkatMachine::persistent(held_store, memory_blob_store()).is_ok()
+    });
+    held.wait_for_blocked_oauth_persist();
+
+    let other: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::handles::FailingOAuthSnapshotStore::default());
+    let (created_tx, created_rx) = std::sync::mpsc::channel();
+    let creating_other = std::thread::spawn(move || {
+        let created = MeerkatMachine::persistent(other, memory_blob_store()).is_ok();
+        let _ = created_tx.send(created);
+    });
+    let other_created = created_rx.recv_timeout(HELD_REHYDRATION_BOUND);
+
+    drop(release);
+    let held_created = creating_held.join().expect("held creation thread");
+    creating_other.join().expect("other creation thread");
+    assert_eq!(
+        other_created,
+        Ok(true),
+        "a machine over another store must not wait for a held OAuth flow rehydration"
+    );
+    assert!(held_created, "the held creation completes once released");
+}
+
+/// Machines over one store wait for that store's held rehydration, and then
+/// share the one authority it built.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn machines_over_one_store_wait_for_and_share_its_auth_rehydration() {
+    let held = store_with_held_rehydration("held-rehydration-same-store");
+    let release = ReleaseHeldRehydration(Arc::clone(&held));
+    let create_over_held = || {
+        let store: Arc<dyn crate::store::RuntimeStore> = held.clone();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        let creating = std::thread::spawn(move || {
+            let _ = created_tx.send(MeerkatMachine::persistent(store, memory_blob_store()));
+        });
+        (creating, created_rx)
+    };
+    let (creating_first, first_rx) = create_over_held();
+    held.wait_for_blocked_oauth_persist();
+    let (creating_second, second_rx) = create_over_held();
+    let second_early = second_rx.recv_timeout(SAME_STORE_WAIT_WINDOW).ok();
+    let second_waited = second_early.is_none();
+
+    drop(release);
+    let first = first_rx
+        .recv_timeout(HELD_REHYDRATION_BOUND)
+        .expect("the first creation returns once released")
+        .expect("first persistent machine");
+    let second = match second_early {
+        Some(created) => created,
+        None => second_rx
+            .recv_timeout(HELD_REHYDRATION_BOUND)
+            .expect("the second creation returns once released"),
+    }
+    .expect("second persistent machine");
+    creating_first.join().expect("first creation thread");
+    creating_second.join().expect("second creation thread");
+    assert!(
+        second_waited,
+        "a machine over the held store must wait for that store's rehydration"
+    );
+
+    let target = oauth_target_with_binding("held-rehydration-shared-flow");
+    let provider = meerkat_auth_core::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt;
+    let redirect_uri = "http://127.0.0.1/callback";
+    let state = first
+        .oauth_flow_authority()
+        .start(
+            target.clone(),
+            meerkat_auth_core::oauth_flow::OAuthBrowserFlowIdentity::from(provider),
+            redirect_uri.to_string(),
+            "shared-verifier".to_string(),
+        )
+        .expect("the first machine admits an OAuth flow");
+    let flow = second
+        .oauth_flow_authority()
+        .consume(
+            &state,
+            &target,
+            meerkat_auth_core::oauth_flow::OAuthBrowserFlowCompletion::from(provider),
+            redirect_uri,
+        )
+        .expect("both machines share one OAuth flow authority");
+    assert_eq!(flow.pkce_verifier, "shared-verifier");
+}
+
+/// A process key's bundle is shared while its store lives and replaced once
+/// the store is gone. The key is odd, so it is never a live store's address
+/// and no other test or machine uses it.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_process_keyed_authority_is_shared_while_its_store_lives_and_replaced_after() {
+    let key = PersistentAuthAuthorityKey::Process(0x5_2c2b_0001);
+    let first: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let created = persistent_auth_authorities_for_key(key.clone(), &first);
+    let shared = persistent_auth_authorities_for_key(key.clone(), &first);
+    assert!(
+        Arc::ptr_eq(&created, &shared),
+        "a live store's key shares one bundle"
+    );
+    drop(shared);
+    drop(first);
+
+    let second: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let replaced = persistent_auth_authorities_for_key(key.clone(), &second);
+    assert!(
+        !Arc::ptr_eq(&created, &replaced),
+        "a gone store's process key gets a fresh bundle"
+    );
+    let again = persistent_auth_authorities_for_key(key, &second);
+    assert!(
+        Arc::ptr_eq(&replaced, &again),
+        "the fresh bundle is shared while its store lives"
+    );
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn persistent_auth_authority_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1621,11 +1798,10 @@ fn persistent_oauth_flow_authority_survives_process_cache_restart_for_sqlite_sto
     drop(first);
     drop(store);
 
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
-
     let restarted_store = Arc::new(
         crate::store::SqliteRuntimeStore::new(path).expect("sqlite runtime store reopens"),
     ) as Arc<dyn crate::store::RuntimeStore>;
+    crate::meerkat_machine::forget_persistent_auth_authorities_for_test(&restarted_store);
     let recovered = MeerkatMachine::persistent(restarted_store, memory_blob_store())
         .expect("persistent machine");
     let browser_flow = recovered
@@ -1653,7 +1829,6 @@ fn persistent_oauth_flow_authority_survives_process_cache_restart_for_sqlite_sto
 #[test]
 fn persistent_oauth_device_consume_prunes_durable_snapshot_for_sqlite_store() {
     let _guard = persistent_auth_authority_test_guard();
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("runtime.sqlite3");
     let store = Arc::new(
@@ -1682,11 +1857,10 @@ fn persistent_oauth_device_consume_prunes_durable_snapshot_for_sqlite_store() {
     drop(machine);
     drop(store);
 
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
-
     let restarted_store = Arc::new(
         crate::store::SqliteRuntimeStore::new(path).expect("sqlite runtime store reopens"),
     ) as Arc<dyn crate::store::RuntimeStore>;
+    crate::meerkat_machine::forget_persistent_auth_authorities_for_test(&restarted_store);
     let restarted = MeerkatMachine::persistent(restarted_store, memory_blob_store())
         .expect("persistent machine");
     let err = restarted
@@ -1706,7 +1880,6 @@ fn persistent_oauth_device_consume_prunes_durable_snapshot_for_sqlite_store() {
 #[test]
 fn persistent_oauth_authority_cache_rebinds_reopened_sqlite_store_after_drop() {
     let _guard = persistent_auth_authority_test_guard();
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("runtime.sqlite3");
     let store = Arc::new(
@@ -1747,11 +1920,10 @@ fn persistent_oauth_authority_cache_rebinds_reopened_sqlite_store_after_drop() {
     drop(reopened);
     drop(reopened_store);
 
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
-
     let final_store = Arc::new(
         crate::store::SqliteRuntimeStore::new(path).expect("sqlite runtime store reopens again"),
     ) as Arc<dyn crate::store::RuntimeStore>;
+    crate::meerkat_machine::forget_persistent_auth_authorities_for_test(&final_store);
     let final_machine =
         MeerkatMachine::persistent(final_store, memory_blob_store()).expect("persistent machine");
     let err = final_machine
@@ -1770,7 +1942,6 @@ fn persistent_oauth_authority_cache_rebinds_reopened_sqlite_store_after_drop() {
 #[test]
 fn persistent_oauth_authority_cache_rebinds_overlapping_reopened_sqlite_store() {
     let _guard = persistent_auth_authority_test_guard();
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("runtime.sqlite3");
     let original_store = Arc::new(
@@ -1811,11 +1982,10 @@ fn persistent_oauth_authority_cache_rebinds_overlapping_reopened_sqlite_store() 
     drop(reopened);
     drop(reopened_store);
 
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
-
     let final_store = Arc::new(
         crate::store::SqliteRuntimeStore::new(path).expect("sqlite runtime store reopens again"),
     ) as Arc<dyn crate::store::RuntimeStore>;
+    crate::meerkat_machine::forget_persistent_auth_authorities_for_test(&final_store);
     let final_machine =
         MeerkatMachine::persistent(final_store, memory_blob_store()).expect("persistent machine");
     let err = final_machine
@@ -1834,7 +2004,6 @@ fn persistent_oauth_authority_cache_rebinds_overlapping_reopened_sqlite_store() 
 #[test]
 fn persistent_oauth_release_prunes_durable_payload_snapshot_for_sqlite_store() {
     let _guard = persistent_auth_authority_test_guard();
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("runtime.sqlite3");
     let store = Arc::new(
@@ -1873,11 +2042,10 @@ fn persistent_oauth_release_prunes_durable_payload_snapshot_for_sqlite_store() {
     drop(machine);
     drop(store);
 
-    crate::meerkat_machine::clear_persistent_auth_authorities_for_test();
-
     let restarted_store = Arc::new(
         crate::store::SqliteRuntimeStore::new(path).expect("sqlite runtime store reopens"),
     ) as Arc<dyn crate::store::RuntimeStore>;
+    crate::meerkat_machine::forget_persistent_auth_authorities_for_test(&restarted_store);
     let restarted = MeerkatMachine::persistent(restarted_store, memory_blob_store())
         .expect("persistent machine");
     let browser_err = restarted

@@ -957,9 +957,21 @@ enum PersistentAuthAuthorityKey {
     Process(usize),
 }
 
+/// One store key's provider-auth authority bundle. Creating the bundle
+/// rehydrates the store's OAuth flows (a store read, and a write back when
+/// flows were persisted), so it runs under this slot's own lock: callers for
+/// one key wait for that key's bundle, callers for other keys never do.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct PersistentAuthAuthoritySlot {
+    bundle: StdMutex<Option<Arc<PersistentAuthAuthorityBundle>>>,
+}
+
+/// Every store key's slot. The map's lock covers only the slot lookup, and
+/// nothing takes it while holding a slot's lock.
 #[cfg(not(target_arch = "wasm32"))]
 static PERSISTENT_AUTH_AUTHORITIES: OnceLock<
-    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthorityBundle>>>,
+    StdMutex<HashMap<PersistentAuthAuthorityKey, Arc<PersistentAuthAuthoritySlot>>>,
 > = OnceLock::new();
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1016,19 +1028,43 @@ impl ProviderAuthRuntimeAuthority {
 fn persistent_auth_authorities(
     store: &Arc<dyn RuntimeStore>,
 ) -> Arc<PersistentAuthAuthorityBundle> {
-    let key = runtime_store_identity(store);
+    persistent_auth_authorities_for_key(runtime_store_identity(store), store)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authority_slot(
+    key: PersistentAuthAuthorityKey,
+) -> Arc<PersistentAuthAuthoritySlot> {
     let authorities = PERSISTENT_AUTH_AUTHORITIES.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut authorities = authorities
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = authorities.get(&key) {
+    Arc::clone(authorities.entry(key).or_default())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_auth_authorities_for_key(
+    key: PersistentAuthAuthorityKey,
+    store: &Arc<dyn RuntimeStore>,
+) -> Arc<PersistentAuthAuthorityBundle> {
+    let durable = matches!(key, PersistentAuthAuthorityKey::Durable(_));
+    let slot = persistent_auth_authority_slot(key);
+    let mut bundle = slot
+        .bundle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = bundle.as_ref() {
         let stored_store_alive = existing
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .upgrade()
             .is_some();
-        if matches!(key, PersistentAuthAuthorityKey::Durable(_)) || stored_store_alive {
+        // A process key whose store is gone gets a fresh bundle. That case is
+        // defensive: the bundle's weak reference keeps the store's allocation,
+        // so no other store takes its address while the entry exists. Only a
+        // test reaches it, with a key of its own.
+        if durable || stored_store_alive {
             existing.oauth_flows.bind_persistent_store(store);
             *existing
                 .store
@@ -1045,22 +1081,27 @@ fn persistent_auth_authorities(
             store,
         ),
     );
-    let bundle = Arc::new(PersistentAuthAuthorityBundle {
+    let created = Arc::new(PersistentAuthAuthorityBundle {
         store: StdMutex::new(Arc::downgrade(store)),
         auth_lease,
         oauth_flows,
     });
-    authorities.insert(key, Arc::clone(&bundle));
-    bundle
+    *bundle = Some(Arc::clone(&created));
+    created
 }
 
+/// Forget the authority bundle cached for `store`'s key, as a process
+/// restart would: the next machine over a store with that key rehydrates
+/// from the store. Only that key is forgotten, so tests running beside the
+/// caller keep theirs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn clear_persistent_auth_authorities_for_test() {
+pub(crate) fn forget_persistent_auth_authorities_for_test(store: &Arc<dyn RuntimeStore>) {
+    let key = runtime_store_identity(store);
     if let Some(authorities) = PERSISTENT_AUTH_AUTHORITIES.get() {
         authorities
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+            .remove(&key);
     }
 }
 
