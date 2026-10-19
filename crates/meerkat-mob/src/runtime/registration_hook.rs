@@ -185,13 +185,13 @@ pub trait MemberRuntimeRegistrationHook: Send + Sync {
     /// refused either way can still be retired, respawned or destroyed: its
     /// retirement archives the durable session without routing a retire to
     /// the runtime the refusal released. A member the boot recreates on a
-    /// fresh session, because the session service keeps no durable sessions,
-    /// is refused the same way: the transaction's own rollback removes the
-    /// registration it inserted, and only that member stays Broken with the
-    /// typed refusal while the rest of the mob comes up. A spawn that adopts
-    /// a session registered before it (a resumed or pre-registered session)
-    /// keeps that registration on a refusal; only the transaction is rolled
-    /// back.
+    /// fresh session (as it does when the session service keeps no durable
+    /// sessions) is refused the same way: the transaction's own rollback
+    /// removes the registration it inserted, and only that member stays
+    /// Broken with the typed refusal while the rest of the mob comes up. A
+    /// spawn that adopts a session registered before it (a resumed or
+    /// pre-registered session) keeps that registration on a refusal; only
+    /// the transaction is rolled back.
     ///
     /// A failed revival's destination stays bound on the restored
     /// registration it keeps, so a host's re-selection for that registration

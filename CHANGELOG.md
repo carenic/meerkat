@@ -129,9 +129,9 @@ them.
   registers the refused member's session again. A refused member, on either
   path, can be retired, respawned or destroyed: the retirement archives its
   durable session without routing a retire to the runtime the refusal
-  released. A member the boot recreates on a fresh session, because the
-  session service keeps no durable sessions, gets the same typed refusal
-  (see Fixed). A failure that is not the host's
+  released. A member the boot recreates on a fresh session (as it does when
+  the session service keeps no durable sessions) gets the same typed
+  refusal (see Fixed). A failure that is not the host's
   refusal keeps the restored registration for the repair to reuse, and a
   spawn that adopts a session registered before it keeps that registration
   on a refusal, as does the recovery of an attached member's actor.
@@ -408,7 +408,7 @@ them.
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
 - `MobBuilder::resume` no longer fails when a host refuses the registration
-  of a member the boot recreates on a fresh session, which it does when the
+  of a member the boot recreates on a fresh session, as it does when the
   session service keeps no durable sessions (`meerkat-mob`). The refusal
   failed the whole resume with the host's error, so the mob did not come
   back after a restart. Now only that member is Broken, with the typed
