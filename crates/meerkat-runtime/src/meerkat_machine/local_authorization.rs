@@ -73,16 +73,20 @@ pub type NativeRetainedResumeCheck = dyn Fn(
 /// each session registration, and, for a per-agent host, of the agent
 /// selection conjunct of its MCP attachment controls.
 ///
-/// A plain closure `Fn(&SessionId, SessionAgentBinding) -> Option<..>` is a
-/// provider that decides configured servers only.
+/// A plain closure `Fn(&RuntimeSessionRegistrationWitness,
+/// SessionAgentBinding) -> Option<..>` is a provider that decides configured
+/// servers only.
 /// [`super::AgentConfiguredMcpProvider`] decides both from one agent grant
 /// owner.
 pub trait ConfiguredMcpAttachmentProvider: Send + Sync {
     /// The configured-server authority of one session registration. It is
-    /// called with the exact session whose configured servers are being
+    /// called with the exact registration whose configured servers are being
     /// staged and that registration's own agent binding, and must decide
     /// from that registration's current realm, mandate, account and grant
-    /// context, never from a process-wide allowlist or a session label.
+    /// context, never from a process-wide allowlist or a session label. A
+    /// later registration of the same session is a different registration
+    /// (`registration.session_id()` is the session it registers): never
+    /// carry a decision made for one registration over to another.
     ///
     /// The binding is the registration's live slot: the trusted host may
     /// bind the agent's mandate after this authority is assembled, and the
@@ -92,7 +96,7 @@ pub trait ConfiguredMcpAttachmentProvider: Send + Sync {
     /// configured server of that session.
     fn configured(
         &self,
-        session_id: &meerkat_core::SessionId,
+        registration: &super::RuntimeSessionRegistrationWitness,
         agent: super::SessionAgentBinding,
     ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>>;
 
@@ -115,7 +119,7 @@ pub trait ConfiguredMcpAttachmentProvider: Send + Sync {
 impl<F> ConfiguredMcpAttachmentProvider for F
 where
     F: Fn(
-            &meerkat_core::SessionId,
+            &super::RuntimeSessionRegistrationWitness,
             super::SessionAgentBinding,
         )
             -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>>
@@ -124,10 +128,10 @@ where
 {
     fn configured(
         &self,
-        session_id: &meerkat_core::SessionId,
+        registration: &super::RuntimeSessionRegistrationWitness,
         agent: super::SessionAgentBinding,
     ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
-        self(session_id, agent)
+        self(registration, agent)
     }
 }
 
@@ -259,12 +263,12 @@ impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
 
     fn configured_mcp_attachment_for_agent(
         &self,
-        session_id: &meerkat_core::SessionId,
+        registration: &super::RuntimeSessionRegistrationWitness,
         agent: super::SessionAgentBinding,
     ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
         self.configured_mcp_attachment
             .as_ref()
-            .and_then(|provider| provider.configured(session_id, agent))
+            .and_then(|provider| provider.configured(registration, agent))
             .unwrap_or_else(|| Arc::new(crate::input_authority::RefuseConfiguredMcpAttachment))
     }
 

@@ -1377,20 +1377,49 @@ mod tests {
         );
     }
 
+    /// The v1 compiled-policy fixtures, as this crate's own copies (so its
+    /// tests build from the published package). Each is byte-identical to
+    /// meerkat-core's `tests/fixtures/` original, which pins the same SHA-256.
+    const COMPILED_POLICY_FIXTURES: [(&str, &[u8], &str); 3] = [
+        (
+            "compiled_application_tool_policy_valid_v1.json",
+            include_bytes!("../tests/fixtures/compiled_application_tool_policy_valid_v1.json"),
+            "e39de29b4673bb286441032932224ee0dc59a24d3179c63e9683be27df73e26b",
+        ),
+        (
+            "compiled_application_tool_policy_unknown_field_v1.json",
+            include_bytes!(
+                "../tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json"
+            ),
+            "0ff0066878c133de7e69a5c4efb863029c15572cf5cf51cac4603c3d9c6d53c7",
+        ),
+        (
+            "compiled_application_tool_policy_absent_default_deny_v1.json",
+            include_bytes!(
+                "../tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json"
+            ),
+            "38eab839b8d2fd72623a58a489f3113b82749b38fdd78009d02273837c813631",
+        ),
+    ];
+
     fn compiled_policy_fixture(name: &str) -> serde_json::Value {
-        let bytes: &[u8] = match name {
-            "compiled_application_tool_policy_valid_v1.json" => include_bytes!(
-                "../../meerkat-core/tests/fixtures/compiled_application_tool_policy_valid_v1.json"
-            ),
-            "compiled_application_tool_policy_unknown_field_v1.json" => include_bytes!(
-                "../../meerkat-core/tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json"
-            ),
-            "compiled_application_tool_policy_absent_default_deny_v1.json" => include_bytes!(
-                "../../meerkat-core/tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json"
-            ),
-            _ => panic!("unknown compiled policy fixture: {name}"),
-        };
+        let (_, bytes, _) = COMPILED_POLICY_FIXTURES
+            .iter()
+            .find(|(fixture, _, _)| *fixture == name)
+            .unwrap_or_else(|| panic!("unknown compiled policy fixture: {name}"));
         serde_json::from_slice(bytes).expect("parse compiled policy fixture")
+    }
+
+    #[test]
+    fn compiled_policy_fixtures_keep_the_core_v1_bytes() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, sha256) in COMPILED_POLICY_FIXTURES {
+            assert_eq!(
+                format!("{:x}", Sha256::digest(bytes)),
+                sha256,
+                "{name} differs from meerkat-core's v1 fixture"
+            );
+        }
     }
 
     fn runtime_accepts_compiled_policy(instance: &serde_json::Value) -> bool {
