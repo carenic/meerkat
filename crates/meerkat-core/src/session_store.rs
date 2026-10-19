@@ -1356,6 +1356,14 @@ pub trait SessionStore: Send + Sync {
 
     /// Save an authoritative projection only if the persisted row is still the
     /// revision that the caller already validated.
+    ///
+    /// Besides runtime-backed services, one offline caller is legitimate: a
+    /// storage migration that runs while no other process uses the store. It
+    /// validates the session's transcript history itself, as `save` would,
+    /// and passes `None` to create the row of a session that only the
+    /// pre-migration store holds (`None` never replaces an existing row). It
+    /// activates the session's runtime authority only afterwards, from the
+    /// `HeadCanonicalAuthorityCrossing` this store issues.
     async fn save_authoritative_projection_if_current_revision(
         &self,
         session: &Session,
