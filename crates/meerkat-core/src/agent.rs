@@ -6347,6 +6347,13 @@ mod governed_operation_tests {
             self.0.tools()
         }
 
+        fn review_entry_support(
+            &self,
+            tool_name: &str,
+        ) -> crate::approval::review::ReviewEntrySupport {
+            self.0.review_entry_support(tool_name)
+        }
+
         async fn dispatch(
             &self,
             call: ToolCallView<'_>,
@@ -6363,6 +6370,41 @@ mod governed_operation_tests {
         }
     }
 
+    /// `inner` behind the call-level execution policy gate, whose allowing
+    /// consequence policy begins one owner change on `work`'s publication
+    /// each time it evaluates, completed by another thread 30 ms later. The
+    /// gate is reached through its resolved entry point, or through an
+    /// adapter that lowers the call ([`Lowering`]).
+    fn gate_beginning_an_owner_change<T: AgentToolDispatcher + 'static>(
+        work: &ChurnWork,
+        inner: Arc<T>,
+        resolved: bool,
+    ) -> Arc<dyn AgentToolDispatcher> {
+        let sequence = Arc::clone(&work.sequence);
+        let policy =
+            crate::tool_execution_policy::tests::allowing_consequence_policy_running(move || {
+                // One owner change, completed by another thread 30 ms later.
+                let odd = sequence.fetch_add(1, Ordering::SeqCst) + 1;
+                let sequence = Arc::clone(&sequence);
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    sequence.store(odd + 1, Ordering::SeqCst);
+                });
+            });
+        let gated: Arc<dyn AgentToolDispatcher> = Arc::new(
+            crate::ExecutionPolicyGatedDispatcher::new(
+                inner,
+                crate::ToolExecutionPolicy::unrestricted(),
+            )
+            .with_consequence_policy(policy),
+        );
+        if resolved {
+            gated
+        } else {
+            Arc::new(Lowering(gated))
+        }
+    }
+
     /// The call-level execution policy gate stages the call again after its
     /// own awaits. An owner change its consequence policy began meanwhile,
     /// held 30 ms, is waited out within the dispatch attempt's own bounds,
@@ -6373,31 +6415,8 @@ mod governed_operation_tests {
     async fn a_policy_gated_entry_waits_out_an_owner_change_its_consequence_policy_began() {
         for resolved in [true, false] {
             let work = ChurnWork::new(crate::authorization::OperationReviewTier::R1, 0, None);
-            let sequence = Arc::clone(&work.sequence);
-            let policy = crate::tool_execution_policy::tests::allowing_consequence_policy_running(
-                move || {
-                    // One owner change, completed by another thread 30 ms later.
-                    let odd = sequence.fetch_add(1, Ordering::SeqCst) + 1;
-                    let sequence = Arc::clone(&sequence);
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(30));
-                        sequence.store(odd + 1, Ordering::SeqCst);
-                    });
-                },
-            );
             let inner = Arc::new(SourceKindDispatcher::default());
-            let gated: Arc<dyn AgentToolDispatcher> = Arc::new(
-                crate::ExecutionPolicyGatedDispatcher::new(
-                    Arc::clone(&inner),
-                    crate::ToolExecutionPolicy::unrestricted(),
-                )
-                .with_consequence_policy(policy),
-            );
-            let root: Arc<dyn AgentToolDispatcher> = if resolved {
-                gated
-            } else {
-                Arc::new(Lowering(gated))
-            };
+            let root = gate_beginning_an_owner_change(&work, Arc::clone(&inner), resolved);
             let started = std::time::Instant::now();
             let result = fenced(&root, "read_file", &churn_context(&work)).await;
             assert!(
@@ -6412,6 +6431,98 @@ mod governed_operation_tests {
                 "resolved={resolved}: the body ran once"
             );
             assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+            assert_eq!(
+                work.sequence.load(Ordering::SeqCst),
+                2,
+                "one change, completed"
+            );
+        }
+    }
+
+    /// A model reviewer that allows every candidate and counts its reviews.
+    struct CountingAllow(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::approval::review::OperationReviewer for CountingAllow {
+        async fn review(
+            &self,
+            _candidate: &crate::approval::review::ReviewCandidate<'_>,
+        ) -> Result<crate::approval::review::ReviewVerdict, crate::approval::review::ReviewerFailure>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::approval::review::ReviewVerdict::Allow)
+        }
+    }
+
+    /// The source-kind tools, entered at their reviewed leaf.
+    struct Reviewed(SourceKindDispatcher);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for Reviewed {
+        fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
+            self.0.tools()
+        }
+
+        fn review_entry_support(&self, _name: &str) -> crate::approval::review::ReviewEntrySupport {
+            crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            self.0.dispatch(call).await
+        }
+    }
+
+    /// The reviewed (R2) case of the gate's wait: the gate waits out the
+    /// change its consequence policy began, and the retained review's check
+    /// point then finds the decision prepared after the change no longer the
+    /// reviewed one. The gate's own code already ran, so on both of its
+    /// staging paths that settles as `review_unsatisfied` (`context_changed`):
+    /// the call is never reviewed again and no body runs.
+    #[tokio::test]
+    async fn a_policy_gated_reviewed_entry_settles_a_decision_its_wait_saw_change() {
+        for resolved in [true, false] {
+            let work = ChurnWork::new(crate::authorization::OperationReviewTier::R2, 0, None);
+            let reviewer = Arc::new(CountingAllow(std::sync::atomic::AtomicUsize::new(0)));
+            let context = churn_context(&work).with_operation_review(Some(Arc::new(
+                crate::approval::review::BoundOperationReview::new(
+                    Arc::clone(&reviewer) as Arc<dyn crate::approval::review::OperationReviewer>,
+                    crate::approval::ApprovalService::new(),
+                    std::time::Duration::from_secs(30),
+                ),
+            )));
+            let inner = Arc::new(Reviewed(SourceKindDispatcher::default()));
+            let root = gate_beginning_an_owner_change(&work, Arc::clone(&inner), resolved);
+            let started = std::time::Instant::now();
+            let result = fenced(&root, "read_file", &context).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(crate::ToolError::ReviewUnsatisfied {
+                        kind: crate::approval::review::ReviewUnsatisfiedKind::ContextChanged,
+                        ..
+                    })
+                ),
+                "resolved={resolved}: the gate waits out the change, then settles the changed decision: {result:?}"
+            );
+            assert_eq!(
+                inner.0.0.load(Ordering::SeqCst),
+                0,
+                "resolved={resolved}: no body ran"
+            );
+            assert_eq!(
+                reviewer.0.load(Ordering::SeqCst),
+                1,
+                "resolved={resolved}: reviewed once, never again"
+            );
+            assert!(
+                started.elapsed() >= std::time::Duration::from_millis(30),
+                "resolved={resolved}: the gate waited for the change"
+            );
             assert_eq!(
                 work.sequence.load(Ordering::SeqCst),
                 2,
@@ -6510,67 +6621,135 @@ mod governed_operation_tests {
         }
     }
 
-    /// One review attempt's owner-change wait state is shared by its root
-    /// staging and the execution policy gate's staging: changes spread over
-    /// both spend one budget of free rebuilds and one deadline, and past
-    /// either the call settles with the typed refusal instead of waiting
-    /// again, before any body runs.
-    #[tokio::test(start_paused = true)]
-    async fn the_root_staging_and_the_gate_share_one_attempt_wait_state() {
-        let ms = std::time::Duration::from_millis;
-        // (holds of the changes at the root staging, at the gate's staging,
-        // whether the call enters)
-        for (root, gate, enters) in [
-            // Three settled waits in all: within the one budget.
-            (vec![ms(10)], vec![ms(10), ms(10)], true),
-            // A fourth change: the gate finds the shared free rebuilds spent.
-            (vec![ms(10), ms(10)], vec![ms(10), ms(10)], false),
-            // The gate's change outlasts the deadline the root staging's
-            // first wait set (2 s from then).
-            (vec![ms(1_500)], vec![ms(1_000)], false),
-        ] {
-            let case = format!("root {root:?}, gate {gate:?}");
-            let work = EntryChurnWork::new(root, gate);
-            let inner = Arc::new(SourceKindDispatcher::default());
-            let gated: Arc<dyn AgentToolDispatcher> =
-                Arc::new(crate::ExecutionPolicyGatedDispatcher::new(
-                    Arc::clone(&inner),
-                    crate::ToolExecutionPolicy::unrestricted(),
-                ));
-            let context = ToolDispatchContext::default().with_work_authorization(Some(
-                crate::WorkAuthorizationContext::new(
-                    Arc::clone(&work) as Arc<dyn WorkAuthorization>,
-                    crate::OperationExecutionScope::Domain,
-                ),
+    /// What one fenced call through the execution policy gate did under an
+    /// [`EntryChurnWork`].
+    struct GatedEntryChurn {
+        result: Result<crate::ops::ToolDispatchOutcome, crate::ToolError>,
+        /// How many bodies ran.
+        bodies: usize,
+        /// The work's publication sequence when the call returned: two per
+        /// completed change, and one more while a change is in progress.
+        sequence: u64,
+        /// The scripted changes never begun, at the root staging and at the
+        /// gate's staging.
+        left: (usize, usize),
+        took: std::time::Duration,
+    }
+
+    /// A fenced call through the execution policy gate under an
+    /// [`EntryChurnWork`] scripted with changes of `root` holds at the root
+    /// staging and `gate` holds at the gate's staging.
+    async fn gated_entry_churn(
+        root: Vec<std::time::Duration>,
+        gate: Vec<std::time::Duration>,
+    ) -> GatedEntryChurn {
+        let work = EntryChurnWork::new(root, gate);
+        let inner = Arc::new(SourceKindDispatcher::default());
+        let gated: Arc<dyn AgentToolDispatcher> =
+            Arc::new(crate::ExecutionPolicyGatedDispatcher::new(
+                Arc::clone(&inner),
+                crate::ToolExecutionPolicy::unrestricted(),
             ));
-            let started = tokio::time::Instant::now();
-            let result = fenced(&gated, "read_file", &context).await;
-            if enters {
-                assert!(
-                    result
-                        .as_ref()
-                        .is_ok_and(|outcome| !outcome.result.is_error),
-                    "{case}: every change waited out, then entered: {result:?}"
-                );
-                assert_eq!(
-                    inner.0.load(Ordering::SeqCst),
-                    1,
-                    "{case}: the body ran once"
-                );
-            } else {
-                assert!(
-                    matches!(&result, Err(crate::ToolError::AuthorizationRefused { refusal })
-                        if refusal.kind() == OperationRefusalKind::ReprepareRequired),
-                    "{case}: the shared wait state is spent, typed refusal: {result:?}"
-                );
-                assert_eq!(inner.0.load(Ordering::SeqCst), 0, "{case}: no body ran");
-                assert!(
-                    started.elapsed() < std::time::Duration::from_millis(2_100),
-                    "{case}: never waits past the shared 2 s: {:?}",
-                    started.elapsed()
-                );
-            }
+        let context = ToolDispatchContext::default().with_work_authorization(Some(
+            crate::WorkAuthorizationContext::new(
+                Arc::clone(&work) as Arc<dyn WorkAuthorization>,
+                crate::OperationExecutionScope::Domain,
+            ),
+        ));
+        let started = tokio::time::Instant::now();
+        let result = fenced(&gated, "read_file", &context).await;
+        let took = started.elapsed();
+        GatedEntryChurn {
+            result,
+            bodies: inner.0.load(Ordering::SeqCst),
+            sequence: work.sequence.load(Ordering::SeqCst),
+            left: (
+                work.root.lock().unwrap().len(),
+                work.gate.lock().unwrap().len(),
+            ),
+            took,
         }
+    }
+
+    /// Every scripted change began and `waited` of them, all, were waited
+    /// out; then the call entered and its body ran once.
+    fn assert_waited_and_entered(case: &str, call: &GatedEntryChurn, waited: u64) {
+        assert!(
+            call.result
+                .as_ref()
+                .is_ok_and(|outcome| !outcome.result.is_error),
+            "{case}: every change waited out, then entered: {:?}",
+            call.result
+        );
+        assert_eq!(call.bodies, 1, "{case}: the body ran once");
+        assert_eq!(call.left, (0, 0), "{case}: every scripted change began");
+        assert_eq!(
+            call.sequence,
+            2 * waited,
+            "{case}: {waited} changes, all waited out"
+        );
+    }
+
+    /// Every scripted change began, so the gate staged after the root
+    /// staging passed; exactly `waited` waits settled, and the last change,
+    /// begun at the gate's last staging, was never waited out: the call
+    /// settled there with the typed refusal, before any body ran.
+    fn assert_refused_at_the_gate(case: &str, call: &GatedEntryChurn, waited: u64) {
+        assert!(
+            matches!(&call.result, Err(crate::ToolError::AuthorizationRefused { refusal })
+                if refusal.kind() == OperationRefusalKind::ReprepareRequired),
+            "{case}: the shared wait state is spent, typed refusal: {:?}",
+            call.result
+        );
+        assert_eq!(call.bodies, 0, "{case}: no body ran");
+        assert_eq!(call.left, (0, 0), "{case}: every scripted change began");
+        assert_eq!(
+            call.sequence,
+            2 * waited + 1,
+            "{case}: exactly {waited} changes waited out, the last one still in progress"
+        );
+    }
+
+    /// One review attempt's free rebuilds (3) are shared by its root staging
+    /// and the execution policy gate's staging: three changes spread over
+    /// both are waited out; with two at the root staging, the gate's second
+    /// change finds them spent, and the call settles with the typed refusal
+    /// at the gate after exactly three settled waits.
+    #[tokio::test(start_paused = true)]
+    async fn the_root_staging_and_the_gate_share_one_budget_of_free_rebuilds() {
+        let ms = std::time::Duration::from_millis;
+        assert_waited_and_entered(
+            "one change at the root staging, two at the gate",
+            &gated_entry_churn(vec![ms(10)], vec![ms(10), ms(10)]).await,
+            3,
+        );
+        assert_refused_at_the_gate(
+            "two changes at each staging",
+            &gated_entry_churn(vec![ms(10), ms(10)], vec![ms(10), ms(10)]).await,
+            3,
+        );
+    }
+
+    /// One review attempt's wait deadline (2 s from its first wait) is shared
+    /// by its root staging and the execution policy gate's staging: the
+    /// gate's wait ends at the deadline the root staging's first wait set,
+    /// so a change that outlasts it settles with the typed refusal at the
+    /// gate, never waiting past that deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_root_staging_and_the_gate_share_one_wait_deadline() {
+        let ms = std::time::Duration::from_millis;
+        assert_waited_and_entered(
+            "0.5 s at the root staging, then 1 s at the gate",
+            &gated_entry_churn(vec![ms(500)], vec![ms(1_000)]).await,
+            2,
+        );
+        let spent = gated_entry_churn(vec![ms(1_500)], vec![ms(1_000)]).await;
+        assert_refused_at_the_gate("1.5 s at the root staging, then 1 s at the gate", &spent, 1);
+        assert!(
+            spent.took >= ms(2_000) && spent.took < ms(2_100),
+            "the gate waits until the shared deadline, never past it: {:?}",
+            spent.took
+        );
     }
 
     /// The reviewed tool the body-entry check refused for a change that
@@ -6580,43 +6759,6 @@ mod governed_operation_tests {
     /// (with the same material) instead of reusing the earlier allow.
     #[tokio::test(start_paused = true)]
     async fn a_waited_body_entry_never_reuses_an_earlier_review() {
-        struct CountingAllow(std::sync::atomic::AtomicUsize);
-        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-        impl crate::approval::review::OperationReviewer for CountingAllow {
-            async fn review(
-                &self,
-                _candidate: &crate::approval::review::ReviewCandidate<'_>,
-            ) -> Result<
-                crate::approval::review::ReviewVerdict,
-                crate::approval::review::ReviewerFailure,
-            > {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::approval::review::ReviewVerdict::Allow)
-            }
-        }
-        /// The source-kind tools, entered at their reviewed leaf.
-        struct Reviewed(SourceKindDispatcher);
-        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl AgentToolDispatcher for Reviewed {
-            fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
-                self.0.tools()
-            }
-            fn review_entry_support(
-                &self,
-                _name: &str,
-            ) -> crate::approval::review::ReviewEntrySupport {
-                crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
-            }
-            async fn dispatch(
-                &self,
-                call: ToolCallView<'_>,
-            ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
-                self.0.dispatch(call).await
-            }
-        }
-
         // The entry's check, the post-review check and the verdict commit's
         // final check pass; the change begins after the third, before the
         // body entry.
