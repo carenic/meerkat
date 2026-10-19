@@ -550,7 +550,7 @@ jobs:
       # for a new test), and the commit hook that regenerates them is local
       # and never sees a merge commit. About 5 seconds.
       - name: Generated Bazel BUILD files are current
-        run: make buildbuddy-generate-check
+        run: node scripts/generate-bazel-rust-builds.mjs --check
 
       # Release binaries must compile no test-only code: the release builds
       # pass the release define, under which no target they link enables a

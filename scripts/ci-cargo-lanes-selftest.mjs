@@ -1660,7 +1660,7 @@ for (const path of [
   const nextStep = governance.findIndex((line, index) => index > freshness && /^      - /.test(line));
   assert.deepEqual(
     governance.slice(freshness + 1, nextStep === -1 ? governance.length : nextStep),
-    ["        run: make buildbuddy-generate-check"],
+    ["        run: node scripts/generate-bazel-rust-builds.mjs --check"],
     "the BUILD freshness step runs the generator's check and nothing else, on every run",
   );
   const stagger = jobLines(workflow, "stagger").join("\n");
