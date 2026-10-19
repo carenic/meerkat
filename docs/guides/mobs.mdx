@@ -1124,6 +1124,21 @@ available. 0.9.3 and earlier answered all of these with
 `ActorCommandChannelClosed`. A command sent while the actor exits after a
 Shutdown now fails instead of waiting forever.
 
+`shutdown_with_report(ShutdownOptions)` returns a `MobShutdownReport` with one
+`MemberShutdownOutcome` per member; `is_clean()` is true when every member was
+unregistered. Since 0.9.4 a member reported `UnregisterPending { stage,
+settlement, .. }` carries a `MemberUnregisterSettlement` that keeps following
+the member's exact runtime registration after Shutdown returns, also after the
+mob's actor exited: `try_state()` reads `Settled`, `Pending`, `Failed` or
+`HandedOver` without waiting, and `settle_within(deadline)` waits, admitting
+the unregister itself when Shutdown's deadline passed first. `HandedOver`
+means a later owner (a resumed mob, or any caller that reused or attached to
+the registration) took it over; the settlement then touches nothing. A member
+whose registration is durability-degraded is now unregistered after the
+runtime's reload-required discard (reported at stage
+`durability_reload_discard` while the runtime refuses the unregister until
+then); 0.9.3 and earlier left it registered until the process exited.
+
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the
 destroy is retried. A recorded placed lifecycle intent, such as a Reset, is not
