@@ -2060,14 +2060,36 @@ TAG_TRUSTED_WORKFLOWS = ("ci.yml", "release-semver-readiness.yml", "release.yml"
 RELEASE_RESTORE_JOBS: tuple[str, ...] = ()
 # The sccache setup every CI lane runs: the GCS objects it writes are what
 # the push to main compiles from before it attests, so only push and
-# schedule runs set the sccache client to write them (a client-side
-# setting: a later step can still read the job's GCS credentials file,
-# SCCACHE_GCS_KEY_PATH, whose identity can write). It installs a release
-# checked against a pinned sha256 itself, not through sccache-action, which
-# would export the job's Actions cache token to the run steps after it.
+# schedule runs, and a dispatch on a release branch (rel/** or release/**,
+# whose code only a writer can push, as for a push to release/**), set the
+# sccache client to write them (a client-side setting: a later step can
+# still read the job's GCS credentials file, SCCACHE_GCS_KEY_PATH, whose
+# identity can write). It installs a release checked against a pinned
+# sha256 itself, not through sccache-action, which would export the job's
+# Actions cache token to the run steps after it.
 SCCACHE_ACTION = "./.github/actions/setup-sccache-ci"
-SCCACHE_WRITERS = ("push", "schedule")
-SCCACHE_READERS = ("pull_request", "pull_request_target", "workflow_dispatch", "merge_group", "workflow_run")
+# The (event, ref) runs whose client writes, and those whose client only
+# reads: a dispatch on any other ref (main, a near-miss branch name, a tag)
+# and every other event, on a release branch's ref too.
+SCCACHE_WRITERS = (
+    ("push", "refs/heads/main"),
+    ("push", "refs/heads/release/next"),
+    ("schedule", "refs/heads/main"),
+    ("workflow_dispatch", "refs/heads/rel/next"),
+    ("workflow_dispatch", "refs/heads/release/next"),
+)
+SCCACHE_READERS = (
+    ("pull_request", "refs/pull/1/merge"),
+    ("pull_request", "refs/heads/rel/next"),
+    ("pull_request_target", "refs/heads/main"),
+    ("workflow_dispatch", "refs/heads/main"),
+    ("workflow_dispatch", "refs/heads/feature/rel/next"),
+    ("workflow_dispatch", "refs/heads/rel-next"),
+    ("workflow_dispatch", "refs/heads/released"),
+    ("workflow_dispatch", "refs/tags/v1.0.0"),
+    ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1"),
+    ("workflow_run", "refs/heads/rel/next"),
+)
 
 
 @dataclass(frozen=True)
@@ -2650,12 +2672,12 @@ def _sccache_problems(root: Path) -> list[str]:
         if mode is None:
             problems.append(f"{where} step `{step.name}` has no RW_MODE")
             continue
-        for event in (*SCCACHE_WRITERS, *SCCACHE_READERS):
-            got = _open_evaluate(mode, OpenFrame(label=f"a {event} run", event_name=event))
-            wanted = "READ_WRITE" if event in SCCACHE_WRITERS else "READ_ONLY"
+        for event, ref in (*SCCACHE_WRITERS, *SCCACHE_READERS):
+            got = _open_evaluate(mode, OpenFrame(label=f"a {event} run on {ref}", event_name=event, ref=ref))
+            wanted = "READ_WRITE" if (event, ref) in SCCACHE_WRITERS else "READ_ONLY"
             if got != wanted:
                 shown = "unknown" if isinstance(got, _Unknown) else got
-                problems.append(f"{where} gives a {event} run sccache mode {shown}, not {wanted}")
+                problems.append(f"{where} gives a {event} run on {ref} sccache mode {shown}, not {wanted}")
     return problems
 
 
@@ -2690,7 +2712,8 @@ def check_release_caches(text: str) -> list[str]:
     cache on a dispatch-like run at all: such runs only restore it. A
     workflow that produces what a tag run trusts (TAG_TRUSTED_WORKFLOWS),
     or that checks out a ref its inputs choose, saves no cache at all on a
-    dispatch-like run. Only push and schedule runs set the CI lanes' sccache
+    dispatch-like run. Only push and schedule runs, and a dispatch on a
+    release branch (rel/** or release/**), set the CI lanes' sccache
     client to write its bucket (a client-side setting, not a credential),
     and the lanes install a sha256-pinned sccache release themselves, so no
     step exports the Actions cache token to their run steps
