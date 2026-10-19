@@ -459,7 +459,10 @@ fn test_credential_store(
 /// grace (`RuntimeStopInProgress`). nextest runs each test in its own process
 /// and never shares the mutex. A test thread takes the permit with the first
 /// state it builds and keeps it until the thread exits, so a test that builds
-/// a second state (a restart) never waits on itself.
+/// a second state (a restart) never waits on itself. The permit belongs to the
+/// thread, so a test builds every state on its own thread: under a
+/// multi-thread runtime, a state built inside a spawned task (on a worker
+/// thread) would wait forever for the permit the test thread holds.
 #[cfg(test)]
 mod test_state_admission {
     use std::cell::RefCell;
