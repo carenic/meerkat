@@ -1,0 +1,400 @@
+==================== Test output for //:e2e_smoke_turbo_s_s98:
+e2e materialize setup (tests/live_smoke/browser): /bin/sh -c test -d node_modules || npm ci
+e2e materialize setup done (tests/live_smoke/browser) in 2.062s: /bin/sh -c test -d node_modules || npm ci
+e2e materialize setup (tests/live_smoke/browser): npx playwright install chromium
+e2e materialize setup done (tests/live_smoke/browser) in 4.248s: npx playwright install chromium
+e2e artifact manifest written: /build/_tmp/c3b9c0f778578cef341b8f6dd8b14fd5/meerkat-e2e-smoke-remote/artifact-manifest.json (1 specs, 2 requirements)
+e2e smoke scheduler: specs=1, jobs=1, media_jobs=1, mob_suite_jobs=1
+e2e smoke scheduler dispatch: 98 GPT Live public real-audio shared-host close/reopen and existing-member execution [Media]
+e2e lane start: 98 GPT Live public real-audio shared-host close/reopen and existing-member execution
+e2e command start: /build/bazel-out/k8-fastbuild/bin/e2e_smoke_turbo_s_s98.runfiles/_main/tests/integration/gpt_live_public_e2e_test e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen --ignored --nocapture
+e2e lane done: 98 GPT Live public real-audio shared-host close/reopen and existing-member execution in 84.243s
+error: 1 e2e-smoke spec(s) failed:
+- command failed after 83.956s (exit Some(101)): /build/bazel-out/k8-fastbuild/bin/e2e_smoke_turbo_s_s98.runfiles/_main/tests/integration/gpt_live_public_e2e_test e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen --ignored --nocapture
+
+running 1 test
+S98_EVIDENCE_JOURNAL path=/build/bazel-out/k8-fastbuild/testlogs/e2e_smoke_turbo_s_s98/test.outputs/s98/905aa050-13ad-48ff-abed-1b59d14b01c3/journal.jsonl
+GPT_LIVE_HOST_LOAD moment=open loadavg="unavailable"
+2026-10-19T06:20:24.916477Z  INFO meerkat_runtime::ops_lifecycle: RuntimeOpsLifecycleRegistry::ShellState creating dsl
+2026-10-19T06:20:24.916559Z  INFO meerkat_runtime::ops_lifecycle: RuntimeOpsLifecycleRegistry::ShellState created dsl
+2026-10-19T06:20:24.916564Z  INFO meerkat_runtime::ops_lifecycle: RuntimeOpsLifecycleRegistry::ShellState creating feed buffer feed_capacity=256
+2026-10-19T06:20:24.916568Z  INFO meerkat_runtime::ops_lifecycle: RuntimeOpsLifecycleRegistry::ShellState created feed buffer
+2026-10-19T06:20:24.916786Z  INFO meerkat_runtime::meerkat_machine: ops lifecycle authority selected from durable store session_id=01a152d1-83d1-7b72-ac7d-34f74dc3c35a runtime_id=rt:session:01a152d1-83d1-7b72-ac7d-34f74dc3c35a epoch_id=01a152d1-83d4-7f31-b1d4-2e3c80109208 recovered_ops=0 initialized=true
+2026-10-19T06:20:25.219748Z DEBUG meerkat::session_runtime::live_orchestration::orchestrator: live/open: mob-owned peer ingress already owns the session; skipping session-owned drain reconfigure session_id=01a152d1-83d1-7b72-ac7d-34f74dc3c35a owner=MobOwned { comms_runtime_id: CommsRuntimeId("comms-runtime-0x9771a8f10"), mob_id: MobId("gpt-live-public-e2e-21109") }
+2026-10-19T06:20:28.927374Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=Ready outcome=StatusUpdated(Ready)
+2026-10-19T06:20:29.761794Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:30.465055Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=1200.0 end_ms=1400.0
+2026-10-19T06:20:30.465130Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=1600
+2026-10-19T06:20:30.465139Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:30.465578Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:30.465593Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:30.465608Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:30.853325Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=1600.0 end_ms=1800.0
+2026-10-19T06:20:30.853346Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2000
+2026-10-19T06:20:30.853353Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:30.853375Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:30.853391Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:31.250380Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2000.0 end_ms=2200.0
+2026-10-19T06:20:31.250399Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2400
+2026-10-19T06:20:31.250407Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:31.250430Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:31.250447Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:31.697161Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2400.0 end_ms=2600.0
+2026-10-19T06:20:31.697181Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2800
+2026-10-19T06:20:31.697190Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:31.697217Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:31.697234Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:31.861055Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2600.0 end_ms=2800.0
+2026-10-19T06:20:31.861077Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=3000
+2026-10-19T06:20:31.861085Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:31.861110Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:31.861127Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:32.759369Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:33.058335Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=3800.0 end_ms=4000.0
+2026-10-19T06:20:33.058357Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=4200
+2026-10-19T06:20:33.058366Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:33.058393Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:33.058411Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:33.464554Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=4200.0 end_ms=4400.0
+2026-10-19T06:20:33.464578Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=4600
+2026-10-19T06:20:33.464586Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:33.464610Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:33.464628Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:33.856959Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=4600.0 end_ms=4800.0
+2026-10-19T06:20:33.856980Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=5000
+2026-10-19T06:20:33.856989Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:33.857015Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:33.857033Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:34.260450Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=5000.0 end_ms=5200.0
+2026-10-19T06:20:34.260471Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=5400
+2026-10-19T06:20:34.260480Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:34.260504Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:34.260522Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:34.862476Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=5600.0 end_ms=5800.0
+2026-10-19T06:20:34.862498Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=6000
+2026-10-19T06:20:34.862507Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:34.862533Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:34.862551Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:35.456253Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6200.0 end_ms=6400.0
+2026-10-19T06:20:35.456276Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=6600
+2026-10-19T06:20:35.456285Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:35.456309Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:35.456331Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:35.951876Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6600.0 end_ms=6800.0
+2026-10-19T06:20:35.951897Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=7000
+2026-10-19T06:20:35.951905Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:35.951930Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:35.951947Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:35.953461Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:1 role=User
+2026-10-19T06:20:35.953572Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_finished", payload: "<redacted>" }
+2026-10-19T06:20:35.954025Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:35.954194Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:35.954205Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:35.956578Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=UserTranscriptFinal { provider_item_id: Some("experimental-gpt-live-user-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:1"), previous_item_id: None, content_index: Some(0), text: " Please remember the code word tangerine .Just say okay, nothing else" } outcome=TranscriptAppended
+2026-10-19T06:20:35.956607Z  INFO meerkat::experimental_gpt_live: live user turn applied to the transcript channel=f03bc1ad-9310-48e4-97e8-4d59a54a58ec item_id=experimental-gpt-live-user-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:1
+2026-10-19T06:20:35.967679Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantOutputStarted { provider_turn_ref: "live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", content_index: 0 } outcome=AssistantOutputAvailable(LiveAssistantOutputAddress { channel_id: LiveChannelId("f03bc1ad-9310-48e4-97e8-4d59a54a58ec"), output_id: "caac4f5f-4b68-4e44-9347-3025f7371ab9", content_index: 0 })
+GPT_LIVE_PUBLIC_AUDIO phase=remember evidence=AudioEvidence { decoded_non_silent_frames: 7200, decoded_non_silent_seconds: 0.15, non_silent_frames: 3, total_audio_energy: Some(0.0), total_samples_received: Some(335040), total_samples_duration: Some(7.759999999999879), bytes_received: 27268, packets_received: 346 }
+2026-10-19T06:20:36.288414Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantPlaybackTerminalObserved { interaction_id: InteractionId(c51fb325-75ce-4734-91d2-fc55b9dfb656), provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", content_index: 0, response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", evidence: CallerConfirmedSnapshot(" Okay."), stop_reason: EndTurn, usage: TurnUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_creation_tokens: None, cache_read_tokens: None, reasoning_tokens: None, provider_accounting: None }, accounting: ProviderTokenAccounting { provider: OpenAI, model: "gpt-live-1", presented_tokens: 0, convention: HostDeclaredInclusiveInputTotal, aggregation: ProviderInclusiveInputTotal } } } outcome=PlaybackTerminalSettled { interaction_id: InteractionId(c51fb325-75ce-4734-91d2-fc55b9dfb656), item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:2", content_index: 0 }
+2026-10-19T06:20:36.562495Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_speech_over_assistant", payload: "<redacted>" }
+2026-10-19T06:20:36.759726Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:37.453775Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=8200.0 end_ms=8400.0
+2026-10-19T06:20:37.453801Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:2 role=Assistant
+2026-10-19T06:20:37.453811Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=8600
+2026-10-19T06:20:37.453820Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_finished", payload: "<redacted>" }
+2026-10-19T06:20:37.453866Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:37.454235Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:37.454247Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:37.454260Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:37.904773Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_playback_restorable", payload: "<redacted>" }
+2026-10-19T06:20:37.907480Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=8600.0 end_ms=8800.0
+2026-10-19T06:20:37.907494Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=9000
+2026-10-19T06:20:37.907503Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:37.907521Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:37.907538Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:38.342669Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=9000.0 end_ms=9200.0
+2026-10-19T06:20:38.342697Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=9400
+2026-10-19T06:20:38.342708Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:38.342737Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:38.342759Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:38.448939Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=9200.0 end_ms=9400.0
+2026-10-19T06:20:38.448961Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=9600
+2026-10-19T06:20:38.448970Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:38.448995Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:38.449013Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:38.858875Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=9600.0 end_ms=9800.0
+2026-10-19T06:20:38.858895Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=10000
+2026-10-19T06:20:38.858903Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:38.858927Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:38.858944Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:39.268506Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=50
+2026-10-19T06:20:39.271201Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=10000.0 end_ms=10200.0
+2026-10-19T06:20:39.271213Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=10400
+2026-10-19T06:20:39.271221Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:39.271246Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:39.271265Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:39.655296Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=10400.0 end_ms=10600.0
+2026-10-19T06:20:39.655319Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=10800
+2026-10-19T06:20:39.655327Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:39.655352Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:39.655372Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:40.091416Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=10800.0 end_ms=11000.0
+2026-10-19T06:20:40.091438Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=11200
+2026-10-19T06:20:40.091447Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:40.091474Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:40.091493Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:40.278733Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=11000.0 end_ms=11200.0
+2026-10-19T06:20:40.278754Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=11400
+2026-10-19T06:20:40.278762Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:40.278787Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:40.278805Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:40.658985Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=11400.0 end_ms=11600.0
+2026-10-19T06:20:40.659007Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=11800
+2026-10-19T06:20:40.659015Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:40.659042Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:40.659061Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:41.159681Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=11800.0 end_ms=12000.0
+2026-10-19T06:20:41.159702Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=400 measured_at_reflected_clock_ms=12400
+2026-10-19T06:20:41.159710Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:41.159735Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:41.159753Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:41.161525Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:3 role=User
+2026-10-19T06:20:41.161538Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_finished", payload: "<redacted>" }
+2026-10-19T06:20:41.161911Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:41.162113Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:41.162124Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:41.164562Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=UserTranscriptFinal { provider_item_id: Some("experimental-gpt-live-user-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:3"), previous_item_id: None, content_index: Some(0), text: " Please reply briefly with voice channel ready; this is a simple greeting" } outcome=TranscriptAppended
+2026-10-19T06:20:41.164570Z  INFO meerkat::experimental_gpt_live: live user turn applied to the transcript channel=f03bc1ad-9310-48e4-97e8-4d59a54a58ec item_id=experimental-gpt-live-user-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:3
+2026-10-19T06:20:41.175645Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantOutputStarted { provider_turn_ref: "live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", content_index: 0 } outcome=AssistantOutputAvailable(LiveAssistantOutputAddress { channel_id: LiveChannelId("f03bc1ad-9310-48e4-97e8-4d59a54a58ec"), output_id: "a438a8d2-194f-4ba1-9af6-cb8f3f1ea6e9", content_index: 0 })
+GPT_LIVE_PUBLIC_AUDIO phase=greeting evidence=AudioEvidence { decoded_non_silent_frames: 13920, decoded_non_silent_seconds: 0.2900000000000001, non_silent_frames: 7, total_audio_energy: Some(0.0), total_samples_received: Some(569760), total_samples_duration: Some(12.649999999999777), bytes_received: 44992, packets_received: 577 }
+2026-10-19T06:20:41.188588Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantPlaybackTerminalObserved { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", content_index: 0, response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", evidence: CallerConfirmedSnapshot(" voice channel"), stop_reason: EndTurn, usage: TurnUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_creation_tokens: None, cache_read_tokens: None, reasoning_tokens: None, provider_accounting: None }, accounting: ProviderTokenAccounting { provider: OpenAI, model: "gpt-live-1", presented_tokens: 0, convention: HostDeclaredInclusiveInputTotal, aggregation: ProviderInclusiveInputTotal } } } outcome=PlaybackTerminalSettled { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", content_index: 0 }
+2026-10-19T06:20:41.555534Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:41.555573Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:41.558756Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantOutputStarted { provider_turn_ref: "live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:1", provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:1", content_index: 0 } outcome=AssistantOutputAvailable(LiveAssistantOutputAddress { channel_id: LiveChannelId("f03bc1ad-9310-48e4-97e8-4d59a54a58ec"), output_id: "0c887d5c-bcbd-4a5e-b596-aeb87ea14e6b", content_index: 0 })
+2026-10-19T06:20:41.567617Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantPlaybackTerminalObserved { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:1", content_index: 0, response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:1", evidence: CallerConfirmedSnapshot(" ready."), stop_reason: EndTurn, usage: TurnUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_creation_tokens: None, cache_read_tokens: None, reasoning_tokens: None, provider_accounting: None }, accounting: ProviderTokenAccounting { provider: OpenAI, model: "gpt-live-1", presented_tokens: 0, convention: HostDeclaredInclusiveInputTotal, aggregation: ProviderInclusiveInputTotal } } } outcome=PlaybackTerminalSettled { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:1", content_index: 0 }
+2026-10-19T06:20:41.949580Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:41.949617Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:41.952975Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantOutputStarted { provider_turn_ref: "live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4", response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:2", provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:2", content_index: 0 } outcome=AssistantOutputAvailable(LiveAssistantOutputAddress { channel_id: LiveChannelId("f03bc1ad-9310-48e4-97e8-4d59a54a58ec"), output_id: "ccb3b294-993d-4f45-bde0-7b07d76b04bc", content_index: 0 })
+2026-10-19T06:20:41.962560Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantPlaybackTerminalObserved { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:2", content_index: 0, response_id: "experimental-gpt-live-response:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:2", evidence: CallerConfirmedSnapshot(" Hi!"), stop_reason: EndTurn, usage: TurnUsage { usage: Usage { input_tokens: 0, output_tokens: 0, cache_creation_tokens: None, cache_read_tokens: None, reasoning_tokens: None, provider_accounting: None }, accounting: ProviderTokenAccounting { provider: OpenAI, model: "gpt-live-1", presented_tokens: 0, convention: HostDeclaredInclusiveInputTotal, aggregation: ProviderInclusiveInputTotal } } } outcome=PlaybackTerminalSettled { interaction_id: InteractionId(409ee0ba-9790-42ca-b635-33997415b486), item_id: "experimental-gpt-live-item:live-turn-v1:36:f03bc1ad-9310-48e4-97e8-4d59a54a58ecturn:4:segment:2", content_index: 0 }
+2026-10-19T06:20:42.162308Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:43.159414Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:44.162891Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:44.977097Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="validate_close_custody"
+2026-10-19T06:20:44.977201Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="validate_close_custody" elapsed_ms=0
+2026-10-19T06:20:44.977213Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="revoke_close_custody"
+2026-10-19T06:20:44.977801Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="revoke_close_custody" elapsed_ms=0
+2026-10-19T06:20:44.977827Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_live_channel"
+2026-10-19T06:20:44.977888Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_experimental"
+2026-10-19T06:20:44.978015Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="revoke_bound_close_custody"
+2026-10-19T06:20:44.978346Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="revoke_bound_close_custody" elapsed_ms=0
+2026-10-19T06:20:44.978365Z  INFO meerkat::live_close: live projections for the closing channel no longer wait behind the member turn boundary channel=f03bc1ad-9310-48e4-97e8-4d59a54a58ec step="release_projection_waiters"
+2026-10-19T06:20:44.978373Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="physical_close"
+2026-10-19T06:20:44.978399Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_exact"
+2026-10-19T06:20:44.978413Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="operations_lock"
+2026-10-19T06:20:44.978418Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="operations_lock" elapsed_ms=0
+2026-10-19T06:20:44.978437Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="quiet_append_pending"
+2026-10-19T06:20:44.978446Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="quiet_append_pending" elapsed_ms=0
+2026-10-19T06:20:44.978484Z  INFO meerkat::live_close: live close step started channel="-" step="sideband_close"
+2026-10-19T06:20:44.979045Z  INFO meerkat::live_close: live close step finished channel="-" step="sideband_close" elapsed_ms=0
+2026-10-19T06:20:45.201095Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:45.430708Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:4 role=Assistant
+2026-10-19T06:20:45.430738Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_finished", payload: "<redacted>" }
+2026-10-19T06:20:45.430938Z  WARN meerkat::experimental_gpt_live: experimental live adapter observation stream ended
+2026-10-19T06:20:45.430991Z  INFO meerkat_mob_mcp::live_delegation: live delegation channel loop ended: the observation stream ended channel_id=f03bc1ad-9310-48e4-97e8-4d59a54a58ec
+2026-10-19T06:20:45.431173Z  INFO meerkat::live_close: live close drain slice observed channel=f03bc1ad-9310-48e4-97e8-4d59a54a58ec step="drain_slice" settled=true close_accepted=true close_request_resolved=true provider_stream_ended=true
+2026-10-19T06:20:45.431187Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="retirement_lock"
+2026-10-19T06:20:45.431193Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="retirement_lock" elapsed_ms=0
+2026-10-19T06:20:45.431209Z  INFO meerkat::live_close: live close step started channel="-" step="retirement_task"
+2026-10-19T06:20:45.431478Z  INFO meerkat::live_close: live close step finished channel="-" step="retirement_task" elapsed_ms=0
+2026-10-19T06:20:45.431491Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_exact" elapsed_ms=453
+2026-10-19T06:20:45.431498Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="await_physical_retirement"
+2026-10-19T06:20:45.431502Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="await_physical_retirement" elapsed_ms=0
+2026-10-19T06:20:45.431509Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="physical_close" elapsed_ms=453
+2026-10-19T06:20:45.431525Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="quiesce_context_outbox"
+2026-10-19T06:20:45.431905Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="quiesce_context_outbox" elapsed_ms=0
+2026-10-19T06:20:45.431912Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="lifecycle_lease"
+2026-10-19T06:20:45.431919Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="lifecycle_lease" elapsed_ms=0
+2026-10-19T06:20:45.431970Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_verb"
+2026-10-19T06:20:45.432018Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="reserve_close_observation"
+2026-10-19T06:20:45.432029Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="reserve_close_observation" elapsed_ms=0
+2026-10-19T06:20:45.432034Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="prepare_physical_close"
+2026-10-19T06:20:45.432051Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="adapter_close"
+2026-10-19T06:20:45.432058Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="adapter_close" elapsed_ms=0
+2026-10-19T06:20:45.432064Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="prepare_physical_close" elapsed_ms=0
+2026-10-19T06:20:45.432070Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="commit_target"
+2026-10-19T06:20:45.432075Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="commit_target" elapsed_ms=0
+2026-10-19T06:20:45.432143Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="owned_commit_task"
+2026-10-19T06:20:45.432320Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="settlement"
+2026-10-19T06:20:45.434768Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="settlement" elapsed_ms=2
+2026-10-19T06:20:45.434781Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="resolve_close_result"
+2026-10-19T06:20:45.435308Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="resolve_close_result" elapsed_ms=0
+2026-10-19T06:20:45.435320Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="commit_close"
+2026-10-19T06:20:45.435352Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="commit_close" elapsed_ms=0
+2026-10-19T06:20:45.435478Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="owned_commit_task" elapsed_ms=3
+2026-10-19T06:20:45.435487Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_verb" elapsed_ms=3
+2026-10-19T06:20:45.435507Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="report_terminal"
+2026-10-19T06:20:45.435512Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="report_terminal" elapsed_ms=0
+2026-10-19T06:20:45.435519Z  INFO meerkat::live_close: live close step started channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="unbind_channel"
+2026-10-19T06:20:45.435585Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="unbind_channel" elapsed_ms=0
+2026-10-19T06:20:45.435593Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_experimental" elapsed_ms=457
+2026-10-19T06:20:45.435601Z  INFO meerkat::live_close: live close step finished channel="f03bc1ad-9310-48e4-97e8-4d59a54a58ec" step="close_live_channel" elapsed_ms=457
+GPT_LIVE_PUBLIC_EXACT_CLOSE elapsed_ms=458 ceiling_ms=5000
+2026-10-19T06:20:45.452970Z DEBUG meerkat::session_runtime::live_orchestration::orchestrator: live/open: mob-owned peer ingress already owns the session; skipping session-owned drain reconfigure session_id=01a152d1-83d1-7b72-ac7d-34f74dc3c35a owner=MobOwned { comms_runtime_id: CommsRuntimeId("comms-runtime-0x9771a8f10"), mob_id: MobId("gpt-live-public-e2e-21109") }
+2026-10-19T06:20:47.794033Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=Ready outcome=StatusUpdated(Ready)
+2026-10-19T06:20:48.611627Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:48.969131Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=800.0 end_ms=1000.0
+2026-10-19T06:20:48.969156Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=1200
+2026-10-19T06:20:48.969169Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:48.969589Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:48.969605Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:48.969619Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:49.382633Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=1200.0 end_ms=1400.0
+2026-10-19T06:20:49.382655Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=1600
+2026-10-19T06:20:49.382663Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:49.382690Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:49.382708Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:49.558930Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=1400.0 end_ms=1600.0
+2026-10-19T06:20:49.558951Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=1800
+2026-10-19T06:20:49.558960Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:49.558985Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:49.559003Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:50.198659Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2000.0 end_ms=2200.0
+2026-10-19T06:20:50.198680Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2400
+2026-10-19T06:20:50.198689Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:50.198716Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:50.198735Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:50.392242Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2200.0 end_ms=2400.0
+2026-10-19T06:20:50.392263Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2600
+2026-10-19T06:20:50.392272Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:50.392300Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:50.392319Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:50.543786Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2400.0 end_ms=2600.0
+2026-10-19T06:20:50.543806Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=2800
+2026-10-19T06:20:50.543814Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:50.543839Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:50.543857Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:50.974639Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=2800.0 end_ms=3000.0
+2026-10-19T06:20:50.974659Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=3200
+2026-10-19T06:20:50.974667Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:50.974691Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:50.974709Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:51.193467Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=3000.0 end_ms=3200.0
+2026-10-19T06:20:51.193485Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=3400
+2026-10-19T06:20:51.193493Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:51.193514Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:51.193530Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:51.350365Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=3200.0 end_ms=3400.0
+2026-10-19T06:20:51.350384Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=3600
+2026-10-19T06:20:51.350391Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:51.350413Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:51.350429Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:51.779994Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=3600.0 end_ms=3800.0
+2026-10-19T06:20:51.780020Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=4000
+2026-10-19T06:20:51.780028Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:51.780057Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:51.780076Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:52.346043Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=4200.0 end_ms=4400.0
+2026-10-19T06:20:52.346065Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=4600
+2026-10-19T06:20:52.346072Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:52.346097Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:52.346116Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:53.209401Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:53.548917Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=5400.0 end_ms=5600.0
+2026-10-19T06:20:53.548937Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=5800
+2026-10-19T06:20:53.548945Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:53.548972Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:53.548991Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:54.186453Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6000.0 end_ms=6200.0
+2026-10-19T06:20:54.186478Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=6400
+2026-10-19T06:20:54.186487Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:54.186520Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:54.186540Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:54.396791Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6200.0 end_ms=6400.0
+2026-10-19T06:20:54.396809Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=6600
+2026-10-19T06:20:54.396817Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:54.396843Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:54.396860Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:54.559898Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6400.0 end_ms=6600.0
+2026-10-19T06:20:54.559918Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=200 measured_at_reflected_clock_ms=6800
+2026-10-19T06:20:54.559926Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:54.559953Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:54.559971Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:55.091482Z DEBUG meerkat_openai::public_live: public Live input transcript delta span start_ms=6800.0 end_ms=7000.0
+2026-10-19T06:20:55.091501Z DEBUG meerkat_openai::public_live: public Live provider input latency backlog_ms=400 measured_at_reflected_clock_ms=7400
+2026-10-19T06:20:55.091509Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "user_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:55.091534Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:55.091552Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:55.277087Z  INFO meerkat_openai::public_live: public Live provider turn finished; queued for the transcript projection turn=public-live-turn:1 role=User
+2026-10-19T06:20:55.277111Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_finished", payload: "<redacted>" }
+2026-10-19T06:20:55.277521Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_started", payload: "<redacted>" }
+2026-10-19T06:20:55.277712Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:55.277723Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:55.280478Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=UserTranscriptFinal { provider_item_id: Some("experimental-gpt-live-user-item:live-turn-v1:36:fd32e2b3-8606-4411-b837-879b39a04f99turn:1"), previous_item_id: None, content_index: Some(0), text: "What was the code word I asked you to remember earlier? Say only the code word" } outcome=TranscriptAppended
+2026-10-19T06:20:55.280487Z  INFO meerkat::experimental_gpt_live: live user turn applied to the transcript channel=fd32e2b3-8606-4411-b837-879b39a04f99 item_id=experimental-gpt-live-user-item:live-turn-v1:36:fd32e2b3-8606-4411-b837-879b39a04f99turn:1
+2026-10-19T06:20:55.287937Z DEBUG meerkat::experimental_gpt_live: live adapter observation applied observation=AssistantOutputStarted { provider_turn_ref: "live-turn-v1:36:fd32e2b3-8606-4411-b837-879b39a04f99turn:2", response_id: "experimental-gpt-live-response:live-turn-v1:36:fd32e2b3-8606-4411-b837-879b39a04f99turn:2", provider_item_id: "experimental-gpt-live-item:live-turn-v1:36:fd32e2b3-8606-4411-b837-879b39a04f99turn:2", content_index: 0 } outcome=AssistantOutputAvailable(LiveAssistantOutputAddress { channel_id: LiveChannelId("fd32e2b3-8606-4411-b837-879b39a04f99"), output_id: "f5f40967-1646-48d9-8334-9020f7861818", content_index: 0 })
+2026-10-19T06:20:55.445439Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "assistant_transcript_fragment", payload: "<redacted>" }
+2026-10-19T06:20:55.445471Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "turn_snapshot_delta", payload: "<redacted>" }
+2026-10-19T06:20:56.009401Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:57.011768Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:58.009612Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:20:58.649020Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=50
+2026-10-19T06:20:59.013509Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:00.010393Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:01.011840Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:02.009341Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:03.014080Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:04.009239Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:05.011517Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:06.009303Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:07.011922Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:08.009576Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:08.540855Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=100
+2026-10-19T06:21:09.011700Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:10.009272Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:11.011701Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:12.008873Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:13.011451Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:14.009803Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:15.012447Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:16.008963Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:17.012065Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:18.009015Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:18.753841Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=150
+2026-10-19T06:21:19.011857Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:20.008900Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:21.011794Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:22.009471Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:23.011671Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:24.009162Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+test e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen has been running for over 60 seconds
+2026-10-19T06:21:25.012297Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:26.009582Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:27.013527Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:28.015311Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:28.801029Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=200
+2026-10-19T06:21:29.012711Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:30.009316Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:31.011865Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:32.010907Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:33.016901Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:34.009248Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:35.012121Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:36.009205Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:37.012120Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:38.014904Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:38.758480Z DEBUG meerkat_openai::public_live: public Live sideband reflected output audio frames=250
+2026-10-19T06:21:39.015224Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+2026-10-19T06:21:40.009830Z DEBUG meerkat_openai::public_live: public Live lowered a sideband observation observation=GptLiveBrokerObservation { kind: "provider_input_latency", payload: "<redacted>" }
+test e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen ... FAILED
+
+failures:
+
+failures:
+    e2e_scenario_98_gpt_live_public_playback_settlement_and_reopen
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 122 filtered out; finished in 75.76s
+
+
+--- stderr ---
+Error: "timed out waiting for spoken output; decoded_frames=2552640, decoded_non_silent_frames=0, max_decoded_rms=0.000289, processor_supported=true, processor_errors=0, sampled_frames=1063, non_silent_frames=0, max_rms=0.000166, bytes_received=187764, packets_received=2577, total_audio_energy=Some(0.0), total_samples_received=Some(2508960)"
+
+================================================================================
