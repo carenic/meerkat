@@ -6420,6 +6420,159 @@ mod governed_operation_tests {
         }
     }
 
+    /// A work owner whose decisions begin one owner change, held for the
+    /// next scripted duration, each time an entry staging records its entry
+    /// at a boundary with changes left: that staging's final check then finds
+    /// the change in progress and refuses to rebuild.
+    struct EntryChurnWork {
+        sequence: Arc<std::sync::atomic::AtomicU64>,
+        /// Holds of the changes left for root stagings (`ToolDispatch`) and
+        /// for the execution policy gate's stagings (`ToolExecutionPolicy`).
+        root: Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Duration>>>,
+        gate: Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Duration>>>,
+    }
+
+    struct EntryChurnPrepared {
+        sequence: Arc<std::sync::atomic::AtomicU64>,
+        at: u64,
+        root: Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Duration>>>,
+        gate: Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Duration>>>,
+    }
+
+    impl EntryChurnWork {
+        fn new(root: Vec<std::time::Duration>, gate: Vec<std::time::Duration>) -> Arc<Self> {
+            Arc::new(Self {
+                sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                root: Arc::new(std::sync::Mutex::new(root.into())),
+                gate: Arc::new(std::sync::Mutex::new(gate.into())),
+            })
+        }
+    }
+
+    impl WorkAuthorization for EntryChurnWork {
+        fn owner_change_in_progress(&self) -> Option<crate::authorization::OwnerChangeInProgress> {
+            let sequence = self.sequence.load(Ordering::SeqCst);
+            (sequence % 2 == 1).then(|| {
+                crate::authorization::OwnerChangeInProgress::new(uuid::Uuid::nil(), sequence)
+            })
+        }
+
+        fn prepare(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+            let at = self.sequence.load(Ordering::SeqCst);
+            if at % 2 == 1 {
+                return Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into());
+            }
+            Ok(Arc::new(EntryChurnPrepared {
+                sequence: Arc::clone(&self.sequence),
+                at,
+                root: Arc::clone(&self.root),
+                gate: Arc::clone(&self.gate),
+            }))
+        }
+    }
+
+    impl PreparedOperationAuthorization for EntryChurnPrepared {
+        fn review_tier(&self) -> crate::authorization::OperationReviewTier {
+            crate::authorization::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<(), OperationAuthorizationError> {
+            if self.sequence.load(Ordering::SeqCst) != self.at {
+                return Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into());
+            }
+            Ok(())
+        }
+
+        fn observe(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+            event: OperationObservation,
+        ) -> Result<(), OperationObservationError> {
+            let script = match event {
+                OperationObservation::Entry(
+                    crate::authorization::OperationEntryBoundary::ToolDispatch,
+                ) => Some(&self.root),
+                OperationObservation::Entry(
+                    crate::authorization::OperationEntryBoundary::ToolExecutionPolicy,
+                ) => Some(&self.gate),
+                _ => None,
+            };
+            if let Some(hold) = script.and_then(|script| script.lock().unwrap().pop_front()) {
+                begin_change(&self.sequence, hold);
+            }
+            Ok(())
+        }
+    }
+
+    /// One review attempt's owner-change wait state is shared by its root
+    /// staging and the execution policy gate's staging: changes spread over
+    /// both spend one budget of free rebuilds and one deadline, and past
+    /// either the call settles with the typed refusal instead of waiting
+    /// again, before any body runs.
+    #[tokio::test(start_paused = true)]
+    async fn the_root_staging_and_the_gate_share_one_attempt_wait_state() {
+        let ms = std::time::Duration::from_millis;
+        // (holds of the changes at the root staging, at the gate's staging,
+        // whether the call enters)
+        for (root, gate, enters) in [
+            // Three settled waits in all: within the one budget.
+            (vec![ms(10)], vec![ms(10), ms(10)], true),
+            // A fourth change: the gate finds the shared free rebuilds spent.
+            (vec![ms(10), ms(10)], vec![ms(10), ms(10)], false),
+            // The gate's change outlasts the deadline the root staging's
+            // first wait set (2 s from then).
+            (vec![ms(1_500)], vec![ms(1_000)], false),
+        ] {
+            let case = format!("root {root:?}, gate {gate:?}");
+            let work = EntryChurnWork::new(root, gate);
+            let inner = Arc::new(SourceKindDispatcher::default());
+            let gated: Arc<dyn AgentToolDispatcher> =
+                Arc::new(crate::ExecutionPolicyGatedDispatcher::new(
+                    Arc::clone(&inner),
+                    crate::ToolExecutionPolicy::unrestricted(),
+                ));
+            let context = ToolDispatchContext::default().with_work_authorization(Some(
+                crate::WorkAuthorizationContext::new(
+                    Arc::clone(&work) as Arc<dyn WorkAuthorization>,
+                    crate::OperationExecutionScope::Domain,
+                ),
+            ));
+            let started = tokio::time::Instant::now();
+            let result = fenced(&gated, "read_file", &context).await;
+            if enters {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_ok_and(|outcome| !outcome.result.is_error),
+                    "{case}: every change waited out, then entered: {result:?}"
+                );
+                assert_eq!(
+                    inner.0.load(Ordering::SeqCst),
+                    1,
+                    "{case}: the body ran once"
+                );
+            } else {
+                assert!(
+                    matches!(&result, Err(crate::ToolError::AuthorizationRefused { refusal })
+                        if refusal.kind() == OperationRefusalKind::ReprepareRequired),
+                    "{case}: the shared wait state is spent, typed refusal: {result:?}"
+                );
+                assert_eq!(inner.0.load(Ordering::SeqCst), 0, "{case}: no body ran");
+                assert!(
+                    started.elapsed() < std::time::Duration::from_millis(2_100),
+                    "{case}: never waits past the shared 2 s: {:?}",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+
     /// The reviewed tool the body-entry check refused for a change that
     /// began after its review: the wait ends with a decision prepared from
     /// current owners, the review check point finds the reviewed one
