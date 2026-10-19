@@ -1960,18 +1960,17 @@ fn schedule_completion_from_runtime_completion(
 }
 
 fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryCompletionFailureReason {
-    match error {
-        CompletionWaitError::ChannelClosed => {
+    use meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation;
+    match error.wait_failure_observation() {
+        Some(RuntimeCompletionWaitFailureObservation::ChannelClosed) => {
             DeliveryCompletionFailureReason::RuntimeCompletionChannelClosed
         }
-        CompletionWaitError::AttachmentReplaced | CompletionWaitError::AuthorityUnavailable(_) => {
+        Some(RuntimeCompletionWaitFailureObservation::AuthorityUnavailable) => {
             DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable
         }
-        // Only reached for an observation that carries no payload, which a
-        // refusal never has.
-        CompletionWaitError::DisclosureRefused { .. } => {
-            DeliveryCompletionFailureReason::CompletionFutureFailed
-        }
+        // A disclosure refusal is no wait failure. It is only reached for an
+        // observation that carries no payload, which a refusal never has.
+        None => DeliveryCompletionFailureReason::CompletionFutureFailed,
     }
 }
 

@@ -1215,11 +1215,15 @@ pub use agent_mandate::{
 };
 pub(crate) mod scoped_context;
 mod session_management;
+mod session_mutation_gate;
 mod terminal_receipt;
 mod traits;
 mod visibility;
 
 pub(crate) use durability_health::{DurabilityHealthHandle, DurabilityReloadRequired};
+pub(crate) use session_mutation_gate::{
+    SessionMutationGate, SessionMutationGateWait, SettledGateWait, WeakSessionMutationGate,
+};
 
 pub(crate) use session_management::{
     DeleteOpsFinalizationAuthority, RetainOpsFinalizationAuthority,
@@ -1602,18 +1606,10 @@ struct RuntimeSessionEntry {
     /// This is a public-result fact only and never substitutes for cleanup
     /// ownership.
     archive_recovered_from_quiescent: bool,
-    /// Per-session mutation gate.
-    ///
-    /// Serializes same-session mutating commands across the full
-    /// DSL-stage → driver-mutate → DSL-sync span. Without this gate,
-    /// two concurrent commands on the same session can interleave between
-    /// the DSL projection sync (which releases `sessions` lock) and the
-    /// driver mutation (which acquires `driver` lock independently).
-    ///
-    /// This is NOT a replacement for `sessions` RwLock or `driver` Mutex —
-    /// it is an additional serialization point that spans the entire
-    /// multi-step mutation window.
-    mutation_gate: Arc<Mutex<()>>,
+    /// Per-session mutation gate (M). It carries this entry's
+    /// `durability_health`, so every copy of it can end a live wait on the
+    /// session's degradation (see [`SessionMutationGate`]).
+    mutation_gate: SessionMutationGate,
     /// Shared fail-closed durability gate for persistent sessions.
     ///
     /// The persistent driver degrades this exact handle when its live shell can
@@ -1809,7 +1805,7 @@ struct PreparedArchiveSessionRegistration {
 #[derive(Clone)]
 struct MemberIncarnationRegistration {
     incarnation: meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
     tracked_turn_journal: Option<Arc<dyn crate::member_observation::TrackedTurnJournal>>,
 }
 
@@ -1817,7 +1813,7 @@ struct MemberIncarnationRegistration {
 struct DirectMemberIncarnationRegistration {
     fence: meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
     runtime_epoch_id: meerkat_core::RuntimeEpochId,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
 }
 
 enum MemberResidencyState {
@@ -1843,7 +1839,7 @@ struct MemberResidencySlot {
 struct MemberEffectAuthorityLease {
     slot: Arc<MemberResidencySlot>,
     slot_guard: crate::tokio::sync::OwnedMutexGuard<()>,
-    session_mutation_gate: Arc<Mutex<()>>,
+    session_mutation_gate: SessionMutationGate,
 }
 
 /// Exact effect interval for a host-member residency. The stable residency
@@ -2236,7 +2232,7 @@ pub struct RuntimeSessionRegistrationWitness {
     machine: std::sync::Weak<MeerkatMachineShared>,
     session_id: SessionId,
     epoch_id: meerkat_core::RuntimeEpochId,
-    registration_gate: std::sync::Weak<Mutex<()>>,
+    registration_gate: WeakSessionMutationGate,
 }
 
 impl RuntimeSessionRegistrationWitness {
@@ -2244,7 +2240,7 @@ impl RuntimeSessionRegistrationWitness {
         machine: std::sync::Weak<MeerkatMachineShared>,
         session_id: SessionId,
         epoch_id: meerkat_core::RuntimeEpochId,
-        registration_gate: std::sync::Weak<Mutex<()>>,
+        registration_gate: WeakSessionMutationGate,
     ) -> Self {
         Self {
             machine,
@@ -2284,10 +2280,10 @@ impl RuntimeSessionRegistrationWitness {
     fn matches_entry(&self, entry: &RuntimeSessionEntry) -> bool {
         self.registration_gate
             .upgrade()
-            .is_some_and(|gate| Arc::ptr_eq(&gate, &entry.mutation_gate))
+            .is_some_and(|gate| gate.same_gate(&entry.mutation_gate))
     }
 
-    fn registration_gate(&self) -> Option<Arc<Mutex<()>>> {
+    fn registration_gate(&self) -> Option<SessionMutationGate> {
         self.registration_gate.upgrade()
     }
 }
@@ -2307,7 +2303,7 @@ impl PartialEq for RuntimeSessionRegistrationWitness {
         self.session_id == other.session_id
             && self.epoch_id == other.epoch_id
             && std::sync::Weak::ptr_eq(&self.machine, &other.machine)
-            && std::sync::Weak::ptr_eq(&self.registration_gate, &other.registration_gate)
+            && self.registration_gate.same_gate(&other.registration_gate)
     }
 }
 
@@ -2679,7 +2675,7 @@ struct MachineCleanupTaskSpawner {
 struct PendingRunlessTerminalPublicationDispatch {
     dispatch_id: uuid::Uuid,
     driver: SharedDriver,
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     requested_generation: u64,
     result_rx: crate::tokio::sync::watch::Receiver<Option<Result<(), RuntimeDriverError>>>,
 }
@@ -2752,6 +2748,38 @@ enum DurabilityGateSettlement {
     Refused(RuntimeDriverError),
 }
 
+/// The typed refusal of a live wait for a session mutation gate that ended
+/// on the session's degradation.
+fn degraded_gate_wait_refusal(required: DurabilityReloadRequired) -> RuntimeDriverError {
+    RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: required.to_string(),
+    }
+}
+
+/// Take a session's driver without M, or end once the session degrades. A
+/// boundary commit or run terminalization holds the driver together with M,
+/// and one past its commit deadline keeps both until the store answers, so a
+/// wait for the driver alone would wait for the store. The driver is polled
+/// first: a free driver is taken even on a degraded session, and a session
+/// without durable state waits as before.
+async fn lock_driver_live<'a, T>(
+    driver: &'a crate::tokio::sync::Mutex<T>,
+    durability_health: Option<&DurabilityHealthHandle>,
+) -> Result<crate::tokio::sync::MutexGuard<'a, T>, DurabilityReloadRequired> {
+    let Some(health) = durability_health else {
+        return Ok(driver.lock().await);
+    };
+    let degradation = health.subscribe_degradation();
+    let mut lock = std::pin::pin!(driver.lock());
+    let mut fired = std::pin::pin!(degradation.fired());
+    crate::tokio::select! {
+        biased;
+        guard = &mut lock => Ok(guard),
+        required = &mut fired => Err(required),
+    }
+}
+
 /// Settle a held session mutation gate: hand it back for a durability-ready
 /// entry, or detach the degraded entry and hard-cancel its exact run before
 /// refusing. Shared by the ready-gated caller and the process-owned task a
@@ -2759,7 +2787,7 @@ enum DurabilityGateSettlement {
 async fn settle_durability_gate(
     shared: &MeerkatMachineShared,
     session_id: &SessionId,
-    gate: &Arc<Mutex<()>>,
+    gate: &SessionMutationGate,
     gate_guard: crate::tokio::sync::OwnedMutexGuard<()>,
 ) -> DurabilityGateSettlement {
     let (reload_required, interrupt_handle, expected_run_id, detached_attachment, cleanup_spawner) = {
@@ -2769,7 +2797,7 @@ async fn settle_durability_gate(
                 state: RuntimeState::Destroyed,
             });
         };
-        if !Arc::ptr_eq(&entry.mutation_gate, gate) {
+        if !entry.mutation_gate.same_gate(gate) {
             return DurabilityGateSettlement::Replaced;
         }
         match entry.require_durability_ready() {
@@ -2927,8 +2955,8 @@ struct PendingDegradedGateSettlement {
 
 impl PendingDegradedGateSettlement {
     /// List `gate`, or `None` when a settlement task already waits for it.
-    fn claim(shared: &Arc<MeerkatMachineShared>, gate: &Arc<Mutex<()>>) -> Option<Self> {
-        let gate_address = Arc::as_ptr(gate).addr();
+    fn claim(shared: &Arc<MeerkatMachineShared>, gate: &SessionMutationGate) -> Option<Self> {
+        let gate_address = gate.address();
         shared
             .pending_degraded_gate_settlements
             .lock()
@@ -5162,7 +5190,7 @@ impl PreparedSessionMaterialization {
                     Arc::downgrade(&self.machine.shared),
                     self.session_id().clone(),
                     entry.epoch_id.clone(),
-                    Arc::downgrade(&entry.mutation_gate),
+                    entry.mutation_gate.downgrade(),
                 )
             })
     }
@@ -5787,7 +5815,7 @@ impl RuntimeLoopAttachmentId {
 /// dispatch. A callback may release M, but only this exact attachment may
 /// receive the resulting effect after revalidation.
 struct RuntimeEffectDispatchAttachmentWitness {
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     driver: SharedDriver,
     dsl_authority: Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
     attachment_id: RuntimeLoopAttachmentId,
@@ -5798,7 +5826,7 @@ struct RuntimeEffectDispatchAttachmentWitness {
 /// callback. Publication resumes only after every attachment-local component
 /// is revalidated.
 struct RuntimeLiveBoundaryAttachmentWitness {
-    mutation_gate: Arc<Mutex<()>>,
+    mutation_gate: SessionMutationGate,
     driver: SharedDriver,
     dsl_authority: Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
     attachment_id: RuntimeLoopAttachmentId,
@@ -6833,30 +6861,94 @@ impl MeerkatMachine {
         ))
     }
 
-    /// Acquire the per-session mutation gate.
-    ///
-    /// Returns an `Arc<Mutex<()>>` that the caller must `.lock().await` and
-    /// hold across the full DSL-stage → driver-mutate → DSL-sync span.
-    /// Returns `None` if the session is not registered.
-    async fn session_mutation_gate(&self, session_id: &SessionId) -> Option<Arc<Mutex<()>>> {
+    /// A copy of the current entry's mutation gate (M), which the caller
+    /// takes through one of its accessors and holds across the full DSL-stage
+    /// -> driver-mutate -> DSL-sync span. `None` if the session is not
+    /// registered.
+    async fn session_mutation_gate(&self, session_id: &SessionId) -> Option<SessionMutationGate> {
         let sessions = self.sessions.read().await;
         sessions
             .get(session_id)
-            .map(|entry| Arc::clone(&entry.mutation_gate))
+            .map(|entry| entry.mutation_gate.clone())
     }
 
-    async fn lock_current_session_mutation_gate(
+    /// Take the current entry's mutation gate for live work, following a
+    /// replaced entry to its new gate; `Ok(None)` once the session is not
+    /// registered. Once the session degrades while another holder keeps the
+    /// gate, the wait ends with the degradation's cause (see
+    /// [`Self::lock_live_session_mutation_gate`]). Unlike the ready-gated
+    /// wait, a free gate of a degraded entry is returned without settling it.
+    async fn lock_current_live_session_mutation_gate(
         &self,
         session_id: &SessionId,
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, DurabilityReloadRequired> {
+        loop {
+            let Some(gate) = self.session_mutation_gate(session_id).await else {
+                return Ok(None);
+            };
+            let gate_guard = self
+                .lock_live_session_mutation_gate(session_id, &gate)
+                .await?;
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
+            if entry.mutation_gate.same_gate(&gate) {
+                return Ok(Some(gate_guard));
+            }
+        }
+    }
+
+    /// Take the current entry's mutation gate however long its holder keeps
+    /// it, following a replaced entry to its new gate; `None` once the session
+    /// is not registered. `reason` says why no holder the session's
+    /// degradation can strand stands in the way.
+    async fn lock_current_settled_session_mutation_gate(
+        &self,
+        session_id: &SessionId,
+        reason: SettledGateWait,
     ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
         loop {
             let gate = self.session_mutation_gate(session_id).await?;
-            let gate_guard = Arc::clone(&gate).lock_owned().await;
+            let gate_guard = gate.lock_settled(reason).await;
             let sessions = self.sessions.read().await;
             let entry = sessions.get(session_id)?;
-            if Arc::ptr_eq(&entry.mutation_gate, &gate) {
+            if entry.mutation_gate.same_gate(&gate) {
                 return Some(gate_guard);
             }
+        }
+    }
+
+    /// Take `gate`, a copy of `session_id`'s mutation gate, for live work
+    /// (see [`SessionMutationGate::lock_live`]).
+    async fn lock_live_session_mutation_gate(
+        &self,
+        session_id: &SessionId,
+        gate: &SessionMutationGate,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, DurabilityReloadRequired> {
+        #[cfg(any(test, feature = "test-support"))]
+        if gate.ends_on_degradation() {
+            self.note_mutation_gate_wait_for_test(session_id, gate);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = session_id;
+        gate.lock_live().await
+    }
+
+    /// Take `gate`, a copy of `session_id`'s mutation gate, as `wait` says:
+    /// live (see [`Self::lock_live_session_mutation_gate`]) or settled for its
+    /// reason, which always takes it.
+    async fn lock_session_mutation_gate_as(
+        &self,
+        session_id: &SessionId,
+        gate: &SessionMutationGate,
+        wait: SessionMutationGateWait,
+    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, DurabilityReloadRequired> {
+        match wait {
+            SessionMutationGateWait::Live => {
+                self.lock_live_session_mutation_gate(session_id, gate).await
+            }
+            SessionMutationGateWait::Settled(reason) => Ok(gate.lock_settled(reason).await),
         }
     }
 
@@ -6881,39 +6973,21 @@ impl MeerkatMachine {
         session_id: &SessionId,
     ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
         loop {
-            let (gate, degradation) = {
-                let sessions = self.sessions.read().await;
-                let entry = sessions
-                    .get(session_id)
-                    .ok_or(RuntimeDriverError::NotReady {
-                        state: RuntimeState::Destroyed,
-                    })?;
-                (
-                    Arc::clone(&entry.mutation_gate),
-                    entry
-                        .durability_health
-                        .as_ref()
-                        .map(DurabilityHealthHandle::subscribe_degradation),
-                )
-            };
-            let gate_guard = match degradation {
-                None => Arc::clone(&gate).lock_owned().await,
-                Some(degradation) => {
-                    #[cfg(any(test, feature = "test-support"))]
-                    self.note_mutation_gate_wait_for_test(session_id, &gate);
-                    let mut lock = std::pin::pin!(Arc::clone(&gate).lock_owned());
-                    let mut fired = std::pin::pin!(degradation.fired());
-                    crate::tokio::select! {
-                        biased;
-                        guard = &mut lock => guard,
-                        required = &mut fired => {
-                            self.hand_off_degraded_gate_settlement(session_id, gate);
-                            return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                                evidence_digest: None,
-                                reason: required.to_string(),
-                            });
-                        }
-                    }
+            let gate = self.session_mutation_gate(session_id).await.ok_or(
+                RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                },
+            )?;
+            let gate_guard = match self
+                .lock_live_session_mutation_gate(session_id, &gate)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(required) => {
+                    // Had it taken the gate, this waiter would have settled
+                    // the degraded entry itself.
+                    self.hand_off_degraded_gate_settlement(session_id, gate);
+                    return Err(degraded_gate_wait_refusal(required));
                 }
             };
             match settle_durability_gate(&self.shared, session_id, &gate, gate_guard).await {
@@ -6931,7 +7005,7 @@ impl MeerkatMachine {
     /// waiters that leave after it spawn nothing, since its settlement is
     /// theirs too. Without a cleanup runtime the next ready-gated caller
     /// settles inline instead.
-    fn hand_off_degraded_gate_settlement(&self, session_id: &SessionId, gate: Arc<Mutex<()>>) {
+    fn hand_off_degraded_gate_settlement(&self, session_id: &SessionId, gate: SessionMutationGate) {
         #[cfg(test)]
         self.test_degraded_gate_settlement_hand_offs
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -6956,7 +7030,7 @@ impl MeerkatMachine {
         let session_id = session_id.clone();
         drop(spawner.spawn(async move {
             let _pending = pending;
-            let gate_guard = Arc::clone(&gate).lock_owned().await;
+            let gate_guard = gate.lock_settled(SettledGateWait::DegradedSettlement).await;
             let _ = settle_durability_gate(&shared, &session_id, &gate, gate_guard).await;
         }));
     }
@@ -7613,8 +7687,37 @@ impl MeerkatMachine {
         parked_rx
     }
 
+    /// Measure the commit outcome declarations of the runtime loops this
+    /// machine starts from now on in busy windows of `window` (test support).
+    /// A store declares its deadline as a sum of busy windows, so this
+    /// shortens each window and keeps the declaration; it does not override
+    /// the deadline.
     #[cfg(any(test, feature = "test-support"))]
-    fn note_mutation_gate_wait_for_test(&self, session_id: &SessionId, gate: &Mutex<()>) {
+    #[doc(hidden)]
+    pub fn set_runtime_commit_busy_window_for_test(&self, window: std::time::Duration) {
+        *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn runtime_commit_deadline_for_test(
+        &self,
+        commit_deadline: crate::runtime_loop::RuntimeLoopCommitDeadline,
+    ) -> crate::runtime_loop::RuntimeLoopCommitDeadline {
+        let window = *self
+            .test_runtime_commit_busy_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match window {
+            Some(window) => commit_deadline.with_busy_window(window),
+            None => commit_deadline,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn note_mutation_gate_wait_for_test(&self, session_id: &SessionId, gate: &SessionMutationGate) {
         if gate.try_lock().is_ok() {
             return;
         }
@@ -7815,29 +7918,38 @@ impl MeerkatMachine {
         }
     }
 
+    /// The mutation gate tied to `lease`'s exact live lifecycle gate, taken as
+    /// `wait` says; `Ok(None)` once the entry is gone or no longer `lease`'s.
     #[cfg(feature = "live")]
     async fn lock_session_mutation_gate_for_live_lifecycle_lease(
         &self,
         session_id: &SessionId,
         lease: &crate::member_live::MemberLiveLifecycleLease,
-    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+        wait: SessionMutationGateWait,
+    ) -> Result<Option<crate::tokio::sync::OwnedMutexGuard<()>>, DurabilityReloadRequired> {
         let mutation_gate = {
             let sessions = self.sessions.read().await;
-            let entry = sessions.get(session_id)?;
+            let Some(entry) = sessions.get(session_id) else {
+                return Ok(None);
+            };
             if !lease.matches_gate(&entry.live_lifecycle_gate) {
-                return None;
+                return Ok(None);
             }
-            Arc::clone(&entry.mutation_gate)
+            entry.mutation_gate.clone()
         };
-        let guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let guard = self
+            .lock_session_mutation_gate_as(session_id, &mutation_gate, wait)
+            .await?;
         let sessions = self.sessions.read().await;
-        let entry = sessions.get(session_id)?;
+        let Some(entry) = sessions.get(session_id) else {
+            return Ok(None);
+        };
         if lease.matches_gate(&entry.live_lifecycle_gate)
-            && Arc::ptr_eq(&entry.mutation_gate, &mutation_gate)
+            && entry.mutation_gate.same_gate(&mutation_gate)
         {
-            Some(guard)
+            Ok(Some(guard))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -8351,7 +8463,10 @@ impl MeerkatMachine {
             None
         };
 
-        let gate_guard = Arc::clone(&witness.mutation_gate).lock_owned().await;
+        let gate_guard = self
+            .lock_live_session_mutation_gate(session_id, &witness.mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         let current_effect_tx = {
             let sessions = self.sessions.read().await;
             match sessions.get(session_id) {
@@ -8361,7 +8476,7 @@ impl MeerkatMachine {
                     ),
                 }),
                 Some(entry)
-                    if !Arc::ptr_eq(&entry.mutation_gate, &witness.mutation_gate)
+                    if !entry.mutation_gate.same_gate(&witness.mutation_gate)
                         || !Arc::ptr_eq(&entry.driver, &witness.driver)
                         || !Arc::ptr_eq(&entry.dsl_authority, &witness.dsl_authority)
                         || !entry.owns_runtime_loop_attachment(witness.attachment_id) =>
@@ -10668,6 +10783,10 @@ pub struct MeerkatMachineShared {
     #[cfg(any(test, feature = "test-support"))]
     test_mutation_gate_wait_observer:
         StdMutex<Option<(SessionId, crate::tokio::sync::oneshot::Sender<()>)>>,
+    /// Test seam: the busy window this machine's runtime loops measure their
+    /// stores' commit outcome declarations in.
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_commit_busy_window: StdMutex<Option<std::time::Duration>>,
     /// Test probe: how many ready-gated waiters left on the degradation
     /// signal and handed the degraded settlement to a process-owned task.
     #[cfg(test)]
@@ -10815,7 +10934,7 @@ impl MemberResidencyUpdate {
         mut self,
         incarnation: meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
         tracked_turn_journal: Option<Arc<dyn crate::member_observation::TrackedTurnJournal>>,
-        session_mutation_gate: Arc<crate::tokio::sync::Mutex<()>>,
+        session_mutation_gate: SessionMutationGate,
     ) -> Result<StagedMemberResidencyPublication, RuntimeDriverError> {
         let slot_guard = self.slot_guard.take().ok_or_else(|| {
             RuntimeDriverError::Internal(
@@ -10854,14 +10973,13 @@ impl MemberResidencyUpdate {
             .await?;
         let gate = {
             let sessions = self.adapter.sessions.read().await;
-            Arc::clone(
-                &sessions
-                    .get(&self.session_id)
-                    .ok_or(RuntimeDriverError::NotReady {
-                        state: RuntimeState::Destroyed,
-                    })?
-                    .mutation_gate,
-            )
+            sessions
+                .get(&self.session_id)
+                .ok_or(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Destroyed,
+                })?
+                .mutation_gate
+                .clone()
         };
         let publication = self
             .stage_under_retained_mutation_gate(incarnation, tracked_turn_journal, gate)
@@ -11821,7 +11939,7 @@ impl MeerkatMachine {
                 .ok_or(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
                 })?;
-            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+            (entry.epoch_id.clone(), entry.mutation_gate.clone())
         };
 
         let local_semantic_high_water = {
@@ -11894,10 +12012,10 @@ impl MeerkatMachine {
                     reason: "direct member runtime disappeared during durable admission"
                         .to_string(),
                 })?;
-            (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+            (entry.epoch_id.clone(), entry.mutation_gate.clone())
         };
         if runtime_epoch_id != captured_runtime_epoch_id
-            || !Arc::ptr_eq(&session_mutation_gate, &captured_session_mutation_gate)
+            || !session_mutation_gate.same_gate(&captured_session_mutation_gate)
         {
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: "direct member runtime was replaced during durable admission".to_string(),
@@ -11928,7 +12046,9 @@ impl MeerkatMachine {
 
         if let Some(current) = direct_member.as_ref() {
             let current_runtime_is_exact = current.runtime_epoch_id == runtime_epoch_id
-                && Arc::ptr_eq(&current.session_mutation_gate, &session_mutation_gate);
+                && current
+                    .session_mutation_gate
+                    .same_gate(&session_mutation_gate);
             let current_semantic = current.fence.incarnation();
             if &current_semantic == requested {
                 if current_runtime_is_exact {
@@ -12037,7 +12157,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member live/open expected incarnation {expected:?}; runtime session was replaced"
@@ -12080,7 +12200,10 @@ impl MeerkatMachine {
             session_mutation_gate,
             ..
         } = lease;
-        let session_guard = Arc::clone(&session_mutation_gate).lock_owned().await;
+        let session_guard = self
+            .lock_live_session_mutation_gate(session_id, &session_mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
@@ -12090,7 +12213,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &session_mutation_gate) {
+            if !entry.mutation_gate.same_gate(&session_mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member effect expected incarnation {expected:?}; runtime session was replaced"
@@ -12132,7 +12255,7 @@ impl MeerkatMachine {
                 (Some(expected), MemberResidencyState::Placed(registration))
                     if &registration.incarnation == expected =>
                 {
-                    Some(Arc::clone(&registration.session_mutation_gate))
+                    Some(registration.session_mutation_gate.clone())
                 }
                 (Some(expected), MemberResidencyState::Placed(registration)) => {
                     return Err(RuntimeDriverError::StaleAuthority {
@@ -12186,7 +12309,7 @@ impl MeerkatMachine {
                     ),
                 });
             };
-            if !Arc::ptr_eq(&entry.mutation_gate, &registered_gate) {
+            if !entry.mutation_gate.same_gate(&registered_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: format!(
                         "member effect expected incarnation {expected:?}; runtime session was replaced"
@@ -12230,10 +12353,9 @@ impl MeerkatMachine {
         match (expected, &*state) {
             (Some(expected), MemberResidencyState::Placed(registration))
                 if &registration.incarnation == expected
-                    && Arc::ptr_eq(
-                        &registration.session_mutation_gate,
-                        &lease.session_mutation_gate,
-                    ) =>
+                    && registration
+                        .session_mutation_gate
+                        .same_gate(&lease.session_mutation_gate) =>
             {
                 Ok(())
             }
@@ -12477,6 +12599,8 @@ impl MeerkatMachine {
                 test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
@@ -12727,6 +12851,8 @@ impl MeerkatMachine {
                 test_reload_required_discard_before_mutation_gate: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_mutation_gate_wait_observer: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_commit_busy_window: StdMutex::new(None),
                 #[cfg(test)]
                 test_degraded_gate_settlement_hand_offs: std::sync::atomic::AtomicUsize::new(0),
                 pending_degraded_gate_settlements: StdMutex::new(HashSet::new()),
@@ -12959,7 +13085,7 @@ impl MeerkatMachine {
         dispatcher: composition::MeerkatCompositionSignalDispatcher,
     ) {
         let _gate = self
-            .lock_current_session_mutation_gate(session_id)
+            .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::TestFixture)
             .await
             .expect("test signal endpoint requires an existing registration");
         self.sessions
@@ -13505,6 +13631,9 @@ mod registration_use_tests;
 
 #[cfg(test)]
 mod durability_gate_wait_tests;
+
+#[cfg(test)]
+mod commit_deadline_tests;
 
 #[cfg(all(test, feature = "live", feature = "test-support"))]
 mod live_bridge_original_work_tests;

@@ -270,7 +270,9 @@ async fn drop_after_custody(route: Route) {
         .expect("actual entry")
         .mutation_gate
         .clone();
-    let held = mutation.lock().await;
+    let held = mutation
+        .lock_settled(crate::meerkat_machine::SettledGateWait::TestFixture)
+        .await;
     let effects = Observation::install(dsl::SessionId::from_domain(&session.session));
     let mut acquisition = AcquisitionObservation::install(&id);
     let caller = tokio::spawn(submit(

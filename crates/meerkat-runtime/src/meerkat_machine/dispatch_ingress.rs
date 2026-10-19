@@ -197,7 +197,7 @@ impl MeerkatMachine {
             let exact_boundary_handle = entry
                 .boundary_handle()
                 .is_some_and(|handle| Arc::ptr_eq(&handle, &witness.boundary_handle));
-            if !Arc::ptr_eq(&entry.mutation_gate, &witness.mutation_gate)
+            if !entry.mutation_gate.same_gate(&witness.mutation_gate)
                 || !Arc::ptr_eq(&entry.driver, &witness.driver)
                 || !Arc::ptr_eq(&entry.dsl_authority, &witness.dsl_authority)
                 || entry.live_attachment_id() != Some(witness.attachment_id)
@@ -298,7 +298,7 @@ impl MeerkatMachine {
         driver: &SharedDriver,
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
-        mutation_gate: &Arc<crate::tokio::sync::Mutex<()>>,
+        mutation_gate: &SessionMutationGate,
         held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
         input_id: &InputId,
         reason: String,
@@ -597,7 +597,7 @@ impl MeerkatMachine {
                 return Ok(LiveOwnerContextDelivery::NotDelivered);
             };
             (
-                Arc::clone(&entry.mutation_gate),
+                entry.mutation_gate.clone(),
                 Arc::clone(&entry.driver),
                 handle,
                 attachment,
@@ -616,11 +616,14 @@ impl MeerkatMachine {
                 meerkat_core::TurnBoundaryDelivery::RequestOnlyAtNextBoundary(contexts),
             )
             .await;
-        let _held_mutation_gate = Arc::clone(&gate).lock_owned().await;
+        let _held_mutation_gate = self
+            .lock_live_session_mutation_gate(session_id, &gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
         let still_exact = {
             let sessions = self.sessions.read().await;
             sessions.get(session_id).is_some_and(|entry| {
-                Arc::ptr_eq(&entry.mutation_gate, &gate)
+                entry.mutation_gate.same_gate(&gate)
                     && Arc::ptr_eq(&entry.driver, &driver)
                     && entry.live_attachment_id() == Some(attachment_id)
                     && entry
@@ -947,7 +950,10 @@ impl MeerkatMachine {
                 meerkat_core::TurnBoundaryDelivery::RequestOnly(contexts),
             )
             .await;
-        let mut held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+        let mut held_mutation_gate = self
+            .lock_live_session_mutation_gate(session_id, &witness.mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
 
         let revalidation = match self
             .revalidate_live_boundary_attachment(session_id, witness, &run_id, input_id)
@@ -1273,7 +1279,10 @@ impl MeerkatMachine {
                 meerkat_core::TurnBoundaryDelivery::DurableAppends(appends),
             )
             .await;
-        let held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+        let held_mutation_gate = self
+            .lock_live_session_mutation_gate(session_id, &witness.mutation_gate)
+            .await
+            .map_err(degraded_gate_wait_refusal)?;
 
         let revalidation = match self
             .revalidate_live_boundary_attachment(session_id, witness, &run_id, input_id)
@@ -1713,7 +1722,7 @@ impl MeerkatMachine {
                     "MeerkatMachine::AcceptWithCompletion resolving mutation gate"
                 );
                 let (gate, preacquired_gate_guard) = match &_member_residency_lease {
-                    Some(lease) => (Arc::clone(&lease.session_mutation_gate), None),
+                    Some(lease) => (lease.session_mutation_gate.clone(), None),
                     None => {
                         let guard = self
                             .lock_current_durability_ready_session_mutation_gate(&session_id)
@@ -1726,7 +1735,7 @@ impl MeerkatMachine {
                                     .ok_or(RuntimeDriverError::NotReady {
                                         state: RuntimeState::Destroyed,
                                     })?;
-                            Arc::clone(&entry.mutation_gate)
+                            entry.mutation_gate.clone()
                         };
                         (gate, Some(guard))
                     }
@@ -1751,7 +1760,11 @@ impl MeerkatMachine {
                 );
                 let mut gate_guard = match preacquired_gate_guard {
                     Some(guard) => Some(guard),
-                    None => Some(Arc::clone(&gate).lock_owned().await),
+                    None => Some(
+                        self.lock_live_session_mutation_gate(&session_id, &gate)
+                            .await
+                            .map_err(degraded_gate_wait_refusal)?,
+                    ),
                 };
                 let hook_input = crate::hook_observation::RuntimeInputHookFacts::from_input(&input);
                 let (
@@ -1772,8 +1785,7 @@ impl MeerkatMachine {
                                     "fenced input admission lost runtime session '{session_id}'"
                                 ),
                             })?;
-                    if !Arc::ptr_eq(&entry.mutation_gate, &gate)
-                        || !Arc::ptr_eq(&entry.driver, &driver)
+                    if !entry.mutation_gate.same_gate(&gate) || !Arc::ptr_eq(&entry.driver, &driver)
                     {
                         return Err(RuntimeDriverError::StaleAuthority {
                             reason: format!(
@@ -2182,7 +2194,7 @@ impl MeerkatMachine {
                             })?;
                             Ok::<_, RuntimeDriverError>(RuntimeAcceptedBoundaryCancelPlan {
                                 witness: RuntimeEffectDispatchAttachmentWitness {
-                                    mutation_gate: Arc::clone(&gate),
+                                    mutation_gate: gate.clone(),
                                     driver: driver.clone(),
                                     dsl_authority: Arc::clone(&dsl_authority),
                                     attachment_id,
@@ -2233,7 +2245,7 @@ impl MeerkatMachine {
                     ) {
                     Some(RuntimeAcceptedLiveBoundaryPlan {
                         witness: RuntimeLiveBoundaryAttachmentWitness {
-                            mutation_gate: Arc::clone(&gate),
+                            mutation_gate: gate.clone(),
                             driver: driver.clone(),
                             dsl_authority: Arc::clone(&dsl_authority),
                             attachment_id,
@@ -2290,7 +2302,7 @@ impl MeerkatMachine {
                     (
                         entry.driver.clone(),
                         entry.completions.clone(),
-                        Arc::clone(&entry.mutation_gate),
+                        entry.mutation_gate.clone(),
                         entry.publication_handle(),
                         Arc::clone(&entry.post_commit_hooks),
                     )

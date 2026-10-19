@@ -138,12 +138,25 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         session_id: &SessionId,
         input_id: &InputId,
     ) -> Result<Option<crate::completion::CompletionOutcome>, RuntimeDriverError> {
-        let driver = {
+        let target = {
             let sessions = self.sessions.read().await;
-            sessions.get(session_id).map(|entry| entry.driver.clone())
+            sessions
+                .get(session_id)
+                .map(|entry| (entry.driver.clone(), entry.durability_health.clone()))
         };
-        if let Some(driver) = driver {
-            let driver = driver.lock().await;
+        if let Some((driver, durability_health)) = target {
+            // A degraded session whose driver a commit past its deadline
+            // still holds cannot say yet whether the input is terminal: the
+            // typed refusal is retryable, and the input reads again after the
+            // session reloads.
+            let driver = super::lock_driver_live(&driver, durability_health.as_ref())
+                .await
+                .map_err(|required| RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "the terminal of input {input_id} is not known yet: {required}; read it again after the session reloads"
+                    ),
+                })?;
             if let Some(row) = driver.as_driver().stored_input_state(input_id) {
                 let outcome = driver.exact_input_terminal_completion_outcome(input_id)?;
                 let permitted = super::scoped_context::disclosure_permitted_with(
@@ -759,7 +772,7 @@ impl MeerkatMachine {
         &self,
         driver: &SharedDriver,
         completions: &SharedCompletionRegistry,
-        mutation_gate: &Arc<Mutex<()>>,
+        mutation_gate: &SessionMutationGate,
         publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     ) -> Result<
         (
@@ -780,7 +793,7 @@ impl MeerkatMachine {
                         .to_string(),
                 });
             }
-            if !Arc::ptr_eq(&existing.mutation_gate, mutation_gate) {
+            if !existing.mutation_gate.same_gate(mutation_gate) {
                 return Err(RuntimeDriverError::StaleAuthority {
                     reason: "runless terminal publication driver changed its mutation gate while a prior dispatch remained pending"
                         .to_string(),
@@ -806,7 +819,7 @@ impl MeerkatMachine {
             PendingRunlessTerminalPublicationDispatch {
                 dispatch_id,
                 driver: driver.clone(),
-                mutation_gate: Arc::clone(mutation_gate),
+                mutation_gate: mutation_gate.clone(),
                 requested_generation: 1,
                 result_rx: result_rx.clone(),
             },
@@ -816,7 +829,7 @@ impl MeerkatMachine {
         let machine = self.clone();
         let driver = driver.clone();
         let completions = completions.clone();
-        let mutation_gate = Arc::clone(mutation_gate);
+        let mutation_gate = mutation_gate.clone();
         cleanup_spawner.spawn(async move {
             let result = if start_rx.await.is_err() {
                 Err(RuntimeDriverError::Internal(
@@ -867,7 +880,15 @@ impl MeerkatMachine {
                     // scan and process-slot removal. A caller that committed a
                     // later carrier must first increment requested_generation,
                     // forcing this task to scan again before acknowledging it.
-                    let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
+                    // A session that degrades while another holder keeps M
+                    // ends the dispatch typed instead of waiting for it. The
+                    // task holds the gate, not the session id, so this live
+                    // waiter is deliberately not reported to the test wait
+                    // observer.
+                    let gate_guard = match mutation_gate.lock_live().await {
+                        Ok(guard) => guard,
+                        Err(required) => break Err(degraded_gate_wait_refusal(required)),
+                    };
                     let mut pending = machine
                         .pending_runless_terminal_publications
                         .lock()
@@ -899,7 +920,11 @@ impl MeerkatMachine {
                 }
             };
 
-            let gate_guard = Arc::clone(&mutation_gate).lock_owned().await;
+            // Without M once the session degrades while another holder keeps
+            // it: a carrier that holder commits later finds no slot and starts
+            // a dispatch of its own, which scans again. Not reported to the
+            // test wait observer, like the dispatch's wait above.
+            let gate_guard = mutation_gate.lock_live().await.ok();
             let mut pending = machine
                 .pending_runless_terminal_publications
                 .lock()
@@ -2213,7 +2238,7 @@ impl MeerkatMachine {
                 let Some(entry) = sessions.get(&resolved_session_id) else {
                     return Err(super::DirectMemberRetireError::Stale { current: None });
                 };
-                (entry.epoch_id.clone(), Arc::clone(&entry.mutation_gate))
+                (entry.epoch_id.clone(), entry.mutation_gate.clone())
             };
             let current = {
                 let state = slot
@@ -2224,10 +2249,9 @@ impl MeerkatMachine {
                     MemberResidencyState::PeerOnly {
                         direct_member: Some(registration),
                     } if registration.runtime_epoch_id == runtime_epoch_id
-                        && Arc::ptr_eq(
-                            &registration.session_mutation_gate,
-                            &session_mutation_gate,
-                        ) =>
+                        && registration
+                            .session_mutation_gate
+                            .same_gate(&session_mutation_gate) =>
                     {
                         Some(registration.fence.clone())
                     }
@@ -3051,7 +3075,7 @@ mod tests {
         let completions = Arc::new(crate::tokio::sync::Mutex::new(
             crate::completion::CompletionRegistry::new(),
         ));
-        let mutation_gate = Arc::new(crate::tokio::sync::Mutex::new(()));
+        let mutation_gate = SessionMutationGate::new(None);
         let first_entered = Arc::new(crate::tokio::sync::Notify::new());
         let release_first = Arc::new(crate::tokio::sync::Notify::new());
         let first_returning = Arc::new(crate::tokio::sync::Notify::new());
@@ -3063,7 +3087,9 @@ mod tests {
             first_returning: Arc::clone(&first_returning),
         });
 
-        let first_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let first_guard = mutation_gate
+            .lock_settled(SettledGateWait::TestFixture)
+            .await;
         commit_dispatch_outbox(&driver, &input_ids[0], "first generation", true).await;
         let (first_result, start) = machine
             .prepare_runless_terminal_publication_dispatch(
@@ -3084,7 +3110,7 @@ mod tests {
 
         let second_guard = crate::tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            Arc::clone(&mutation_gate).lock_owned(),
+            mutation_gate.lock_settled(SettledGateWait::TestFixture),
         )
         .await
         .expect("wedged public callback must not retain M");
@@ -3148,12 +3174,14 @@ mod tests {
         let completions = Arc::new(crate::tokio::sync::Mutex::new(
             crate::completion::CompletionRegistry::new(),
         ));
-        let mutation_gate = Arc::new(crate::tokio::sync::Mutex::new(()));
+        let mutation_gate = SessionMutationGate::new(None);
         let publisher = Arc::new(PanicOnceDispatchPublisher {
             calls: AtomicUsize::new(0),
         });
 
-        let guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let guard = mutation_gate
+            .lock_settled(SettledGateWait::TestFixture)
+            .await;
         commit_dispatch_outbox(&driver, &input_ids[0], "panic remains durable", true).await;
         let (first_result, start) = machine
             .prepare_runless_terminal_publication_dispatch(
@@ -3182,7 +3210,9 @@ mod tests {
         }
 
         let cold_machine = MeerkatMachine::ephemeral();
-        let retry_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let retry_guard = mutation_gate
+            .lock_settled(SettledGateWait::TestFixture)
+            .await;
         let (retry_result, retry_start) = cold_machine
             .prepare_runless_terminal_publication_dispatch(
                 &driver,
@@ -3206,7 +3236,9 @@ mod tests {
             assert_dispatch_outboxes_published(&driver, 1);
         }
 
-        let cleanup_probe_guard = Arc::clone(&mutation_gate).lock_owned().await;
+        let cleanup_probe_guard = mutation_gate
+            .lock_settled(SettledGateWait::TestFixture)
+            .await;
         let (cleanup_probe, cleanup_probe_start) = machine
             .prepare_runless_terminal_publication_dispatch(
                 &driver,
