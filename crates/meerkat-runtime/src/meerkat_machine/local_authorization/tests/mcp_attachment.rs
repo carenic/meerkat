@@ -321,7 +321,7 @@ impl Fixture {
         id: &str,
         server: &str,
     ) -> meerkat_authorization_contracts::grant::GrantLineageRef {
-        use meerkat_authorization_contracts::constraints::ExactRestriction;
+        use meerkat_authorization_contracts::constraints::{DomainRestriction, ExactRestriction};
         self.grants
             .issue_root(
                 &self.root,
@@ -343,7 +343,7 @@ impl Fixture {
                             &meerkat_core::McpConnectorApproval::NoConnector,
                         ),
                     ]),
-                    resource_domains: ExactRestriction::exact([
+                    resource_domains: DomainRestriction::exact([
                         ResourceDomain {
                             authority: self.root.clone(),
                             namespace: format!("mcp-server/{server}"),
