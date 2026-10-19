@@ -608,7 +608,7 @@ secret_env = ["SEARCH_API_KEY"]
 | Code | Where | Meaning |
 | --- | --- | --- |
 | `confinement_refused` | tool result | launch refused by confinement; `data.refusal` |
-| `operation_refused` | tool result; REST 403 `OPERATION_REFUSED` | refused by governed authorization; since 0.9.4 `data.kind` (`reprepare_required`, `denied`, `malformed_facts`) and `data.tool_invoked` (`false` or `"unknown"`), neither a permission to retry |
+| `operation_refused` | tool result; REST 403 `OPERATION_REFUSED` | denied by governed authorization; tool result `data.kind` (`reprepare_required`, `denied`, `malformed_facts`) and `data.tool_invoked` (`false`, or `"unknown"` when no claim is made); neither is a permission, and a new call gets fresh admission |
 | `operation_authorization_unavailable` | tool result; REST 503 | authorization owner could not decide |
 | `operation_observation_unavailable` | tool result; REST 500 | required audit could not be recorded |
 | `review_unsatisfied` / `REVIEW_UNSATISFIED` | tool result; REST 403 | review denied, escalated, stale, consent required, used |

@@ -10,18 +10,13 @@ peer. Permissions belong to the authenticated work and the actual operation,
 not to a model's claim that it is authorized.
 
 <Note>
-**Bounded native support.** Explicit native embedding has acceptance for local
-refusal feedback, permitted siblings and model continuation, input-owned audit,
-completed-turn SQLite reconstruction in a new process followed by fresh governed
-work, and the commissioned JSONL profile. These are fixed-host, loopback
-qualifications, not full surface or live-provider coverage. Ordinary constructors,
-provider login and Console access administration do not activate native permission.
-The measured conditional fresh-turn means missed the cheap-default target;
-full-platform and per-operation p99 acceptance remain open. This page describes
-the full contract. See [integration and current support](/guides/authorization-integration),
-the [implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md)
-and [acceptance scope](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/acceptance-plan.md)
-for deployment boundaries and qualified evidence.
+Native authorization is available to explicit Rust embeddings, to the
+fixed-host governed JSONL profile, and to a governed realm opened by the stock
+`rkat` CLI or `rkat-rpc`. Ordinary constructors, provider login and Console
+access administration do not activate native permission. This page describes
+the full contract. See [integration and current support](/guides/authorization-integration)
+and [Native governed embedding](/rust/native-authorization) for deployment
+boundaries.
 </Note>
 
 ## Authentication does not grant every action
@@ -93,8 +88,8 @@ decision is process-local and is not a serializable bearer token.
 
 The design adds no authorization network round trip or separate audit fsync to
 each operation. It targets constant-time warm checking; preparation and recording
-still have a cost. Performance acceptance requires measurement, not just a fast
-lookup in a unit test.
+still have a cost; measure it in your deployment, since a fast lookup in a unit
+test does not show it.
 
 ## A denied operation gives feedback
 
@@ -146,8 +141,7 @@ not automatically permit hosted actions.
 Ordinary grant, route, and credential changes must preserve or atomically replace
 the last usable controller while unfinished work depends on it, or receive an
 administrative refusal. Deliberate stopping is a separate, attributed operation.
-This is not an indefinite lease for idle sessions. Complete controller mutation
-and credential continuity are still being integrated.
+This is not an indefinite lease for idle sessions.
 
 ## Sources, peers, and Elephant
 
