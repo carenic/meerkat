@@ -7680,6 +7680,190 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
     assert_ne!(resumed.incarnation(), recreated.incarnation());
 }
 
+/// A Stop an earlier runtime durably began and never finished (its quiesce
+/// marker is the last event of the log, as an unclean stop on a member that
+/// never settled leaves it) is finished before the resume hands the mob
+/// back. The handle's phase is Stopped as soon as the resume returns, the
+/// Stop is durable, and a host that lifts a stopped mob right after its
+/// resume runs it again. The resume used to hand back a Running mob that the
+/// recovered Stop left Stopped moments later, after such a host had read
+/// Running and skipped its lift, so no member accepted work.
+#[tokio::test]
+async fn a_resume_finishes_an_interrupted_stop_before_it_hands_the_mob_back() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id,
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Stop,
+            },
+        })
+        .await
+        .expect("record a Stop the first runtime began and never finished");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Stopped,
+        "the resume hands back the phase the interrupted Stop leaves"
+    );
+    assert_eq!(resumed.status().await.expect("status"), MobState::Stopped);
+    assert!(
+        storage
+            .events
+            .replay_all()
+            .await
+            .expect("replay the log")
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MobStopped)),
+        "the interrupted Stop is finished durably"
+    );
+
+    resumed
+        .resume()
+        .await
+        .expect("the host lifts the stopped mob");
+    assert_eq!(resumed.status().await.expect("status"), MobState::Running);
+}
+
+/// A Complete an earlier runtime durably began and never finished is
+/// finished before the resume hands the mob back, as an interrupted Stop
+/// is: the handle's phase is Completed as soon as the resume returns, and
+/// the Complete is durable.
+#[tokio::test]
+async fn a_resume_finishes_an_interrupted_complete_before_it_hands_the_mob_back() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id,
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Complete,
+            },
+        })
+        .await
+        .expect("record a Complete the first runtime began and never finished");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Completed,
+        "the resume hands back the phase the interrupted Complete leaves"
+    );
+    assert!(
+        storage
+            .events
+            .replay_all()
+            .await
+            .expect("replay the log")
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MobCompleted)),
+        "the interrupted Complete is finished durably"
+    );
+}
+
+/// The resume waits only a short, bounded time for the first attempt at a
+/// recovered Stop. Here the attempt does not answer (its driver is held, as
+/// a Stop held on a member would be): the resume returns as the bound ends,
+/// with the mob still Running as before, and the Stop lands in the
+/// background once the driver goes on.
+#[tokio::test(start_paused = true)]
+async fn a_resume_waits_only_a_bounded_time_for_a_recovered_stop_that_does_not_answer() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let definition = with_unique_mob_id(sample_definition(), "recovered-stop-held");
+    let created = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id: mob_id.clone(),
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Stop,
+            },
+        })
+        .await
+        .expect("record a Stop the first runtime began and never finished");
+    let hold = Arc::new(tokio::sync::Notify::new());
+    crate::runtime::builder::RECOVERED_LIFECYCLE_DRIVER_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id.as_str().to_string(), Arc::clone(&hold));
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let started = tokio::time::Instant::now();
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    let waited = started.elapsed();
+    let bound = crate::runtime::builder::RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT;
+    assert!(
+        waited >= bound && waited < bound + Duration::from_secs(1),
+        "the resume returns as the bound ends: waited {waited:?}"
+    );
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Running,
+        "a Stop that has not answered leaves the mob as the resume found it"
+    );
+
+    crate::runtime::builder::RECOVERED_LIFECYCLE_DRIVER_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(mob_id.as_str());
+    hold.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while resumed.status().await.expect("status") != MobState::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Stop lands in the background once its driver goes on");
+}
+
 /// Create seals the generation high-water window of a fresh machine. Resume
 /// first recovers every identity's high-water from the whole log, the epochs
 /// before the last reset included, and then seals it, so a member re-spawned

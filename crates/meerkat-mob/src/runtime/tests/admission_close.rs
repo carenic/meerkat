@@ -1115,6 +1115,7 @@ async fn a_recovered_placed_reset_intent_returns_once_admission_is_closed() {
         crate::runtime::builder::drive_recovered_placed_lifecycle_intent(
             handle.clone(),
             crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Reset,
+            None,
         ),
     )
     .await

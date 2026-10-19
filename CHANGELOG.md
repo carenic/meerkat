@@ -1475,6 +1475,23 @@ them.
   registration whose runtime loop is still attached keeps its fence until
   that loop hands it back, and the discard waits for that handoff, as
   before.
+- `MobBuilder::resume` finishes a Stop that an earlier process durably
+  began and never finished before it hands the mob back (`meerkat-mob`).
+  A mob whose last process ended in the middle of a Stop (for example a
+  shutdown that waited on a member stuck at a compaction in an earlier
+  release) resumed as Running, and its recovery finished the Stop in the
+  background a moment later. A host that reads the phase right after the
+  resume to decide whether to lift a stopped mob read Running and never
+  lifted it: the mob stayed Stopped, every send to a member was refused
+  with `invalid state transition: Stopped -> Running`, and the next
+  shutdown failed on the Stop of a stopped mob. The resume now waits, up
+  to 5 s, for the first attempt at that Stop, so the handle it returns is
+  Stopped and the host lifts it as it lifts a completed Stop. An
+  interrupted Complete is finished the same way, so the handle reads
+  Completed. An attempt that is refused, or still running when the wait
+  ends (a Stop held on a member or on a placed completion), goes on in the
+  background as before; a host that must see the phase such a slow Stop
+  leaves waits for its `MobStopped` itself.
 
 ## [0.9.3] - 2026-10-18
 
