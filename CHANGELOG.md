@@ -414,6 +414,13 @@ them.
   read answers the phase its snapshot holds, and the next read answers the
   committed one. Four generated machine invariants pin the stage and
   activation records every custody answer reads (#1606).
+- `meerkat-contracts`: the `tool_config_changed` entry of
+  `WireEvent.known_payloads` in `artifacts/schemas/events.json` is generated
+  from the typed payload. The hand-written entry required a `status` field
+  that the event has never carried (its status is `status_info`), so every
+  real `tool_config_changed` event failed validation against it. It now
+  accepts the events the runtime serializes, including those stored by
+  0.9.3 and earlier and served with their `persisted` bit.
 
 ## [0.9.3] - 2026-10-18
 
