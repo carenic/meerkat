@@ -723,7 +723,7 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         self.close_standalone_turn(&run_id, mm_dsl::TurnPhase::Cancelled)
     }
 
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::panic)]
     fn snapshot(&self) -> TurnStateSnapshot {
         // One coherent observation under the authority lock: the projection
         // copies only the fields it returns, and the generated terminality
@@ -734,8 +734,10 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         let (projection, observed) = self
             .dsl
             .with_state_lock(|state| (project_turn_state(state), state.clone()));
-        let (mut snapshot, current_run_id) =
-            projection.expect("generated MeerkatMachine turn state must project");
+        let (mut snapshot, current_run_id) = match projection {
+            Ok(projected) => projected,
+            Err(MalformedTurnState(invariant)) => panic!("{invariant}"),
+        };
         snapshot.turn_terminal = classify_turn_terminal(observed);
         if !snapshot.turn_terminal {
             snapshot.active_run_id = current_run_id;
