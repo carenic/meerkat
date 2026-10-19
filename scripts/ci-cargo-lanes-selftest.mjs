@@ -1636,6 +1636,15 @@ for (const path of [
       assert.fail(`${job}: the rest wave differs from the job in ${JSON.stringify(line)} / ${JSON.stringify(twin)}`);
     });
   }
+  // The feature-check rows are compile-only, but a row whose objects are not
+  // in sccache yet runs long: the rkat+6 matrix row hit the 30-minute timeout
+  // on main push run 39186529346 and on release-branch dispatches. Both waves
+  // allow at least 45 minutes (the copy check above keeps them equal).
+  for (const job of ["feature-check", "feature-check-rest"]) {
+    const timeout = jobLines(workflow, job).find((line) => /^    timeout-minutes: \d+$/.test(line));
+    assert.ok(timeout, `${job} names its timeout`);
+    assert.ok(Number(timeout.split(":")[1]) >= 45, `${job}: a cold feature row needs more than 30 minutes, the job allows ${timeout.trim()}`);
+  }
   const stagger = jobLines(workflow, "stagger").join("\n");
   assert.match(stagger, /^    needs: changes$/m, "the stagger job follows the classification");
   assert.match(stagger, /STAGGER_SECONDS: \$\{\{ github\.event_name == 'pull_request' && '0' \|\| '30' \}\}/, "it waits on a push only");
