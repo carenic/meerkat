@@ -189,9 +189,9 @@ impl LlmClient for ScriptedCouncilClient {
                     ),
                 },
                 LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::ToolUse,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(
+                        meerkat_core::StopReason::ToolUse,
+                    ),
                 },
             ],
             ScriptedTurn::ToolCalls(calls) => calls
@@ -211,9 +211,9 @@ impl LlmClient for ScriptedCouncilClient {
                         ),
                     },
                     LlmEvent::Done {
-                        outcome: meerkat_client::LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::ToolUse,
+                        ),
                     },
                 ])
                 .collect(),
@@ -230,9 +230,9 @@ impl LlmClient for ScriptedCouncilClient {
                     ),
                 },
                 LlmEvent::Done {
-                    outcome: meerkat_client::LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: meerkat_client::LlmDoneOutcome::success(
+                        meerkat_core::StopReason::EndTurn,
+                    ),
                 },
             ],
             ScriptedTurn::Fail(reason) => {
@@ -265,9 +265,9 @@ impl LlmClient for ScriptedCouncilClient {
                             ),
                         },
                         LlmEvent::Done {
-                            outcome: meerkat_client::LlmDoneOutcome::Success {
-                                stop_reason: meerkat_core::StopReason::EndTurn,
-                            },
+                            outcome: meerkat_client::LlmDoneOutcome::success(
+                                meerkat_core::StopReason::EndTurn,
+                            ),
                         },
                     ]
                 };

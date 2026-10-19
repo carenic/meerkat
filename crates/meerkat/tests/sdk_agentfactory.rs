@@ -76,9 +76,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::ToolUse),
                 }),
             ]))
         } else {
@@ -89,9 +87,7 @@ impl LlmClient for MockLlmClient {
                 }),
                 Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -321,9 +317,7 @@ impl LlmClient for ParamsCaptureClient {
             }),
             Ok(normalized_anthropic_usage(request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat::StopReason::EndTurn),
             }),
         ]))
     }

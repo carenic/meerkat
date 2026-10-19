@@ -666,9 +666,7 @@ fn ns(duration: Duration) -> u64 {
 }
 fn done(reason: StopReason) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success {
-            stop_reason: reason,
-        },
+        outcome: LlmDoneOutcome::success(reason),
     })
 }
 fn tool(call: &str, name: &str) -> Result<LlmEvent, LlmError> {
@@ -790,7 +788,8 @@ impl LlmClient for ProviderFixture {
                         event,
                         Ok(LlmEvent::Done {
                             outcome: LlmDoneOutcome::Success {
-                                stop_reason: StopReason::ToolUse
+                                stop_reason: StopReason::ToolUse,
+                                ..
                             }
                         })
                     )

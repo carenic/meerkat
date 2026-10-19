@@ -657,6 +657,7 @@ pub struct LlmStreamResult {
     stop_reason: StopReason,
     usage: Usage,
     cache_breakpoint_claims: Vec<crate::ProviderCacheBreakpointClaim>,
+    stop_detail: Option<Box<crate::types::ProviderStopDetail>>,
 }
 
 impl LlmStreamResult {
@@ -666,7 +667,22 @@ impl LlmStreamResult {
             stop_reason,
             usage,
             cache_breakpoint_claims: Vec::new(),
+            stop_detail: None,
         }
+    }
+
+    /// The provider's own account of why it stopped, carried to the caller
+    /// as tagged provider data (see [`crate::types::ProviderStopDetail`]).
+    pub fn with_stop_detail(
+        mut self,
+        stop_detail: Option<Box<crate::types::ProviderStopDetail>>,
+    ) -> Self {
+        self.stop_detail = stop_detail;
+        self
+    }
+
+    pub fn stop_detail(&self) -> Option<&crate::types::ProviderStopDetail> {
+        self.stop_detail.as_deref()
     }
 
     pub fn blocks(&self) -> &[AssistantBlock] {

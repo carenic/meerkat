@@ -65,9 +65,7 @@ impl LlmClient for CallbackThenTextClient {
                 },
                 usage(request),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::ToolUse,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                 },
             ]
         } else {
@@ -78,9 +76,7 @@ impl LlmClient for CallbackThenTextClient {
                 },
                 usage(request),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 },
             ]
         };

@@ -637,7 +637,14 @@ pub enum AgentError {
     #[error("Max tokens reached on turn {turn}, partial output: {partial}")]
     MaxTokensReached { turn: u32, partial: String },
     #[error("Content filtered on turn {turn}")]
-    ContentFiltered { turn: u32 },
+    ContentFiltered {
+        turn: u32,
+        /// Which refusing stop the provider ended the response with.
+        stop: crate::types::ContentFilteredStop,
+        /// The provider's own account of the refusal or filter, carried as
+        /// tagged provider data. Nothing in core reads it.
+        detail: Option<Box<crate::types::ProviderStopDetail>>,
+    },
     #[error("Max turns reached: {turns}")]
     MaxTurnsReached { turns: u32 },
     #[error("Run was cancelled")]

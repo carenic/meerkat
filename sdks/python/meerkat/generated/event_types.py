@@ -70,6 +70,12 @@ Value = Any
 AgentErrorClass = Literal['llm', 'operation_refused', 'store', 'tool', 'policy_indeterminate', 'mcp', 'session_not_found', 'budget', 'max_tokens', 'content_filtered', 'max_turns', 'cancelled', 'invalid_state', 'operation_not_found', 'depth_limit', 'concurrency_limit', 'config', 'internal', 'build', 'auth', 'callback_pending', 'skill', 'structured_output', 'invalid_output_schema', 'hook', 'terminal', 'no_pending_boundary']
 
 
+# The refusing stop a content-filtered run ended on: the closed pair of
+# [`StopReason`]s that fail a run as
+# [`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).
+ContentFilteredStop = Literal['refusal', 'content_filter']
+
+
 class HookFailureReasonTimeout(TypedDict, total=False):
     """The hook runtime did not complete within its configured timeout.
     """
@@ -135,6 +141,48 @@ LlmProviderErrorRetryability = Literal['retryable', 'non_retryable']
 
 
 ModelFallbackSkipReason = Literal['provider_boundary', 'auth_unavailable', 'context_fit', 'context_unknown', 'output_budget', 'tool_parity', 'modality_parity', 'request_unsupported', 'admission_unavailable'] | Literal['tool_choice_unsupported']
+
+
+# Where Gemini blocked a response.
+GeminiStopStage = Literal['prompt', 'candidate']
+
+
+class ProviderStopDetailAnthropic(TypedDict, total=False):
+    """Anthropic `stop_details` of a `refusal` stop.
+    """
+    category: NotRequired[Optional[str]]
+    explanation: NotRequired[Optional[str]]
+    provider: Required[Literal['anthropic']]
+
+
+class ProviderStopDetailOpenAi(TypedDict, total=False):
+    """OpenAI: what refused or filtered the response.
+    """
+    provider: Required[Literal['open_ai']]
+    reason: Required[str]
+    refusal: NotRequired[Optional[str]]
+
+
+class ProviderStopDetailGemini(TypedDict, total=False):
+    """Gemini: the raw reason a prompt or a candidate was blocked.
+    """
+    blocked_categories: NotRequired[list[str]]
+    provider: Required[Literal['gemini']]
+    reason: Required[str]
+    stage: Required[GeminiStopStage]
+
+
+# A provider's own account of why it refused or filtered a response, held
+# as tagged provider data.
+#
+# The meaning is the [`StopReason`] (and, for a failed run,
+# [`ContentFilteredStop`]); this is evidence. Its fields are the provider's
+# raw strings, tagged by provider, and nothing in the agent loop, retry,
+# error classification or error codes reads them: provider crates build a
+# detail with the constructors below and core only carries it to the
+# caller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]
+# bytes.
+ProviderStopDetail = ProviderStopDetailAnthropic | ProviderStopDetailOpenAi | ProviderStopDetailGemini
 
 
 # Closed machine-owned classifier for why a turn reached a terminal failure.
@@ -249,7 +297,17 @@ class AgentErrorReasonHookLaunchRefused(TypedDict, total=False):
     reason_type: Required[Literal['hook_launch_refused']]
 
 
-AgentErrorReason = AgentErrorReasonLlmRateLimited | AgentErrorReasonLlmContextExceeded | AgentErrorReasonLlmAuthError | AgentErrorReasonLlmInvalidModel | AgentErrorReasonLlmProviderError | AgentErrorReasonLlmNetworkTimeout | AgentErrorReasonLlmCallTimeout | AgentErrorReasonHookDenied | AgentErrorReasonHookTimeout | AgentErrorReasonHookExecutionFailed | AgentErrorReasonHookConfigInvalid | AgentErrorReasonStructuredOutputValidationFailed | AgentErrorReasonInvalidOutputSchema | AgentErrorReasonAuthReauthRequired | AgentErrorReasonCallbackPending | AgentErrorReasonTurnTerminalCause | AgentErrorReasonModelFallbackResumeHeld | AgentErrorReasonHookLaunchRefused
+class AgentErrorReasonContentFiltered(TypedDict, total=False):
+    """The provider refused or filtered the response: every
+    [`AgentError::ContentFiltered`] failure, with the provider's own
+    account when it gave one.
+    """
+    detail: NotRequired[Optional[ProviderStopDetail]]
+    reason_type: Required[Literal['content_filtered']]
+    stop: Required[ContentFilteredStop]
+
+
+AgentErrorReason = AgentErrorReasonLlmRateLimited | AgentErrorReasonLlmContextExceeded | AgentErrorReasonLlmAuthError | AgentErrorReasonLlmInvalidModel | AgentErrorReasonLlmProviderError | AgentErrorReasonLlmNetworkTimeout | AgentErrorReasonLlmCallTimeout | AgentErrorReasonHookDenied | AgentErrorReasonHookTimeout | AgentErrorReasonHookExecutionFailed | AgentErrorReasonHookConfigInvalid | AgentErrorReasonStructuredOutputValidationFailed | AgentErrorReasonInvalidOutputSchema | AgentErrorReasonAuthReauthRequired | AgentErrorReasonCallbackPending | AgentErrorReasonTurnTerminalCause | AgentErrorReasonModelFallbackResumeHeld | AgentErrorReasonHookLaunchRefused | AgentErrorReasonContentFiltered
 
 
 class AgentErrorReport(TypedDict, total=False):

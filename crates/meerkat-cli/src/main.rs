@@ -26080,9 +26080,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     }),
                 ],
                 1 => vec![
@@ -26103,9 +26101,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     }),
                 ],
                 _ => vec![
@@ -26115,9 +26111,7 @@ default_model = "gemma"
                     }),
                     Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     }),
                 ],
             };
@@ -26185,9 +26179,7 @@ default_model = "gemma"
                 }),
                 Ok(normalized_cli_fixture_usage(request)),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }

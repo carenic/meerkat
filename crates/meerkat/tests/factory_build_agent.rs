@@ -98,9 +98,7 @@ impl LlmClient for MockLlmClient {
                 request,
             )),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }
@@ -4052,9 +4050,7 @@ impl LlmClient for ParamsCaptureClient {
             }),
             Ok(normalized_llm_usage(self.provider, request)),
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             }),
         ]))
     }

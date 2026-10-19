@@ -69,9 +69,7 @@ impl LlmClient for MockLlmClient {
                 ),
             }),
             Ok(meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
     }
@@ -130,9 +128,7 @@ impl LlmClient for RecordingToolClient {
                 ),
             }),
             Ok(meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: meerkat_client::LlmDoneOutcome::success(StopReason::EndTurn),
             }),
         ]))
     }
@@ -1525,7 +1521,7 @@ mod tcp_callback_ownership {
                     else if request.model.starts_with("gemini-") { meerkat_core::Provider::Gemini }
                     else { meerkat_core::Provider::Other };
                 yield Ok(LlmEvent::UsageUpdate { usage: meerkat_core::TurnUsage::host_declared(provider, &request.model, meerkat_core::Usage::default()) });
-                yield Ok(LlmEvent::Done { outcome: LlmDoneOutcome::Success { stop_reason } });
+                yield Ok(LlmEvent::Done { outcome: LlmDoneOutcome::success(stop_reason) });
             })
         }
         fn provider(&self) -> meerkat_core::Provider {

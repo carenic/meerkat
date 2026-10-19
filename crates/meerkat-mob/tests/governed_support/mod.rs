@@ -557,9 +557,7 @@ impl LlmClient for ScriptedProvider {
                 })
             })
             .chain(futures::stream::iter([Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(StopReason::EndTurn),
             })])),
         )
     }

@@ -157,9 +157,7 @@ fn text_event(text: &str) -> LlmEvent {
 
 fn end_turn() -> LlmEvent {
     LlmEvent::Done {
-        outcome: LlmDoneOutcome::Success {
-            stop_reason: StopReason::EndTurn,
-        },
+        outcome: LlmDoneOutcome::success(StopReason::EndTurn),
     }
 }
 

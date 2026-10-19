@@ -538,6 +538,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -3009,6 +3038,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -3426,6 +3470,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -4535,6 +4594,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -25263,6 +25409,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -27826,6 +28001,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -28281,6 +28471,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -29424,6 +29629,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -38485,6 +38777,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -42806,6 +43127,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -43261,6 +43597,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -44793,6 +45144,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -53414,6 +53852,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -60698,6 +61165,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -61243,6 +61725,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -63969,6 +64466,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -76127,6 +76711,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -81261,6 +81874,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -81716,6 +82344,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -83248,6 +83891,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -91668,6 +92398,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -94139,6 +94898,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -94620,6 +95394,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -95729,6 +96518,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
@@ -153200,6 +154076,35 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "The provider refused or filtered the response: every\n[`AgentError::ContentFiltered`] failure, with the provider's own\naccount when it gave one.",
+            "properties": {
+              "detail": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ProviderStopDetail"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The provider's tagged evidence, absent when it sent none. An\nunknown provider or a malformed detail decodes as absent."
+              },
+              "reason_type": {
+                "const": "content_filtered",
+                "type": "string"
+              },
+              "stop": {
+                "$ref": "#/$defs/ContentFilteredStop",
+                "description": "Which refusing stop the provider ended the response with."
+              }
+            },
+            "required": [
+              "reason_type",
+              "stop"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -155671,6 +156576,21 @@
           }
         ]
       },
+      "ContentFilteredStop": {
+        "description": "The refusing stop a content-filtered run ended on: the closed pair of\n[`StopReason`]s that fail a run as\n[`AgentError::ContentFiltered`](crate::error::AgentError::ContentFiltered).",
+        "oneOf": [
+          {
+            "const": "refusal",
+            "description": "The model declined the response ([`StopReason::Refusal`]).",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "A provider content filter blocked it ([`StopReason::ContentFilter`]).",
+            "type": "string"
+          }
+        ]
+      },
       "ContentInput": {
         "anyOf": [
           {
@@ -156126,6 +157046,21 @@
           "target_model"
         ],
         "type": "object"
+      },
+      "GeminiStopStage": {
+        "description": "Where Gemini blocked a response.",
+        "oneOf": [
+          {
+            "const": "prompt",
+            "description": "The prompt itself (`promptFeedback.blockReason`, no candidate).",
+            "type": "string"
+          },
+          {
+            "const": "candidate",
+            "description": "A generated candidate (its `finishReason`).",
+            "type": "string"
+          }
+        ]
       },
       "GeminiThinkingConfig": {
         "additionalProperties": false,
@@ -157235,6 +158170,93 @@
           }
         },
         "type": "object"
+      },
+      "ProviderStopDetail": {
+        "description": "A provider's own account of why it refused or filtered a response, held\nas tagged provider data.\n\nThe meaning is the [`StopReason`] (and, for a failed run,\n[`ContentFilteredStop`]); this is evidence. Its fields are the provider's\nraw strings, tagged by provider, and nothing in the agent loop, retry,\nerror classification or error codes reads them: provider crates build a\ndetail with the constructors below and core only carries it to the\ncaller. Each text field is capped at [`PROVIDER_STOP_DETAIL_TEXT_CAP`]\nbytes.",
+        "oneOf": [
+          {
+            "description": "Anthropic `stop_details` of a `refusal` stop.",
+            "properties": {
+              "category": {
+                "description": "The policy category that triggered the refusal (for example\n`cyber`); absent when the refusal maps to no named category.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explanation": {
+                "description": "Anthropic's human-readable explanation, for display only: the\ntext is not stable.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "OpenAI: what refused or filtered the response.",
+            "properties": {
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`refusal` for a refusal output, otherwise the raw filter reason\n(`incomplete_details.reason`, a Chat `finish_reason` or a\nrealtime `status_details.reason`).",
+                "type": "string"
+              },
+              "refusal": {
+                "description": "The model's refusal text, for a refusal.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Gemini: the raw reason a prompt or a candidate was blocked.",
+            "properties": {
+              "blocked_categories": {
+                "description": "The `safetyRatings` categories Gemini marked `blocked`.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "reason": {
+                "description": "`promptFeedback.blockReason` for the prompt, the candidate's\n`finishReason` otherwise.",
+                "type": "string"
+              },
+              "stage": {
+                "$ref": "#/$defs/GeminiStopStage",
+                "description": "Whether the prompt or a candidate was blocked."
+              }
+            },
+            "required": [
+              "provider",
+              "stage",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ProviderTag": {
         "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",

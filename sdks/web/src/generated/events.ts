@@ -71,6 +71,10 @@ export type AgentErrorReason = {
   hook_id: HookId;
   reason: HookFailureReason;
   reason_type: "hook_launch_refused";
+} | {
+  detail?: ProviderStopDetail | null;
+  reason_type: "content_filtered";
+  stop: ContentFilteredStop;
 };
 
 export type AgentErrorReport = {
@@ -245,6 +249,8 @@ export type ContentBlock = {
   type: "skill_context";
 };
 
+export type ContentFilteredStop = "refusal" | "content_filter";
+
 export type ContentInput = string | ContentBlock[];
 
 export type ContextBudgetEstimateProvenance = "canonical_forecast" | "exact_provider_token_count";
@@ -303,6 +309,8 @@ export type GeminiImageMetadata = {
   response_id?: string | null;
   target_model: string;
 };
+
+export type GeminiStopStage = "prompt" | "candidate";
 
 export type GeminiThinkingConfig = {
   include_thoughts?: boolean | null;
@@ -512,6 +520,21 @@ export type ProviderParamsOverride = {
   temperature?: number | null;
   thinking_budget_tokens?: number | null;
   top_p?: number | null;
+};
+
+export type ProviderStopDetail = {
+  category?: string | null;
+  explanation?: string | null;
+  provider: "anthropic";
+} | {
+  provider: "open_ai";
+  reason: string;
+  refusal?: string | null;
+} | {
+  blocked_categories?: string[];
+  provider: "gemini";
+  reason: string;
+  stage: GeminiStopStage;
 };
 
 export type ProviderTag = {

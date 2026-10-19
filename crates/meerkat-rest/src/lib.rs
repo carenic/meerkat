@@ -9884,9 +9884,7 @@ mod tests {
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }
@@ -9934,9 +9932,7 @@ mod tests {
                     ),
                 });
                 yield Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 });
             })
         }
@@ -15376,9 +15372,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                     ),
                 }),
                 Ok(LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success {
-                        stop_reason: meerkat_core::StopReason::EndTurn,
-                    },
+                    outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                 }),
             ]))
         }

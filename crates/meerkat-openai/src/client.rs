@@ -14,8 +14,8 @@ use meerkat_core::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, ImageData, ImageGenerationIntent,
     ImageGenerationWarning, ImageProviderErrorCode, ImageProviderTerminalObservation, Message,
     OpenAiImageMetadata, OutputSchema, Provider, ProviderImageMetadata, ProviderMeta,
-    RevisedPromptDisposition, RevisedPromptSource, ServerToolKind, StopReason, SystemNoticeBlock,
-    SystemNoticeMessage, ToolResult, Usage, UserMessage,
+    ProviderStopDetail, RevisedPromptDisposition, RevisedPromptSource, ServerToolKind, StopReason,
+    SystemNoticeBlock, SystemNoticeMessage, ToolResult, Usage, UserMessage,
 };
 use meerkat_llm_core::{
     ImageGenerationExecutor, LlmClient, LlmDoneOutcome, LlmEvent, LlmRequest, LlmStream,
@@ -2600,6 +2600,9 @@ impl OpenAiClient {
             let mut streamed_web_search_ids: HashSet<String> = HashSet::new();
             let mut done_emitted = false;
             let mut saw_terminal_fallback_output = false;
+            // A refusal the model streams (`response.refusal.delta`/`.done`):
+            // never answer text, it ends the response as a refusal.
+            let mut streamed_refusal = String::new();
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| LlmError::ConnectionReset)?;
@@ -2621,15 +2624,27 @@ impl OpenAiClient {
                                 yield LlmEvent::AssistantOutput { blocks };
                             }
                             done_emitted = true;
-                            let stop_reason = if streamed_tool_ids.is_empty() {
-                                StopReason::EndTurn
-                            } else {
-                                StopReason::ToolUse
-                            };
                             chunk_yielded.set(true);
-                            yield LlmEvent::Done {
-                                outcome: LlmDoneOutcome::Success { stop_reason },
-                            };
+                            if streamed_refusal.is_empty() {
+                                let stop_reason = if streamed_tool_ids.is_empty() {
+                                    StopReason::EndTurn
+                                } else {
+                                    StopReason::ToolUse
+                                };
+                                yield LlmEvent::Done {
+                                    outcome: LlmDoneOutcome::success(stop_reason),
+                                };
+                            } else {
+                                yield LlmEvent::Done {
+                                    outcome: LlmDoneOutcome::success_with_detail(
+                                        StopReason::Refusal,
+                                        ProviderStopDetail::openai(
+                                            "refusal",
+                                            Some(std::mem::take(&mut streamed_refusal)),
+                                        ),
+                                    ),
+                                };
+                            }
                         }
                         continue;
                     }
@@ -2776,17 +2791,10 @@ impl OpenAiClient {
                                                                             yield LlmEvent::TextDelta { delta: text.to_string(), meta };
                                                                         }
                                                                     }
-                                                                    "refusal" => {
-                                                                        if let Some(refusal) = part.get("refusal").and_then(|r| r.as_str())
-                                                                            && !saw_stream_text_delta
-                                                                            && !item.get("id").and_then(Value::as_str).is_some_and(|id| streamed_text_items.contains(id))
-                                                                        {
-                                                                            let meta = crate::responses_output::assistant_meta(item, active_response_id.as_deref())?;
-                                                                            saw_terminal_fallback_output = true;
-                                                                            chunk_yielded.set(true);
-                                                                            yield LlmEvent::TextDelta { delta: refusal.to_string(), meta };
-                                                                        }
-                                                                    }
+                                                                    // A refusal part is never answer text: it ends
+                                                                    // the response as a refusal, its text the stop's
+                                                                    // provider detail (see `responses_terminal_outcome`).
+                                                                    "refusal" => {}
                                                                     _ => {}
                                                                 }
                                                             }
@@ -2923,6 +2931,7 @@ impl OpenAiClient {
                                     outcome: responses_terminal_outcome(
                                         &event.event_type,
                                         response_obj,
+                                        &streamed_refusal,
                                     ),
                                 };
                             }
@@ -2983,6 +2992,21 @@ impl OpenAiClient {
                                     item_id.to_string(),
                                     (call_id.to_string(), name.to_string()),
                                 );
+                            }
+                        }
+                        // The model's refusal streams apart from its text: it is
+                        // never answer text (no `TextDelta`), and it ends the
+                        // response as a refusal (`responses_terminal_outcome`).
+                        else if event.event_type == "response.refusal.delta" {
+                            if let Some(delta) = &event.delta {
+                                streamed_refusal.push_str(delta);
+                                saw_terminal_fallback_output = true;
+                            }
+                        }
+                        else if event.event_type == "response.refusal.done" {
+                            if let Some(refusal) = &event.refusal {
+                                streamed_refusal.clone_from(refusal);
+                                saw_terminal_fallback_output = true;
                             }
                         }
                         else if event.event_type == "response.output_text.delta" {
@@ -3504,6 +3528,8 @@ struct ResponsesStreamEvent {
     event_type: String,
     /// Text delta for streaming events
     delta: Option<String>,
+    /// The full refusal text of `response.refusal.done`.
+    refusal: Option<String>,
     /// Call ID for function call events
     call_id: Option<String>,
     /// Function name for function call events
@@ -3604,9 +3630,29 @@ fn validate_responses_terminal_status(event_type: &str, response: &Value) -> Res
     Ok(())
 }
 
-fn responses_terminal_outcome(event_type: &str, response: &Value) -> LlmDoneOutcome {
+/// The terminal outcome of a Responses API response.
+///
+/// A refusal (a `refusal` output part, or one the model streamed) wins over
+/// every other stop, as an Anthropic refusal does: the response is refused
+/// whole, text and tool calls beside it included, and nothing of it is
+/// committed. Its text travels as the stop's provider detail, never as
+/// answer text. A `content_filter` incomplete reason carries its raw reason.
+fn responses_terminal_outcome(
+    event_type: &str,
+    response: &Value,
+    streamed_refusal: &str,
+) -> LlmDoneOutcome {
     if let Err(error) = validate_responses_terminal_status(event_type, response) {
         return LlmDoneOutcome::Error { error };
+    }
+
+    let refusal = responses_refusal_text(response)
+        .or_else(|| (!streamed_refusal.is_empty()).then(|| streamed_refusal.to_string()));
+    if let Some(refusal) = refusal {
+        return LlmDoneOutcome::success_with_detail(
+            StopReason::Refusal,
+            ProviderStopDetail::openai("refusal", Some(refusal)),
+        );
     }
 
     let status = response.get("status").and_then(Value::as_str);
@@ -3636,7 +3682,12 @@ fn responses_terminal_outcome(event_type: &str, response: &Value) -> LlmDoneOutc
                 // Accept the documented/generated-schema spellings used by
                 // OpenAI and compatible Responses endpoints.
                 Some("max_tokens" | "max_output_tokens") => StopReason::MaxTokens,
-                Some("content_filter") => StopReason::ContentFilter,
+                Some(reason @ "content_filter") => {
+                    return LlmDoneOutcome::success_with_detail(
+                        StopReason::ContentFilter,
+                        ProviderStopDetail::openai(reason, None),
+                    );
+                }
                 Some(reason) => {
                     return LlmDoneOutcome::Error {
                         error: LlmError::IncompleteResponse {
@@ -3668,7 +3719,23 @@ fn responses_terminal_outcome(event_type: &str, response: &Value) -> LlmDoneOutc
         }
     };
 
-    LlmDoneOutcome::Success { stop_reason }
+    LlmDoneOutcome::success(stop_reason)
+}
+
+/// The refusal text of a Responses output: every `refusal` part of its
+/// assistant messages, joined. `None` when the output holds no refusal.
+fn responses_refusal_text(response: &Value) -> Option<String> {
+    let parts: Vec<&str> = response
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+        .filter_map(|part| part.get("refusal").and_then(Value::as_str))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn missing_terminal_response_outcome(event_type: &str) -> LlmDoneOutcome {
@@ -7646,8 +7713,8 @@ mod tests {
                 "output": []
             });
             assert!(matches!(
-                responses_terminal_outcome("response.incomplete", &response),
-                LlmDoneOutcome::Success { stop_reason } if stop_reason == expected
+                responses_terminal_outcome("response.incomplete", &response, ""),
+                LlmDoneOutcome::Success { stop_reason, .. } if stop_reason == expected
             ));
         }
     }
@@ -7681,6 +7748,144 @@ mod tests {
         server.abort();
 
         assert_eq!(deltas, vec!["Hello"]);
+    }
+
+    /// Every event of one stubbed Responses stream, through the first `Done`.
+    async fn responses_stream_events(lines: &[&str]) -> Vec<LlmEvent> {
+        let mut payload = lines.join("\n");
+        payload.push('\n');
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+        let mut stream = client.stream(&request);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream wrapper should convert errors to Done");
+            let done = matches!(event, LlmEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        server.abort();
+        events
+    }
+
+    /// The last event's success outcome: stop reason and provider detail.
+    fn responses_done(events: &[LlmEvent]) -> (StopReason, Option<ProviderStopDetail>) {
+        match events.last() {
+            Some(LlmEvent::Done {
+                outcome:
+                    LlmDoneOutcome::Success {
+                        stop_reason,
+                        stop_detail,
+                        ..
+                    },
+            }) => (*stop_reason, stop_detail.as_deref().cloned()),
+            other => panic!("expected a successful Done, got {other:?}"),
+        }
+    }
+
+    /// F1 (rev-239): an OpenAI refusal is never answer text. Streamed refusal
+    /// deltas yield no `TextDelta`, and the response ends as a refusal with
+    /// its text as the stop's provider detail.
+    #[tokio::test]
+    async fn responses_refusal_streams_no_text_and_ends_as_a_refusal() {
+        let refusal = "I can't help with that.";
+        let events = responses_stream_events(&[
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"I can't "}"#,
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"help with that."}"#,
+            r#"data: {"type":"response.refusal.done","item_id":"msg_1","output_index":0,"content_index":0,"refusal":"I can't help with that."}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I can't help with that."}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        ])
+        .await;
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                LlmEvent::TextDelta { delta, .. } if delta.contains("help with that")
+            )),
+            "{events:?}"
+        );
+        assert_eq!(
+            responses_done(&events),
+            (
+                StopReason::Refusal,
+                Some(ProviderStopDetail::openai(
+                    "refusal",
+                    Some(refusal.to_string())
+                ))
+            )
+        );
+    }
+
+    /// The refusal wins over text and tool calls in the same response, as an
+    /// Anthropic refusal does: the response ends as a refusal, so nothing of
+    /// it is committed.
+    #[tokio::test]
+    async fn responses_refusal_wins_over_text_and_tool_calls() {
+        for (label, output) in [
+            (
+                "text and refusal",
+                r#"[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Sure, here is"},{"type":"refusal","refusal":"I can't continue."}]}]"#,
+            ),
+            (
+                "tool call and refusal",
+                r#"[{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"location\":\"Tokyo\"}"},{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"refusal","refusal":"I can't continue."}]}]"#,
+            ),
+        ] {
+            let completed = format!(
+                r#"data: {{"type":"response.completed","response":{{"id":"resp_1","status":"completed","output":{output},"usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+            );
+            let events = responses_stream_events(&[completed.as_str()]).await;
+            assert_eq!(
+                responses_done(&events),
+                (
+                    StopReason::Refusal,
+                    Some(ProviderStopDetail::openai(
+                        "refusal",
+                        Some("I can't continue.".to_string())
+                    ))
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// A refusal streamed before a bare `[DONE]` (no terminal response) still
+    /// ends the response as a refusal; a `content_filter` incomplete reason
+    /// carries its raw reason.
+    #[tokio::test]
+    async fn responses_refusal_before_done_and_content_filter_carry_their_detail() {
+        let events = responses_stream_events(&[
+            r#"data: {"type":"response.refusal.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"No."}"#,
+            "data: [DONE]",
+        ])
+        .await;
+        assert_eq!(
+            responses_done(&events),
+            (
+                StopReason::Refusal,
+                Some(ProviderStopDetail::openai(
+                    "refusal",
+                    Some("No.".to_string())
+                ))
+            )
+        );
+
+        let events = responses_stream_events(&[
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_2","status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+        ])
+        .await;
+        assert_eq!(
+            responses_done(&events),
+            (
+                StopReason::ContentFilter,
+                Some(ProviderStopDetail::openai("content_filter", None))
+            )
+        );
     }
 
     /// Watchdog liveness regression: Responses lifecycle events with no
@@ -7813,7 +8018,8 @@ mod tests {
         assert!(matches!(
             outcomes[0],
             LlmDoneOutcome::Success {
-                stop_reason: StopReason::MaxTokens
+                stop_reason: StopReason::MaxTokens,
+                ..
             }
         ));
         let bodies = seen.lock().expect("seen request bodies");
@@ -7961,7 +8167,7 @@ mod tests {
             match event.expect("stream event") {
                 LlmEvent::TextDelta { delta, .. } => deltas.push(delta),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::Success { stop_reason, .. },
                 } => {
                     assert_eq!(stop_reason, StopReason::EndTurn);
                     saw_success_done = true;
@@ -8001,7 +8207,7 @@ mod tests {
             match event.expect("stream event") {
                 LlmEvent::ReasoningDelta { delta } => reasoning_deltas.push(delta),
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::Success { stop_reason, .. },
                 } => {
                     assert_eq!(stop_reason, StopReason::EndTurn);
                     saw_success_done = true;
@@ -8052,7 +8258,7 @@ mod tests {
                     saw_reasoning_meta = true;
                 }
                 LlmEvent::Done {
-                    outcome: LlmDoneOutcome::Success { stop_reason },
+                    outcome: LlmDoneOutcome::Success { stop_reason, .. },
                 } => {
                     assert_eq!(stop_reason, StopReason::EndTurn);
                     saw_success_done = true;

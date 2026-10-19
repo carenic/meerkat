@@ -962,6 +962,7 @@ test_suite(
         "//crates/meerkat:mcp_confinement_feedback_test",
         "//crates/meerkat:mcp_oauth_host_canary_test",
         "//crates/meerkat:meerkat_unit_test",
+        "//crates/meerkat:openai_stop_reasons_test",
         "//crates/meerkat:persistence_contract_test",
         "//crates/meerkat:predicate_schedule_test",
         "//crates/meerkat:realm_config_write_lock_test",

@@ -35,22 +35,74 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-llm-core`: `LlmDoneOutcome::Success` gains the field
+  `stop_detail: Option<Box<ProviderStopDetail>>` (the provider's own account
+  of a refusal or filter) and is `#[non_exhaustive]`: build it with
+  `LlmDoneOutcome::success(stop_reason)` or
+  `LlmDoneOutcome::success_with_detail(stop_reason, detail)`, and match it with
+  `LlmDoneOutcome::Success { stop_reason, .. }`. The field is omitted from the
+  serialized form when absent, so recorded frames keep their bytes.
+- `meerkat-core`: `AgentError::ContentFiltered` gains the fields
+  `stop: ContentFilteredStop` (`refusal` or `content_filter`, the refusing stop
+  the provider ended on) and `detail: Option<Box<ProviderStopDetail>>`.
+- `meerkat-core`: `AgentErrorReason` gains the variant
+  `ContentFiltered { stop, detail }`, appended last. Wire change: every
+  content-filtered run failure now carries it, so `error_report.reason` of a
+  `run_failed` event with class `content_filtered` goes from `null` to
+  `{"reason_type": "content_filtered", "stop": ..., "detail": ...}` (`detail`
+  omitted when the provider sent none). SDKs of earlier versions read it as an
+  unknown reason and keep it raw. Downgrade: the session event store decodes
+  every line strictly, so a 0.9.3 binary cannot read a session event log that
+  holds such a `run_failed` line.
+
+### Added
+
+- `meerkat-core`: `ProviderStopDetail`, the provider's own account of why it
+  refused or filtered a response, held as provider-tagged data (`anthropic`:
+  the refusal's `stop_details` category and explanation; `open_ai`: the filter
+  reason, or `refusal` with the refusal text; `gemini`: the raw
+  `promptFeedback.blockReason` or candidate `finishReason` with the safety
+  categories marked `blocked`). Nothing in core reads it; each text field is
+  capped at 4 KiB, and an unknown provider or a malformed detail decodes as
+  absent. With `GeminiStopStage` and `ContentFilteredStop`, and
+  `LlmStreamResult::stop_detail`.
+- `meerkat-llm-core`: `classify_web_search_stop` and `WebSearchStop`, one
+  classification of a native web-search call's stop reason for every
+  provider's executor.
+
 ### Fixed
 
 - The `web_search` tool's native search call now reads its stop reason
   (#1887). A search the provider refused or filtered, one whose context window
   filled and a cancelled one come back `failed`, naming the stop reason, with
   no answer, evidence or native events: the refusal text is no longer reported
-  as a `completed` (or `unavailable`) answer. A search cut at its output cap or
-  paused by the provider's server-tool loop still reports its answer under the
-  rules of a natural end.
+  as a `completed` (or `unavailable`) answer.
 - A Gemini prompt blocked before any candidate (`promptFeedback.blockReason`
   and so no `finishReason`) now ends the response as a content filter
   (#1888). The run fails as `content_filtered` after one provider call,
   instead of being retried as an incomplete response and failing as
   `ProviderError(IncompleteResponse)`. Every block reason reads this way,
   `OTHER` and one the adapter does not know included: a blocked prompt is
-  blocked again on every retry.
+  blocked again on every retry. The raw block reason and the blocked safety
+  categories now reach the caller as the typed reason's provider detail, so a
+  `SAFETY` block and a `BLOCKLIST` block can be told apart, of the prompt or
+  of a candidate.
+- An OpenAI refusal is no longer committed as the answer. A Responses
+  `refusal` output part, streamed (`response.refusal.delta`/`.done`) or in the
+  terminal response, and a Chat Completions `delta.refusal` end the response
+  as a refusal: the run fails `content_filtered` with stop `refusal`, and the
+  refusal text travels as the provider detail, never as answer text. The
+  refusal wins over text and tool calls in the same response. A refused
+  OpenAI native search now comes back from the `web_search` tool `failed`
+  (#1887), as the Anthropic and Gemini ones do.
+- An Anthropic refusal now carries its `stop_details` (policy category and
+  explanation) as the provider detail. Its terminal waits for `message_stop`,
+  so `stop_details` is read wherever the stream puts it.
+- A native web search cut at its output cap (`max_tokens`) or paused by the
+  provider's server-tool loop (`pause_turn`) keeps its status and answer and
+  now says, in its `error`, that the answer may be incomplete (#1887).
 
 ## [0.9.3] - 2026-10-18
 

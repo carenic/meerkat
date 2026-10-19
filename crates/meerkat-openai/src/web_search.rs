@@ -7,10 +7,8 @@ use meerkat_core::lifecycle::run_primitive::{
 use meerkat_core::web_search::{
     WebSearchEvidence, WebSearchNativeEvent, WebSearchRequest, WebSearchResult, WebSearchStatus,
 };
-use meerkat_core::{
-    AgentLlmClient, AssistantBlock, Message, Provider, StopReason, SystemMessage, UserMessage,
-};
-use meerkat_llm_core::{LlmError, WebSearchExecutor};
+use meerkat_core::{AgentLlmClient, AssistantBlock, Message, Provider, SystemMessage, UserMessage};
+use meerkat_llm_core::{LlmError, WebSearchExecutor, WebSearchStop, classify_web_search_stop};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -117,22 +115,29 @@ async fn execute_native_web_search(
     // A call that stopped on a refusal, a content filter, a filled context
     // window or a cancellation produced no answer, even when a native search
     // ran first: report it failed with the reason, never its text as the
-    // answer (#1887).
-    if let Some(stop) = unanswered_stop(result.stop_reason()) {
-        return Ok(WebSearchResult {
-            status: WebSearchStatus::Failed,
-            query: request.query,
-            provider: Some(provider),
-            model: Some(ModelId::new(model.to_string())),
-            answer: None,
-            evidence: Vec::new(),
-            native_events: Vec::new(),
-            error: Some(format!(
-                "the native web-search call stopped with `{stop}` and produced no answer"
-            )),
-            checked_at: chrono::Utc::now(),
-        });
-    }
+    // answer. One cut at its output cap or paused by the provider's
+    // server-tool loop keeps its answer and says it may be incomplete (#1887).
+    let cut_note = match classify_web_search_stop(result.stop_reason()) {
+        WebSearchStop::Unanswered(stop) => {
+            return Ok(WebSearchResult {
+                status: WebSearchStatus::Failed,
+                query: request.query,
+                provider: Some(provider),
+                model: Some(ModelId::new(model.to_string())),
+                answer: None,
+                evidence: Vec::new(),
+                native_events: Vec::new(),
+                error: Some(format!(
+                    "the native web-search call stopped with `{stop}` and produced no answer"
+                )),
+                checked_at: chrono::Utc::now(),
+            });
+        }
+        WebSearchStop::MaybeIncomplete(stop) => Some(format!(
+            "the native web-search call stopped with `{stop}`; the answer may be incomplete"
+        )),
+        WebSearchStop::Answered => None,
+    };
 
     let mut answer_parts = Vec::new();
     let mut native_events = Vec::new();
@@ -170,11 +175,15 @@ async fn execute_native_web_search(
             answer: (!answer_parts.is_empty()).then(|| answer_parts.join("\n\n")),
             evidence,
             native_events,
-            error: Some(
-                "provider stream produced no native web-search event; \
-                 search execution is unverified"
+            error: Some(match cut_note {
+                Some(cut_note) => format!(
+                    "provider stream produced no native web-search event; \
+                     search execution is unverified; {cut_note}"
+                ),
+                None => "provider stream produced no native web-search event; \
+                         search execution is unverified"
                     .to_string(),
-            ),
+            }),
             checked_at: chrono::Utc::now(),
         });
     }
@@ -187,28 +196,9 @@ async fn execute_native_web_search(
         answer: (!answer_parts.is_empty()).then(|| answer_parts.join("\n\n")),
         evidence,
         native_events,
-        error: None,
+        error: cut_note,
         checked_at: chrono::Utc::now(),
     })
-}
-
-/// The wire name of a stop reason that ends a native search call without an
-/// answer: a refusal, a content filter, a filled context window or a
-/// cancellation (#1887). `None` for a call that answered, also one cut at its
-/// output cap or paused by the provider's server-tool loop. The match is
-/// exhaustive, so a new stop reason has to be placed here.
-fn unanswered_stop(stop_reason: StopReason) -> Option<&'static str> {
-    match stop_reason {
-        StopReason::Refusal => Some("refusal"),
-        StopReason::ContentFilter => Some("content_filter"),
-        StopReason::ContextWindowExceeded => Some("context_window_exceeded"),
-        StopReason::Cancelled => Some("cancelled"),
-        StopReason::EndTurn
-        | StopReason::ToolUse
-        | StopReason::MaxTokens
-        | StopReason::StopSequence
-        | StopReason::PauseTurn => None,
-    }
 }
 
 /// Translate the agent-loop [`AgentError`] returned by `stream_response` into a
@@ -716,7 +706,16 @@ mod tests {
                 Some("Meerkats are small."),
                 "{stop_reason:?}"
             );
-            assert_eq!(result.error, None, "{stop_reason:?}");
+            let expected_error = match stop_reason {
+                StopReason::MaxTokens => Some(
+                    "the native web-search call stopped with `max_tokens`; the answer may be incomplete",
+                ),
+                StopReason::PauseTurn => Some(
+                    "the native web-search call stopped with `pause_turn`; the answer may be incomplete",
+                ),
+                _ => None,
+            };
+            assert_eq!(result.error.as_deref(), expected_error, "{stop_reason:?}");
         }
     }
 

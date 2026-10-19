@@ -157,9 +157,7 @@ impl LlmClient for MockLlmClient {
     ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>>
     {
         Box::pin(stream::iter(vec![Ok(LlmEvent::Done {
-            outcome: LlmDoneOutcome::Success {
-                stop_reason: meerkat_core::StopReason::EndTurn,
-            },
+            outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
         })]))
     }
 

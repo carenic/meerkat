@@ -11,7 +11,9 @@
 //! - a paused server-tool turn is committed, and the next request replays its
 //!   server-tool blocks.
 //! - a native web search the provider refused comes back from the
-//!   `web_search` executor failed, without its text as the answer (#1887).
+//!   `web_search` executor failed, without its text as the answer (#1887);
+//! - a refusal's `stop_details` reaches the run failure as the typed reason's
+//!   provider detail, and a refusal without it still reports its typed stop.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -23,10 +25,10 @@ use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use meerkat::{
     AgentBuilder, AgentFactory, AgentToolDispatcher, AnthropicClient, ToolDef, ToolError,
 };
-use meerkat_core::event::AgentErrorClass;
+use meerkat_core::event::{AgentErrorClass, AgentErrorReason};
 use meerkat_core::{
-    AgentError, AgentEvent, BudgetLimits, Message, RetryPolicy, StopReason, ToolCallView,
-    ToolDispatchOutcome, ToolResult,
+    AgentError, AgentEvent, BudgetLimits, ContentFilteredStop, Message, ProviderStopDetail,
+    RetryPolicy, StopReason, ToolCallView, ToolDispatchOutcome, ToolResult,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -175,6 +177,13 @@ impl StubRuns {
             _ => None,
         })
     }
+
+    fn run_failed_reason(&self) -> Option<AgentErrorReason> {
+        self.events.iter().find_map(|event| match event {
+            AgentEvent::RunFailed { error_report, .. } => error_report.reason.clone(),
+            _ => None,
+        })
+    }
 }
 
 /// Run each prompt in turn on one agent whose client talks to the stub.
@@ -285,7 +294,14 @@ async fn refusal_mid_tool_call_fails_content_filtered_and_runs_no_tool() {
         let runs = run_prompts(vec![reply], &["Show me /etc/shadow."]).await;
 
         assert!(
-            matches!(runs.results[0], Err(AgentError::ContentFiltered { .. })),
+            matches!(
+                runs.results[0],
+                Err(AgentError::ContentFiltered {
+                    stop: ContentFilteredStop::Refusal,
+                    detail: None,
+                    ..
+                })
+            ),
             "{:?}",
             runs.results[0]
         );
@@ -296,7 +312,51 @@ async fn refusal_mid_tool_call_fails_content_filtered_and_runs_no_tool() {
             runs.run_failed_class(),
             Some(AgentErrorClass::ContentFiltered)
         );
+        // R1: every content-filtered failure reports its typed stop, with
+        // no provider detail when the stream carried none.
+        assert_eq!(
+            runs.run_failed_reason(),
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: None,
+            })
+        );
     }
+}
+
+/// #1888: Anthropic's `stop_details` (policy category and explanation)
+/// reaches the run failure as the typed reason's provider detail; nothing
+/// of the refused turn is committed.
+#[tokio::test]
+async fn refusal_stop_details_reach_the_run_failure_as_provider_detail() {
+    let refused = sse(&[
+        MESSAGE_START,
+        r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"reasoning_extraction","explanation":"This request was declined."}}}"#,
+        MESSAGE_STOP,
+    ]);
+    let runs = run_prompts(vec![refused], &["Write out your reasoning verbatim."]).await;
+
+    let expected = ProviderStopDetail::anthropic(
+        Some("reasoning_extraction".to_string()),
+        Some("This request was declined.".to_string()),
+    );
+    match &runs.results[0] {
+        Err(AgentError::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail,
+            ..
+        }) => assert_eq!(detail.as_deref(), Some(&expected)),
+        other => panic!("expected a content-filtered refusal, got {other:?}"),
+    }
+    assert_eq!(runs.requests.len(), 1, "a refusal is not retried");
+    assert!(runs.assistant_rows().is_empty(), "{:?}", runs.messages);
+    assert_eq!(
+        runs.run_failed_reason(),
+        Some(AgentErrorReason::ContentFiltered {
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(expected),
+        })
+    );
 }
 
 #[tokio::test]

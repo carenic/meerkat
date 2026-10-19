@@ -2301,9 +2301,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| {
                     vec![LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     }]
                 });
             Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
@@ -2798,9 +2796,7 @@ mod tests {
                         meta: None,
                     },
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::ToolUse,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::ToolUse),
                     },
                 ],
                 vec![
@@ -2809,9 +2805,7 @@ mod tests {
                         meta: None,
                     },
                     LlmEvent::Done {
-                        outcome: LlmDoneOutcome::Success {
-                            stop_reason: meerkat_core::StopReason::EndTurn,
-                        },
+                        outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
                     },
                 ],
             ]));

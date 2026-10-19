@@ -61,9 +61,7 @@ impl LlmClient for TextClient {
                 ),
             },
             LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success {
-                    stop_reason: meerkat_core::StopReason::EndTurn,
-                },
+                outcome: LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
             },
         ];
         Box::pin(futures::stream::iter(events.into_iter().map(Ok)))

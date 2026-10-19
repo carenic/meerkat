@@ -530,7 +530,7 @@ fn text_turn_done_outcome(response: &Response, completed_stop: StopReason) -> Ll
             };
         }
     };
-    LlmDoneOutcome::Success { stop_reason }
+    LlmDoneOutcome::success(stop_reason)
 }
 
 /// The outcome of a `response.done` that did not parse, usually because its
@@ -716,7 +716,7 @@ mod tests {
             ),
         ] {
             match text_turn_done_outcome(&done_response(status, reason), completed_stop) {
-                LlmDoneOutcome::Success { stop_reason } => {
+                LlmDoneOutcome::Success { stop_reason, .. } => {
                     assert_eq!(stop_reason, expected, "{status:?} {reason:?}");
                 }
                 other => panic!("{status:?} {reason:?}: expected Success, got {other:?}"),

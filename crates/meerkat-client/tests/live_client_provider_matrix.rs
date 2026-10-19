@@ -523,7 +523,7 @@ async fn e2e_anthropic_tool_use() -> Result<(), Box<dyn std::error::Error>> {
                 got_tool = true;
             }
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             }) => {
                 assert_eq!(stop_reason, StopReason::ToolUse);
                 break;
@@ -616,6 +616,7 @@ async fn test_anthropic_message_stop_without_newline_yields_done()
                 outcome:
                     LlmDoneOutcome::Success {
                         stop_reason: reason,
+                        ..
                     },
             }) => {
                 got_done = true;
@@ -677,6 +678,7 @@ async fn test_anthropic_message_stop_without_space_prefix_yields_done()
                 outcome:
                     LlmDoneOutcome::Success {
                         stop_reason: reason,
+                        ..
                     },
             }) => {
                 got_done = true;
@@ -737,7 +739,7 @@ async fn test_anthropic_stream_end_without_done_yields_incomplete()
                 }
             }
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             }) => {
                 return Err(format!(
                     "truncated stream must not launder into Done{{Success}}; got stop_reason {stop_reason:?}"
@@ -831,7 +833,7 @@ async fn e2e_openai_tool_use() -> Result<(), Box<dyn std::error::Error>> {
                 got_tool = true;
             }
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             }) => {
                 assert_eq!(stop_reason, StopReason::ToolUse);
                 break;
@@ -912,7 +914,7 @@ async fn e2e_gemini_tool_use() -> Result<(), Box<dyn std::error::Error>> {
                 got_tool = true;
             }
             Ok(LlmEvent::Done {
-                outcome: LlmDoneOutcome::Success { stop_reason },
+                outcome: LlmDoneOutcome::Success { stop_reason, .. },
             }) => {
                 assert_eq!(stop_reason, StopReason::ToolUse);
                 break;

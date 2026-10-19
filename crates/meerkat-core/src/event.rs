@@ -376,6 +376,21 @@ pub enum AgentErrorReason {
         hook_id: HookId,
         reason: HookFailureReason,
     },
+    /// The provider refused or filtered the response: every
+    /// [`AgentError::ContentFiltered`] failure, with the provider's own
+    /// account when it gave one.
+    ContentFiltered {
+        /// Which refusing stop the provider ended the response with.
+        stop: crate::types::ContentFilteredStop,
+        /// The provider's tagged evidence, absent when it sent none. An
+        /// unknown provider or a malformed detail decodes as absent.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::types::deserialize_lenient_provider_stop_detail"
+        )]
+        detail: Option<crate::types::ProviderStopDetail>,
+    },
 }
 
 impl AgentErrorReason {
@@ -491,6 +506,10 @@ impl AgentErrorReason {
                     outcome: *outcome,
                     cause_kind: *cause_kind,
                 }),
+            AgentError::ContentFiltered { stop, detail, .. } => Some(Self::ContentFiltered {
+                stop: *stop,
+                detail: detail.as_deref().cloned(),
+            }),
             _ => None,
         }
     }
@@ -4774,6 +4793,113 @@ mod tests {
                     "message": "provider overloaded"
                 }),
             })
+        );
+    }
+
+    /// R1 (rev-239): every content-filtered failure reports its typed stop,
+    /// with the provider's detail when it sent one. The detail is only
+    /// carried: class, Display, the turn failure source and the session
+    /// error code are the same with and without it.
+    #[test]
+    fn content_filtered_report_carries_its_stop_with_or_without_detail() {
+        use crate::types::{ContentFilteredStop, ProviderStopDetail};
+        let detail = ProviderStopDetail::anthropic(
+            Some("cyber".to_string()),
+            Some("This request was declined.".to_string()),
+        );
+        let with_detail = crate::error::AgentError::ContentFiltered {
+            turn: 2,
+            stop: ContentFilteredStop::Refusal,
+            detail: Some(Box::new(detail.clone())),
+        };
+        let without_detail = crate::error::AgentError::ContentFiltered {
+            turn: 2,
+            stop: ContentFilteredStop::Refusal,
+            detail: None,
+        };
+
+        let report_with = AgentErrorReport::from_agent_error(&with_detail);
+        let report_without = AgentErrorReport::from_agent_error(&without_detail);
+        assert_eq!(report_with.class, AgentErrorClass::ContentFiltered);
+        assert_eq!(report_without.class, AgentErrorClass::ContentFiltered);
+        assert_eq!(with_detail.to_string(), without_detail.to_string());
+        assert_eq!(report_with.message, report_without.message);
+        assert_eq!(
+            crate::turn_execution_authority::TurnFailureSourceKind::from_agent_error(&with_detail)
+                .ok(),
+            crate::turn_execution_authority::TurnFailureSourceKind::from_agent_error(
+                &without_detail
+            )
+            .ok(),
+        );
+        assert_eq!(
+            report_with.reason,
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: Some(detail),
+            })
+        );
+        assert_eq!(
+            report_without.reason,
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::Refusal,
+                detail: None,
+            })
+        );
+
+        let wire_with = serde_json::to_value(&report_with).expect("serialize");
+        assert_eq!(wire_with["reason"]["reason_type"], "content_filtered");
+        assert_eq!(wire_with["reason"]["stop"], "refusal");
+        assert_eq!(wire_with["reason"]["detail"]["provider"], "anthropic");
+        assert_eq!(wire_with["reason"]["detail"]["category"], "cyber");
+        let wire_without = serde_json::to_value(&report_without).expect("serialize");
+        assert_eq!(wire_without["reason"]["reason_type"], "content_filtered");
+        assert_eq!(wire_without["reason"]["stop"], "refusal");
+        assert!(wire_without["reason"].get("detail").is_none());
+
+        assert_eq!(
+            crate::service::SessionError::Agent(with_detail).code(),
+            crate::service::SessionError::Agent(without_detail).code(),
+        );
+    }
+
+    /// L1 (rev-239): provider evidence never makes a record undecodable. An
+    /// unknown provider tag or a malformed detail decodes as absent, and the
+    /// typed stop survives.
+    #[test]
+    fn content_filtered_reason_decodes_unknown_or_malformed_detail_as_absent() {
+        use crate::types::{ContentFilteredStop, GeminiStopStage, ProviderStopDetail};
+        for raw in [
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"future_provider","code":7}}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"gemini","stage":"nowhere","reason":"SAFETY"}}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":"not an object"}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":null}"#,
+            r#"{"reason_type":"content_filtered","stop":"content_filter"}"#,
+        ] {
+            let reason: AgentErrorReason = serde_json::from_str(raw).expect(raw);
+            assert_eq!(
+                reason,
+                AgentErrorReason::ContentFiltered {
+                    stop: ContentFilteredStop::ContentFilter,
+                    detail: None,
+                },
+                "{raw}"
+            );
+        }
+        let known: AgentErrorReason = serde_json::from_str(
+            r#"{"reason_type":"content_filtered","stop":"content_filter","detail":{"provider":"gemini","stage":"prompt","reason":"BLOCKLIST"}}"#,
+        )
+        .expect("known detail");
+        assert_eq!(
+            known,
+            AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::ContentFilter,
+                detail: Some(ProviderStopDetail::gemini(
+                    GeminiStopStage::Prompt,
+                    "BLOCKLIST",
+                    Vec::new(),
+                )),
+            }
         );
     }
 

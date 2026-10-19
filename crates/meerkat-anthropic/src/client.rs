@@ -12,8 +12,8 @@ use meerkat_core::lifecycle::run_primitive::{
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, ImageData, Message, OutputSchema,
-    Provider, ServerToolKind, StopReason, SystemNoticeBlock, SystemNoticeMessage, ToolResult,
-    Usage,
+    Provider, ProviderStopDetail, ServerToolKind, StopReason, SystemNoticeBlock,
+    SystemNoticeMessage, ToolResult, Usage,
 };
 use meerkat_llm_core::LlmError;
 use meerkat_llm_core::error::ProviderErrorObject;
@@ -1526,13 +1526,26 @@ impl AnthropicClient {
                 ),
                 _,
             )
-            | (Ok(stop_reason), None) => LlmDoneOutcome::Success { stop_reason },
+            | (Ok(stop_reason), None) => LlmDoneOutcome::success(stop_reason),
             (Ok(_), Some(error)) => LlmDoneOutcome::Error { error },
         }
     }
 
     /// The terminal outcome of a stream that ended without any stop reason.
     ///
+    /// The terminal outcome of a refusal, with Anthropic's `stop_details`
+    /// (policy category and explanation) as the stop's provider detail when
+    /// the stream carried it.
+    fn refusal_outcome(details: Option<AnthropicStopDetails>) -> LlmDoneOutcome {
+        match details {
+            Some(details) => LlmDoneOutcome::success_with_detail(
+                StopReason::Refusal,
+                ProviderStopDetail::anthropic(details.category, details.explanation),
+            ),
+            None => LlmDoneOutcome::success(StopReason::Refusal),
+        }
+    }
+
     /// A missing reason is not an unknown one: a proxy may omit it, so the
     /// turn ends as `end_turn` unless a tool call's input failed to parse.
     fn missing_stop_outcome(
@@ -1541,9 +1554,7 @@ impl AnthropicClient {
     ) -> LlmDoneOutcome {
         match deferred_tool_args_error {
             Some(error) => LlmDoneOutcome::Error { error },
-            None => LlmDoneOutcome::Success {
-                stop_reason: last_stop_reason.unwrap_or(StopReason::EndTurn),
-            },
+            None => LlmDoneOutcome::success(last_stop_reason.unwrap_or(StopReason::EndTurn)),
         }
     }
 }
@@ -1749,6 +1760,11 @@ impl AnthropicClient {
             let mut current_block_type: Option<String> = None;
             let mut current_thinking_signature: Option<String> = None;
             let mut last_stop_reason: Option<StopReason> = None;
+            // A refusal's `Done` waits for `message_stop` (or the end of the
+            // stream), so its `stop_details` is read wherever the stream puts
+            // it: in the stop's `message_delta` or after it.
+            let mut refusal_pending = false;
+            let mut refusal_details: Option<AnthropicStopDetails> = None;
             // A refusal or a filled context window can cut a tool call
             // mid-input; its parse failure waits for the stop reason that
             // says why (`stop_outcome`).
@@ -1990,18 +2006,36 @@ impl AnthropicClient {
                                         })?,
                                 };
                             }
-                            if let Some(finish_reason) = $event.delta.and_then(|d| d.stop_reason) {
+                            let delta = $event.delta;
+                            if let Some(details) = delta
+                                .as_ref()
+                                .and_then(|delta| delta.stop_details.clone())
+                                .or($event.stop_details)
+                            {
+                                refusal_details = Some(details);
+                            }
+                            if let Some(finish_reason) = delta.and_then(|d| d.stop_reason) {
                                 let outcome = Self::stop_outcome(
                                     finish_reason.as_str(),
                                     deferred_tool_args_error.take(),
                                 );
-                                if let LlmDoneOutcome::Success { stop_reason } = &outcome {
+                                if let LlmDoneOutcome::Success { stop_reason, .. } = &outcome {
                                     last_stop_reason = Some(*stop_reason);
                                 }
                                 if !saw_done {
-                                    chunk_yielded.set(true);
-                                    yield LlmEvent::Done { outcome };
-                                    saw_done = true;
+                                    if matches!(
+                                        outcome,
+                                        LlmDoneOutcome::Success {
+                                            stop_reason: StopReason::Refusal,
+                                            ..
+                                        }
+                                    ) {
+                                        refusal_pending = true;
+                                    } else {
+                                        chunk_yielded.set(true);
+                                        yield LlmEvent::Done { outcome };
+                                        saw_done = true;
+                                    }
                                 }
                             }
                         }
@@ -2019,6 +2053,16 @@ impl AnthropicClient {
                             }
                         }
                         "message_stop" => {
+                            if let Some(details) = $event.stop_details {
+                                refusal_details = Some(details);
+                            }
+                            if !saw_done && refusal_pending {
+                                chunk_yielded.set(true);
+                                yield LlmEvent::Done {
+                                    outcome: Self::refusal_outcome(refusal_details.take()),
+                                };
+                                saw_done = true;
+                            }
                             if !saw_done {
                                 let finish_reason = $event.delta.and_then(|d| d.stop_reason);
                                 let outcome = match finish_reason.as_deref() {
@@ -2031,7 +2075,7 @@ impl AnthropicClient {
                                         deferred_tool_args_error.take(),
                                     ),
                                 };
-                                if let LlmDoneOutcome::Success { stop_reason } = &outcome {
+                                if let LlmDoneOutcome::Success { stop_reason, .. } = &outcome {
                                     last_stop_reason = Some(*stop_reason);
                                 }
                                 chunk_yielded.set(true);
@@ -2120,10 +2164,14 @@ impl AnthropicClient {
                         if let Some(data) = Self::strip_data_prefix($line) {
                             if data == "[DONE]" {
                                 if !saw_done {
-                                    let outcome = Self::missing_stop_outcome(
-                                        last_stop_reason,
-                                        deferred_tool_args_error.take(),
-                                    );
+                                    let outcome = if refusal_pending {
+                                        Self::refusal_outcome(refusal_details.take())
+                                    } else {
+                                        Self::missing_stop_outcome(
+                                            last_stop_reason,
+                                            deferred_tool_args_error.take(),
+                                        )
+                                    };
                                     chunk_yielded.set(true);
                                     yield LlmEvent::Done { outcome };
                                     saw_done = true;
@@ -2181,7 +2229,11 @@ impl AnthropicClient {
                     yield LlmEvent::WireLiveness;
                 }
             }
-            if !saw_done && let Some(error) = deferred_tool_args_error.take() {
+            if !saw_done && refusal_pending {
+                yield LlmEvent::Done {
+                    outcome: Self::refusal_outcome(refusal_details.take()),
+                };
+            } else if !saw_done && let Some(error) = deferred_tool_args_error.take() {
                 yield LlmEvent::Done {
                     outcome: LlmDoneOutcome::Error { error },
                 };
@@ -2649,6 +2701,17 @@ struct AnthropicEvent {
     usage: Option<AnthropicUsage>,
     /// Error object for streaming error events
     error: Option<Value>,
+    /// `stop_details` sent beside the delta rather than inside it.
+    stop_details: Option<AnthropicStopDetails>,
+}
+
+/// Anthropic `stop_details`: on a `refusal` stop, the policy category that
+/// triggered it and a human-readable explanation (both null when the refusal
+/// maps to no named category); null for every other stop.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicStopDetails {
+    category: Option<String>,
+    explanation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2658,6 +2721,9 @@ struct AnthropicDelta {
     text: Option<String>,
     partial_json: Option<String>,
     stop_reason: Option<String>,
+    /// `stop_details` of the stop (Anthropic documents it on the message;
+    /// a stream carries it with the stop's `message_delta`).
+    stop_details: Option<AnthropicStopDetails>,
     /// Thinking content for thinking_delta events
     thinking: Option<String>,
     /// Signature for signature_delta events (arrives separately before content_block_stop)
@@ -5646,7 +5712,8 @@ mod tests {
             matches!(
                 fixture_done(&events),
                 LlmDoneOutcome::Success {
-                    stop_reason: StopReason::ContextWindowExceeded
+                    stop_reason: StopReason::ContextWindowExceeded,
+                    ..
                 }
             ),
             "{events:?}"
@@ -5706,11 +5773,98 @@ mod tests {
                 matches!(
                     fixture_done(&events),
                     LlmDoneOutcome::Success {
-                        stop_reason: StopReason::Refusal
+                        stop_reason: StopReason::Refusal,
+                        ..
                     }
                 ),
                 "close_block={close_block}: {events:?}"
             );
+        }
+    }
+
+    /// R2 (rev-239, #1888): a refusal's `stop_details` (policy category and
+    /// explanation) rides the stop's provider detail wherever the stream
+    /// carries it: inside the stop's `message_delta`, beside its delta, or on
+    /// a later `message_stop`. The refusal's `Done` waits for `message_stop`
+    /// (or the end of the stream), so a late `stop_details` is never dropped.
+    #[tokio::test]
+    async fn refusal_stop_details_ride_the_stop_wherever_the_stream_puts_them() {
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#;
+        let details =
+            r#"{"type":"refusal","category":"cyber","explanation":"This request was declined."}"#;
+        let in_delta = format!(
+            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal","stop_sequence":null,"stop_details":{details}}}}}"#
+        );
+        let beside_delta = format!(
+            r#"data: {{"type":"message_delta","usage":{{"output_tokens":0}},"delta":{{"stop_reason":"refusal"}},"stop_details":{details}}}"#
+        );
+        let bare_delta = r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal"}}"#;
+        let late_stop = format!(r#"data: {{"type":"message_stop","stop_details":{details}}}"#);
+        let stop = r#"data: {"type":"message_stop"}"#;
+        let expected = ProviderStopDetail::anthropic(
+            Some("cyber".to_string()),
+            Some("This request was declined.".to_string()),
+        );
+        for (label, lines) in [
+            ("in the delta", vec![start, in_delta.as_str(), stop]),
+            ("beside the delta", vec![start, beside_delta.as_str(), stop]),
+            (
+                "on message_stop",
+                vec![start, bare_delta, late_stop.as_str()],
+            ),
+            ("stream cut after the delta", vec![start, in_delta.as_str()]),
+        ] {
+            let events = stop_reason_fixture_events(&lines).await;
+            match fixture_done(&events) {
+                LlmDoneOutcome::Success {
+                    stop_reason: StopReason::Refusal,
+                    stop_detail,
+                    ..
+                } => assert_eq!(stop_detail.as_deref(), Some(&expected), "{label}"),
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A refusal that maps to no named category carries null category and
+    /// explanation; one without `stop_details` at all (an older API or a
+    /// proxy) is still a refusal, without detail. Any other stop carries none.
+    #[tokio::test]
+    async fn refusal_detail_is_null_category_or_absent_and_other_stops_carry_none() {
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#;
+        let stop = r#"data: {"type":"message_stop"}"#;
+        for (label, delta, expected_stop, expected_detail) in [
+            (
+                "unnamed category",
+                r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null,"explanation":null}}}"#,
+                StopReason::Refusal,
+                Some(ProviderStopDetail::anthropic(None, None)),
+            ),
+            (
+                "no stop_details",
+                r#"data: {"type":"message_delta","usage":{"output_tokens":0},"delta":{"stop_reason":"refusal"}}"#,
+                StopReason::Refusal,
+                None,
+            ),
+            (
+                "end_turn",
+                r#"data: {"type":"message_delta","usage":{"output_tokens":3},"delta":{"stop_reason":"end_turn","stop_details":null}}"#,
+                StopReason::EndTurn,
+                None,
+            ),
+        ] {
+            let events = stop_reason_fixture_events(&[start, delta, stop]).await;
+            match fixture_done(&events) {
+                LlmDoneOutcome::Success {
+                    stop_reason,
+                    stop_detail,
+                    ..
+                } => {
+                    assert_eq!(*stop_reason, expected_stop, "{label}");
+                    assert_eq!(stop_detail.as_deref(), expected_detail.as_ref(), "{label}");
+                }
+                other => panic!("{label}: {other:?}"),
+            }
         }
     }
 

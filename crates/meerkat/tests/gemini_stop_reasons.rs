@@ -4,7 +4,9 @@
 //! `streamGenerateContent` stub that records every request body, and pin
 //! what a prompt Gemini blocked before any candidate does to the run: it
 //! fails as content filtered after exactly one provider call, never as an
-//! incomplete response that is retried (#1888).
+//! incomplete response that is retried, keeps the prompt tokens it was
+//! billed, and reports the raw block reason as the typed reason's provider
+//! detail (#1888).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -14,9 +16,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use meerkat::{AgentBuilder, AgentFactory, AgentToolDispatcher, GeminiClient, ToolDef, ToolError};
-use meerkat_core::event::AgentErrorClass;
+use meerkat_core::event::{AgentErrorClass, AgentErrorReason};
 use meerkat_core::{
-    AgentError, AgentEvent, Message, RetryPolicy, ToolCallView, ToolDispatchOutcome,
+    AgentError, AgentEvent, ContentFilteredStop, GeminiStopStage, Message, ProviderStopDetail,
+    RetryPolicy, ToolCallView, ToolDispatchOutcome, Usage,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -84,12 +87,20 @@ struct StubRun {
     events: Vec<AgentEvent>,
     requests: usize,
     assistant_rows: usize,
+    usage: Usage,
 }
 
 impl StubRun {
     fn run_failed_class(&self) -> Option<AgentErrorClass> {
         self.events.iter().find_map(|event| match event {
             AgentEvent::RunFailed { error_report, .. } => Some(error_report.class),
+            _ => None,
+        })
+    }
+
+    fn run_failed_reason(&self) -> Option<AgentErrorReason> {
+        self.events.iter().find_map(|event| match event {
+            AgentEvent::RunFailed { error_report, .. } => error_report.reason.clone(),
             _ => None,
         })
     }
@@ -136,11 +147,13 @@ async fn run_prompt(reply: String) -> StubRun {
         .iter()
         .filter(|message| matches!(message, Message::BlockAssistant(_)))
         .count();
+    let usage = agent.session().total_usage();
     StubRun {
         result,
         events,
         requests,
         assistant_rows,
+        usage,
     }
 }
 
@@ -152,11 +165,16 @@ async fn prompt_blocked_before_any_candidate_fails_content_filtered_once() {
         );
         let run = run_prompt(reply).await;
 
-        assert!(
-            matches!(run.result, Err(AgentError::ContentFiltered { .. })),
-            "{block_reason}: {:?}",
-            run.result
-        );
+        let expected =
+            ProviderStopDetail::gemini(GeminiStopStage::Prompt, block_reason, Vec::new());
+        match &run.result {
+            Err(AgentError::ContentFiltered {
+                stop: ContentFilteredStop::ContentFilter,
+                detail,
+                ..
+            }) => assert_eq!(detail.as_deref(), Some(&expected), "{block_reason}"),
+            other => panic!("{block_reason}: expected content filtered, got {other:?}"),
+        }
         assert_eq!(
             run.requests, 1,
             "{block_reason}: a blocked prompt is not retried"
@@ -166,6 +184,20 @@ async fn prompt_blocked_before_any_candidate_fails_content_filtered_once() {
             run.run_failed_class(),
             Some(AgentErrorClass::ContentFiltered),
             "{block_reason}"
+        );
+        assert_eq!(
+            run.run_failed_reason(),
+            Some(AgentErrorReason::ContentFiltered {
+                stop: ContentFilteredStop::ContentFilter,
+                detail: Some(expected),
+            }),
+            "{block_reason}: the raw block reason reaches the caller"
+        );
+        // N1: the blocked prompt was billed, and its tokens stay counted.
+        assert_eq!(
+            run.usage.input_tokens, 12,
+            "{block_reason}: {:?}",
+            run.usage
         );
     }
 }

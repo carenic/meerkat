@@ -269,8 +269,24 @@ export interface ProviderAgentErrorReason {
   readonly providerError: unknown;
 }
 
+/** The provider's own account of a refusal or filter, tagged by `provider`. */
+export type ContentFilteredStopDetail = Readonly<Record<string, unknown>> & {
+  readonly provider: string;
+};
+
+/**
+ * The provider refused or filtered the response. `stop` is the typed meaning;
+ * `detail` is the provider's tagged evidence, absent when it sent none.
+ */
+export interface ContentFilteredAgentErrorReason {
+  readonly reasonType: "content_filtered";
+  readonly stop: "refusal" | "content_filter";
+  readonly detail?: ContentFilteredStopDetail;
+}
+
 export type AgentErrorReason =
   | ProviderAgentErrorReason
+  | ContentFilteredAgentErrorReason
   | TurnTerminalCauseReason
   | UnknownAgentErrorReason
   | HookAgentErrorReason;
@@ -1103,6 +1119,20 @@ function parseAgentErrorReason(raw: unknown): AgentErrorReason | null | undefine
       providerErrorRetryability,
       providerError: raw.provider_error,
     };
+  }
+
+  if (reasonType === "content_filtered") {
+    const stop = raw.stop;
+    if (stop !== "refusal" && stop !== "content_filter") {
+      return { reasonType: "unknown", rawReasonType: reasonType, raw };
+    }
+    // Provider evidence never fails the report: a detail that is not a
+    // provider-tagged object reads as absent, as Core decodes it.
+    const detail = raw.detail;
+    if (isPlainRecord(detail) && typeof detail.provider === "string") {
+      return { reasonType, stop, detail: detail as ContentFilteredStopDetail };
+    }
+    return { reasonType, stop };
   }
 
   if (!["hook_denied", "hook_timeout", "hook_execution_failed"].includes(reasonType)) {
