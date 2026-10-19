@@ -3451,12 +3451,20 @@ fn s99_resends_current_answer(append: &str) -> bool {
 async fn s99_wait_for_assistant_quiet(
     live: &mut PublicLiveHarness,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_assistant_quiet(
+    let (report, waited) = wait_for_assistant_quiet(
         &mut live.peer,
         live.evidence.as_ref(),
         PlaybackAudioPolicy::Required,
     )
     .await?;
+    let evidence = s99_evidence(live)?;
+    record_metric(
+        evidence,
+        evidence.current_channel()?,
+        "S99",
+        "quiet_wait",
+        report.describe(waited),
+    )?;
     Ok(())
 }
 
@@ -3477,7 +3485,8 @@ async fn wait_for_assistant_quiet(
     peer: &mut BrowserPeer,
     journal: Option<&Journal>,
     policy: PlaybackAudioPolicy,
-) -> Result<QuietReport, Box<dyn std::error::Error>> {
+) -> Result<(QuietReport, Duration), Box<dyn std::error::Error>> {
+    let started = Instant::now();
     let mut quiet: Option<AssistantQuiet> = None;
     loop {
         let (events, audio) = peer.quiet_probe().await?;
@@ -3500,10 +3509,9 @@ async fn wait_for_assistant_quiet(
         match poll {
             QuietPoll::Waiting => sleep(Duration::from_millis(100)).await,
             QuietPoll::Quiet(report) => {
-                if report.audio_unmeasured {
-                    println!("GPT_LIVE_QUIET_AUDIO=unmeasured");
-                }
-                return Ok(report);
+                let waited = started.elapsed();
+                println!("GPT_LIVE_QUIET {}", report.describe(waited));
+                return Ok((report, waited));
             }
             QuietPoll::Unmeasured => {
                 return Err(

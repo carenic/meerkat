@@ -1268,16 +1268,37 @@ pub enum QuietRestart {
     ContextAppend,
 }
 
-/// How an assistant-quiet wait ended.
+/// How an assistant-quiet wait ended. The append counts are waiting
+/// periods, not appends: every owned append seen before assistant output
+/// follows joins one period (the bound runs from the newest of them), and
+/// the journal counts append attempts per fragment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QuietReport {
-    /// Owned appends that assistant output followed within the bound.
+    /// Waiting periods that assistant output ended within the bound.
     pub appends_answered: u32,
-    /// Owned appends no assistant output followed within the bound.
+    /// Waiting periods the bound ended with no assistant output.
     pub appends_unanswered: u32,
     /// Playback was not measured, so the audio clause did not run
     /// ([`PlaybackAudioPolicy::BestEffort`] only).
     pub audio_unmeasured: bool,
+}
+
+impl QuietReport {
+    /// The record of one wait that took `waited`: which clauses ended it,
+    /// for the `GPT_LIVE_QUIET` line and S99's `quiet_wait` metric.
+    pub fn describe(&self, waited: Duration) -> String {
+        format!(
+            "appends_answered={} appends_unanswered={} audio={} waited_ms={}",
+            self.appends_answered,
+            self.appends_unanswered,
+            if self.audio_unmeasured {
+                "unmeasured"
+            } else {
+                "measured"
+            },
+            waited.as_millis()
+        )
+    }
 }
 
 /// One poll of an assistant-quiet wait.
@@ -1728,6 +1749,25 @@ mod assistant_quiet_tests {
         assert_eq!(
             QuestionOnset::classify(PlaybackAudio::Unmeasured, PlaybackAudio::Measured(900)),
             QuestionOnset::Unmeasured
+        );
+    }
+
+    /// The per-wait record (`GPT_LIVE_QUIET`, S99's `quiet_wait`) names how
+    /// the wait ended, so a soak can count cues left unanswered.
+    #[test]
+    fn a_quiet_report_describes_how_its_wait_ended() {
+        let report = QuietReport {
+            appends_answered: 1,
+            appends_unanswered: 2,
+            audio_unmeasured: true,
+        };
+        assert_eq!(
+            report.describe(ms(9_250)),
+            "appends_answered=1 appends_unanswered=2 audio=unmeasured waited_ms=9250"
+        );
+        assert_eq!(
+            QuietReport::default().describe(ms(3_000)),
+            "appends_answered=0 appends_unanswered=0 audio=measured waited_ms=3000"
         );
     }
 }
