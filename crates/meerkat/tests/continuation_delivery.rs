@@ -2896,7 +2896,7 @@ mod hosting {
         );
     }
 
-    /// #549b: the store's kept delivery-generation reader under a delivery
+    /// The store's kept delivery-generation reader under a delivery
     /// owner. Unix only: the store keeps the reader on unix.
     #[cfg(unix)]
     mod kept_reader {
@@ -2947,7 +2947,7 @@ mod hosting {
                 .is_some()
         }
 
-        /// #549b: a quiet watched store ticks its owner every sweep, and
+        /// A quiet watched store ticks its owner every sweep, and
         /// every tick reads the delivery generation. Through the store's kept
         /// reader the owner opens the database once and reads on the kept
         /// connection at its ticks; through the fresh-open path (the one
@@ -2996,7 +2996,7 @@ mod hosting {
             drop(handle);
         }
 
-        /// #549b: the kept reader's connection closes once the store has been
+        /// The kept reader's connection closes once the store has been
         /// quiet for `KEPT_DELIVERY_READER_IDLE`, and with it the presence
         /// lock the maintenance fence waits for (paused time).
         #[tokio::test(start_paused = true)]
@@ -3194,7 +3194,7 @@ mod hosting {
             }
         }
 
-        /// #549b: delivering calls into the host, which can wait, so an owner
+        /// Delivering calls into the host, which can wait, so an owner
         /// closes its kept reader's connection before it delivers, and
         /// maintenance never waits on a delivery. The arming pass reads the
         /// delivery generation through the kept reader, then delivers a
@@ -3239,7 +3239,7 @@ mod hosting {
             drop(handle);
         }
 
-        /// #549b: projecting a page of owed continuations calls into the
+        /// Projecting a page of owed continuations calls into the
         /// host, which can wait, so an owner closes its kept reader's
         /// connection before it projects. The store sweep reads on the kept
         /// connection until a change of the owing source starts a round,
@@ -3286,7 +3286,7 @@ mod hosting {
             drop(handle);
         }
 
-        /// #549b: resolving a continuation address calls into the host, which
+        /// Resolving a continuation address calls into the host, which
         /// can wait (it can revive a member), so an owner closes its kept
         /// reader's connection before it resolves the address of a member
         /// continuation waiting on another host. The test holds the

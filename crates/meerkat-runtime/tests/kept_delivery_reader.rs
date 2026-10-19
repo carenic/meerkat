@@ -1,4 +1,4 @@
-//! The kept delivery-generation reader (#549b): one verified open, then one
+//! The kept delivery-generation reader: one verified open, then one
 //! guarded snapshot read per store tick, closed for maintenance, for a file
 //! replaced at its path, and for a schema or ledger change. Unix only: the
 //! store keeps the reader on unix, and the replacement tests rename open

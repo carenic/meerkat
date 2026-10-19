@@ -884,7 +884,7 @@ impl RuntimeDeliveryInbox {
     }
 
     /// The store's reader of its delivery generation for a delivery owner's
-    /// store ticks (#549b), if the store keeps one; see
+    /// store ticks, if the store keeps one; see
     /// [`RuntimeStore::delivery_generation_reader`]. `None` reads through
     /// [`Self::delivery_generation`].
     pub fn delivery_generation_reader(

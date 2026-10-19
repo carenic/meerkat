@@ -383,7 +383,7 @@ impl RuntimeDeliveryOwner {
         // seen by the pass or ticks the watch (at worst at the next sweep).
         let store_watch = StoreWake::start(&capability, self.store_sweep);
         // Each tick of a watched store reads the delivery generation: through
-        // the store's kept reader when it keeps one (#549b). An unwatched
+        // the store's kept reader when it keeps one. An unwatched
         // store reads it only when a pass reconciles, and keeps nothing.
         let generation_reader = if store_watch.is_watching() {
             self.runtime_inbox
@@ -657,7 +657,7 @@ struct OwnerLoop {
     /// The store's durable delivery generation as last reconciled; a store
     /// tick reconciles only when it moved.
     last_delivery_generation: Option<u64>,
-    /// The store's kept reader of its delivery generation (#549b): on a
+    /// The store's kept reader of its delivery generation: on a
     /// watched store whose store keeps one; `None` reads through the inbox.
     /// One per owner, so one kept connection per runtime delivery inbox. The
     /// loop reaches it only through `&mut self` (`Mutex::get_mut`, which never

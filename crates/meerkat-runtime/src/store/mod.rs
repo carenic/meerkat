@@ -8567,7 +8567,7 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
 }
 
 /// How long a delivery owner keeps its generation reader's connection open
-/// after the reader's last read (#549b).
+/// after the reader's last read.
 ///
 /// - It bounds how long a quiet reader delays maintenance. The maintenance
 ///   fence waits for kept connections to close. An owner closes its reader's
@@ -9136,7 +9136,7 @@ pub trait RuntimeStore: Send + Sync {
     }
 
     /// A reader of [`Self::load_delivery_generation`] for one delivery
-    /// owner's store ticks (#549b), or `None`, the default, to read through
+    /// owner's store ticks, or `None`, the default, to read through
     /// [`Self::load_delivery_generation`] on every tick.
     ///
     /// A store decorator forwards this to the store it wraps, or keeps the

@@ -260,7 +260,8 @@ impl KeptConnectionPresence {
     ///   the registry and keep nothing, so the holder never waits on itself;
     /// - maintenance holds the presence lock;
     /// - the database file is missing (nothing to keep, and no presence file
-    ///   is planted next to it) or refused (see
+    ///   is planted next to it), has no file identity (as on every platform
+    ///   but unix), or is refused (see
     ///   [`validate_database_file`](crate::profile::validate_database_file)),
     ///   or the presence lock file cannot be created or locked (a read-only
     ///   medium, a filesystem without locks): presence that cannot be held

@@ -4877,8 +4877,8 @@ END";
         }
     }
 
-    /// A delivery owner's kept reader of the durable delivery generation
-    /// (#549b): one verified open, then one guarded snapshot read per tick.
+    /// A delivery owner's kept reader of the durable delivery generation:
+    /// one verified open, then one guarded snapshot read per tick.
     ///
     /// The connection stays open between reads under the database's presence
     /// lock ([`meerkat_sqlite::KeptConnectionPresence`]), so maintenance waits
@@ -5056,7 +5056,7 @@ END";
         }
     }
 
-    /// Test hooks of the delivery-generation reads (#549b), keyed by database
+    /// Test hooks of the delivery-generation reads, keyed by database
     /// path, so tests on their own databases do not meet.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
