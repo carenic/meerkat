@@ -51,6 +51,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-openai = { path = ".", features = ["workspace-tests"] }
 meerkat = { path = "../meerkat", default-features = false }
 meerkat-authorization.workspace = true
 meerkat-authorization-contracts.workspace = true
@@ -81,6 +84,12 @@ experimental-gpt-live = [
 # qualified experimental admission carrier and advertises no capability.
 experimental-gpt-live-gate0-harness = ["experimental-gpt-live"]
 test-realtime-fixtures = []
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [package.metadata.cargo-machete]
 ignored = ["getrandom", "base64", "indexmap", "tempfile"]

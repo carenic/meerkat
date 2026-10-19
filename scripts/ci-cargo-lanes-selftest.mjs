@@ -2052,12 +2052,12 @@ for (const path of [
     "--test gpt_live_replay",
     undefined,
   ]);
-  // A docs edit selects no suite: its integration rows are its reader rows.
+  // A docs edit selects no suite: its integration rows are its reader rows
+  // (rkat's doc-example test runs in the push's closure-tests rows).
   const docsGithub = run(["--format", "github", "--", "docs/index.mdx"]);
   const docsLines = Object.fromEntries(docsGithub.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  assert.equal(docsLines.integration_count, "3");
+  assert.equal(docsLines.integration_count, "2");
   assert.deepEqual(JSON.parse(docsLines.integration_matrix).include.map((row) => row.name), [
-    "reader rkat:bin:rkat",
     "reader xtask:package",
     "reader xtask:test:machines_contracts",
   ]);
@@ -2394,7 +2394,7 @@ for (const path of [
     staticLanes,
   ]);
   assert.deepEqual(pullRequest.reader_rows.map((row) => row.reads), [["docs/index.mdx"], ["docs/index.mdx"], ["docs/index.mdx"]]);
-  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:bin:rkat", "xtask:package test targets"]);
+  assert.deepEqual(pullRequest.deferred_to_push.reader_rows, ["rkat:test:doc_examples_fixture", "xtask:package test targets"]);
   const prLines = outputs(["--event", "pull_request", "--", "docs/index.mdx"]);
   assert.equal(prLines.integration_count, "3", "the integration lane runs the reader rows");
   assert.deepEqual(JSON.parse(prLines.integration_matrix).include.map((row) => [row.name, row.packages, row.tests]), [
@@ -2406,19 +2406,20 @@ for (const path of [
     ["reader xtask:package", "-p xtask", "--lib --bins"],
     staticLanes.split(" | "),
   ]);
-  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:bin:rkat, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
+  assert.match(prLines.deferred_to_push, /(^|; )reader rows rkat:test:doc_examples_fixture, xtask:package test targets($|;)/, "the gate prints the readers left to the push");
   // Every push plans xtask's machine-authority contracts, a whole-checkout
   // audit whose test target needs a feature the closure-tests rows do not
   // build, unless an xtask integration suite with that feature runs.
   const machineContracts = "reader xtask:test:machines_contracts | -p xtask --features machine-authority | --test machines_contracts -E test(/(^|::)(canonical_machine_inventory_matches_docs_and_artifact_bundle|live_flow_runtime_reducer_transitions_are_mob_machine_command_gated|live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs)$/)";
   // The docs-only push: its closure-tests rows run the readers' test
-  // targets they build; with no main unit lane, reader rows run the lib and
-  // bin targets, the meerkat-mob chain's included.
-  assert.deepEqual(rowsOf(planFor(["docs/index.mdx"])), [
-    "reader rkat:bin:rkat | -p rkat | --bin rkat -E test(/(^|::)(fenced_rkat_doc_examples_parse_against_clap)$/)",
-    "reader xtask:package | -p xtask | --lib --bins",
-    machineContracts,
-  ]);
+  // targets they build, rkat's doc-example test among them; with no main
+  // unit lane, reader rows run the lib and bin targets.
+  const docsPush = planFor(["docs/index.mdx"]);
+  assert.deepEqual(rowsOf(docsPush), ["reader xtask:package | -p xtask | --lib --bins", machineContracts]);
+  assert.ok(
+    docsPush.closure_test_rows.some((row) => row.binaries.includes("rkat::doc_examples_fixture")),
+    "the docs-only push runs rkat's doc-example test in its closure-tests rows",
+  );
   // A Rust-relevant push runs every package's lib and bins in main unit.
   assert.deepEqual(rowsOf(planFor(["docs/index.mdx", "crates/meerkat-core/src/lib.rs"])), [machineContracts]);
   assert.deepEqual(planFor(["crates/xtask/src/lib.rs"]).reader_rows, [], "xtask's own suite runs its contracts");

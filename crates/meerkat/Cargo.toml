@@ -11,6 +11,35 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # repository policy canary: reads sibling crates' build scripts, sources and Bazel targets
+    "tests/agent_builder_policy_canary.rs",
+    # scans sibling crates' surface sources
+    "tests/brain_swap_surface_parity.rs",
+    # workspace launch-site gate over clippy.toml and every crate's sources
+    "tests/host_launch_sites.rs",
+    # needs the unpublished mcp-test-server crate
+    "tests/integration.rs",
+    # needs the unpublished mcp-test-server crate
+    "tests/governed_realm.rs",
+    # needs the unpublished mcp-test-server crate
+    "tests/governed_realm_account_binding.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/e2e_shell.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_meerkat_regression.rs",
+    # support modules of tests/live_meerkat_regression.rs
+    "tests/live_meerkat_regression",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/live_meerkat_user_flows.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/smoke_meerkat_sdk.rs",
+    # live provider smoke: needs GEMINI_API_KEY
+    "tests/live_video_uri_surface_smoke.rs",
+]
 
 [dependencies]
 meerkat-capabilities = { workspace = true }
@@ -119,6 +148,7 @@ indexmap = { workspace = true }
 # Rule 9. `integration-real-tests` and the live/realtime features stay out:
 # those need real resources and belong to the e2e lanes.
 meerkat = { path = ".", features = [
+    "workspace-tests",
     "local-authorization",
     "session-store",
     # Enabling `session-store` alone makes the cold-restart compaction batteries
@@ -277,9 +307,22 @@ test-mcp-oauth-fixtures = ["meerkat-mcp?/test-support"]
 # promotion fault. Test-support only: enable it under [dev-dependencies] so
 # normal builds compile the seams out.
 test-support = ["meerkat-runtime/test-support"]
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [package.metadata.cargo-machete]
 ignored = ["which"]  # dev-dependency used in e2e tests
+
+# The feature set this crate's own tests need. The published package
+# has no self dev-dependency to turn them on, so its README.md prints the
+# command with these features, and the standalone test lane
+# (scripts/published_crates_standalone.py) reads them from here.
+[package.metadata.meerkat.standalone-tests]
+features = ["local-authorization", "session-store", "session-compaction", "jsonl-store", "memory-store", "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "atif"]
 
 [lints]
 workspace = true

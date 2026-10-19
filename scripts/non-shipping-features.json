@@ -23,7 +23,8 @@
     "test-mcp-oauth-fixtures",
     "test-oracle",
     "test-realtime-fixtures",
-    "test-support"
+    "test-support",
+    "workspace-tests"
   ],
   "external_crate_features": {
     "tokio": ["test-util"]

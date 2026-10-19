@@ -9733,6 +9733,7 @@ mod tests {
     /// Discards routed by one turn: the retained count plus the discarded set.
     type ObservedCacheDiscards = Vec<(usize, Vec<crate::DiscardedCacheBreakpoint>)>;
 
+    #[cfg(feature = "workspace-tests")]
     async fn run_turn_with_cache_claim(
         shape: CacheClaimShape,
     ) -> (crate::Session, ObservedCacheDiscards) {
@@ -9742,6 +9743,7 @@ mod tests {
 
     /// Run one turn per shape against a single agent, returning the routed
     /// discard events observed in each turn.
+    #[cfg(feature = "workspace-tests")]
     async fn run_turns_with_cache_claims(
         shapes: &[CacheClaimShape],
     ) -> (crate::Session, Vec<ObservedCacheDiscards>) {
@@ -9782,6 +9784,7 @@ mod tests {
 
     /// Root-cause shape A, end to end: the turn COMPLETES and the discard is
     /// routed onto the ordinary event stream a host already watches.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn overhanging_cache_anchor_is_discarded_and_the_turn_completes() {
         let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Overhanging).await;
@@ -9822,6 +9825,7 @@ mod tests {
     }
 
     /// Root-cause shape B, end to end.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn moved_prefix_cache_anchor_is_discarded_and_the_turn_completes() {
         let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::MovedPrefix).await;
@@ -9852,6 +9856,7 @@ mod tests {
     /// The other half of the ruling: a proof that DOES bind is preserved and
     /// stays usable. Without this, "never fails a turn" would be satisfied by
     /// simply discarding every breakpoint.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn binding_cache_anchor_is_preserved_and_emits_no_discard() {
         let (session, observed) = run_turn_with_cache_claim(CacheClaimShape::Binding).await;
@@ -9876,6 +9881,7 @@ mod tests {
     /// every claim is rejected as unusable authors nothing, so the retention
     /// seam reports `0` by construction - the boundary has to count the
     /// durable set that is still binding instead of forwarding that `0`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn discard_event_reports_durable_evidence_that_still_binds() {
         let (session, per_turn) = run_turns_with_cache_claims(&[
@@ -9994,10 +10000,12 @@ mod tests {
     /// only through generated authority.
     ///
     /// See #32 Class W1 — runtime_turn_authority missing handle.
+    #[cfg(feature = "workspace-tests")]
     fn with_test_turn_state_handle(builder: AgentBuilder) -> AgentBuilder {
         with_test_turn_state_handle_for_session(builder, crate::Session::new())
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn with_test_turn_state_handle_for_session(
         builder: AgentBuilder,
         mut session: crate::Session,
@@ -10014,6 +10022,7 @@ mod tests {
             )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn explicit_test_visibility_owner() -> crate::GeneratedToolVisibilityOwner {
         let owner: Arc<dyn crate::ToolVisibilityOwner> =
             Arc::new(crate::tool_scope::GeneratedTestToolVisibilityOwner::new());
@@ -10345,6 +10354,7 @@ mod tests {
     /// no longer launders `health_snapshot()`/`quarantined_diagnostics()` errors
     /// into a whole-`None`/empty value; `collect_skill_diagnostics` returns the
     /// typed `SkillError` so the fault is surfaced rather than swallowed.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn collect_skill_diagnostics_surfaces_typed_collection_fault() {
         let skill_runtime = Arc::new(crate::skills::SkillRuntime::new(Arc::new(
@@ -10376,6 +10386,7 @@ mod tests {
 
     /// With no skill engine attached, the diagnostics collection is genuinely
     /// absent (`Ok(None)`) — distinct from the collection-fault case above.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn collect_skill_diagnostics_absent_engine_is_ok_none() {
         let agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -11903,6 +11914,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_compaction_failure_rolls_back_rewrite_before_next_success() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12026,6 +12038,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_compaction_hook_failure_retains_full_monotonic_usage_delta() {
         use crate::hooks::{
@@ -12134,6 +12147,7 @@ mod tests {
         assert_eq!(memory_store.aborted.lock().unwrap().len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_projection_rejection_still_charges_summary_provider_usage() {
         let memory_store = Arc::new(RecordingMemoryStore::failing());
@@ -12182,6 +12196,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn callback_pending_preserves_compaction_pair_for_runtime_boundary_commit() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12376,6 +12391,7 @@ mod tests {
     /// compaction on a pre-0.8.22 session keeps the summary call charged and
     /// leaves the reported total where it was, instead of mixing a normalized
     /// delta into the raw legacy head.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn legacy_session_compaction_abort_keeps_reported_usage_consistent() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12450,6 +12466,7 @@ mod tests {
 
     /// An abort on a pre-0.8.22 session that recorded nothing restores the raw
     /// head byte for byte: no normalization and no timestamp bump.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn legacy_session_compaction_abort_with_nothing_recorded_keeps_raw_head() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12501,6 +12518,7 @@ mod tests {
         assert_eq!(agent.session().updated_at(), rollback_updated_at);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn empty_runtime_outbox_keeps_transaction_abortable_after_commit_failure() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12616,6 +12634,7 @@ mod tests {
         assert!(memory_store.finalized.lock().unwrap().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn abort_uncommitted_projections_drains_all_and_retains_only_failures_for_retry() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12690,6 +12709,7 @@ mod tests {
         assert!(memory_store.aborted.lock().unwrap().contains(&first));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn abort_marker_only_cleans_exact_stage_without_empty_reconciliation() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12724,6 +12744,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_committed_finalize_failure_refuses_abort_and_retries_atomically() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -12810,6 +12831,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_outbox_exact_authority_rejects_subset_superset_and_duplicates() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -13616,6 +13638,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn build_agent<C>(client: Arc<C>) -> crate::agent::Agent<C, NoTools, NoopStore>
     where
         C: AgentLlmClient + ?Sized + 'static,
@@ -13653,6 +13676,7 @@ mod tests {
     /// PeerContentIngested observe fact — with the sender's declaration and
     /// BEFORE RunStarted — so a host taint tracker never parses projection
     /// text to classify inbound peer content.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn queued_peer_append_emits_peer_content_ingested_before_run_started() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -13763,6 +13787,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reused_session_follow_up_run_can_compact_before_first_llm_call() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -13786,6 +13811,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_repoll_reopens_the_same_assistant_message_and_parks_discarded_ids() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -13892,6 +13918,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn failed_compaction_attempt_uses_cadence_guard_before_retry() {
         let client = Arc::new(FailingCompactionLlmClient::new());
@@ -13968,6 +13995,7 @@ mod tests {
         assert_eq!(cadence.last_compaction_attempt_boundary_index, Some(1));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn context_capacity_failure_mechanically_compacts_and_continues() {
         let client = Arc::new(FailingCompactionLlmClient::context_capacity_exceeded());
@@ -14028,6 +14056,7 @@ mod tests {
     /// A summary call the provider refused, filtered or stopped at the
     /// context window did real work. Nothing of it is committed, but the
     /// session, the budget and the run's request rows all charge it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn uncommitted_compaction_summary_call_is_charged() {
         for summary_stop in [
@@ -14096,6 +14125,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_discards_are_indexed_before_history_replacement() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14143,6 +14173,7 @@ mod tests {
     /// messages via the empty-string convention. A discarded tool-result
     /// message must reach the store as a typed `Excluded(ToolResults)` request,
     /// so the store — not the producer — owns indexability.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_discard_producer_carries_typed_indexability_to_store() {
         let client = Arc::new(StaticLlmClient);
@@ -14198,6 +14229,7 @@ mod tests {
         assert_eq!(source_ranges[1].start(), 9);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_memory_index_failure_preserves_original_history() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14268,6 +14300,7 @@ mod tests {
     /// reaches the wire so an adopter can route it, the turn survives, and the
     /// attempted cadence stays in place so the next ordinary boundary does not
     /// retry immediately.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn refused_durable_projection_handoff_reports_its_typed_cause_and_keeps_the_turn() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -14416,6 +14449,7 @@ mod tests {
     /// fits its provider cap is reported as over-window, because that session
     /// cannot make progress until a compaction persists. The provider then
     /// refuses the oversized request, which is exactly the production shape.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn refused_handoff_on_an_over_window_strand_is_reported_as_over_window() {
         let memory_store = Arc::new(AbortRetryMemoryStore::new());
@@ -14478,6 +14512,7 @@ mod tests {
     /// The trigger side of this release moved onto the composed-request budget
     /// for exactly this reason; the escalation verdict must measure the same
     /// request, or the two halves of one boundary disagree about what fits.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn refused_handoff_over_the_composed_request_window_is_not_reported_as_still_fits() {
         let registry = fallback_activation_test_registry();
@@ -14580,6 +14615,7 @@ mod tests {
     /// regardless of the witness would restore the over-claim - a session
     /// reported as a cost note while every request it composes is a body the
     /// provider refuses.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn preserved_history_fit_claims_a_byte_fit_only_from_a_measured_witness() {
         let registry = fallback_activation_test_registry();
@@ -14640,6 +14676,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn misdeclared_ephemeral_store_never_enters_async_index_and_preserves_transcript() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14682,6 +14719,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_partial_memory_index_failure_leaves_no_projection() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14713,6 +14751,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn invalid_compaction_rewrite_is_rejected_before_memory_projection() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14823,6 +14862,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hostile_compaction_summary_is_rejected_before_memory_projection() {
         let client = Arc::new(CompactionAwareLlmClient::new());
@@ -14862,6 +14902,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_curator_substitutes_summary_without_llm_call() {
         // The failing client errors on any summarization call ("COMPACT NOW"),
@@ -15131,6 +15172,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_curator_failure_emits_typed_event_and_preserves_history() {
         let client = Arc::new(FailingCompactionLlmClient::new());
@@ -15190,6 +15232,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_curator_empty_summary_surfaces_typed_error() {
         let client = Arc::new(FailingCompactionLlmClient::new());
@@ -15234,6 +15277,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn byte_triggered_curator_compaction_rescues_over_cap_session() {
         // End-to-end no-LLM rescue for the 2026-07-29 request_too_large
@@ -15387,6 +15431,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn pre_compaction_externalization_leaves_committed_inline_rows_and_their_prefix_digest_untouched()
      {
@@ -15515,6 +15560,7 @@ mod tests {
         assert_eq!(agent.session().audited_endpoint_divergence().unwrap(), None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn failed_pre_compaction_externalization_skips_the_attempt_with_a_typed_failure() {
         // The blob store refuses every put at the compaction boundary, so the
@@ -15689,6 +15735,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_externalizes_inline_media_before_the_rewrite_edge_binds_it() {
         // Regression for a 2026-09-22 production wedge (a downstream session,
@@ -15822,6 +15869,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_completed_event_uses_canonical_text_after_hook_observation() {
         use crate::hooks::{
@@ -15897,6 +15945,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_completed_hook_failure_emits_run_failed_without_run_completed() {
         use crate::hooks::{
@@ -16021,6 +16070,7 @@ mod tests {
     /// hook, including ones a deny short-circuit or a saturated background queue
     /// never ran). This engine advertises two matching ids but reports only the
     /// first as started, proving the agent drives `HookStarted` off `started`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hook_started_emitted_only_for_started_hooks_not_matched() {
         use crate::hooks::{
@@ -16132,6 +16182,7 @@ mod tests {
     /// `AssistantBlock::ServerToolContent` kinds so a foreground
     /// `PostLlmResponse` hook classifies provider-native content synchronously
     /// instead of racing the lossy observe stream.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hook_payloads_carry_tool_provenance_and_server_tool_content() {
         use crate::hooks::{
@@ -16344,6 +16395,7 @@ mod tests {
     /// this, a timed-out hook would emit a terminal `HookFailed` with no
     /// preceding `HookStarted` — the inverse of the started-without-terminal
     /// gap this fix closed.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hook_started_emitted_before_hook_failed_on_engine_error() {
         use crate::hooks::{
@@ -16442,12 +16494,14 @@ mod tests {
     /// Wraps the generated-kernel-backed [`TestTurnStateHandle`] so every
     /// non-terminal transition still moves through real MeerkatMachine
     /// authority. Completion always rejects; failure rejection is opt-in.
+    #[cfg(feature = "workspace-tests")]
     #[derive(Debug)]
     struct RejectRunCompletedHandle {
         inner: crate::agent::test_turn_state_handle::TestTurnStateHandle,
         reject_failed: bool,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectRunCompletedHandle {
         fn new() -> Self {
             Self {
@@ -16457,6 +16511,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl crate::handles::TurnStateHandle for RejectRunCompletedHandle {
         fn apply_turn_input(
             &self,
@@ -16702,6 +16757,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_completed_effect_rejection_fails_run_closed() {
         let mut agent = AgentBuilder::new()
@@ -16739,6 +16795,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_failed_effect_rejection_covers_all_limit_terminal_routes() {
         struct RequestBudgetFailure;
@@ -16817,6 +16874,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn turn_boundary_denial_blocks_boundary_side_effects_and_turn_completed() {
         use crate::hooks::{
@@ -16959,6 +17017,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_llm_denial_terminalizes_turn_authority() {
         use crate::hooks::{
@@ -17037,6 +17096,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_without_primary_channel_still_emits_run_lifecycle_to_tap() {
         use crate::event_tap::EventTapState;
@@ -17084,6 +17144,7 @@ mod tests {
     /// copies, against the selected model's catalog row, and reports each
     /// attempt. The next turn without one is the baseline again, and the
     /// durable session identity never changes.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reasoning_preference_lowers_only_its_turn_and_never_the_session() {
         use crate::lifecycle::run_primitive::{
@@ -17227,6 +17288,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hot_swap_request_policy_updates_next_turn_provider_params() {
         use crate::lifecycle::run_primitive::{
@@ -17299,6 +17361,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn provider_native_tool_policy_is_a_final_narrow_only_request_gate() {
         use crate::lifecycle::run_primitive::{OpaqueProviderBody, OpenAiProviderTag, ProviderTag};
@@ -17411,6 +17474,7 @@ mod tests {
         session
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_hot_swap_moves_profile_limit_and_durable_identity_both_directions() {
         let registry = fallback_activation_test_registry();
@@ -17620,6 +17684,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_hot_swap_rejects_unknown_profile_before_live_mutation() {
         let registry = fallback_activation_test_registry();
@@ -17673,6 +17738,7 @@ mod tests {
         assert!(unknown.seen_max_tokens().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_hot_swap_preserves_arbitrary_position_system_messages() {
         let registry = fallback_activation_test_registry();
@@ -17809,6 +17875,7 @@ mod tests {
         assert!(other_provider.seen_max_tokens().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_client_replacement_preserves_arbitrary_position_system_messages() {
         let primary = Arc::new(HotSwapLimitRecordingClient::new("primary"));
@@ -17838,6 +17905,7 @@ mod tests {
         assert_eq!(replacement.seen_max_tokens().len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn pending_skill_keys_are_resolved_and_injected_into_runtime_prompt() {
         let client = Arc::new(RecordingLlmClient::new());
@@ -17896,6 +17964,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn llm_execution_hydrates_blob_refs_before_provider_call() {
         let blob_id = BlobId::new("sha256:test-image");
@@ -17956,6 +18025,7 @@ mod tests {
     /// LLM-execution hydration seam terminalizes the turn with a typed
     /// `ConfigError` — the model boundary is unconditionally fail-closed and
     /// never degrades to placeholder prompt text.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn llm_execution_errors_on_missing_blob_when_policy_is_error() {
         let missing_blob_id = BlobId::new("sha256:absent-image");
@@ -17996,6 +18066,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_filter_staging_requires_generated_visibility_authority() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
@@ -18015,6 +18086,7 @@ mod tests {
         assert!(tools.dispatched().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_tool_dispatch_uses_visible_dispatcher() {
         let client = Arc::new(StaticLlmClient);
@@ -18037,6 +18109,7 @@ mod tests {
         assert_eq!(tools.dispatched(), vec!["visible".to_string()]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_tool_dispatch_timeout_uses_canonical_terminal_outcome() {
         struct HangingDispatcher {
@@ -18123,6 +18196,7 @@ mod tests {
     /// `ToolsConfig` per-call timeout. A tool that hangs forever must be
     /// terminalized as a `timeout` tool result (flowing through
     /// `terminal_tool_outcome_for_error`) rather than blocking the turn.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn normal_loop_tool_dispatch_applies_tools_config_timeout() {
         struct HangingTurnDispatcher {
@@ -18203,6 +18277,7 @@ mod tests {
     /// A call the per-call timeout ends publishes the documented
     /// `ToolExecutionTimedOut` execution fact with the bound it ran into,
     /// and still completes with its timeout result after it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn normal_loop_tool_timeout_emits_tool_execution_timed_out() {
         struct HangingTurnDispatcher {
@@ -18322,6 +18397,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn run_tool_owned_call(
         tools_config: crate::config::ToolsConfig,
         run_for: std::time::Duration,
@@ -18355,6 +18431,7 @@ mod tests {
 
     /// A tool that owns its lifetime bound is not cut by the core DEFAULT
     /// deadline (`tools.default_timeout`).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_owned_deadline_is_not_cut_by_the_default_timeout() {
         let tools_config = crate::config::ToolsConfig {
@@ -18367,6 +18444,7 @@ mod tests {
 
     /// An operator's explicit per-tool override (`tools.tool_timeouts`) still
     /// bounds a tool that owns its lifetime bound.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_owned_deadline_obeys_an_operator_per_tool_override() {
         let tools_config = crate::config::ToolsConfig {
@@ -18620,6 +18698,7 @@ mod tests {
 
     /// Exercise the real agent loop with one denied call and one executable
     /// sibling, including the next model request's complete tool-result batch.
+    #[cfg(feature = "workspace-tests")]
     async fn assert_tool_denial_preserves_sibling_and_model_turn(
         hide_blocked_tool: bool,
         denied_first: bool,
@@ -19151,6 +19230,7 @@ mod tests {
         assert!(run_completed);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn visibility_precheck_denial_preserves_sibling_and_model_turn() {
         for denied_first in [true, false] {
@@ -19169,6 +19249,7 @@ mod tests {
     /// A model call naming a tool absent from every catalog is typed
     /// operation-local feedback: the permitted sibling still runs, the next
     /// model turn receives both results in call order, and the run completes.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn missing_tool_call_is_call_local_feedback_and_run_continues() {
         struct RecordingDispatcher {
@@ -19378,6 +19459,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn execution_policy_gate_denial_is_ordinary_tool_error_and_run_continues() {
         for denied_first in [true, false] {
@@ -19393,6 +19475,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn pre_tool_confinement_refusal_preserves_sibling_and_model_turn() {
         use crate::confinement::ConfinementRefusal;
@@ -19419,6 +19502,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn pre_tool_launch_io_failure_preserves_sibling_and_model_turn() {
         for refused_first in [true, false] {
@@ -19434,6 +19518,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn dispatched_confinement_refusal_preserves_sibling_and_model_turn() {
         use crate::confinement::ConfinementRefusal;
@@ -19460,6 +19545,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_pre_tool_hook_denial_preserves_sibling_and_model_turn() {
         use crate::hooks::{HookDecision, HookId, HookReasonCode};
@@ -19501,6 +19587,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_tool_dispatch_clears_tool_returned_terminal_cause() {
         struct ToolAuthoredTerminalCauseDispatcher {
@@ -19562,6 +19649,7 @@ mod tests {
         assert_eq!(outcome.terminal_cause(), None);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn callback_pending_closes_generated_turn_before_external_terminal() {
         struct CallbackPendingDispatcher {
@@ -19833,6 +19921,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn usage_callback_agent()
     -> crate::agent::Agent<UsageCallbackClient, UsageCallbackDispatcher, NoopStore> {
         AgentBuilder::new()
@@ -19860,6 +19949,7 @@ mod tests {
 
     /// Calls made before a callback suspension stay in the resumed run's
     /// run_usage and request_usage.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn callback_resume_keeps_the_run_usage_account() {
         let mut agent = usage_callback_agent().await;
@@ -19941,6 +20031,7 @@ mod tests {
     /// A callback resume that arrives with a new prompt (applied results,
     /// then a content turn) keeps the suspended run's account, like
     /// `run_pending` does.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn applied_callback_then_content_turn_keeps_the_run_usage_account() {
         let mut agent = usage_callback_agent().await;
@@ -19972,6 +20063,7 @@ mod tests {
 
     /// A run that does not resume the callback never absorbs the suspended
     /// run's account: the host abandoned the callback and started over.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn abandoned_callback_does_not_leak_into_the_next_run() {
         let mut agent = usage_callback_agent().await;
@@ -20005,6 +20097,7 @@ mod tests {
     /// commits the whole batch once, keeps the affected call's raw result and
     /// assistant content withheld, and ends with the original hook error,
     /// with no further model call, replay or duplicate effect.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn callback_batch_with_post_tool_hook_infrastructure_failure_resumes_to_the_exact_error()
     {
@@ -20316,6 +20409,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn callback_pending_preserves_completed_sibling_outcome() {
         struct MixedCallbackDispatcher {
@@ -20818,6 +20912,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_attached_content_turn_rejects_resume_pending_before_transcript_or_provider() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20885,6 +20980,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn multiple_callback_pending_results_stage_and_apply_as_one_ordered_batch() {
         struct TwoCallbacks {
@@ -21030,6 +21126,7 @@ mod tests {
     /// registered without an `ops_lifecycle` registry) must terminalize the
     /// turn through `TurnExecutionInput::FatalFailure` BEFORE returning the
     /// raw `AgentError`, so the turn is never left non-terminal.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn waiting_for_ops_registry_missing_terminalizes_turn() {
         struct BarrierOpDispatcher {
@@ -21149,6 +21246,7 @@ mod tests {
     /// Row 274: an unsupported video tool result must terminalize the turn
     /// via the machine and must NOT emit success-shaped progress events
     /// (`ToolExecutionCompleted`/`ToolResultReceived`) for the rejected call.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn unsupported_video_tool_result_terminalizes_without_success_events() {
         struct VideoResultDispatcher {
@@ -21279,6 +21377,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_external_hidden_tool_policy_requires_generated_visibility_authority() {
         let client = Arc::new(StaticLlmClient);
@@ -21298,6 +21397,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn external_tool_dispatch_fails_closed_without_deferred_visibility_authority() {
         let client = Arc::new(StaticLlmClient);
@@ -21336,6 +21436,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn llm_hidden_tool_policy_staging_requires_generated_visibility_authority() {
         use crate::hooks::{
@@ -21610,11 +21711,13 @@ mod tests {
     // Pure forwarding wrapper: registrations are recorded only after the real
     // generated turn owner accepts them, with its resulting snapshot checked.
     // It supplies no lifecycle verdict, async completion, or barrier receipt.
+    #[cfg(feature = "workspace-tests")]
     struct PostToolRetentionHandle {
         inner: Arc<crate::agent::test_turn_state_handle::TestTurnStateHandle>,
         registrations: Mutex<Vec<(RunId, Vec<crate::ops::AsyncOpRef>)>>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl crate::handles::TurnStateHandle for PostToolRetentionHandle {
         fn apply_turn_input(
             &self,
@@ -21885,6 +21988,7 @@ mod tests {
         InfrastructureFailed,
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn assert_post_tool_refusal_preserves_entered_sibling(mode: PostToolFailureMode) {
         let launch_refused = mode == PostToolFailureMode::LaunchRefused;
         let infrastructure_failed = mode == PostToolFailureMode::InfrastructureFailed;
@@ -22636,11 +22740,13 @@ mod tests {
         assert_eq!(snapshot.terminal_outcome, outcome);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_tool_denial_settles_sibling_and_continues_without_replay() {
         assert_post_tool_refusal_preserves_entered_sibling(PostToolFailureMode::Denied).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_tool_launch_refusal_settles_sibling_and_continues_without_replay() {
         assert_post_tool_refusal_preserves_entered_sibling(PostToolFailureMode::LaunchRefused)
@@ -22652,6 +22758,7 @@ mod tests {
     /// affected call's non-transcript effects, settlement diagnostics and
     /// detached registration all settle, then the run ends with the exact
     /// hook error. (Fails-old: the run ended before the batch committed.)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_tool_hook_infrastructure_failure_settles_entered_siblings() {
         assert_post_tool_refusal_preserves_entered_sibling(
@@ -22660,6 +22767,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_assistant_image_response_emits_typed_event() {
         let client = Arc::new(DirectImageClient);
@@ -22697,6 +22805,7 @@ mod tests {
         assert_eq!((image.width, image.height), (32, 24));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_image_session_effects_preserve_tool_result_adjacency_and_emit_typed_event() {
         let client = Arc::new(ImageEffectClient {
@@ -22795,6 +22904,7 @@ mod tests {
         assert!(image_event_index > 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn empty_completion_after_successful_tool_effect_completes_turn() {
         let client = Arc::new(EmptyAfterImageEffectClient {
@@ -22841,6 +22951,7 @@ mod tests {
         assert_eq!(turn_handle.run_failed_effect_count(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn control_tool_visibility_policy_staging_requires_generated_authority() {
         let client = Arc::new(ControlPlaneVisibilityClient::new());
@@ -22865,6 +22976,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn deferred_tool_load_effect_fails_closed_without_generated_visibility_authority() {
         let client = Arc::new(DeferredLoadVisibilityClient::new());
@@ -22893,6 +23005,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn deferred_catalog_delta_events_require_generated_visibility_authority() {
         let client = Arc::new(DeferredLoadVisibilityClient::new());
@@ -22936,6 +23049,7 @@ mod tests {
     /// is available to call, a dropped one is no longer available. The typed
     /// delta still carries both names, and the provider request carries only
     /// the loaded one.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn deferred_catalog_notice_separates_loaded_tools_from_removed_tools() {
         struct ShrinkingDeferredDispatcher {
@@ -23095,6 +23209,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn direct_builder_exact_catalog_without_control_plane_keeps_deferred_tools_inline() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
@@ -23133,6 +23248,7 @@ mod tests {
     /// A host can ask a live agent, without changing it, how its next model
     /// request projects the tool catalog: the catalog mode, and per tool
     /// whether the model sees it or finds it behind the deferred catalog.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_catalog_view_reports_the_next_request_projection() {
         use crate::{ToolCatalogMode, ToolCatalogVisibility};
@@ -23188,6 +23304,7 @@ mod tests {
     /// A staged visibility change is reported as waiting for the next
     /// boundary, from the same read of the visibility state as the active
     /// visibility the view still shows; the boundary then applies it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_catalog_view_reports_a_staged_change_without_applying_it() {
         use crate::ToolCatalogVisibility;
@@ -23229,6 +23346,7 @@ mod tests {
     /// Without a catalog control plane the session never hides a
     /// deferred-eligible tool: the view reports the inline mode the requests
     /// actually take, with every tool visible.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_catalog_view_without_a_control_plane_is_inline() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
@@ -23247,6 +23365,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_loop_filter_boundary_requires_generated_visibility_authority() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
@@ -23320,6 +23439,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generated_authority_stage_persists_projection_and_clears_legacy_only_on_success() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
@@ -23366,6 +23486,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_loop_fails_closed_on_tool_scope_boundary_failure() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
@@ -23422,6 +23543,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_builder_rejects_legacy_external_filter_without_authority() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
@@ -23453,6 +23575,7 @@ mod tests {
         assert!(client.seen_tools().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_builder_rejects_unknown_legacy_filter_without_authority() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
@@ -23486,6 +23609,7 @@ mod tests {
         assert!(client.seen_tools().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn standalone_builder_rejects_legacy_inherited_filter_without_authority() {
         let client = Arc::new(SingleTurnVisibilityClient::new());
@@ -23619,6 +23743,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn max_token_reasoning_only_response_is_a_typed_visible_failure() {
         let mut agent = build_agent(Arc::new(ReasoningOnlyLlmClient)).await;
@@ -23734,6 +23859,7 @@ mod tests {
 
     /// Run one prompt against a scripted stop on the `primary` model, whose
     /// registry entry declares a 128K context window.
+    #[cfg(feature = "workspace-tests")]
     async fn run_scripted_stop(
         stop_reason: StopReason,
         blocks: Vec<AssistantBlock>,
@@ -23788,6 +23914,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn context_window_stop_fails_typed_and_commits_nothing() {
         let run = run_scripted_stop(StopReason::ContextWindowExceeded, text_and_probe_call()).await;
@@ -23841,6 +23968,7 @@ mod tests {
     /// A refusal can arrive with a tool call already streamed. The call
     /// never runs and nothing of the turn is committed; content_filter (any
     /// provider) ends the same way.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn refused_or_filtered_turn_fails_content_filtered_and_dispatches_nothing() {
         for stop_reason in [StopReason::Refusal, StopReason::ContentFilter] {
@@ -23877,6 +24005,7 @@ mod tests {
     /// A refused, filtered or window-stopped response with nothing in it is
     /// decided by its stop reason: never retried as empty output, never
     /// failed as an empty response.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn empty_response_with_a_refusing_stop_is_not_retried_as_empty_output() {
         for stop_reason in [
@@ -23914,6 +24043,7 @@ mod tests {
 
     /// A paused server-tool turn is committed as it stands, even with no
     /// text yet: its server-tool blocks are what the next request resumes.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn paused_server_tool_turn_commits_with_its_stop_reason() {
         let paused = vec![AssistantBlock::ServerToolContent {
@@ -23948,6 +24078,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn generic_fatal_llm_failure_uses_machine_terminal_cause_and_preserves_detail() {
         let mut agent = build_agent(Arc::new(FatalLlmClient)).await;
@@ -23992,6 +24123,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_failure_records_exact_machine_terminal_witness() {
         let mut agent = build_agent(Arc::new(FatalLlmClient)).await;
@@ -24024,6 +24156,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_invalid_model_witness_preserves_model_metadata() {
         let mut agent = build_agent(Arc::new(InvalidModelLlmClient)).await;
@@ -24046,6 +24179,7 @@ mod tests {
         assert_eq!(witness.retryable, Some(false));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn runtime_preflight_failure_cannot_reuse_prior_terminal_witness() {
         let mut agent = build_agent(Arc::new(FatalLlmClient)).await;
@@ -24081,6 +24215,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn display_failure_text_does_not_classify_after_machine_terminalization() {
         use crate::TurnExecutionInput;
@@ -24147,6 +24282,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn hard_failure_without_pending_diagnostic_uses_machine_terminal_cause() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -24187,6 +24323,7 @@ mod tests {
     /// `DEFAULT_MAX_TURNS` owner into the agent's config, so the resolved value
     /// is assertable on the built agent and the loop reads it rather than
     /// re-deriving the default.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn max_turns_default_is_resolved_at_build_seam_not_in_loop() {
         // `build_agent` uses `AgentBuilder::new()` whose default config leaves
@@ -24202,6 +24339,7 @@ mod tests {
     /// Dogma row #272: the loop terminalizes via the machine-owned
     /// `TurnLimitReached` at the build-resolved cap value, with no literal
     /// fallback default invented inside `run_loop`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_loop_terminalizes_at_build_resolved_turn_cap() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -24222,6 +24360,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_loop_consumes_generated_prestarted_turn_without_restarting() {
         use crate::agent::test_turn_state_handle::TestTurnStateHandle;
@@ -24267,6 +24406,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn fatal_failure_unknown_input_source_fails_before_machine_apply() {
         use crate::TurnExecutionInput;
@@ -24344,6 +24484,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn build_result_cancelled_terminal_does_not_return_success() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -24367,6 +24508,7 @@ mod tests {
         assert_eq!(AgentErrorClass::from(&error), AgentErrorClass::Cancelled);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_llm_boundary_cancel_does_not_return_success() {
         use crate::agent::{CancelAfterBoundaryCommand, CancelAfterBoundarySender};
@@ -24540,6 +24682,7 @@ mod tests {
     }
 
     /// A staged run with one ordinary tool and its scripted client.
+    #[cfg(feature = "workspace-tests")]
     async fn boundary_cancel_agent() -> (
         crate::agent::Agent<ToolThenTextClient, OkDispatcher, NoopStore>,
         Arc<ToolThenTextClient>,
@@ -24582,6 +24725,7 @@ mod tests {
     /// run was staged, before the agent claimed it, is not discarded at run
     /// start: the run ends at its first boundary and the model is not called
     /// after the tool batch. A command for another run is still discarded.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_cancel_dispatched_while_the_run_was_staged_ends_it_at_its_first_boundary() {
         use crate::agent::CancelAfterBoundaryCommand;
@@ -24610,6 +24754,7 @@ mod tests {
     }
 
     /// A command for another run alone never cancels this one.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_cancel_for_another_run_never_cancels_this_one() {
         use crate::agent::CancelAfterBoundaryCommand;
@@ -24631,6 +24776,7 @@ mod tests {
     /// A cancel requested while a tool batch runs ends the run at the
     /// post-tool boundary, as at the text boundary: the turn is cancelled and
     /// the model is not called again.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn post_tool_boundary_cancel_ends_the_run_without_another_model_call() {
         use crate::agent::{CancelAfterBoundaryCommand, CancelAfterBoundarySender};
@@ -24942,6 +25088,7 @@ mod tests {
 
     /// The WaitingForOps twin of `boundary_cancel_agent`: a staged run whose
     /// tool batch registers a barrier op that is already satisfied.
+    #[cfg(feature = "workspace-tests")]
     async fn barrier_boundary_cancel_agent() -> (
         crate::agent::Agent<ToolThenTextClient, BarrierOkDispatcher, NoopStore>,
         Arc<ToolThenTextClient>,
@@ -24982,6 +25129,7 @@ mod tests {
 
     /// The WaitingForOps path observes a cancel requested during its
     /// turn-boundary hooks before the machine decides that boundary.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_cancel_during_waiting_for_ops_boundary_hooks_ends_the_run_at_that_boundary() {
         let (mut agent, client, run_id) = barrier_boundary_cancel_agent().await;
@@ -25013,6 +25161,7 @@ mod tests {
     }
 
     /// The same WaitingForOps boundary hooks without a Stop continue the run.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn waiting_for_ops_boundary_hooks_without_a_cancel_continue_the_run() {
         let (mut agent, client, _run_id) = barrier_boundary_cancel_agent().await;
@@ -25075,6 +25224,7 @@ mod tests {
     /// A cancel requested while the turn-boundary hooks drain is observed
     /// before the machine decides that boundary: the run is cancelled there
     /// and the model is not called again.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn a_cancel_requested_during_turn_boundary_hooks_ends_the_run_at_that_boundary() {
         let (mut agent, client, tools, run_id) = boundary_cancel_agent().await;
@@ -25112,6 +25262,7 @@ mod tests {
 
     /// The same boundary hooks without a Stop leave the run to continue to
     /// the model and complete normally.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn turn_boundary_hooks_without_a_cancel_continue_the_run() {
         let (mut agent, client, tools, _run_id) = boundary_cancel_agent().await;
@@ -25134,6 +25285,7 @@ mod tests {
         assert_eq!(*client.calls.lock().unwrap(), 2);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn typed_cancel_after_boundary_command_observed_once_at_boundary() {
         use crate::agent::CancelAfterBoundaryCommand;
@@ -25192,6 +25344,7 @@ mod tests {
             .expect("a second observe with no fresh command must be a no-op");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn typed_cancel_after_boundary_discards_stale_run_command() {
         use crate::agent::CancelAfterBoundaryCommand;
@@ -25227,6 +25380,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn build_result_missing_terminal_outcome_fails_closed() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -25246,6 +25400,7 @@ mod tests {
         assert_eq!(AgentErrorClass::from(&error), AgentErrorClass::Internal);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn build_result_hard_failure_remains_typed_terminal_failure() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -25343,6 +25498,7 @@ mod tests {
     /// Before the fix, budget errors from inside call_llm_with_retry bypassed
     /// the machine authority entirely (Dogma §4: same semantic condition, one
     /// canonical terminal path).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn token_budget_exhausted_after_llm_call_routes_through_authority() {
         // Budget allows exactly 100 tokens — the first LLM call reports 1000,
@@ -25375,6 +25531,7 @@ mod tests {
 
     /// Regression test: tool-call budget exhaustion detected anywhere in the
     /// agent loop must route through BudgetExhausted, producing Success.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn tool_call_budget_exhausted_routes_through_authority() {
         let mut agent = build_agent(Arc::new(StaticLlmClient)).await;
@@ -25520,6 +25677,7 @@ mod tests {
     /// deadline and terminalizes the turn after one call: the deadline is
     /// measured on the clock its timer runs on, so the loop cannot re-arm
     /// forever while real time stands still.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(start_paused = true)]
     async fn call_wait_wakes_exactly_at_the_turn_deadline_under_a_paused_clock() {
@@ -25563,6 +25721,7 @@ mod tests {
     /// finishes far inside its own timeout, yet their sum is what runs the
     /// turn past its ceiling. `max_turn_duration` is the owner of that sum,
     /// and its exhaustion travels the existing time terminal.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn turn_horizon_terminalizes_an_aggregate_of_in_bound_segments() {
         let client = Arc::new(EndlessToolCallClient::new());
@@ -25672,6 +25831,7 @@ mod tests {
     /// The horizon is a per-turn fact, so it is re-armed at every run entry.
     /// A session that sat idle between turns has not spent this turn's
     /// ceiling: the second turn is judged on its own wall-clock.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn turn_horizon_rearms_per_run_and_ignores_idle_between_turns() {
         let mut agent = build_agent(Arc::new(ImmediateTextClient)).await;
@@ -25712,6 +25872,7 @@ mod tests {
     /// construction, so on a long-lived agent it charges a later turn for
     /// wall-clock that turn never spent. This asserts current behavior, not
     /// desired behavior.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn characterization_agent_lifetime_horizon_charges_idle_time_to_a_later_turn() {
         let mut agent = build_agent(Arc::new(ImmediateTextClient)).await;
@@ -26368,6 +26529,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn context_budget_preflight_terminalizes_before_provider_dispatch() {
         let registry = fallback_activation_test_registry();
@@ -26412,6 +26574,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn context_budget_preflight_reports_input_ceiling_without_output_reserve() {
         // The input ceiling takes precedence even when the shared 128K
@@ -26464,6 +26627,7 @@ mod tests {
     /// silently restore transcript-only token accounting: tool schemas ride
     /// every request in full and the provider counts them, so a trigger that
     /// cannot see them under-reports the request by exactly that amount.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_check_carries_the_measured_request_budget() {
         let registry = fallback_activation_test_registry();
@@ -26525,6 +26689,7 @@ mod tests {
     /// budget, and the compaction check must still run on exactly the measures
     /// it used before. An absent window is truthful, never a substitute
     /// ceiling, and it must not make the boundary fail.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compaction_check_without_a_declared_window_carries_no_request_budget() {
         let compactor = Arc::new(TrackingCompactor::new(None));
@@ -26554,6 +26719,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn provider_lowered_forecast_does_not_refuse_dispatch() {
         let registry = fallback_activation_test_registry();
@@ -27483,6 +27649,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_exhaustion_surfaces_typed_terminal_failure() {
         use crate::retry::RetryPolicy;
@@ -27514,6 +27681,7 @@ mod tests {
     /// Integration test: verify that a 429 with Retry-After hint actually
     /// delays the retry by at least the server-directed duration, and that
     /// the run completes successfully after the retry.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn retry_after_hint_delays_second_attempt() {
         use crate::retry::RetryPolicy;
@@ -27559,6 +27727,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn unknown_provider_failure_retries_instead_of_killing_agent() {
         use crate::retry::RetryPolicy;
@@ -27596,6 +27765,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn initial_route_change_rebuilds_pressure_before_dispatch() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -27621,6 +27791,7 @@ mod tests {
     /// Field defect: a provider stream that goes silent mid-turn must be
     /// aborted by the inactivity watchdog and retried through the ordinary
     /// machine-gated recovery path — not hang the turn forever.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stream_stall_watchdog_aborts_and_retries() {
         use crate::retry::RetryPolicy;
@@ -27648,6 +27819,7 @@ mod tests {
 
     /// Repeated stalls must exhaust the retry budget and terminalize the turn
     /// with the machine-owned typed failure instead of hanging.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn stream_stall_exhausts_retries_with_typed_terminal_failure() {
         use crate::retry::RetryPolicy;
@@ -27687,6 +27859,7 @@ mod tests {
 
     /// A slow-but-alive stream (events at intervals below the window, total
     /// duration above it) must NOT trip the watchdog: each event re-arms it.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn slow_but_alive_stream_does_not_trip_watchdog() {
         use crate::retry::RetryPolicy;
@@ -27746,6 +27919,7 @@ mod tests {
     /// While the override inherits, the current model's own window wins over
     /// the retry policy's: a model that declares 30 ms has its silent stream
     /// aborted although the policy's window is an hour.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_stream_inactivity_window_wins_over_the_policy_window() {
         let client = Arc::new(StallThenSucceedClient::new());
@@ -27770,6 +27944,7 @@ mod tests {
 
     /// An explicit override wins over the model's window: 30 ms applies
     /// although the model declares an hour.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn explicit_stream_inactivity_override_wins_over_the_model_window() {
         let client = Arc::new(StallThenSucceedClient::new());
@@ -27798,6 +27973,7 @@ mod tests {
     /// `Disabled` turns the watchdog off whatever the model declares: a
     /// response silent for 150 ms completes on its first call although the
     /// model's window is 30 ms.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn disabled_stream_inactivity_override_turns_off_the_model_window() {
         let client = Arc::new(SlowButAliveClient::new(Duration::from_millis(150), 1));
@@ -27818,6 +27994,7 @@ mod tests {
         assert_eq!(client.calls(), 1, "no stall, no retry");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_fallback_activation_filters_tools_before_retry() {
         use crate::retry::RetryPolicy;
@@ -28013,6 +28190,7 @@ mod tests {
     /// fallback (with full live compensation) and let the machine-accepted
     /// same-model retry proceed, instead of terminalizing the turn as a
     /// ConfigError.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn non_teardown_begin_refusal_skips_fallback_and_retries_previous_model() {
         use crate::retry::RetryPolicy;
@@ -28061,6 +28239,7 @@ mod tests {
 
     /// The same skip semantics when the durable refusal surfaces from the
     /// supervised operation `wait` instead of `begin`.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn non_teardown_wait_refusal_skips_fallback_and_retries_previous_model() {
         use crate::retry::RetryPolicy;
@@ -28109,6 +28288,7 @@ mod tests {
 
     /// Teardown-class refusals must remain fatal: the coordinator could not
     /// prove a single authoritative durable parent.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn teardown_class_begin_refusal_remains_fatal() {
         use crate::retry::RetryPolicy;
@@ -28157,6 +28337,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn terminal_fallback_retry_keeps_the_accepted_target_sticky() {
         use crate::retry::RetryPolicy;
@@ -28232,6 +28413,7 @@ mod tests {
     /// A non-teardown coordinator rejection skips the fallback; the turn then
     /// terminalizes through the machine-owned retry budget on the still-failing
     /// primary provider, with the client compensated before every next run.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn rejected_fallback_coordinator_terminalizes_error_recovery_for_next_run() {
         use crate::retry::RetryPolicy;
@@ -28298,6 +28480,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn divergent_durable_identity_parent_rejects_fallback_before_any_commit() {
         use crate::retry::RetryPolicy;
@@ -28360,6 +28543,7 @@ mod tests {
         assert_eq!(client.model(), "primary");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_fallback_post_activation_identity_read_failure_rolls_back_client() {
         use crate::retry::RetryPolicy;
@@ -28423,6 +28607,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_fallback_proposer_without_activation_leaves_all_fallback_state_unchanged() {
         use crate::retry::RetryPolicy;
@@ -28543,6 +28728,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn policy_stop_refuses_retry_fallback_and_conversation_replacement() {
         for output_observed in [false, true] {
@@ -28593,6 +28779,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn policy_stop_during_compaction_never_dispatches_the_main_request() {
         let client = Arc::new(PolicyStopClient {
@@ -28640,6 +28827,7 @@ mod tests {
         assert!(crate::retry::LlmRetryFailure::from_agent_error(&error).is_none());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_fallback_does_not_switch_after_visible_stream_output() {
         use crate::retry::RetryPolicy;
@@ -28675,11 +28863,13 @@ mod tests {
     /// `ClassifyLlmFailureRecovery` classifier that yields `Recover`) flows
     /// through real MeerkatMachine authority; only the recoverable-failure
     /// commit is forced to refuse.
+    #[cfg(feature = "workspace-tests")]
     #[derive(Debug)]
     struct RejectRecoverableFailureHandle {
         inner: crate::agent::test_turn_state_handle::TestTurnStateHandle,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl RejectRecoverableFailureHandle {
         fn new() -> Self {
             Self {
@@ -28688,6 +28878,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl crate::handles::TurnStateHandle for RejectRecoverableFailureHandle {
         fn apply_turn_input(
             &self,
@@ -28935,6 +29126,7 @@ mod tests {
     /// the recovery, NO durable/client mutation may have happened: the client
     /// active index stays on the primary model and the persisted session
     /// metadata still names the primary model.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn model_fallback_does_not_mutate_when_machine_rejects_recovery() {
         use crate::retry::RetryPolicy;
@@ -29085,6 +29277,7 @@ mod tests {
     /// Integration test: rate-limited error WITHOUT a hint uses the 30s floor,
     /// but we can't wait 30s in CI. Instead verify via a tight time budget
     /// that the delay is correctly capped and the budget check fires.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn rate_limit_without_hint_respects_budget_cap() {
         use crate::budget::{Budget, BudgetLimits};
@@ -29184,6 +29377,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn empty_llm_completion_retries_before_terminal_failure() {
         use crate::retry::RetryPolicy;
@@ -29792,6 +29986,7 @@ mod tests {
 
     /// run_usage and request_usage cover the extraction call and its retry,
     /// not only the agentic turn.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn run_usage_and_request_rows_cover_extraction_and_its_retry() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -29837,6 +30032,7 @@ mod tests {
 
     /// Happy path: agent with output_schema, LLM returns valid JSON
     /// matching schema on the extraction turn.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_happy_path_returns_structured_output() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -29875,6 +30071,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_fallback_reapplies_structured_output_and_clears_native_search() {
         use crate::lifecycle::run_primitive::ProviderTag;
@@ -30018,6 +30215,7 @@ mod tests {
     /// schema. A retry after a sticky model fallback goes to the target
     /// provider, so it must carry the target's section (the schema terminal
     /// validation now uses), not the one composed for the failed provider.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn fallback_retry_reprojects_the_output_schema_section_for_the_target() {
         use crate::retry::RetryPolicy;
@@ -30119,6 +30317,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_fallback_authority_unknown_survives_as_teardown_required() {
         use crate::lifecycle::core_executor::{CoreExecutorError, CoreExecutorTeardownReason};
@@ -30190,6 +30389,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn fallback_provider_tag_mismatch_rejects_before_any_identity_or_visibility_commit() {
         use crate::retry::RetryPolicy;
@@ -30268,6 +30468,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn fallback_target_schema_compile_rejection_leaves_all_fallback_state_unchanged() {
         use crate::retry::RetryPolicy;
@@ -30342,6 +30543,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn fallback_profile_witness_mismatch_rejects_atomically() {
         use crate::retry::RetryPolicy;
@@ -30422,6 +30624,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn foreign_identical_registry_profile_witness_rejects_atomically() {
         use crate::retry::RetryPolicy;
@@ -30504,6 +30707,7 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn registry_absent_fallback_target_rejects_even_with_a_valid_foreign_profile() {
         use crate::retry::RetryPolicy;
@@ -30582,6 +30786,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_turn_does_not_emit_normal_text_or_turn_completion() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -30653,6 +30858,7 @@ mod tests {
         assert_eq!(extraction_succeeded_count, 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_llm_failure_emits_extraction_failed_without_run_failed() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -30720,6 +30926,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_retry_budget_failure_preserves_completed_main_run() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -30787,6 +30994,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_request_pressure_failure_preserves_completed_main_run() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -30852,6 +31060,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_tool_call_response_emits_extraction_failed_without_tool_semantics() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -30936,6 +31145,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_boundary_denial_emits_extraction_failed_without_run_failed() {
         use crate::hooks::{
@@ -31048,6 +31258,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_zero_retries_still_runs_extraction_phase() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -31105,6 +31316,7 @@ mod tests {
         assert!(saw_extraction_failed);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_does_not_consume_agentic_max_turn_budget() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -31173,6 +31385,7 @@ mod tests {
     /// success-shaped boundary events (`TurnCompleted` / `RunCompleted`) must
     /// NOT be emitted before the extraction-failed terminal. Schema compile is
     /// a fallible extraction-setup step that runs before any success event.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn compile_schema_failure_emits_no_run_completed_before_terminal() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -31233,6 +31446,7 @@ mod tests {
 
     /// Retry path: LLM returns invalid JSON on the first extraction attempt,
     /// then valid JSON on the retry.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_retry_recovers_on_second_attempt() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -31278,6 +31492,7 @@ mod tests {
     /// Exhaust path: LLM returns invalid JSON on every extraction attempt,
     /// exceeding max retries. The main run should remain successful while the
     /// result carries extraction_error.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn extraction_exhaust_returns_validation_error() {
         let schema = crate::types::OutputSchema::new(serde_json::json!({
@@ -31555,6 +31770,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn completion_notice_failure_keeps_cursor_and_event_retryable_then_emits_once() {
         use crate::completion_feed::tests::MockCompletionFeed;
@@ -31657,6 +31873,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn busy_completion_enrichment_defers_provider_until_eventual_single_application() {
         use crate::completion_feed::tests::MockCompletionFeed;
@@ -31792,6 +32009,7 @@ mod tests {
     /// A detached tool without a process-local enrichment record (fork_off,
     /// mob_wait_ready) must still deliver its typed result to the owner: the
     /// completion notice carries the operation's terminal outcome.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn completion_without_enrichment_delivers_the_terminal_outcome_to_the_owner() {
         use crate::completion_feed::tests::MockCompletionFeed;
@@ -31885,6 +32103,7 @@ mod tests {
         assert!(delivered, "the owner's model must see the detached result");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn cursor_refusal_defers_provider_and_retries_completion_without_external_consumption() {
         use crate::completion_feed::tests::MockCompletionFeed;
@@ -32003,6 +32222,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn settlement_failures_preserve_tool_siblings_and_continue_the_model_turn() {
         struct Siblings {
@@ -32131,6 +32351,7 @@ mod tests {
         assert_eq!(calls, vec!["completed", "denied"]);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn decorated_callback_retains_settlement_through_snapshot_resume_and_replay() {
         let dispatcher = Arc::new(
@@ -32203,6 +32424,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn decorated_policy_indeterminate_keeps_its_existing_agent_class() {
         struct IndeterminateTool;
@@ -32667,6 +32889,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn refused_alternate_at_every_request_boundary_returns_to_pinned_controller() {
             for boundary in [
@@ -33877,6 +34100,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn pre_llm_withholding_is_recorded_under_the_candidate_before_feedback() {
             let audit = RecordingAudit::new(0, false);
@@ -33920,6 +34144,7 @@ mod tests {
             assert_ne!(&controller[0], record.operation_id());
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn the_withholding_record_survives_feedback_that_cannot_run() {
             // Feedback denied by its own gate (a misbehaving engine).
@@ -33956,6 +34181,7 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_one_shot_withholding_append_failure_stays_local_to_its_operation() {
             // The first append fails once; custody and controller preparation
@@ -34017,6 +34243,7 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn post_llm_withholding_names_the_replacement_request_that_responded() {
             // The ordinary route is refused at preparation, local recovery
@@ -34099,6 +34326,7 @@ mod tests {
             result: Result<crate::types::RunResult, AgentError>,
         }
 
+        #[cfg(feature = "workspace-tests")]
         async fn run_with_gate(
             engine: Arc<DenyModelRequests>,
             tool_first: bool,
@@ -34108,6 +34336,7 @@ mod tests {
                 .await
         }
 
+        #[cfg(feature = "workspace-tests")]
         async fn run_with_gate_and_audit(
             engine: Arc<DenyModelRequests>,
             tool_first: bool,
@@ -34170,6 +34399,7 @@ mod tests {
                 .count()
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn mandatory_prerequisite_feedback_is_never_recursive() {
             let engine = DenyModelRequests::new(true, true);
@@ -34202,6 +34432,7 @@ mod tests {
             assert_eq!(prerequisite_notices(&run.agent), 1);
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_mandatory_run_override_without_an_engine_is_rejected_before_entry() {
             let controller = Arc::new(FixtureClient {
@@ -34257,6 +34488,7 @@ mod tests {
             assert!(controller.requests.lock().unwrap().is_empty());
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn a_denial_outside_the_admitted_topology_stays_fail_closed() {
             // The engine attests no gate, so admission records none and its
@@ -34282,6 +34514,7 @@ mod tests {
             assert_eq!(prerequisite_notices(&run.agent), 0);
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn an_always_denying_gate_is_bounded_by_the_turn_limit() {
             // Each withheld operation is followed by one accepted feedback
@@ -34337,6 +34570,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn unavailable_alternate_uses_one_safe_retained_controller_attempt() {
             for boundary in [
@@ -34484,6 +34718,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn bare_controller_hosted_defaults_are_suppressed_across_tool_turns() {
             let client = Arc::new(FixtureClient {
@@ -34571,6 +34806,7 @@ mod tests {
             assert!(controller_feedback_params(crate::Provider::Other, None).is_none());
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn denied_hosted_capability_reaches_controller_as_local_feedback() {
             let client = Arc::new(FixtureClient {
@@ -34650,6 +34886,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn governed_indeterminate_tool_preserves_kind_privacy_and_continuation() {
             let client = Arc::new(FixtureClient {
@@ -34716,6 +34953,7 @@ mod tests {
             assert_completed_without_failure(&mut rx);
         }
 
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn denied_compaction_preserves_history_and_informs_the_controller() {
             let client = Arc::new(FixtureClient {
@@ -34848,6 +35086,7 @@ mod tests {
         /// retained controller client (still authorized per request as
         /// Compaction), never on a different session client of the same
         /// selection; a refusal still leaves history and continuation intact.
+        #[cfg(feature = "workspace-tests")]
         #[tokio::test]
         async fn controller_compaction_runs_on_the_retained_controller_client() {
             let fixture = || {
@@ -35535,6 +35774,7 @@ mod tests {
                 }
             }
 
+            #[cfg(feature = "workspace-tests")]
             async fn assert_entry_failure_keeps_sibling(failed_first: bool) {
                 let observer = Arc::new(EntryObserver::default());
                 let tools = Arc::new(Siblings::default());
@@ -35637,6 +35877,7 @@ mod tests {
                 );
             }
 
+            #[cfg(feature = "workspace-tests")]
             #[tokio::test]
             async fn authority_unavailable_keeps_siblings_and_returns_local_model_feedback() {
                 for failed_first in [false, true] {
@@ -35819,11 +36060,13 @@ mod tests {
                 }
             }
 
+            #[cfg(feature = "workspace-tests")]
             #[tokio::test]
             async fn observation_infrastructure_failed_entry_preserves_later_synchronous_sibling() {
                 assert_entry_failure_keeps_sibling(true).await;
             }
 
+            #[cfg(feature = "workspace-tests")]
             #[tokio::test]
             async fn observation_infrastructure_failed_entry_preserves_earlier_synchronous_sibling()
             {

@@ -25,20 +25,23 @@ const CONFLICT_TEXT: &str = "`--realm` and `--isolated` cannot be used together"
 
 /// Cargo and nextest advertise the crate's own binary to its integration
 /// tests through the runtime environment. Resolving it there (never at compile
-/// time) keeps the test valid inside a nextest archive.
-fn binary() -> Option<PathBuf> {
-    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest").map(PathBuf::from)?;
-    advertised.exists().then_some(advertised)
+/// time) keeps the test valid inside a nextest archive. Both always advertise
+/// it, so a missing binary fails the test instead of skipping it.
+fn binary() -> PathBuf {
+    let advertised = std::env::var_os("CARGO_BIN_EXE_rkat-rest")
+        .map(PathBuf::from)
+        .expect("cargo advertises CARGO_BIN_EXE_rkat-rest to the crate's integration tests");
+    assert!(
+        advertised.exists(),
+        "CARGO_BIN_EXE_rkat-rest names a missing binary: {}",
+        advertised.display()
+    );
+    advertised
 }
 
 #[test]
 fn fatal_startup_error_renders_display_chain_and_exits_one() {
-    let Some(binary) = binary() else {
-        eprintln!(
-            "skipping: {BINARY} binary not advertised (CARGO_BIN_EXE_rkat-rest unset or missing)"
-        );
-        return;
-    };
+    let binary = binary();
 
     let output = Command::new(&binary)
         .args(["--realm", "conflicting-selection", "--isolated"])

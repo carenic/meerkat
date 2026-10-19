@@ -4595,6 +4595,7 @@ pub mod tests {
     }
 
     /// RCT: Verify MCP initialize handshake works
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_mcp_initialize_handshake() {
         let server_path = mcp_test_server::fixture_binary();
@@ -4622,6 +4623,7 @@ pub mod tests {
     }
 
     /// RCT: Verify tools/list schema parsing
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_mcp_tools_list_schema_parse() {
         let server_path = mcp_test_server::fixture_binary();
@@ -4685,6 +4687,7 @@ pub mod tests {
     }
 
     /// RCT: Verify tools/call round-trip (returns Vec<ContentBlock>)
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_mcp_tools_call_round_trip() {
         let server_path = mcp_test_server::fixture_binary();
@@ -5218,6 +5221,7 @@ pub mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_custody_close_reports_a_reap_failure() {
@@ -6730,6 +6734,6 @@ mod structured_result_tests;
 #[path = "process_confinement_tests.rs"]
 mod process_confinement_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[path = "service_secret_tests.rs"]
 mod service_secret_tests;

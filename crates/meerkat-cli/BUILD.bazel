@@ -105,6 +105,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -188,6 +189,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -213,9 +215,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:workspace_cargo_manifests",
-        "//:workspace_metadata",
-        "//crates/meerkat-cli:cargo_manifest",
         "//crates/meerkat-cli:rkat",
     ],
     env = {
@@ -301,6 +300,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -413,6 +413,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -526,6 +527,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -648,6 +650,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -770,6 +773,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -892,6 +896,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -922,6 +927,124 @@ rust_test(
     env = {
         "RUST_MIN_STACK": "8388608",
         "RUST_TEST_THREADS": "1",
+        "CARGO_BIN_EXE_rkat": "$(rootpath //crates/meerkat-cli:rkat)",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-cli",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-mob-mcp:meerkat_mob_mcp_with_runtime_test_support",
+        "//crates/meerkat-mob-pack:meerkat_mob_pack_with_runtime_test_support",
+        "//crates/meerkat-mob:meerkat_mob_with_runtime_test_support",
+        "//crates/meerkat-rpc:meerkat_rpc_with_runtime_test_support",
+        "//crates/meerkat:meerkat_anthropic_agent_factory_build",
+        "//crates/meerkat:meerkat_atif_agent_factory_build",
+        "//crates/meerkat:meerkat_auth_core_agent_factory_build",
+        "//crates/meerkat:meerkat_client_agent_factory_build",
+        "//crates/meerkat:meerkat_comms_agent_factory_build",
+        "//crates/meerkat:meerkat_contracts_agent_factory_build",
+        "//crates/meerkat:meerkat_copilot_agent_factory_build",
+        "//crates/meerkat:meerkat_core_agent_factory_build",
+        "//crates/meerkat:meerkat_gemini_agent_factory_build",
+        "//crates/meerkat:meerkat_live_agent_factory_build",
+        "//crates/meerkat:meerkat_llm_core_agent_factory_build",
+        "//crates/meerkat:meerkat_mcp_agent_factory_build_test_support",
+        "//crates/meerkat:meerkat_models_agent_factory_build",
+        "//crates/meerkat:meerkat_openai_agent_factory_build",
+        "//crates/meerkat:meerkat_providers_agent_factory_build",
+        "//crates/meerkat:meerkat_runtime_agent_factory_build_test_support",
+        "//crates/meerkat:meerkat_session_agent_factory_build_with_runtime_test_support",
+        "//crates/meerkat:meerkat_store_agent_factory_build",
+        "//crates/meerkat:meerkat_tools_agent_factory_build_with_runtime_test_support",
+        "//crates/meerkat:meerkat_with_runtime_test_support",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-cli",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "doc_examples_fixture_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-cli",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "doc_examples_fixture",
+    crate_root = "tests/doc_examples_fixture.rs",
+    crate_features = [
+        "anthropic",
+        "comms",
+        "copilot",
+        "gemini",
+        "integration-real-tests",
+        "jsonl-store",
+        "local-authorization",
+        "mcp",
+        "meerkat-rpc?/comms",
+        "meerkat-rpc?/mcp",
+        "meerkat-rpc?/openai-realtime",
+        "meerkat-rpc?/schedule",
+        "meerkat-rpc?/workgraph",
+        "memory-store",
+        "memory-store-session",
+        "mob",
+        "openai",
+        "openai-realtime",
+        "rpc-surface",
+        "schedule",
+        "session-store",
+        "skills",
+        "workgraph",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
+        "tests/fixtures/v0_8_10_released_realm/config.toml",
+    ] + [
+        "//:docs/cli/commands.mdx",
+        "//:docs/docs.json",
+        "//:docs/examples/mobpack.mdx",
+        "//:docs/examples/wasm.mdx",
+        "//:docs/guides/mobpack.mdx",
+        "//:docs/guides/mobs.mdx",
+        "//:docs/reference/mob-architecture.mdx",
+    ],
+    srcs = [
+        "tests/doc_examples_fixture.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "doc_examples_fixture",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-cli",
+    },
+    tags = [
+        "fixture",
+    ],
+    data = [
+        ":package_runfiles",
+        "//:test_fixtures",
+        "//:workspace_cargo_manifests",
+        "//:workspace_metadata",
+        "//tests/fixtures/machine-dsl-tests:package_runfiles",
+        "//tests/fixtures/mcp-test-server:package_runfiles",
+        "//tests/fixtures/surface-build-fixtures:package_runfiles",
+        "//:workspace_runfiles",
+        "//crates/meerkat-cli:rkat",
+    ],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+        "WORKSPACE_ROOT": ".",
         "CARGO_BIN_EXE_rkat": "$(rootpath //crates/meerkat-cli:rkat)",
     },
     proc_macro_deps = all_crate_deps(
@@ -1002,6 +1125,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1112,6 +1236,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1222,6 +1347,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1335,6 +1461,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1457,6 +1584,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1567,6 +1695,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1677,6 +1806,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1789,6 +1919,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -1903,6 +2034,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2015,6 +2147,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2125,6 +2258,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2235,6 +2369,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2348,6 +2483,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2469,6 +2605,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2590,6 +2727,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2703,6 +2841,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2824,6 +2963,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -2937,6 +3077,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3058,6 +3199,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3169,6 +3311,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3289,6 +3432,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3409,6 +3553,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3529,6 +3674,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3649,6 +3795,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3769,6 +3916,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -3889,6 +4037,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4002,6 +4151,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4123,6 +4273,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4238,6 +4389,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4361,6 +4513,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4477,6 +4630,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4601,6 +4755,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4716,6 +4871,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4839,6 +4995,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -4962,6 +5119,7 @@ rust_test(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ] + [
         "//:docs/cli/commands.mdx",
@@ -5044,6 +5202,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -5101,6 +5260,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -5161,6 +5321,7 @@ rust_binary(
     compile_data = [
         "Cargo.toml",
         "src/main.rs",
+        "tests/fixtures/doc_examples.txt",
         "tests/fixtures/v0_8_10_released_realm/config.toml",
     ],
     srcs = glob(["src/**/*.rs"]),

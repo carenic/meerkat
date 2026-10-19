@@ -799,6 +799,7 @@ impl AgentLlmClient for SiblingClient {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_agent_preserves_run_and_model_continuation_after_local_tool_refusal() {
     let client = Arc::new(SiblingClient::default());

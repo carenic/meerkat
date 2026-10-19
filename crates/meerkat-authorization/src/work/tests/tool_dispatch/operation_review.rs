@@ -2626,6 +2626,7 @@ impl AgentLlmClient for ReviewBatchClient {
 /// Review composition is trusted host attachment on the factory, never a
 /// build option; `None` builds a factory with no reviewer at all. The tool
 /// dispatcher is the review-capable test leaf over the shared body counter.
+#[cfg(feature = "workspace-tests")]
 async fn review_agent(
     review: Option<Arc<BoundOperationReview>>,
     client: Arc<ReviewBatchClient>,
@@ -2650,6 +2651,7 @@ async fn review_agent(
         .expect("real factory with explicit host resources")
 }
 
+#[cfg(feature = "workspace-tests")]
 async fn run_batch(
     agent: &mut meerkat::DynAgent,
     work: &ToolWork,
@@ -2708,6 +2710,7 @@ fn result_text<'a>(results: &'a [ToolResult], id: &str) -> (&'a ToolResult, Stri
     (result, meerkat_core::types::text_content(&result.content))
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_agent_settles_stale_review_locally_and_continues_with_sibling() {
     let world = ReviewWorld::new();
@@ -2811,6 +2814,7 @@ async fn factory_agent_reviews_a_superseded_call_once_more_and_enters() {
     assert_single_completion(&mut received);
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_agent_narrow_revocation_keeps_sibling_controller_and_continuation() {
     let world = ReviewWorld::new();
@@ -2858,6 +2862,7 @@ async fn factory_agent_narrow_revocation_keeps_sibling_controller_and_continuati
     assert_single_completion(&mut received);
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_review_denial_and_escalation_preserve_goal_sibling_and_model_continuation() {
     for (verdict, expected) in [
@@ -2933,6 +2938,7 @@ async fn factory_review_denial_and_escalation_preserve_goal_sibling_and_model_co
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_agent_unchanged_review_enters_with_sibling() {
     let world = ReviewWorld::new();
@@ -2969,6 +2975,7 @@ async fn factory_agent_unchanged_review_enters_with_sibling() {
     assert_single_completion(&mut received);
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_without_reviewer_settles_required_review_locally() {
     for (tier, expected_code) in [
@@ -3004,6 +3011,7 @@ async fn factory_without_reviewer_settles_required_review_locally() {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test(start_paused = true)]
 async fn agent_tool_timeout_keeps_timeout_and_abandons_review() {
     // The agent loop's own per-call timeout drops the dispatch. The tool
@@ -3059,6 +3067,7 @@ async fn agent_tool_timeout_keeps_timeout_and_abandons_review() {
 /// it: drop the run future, clear the work context, take the dropped run's
 /// canonical terminal. This is Agent cleanup coverage, not a
 /// `SessionService::interrupt` test.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn dropped_run_with_pending_review_stays_cancelled_through_agent_cleanup() {
     let world = ReviewWorld::new();

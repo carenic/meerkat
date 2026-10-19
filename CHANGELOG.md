@@ -844,6 +844,47 @@ them.
   now decodes as `operation_authorization_unavailable` instead of
   `operation_refused` with `malformed_facts`: it is no verdict the peer
   gave.
+- Every crate the release publishes now passes its own tests standalone:
+  `cargo test` in the unpacked published package builds with the default
+  features, and passes with the features its
+  `[package.metadata.meerkat.standalone-tests]` declares (meerkat,
+  meerkat-runtime and meerkat-mob, whose packages now carry a README.md
+  that prints the command). Plain `cargo test` runs a binary's tests as
+  threads of one process, and three suites no longer collide there:
+  meerkat's realtime pipeline tests take the process-wide open reservation
+  one at a time, meerkat-rpc's callback-ownership tests give each case its
+  own mob, and meerkat-rest's unit tests build their app states one at a
+  time (concurrent states queued on SQLite's process-wide allocation
+  statistics mutex until creates and stops missed their bounds). A test
+  that needs the repository, or a crate the package cannot depend on (a
+  cyclic or unpublished dev-dependency), is workspace-only and does not
+  reach the package: its file is left out
+  (`[package] exclude`, each entry with its reason, the same list as
+  `ci/standalone-workspace-only.toml`), or it compiles only with the
+  crate's `workspace-tests` feature (meerkat, meerkat-auth-core,
+  meerkat-authorization, meerkat-comms, meerkat-core, meerkat-llm-core,
+  meerkat-mcp, meerkat-openai and meerkat-rpc). `workspace-tests` is
+  internal, not for consumers: only the crate's path-only self
+  dev-dependency enables it, and `cargo package` strips that dependency.
+  Tests that read another crate's files now read their own copy or a shared
+  constant: meerkat-store embeds its own copy of meerkat-runtime's released
+  0.8.10 corpus, pinned byte-identical, and the REST, MCP server and rkat
+  hook-override tests parse `meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON`
+  (meerkat-core's `test-support`). The rkat-rpc, rkat-rest and rkat-mcp
+  binary tests take their binary from Cargo (`CARGO_BIN_EXE_*`) and fail
+  when it is missing instead of passing without running. rkat's
+  docs-examples test parses `tests/fixtures/doc_examples.txt`, which the
+  package carries, instead of reading `docs/`; after adding or changing an
+  `rkat` example in `docs/`, refresh it with
+  `UPDATE_DOC_EXAMPLES_FIXTURE=1 cargo test -p rkat --test doc_examples_fixture`
+  (that test fails until the fixture matches).
+- A nightly workflow, `published-crates-standalone.yml`, packages every
+  release crate, runs each one's tests in its unpacked package, and compares
+  every test target's test names with the workspace's. Publication does not
+  wait for it yet: the release gate on a passing run at the release commit
+  returns once a nightly run has passed and its duration is measured.
+  `scripts/release-require-standalone-green` checks that a run passed at a
+  given commit.
 
 ### Fixed
 
@@ -1310,6 +1351,15 @@ them.
   this release do not know the `turn_failed` observation or the
   `assistant_turn_failed` transcript event, and a decoder that validates the
   observation type rejects them; upgrade the SDK with the server.
+- `rkat` builds without its default features
+  (`cargo check -p rkat --no-default-features`). Five helpers named types
+  and methods that exist only with `session-store` and failed to compile
+  without it: the ungoverned `bind_stock_prompt`, the governed-realm MCP
+  server lookup (`persistence_is_governed`, `GovernedMcpServers`,
+  `governed_configured_mcp_servers`) and the runtime-backed service builder
+  that waits for MCP servers. They are now gated on `session-store`, and a
+  build without it no longer warns about the session code it leaves out.
+  Pre-existing in 0.9.3.
 
 ## [0.9.3] - 2026-10-18
 

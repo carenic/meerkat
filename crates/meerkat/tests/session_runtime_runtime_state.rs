@@ -670,6 +670,7 @@ async fn archive_runtime_cleanup_preserves_downstream_anchors_when_unregister_fa
 /// post-stop cleanup parks on a deterministic gate so the owned unregister
 /// teardown saga can be held past the ordinary 2-second caller grace, and a
 /// mock LLM so the persistent service can materialize a real live actor.
+#[cfg(feature = "session-store")]
 mod stale_discard {
     use std::collections::HashMap;
     use std::pin::Pin;

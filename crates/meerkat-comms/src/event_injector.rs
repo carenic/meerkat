@@ -254,6 +254,7 @@ mod tests {
     use crate::inbox::Inbox;
     use crate::trust::TrustStore;
 
+    #[cfg(feature = "workspace-tests")]
     fn classified_inbox() -> (Inbox, InboxSender) {
         Inbox::new_classified(test_support::classification_context(
             TrustStore::new(),
@@ -261,6 +262,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_comms_event_injector_sends_to_inbox() {
         let (inbox, sender) = classified_inbox();
@@ -286,6 +288,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_comms_event_injector_reports_full() {
         let (_inbox, sender) = Inbox::new_classified_with_capacity_for_test(
@@ -317,6 +320,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_comms_event_injector_as_dyn() {
         use std::sync::Arc;
@@ -338,6 +342,7 @@ mod tests {
         assert_eq!(items.len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_inject_with_subscription_stores_subscriber_and_sends_item() {
         use meerkat_core::event_injector::SubscribableInjector;
@@ -374,6 +379,7 @@ mod tests {
         assert!(registry.lock().contains_key(&sub.id.0));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn test_inject_with_subscription_cleans_up_on_full() {
         use meerkat_core::event_injector::SubscribableInjector;

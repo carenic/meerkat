@@ -2050,6 +2050,7 @@ async fn materialize_identity_mismatch_rollback_joins_a_slow_unregister_saga() {
 /// that lease into its surface cleanup, which takes B. The cleanup is paused
 /// with B held until the saga holds the lease, so no scheduling decides the
 /// outcome.
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn revival_cleanup_rollback_does_not_deadlock_with_a_raw_unregister_saga() {
     const DEADLOCK_BOUND: Duration = Duration::from_secs(10);

@@ -23032,6 +23032,7 @@ mod prepared_agent_tests {
     }
 
     /// A configured fixture MCP server the construction connects.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     fn mcp_fixture_build(snapshots: &Arc<AtomicUsize>) -> AgentBuildConfig {
         let mut build = governed("host", snapshots);
@@ -23050,6 +23051,7 @@ mod prepared_agent_tests {
     /// The trusted host's custody adopts each construction's exact MCP
     /// adapter before any server is staged, and observes that adapter's
     /// shutdown when the construction is abandoned.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn the_mcp_adapter_custody_adopts_the_adapter_before_anything_is_staged() {
@@ -23118,6 +23120,7 @@ mod prepared_agent_tests {
     /// A closed custody fails the build at adoption, before any server is
     /// staged: no server process ever exists for the construction, and the
     /// empty adapter is shut down.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn a_closed_mcp_adapter_custody_fails_the_build_before_any_server_exists() {
@@ -23231,6 +23234,7 @@ mod prepared_agent_tests {
     /// r1 15: each configured stdio server of a construction gets a guard
     /// request whose construction id is the adopted adapter's, for the
     /// construction's session and mob member.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn configured_servers_begin_guards_for_the_adopted_construction() {
@@ -23274,6 +23278,7 @@ mod prepared_agent_tests {
 
     /// r1 16: a rebuild keeps the session and changes the construction; a
     /// reset changes both and keeps the mob member.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn a_rebuild_and_a_reset_change_the_construction() {
@@ -23330,6 +23335,7 @@ mod prepared_agent_tests {
 
     /// r1 17: aborting a prepared agent finishes every guard; dropping it
     /// finishes them in the background, and the installation reports them.
+    #[cfg(feature = "workspace-tests")]
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn an_aborted_or_dropped_prepared_agent_finishes_its_guards() {

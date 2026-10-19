@@ -2108,6 +2108,7 @@ async fn a_source_change_published_during_a_blocked_pass_is_retried() {
 /// every facade host arms: a retained completion that blocked before its job
 /// owner was bound is resumed by the binding alone, with no attachment, run
 /// or custody signal ever raised.
+#[cfg(all(feature = "session-store", feature = "memory-store"))]
 #[tokio::test]
 async fn binding_the_job_owner_alone_resumes_a_blocked_retained_completion() {
     let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());

@@ -308,6 +308,14 @@ repos:
         always_run: true
         stages: [manual]
 
+      - id: release-standalone-gate-contract
+        name: release crate publication requires the standalone census at the release commit
+        entry: scripts/test-release-require-standalone-green.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
+
       - id: macos-x86-release-binary-check-contract
         name: Intel macOS release binary check refuses each defect
         entry: scripts/test-check-macos-x86-release-binary.sh

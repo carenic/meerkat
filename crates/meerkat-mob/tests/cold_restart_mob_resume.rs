@@ -13,6 +13,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(feature = "test-support")]
 mod support;
 
 use meerkat::{

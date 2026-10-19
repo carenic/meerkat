@@ -1328,6 +1328,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[allow(clippy::expect_used)]
     fn test_peer_projection_reconcile_obligation(
         session_id: impl Into<String>,
@@ -1402,6 +1403,7 @@ mod tests {
         (dsl, obligations.pop().expect("obligation count checked"))
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn add_generated_peer_projection_trust(
         runtime: &CommsRuntime,
         peer: TrustedPeerDescriptor,
@@ -1410,6 +1412,7 @@ mod tests {
         add_generated_peer_projection_trust_batch(runtime, vec![peer], context).await;
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn add_generated_peer_projection_trust_batch(
         runtime: &CommsRuntime,
         peers: Vec<TrustedPeerDescriptor>,
@@ -1447,6 +1450,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_trusted_runtime_less_context(
         peer_keypair: &Keypair,
     ) -> (ToolContext, meerkat_core::comms::PeerId) {
@@ -1481,11 +1485,13 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_runtime_less_trust_only_context() -> (ToolContext, meerkat_core::comms::PeerId) {
         let peer_keypair = Keypair::generate();
         make_trusted_runtime_less_context(&peer_keypair).await
     }
 
+    #[cfg(feature = "workspace-tests")]
     async fn make_runtime_less_inproc_delivery_pair() -> (
         ToolContext,
         meerkat_core::comms::PeerId,
@@ -1546,6 +1552,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn spawn_runtime_finalization(
         receiver: Arc<CommsRuntime>,
         finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
@@ -1806,6 +1813,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_dispatches_peer_message_to_capability_peer() {
         let peer_keypair = Keypair::generate();
@@ -1842,6 +1850,7 @@ mod tests {
         assert_eq!(*handling_mode, HandlingMode::Queue);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_without_capability_returns_no_reply_capability() {
         let peer_keypair = Keypair::generate();
@@ -1865,6 +1874,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0, "nothing may be dispatched");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_with_multiple_deliveries_requires_selector() {
         let peer_keypair = Keypair::generate();
@@ -1911,6 +1921,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 1);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_with_unknown_selector_returns_unknown_reply_to() {
         let peer_keypair = Keypair::generate();
@@ -1942,6 +1953,7 @@ mod tests {
     /// Trust is re-validated at dispatch time: a capability naming a peer that
     /// is not (or no longer) trusted must fail closed, never route on the
     /// minted identity alone.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_revalidates_trust_at_dispatch() {
         let peer_keypair = Keypair::generate();
@@ -1969,6 +1981,7 @@ mod tests {
 
     /// A present-but-malformed reply context is a distinct fail-closed error,
     /// never coerced into "no capability" or a successful dispatch.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn reply_to_peer_rejects_malformed_reply_context() {
         let peer_keypair = Keypair::generate();
@@ -2021,6 +2034,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_resolves_current_turn_image_ref_to_peer_message_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2082,6 +2096,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_request_resolves_current_turn_image_ref_to_peer_request_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2137,6 +2152,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_resolves_blob_image_ref_to_peer_message_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2187,6 +2203,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_request_resolves_blob_image_ref_to_peer_request_blocks() {
         let peer_keypair = Keypair::generate();
@@ -2236,6 +2253,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn blob_image_ref_rejects_current_turn_index() {
         let peer_keypair = Keypair::generate();
@@ -2262,6 +2280,7 @@ mod tests {
         assert_eq!(err, "invalid image_ref: source blob does not accept index");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_synthesizes_body_text_when_blocks_only_reference_image() {
         let peer_keypair = Keypair::generate();
@@ -2316,6 +2335,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_does_not_duplicate_body_when_text_blocks_split_it() {
         let peer_keypair = Keypair::generate();
@@ -2364,6 +2384,7 @@ mod tests {
     /// ROW #94 gate: when a comms message carries blocks, blocks are the single
     /// content authority and the carried `body` is provably a projection of the
     /// text blocks — it cannot diverge from a contradicting `body` input.
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_message_body_is_projection_of_text_blocks_when_blocks_present() {
         let peer_keypair = Keypair::generate();
@@ -2471,6 +2492,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn ping_request_projection_send_response_is_accepted_by_tool_boundary() {
         let requester = Keypair::generate();
@@ -2546,6 +2568,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers() {
         let runtime = Arc::new(
@@ -2599,6 +2622,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers_runtime_payload_uses_typed_directory_contract() {
         let peer_id = PeerId::new();
@@ -2636,6 +2660,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_handle_peers_runtime_less_payload_uses_authorized_sendability() {
         let peer_keypair = Keypair::generate();
@@ -2696,6 +2721,7 @@ mod tests {
     /// once with the typed, model-visible refusal, never a silent wait. A
     /// voice executor told to ask an unwired member reports exactly this
     /// (Turbo S S102 round 1).
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_fails_typed_when_recipient_is_not_trusted() {
         let peer_keypair = Keypair::generate();
@@ -2786,6 +2812,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_without_runtime_command_authority_fails_closed() {
         let (ctx, peer_id) = make_runtime_less_trust_only_context().await;
@@ -2809,6 +2836,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_without_runtime_command_authority_fails_closed() {
         let (ctx, peer_id) = make_runtime_less_trust_only_context().await;
@@ -2833,6 +2861,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_unknown_intent_fails_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2860,6 +2889,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_request_malformed_params_fail_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2888,6 +2918,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_malformed_result_fails_at_typed_boundary() {
         let peer_keypair = Keypair::generate();
@@ -2917,6 +2948,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_send_response_checksum_token_requires_request_subject() {
         let peer_keypair = Keypair::generate();
@@ -2948,6 +2980,7 @@ mod tests {
         assert_eq!(runtime.sent_len(), 0);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_message_returns_typed_delivery_outcome() {
         let peer_keypair = Keypair::generate();
@@ -2993,6 +3026,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_inproc_send_message_returns_typed_delivery_outcome() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
@@ -3026,6 +3060,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_send_message_rejects_sender_local_blob_before_transport() {
         let (ctx, peer_id, _sender, _receiver, _finalizer) =
@@ -3053,6 +3088,7 @@ mod tests {
         assert!(error.contains("runtime_less_blob_transport_unavailable"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_less_inproc_fenced_send_has_peer_message_receipt_parity() {
         let (ctx, peer_id, _sender, receiver, finalizer) =
@@ -3091,6 +3127,7 @@ mod tests {
             .expect("fenced tool-send finalization task must complete");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_request_returns_typed_receipt() {
         let peer_keypair = Keypair::generate();
@@ -3132,6 +3169,7 @@ mod tests {
         assert_eq!(params, &bridge_command_json());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_response_returns_typed_receipt() {
         let peer_keypair = Keypair::generate();
@@ -3169,6 +3207,7 @@ mod tests {
         assert_eq!(result, &bridge_reply_json());
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn send_response_resolves_blob_image_ref_to_peer_response_blocks() {
         let peer_keypair = Keypair::generate();
@@ -3218,6 +3257,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn test_runtime_bound_send_response_accepts_checksum_token_subject() {
         let peer_keypair = Keypair::generate();

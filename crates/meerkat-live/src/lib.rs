@@ -99,48 +99,77 @@ where
 // the two with their own session-runtime backing. A previous design had
 // `LiveAdapterHost` living in `meerkat-runtime` and `meerkat-live`
 // depending on it — wrong direction (transport pulling runtime). This
-// inline test parses `Cargo.toml` at compile time and asserts the
-// `meerkat-runtime` line is absent. Anyone who re-introduces the dep will
+// inline test parses `Cargo.toml` at compile time and asserts that no
+// dependency table names `meerkat-runtime`. Anyone who re-introduces the dep will
 // fail this test before E26 silently regresses.
 #[cfg(test)]
 mod e26_dependency_direction {
+    /// The crate's manifest, parsed. `cargo package` rewrites dependency
+    /// lines into `[dependencies.<name>]` tables, so a line scan would pass in
+    /// the workspace and fail in the published package.
+    fn manifest() -> toml::Table {
+        toml::from_str(include_str!("../Cargo.toml")).expect("meerkat-live Cargo.toml parses")
+    }
+
+    /// Every dependency table: normal, dev and build, and their
+    /// `[target.<cfg>]` forms.
+    fn dependency_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
+        let kinds = ["dependencies", "dev-dependencies", "build-dependencies"];
+        let mut tables: Vec<&toml::Table> = kinds
+            .iter()
+            .filter_map(|kind| manifest.get(*kind).and_then(toml::Value::as_table))
+            .collect();
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            for target in targets.values().filter_map(toml::Value::as_table) {
+                tables.extend(
+                    kinds
+                        .iter()
+                        .filter_map(|kind| target.get(*kind).and_then(toml::Value::as_table)),
+                );
+            }
+        }
+        tables
+    }
+
     /// E26: `meerkat-live` must not list `meerkat-runtime` as a dependency.
     /// We read `Cargo.toml` via `include_str!` (compile-time embed, no I/O
-    /// at test runtime) and assert the line is absent. This catches both
-    /// `meerkat-runtime = { workspace = true }` and the older
-    /// `meerkat-runtime = "..."` shapes; we simply look for the bare
-    /// crate name as a TOML key.
+    /// at test runtime) and look for the crate name as a key of every
+    /// dependency table, whatever shape the dependency takes.
     #[test]
     fn cargo_toml_does_not_depend_on_meerkat_runtime() {
-        let cargo_toml = include_str!("../Cargo.toml");
-        // Per-line scan so we don't trip on the word in a comment (none
-        // present today, but futureproof against documentation drift).
-        for line in cargo_toml.lines() {
-            let trimmed = line.trim_start();
+        let manifest = manifest();
+        for table in dependency_tables(&manifest) {
             assert!(
-                !trimmed.starts_with("meerkat-runtime"),
-                "E26 regression: meerkat-live must not depend on meerkat-runtime; \
-                 found Cargo.toml line: {line}"
+                !table.contains_key("meerkat-runtime"),
+                "E26 regression: meerkat-live must not depend on meerkat-runtime"
             );
         }
     }
 
     #[test]
     fn webrtc_media_dependencies_are_feature_gated() {
-        let cargo_toml = include_str!("../Cargo.toml");
+        let manifest = manifest();
+        let default = manifest
+            .get("features")
+            .and_then(|features| features.get("default"))
+            .and_then(toml::Value::as_array)
+            .expect("meerkat-live declares its default feature set");
         assert!(
-            cargo_toml.lines().any(|line| line.trim() == "default = []"),
-            "meerkat-live default feature set must not enable WebRTC/media"
+            default.is_empty(),
+            "meerkat-live default feature set must not enable WebRTC/media: {default:?}"
         );
+        let dependencies = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .expect("meerkat-live has a [dependencies] table");
         for dep in ["webrtc", "webrtc-media", "opus", "rubato"] {
-            let needle = format!("{dep} = ");
-            let dep_line = cargo_toml
-                .lines()
-                .find(|line| line.trim_start().starts_with(&needle))
+            let spec = dependencies
+                .get(dep)
                 .unwrap_or_else(|| panic!("missing optional {dep} dependency"));
-            assert!(
-                dep_line.contains("optional = true"),
-                "{dep} dependency must stay optional: {dep_line}"
+            assert_eq!(
+                spec.get("optional").and_then(toml::Value::as_bool),
+                Some(true),
+                "{dep} dependency must stay optional: {spec}"
             );
         }
     }

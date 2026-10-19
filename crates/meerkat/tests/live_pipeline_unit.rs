@@ -119,9 +119,18 @@ mod live_pipeline {
         ws_state: Arc<LiveWsState>,
         actor_witness_slots: Arc<std::sync::Mutex<Vec<meerkat::LiveSessionActorWitnessSlot>>>,
         _temp: tempfile::TempDir,
+        // Last, so it is released after everything else the test built.
+        _open_reservation: tokio::sync::MutexGuard<'static, ()>,
     }
 
+    // The production one-open memory reservation is process wide; nextest
+    // isolates tests by process, plain `cargo test` does not. Every test that
+    // builds a fixture holds this for its whole run, so one test's opens (and
+    // the test that occupies the reservation on purpose) never meet another's.
+    static OPEN_RESERVATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn build_fixture() -> Fixture {
+        let open_reservation = OPEN_RESERVATION.lock().await;
         let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let persistence = PersistenceBundle::new(
             session_store,
@@ -172,6 +181,7 @@ mod live_pipeline {
             ws_state,
             actor_witness_slots: Arc::new(std::sync::Mutex::new(Vec::new())),
             _temp: temp,
+            _open_reservation: open_reservation,
         }
     }
 

@@ -11,6 +11,19 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/inbox_admission_toctou.rs",
+    # needs meerkat-runtime, which depends on this crate (a cyclic dev-dependency the package cannot carry)
+    "tests/inproc_canonical_peer_routing.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/e2e.rs",
+    # live or system lane (integration-real-tests): needs provider credentials, built binaries or repository fixtures
+    "tests/router_integration.rs",
+]
 
 [dependencies]
 # Internal crates
@@ -58,6 +71,9 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
+# Enables `workspace-tests` for this crate's own tests; path-only, so the
+# published package does not carry it.
+meerkat-comms = { path = ".", features = ["workspace-tests"] }
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = { workspace = true }
 ciborium = { workspace = true }
@@ -67,6 +83,12 @@ meerkat-runtime = { path = "../meerkat-runtime", features = ["test-support"] }
 default = ["capability"]
 capability = []
 integration-real-tests = []
+# Internal, not for consumers: compiles the unit tests that need the
+# workspace (a crate this one cannot depend on once published). Only the
+# path-only self dev-dependency enables it, and `cargo package` strips that
+# dev-dependency, so the published package compiles those tests out
+# (ci/standalone-workspace-only.toml names them).
+workspace-tests = []
 
 [[test]]
 name = "router_integration"

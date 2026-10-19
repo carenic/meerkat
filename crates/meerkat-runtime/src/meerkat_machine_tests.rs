@@ -269,6 +269,7 @@ async fn live_delegation_worker_start_resolves_after_its_channel_closed() {
         .expect("the committed start replays idempotently after the close");
 }
 
+#[cfg(feature = "live")]
 #[tokio::test]
 async fn live_delegation_runtime_reconciles_already_committed_worker_edges() {
     let machine = MeerkatMachine::ephemeral();
@@ -3628,11 +3629,13 @@ async fn teardown_required_runtime_loop_exit_unregisters_after_exact_cleanup() {
 /// A [`CoreExecutor`] whose post-stop cleanup reports that it started and then
 /// waits for its release, so a test can hold an unregister after the runtime
 /// loop has exited and handed the executor off.
+#[cfg(feature = "test-support")]
 struct HeldTeardownCleanupExecutor {
     cleanup_started: Arc<Notify>,
     release_cleanup: Arc<Notify>,
 }
 
+#[cfg(feature = "test-support")]
 #[async_trait::async_trait]
 impl CoreExecutor for HeldTeardownCleanupExecutor {
     async fn apply(
@@ -3662,6 +3665,7 @@ impl CoreExecutor for HeldTeardownCleanupExecutor {
 
 /// A persistent machine over an in-memory store that owns execution custody,
 /// with one session attached through a [`HeldTeardownCleanupExecutor`].
+#[cfg(feature = "test-support")]
 struct HeldTeardownSession {
     store: Arc<dyn crate::store::RuntimeStore>,
     machine: Arc<MeerkatMachine>,
@@ -3671,6 +3675,7 @@ struct HeldTeardownSession {
     release_cleanup: Arc<Notify>,
 }
 
+#[cfg(feature = "test-support")]
 async fn held_teardown_session() -> HeldTeardownSession {
     let store: Arc<dyn crate::store::RuntimeStore> =
         Arc::new(crate::store::InMemoryRuntimeStore::new());
@@ -3719,6 +3724,7 @@ async fn held_teardown_session() -> HeldTeardownSession {
 /// to its first suspension before this test resumes, so no scheduling decides
 /// what is observed. Every wait is bounded, and the unregister is released and
 /// joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn teardown_watcher_waits_for_its_unregister_without_the_machine() {
     let HeldTeardownSession {
@@ -3789,6 +3795,7 @@ async fn teardown_watcher_waits_for_its_unregister_without_the_machine() {
 /// drops its handle and reopens while the kickoff still holds the machine,
 /// and finds the custody busy. Every wait is bounded, and the kickoff is
 /// released and the unregister joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn unregister_publication_waits_for_the_watcher_kickoff_to_release_the_machine() {
     let HeldTeardownSession {
@@ -3892,6 +3899,7 @@ async fn unregister_publication_waits_for_the_watcher_kickoff_to_release_the_mac
 /// holds the machine, in which case the reopen finds the custody busy. Every
 /// wait is bounded, and a parked kickoff is released and the unregister
 /// joined before anything observed is judged.
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn a_watcher_waking_after_its_successful_unregister_does_not_take_the_machine() {
     let HeldTeardownSession {
@@ -51864,84 +51872,6 @@ async fn machine_owns_transcript_edit_admission_verdict() {
     assert_eq!(verdict(true, true).await, Verdict::DeniedBusy);
 }
 
-/// Extract the variant identifiers of a wire enum from its source text.
-///
-/// The wire enums are `#[non_exhaustive]`, so a compile-time exhaustive match
-/// is impossible outside `meerkat-contracts`; source parity is the available
-/// structural truth (the `runtime_alphabet_parity` classifier-body checks and
-/// `bridge_delivery_handler_does_not_wait_for_completion_inline` set the
-/// precedent). Only payload-carrying variants (`Ident(...)`) are captured;
-/// a future fieldless variant surfaces as a loud manifest mismatch.
-fn parse_wire_enum_variant_names(source: &str, enum_marker: &str) -> BTreeSet<String> {
-    let start = source
-        .find(enum_marker)
-        .unwrap_or_else(|| panic!("wire enum marker `{enum_marker}` not found"));
-    let body_start = start + enum_marker.len();
-    let mut depth = 1_usize;
-    let mut body_end = None;
-    for (offset, ch) in source[body_start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    body_end = Some(body_start + offset);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let body_end = body_end.unwrap_or_else(|| panic!("unterminated enum body for `{enum_marker}`"));
-    source[body_start..body_end]
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.starts_with("//") || line.starts_with('#') {
-                return None;
-            }
-            let ident: String = line
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric())
-                .collect();
-            if !ident
-                .chars()
-                .next()
-                .is_some_and(|ch| ch.is_ascii_uppercase())
-            {
-                return None;
-            }
-            line[ident.len()..].starts_with('(').then_some(ident)
-        })
-        .collect()
-}
-
-/// Multi-host mobs plan §6.4: the supervisor bridge command manifest
-/// (`SupervisorBridgeCommandKind`) is the closed typed completeness authority
-/// over the `#[non_exhaustive]` `BridgeCommand` wire enum. A new wire command
-/// cannot ship without a typed admission classification (route + realization)
-/// in the member runtime's manifest.
-#[test]
-fn supervisor_bridge_command_manifest_matches_wire_enum() {
-    let contracts_source = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../meerkat-contracts/src/wire/supervisor_bridge.rs"),
-    )
-    .expect("read meerkat-contracts supervisor_bridge.rs");
-    let wire_variants =
-        parse_wire_enum_variant_names(&contracts_source, "pub enum BridgeCommand {");
-    let manifest: BTreeSet<String> = crate::meerkat_machine_types::SupervisorBridgeCommandKind::ALL
-        .iter()
-        .map(|kind| kind.variant_name().to_string())
-        .collect();
-    assert_eq!(
-        wire_variants, manifest,
-        "SupervisorBridgeCommandKind must exactly mirror the BridgeCommand wire enum: \
-         classify every new wire command (admission route + realization) in \
-         meerkat_machine_types.rs before shipping it"
-    );
-}
-
 /// Multi-host mobs plan §6.4: each manifest kind's realization posture must
 /// match the comms drain's bridge dispatch match. `Realized` kinds have a
 /// dispatch arm; `FailClosedUnsupported` kinds must NOT have one — the
@@ -52657,6 +52587,7 @@ mod prepared_materialization_transactions {
     /// own wait can prove the registration gone. The saga is held until the
     /// rollback has dispatched its wait, and the machine witnesses which wait
     /// that was, so no scheduling decides the outcome.
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn prepared_rollback_joins_an_already_started_unregister_until_terminal() {
         let machine = Arc::new(MeerkatMachine::ephemeral());

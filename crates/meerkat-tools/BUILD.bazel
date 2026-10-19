@@ -728,6 +728,79 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
+    ],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-tools",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-capabilities:meerkat_capabilities",
+        "//crates/meerkat-comms:meerkat_comms",
+        "//crates/meerkat-contracts:meerkat_contracts",
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-jobs:meerkat_jobs",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
+        "//crates/meerkat-mcp:meerkat_mcp_test_support",
+        "//crates/meerkat-runtime:meerkat_runtime_test_support",
+        "//crates/meerkat-sandbox:meerkat_sandbox",
+        "//crates/meerkat-skills:meerkat_skills",
+        "//crates/meerkat-sqlite:meerkat_sqlite",
+        "//crates/meerkat-store:meerkat_store",
+        "//crates/meerkat-tools:meerkat_tools_with_runtime_test_support",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-tools",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "rct_manual_schema_literals_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-tools",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "rct_manual_schema_literals",
+    crate_root = "tests/rct_manual_schema_literals.rs",
+    crate_features = [
+        "comms",
+        "mcp",
+        "skills",
+        "sqlite",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
+        "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
+        "skills/task-workflow/SKILL.md",
+        "src/builtin/shell/tool.rs",
+    ],
+    srcs = [
+        "tests/rct_manual_schema_literals.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.9.3",
+        "CARGO_BIN_NAME": "rct_manual_schema_literals",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-tools",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [
+        ":package_runfiles",
         "//:workspace_cargo_manifests",
         "//:workspace_metadata",
         "//:workspace_rust_sources",
@@ -916,6 +989,7 @@ test_suite(
         ":meerkat_tools_unit_test",
         ":monitor_protocol_test",
         ":rct_contracts_test",
+        ":rct_manual_schema_literals_test",
         ":read_only_execution_gate_test",
     ],
 )

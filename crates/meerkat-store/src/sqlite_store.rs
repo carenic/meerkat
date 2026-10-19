@@ -10800,39 +10800,18 @@ mod tests {
         );
     }
 
+    /// The released 0.8.10 corpus database: this crate's byte copy of
+    /// meerkat-runtime's corpus (see the fixture README), embedded so archived,
+    /// sandboxed and published-package test runs need no source-tree path.
+    const RELEASED_0810_CORPUS_DB: &[u8] =
+        include_bytes!("../tests/fixtures/v0_8_10_released_corpus/sessions.sqlite3");
+
     #[tokio::test]
     async fn exact_released_0810_corpus_imports_and_fully_loads_current_session() {
-        // The workspace root: `MEERKAT_WORKSPACE_ROOT` (set by the
-        // `repo-cargo` wrapper), the working directory when it holds the
-        // fixture (Bazel runs the test from its runfiles root), or two levels
-        // above this crate's manifest. A plain `cargo test` runs from
-        // `crates/meerkat-store`, whose own `Cargo.toml` must not make it the
-        // root. The fixture literal stays joined onto a `workspace_root`, the
-        // form CI's non-Rust readers guard recognizes as a read.
-        let fixture_under = |workspace_root: &Path| {
-            workspace_root.join(
-                "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
-            )
-        };
-        let workspace_root = std::env::var_os("MEERKAT_WORKSPACE_ROOT")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .filter(|root| fixture_under(root).is_file())
-            })
-            .or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .ancestors()
-                    .nth(2)
-                    .filter(|root| fixture_under(root).is_file())
-                    .map(Path::to_path_buf)
-            })
-            .expect("a workspace root holding the released 0.8.10 corpus fixture");
-        let source = fixture_under(&workspace_root);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sessions.sqlite3");
-        std::fs::copy(&source, &path).expect("copy exact released 0.8.10 corpus database");
+        std::fs::write(&path, RELEASED_0810_CORPUS_DB)
+            .expect("write exact released 0.8.10 corpus database");
 
         let raw = open_connection(&path).unwrap();
         let raw_id = raw

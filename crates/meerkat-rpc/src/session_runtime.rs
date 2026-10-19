@@ -25261,6 +25261,7 @@ mod tests {
         assert_eq!(identity.model, "gpt-5.4");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     fn mcp_server_config(server_name: &str) -> McpServerConfig {
         McpServerConfig::stdio(
@@ -33776,6 +33777,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn start_turn_applies_staged_mcp_remove_and_reload_at_turn_boundary() {
@@ -33852,6 +33854,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn async_mcp_removal_timeout_is_emitted_on_next_boundary() {
@@ -33960,6 +33963,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn staged_ops_remain_boundary_gated_while_background_drain_runs() {
@@ -34122,6 +34126,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn queued_lifecycle_actions_survive_boundary_apply_failure() {

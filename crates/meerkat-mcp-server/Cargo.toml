@@ -11,6 +11,13 @@ homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Workspace-only test files: `cargo package` leaves them out and the
+# workspace still runs them. ci/standalone-workspace-only.toml lists the same
+# files with the same reasons; the PR guard fails when the two disagree.
+exclude = [
+    # includes the repository's tests/fixtures/live_smoke/support.rs (live lane)
+    "tests/live_mcp_matrix.rs",
+]
 
 [[bin]]
 name = "rkat-mcp"
@@ -58,6 +65,8 @@ workgraph = ["meerkat/workgraph"]
 ignored = ["dirs", "meerkat-client", "meerkat-comms", "meerkat-mcp", "meerkat-mob", "meerkat-mob-mcp", "meerkat-runtime", "rmcp"]  # feature-gated / optional
 
 [dev-dependencies]
+# The hook run-override fixture (meerkat_core::config::HOOK_RUN_OVERRIDES_FIXTURE_JSON).
+meerkat-core = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 meerkat-mob = { workspace = true, features = ["test-support"] }
 meerkat-runtime = { workspace = true, features = ["test-support"] }

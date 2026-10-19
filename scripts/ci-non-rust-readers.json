@@ -41,13 +41,13 @@
       },
       {
         "package": "meerkat-tools",
-        "target": "test:rct_contracts",
+        "target": "test:rct_manual_schema_literals",
         "scope": "target",
         "tests": [
           "test_rct_contracts_no_manual_tool_schema_literals"
         ],
         "sources": [
-          "crates/meerkat-tools/tests/rct_contracts.rs"
+          "crates/meerkat-tools/tests/rct_manual_schema_literals.rs"
         ]
       },
       {
@@ -673,13 +673,13 @@
     "crates/meerkat-contracts/src/wire/supervisor_bridge.rs": [
       {
         "package": "meerkat-runtime",
-        "target": "lib",
+        "target": "test:supervisor_bridge_command_manifest",
         "scope": "target",
         "tests": [
           "supervisor_bridge_command_manifest_matches_wire_enum"
         ],
         "sources": [
-          "crates/meerkat-runtime/src/meerkat_machine_tests.rs"
+          "crates/meerkat-runtime/tests/supervisor_bridge_command_manifest.rs"
         ]
       }
     ],
@@ -837,19 +837,6 @@
         ],
         "sources": [
           "crates/xtask/tests/protocol_codegen_drift.rs"
-        ]
-      }
-    ],
-    "crates/meerkat-core/src/interaction.rs": [
-      {
-        "package": "meerkat-runtime",
-        "target": "test:peer_ingress_fact_ratchet",
-        "scope": "target",
-        "tests": [
-          "peer_input_candidate_does_not_duplicate_ingress_class_or_auth"
-        ],
-        "sources": [
-          "crates/meerkat-runtime/tests/peer_ingress_fact_ratchet.rs"
         ]
       }
     ],
@@ -1185,16 +1172,13 @@
     "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3": [
       {
         "package": "meerkat-store",
-        "target": "lib",
+        "target": "test:released_0810_corpus_copy",
         "scope": "target",
-        "features": [
-          "sqlite"
-        ],
         "tests": [
-          "exact_released_0810_corpus_imports_and_fully_loads_current_session"
+          "released_0810_corpus_copy_matches_its_owner"
         ],
         "sources": [
-          "crates/meerkat-store/src/sqlite_store.rs"
+          "crates/meerkat-store/tests/released_0810_corpus_copy.rs"
         ]
       }
     ],
@@ -1342,13 +1326,10 @@
       },
       {
         "package": "rkat",
-        "target": "bin:rkat",
+        "target": "test:doc_examples_fixture",
         "scope": "target",
-        "tests": [
-          "fenced_rkat_doc_examples_parse_against_clap"
-        ],
         "sources": [
-          "crates/meerkat-cli/src/main.rs"
+          "crates/meerkat-cli/tests/doc_examples_fixture.rs"
         ]
       },
       {
@@ -2094,43 +2075,6 @@
         "scope": "package",
         "sources": [
           "crates/xtask/src/rmat_audit.rs"
-        ]
-      }
-    ],
-    "tests/fixtures/hooks/run_override.json": [
-      {
-        "package": "meerkat-core",
-        "target": "test:hooks_contracts",
-        "scope": "target",
-        "tests": [
-          "run_override_fixture_contract"
-        ],
-        "sources": [
-          "crates/meerkat-core/tests/hooks_contracts.rs"
-        ]
-      },
-      {
-        "package": "meerkat-mcp-server",
-        "target": "lib",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-mcp-server/src/lib.rs"
-        ]
-      },
-      {
-        "package": "meerkat-rest",
-        "target": "lib",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-rest/src/lib.rs"
-        ]
-      },
-      {
-        "package": "rkat",
-        "target": "bin:rkat",
-        "scope": "target",
-        "sources": [
-          "crates/meerkat-cli/src/main.rs"
         ]
       }
     ],

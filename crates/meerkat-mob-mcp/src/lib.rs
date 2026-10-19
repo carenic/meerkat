@@ -17378,9 +17378,12 @@ mod tests {
     }
 
     /// A holder that still observes the destroyed mob's database when the
-    /// cleanup first drains it, and lets go shortly after, does not leave the
-    /// cleanup outstanding: the refused drain is retried a bounded number of
-    /// times, each after the host's release hook ran again.
+    /// cleanup first drains it, and lets go before the retry, does not leave
+    /// the cleanup outstanding: the refused drain is retried a bounded number
+    /// of times, each after the host's release hook ran again. The holder
+    /// lets go when the hook runs again, not after a fixed delay: a delay
+    /// races the first drain when all of the binary's tests run at once
+    /// (plain `cargo test`), and that drain then has nothing to refuse.
     #[tokio::test]
     async fn a_short_lived_holder_does_not_leave_the_destroy_cleanup_outstanding() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -17388,21 +17391,25 @@ mod tests {
         let state = persistent_destroy_state(&svc, root.path());
         let bound = bind_activated_mobs(&state);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (releaser, counted) = (Arc::clone(&bound), Arc::clone(&calls));
+        let holder = Arc::new(std::sync::Mutex::new(None));
+        let (releaser, counted, slot) =
+            (Arc::clone(&bound), Arc::clone(&calls), Arc::clone(&holder));
         let hook: MobAfterDestroy = Arc::new(move |mob_id: &MobId| {
-            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
-                return;
-            }
-            // The first call hands the binding to a short-lived holder, as
-            // an observer that cloned it just before the destroy would be.
-            let held = releaser
+            let mut held = slot
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(mob_id);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                drop(held);
-            });
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                // The first call hands the binding to a short-lived holder,
+                // as an observer that cloned it just before the destroy would
+                // be.
+                *held = releaser
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(mob_id);
+            } else {
+                // The holder lets go before the retried drain.
+                drop(held.take());
+            }
         });
         state
             .set_after_destroy(hook)

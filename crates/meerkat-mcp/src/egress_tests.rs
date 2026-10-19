@@ -695,6 +695,7 @@ async fn a_required_profile_never_uses_the_ambient_proxy() {
 }
 
 /// A router retains the profile for its immediate and staged connections.
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn a_router_retains_the_profile_for_every_connection() {
     let (port, fixture) = spawn_mcp_fixture(None).await;

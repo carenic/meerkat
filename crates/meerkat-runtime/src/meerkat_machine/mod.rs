@@ -10113,7 +10113,7 @@ pub struct MeerkatMachineShared {
     test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool,
     /// Fail the next record of a deferred close-time playback settlement
     /// after its machine transition, as a failed recovery-state persist does.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "live", any(test, feature = "test-support")))]
     test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool,
     /// One-shot deterministic gate before the runtime loop's terminal run
     /// commit takes the session driver. The turn is terminal in its live
@@ -11989,7 +11989,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
@@ -12225,7 +12225,7 @@ impl MeerkatMachine {
                 test_fail_next_boundary_cancel_dispatch_abort: std::sync::atomic::AtomicBool::new(
                     false,
                 ),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(all(feature = "live", any(test, feature = "test-support")))]
                 test_fail_next_live_close_settlement_deferral: std::sync::atomic::AtomicBool::new(
                     false,
                 ),

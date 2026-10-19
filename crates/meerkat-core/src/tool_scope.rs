@@ -533,39 +533,49 @@ mod generated_visibility_test_owner {
     use std::collections::BTreeMap;
 
     use super::*;
+    #[cfg(feature = "workspace-tests")]
     use meerkat_machine_kernels::generated::meerkat;
+    #[cfg(feature = "workspace-tests")]
     use meerkat_machine_kernels::test_oracle::{
         GeneratedMachineKernel, KernelInput, KernelSignal, KernelState, KernelValue,
         TransitionRefusal,
     };
+    #[cfg(feature = "workspace-tests")]
     use meerkat_machine_schema::identity::{
         EnumTypeId, EnumVariantId, FieldId, InputVariantId, NamedTypeId, SignalVariantId,
     };
 
+    #[cfg(feature = "workspace-tests")]
     fn field_id(slug: &str) -> FieldId {
         FieldId::parse(slug).expect("generated MeerkatMachine field id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn input_id(slug: &str) -> InputVariantId {
         InputVariantId::parse(slug).expect("generated MeerkatMachine input id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn signal_id(slug: &str) -> SignalVariantId {
         SignalVariantId::parse(slug).expect("generated MeerkatMachine signal id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn named_type_id(slug: &str) -> NamedTypeId {
         NamedTypeId::parse(slug).expect("generated MeerkatMachine named type id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn enum_type_id(slug: &str) -> EnumTypeId {
         EnumTypeId::parse(slug).expect("generated MeerkatMachine enum type id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn enum_variant_id(slug: &str) -> EnumVariantId {
         EnumVariantId::parse(slug).expect("generated MeerkatMachine enum variant id")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn named_string(type_name: &str, value: String) -> KernelValue {
         KernelValue::Named {
             type_name: named_type_id(type_name),
@@ -573,6 +583,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn enum_value(enum_name: &str, variant: &str) -> KernelValue {
         KernelValue::NamedVariant {
             enum_name: enum_type_id(enum_name),
@@ -580,6 +591,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn input(
         variant: &str,
         fields: impl IntoIterator<Item = (&'static str, KernelValue)>,
@@ -593,6 +605,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn named_payload<'a>(value: &'a KernelValue, expected_type: &str) -> Option<&'a KernelValue> {
         match value {
             KernelValue::Named { type_name, value } if type_name.as_str() == expected_type => {
@@ -602,6 +615,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn state_field<'a>(state: &'a KernelState, name: &str) -> Option<&'a KernelValue> {
         state.fields.get(&field_id(name))
     }
@@ -621,6 +635,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn required_state_field<'a>(
         state: &'a KernelState,
         name: &str,
@@ -629,6 +644,7 @@ mod generated_visibility_test_owner {
             .ok_or_else(|| owner_projection_error(format!("missing required state field `{name}`")))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn state_u64(state: &KernelState, name: &str) -> Result<u64, ToolScopeApplyError> {
         match required_state_field(state, name)? {
             KernelValue::U64(value) => Ok(*value),
@@ -638,6 +654,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn state_bool(state: &KernelState, name: &str) -> Result<bool, ToolScopeApplyError> {
         match required_state_field(state, name)? {
             KernelValue::Bool(value) => Ok(*value),
@@ -647,6 +664,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn state_string_set(
         state: &KernelState,
         name: &str,
@@ -667,6 +685,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn kernel_string_set(values: &BTreeSet<ToolName>) -> KernelValue {
         KernelValue::Set(
             values
@@ -676,6 +695,7 @@ mod generated_visibility_test_owner {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn tool_filter_value(filter: &ToolFilter) -> KernelValue {
         match filter {
             ToolFilter::All => enum_value("ToolFilter", "All"),
@@ -707,6 +727,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn tool_filter_from_value(value: &KernelValue) -> Result<ToolFilter, ToolScopeApplyError> {
         let Some(payload) = named_payload(value, "ToolFilter") else {
             return match value {
@@ -795,6 +816,7 @@ mod generated_visibility_test_owner {
         })
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn tool_provenance_value(provenance: &crate::types::ToolProvenance) -> KernelValue {
         KernelValue::Map(BTreeMap::from([
             (
@@ -811,6 +833,7 @@ mod generated_visibility_test_owner {
         ]))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn tool_provenance_from_value(
         value: &KernelValue,
     ) -> Result<crate::types::ToolProvenance, ToolScopeApplyError> {
@@ -852,6 +875,7 @@ mod generated_visibility_test_owner {
         })
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn witness_value(witness: &ToolVisibilityWitness) -> KernelValue {
         let mut fields = BTreeMap::new();
         if let Some(provenance) = witness.last_seen_provenance.as_ref() {
@@ -866,6 +890,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn witness_from_value(
         value: &KernelValue,
     ) -> Result<ToolVisibilityWitness, ToolScopeApplyError> {
@@ -885,6 +910,7 @@ mod generated_visibility_test_owner {
         })
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn witness_map_value(witnesses: &BTreeMap<ToolName, ToolVisibilityWitness>) -> KernelValue {
         KernelValue::Map(
             witnesses
@@ -899,6 +925,7 @@ mod generated_visibility_test_owner {
         )
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn witness_map_from_value(
         value: &KernelValue,
     ) -> Result<BTreeMap<ToolName, ToolVisibilityWitness>, ToolScopeApplyError> {
@@ -919,6 +946,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn state_witness_map(
         state: &KernelState,
         name: &str,
@@ -946,6 +974,7 @@ mod generated_visibility_test_owner {
             .collect()
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn map_apply_refusal(err: TransitionRefusal, context: &str) -> ToolScopeApplyError {
         ToolScopeApplyError::Owner {
             message: format!(
@@ -954,6 +983,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn map_stage_refusal(err: TransitionRefusal, context: &str) -> ToolScopeStageError {
         ToolScopeStageError::Owner {
             message: format!(
@@ -963,12 +993,14 @@ mod generated_visibility_test_owner {
     }
 
     /// Test-only visibility owner backed by the generated MeerkatMachine kernel.
+    #[cfg(feature = "workspace-tests")]
     #[derive(Debug)]
     pub(crate) struct GeneratedTestToolVisibilityOwner {
         kernel: GeneratedMachineKernel,
         state: RwLock<KernelState>,
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl GeneratedTestToolVisibilityOwner {
         pub(crate) fn new() -> Self {
             let kernel = GeneratedMachineKernel::new(meerkat::schema());
@@ -1053,6 +1085,7 @@ mod generated_visibility_test_owner {
         }
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn visibility_state_from_kernel(
         state: &KernelState,
     ) -> Result<SessionToolVisibilityState, ToolScopeApplyError> {
@@ -1080,6 +1113,7 @@ mod generated_visibility_test_owner {
         })
     }
 
+    #[cfg(feature = "workspace-tests")]
     impl ToolVisibilityOwner for GeneratedTestToolVisibilityOwner {
         fn visibility_state(&self) -> Result<SessionToolVisibilityState, ToolScopeApplyError> {
             self.state
@@ -1336,6 +1370,7 @@ mod generated_visibility_test_owner {
     }
 }
 
+#[cfg(feature = "workspace-tests")]
 #[cfg(test)]
 pub(crate) use generated_visibility_test_owner::GeneratedTestToolVisibilityOwner;
 
@@ -3106,10 +3141,12 @@ mod tests {
         GeneratedToolVisibilityOwner::from_generated_authority(owner)
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn generated_visibility_owner() -> GeneratedToolVisibilityOwner {
         generated_visibility_owner_from(Arc::new(super::GeneratedTestToolVisibilityOwner::new()))
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn scope_with_generated_visibility(base_tools: Arc<[Arc<ToolDef>]>) -> ToolScope {
         ToolScope::new_with_visibility_owner(
             base_tools,
@@ -3120,6 +3157,7 @@ mod tests {
         .expect("generated test visibility owner should accept initial catalog authority")
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn scope_with_generated_projection_names(
         base_tools: Arc<[Arc<ToolDef>]>,
         deferred_tool_names: HashSet<ToolName>,
@@ -3133,6 +3171,7 @@ mod tests {
         .expect("generated test visibility owner should accept projection authority")
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn tool_audience_app_projection_obeys_filters_without_loading_model_tools() {
         let definitions: Arc<[Arc<ToolDef>]> = [
@@ -3201,6 +3240,7 @@ mod tests {
         assert!(scope.host_visible_tool_names().unwrap().is_empty());
     }
 
+    #[cfg(feature = "workspace-tests")]
     fn scope_with_generated_control_tool_names(
         base_tools: Arc<[Arc<ToolDef>]>,
         control_tool_names: HashSet<ToolName>,
@@ -3318,6 +3358,7 @@ mod tests {
         assert!(matches!(staged, Err(ToolScopeStageError::Owner { .. })));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn stage_revision_is_monotonic() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -3334,6 +3375,7 @@ mod tests {
         assert_eq!(handle.staged_revision().unwrap(), second);
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn sticky_fallback_rebases_pending_staged_revision_after_new_active_commit() {
         let scope = scope_with_generated_visibility(tools(&[crate::VIEW_IMAGE_TOOL_NAME, "shell"]));
@@ -3390,6 +3432,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn stage_rejects_unknown_tools() {
         let scope = scope_with_generated_visibility(tools(&["known"]));
@@ -3407,6 +3450,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn control_tools_remain_visible_and_unfilterable() {
         let scope = scope_with_generated_control_tool_names(
@@ -3439,6 +3483,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn deferred_tools_stay_hidden_until_requested_boundary_applies() {
         let visible = tools(&["visible"])[0].clone();
@@ -3479,6 +3524,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn catalog_witnessed_deferred_tool_activation_is_turn_scoped() {
         let visible = tools(&["visible"])[0].clone();
@@ -3516,6 +3562,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn catalog_witnessed_turn_authority_is_inert_for_inline_tool() {
         let inline = tool_with_provenance("inline", "attention-binding-a");
@@ -3543,6 +3590,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn inline_turn_authority_still_rejects_forged_witness() {
         let inline = tool_with_provenance("inline", "attention-binding-a");
@@ -3597,6 +3645,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn snapshot_reflects_active_and_staged_scope_state() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -3656,6 +3705,7 @@ mod tests {
         assert!(!composed_precedence.allows("b"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn staged_update_is_boundary_only_until_apply_staged() {
         let scope = scope_with_generated_visibility(tools(&["visible", "secret"]));
@@ -3699,6 +3749,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn boundary_projection_uses_pre_promotion_visibility_for_change_detection() {
         let scope = scope_with_generated_visibility(tools(&["visible", "secret"]));
@@ -3727,6 +3778,7 @@ mod tests {
         assert_eq!(applied.applied_revision, ToolScopeRevision(1));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn structural_base_change_preserves_dormant_filter_names() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -3780,6 +3832,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn requested_witness_mismatch_prevents_rebinding_a_dormant_deferred_name() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3827,6 +3880,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn local_visibility_replace_rejects_empty_deferred_authority() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3860,6 +3914,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn local_visibility_replace_rejects_mismatched_deferred_authority() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3902,6 +3957,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn name_only_deferred_staging_rejects_without_witness_authority() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3930,6 +3986,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn requested_deferred_names_reject_empty_witnesses() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3959,6 +4016,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn requested_deferred_authorities_reject_mismatched_visible_catalog() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -3994,6 +4052,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn requested_deferred_authorities_reject_conflicting_duplicate_authority_values() {
         let requested = tool_with_provenance("deferred", "owner-a");
@@ -4037,6 +4096,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn requested_deferred_names_reuse_existing_witnesses_for_extended_sets() {
         let requested_a = tool_with_provenance("deferred_a", "owner-a");
@@ -4075,6 +4135,7 @@ mod tests {
         assert!(state.requested_witnesses.contains_key("deferred_b"));
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn filter_witness_mismatch_prevents_rebinding_a_dormant_filter_name() {
         // The original carries a verified artifact; the staged witness
@@ -4118,6 +4179,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn empty_inherited_witness_does_not_become_authority() {
         let original = tool_with_provenance("a", "owner-a");
@@ -4146,6 +4208,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn inherited_filter_witness_mismatch_prevents_rebinding_a_dormant_name() {
         let original = tool_with_provenance("a", "owner-a");
@@ -4193,6 +4256,7 @@ mod tests {
     /// later boundary applies (that tool hidden, the rest of the ceiling
     /// visible) instead of failing the whole tool set closed, and the
     /// witnessed tool lists again when its own source returns.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn inherited_witness_stays_the_filter_authority_while_another_source_serves_its_name() {
         let original = tool_with_provenance("a", "owner-a");
@@ -4248,6 +4312,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn turn_overlay_is_ephemeral_and_most_restrictive() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -4293,6 +4358,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn turn_overlay_deny_of_absent_tool_is_admitted_no_op() {
         let scope = scope_with_generated_visibility(tools(&["a", "b"]));
@@ -4319,6 +4385,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn turn_overlay_allow_of_unknown_tool_is_refused_with_typed_names() {
         let scope = scope_with_generated_visibility(tools(&["a", "b"]));
@@ -4339,6 +4406,7 @@ mod tests {
     /// #1807: the policy filter hides the tools the execution policy makes
     /// unreachable, needs no witnesses (it may name a tool this build never
     /// mounted), shows in the snapshot, and composes with the other filters.
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn policy_base_filter_hides_unreachable_tools_without_witnesses() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -4371,6 +4439,7 @@ mod tests {
         assert_eq!(visible(), vec!["a".to_string()], "filters compose");
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn set_base_filter_restricts_visible_tools() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));
@@ -4400,6 +4469,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[test]
     fn set_base_filter_composes_with_external_filter() {
         let scope = scope_with_generated_visibility(tools(&["a", "b", "c"]));

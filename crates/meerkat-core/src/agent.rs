@@ -2,11 +2,11 @@
 //!
 //! The Agent struct ties together all components and runs the agent loop.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod assistant_message_identity_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod brain_swap_promotion_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod budget_warning_tests;
 mod builder;
 pub mod comms_impl;
@@ -15,15 +15,15 @@ pub mod compact;
 mod durable_boundary_tests;
 mod extraction;
 mod hook_impl;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod hooks_behavior_tests;
 pub(crate) mod reasoning_preference;
 mod runner;
 pub mod skills;
 mod state;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod structured_output_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 #[doc(hidden)]
 pub(crate) mod test_turn_state_handle;
 mod tool_application_execution;
@@ -31,7 +31,7 @@ mod tool_application_execution;
 mod tool_delegate_tests;
 #[cfg(test)]
 mod usage_accounting_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "workspace-tests"))]
 mod usage_degradation_tests;
 use crate::budget::Budget;
 use crate::comms::{
