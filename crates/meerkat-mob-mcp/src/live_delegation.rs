@@ -917,6 +917,9 @@ fn session_error_is_transient(error: &meerkat_core::service::SessionError) -> bo
         | SessionError::FailedWithData { .. }
         | SessionError::CapabilityUnavailable(_)
         | SessionError::Unsupported(_)
+        // A fork the host's instruction policy refused stays refused until
+        // a new request changes the policy or the source.
+        | SessionError::ForkInstructionRefused(_)
         | SessionError::ExternalWriteFenceConflict { .. }
         // Another owner hosts the destination; restart reconcile re-drives
         // the append from the recovery snapshot, never a hosting poll.
