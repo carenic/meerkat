@@ -26271,6 +26271,7 @@ mod tests {
                         message_index: 2,
                         running_behavior: TranscriptEditRunningBehavior::Reject,
                         tool_access_policy: None,
+                        inherited_instructions: None,
                     },
                 )
                 .await
@@ -26285,6 +26286,7 @@ mod tests {
                         },
                         running_behavior: TranscriptEditRunningBehavior::Reject,
                         tool_access_policy: None,
+                        inherited_instructions: None,
                     },
                 )
                 .await
@@ -26324,6 +26326,7 @@ mod tests {
                     SessionId::new(),
                     None,
                     None,
+                    meerkat_core::ForkInstructionPolicy::default(),
                 )
                 .await
                 .map(|forked| forked.fork.session_id),
