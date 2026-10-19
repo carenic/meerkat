@@ -147,6 +147,29 @@ them.
   registration instead of to an identity it derives from the member's
   session id or labels; a later registration of the same session is a
   different registration.
+- `meerkat-mob`: member binding history reads over the mob's durable member
+  journal. `MobHandle::member_binding_history` folds the journal and Core's
+  identity intent rows, read in one store transaction, into a
+  `MemberBindingHistory`. `member_binding_for_session` answers the latest
+  binding that named a session (a resume keeps a session across
+  generations); `last_member_binding` an identity's latest incarnation since
+  the latest mob reset, live or retired, with the session a resume can
+  restore; `durable_identity_members` the live members spawned with
+  `SpawnContinuityIntent::DurableIdentity`; and `identity_management`
+  whether Core holds an identity intent row for an identity
+  (`MemberIdentityManagement`: command-driven, intent-managed, or an intent
+  row this build cannot read). Each
+  `MemberBinding` carries its session, generation, role, continuity intent,
+  a typed `MemberBindingState` (live, moved by a binding recovery, or
+  retired) and that intent-row fact;
+  `MemberBindingHistory::durable_identity_bindings` lists every durable
+  identity's last binding, live or retired. `MobReadHandle` has the
+  same reads, under the same `List` control scope.
+  `MobStorage::read_member_binding_history` reads a stopped mob's store at a
+  path with the same fold: it opens the file read-only, never creates or
+  migrates a store, and refuses a missing store or a schema it does not read
+  with a typed `MemberBindingHistoryReadError`. Every event kind the history
+  reads is a retention anchor, so pruning never removes it.
 - `meerkat-authorization-contracts`: an owner-scoped resource-domain bound,
   `DomainBound::OwnedBy`: every domain whose typed authority is one of a
   non-empty set of owners, under any namespace. A parent grant can now fix the

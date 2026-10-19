@@ -2,7 +2,8 @@
 
 use super::MobHandle;
 use crate::{
-    AgentIdentity, MemberCreationError, MemberCreationSnapshot, MobError, MobId, MobState,
+    AgentIdentity, MemberBinding, MemberBindingHistory, MemberCreationError,
+    MemberCreationSnapshot, MemberIdentityManagement, MobError, MobId, MobState,
 };
 use meerkat_core::SessionId;
 
@@ -53,6 +54,47 @@ impl MobReadHandle {
 
     pub async fn member_creation_journal_cursor(&self) -> Result<u64, MemberCreationError> {
         self.handle.member_creation_journal_cursor().await
+    }
+
+    /// The member binding history, one fold of the journal and the
+    /// identity intent rows: [`MobHandle::member_binding_history`], with the
+    /// same authority.
+    pub async fn member_binding_history(&self) -> Result<MemberBindingHistory, MobError> {
+        self.handle.member_binding_history().await
+    }
+
+    /// The journal binding that last named a session, before or after any
+    /// mob reset: [`MobHandle::member_binding_for_session`], with the same
+    /// authority.
+    pub async fn member_binding_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<MemberBinding>, MobError> {
+        self.handle.member_binding_for_session(session_id).await
+    }
+
+    /// An identity's latest incarnation since the latest mob reset, live or
+    /// retired: [`MobHandle::last_member_binding`], with the same authority.
+    pub async fn last_member_binding(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberBinding>, MobError> {
+        self.handle.last_member_binding(identity).await
+    }
+
+    /// The live durable-identity members:
+    /// [`MobHandle::durable_identity_members`], with the same authority.
+    pub async fn durable_identity_members(&self) -> Result<Vec<MemberBinding>, MobError> {
+        self.handle.durable_identity_members().await
+    }
+
+    /// Whether Core holds an identity intent row for an identity:
+    /// [`MobHandle::identity_management`], with the same authority.
+    pub async fn identity_management(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<MemberIdentityManagement, MobError> {
+        self.handle.identity_management(identity).await
     }
 
     /// Read the generated machine's owner-session lifecycle observation.

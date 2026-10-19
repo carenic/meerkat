@@ -5462,6 +5462,10 @@ pub struct MobHandle {
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) definition: Arc<MobDefinition>,
     pub(super) events: Arc<dyn MobEventStore>,
+    /// The built-in atomic identity/member store, when the storage
+    /// composition has one: member binding history reads its journal and
+    /// identity intent rows in one store transaction. Read-only here.
+    pub(super) identity_member: Option<Arc<dyn crate::store::MobIdentityMemberStore>>,
     pub(super) run_store: Arc<dyn MobRunStore>,
     pub(super) runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
     pub(super) flow_streams:

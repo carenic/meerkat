@@ -90220,6 +90220,10 @@ mod fork_job_terminal;
 mod held_spawn;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod host_outage_recovery;
+/// Member binding history reads over real persistent stores, on the running
+/// mob and on its stopped store.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod member_history;
 /// Member-level safe-boundary instruction activation on real persistent
 /// stores (restored member, keyed duplicate, mid-turn refusal).
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

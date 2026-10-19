@@ -14038,6 +14038,7 @@ impl MobActor {
             roster: self.roster.clone(),
             definition: self.definition.clone(),
             events: self.events.clone(),
+            identity_member: self.identity_member.clone(),
             run_store: self.run_store.clone(),
             runtime_metadata: self.runtime_metadata.clone(),
             flow_streams: self.flow_streams.clone(),
