@@ -54,6 +54,17 @@ them.
   thread (a dropped machine's ops worker) updated the counters. An acquire or
   upgrade now waits for that update, so `Busy` means only a real governed or
   shared conflict; a poisoned owner is still `Unavailable` (#1736).
+- `meerkat-runtime`: live channel custody and playback-readiness reads
+  (`MeerkatMachine::validate_live_channel_custody_by_pending_receipt`,
+  `validate_live_channel_custody_by_activation_receipt`,
+  `validate_live_playback_owner_readiness` and
+  `validate_live_active_playback_owner_readiness`, and the facade's
+  `validate_experimental_live_channel_custody*`) answer from one machine
+  snapshot. An activation, revocation or close that commits during the read
+  no longer fails it with `ValidationFailed` ("receipt is not current"): the
+  read answers the phase its snapshot holds, and the next read answers the
+  committed one. Four generated machine invariants pin the stage and
+  activation records every custody answer reads (#1606).
 
 ## [0.9.3] - 2026-10-18
 

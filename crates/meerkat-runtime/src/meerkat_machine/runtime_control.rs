@@ -7604,6 +7604,19 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        Self::live_pending_stage_from_state(&state, session_id, channel_id, pending_receipt)
+    }
+
+    /// The sealed pending carrier `pending_receipt` names in one machine
+    /// snapshot. Every read that answers from the stage uses this one
+    /// projection over its own snapshot, so no answer combines two snapshots.
+    #[cfg(feature = "live")]
+    fn live_pending_stage_from_state(
+        state: &crate::meerkat_machine::dsl::MeerkatMachineState,
+        session_id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+        pending_receipt: &str,
+    ) -> Result<ExperimentalLiveExecutionStageAuthority, RuntimeDriverError> {
         let channel = channel_id.as_str();
         if state.live_channel_session_by_channel.get(channel) != Some(&session_id.to_string())
             || state.live_execution_phase_by_channel.get(channel)
@@ -7618,6 +7631,8 @@ impl MeerkatMachine {
                 reason: "opaque live pending receipt is not current".to_string(),
             });
         }
+        // Unreachable while `live_pending_phase_has_its_stage` holds; kept as
+        // typed fail-closed answers.
         let runtime_id = state
             .live_experimental_staged_runtime_by_channel
             .get(channel)
@@ -7656,6 +7671,10 @@ impl MeerkatMachine {
         })
     }
 
+    /// Reacquire the playback-owner readiness of a pending channel. The stage
+    /// and the readiness come from one machine snapshot. Unlike the custody
+    /// projections, this read has no revoked or closed answer: a revocation or
+    /// close that the snapshot holds fails it with the stage reason.
     #[cfg(feature = "live")]
     pub async fn validate_live_playback_owner_readiness(
         &self,
@@ -7664,14 +7683,15 @@ impl MeerkatMachine {
         pending_receipt: &str,
         readiness_id: &str,
     ) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
-        let stage = self
-            .validate_live_pending_channel_receipt(session_id, channel_id, pending_receipt)
-            .await?;
         let state = self.session_dsl_state(session_id).await.map_err(|reason| {
             RuntimeDriverError::ValidationFailed {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
+        let stage =
+            Self::live_pending_stage_from_state(&state, session_id, channel_id, pending_receipt)?;
         let owner_id = state
             .live_playback_owner_by_channel
             .get(channel_id.as_str())
@@ -7709,6 +7729,19 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        Self::live_activation_from_state(&state, session_id, channel_id, activation_receipt)
+    }
+
+    /// The active execution `activation_receipt` names in one machine
+    /// snapshot. Every read that answers from the activation uses this one
+    /// projection over its own snapshot, so no answer combines two snapshots.
+    #[cfg(feature = "live")]
+    fn live_activation_from_state(
+        state: &crate::meerkat_machine::dsl::MeerkatMachineState,
+        session_id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+        activation_receipt: &str,
+    ) -> Result<LiveChannelActivationReceipt, RuntimeDriverError> {
         let channel = channel_id.as_str();
         if state.live_channel_session_by_channel.get(channel) != Some(&session_id.to_string())
             || state.live_execution_phase_by_channel.get(channel)
@@ -7724,6 +7757,9 @@ impl MeerkatMachine {
                 reason: "opaque live activation receipt is not current".to_string(),
             });
         }
+        // Unreachable while `live_active_pending_channel_has_its_activation`
+        // and `live_execution_binding_is_complete_and_channel_scoped` hold;
+        // kept as typed fail-closed answers.
         let runtime_id = state
             .live_execution_runtime_id_by_channel
             .get(channel)
@@ -7754,6 +7790,11 @@ impl MeerkatMachine {
         })
     }
 
+    /// Reacquire the playback-owner readiness of an active channel. The
+    /// activation and the readiness come from one machine snapshot. Unlike
+    /// the custody projections, this read has no revoked or closed answer: a
+    /// revocation or close that the snapshot holds fails it with the
+    /// activation reason.
     #[cfg(feature = "live")]
     pub async fn validate_live_active_playback_owner_readiness(
         &self,
@@ -7763,14 +7804,15 @@ impl MeerkatMachine {
         pending_receipt: &str,
         readiness_id: &str,
     ) -> Result<LivePlaybackOwnerReadinessAuthority, RuntimeDriverError> {
-        let activation = self
-            .validate_live_channel_activation_receipt(session_id, channel_id, activation_receipt)
-            .await?;
         let state = self.session_dsl_state(session_id).await.map_err(|reason| {
             RuntimeDriverError::ValidationFailed {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
+        let activation =
+            Self::live_activation_from_state(&state, session_id, channel_id, activation_receipt)?;
         let channel = channel_id.as_str();
         let owner_id = state
             .live_playback_owner_by_channel
@@ -7805,6 +7847,18 @@ impl MeerkatMachine {
     /// Reacquire pending, active, revoked, or closed custody from the original
     /// opaque pending receipt. The active variant contains the exact generated
     /// activation receipt, so stateless facades never mint transition truth.
+    ///
+    /// The answer comes from one machine snapshot, so a transition in progress
+    /// (activation, revocation, close) reads as the phase that snapshot holds,
+    /// never as an error. The generated invariants
+    /// `live_pending_phase_has_its_stage`,
+    /// `live_active_pending_channel_has_its_activation`,
+    /// `live_custody_receipts_have_mode_and_phase` and
+    /// `live_activation_receipt_phase_is_active_or_revoked` make every arm
+    /// total for a bound receipt; the arms they rule out stay typed
+    /// fail-closed answers. `ValidationFailed` therefore means the receipt
+    /// names no custody here: a wrong receipt, an abandoned open, or an owner
+    /// session that is gone.
     #[cfg(feature = "live")]
     pub async fn validate_live_channel_custody_by_pending_receipt(
         &self,
@@ -7817,6 +7871,8 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
         let channel = channel_id.as_str();
         let preparation =
             crate::live_execution::LiveContextPreparationStatus::from_state(&state, channel)
@@ -7855,60 +7911,55 @@ impl MeerkatMachine {
                 reason: "opaque live pending receipt is not bound to this session".to_string(),
             });
         }
-        match state.live_execution_phase_by_channel.get(channel).copied() {
+        let custody = match state.live_execution_phase_by_channel.get(channel).copied() {
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Pending) => {
-                drop(state);
-                self.validate_live_pending_channel_receipt(session_id, channel_id, pending_receipt)
-                    .await
-                    .map(|stage| LiveChannelCustodyProjection {
-                        session_id: session_id.clone(),
-                        channel_id: channel_id.clone(),
-                        mode,
-                        state: LiveChannelCustodyState::Pending(stage),
-                        preparation,
-                    })
+                LiveChannelCustodyState::Pending(Self::live_pending_stage_from_state(
+                    &state,
+                    session_id,
+                    channel_id,
+                    pending_receipt,
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Active) => {
                 let activation_receipt = state
                     .live_activation_receipt_by_channel
                     .get(channel)
-                    .cloned()
                     .ok_or_else(|| RuntimeDriverError::ValidationFailed {
                         reason: "active live channel has no activation receipt".to_string(),
                     })?;
-                drop(state);
-                self.validate_live_channel_activation_receipt(
+                LiveChannelCustodyState::Active(Self::live_activation_from_state(
+                    &state,
                     session_id,
                     channel_id,
-                    &activation_receipt,
-                )
-                .await
-                .map(|activation| LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Active(activation),
-                    preparation,
-                })
+                    activation_receipt,
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Revoked) => {
-                Ok(LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Revoked,
-                    preparation,
-                })
+                LiveChannelCustodyState::Revoked
             }
-            None => Err(RuntimeDriverError::ValidationFailed {
-                reason: "opaque live pending receipt has no channel phase".to_string(),
-            }),
-        }
+            None => {
+                return Err(RuntimeDriverError::ValidationFailed {
+                    reason: "opaque live pending receipt has no channel phase".to_string(),
+                });
+            }
+        };
+        Ok(LiveChannelCustodyProjection {
+            session_id: session_id.clone(),
+            channel_id: channel_id.clone(),
+            mode,
+            state: custody,
+            preparation,
+        })
     }
 
     /// Reacquire active, revoked, or closed custody from an exact activation
     /// receipt. Revocation disables active controls but retains this opaque
     /// tombstone so an Active handle can still close or poll terminal status.
+    ///
+    /// The answer comes from one machine snapshot, so a revocation or close in
+    /// progress reads as the phase that snapshot holds, never as an error (see
+    /// [`Self::validate_live_channel_custody_by_pending_receipt`] for the
+    /// invariants that make every arm total).
     #[cfg(feature = "live")]
     pub async fn validate_live_channel_custody_by_activation_receipt(
         &self,
@@ -7921,6 +7972,8 @@ impl MeerkatMachine {
                 reason: reason.to_string(),
             }
         })?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.run_live_custody_read_test_hold().await;
         let channel = channel_id.as_str();
         let preparation =
             crate::live_execution::LiveContextPreparationStatus::from_state(&state, channel)
@@ -7959,38 +8012,31 @@ impl MeerkatMachine {
                 reason: "opaque live activation receipt is not bound to this session".to_string(),
             });
         }
-        match state.live_execution_phase_by_channel.get(channel).copied() {
+        let custody = match state.live_execution_phase_by_channel.get(channel).copied() {
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Active) => {
-                drop(state);
-                self.validate_live_channel_activation_receipt(
+                LiveChannelCustodyState::Active(Self::live_activation_from_state(
+                    &state,
                     session_id,
                     channel_id,
                     activation_receipt,
-                )
-                .await
-                .map(|activation| LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Active(activation),
-                    preparation,
-                })
+                )?)
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Revoked) => {
-                Ok(LiveChannelCustodyProjection {
-                    session_id: session_id.clone(),
-                    channel_id: channel_id.clone(),
-                    mode,
-                    state: LiveChannelCustodyState::Revoked,
-                    preparation,
-                })
+                LiveChannelCustodyState::Revoked
             }
             Some(crate::meerkat_machine::dsl::LiveExecutionChannelPhase::Pending) | None => {
-                Err(RuntimeDriverError::ValidationFailed {
+                return Err(RuntimeDriverError::ValidationFailed {
                     reason: "activation receipt has no active or terminal custody".to_string(),
-                })
+                });
             }
-        }
+        };
+        Ok(LiveChannelCustodyProjection {
+            session_id: session_id.clone(),
+            channel_id: channel_id.clone(),
+            mode,
+            state: custody,
+            preparation,
+        })
     }
 
     /// Revoke all exact channel-scoped execution custody before physical

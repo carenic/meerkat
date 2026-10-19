@@ -9262,6 +9262,40 @@ macro_rules! meerkat_catalog_machine_dsl {
                     == Some(LiveExecutionChannelPhase::Revoked))
         }
 
+        // The custody and readiness reads answer from one snapshot; these four
+        // make each of their arms total for a bound receipt (#1606).
+        invariant live_pending_phase_has_its_stage {
+            for_all(channel_id in self.live_execution_phase_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Pending)
+                || self.live_experimental_staged_runtime_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_active_pending_channel_has_its_activation {
+            for_all(channel_id in self.live_experimental_pending_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    != Some(LiveExecutionChannelPhase::Active)
+                || (self.live_activation_receipt_by_channel.contains_key(channel_id)
+                    && self.live_execution_runtime_id_by_channel.contains_key(channel_id)))
+        }
+
+        invariant live_custody_receipts_have_mode_and_phase {
+            for_all(channel_id in self.live_experimental_pending_receipt_by_channel.keys(),
+                self.live_execution_mode_by_channel.contains_key(channel_id)
+                && self.live_execution_phase_by_channel.contains_key(channel_id))
+            && for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_mode_by_channel.contains_key(channel_id)
+                && self.live_execution_phase_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_activation_receipt_phase_is_active_or_revoked {
+            for_all(channel_id in self.live_activation_receipt_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                || self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Revoked))
+        }
+
         invariant live_bridge_operation_identity_is_complete_and_direct {
             self.live_bridge_channel_by_operation.keys()
                 == self.live_bridge_interaction_by_operation.keys()
