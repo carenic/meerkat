@@ -123,6 +123,11 @@ them.
   which only `LiveSidebandCommand::note_delegation_finished` produces, from
   the new one-shot `LiveSidebandFinishedNoticeAuthority`. A provider adapter
   that matches the carrier lowers or refuses it.
+- `meerkat-openai`: `GptLiveBrokerObservation` gains
+  `InstructionsContextAppendWithdrawn { token }`, appended last: a
+  delegation's finished notice that waited while the model was speaking and
+  was withdrawn unsent because a result of the delegation reached the session
+  first (see Fixed). The enum is exhaustive, so a `match` on it adds the arm.
 
 ### Added
 
@@ -263,7 +268,11 @@ them.
   for example) gets the same notice: the machine authorizes it once, as
   the narration kind `FinishedPending`, and the broker sends it
   (`PublicLiveBrokerSession::append_delegation_finished_notice`) unless a
-  result of that delegation has already reached the session.
+  result of that delegation has already reached the session. While the
+  model is speaking, that notice waits until its response ends or the user
+  takes the floor (an instructions append mid-answer can cut the answer
+  off), and it is withdrawn, never sent, if the result reaches the session
+  first.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved

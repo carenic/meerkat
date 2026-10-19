@@ -295,6 +295,13 @@ pub enum GptLiveBrokerObservation {
     /// each input-transcript delta and on each second the reflected clock
     /// advances. Never authority: consumers only record it for display.
     ProviderInputLatency(GptLiveProviderInputLatencyStatus),
+    /// A caller-owned instructions append withdrawn unsent: a delegation's
+    /// finished notice that waited while the model was speaking, withdrawn
+    /// because a result of the delegation reached the session first (a
+    /// notice must never follow its result). Nothing reached the provider.
+    InstructionsContextAppendWithdrawn {
+        token: GptLiveAppendToken,
+    },
 }
 
 impl std::fmt::Debug for GptLiveBrokerObservation {
@@ -337,6 +344,9 @@ impl std::fmt::Debug for GptLiveBrokerObservation {
             Self::DelegationContextAppendRejected { .. } => "delegation_context_append_rejected",
             Self::UnsupportedProviderEvent => "unsupported_provider_event",
             Self::ProviderInputLatency(_) => "provider_input_latency",
+            Self::InstructionsContextAppendWithdrawn { .. } => {
+                "instructions_context_append_withdrawn"
+            }
         };
         formatter
             .debug_struct("GptLiveBrokerObservation")

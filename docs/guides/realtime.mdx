@@ -669,7 +669,9 @@ finished but must not state, guess or imply the outcome before the result
 reaches it. The notice carries no result content, and the result itself is
 still released only by those triggers. A finished delegation whose result
 Meerkat cannot release yet, for example while another delegation's result
-holds the channel's one result slot, gets the same notice.
+holds the channel's one result slot, gets the same notice. While the
+model is speaking, that notice waits until the response ends or the user takes
+the floor, and it is dropped if the result arrives first.
 
 On open and reopen, the selected canonical dialogue is supplied in native
 `session.input` at provider session creation. User text and visible assistant

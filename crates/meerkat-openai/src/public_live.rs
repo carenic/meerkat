@@ -1697,13 +1697,22 @@ impl PublicLiveBrokerSession {
     /// is held by another result, or another release guard refuses it for
     /// now. The notice is the finished notice of a result held behind the
     /// user's floor ([`delegation_finished_pending_notice_sections`]), bound
-    /// to the delegation and sent at once on the instructions lane under the
-    /// state lock, like that one: it carries no result content, so it is
-    /// never held, and a result of the delegation appended later can only
-    /// follow it. It replaces a still-due in-progress notice, the delegation
-    /// leaves later still-running lines, and its result cue takes the
-    /// after-notice head. Unlike the broker's own notices, its receipt is the
-    /// caller's.
+    /// to the delegation on the instructions lane, and handed to the sender
+    /// under the state lock, like that one, so a result of the delegation
+    /// appended later can only follow it. It replaces a still-due
+    /// in-progress notice, the delegation leaves later still-running lines,
+    /// and its result cue takes the after-notice head. Unlike the broker's
+    /// own notices, its receipt is the caller's.
+    ///
+    /// It goes at once while the user holds the floor or the model is
+    /// silent ([`SessionState::finished_notice_may_go_now`]). While the
+    /// model speaks it waits, reserved under the caller's token: an
+    /// instructions append mid-answer can cut the answer off. The frame loop
+    /// sends it at the first frame where the response has ended or the user
+    /// has taken the floor. If a result of the delegation reaches the session
+    /// first, the notice is withdrawn unsent and its receipt resolves as
+    /// [`GptLiveBrokerObservation::InstructionsContextAppendWithdrawn`]; a
+    /// close first settles it as interrupted by close.
     ///
     /// Refused with [`GptLiveBrokerError::MissingContext`] when there is no
     /// in-progress instruction of running work to replace: the delegation is
@@ -1716,6 +1725,17 @@ impl PublicLiveBrokerSession {
     ) -> Result<GptLiveAppendToken, GptLiveBrokerError> {
         let mut state = self.state.lock().await;
         let (token, fragments) = state.reserve_finished_notice(&delegation.0)?;
+        if !state.finished_notice_may_go_now() {
+            state
+                .deferred_finished_notices
+                .push_back((token, delegation.0.clone(), fragments));
+            drop(state);
+            tracing::info!(
+                delegation_id = %delegation.0,
+                "public Live delegation finished notice waits: the model is speaking"
+            );
+            return Ok(token);
+        }
         self.send_finished_notice_locked(&mut state, token, &delegation.0, fragments)
             .await?;
         drop(state);
@@ -1836,11 +1856,17 @@ impl PublicLiveBrokerSession {
                     sends.push((token, event));
                 }
             }
+            if sends.iter().any(|(token, _)| *token == result_token) {
+                // The result goes to the model now: a finished notice still
+                // waiting for it would follow it.
+                state.withdraw_deferred_finished_notices(&delegation.0);
+            }
             // A held result's finished notice goes out now, under the lock
             // that held the result.
             #[cfg(test)]
             finished_notice_pause::at(finished_notice_pause::Point::AfterHold).await;
             self.send_due_finished_notices_locked(&mut state).await;
+            self.send_deferred_finished_notices_locked(&mut state).await;
             (result_token, sends)
         };
         for (token, event) in sends {
@@ -1876,6 +1902,11 @@ impl PublicLiveBrokerSession {
                 #[cfg(test)]
                 finished_notice_pause::at(finished_notice_pause::Point::AfterHold).await;
                 self.send_due_finished_notices_locked(&mut state).await;
+                self.send_deferred_finished_notices_locked(&mut state).await;
+            } else if let Some(result_of) = result_of {
+                // The result goes to the model now: a finished notice still
+                // waiting for it would follow it.
+                state.withdraw_deferred_finished_notices(&result_of.0);
             }
             (token, send)
         };
@@ -1922,6 +1953,36 @@ impl PublicLiveBrokerSession {
             tracing::info!(
                 delegation_id = %delegation_id,
                 "public Live delegation finished notice sent"
+            );
+        }
+    }
+
+    /// Send the finished notices the runtime asked for while the model was
+    /// speaking, in request order, once one may go
+    /// ([`SessionState::finished_notice_may_go_now`]), under the state lock
+    /// the caller holds. A failed send fences later appends like any failed
+    /// send, and the transport's close settles the receipts left.
+    async fn send_deferred_finished_notices_locked(&self, state: &mut SessionState) {
+        while !state.close_requested && state.finished_notice_may_go_now() {
+            let Some((token, delegation_id, fragments)) =
+                state.deferred_finished_notices.pop_front()
+            else {
+                return;
+            };
+            if self
+                .send_finished_notice_locked(state, token, &delegation_id, fragments)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    delegation_id = %delegation_id,
+                    "public Live finished notice that waited could not be sent; the transport is gone and its close settles the delivery"
+                );
+                return;
+            }
+            tracing::info!(
+                delegation_id = %delegation_id,
+                "public Live delegation finished notice sent once the model stopped speaking or the user took the floor"
             );
         }
     }
@@ -2251,6 +2312,9 @@ impl PublicLiveBrokerSession {
             let notices_due = !state.due_progress_notices.is_empty() && !state.close_requested;
             let finished_notices_due =
                 !state.due_finished_notices.is_empty() && !state.close_requested;
+            let waiting_notices_due = !state.deferred_finished_notices.is_empty()
+                && !state.close_requested
+                && state.finished_notice_may_go_now();
             #[cfg(feature = "test-realtime-fixtures")]
             if let Some(capture) = &self.thinking_capture
                 && let Some((client_event_id, matched_owned)) = instructions_ack
@@ -2360,6 +2424,12 @@ impl PublicLiveBrokerSession {
                 // Under the lock that released held results above: a notice
                 // left due is for a result still held, never one already sent.
                 self.send_due_finished_notices_locked(&mut state).await;
+            }
+            if waiting_notices_due {
+                // The model's response ended or the user took the floor: the
+                // finished notices asked for while it spoke go now, under the
+                // same lock, ahead of any result appended later.
+                self.send_deferred_finished_notices_locked(&mut state).await;
             }
             if cues_due || notices_due {
                 drop(state);
@@ -2691,6 +2761,10 @@ struct SessionState {
     /// finished notice is not yet sent, in hold order
     /// ([`delegation_finished_pending_notice_sections`]).
     due_finished_notices: VecDeque<String>,
+    /// Finished notices the runtime asked for (#1820) while the model was
+    /// speaking: reserved under the caller's token, not yet sent, in request
+    /// order ([`SessionState::finished_notice_may_go_now`]).
+    deferred_finished_notices: VecDeque<(GptLiveAppendToken, String, Vec<String>)>,
     /// Delegations that got a finished notice: at most one each, they leave
     /// the still-running lines, and their result cue takes the after-notice
     /// head ([`LIVE_RESULT_UNREPORTED_AFTER_NOTICE_CUE_HEAD`]). Bounded by
@@ -2827,6 +2901,7 @@ impl Default for SessionState {
             result_inserted_through_ms: HashMap::new(),
             due_progress_notices: VecDeque::new(),
             due_finished_notices: VecDeque::new(),
+            deferred_finished_notices: VecDeque::new(),
             finished_notice_sent: HashSet::new(),
             awaiting_peer_results: HashSet::new(),
             unanswered_user_input: false,
@@ -3020,6 +3095,38 @@ impl SessionState {
         }
         self.finished_notice_sent.insert(delegation_id.clone());
         Ok(Some((token, delegation_id, fragments)))
+    }
+
+    /// Whether a runtime finished notice may be sent now: the user holds the
+    /// floor (the question it answers is open), or the model's output has
+    /// been silent for [`OUTPUT_SILENCE_RELEASE_MS`], the deferred result
+    /// cue's rule. An instructions append while the model speaks can cut its
+    /// answer off mid-sentence (final soak: 5 of 44 such cues), so a notice
+    /// asked for then waits for one of the two.
+    fn finished_notice_may_go_now(&self) -> bool {
+        self.user_holds_floor() || !self.assistant_audible()
+    }
+
+    /// Withdraw the finished notices still waiting for `delegation_id`: a
+    /// result of the delegation reaches the session first, and a notice must
+    /// never follow its result. Each reservation is released, and its
+    /// caller's receipt resolves as withdrawn, never sent.
+    fn withdraw_deferred_finished_notices(&mut self, delegation_id: &str) {
+        for (token, delegation, fragments) in std::mem::take(&mut self.deferred_finished_notices) {
+            if delegation != delegation_id {
+                self.deferred_finished_notices
+                    .push_back((token, delegation, fragments));
+                continue;
+            }
+            self.pending_appends
+                .retain(|pending| pending.token != token);
+            self.queued_observations
+                .push_back(GptLiveBrokerObservation::InstructionsContextAppendWithdrawn { token });
+            tracing::info!(
+                delegation_id = %delegation,
+                "public Live finished notice withdrawn unsent: its result reached the session first"
+            );
+        }
     }
 
     /// Record an output delta against every result awaiting its cue that it
@@ -3371,6 +3478,7 @@ impl SessionState {
             if let Some(delegation_id) = self.result_cue_candidates.get(token).cloned() {
                 self.due_finished_notices
                     .retain(|due| *due != delegation_id);
+                self.withdraw_deferred_finished_notices(&delegation_id);
             }
         }
         released
@@ -3503,6 +3611,7 @@ impl SessionState {
                 self.closed_observed = true;
                 self.close_pending_until_started = false;
                 self.drop_held_commentary_for_close();
+                self.deferred_finished_notices.clear();
                 self.drop_held_text_chat_for_close();
                 self.finish_open_turn();
                 let observations = &mut self.queued_observations;
@@ -10956,6 +11065,267 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("the result was released: {events:?}"));
         assert!(notice_at < result_at, "{events:?}");
+    }
+
+    /// #1820: a runtime finished notice may go at once only while the model
+    /// is silent ([`OUTPUT_SILENCE_RELEASE_MS`] of silent output, the
+    /// deferred cue's rule) or the user holds the floor.
+    #[test]
+    fn a_finished_notice_may_go_only_while_the_model_is_silent_or_the_user_holds_the_floor() {
+        let mut state = state_with_spoken_delegation();
+        model_output(&mut state, false, 8);
+        assert!(state.finished_notice_may_go_now(), "the model is silent");
+        model_output(&mut state, true, 2);
+        assert!(!state.finished_notice_may_go_now(), "the model is speaking");
+        state.unanswered_user_input = true;
+        assert!(
+            state.finished_notice_may_go_now(),
+            "the user's question is open"
+        );
+        state.unanswered_user_input = false;
+        model_output(&mut state, false, 7);
+        assert!(
+            !state.finished_notice_may_go_now(),
+            "1400 ms of silence: still the response"
+        );
+        model_output(&mut state, false, 1);
+        assert!(
+            state.finished_notice_may_go_now(),
+            "1600 ms of silence: the response ended"
+        );
+    }
+
+    /// The provider side of the waiting-notice tests: a delegation is
+    /// created and the model speaks (three voiced output frames) before its
+    /// "one moment"; once `quiet` is notified, 1.6 s of silent output ends
+    /// the response. Every append is acknowledged.
+    fn speaking_model_attach(
+        quiet: Arc<tokio::sync::Notify>,
+    ) -> impl Fn(
+        State<SharedCapture>,
+        WebSocketUpgrade,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
+    > + Clone
+    + Send
+    + Sync
+    + 'static {
+        move |State(capture): State<SharedCapture>, upgrade: WebSocketUpgrade| {
+            let quiet = Arc::clone(&quiet);
+            Box::pin(async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    send_json(&mut socket, json!({"type":"session.started","event_id":"s","session":{"id":"live_fixture","model":"gpt-live-1","status":"active","expires_at":1.0}})).await;
+                    send_json(&mut socket, input_delta("book a table")).await;
+                    send_json(&mut socket, delegation_created("dlg_cue", "client")).await;
+                    for _ in 0..3 {
+                        send_json(&mut socket, output_audio(true)).await;
+                    }
+                    send_json(&mut socket, output_delta_span("one moment", 1500.0, 2000.0)).await;
+                    let mut quiet_sent = false;
+                    loop {
+                        let event = tokio::select! {
+                            () = quiet.notified(), if !quiet_sent => {
+                                quiet_sent = true;
+                                for _ in 0..8 {
+                                    send_json(&mut socket, output_audio(false)).await;
+                                }
+                                continue;
+                            }
+                            event = recv_json(&mut socket, &capture) => event,
+                        };
+                        match event["type"].as_str() {
+                            Some("session.commentary.append") => {
+                                send_json(&mut socket, ack(event["event_id"].as_str())).await;
+                            }
+                            Some("session.thinking.append" | "session.instructions.append") => {
+                                let mut receipt = ack(event["event_id"].as_str());
+                                receipt["type"] = json!(if event["type"] == "session.thinking.append" {
+                                    "session.thinking.appended"
+                                } else {
+                                    "session.instructions.appended"
+                                });
+                                send_json(&mut socket, receipt).await;
+                            }
+                            Some("session.close") => {
+                                send_json(&mut socket, session_closed()).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+            })
+        }
+    }
+
+    /// Open a broker session on `attach` and return it once the model's
+    /// "one moment" is observed, with every later observation forwarded.
+    async fn open_after_one_moment(
+        attach: impl Fn(
+            State<SharedCapture>,
+            WebSocketUpgrade,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+        capture: SharedCapture,
+    ) -> (
+        Arc<PublicLiveBrokerSession>,
+        tokio::sync::mpsc::UnboundedReceiver<GptLiveBrokerObservation>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let app = Router::new()
+            .route("/v1/live/sessions", post(create_session))
+            .route("/v1/live/sessions/{session_id}/attach", get(attach))
+            .with_state(capture);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_, session) = PublicLiveBrokerFactory::__try_from_target_with_base_url(
+            realtime_target("gpt-live-1", OpenAiBackendKind::OpenAiApi),
+            &format!("http://{address}/v1/"),
+        )
+        .unwrap()
+        .open(PublicLiveOpenConfig::new("v=0", "marin").unwrap())
+        .await
+        .unwrap()
+        .into_parts();
+        let session = Arc::new(session);
+        loop {
+            if let Some(GptLiveBrokerObservation::AssistantTranscriptFragment { text, .. }) =
+                session.next_observation().await.unwrap()
+                && text.contains("one moment")
+            {
+                break;
+            }
+        }
+        let (observations_tx, observations) = tokio::sync::mpsc::unbounded_channel();
+        let observer = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move {
+                while let Ok(Some(observation)) = session.next_observation().await {
+                    if observations_tx.send(observation).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        (session, observations, observer, server)
+    }
+
+    /// Whether the delegation's finished notice reached the provider.
+    fn finished_notice_on_the_wire(capture: &SharedCapture) -> bool {
+        capture
+            .lock()
+            .expect("capture lock")
+            .client_events
+            .iter()
+            .any(|event| {
+                event["type"] == "session.instructions.append"
+                    && event["content"].as_str().is_some_and(|content| {
+                        content.starts_with("This replaces the earlier in-progress instruction")
+                    })
+            })
+    }
+
+    /// #1820: a runtime finished notice asked for while the model speaks
+    /// waits: an instructions append mid-answer can cut the answer off. It
+    /// goes out once the model's output has been silent for the release
+    /// window, and its acknowledgement is the caller's receipt.
+    #[tokio::test]
+    async fn a_runtime_finished_notice_waits_while_the_model_speaks() {
+        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let quiet = Arc::new(tokio::sync::Notify::new());
+        let (session, mut observations, observer, server) = open_after_one_moment(
+            speaking_model_attach(Arc::clone(&quiet)),
+            Arc::clone(&capture),
+        )
+        .await;
+        let token = session
+            .append_delegation_finished_notice(&GptLiveDelegationRef("dlg_cue".to_string()))
+            .await
+            .expect("the notice is accepted while the model speaks");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !finished_notice_on_the_wire(&capture),
+            "no instructions append while the model speaks"
+        );
+        quiet.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match observations.recv().await {
+                    Some(GptLiveBrokerObservation::InstructionsContextAppendAcknowledged {
+                        token: acknowledged,
+                    }) if acknowledged == token => return,
+                    Some(GptLiveBrokerObservation::InstructionsContextAppendWithdrawn {
+                        ..
+                    }) => panic!("the notice was withdrawn"),
+                    Some(_) => {}
+                    None => panic!("the observation stream ended before the notice's receipt"),
+                }
+            }
+        })
+        .await
+        .expect("the notice goes out once the response ends");
+        assert!(finished_notice_on_the_wire(&capture));
+        session.close().await.expect("close requested");
+        observer.await.expect("observer task");
+        server.abort();
+    }
+
+    /// #1820: a result that reaches the session while its finished notice
+    /// waits for the model to stop speaking withdraws the notice, since a
+    /// notice must never follow its result. It is never sent, and the
+    /// caller's receipt resolves as withdrawn.
+    #[tokio::test]
+    async fn a_result_reaching_the_session_first_withdraws_a_waiting_finished_notice() {
+        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(Capture::default()));
+        let (session, mut observations, observer, server) = open_after_one_moment(
+            speaking_model_attach(Arc::new(tokio::sync::Notify::new())),
+            Arc::clone(&capture),
+        )
+        .await;
+        let delegation = GptLiveDelegationRef("dlg_cue".to_string());
+        let token = session
+            .append_delegation_finished_notice(&delegation)
+            .await
+            .expect("the notice is accepted while the model speaks");
+        let result_token = session
+            .append_delegation_result(&delegation, "Table booked for two.")
+            .await
+            .expect("the result goes out at once");
+        let (mut withdrawn, mut result_acknowledged) = (false, false);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !(withdrawn && result_acknowledged) {
+                match observations.recv().await {
+                    Some(GptLiveBrokerObservation::InstructionsContextAppendWithdrawn {
+                        token: withdrawn_token,
+                    }) if withdrawn_token == token => withdrawn = true,
+                    Some(GptLiveBrokerObservation::DelegationContextAppendAcknowledged {
+                        token: acknowledged,
+                    }) if acknowledged == result_token => result_acknowledged = true,
+                    Some(GptLiveBrokerObservation::InstructionsContextAppendAcknowledged {
+                        token: acknowledged,
+                    }) if acknowledged == token => panic!("the withdrawn notice was sent"),
+                    Some(_) => {}
+                    None => panic!("the observation stream ended before both receipts"),
+                }
+            }
+        })
+        .await
+        .expect("the notice is withdrawn and the result acknowledged");
+        session.close().await.expect("close requested");
+        observer.await.expect("observer task");
+        server.abort();
+        assert!(
+            !finished_notice_on_the_wire(&capture),
+            "a notice that would follow its result is never sent"
+        );
     }
 
     /// #1820 A2 on the wire: the runtime's finished notice is sent under the

@@ -9677,6 +9677,17 @@ impl ExperimentalGptLiveSideband {
                     .observe_terminal(SidebandAppendLane::Instructions, &token)?;
                 LiveSidebandObservationKind::AppendRejected { attempt }
             }
+            // A finished notice withdrawn unsent: a definitive refusal
+            // before delivery.
+            GptLiveBrokerObservation::InstructionsContextAppendWithdrawn { token } => {
+                let attempt = self
+                    .correlations
+                    .lock()
+                    .await
+                    .appends
+                    .observe_terminal(SidebandAppendLane::Instructions, &token)?;
+                LiveSidebandObservationKind::AppendRejected { attempt }
+            }
             GptLiveBrokerObservation::SessionContextAppendAcknowledged { token } => {
                 let attempt = self
                     .correlations
