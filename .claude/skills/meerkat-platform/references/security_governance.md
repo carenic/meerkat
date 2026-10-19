@@ -183,6 +183,11 @@ max_output_tokens = 1024
   `<project-root>/.rkat/realms/<realm>/config.toml`); rules take effect when the
   realm next opens. A malformed or unreadable section refuses the realm's
   governed work.
+- Rust hosts observe refusal dispositions with
+  `AgentFactory::with_operation_refusal_observer` /
+  `AgentBuilder::with_operation_refusal_observer` (`OperationRefusalObserver`):
+  the typed refusal, its surface and what Core did with it, host-only and
+  never in the event stream or a model context.
 - Rust hosts attach review with `AgentFactory::with_operation_review` /
   `AgentBuilder::with_operation_review` (`BoundOperationReview`). A tool
   without a reviewed entry point (for example `web_search` and comms `send`)

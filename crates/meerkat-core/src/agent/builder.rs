@@ -94,6 +94,7 @@ pub struct AgentBuilder {
     pub(super) call_timeout_override: CallTimeoutOverride,
     pub(super) stream_inactivity_timeout_override: CallTimeoutOverride,
     pub(super) operation_review: Option<Arc<crate::approval::review::BoundOperationReview>>,
+    pub(super) refusal_observer: Option<Arc<dyn crate::authorization::OperationRefusalObserver>>,
     pub(super) tools_config: ToolsConfig,
     pub(super) epoch_cursor_state: Option<Arc<crate::runtime_epoch::EpochCursorState>>,
     pub(super) tool_visibility_owner: Option<GeneratedToolVisibilityOwner>,
@@ -267,6 +268,7 @@ impl AgentBuilder {
             call_timeout_override: CallTimeoutOverride::default(),
             stream_inactivity_timeout_override: CallTimeoutOverride::default(),
             operation_review: None,
+            refusal_observer: None,
             tools_config: ToolsConfig::default(),
             epoch_cursor_state: None,
             tool_visibility_owner: None,
@@ -808,6 +810,7 @@ impl AgentBuilder {
             last_pending_catalog_sources: Default::default(),
             tool_dispatch_context: Default::default(),
             operation_review: self.operation_review,
+            refusal_observer: self.refusal_observer,
             run_consent_attempts: Default::default(),
             live_bridge_dispatch_admission: None,
             live_bridge_tool_defs: None,
@@ -1313,6 +1316,22 @@ impl AgentBuilder {
         review: Arc<crate::approval::review::BoundOperationReview>,
     ) -> Self {
         self.operation_review = Some(review);
+        self
+    }
+
+    /// Install the host's operation refusal observer: it receives each
+    /// refusal disposition this agent decides for a governed operation (its
+    /// model requests, tool calls and their delegate operations, and
+    /// compaction summaries), with the typed refusal and what was done with
+    /// it. Host-only: an observation never enters the event stream, a wire
+    /// type or any model context. See
+    /// [`crate::authorization::OperationRefusalObserver`].
+    #[must_use]
+    pub fn with_operation_refusal_observer(
+        mut self,
+        observer: Arc<dyn crate::authorization::OperationRefusalObserver>,
+    ) -> Self {
+        self.refusal_observer = Some(observer);
         self
     }
 

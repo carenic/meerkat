@@ -449,7 +449,10 @@ fn assert_wire_sibling_feedback(body: &Value) {
     let diagnostic: Value = serde_json::from_str(&refused_text).expect("typed safe refusal JSON");
     assert_eq!(
         diagnostic,
-        ToolError::AuthorizationRefused { refusal: denied() }.to_error_payload()
+        ToolError::AuthorizationRefused {
+            refusal: denied_before_dispatch(),
+        }
+        .to_error_payload()
     );
     assert!(!refused_text.contains("synthetic-e3"));
     assert_ne!(allowed["is_error"], true);

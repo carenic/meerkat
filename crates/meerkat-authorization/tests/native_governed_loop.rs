@@ -118,6 +118,12 @@ fn denied() -> OperationRefused {
     OperationRefused::new(OperationRefusalKind::Denied)
 }
 
+/// A denial the fenced dispatch met before the tool's code ran, as the
+/// model's refusal payload reports it (`tool_invoked: false`).
+fn denied_before_dispatch() -> OperationRefused {
+    denied().certified_not_dispatched_for_test()
+}
+
 fn evidence(value: &str) -> HistoricalEvidenceRef {
     HistoricalEvidenceRef {
         resource: ResourceRef {
