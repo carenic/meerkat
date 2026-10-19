@@ -65,15 +65,15 @@ AuditPrefixLength == 8
 AuditPrefix ==
     \/ model_step_count = 0 /\ Initialize
     \/ model_step_count = 1 /\ RegisterSessionIdle(AuditSession, None, {})
-    \/ model_step_count = 2 /\ ResolveAdmissionPlanDefaultQueueKindIdle(AuditBatch, None, None, "Prompt", None, "Ordinary", "Untyped", FALSE, None, FALSE, FALSE, FALSE)
+    \/ model_step_count = 2 /\ ResolveAdmissionPlanDefaultQueueKindIdle(AuditBatch, None, None, "Prompt", None, "Ordinary", "InTurnEligible", FALSE, None, FALSE, FALSE, FALSE)
     \/ model_step_count = 3 /\ QueueAcceptedIdle(AuditBatch)
     \/ model_step_count = 4 /\ PrepareIdle(AuditSession, AuditRun)
     \/ model_step_count = 5 /\ StageForRunRunning(AuditBatch, AuditRun)
     \/ model_step_count = 6 /\ StartConversationRunRunning(AuditRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
     \/ model_step_count = 7 /\ PrimitiveAppliedConversation(AuditRun)
 
-\* The late Steer input of the audited kinds under every turn-append shape the
-\* shell can report.
+\* The late Steer input of the audited kinds under every turn-append shape
+\* value; admission refuses Untyped for a content kind.
 AuditLateAdmission ==
     \/ \E kind \in AuditLateKinds : \E shape \in AdmissionTurnAppendShapeValues :
         ResolveAdmissionPlanRequestedSteerRunning(AuditLate, None, None, kind, Some("Steer"), "Ordinary", shape, FALSE, None, TRUE, TRUE, FALSE)
