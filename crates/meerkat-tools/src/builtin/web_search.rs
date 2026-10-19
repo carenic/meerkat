@@ -122,19 +122,19 @@ impl BuiltinTool for WebSearchTool {
             )
             .map_err(|error| BuiltinToolError::EntryRefused(Box::new(error)))?
             .map(meerkat_core::LlmRequestAuthorization::for_tool_delegate);
-        self.search(args, authorization, context.work_authorization())
-            .await
+        self.search(args, authorization, Some(context)).await
     }
 }
 
 impl WebSearchTool {
-    /// `work` is the call's admitted work, whose owner change in progress a
-    /// refused delegate request waits out.
+    /// `context` is the call's dispatch context: a refused delegate request
+    /// waits out an owner change in progress on its admitted work, within
+    /// the call's remaining tool time.
     async fn search(
         &self,
         args: Value,
         authorization: Option<meerkat_core::LlmRequestAuthorization>,
-        work: Option<&meerkat_core::WorkAuthorizationContext>,
+        context: Option<&meerkat_core::ToolDispatchContext>,
     ) -> Result<ToolOutput, BuiltinToolError> {
         let args: WebSearchToolArgs = serde_json::from_value(args)
             .map_err(|err| BuiltinToolError::invalid_args(err.to_string()))?;
@@ -154,8 +154,9 @@ impl WebSearchTool {
             context: args.context.filter(|value| !value.trim().is_empty()),
         };
         // A delegate request refused because an owner change is still in
-        // progress on the work's own publication waits for it (bounded) and
-        // asks again under the same operation.
+        // progress on the work's own publication waits for it (bounded, and
+        // never past the call's tool time, read at the wait) and asks again
+        // under the same operation.
         let mut owner_change_churn = meerkat_core::authorization::OwnerChangeChurn::new();
         let result = loop {
             let result = self
@@ -165,9 +166,13 @@ impl WebSearchTool {
             if let Err(meerkat_llm_core::LlmError::OperationRefused { refusal }) = &result
                 && refusal.kind()
                     == meerkat_core::authorization::OperationRefusalKind::ReprepareRequired
-                && let Some(work) = work
+                && let Some(context) = context
+                && let Some(work) = context.work_authorization()
                 && let Some(wait) = owner_change_churn
-                    .wait_for_settled_change(work.authorization().as_ref(), None)
+                    .wait_for_settled_change(
+                        work.authorization().as_ref(),
+                        context.remaining_tool_time(),
+                    )
                     .await
             {
                 wait.trace(
@@ -450,6 +455,15 @@ mod tests {
         executor: Arc<dyn WebSearchExecutor>,
         work: meerkat_core::WorkAuthorizationContext,
     ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        governed_dispatch_within(executor, work, std::time::Duration::from_secs(60)).await
+    }
+
+    /// [`governed_dispatch`] whose plan has `tool_time` as its tool timeout.
+    async fn governed_dispatch_within(
+        executor: Arc<dyn WebSearchExecutor>,
+        work: meerkat_core::WorkAuthorizationContext,
+        tool_time: std::time::Duration,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
         let mut composite = crate::builtin::CompositeDispatcher::new(
             Arc::new(crate::builtin::MemoryTaskStore::new()),
             &crate::builtin::BuiltinToolConfig::default(),
@@ -479,7 +493,7 @@ mod tests {
             meerkat_core::ToolDeadlineChain::new(vec![
                 meerkat_core::ToolDeadlineContributor::finite(
                     meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
-                    std::time::Duration::from_secs(60),
+                    tool_time,
                 ),
             ])
             .unwrap(),
@@ -697,13 +711,15 @@ mod tests {
 
     /// Work whose publication changes under the helper: its first helper
     /// model preparation begins an owner change that completes after 30 ms
-    /// and refuses, and every preparation while the change is in progress
-    /// refuses to rebuild. The call's own tool operation is allowed.
+    /// (never, when `held`) and refuses, and every preparation while the
+    /// change is in progress refuses to rebuild. The call's own tool
+    /// operation is allowed.
     #[derive(Default)]
     struct ChurningHelperWork {
         sequence: Arc<std::sync::atomic::AtomicU64>,
         began: std::sync::atomic::AtomicBool,
         model_prepares: std::sync::atomic::AtomicUsize,
+        held: bool,
     }
 
     impl meerkat_core::authorization::WorkAuthorization for ChurningHelperWork {
@@ -741,11 +757,13 @@ mod tests {
                 if !self.began.swap(true, Ordering::SeqCst) {
                     let odd = sequence + 1;
                     self.sequence.store(odd, Ordering::SeqCst);
-                    let completes = Arc::clone(&self.sequence);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                        completes.store(odd + 1, Ordering::SeqCst);
-                    });
+                    if !self.held {
+                        let completes = Arc::clone(&self.sequence);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                            completes.store(odd + 1, Ordering::SeqCst);
+                        });
+                    }
                     return Err(refused());
                 }
             }
@@ -828,5 +846,50 @@ mod tests {
             2
         );
         assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+    }
+
+    /// The helper request refused while an owner change stays in progress
+    /// waits only within the call's remaining tool time: the refusal
+    /// returns at the tool deadline instead of after the owner-change wait
+    /// bound, so the wait never turns the refusal into the dispatch's
+    /// timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_helper_request_waits_only_within_the_call_s_tool_time() {
+        let tool_time = std::time::Duration::from_millis(300);
+        let work = Arc::new(ChurningHelperWork {
+            held: true,
+            ..ChurningHelperWork::default()
+        });
+        let helper = Arc::new(CheckingHelper::default());
+        let started = tokio::time::Instant::now();
+        let error = governed_dispatch_within(
+            helper.clone(),
+            meerkat_core::WorkAuthorizationContext::new(
+                work.clone(),
+                meerkat_core::exact_operation::OperationExecutionScope::Domain,
+            ),
+            tool_time,
+        )
+        .await
+        .expect_err("the change outlasts the tool time");
+        assert!(
+            matches!(
+                &error,
+                meerkat_core::ToolError::AuthorizationRefused { refusal }
+                    if refusal.kind()
+                        == meerkat_core::authorization::OperationRefusalKind::ReprepareRequired
+            ),
+            "{error:?}"
+        );
+        assert!(
+            started.elapsed() <= tool_time,
+            "waited {:?}, past the call's tool time",
+            started.elapsed()
+        );
+        assert_eq!(
+            helper.operations.lock().await.len(),
+            1,
+            "no request after an unsettled wait"
+        );
     }
 }
