@@ -101,11 +101,8 @@ semantic-provenance machinery.
 | The operator deployment | Accept with one blocking audit condition: MobKit's lossy event-log ingress must not be the sole authoritative audit. Also preserve work associations across in-memory loss/reseed and define retained channel audiences/monitoring copies. | r3 requires native audit at the next existing commit, explicit exporter loss, retained associations or fresh authorized admission, and declared future-reader/retention policy. |
 | Meerkat Toolkit | Bounded design acceptance; clarify that ordinary trusted connectors may attest a local retained-copy contract but cannot invent vendor-issued ACL leases. | The exact source-issuer clarification landed in r4 and Toolkit closed the finding. Full native-path integration remains required for production use. |
 
-Exact bus envelopes are retained in the r2 `bus-reviews` evidence directory:
-`20261001T102006.831549-ops-f743f1.json`,
-`20261001T102111.388675-downstream-app-051ec7.json`,
-`20261001T102116.761922-claude-gcp-lead-0a70b6.json` and
-`20261001T102619.968986-toolkit-codex-local-ad98fd.json`.
+Exact bus envelopes are retained in the r2 `bus-reviews` evidence directory as
+four archived review messages.
 Their copied full-review manifest is
 `96a17fd26e8245106f29042607ff189e393c08f7704918888a8deb2b49e7da5f`.
 

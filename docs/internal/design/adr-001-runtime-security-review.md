@@ -78,21 +78,21 @@ coherence and further project review. No mandatory text repairs remained.
 - Information and identity
 - Federation and domain compatibility
 
-## Project-owner review via agent bus
+## Project-owner review via the review message channel
 
-Requested reviewers: GCP Meerkat/MobKit lead (`claude-gcp-lead`), downstream-app
-developer (`downstream-app`), operator-deployment developer (`ops`), and Meerkat Toolkit developer
-(`toolkit-codex-local`). Each reviewer received the complete frozen r2 candidate via the GCS-backed
-agent bus on 2026-09-30, from `codex-security-adr-mac`. All four sends succeeded.
+Requested reviewers: the GCP Meerkat/MobKit lead, the downstream-app developer,
+the operator-deployment developer, and the Meerkat Toolkit developer. Each
+reviewer received the complete frozen r2 candidate via the review message
+channel on 2026-09-30, from the author. All four sends succeeded.
 The requests specified the exact hash, asked for counterexamples and minimum
 repairs, and did not disclose the subagent verdicts.
 
-| Reviewer | Role | Status |
-| --- | --- | --- |
-| `claude-gcp-lead` | GCP Meerkat/MobKit lead | RED on r2; F1-F9 resolved in the dispositions below. |
-| `downstream-app` | Downstream-app developer | RED on r2; F1-F10 dispositioned below. F5 closed as an accepted limitation: anonymous, physical and dynamic profiles remain unavailable. |
-| `ops` | Operator-deployment developer | RED on r2; F1-F7 resolved in the dispositions below. |
-| `toolkit-codex-local` | Meerkat Toolkit developer | GREEN on r2, with implementation acceptance requirements. |
+| Reviewer | Status |
+| --- | --- |
+| GCP Meerkat/MobKit lead | RED on r2; F1-F9 resolved in the dispositions below. |
+| Downstream-app developer | RED on r2; F1-F10 dispositioned below. F5 closed as an accepted limitation: anonymous, physical and dynamic profiles remain unavailable. |
+| Operator-deployment developer | RED on r2; F1-F7 resolved in the dispositions below. |
+| Meerkat Toolkit developer | GREEN on r2, with implementation acceptance requirements. |
 
 Responses, findings and revisions are recorded here rather than inferred from
 delivery or silence.
@@ -160,8 +160,9 @@ certify later text.
 ### Exact r3 re-review
 
 All four project reviewers received the complete frozen r3 candidate and their
-finding dispositions via agent bus on 2026-09-30. The request asked them to
-check both closure and regressions; no r2 verdict is treated as approval of r3.
+finding dispositions via the review message channel on 2026-09-30. The request
+asked them to check both closure and regressions; no r2 verdict is treated as
+approval of r3.
 
 | Reviewer | r3 result |
 | --- | --- |
