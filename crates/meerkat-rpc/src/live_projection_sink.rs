@@ -1125,7 +1125,7 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         self.runtime
             .hold_live_channel_projection_boundary(session_id, channel_id)
             .await
-            .map(|hold| Some(meerkat_live::LiveProjectionBoundaryHold::new(hold)))
+            .map(Some)
             .map_err(|err| session_error_to_projection(err, session_id))
     }
 }

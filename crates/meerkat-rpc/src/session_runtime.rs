@@ -6743,10 +6743,11 @@ impl SessionRuntime {
         &self,
         session_id: &SessionId,
         channel_id: &meerkat_core::LiveChannelId,
-    ) -> Result<meerkat_session::LiveChannelProjectionBoundaryHold, SessionError> {
+    ) -> Result<meerkat_live::LiveProjectionBoundaryHold, SessionError> {
         self.service
             .hold_live_channel_projection_boundary(session_id, channel_id)
             .await
+            .map(meerkat_live::LiveProjectionBoundaryHold::new)
     }
 
     /// Admit an assistant playback target only from the generated foreground
