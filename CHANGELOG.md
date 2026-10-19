@@ -305,6 +305,9 @@ them.
 - `meerkat_mob_mcp::MobMcpState::session_member_matches` (with
   `meerkat_mob_mcp::SessionMemberMatch`): every hosted roster, managed or
   held, that names a session, read as one complete lookup.
+- `meerkat_mob_mcp::MobMcpState::unrestored_mobs`: the persisted mobs whose
+  resume failed at restore, each with the typed error a lookup of its id
+  answers. They are not in `mob_list`.
 
 ### Changed
 
@@ -480,6 +483,18 @@ them.
   audits-c). It also reaches both replay histories above, refuses three
   seeded defects, and checks that restoring the exact-successor replay rule
   makes those histories unreachable.
+- A persisted mob whose resume is refused at restore no longer fails the
+  whole restore of `MobMcpState` (`meerkat-mob-mcp`). One such store, for
+  example one whose creation record disagrees with its log
+  (`MobError::IncarnationInconsistent`), made every mob verb fail after a
+  restart, and no mob of the host came back. That mob is now left
+  unrestored, its store kept as found, and the other mobs restore. A lookup
+  of its id, and a create of that id, answer its refusal:
+  `IncarnationInconsistent` and `IncarnationDestroyed` keep their variants,
+  and any other refusal answers `MobError::Internal` with its message. A
+  transport or persistence fault, and a store that names no mob, still fail
+  the restore, so the next mob verb tries it again. Pre-existing in 0.9.3
+  and earlier.
 
 ## [0.9.3] - 2026-10-18
 
