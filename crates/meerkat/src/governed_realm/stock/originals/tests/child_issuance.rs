@@ -865,7 +865,8 @@ fn a_pending_further_original_leaves_the_child_unissued_and_unavailable() {
     assert!(
         matches!(
             issue("t", "cancelled"),
-            Err(meerkat_core::OperationAuthorizationError::Refused(_))
+            Err(meerkat_core::OperationAuthorizationError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::Denied
         ),
         "a cancellation wins over a pending admission"
     );

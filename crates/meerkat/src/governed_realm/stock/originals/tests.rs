@@ -658,7 +658,12 @@ fn a_pending_contributor_is_not_yet_admissible() {
         .expect("b recorded in its own occurrence");
     let not_yet = check.check(&runtime, &input, &ingress, &association);
     assert!(
-        matches!(not_yet, Err(NativeAdmissionError::Readiness(_))),
+        matches!(
+            not_yet,
+            Err(NativeAdmissionError::Readiness(
+                meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending
+            ))
+        ),
         "not yet admissible while b is pending: {not_yet:?}"
     );
     pending_b.admit().expect("b admitted");
@@ -687,7 +692,12 @@ fn another_requesters_pending_contributor_is_not_yet_then_still_malformed() {
         .expect("b recorded by another requester");
     let not_yet = check.check(&runtime, &input, &ingress, &association);
     assert!(
-        matches!(not_yet, Err(NativeAdmissionError::Readiness(_))),
+        matches!(
+            not_yet,
+            Err(NativeAdmissionError::Readiness(
+                meerkat_core::authorization::ControllerReadinessFailure::OriginalAdmissionPending
+            ))
+        ),
         "not yet while b is pending: {not_yet:?}"
     );
     pending_b.admit().expect("b admitted for its own requester");
@@ -731,7 +741,11 @@ fn a_cancelled_or_unknown_contributor_stays_a_definite_refusal() {
         .expect("a pending candidate can be cancelled");
     let cancelled = check.check(&runtime, &input, &ingress, &association);
     assert!(
-        matches!(cancelled, Err(NativeAdmissionError::Refused(_))),
+        matches!(
+            &cancelled,
+            Err(NativeAdmissionError::Refused(refusal))
+                if refusal.kind() == meerkat_core::OperationRefusalKind::Denied
+        ),
         "a cancellation wins over a pending admission: {cancelled:?}"
     );
 }
