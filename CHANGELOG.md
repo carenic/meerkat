@@ -110,6 +110,58 @@ them.
   verdict before the host is asked, as it already refused the operator.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
+- `meerkat-mob`: `MobError` is now `#[non_exhaustive]`, and gains the variant
+  `MobError::ShutdownInProgress { mob_id }`, appended last (see the next
+  entry). A downstream exhaustive `match` on `MobError` needs a wildcard arm.
+- Behaviour-only (not measured by the gate): an admitted `MobHandle::shutdown`
+  or `MobHandle::shutdown_with_report` closes the mob's admission before its
+  teardown (see Fixed). From the Shutdown's admission (while it drains its own
+  work, and while it is parked on its members' stops or on its runtime
+  teardown), a command the Closing state refuses is refused with
+  `MobError::AdmissionClosed` (reason `MobAdmissionCloseReason::Shutdown`): a
+  spawn, respawn, work submission or flow run got
+  `MobError::ActorCommandChannelClosed` there; while the Shutdown drained, so
+  did the other refused commands (for example wiring, a host bind, a live
+  commit, resume, reset or reload), which waited for the Shutdown or ran while
+  it was parked. `MobHandle::acquire_owner` after the Shutdown's admission is
+  refused the same way where it granted an owner lease. Every other request
+  the actor answers while the Shutdown drains (a Stop, Destroy, Complete or
+  retirement, a read, a status probe, `MobHandle::status` included) gets the
+  new `MobError::ShutdownInProgress`, where v0.9.3 answered
+  `MobError::ActorCommandChannelClosed`: retryable with the authority
+  retained (wire code `SessionBusy`), returned by `MobHandle::stop` at once.
+  Requests on the actor's internal lane, sent by the tasks the drain joins,
+  keep `ActorCommandChannelClosed`, which otherwise now means the actor has
+  exited or is exiting.
+- Behaviour-only (not measured by the gate): a Shutdown that fails after its
+  admission keeps the actor alive as the retry owner with admission closed,
+  so the Closing set (spawn, work submission, flows, wiring, a host bind, a
+  live commit, resume, reset, reload, owner leases and identity realization)
+  stays refused with `MobError::AdmissionClosed` for the actor's life, where
+  the actor admitted all of it again before. Stop, Shutdown and Destroy stay
+  available.
+- Behaviour-only (not measured by the gate): once a destroy is admitted (its
+  durable destroy marker is written), `MobHandle::acquire_owner` is refused
+  with `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::Destroyed`) where it granted an owner lease, and a
+  command the Closing state refuses gets that error before the destroyed
+  mob's own refusal (see Fixed). A mob restored with that marker starts
+  closed: `MobBuilder::resume` returns its handle with admission already
+  closed.
+- Behaviour-only (not measured by the gate): after a durability fail-stop,
+  `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
+  (reason `MobAdmissionCloseReason::DurabilityFailStop`) where it granted an
+  owner lease on the exited actor (see Fixed).
+- Behaviour-only (not measured by the gate): after the mob's actor task is
+  lost (it ends without its loop returning, as on a panic),
+  `MobHandle::acquire_owner` is refused with `MobError::AdmissionClosed`
+  (reason `MobAdmissionCloseReason::ActorLost`) where it granted an owner
+  lease (see Fixed).
+- Behaviour-only (not measured by the gate): after a composition dispatch
+  failure stops the mob's actor, `MobHandle::acquire_owner` is refused with
+  `MobError::AdmissionClosed` (reason
+  `MobAdmissionCloseReason::DispatchFailed`) where it granted an owner lease
+  on the stopped actor (see Fixed).
 
 ### Added
 
@@ -330,6 +382,64 @@ them.
   crate now embeds its own byte-identical copy, pinned to the original's
   SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
   rkat package and runs in the repository only.
+- A request a mob's actor answers while a Shutdown drains its own work is
+  refused with the new `MobError::ShutdownInProgress`, no longer with
+  `MobError::ActorCommandChannelClosed`, which a caller could not tell from
+  an exited actor: `MobHandle::stop` reported the mob gone while its Shutdown
+  could still fail and leave the actor serving, and the actor's own recovery
+  retries stopped. A retry now runs on the actor once its Shutdown fails, and
+  finds the channel closed once it finishes. The `meerkat-mob-mcp`
+  stand-down counts a shutting-down mob's admission as closed, and
+  `MobHandle::revoke_forked_participant_with_recovery` revokes through its
+  recovery transport while the source mob shuts down, as both did when the
+  drain answered with a closed channel.
+- The recovery of a durable placed lifecycle intent stops once the mob's
+  admission is closed. A Reset intent, which the Closing state refuses, was
+  retried every 2 s with a warning for the rest of the actor's life after a
+  stand-down or a failed Shutdown. The intent stays recorded, and the next
+  start drives it again.
+- `MobHandle::shutdown` closes the mob's admission, as its contract says
+  ("After this, no more commands are accepted"). The actor closes it on its
+  serialized admission path when it admits the Shutdown, before any teardown
+  step, with the new `MobAdmissionCloseReason::Shutdown` (appended to the
+  `#[non_exhaustive]` enum; it displays as "shutdown"); an earlier close keeps
+  its reason. Before, admission closed only through `close_if_idle`, the last
+  owner's release or `close_admission`: after a Shutdown, `acquire_owner`
+  handed out an owner lease on an actor that would take no further command,
+  and `admission_closed()` stayed `None`, so an embedding host that treats a
+  closed mob as gone kept treating the shut-down mob as live. A Shutdown that
+  fails after its admission leaves admission closed; Stop, Shutdown and
+  Destroy stay available. A Stop, the resumable pause, leaves admission open.
+- `MobHandle::destroy` closes the mob's admission once the destroy is
+  admitted (its durable destroy marker is written, by this attempt or an
+  earlier one), before any destroy cleanup, with the new
+  `MobAdmissionCloseReason::Destroyed` (it displays as "destroyed"); an
+  earlier close keeps its reason. Before, a destroyed mob's actor exited with
+  admission open, so `acquire_owner` still handed out owner leases and
+  `admission_closed()` stayed `None`. A destroy left incomplete after its
+  admission keeps admission closed; retrying the destroy stays available. A
+  mob restored with the durable marker starts with admission closed, before
+  `MobBuilder::resume` returns its handle, so nothing is spawned into it, and
+  no owner lease is granted, while its destroy is unfinished.
+- A durability fail-stop (a durable mutation whose outcome stayed uncertain,
+  or a durable recovery that fails before the actor admits a command) closes
+  the mob's admission before the actor exits (a mutation's fail-stop before it
+  quiesces), with the new `MobAdmissionCloseReason::DurabilityFailStop` (it
+  displays as "durability fail-stop"); an earlier close keeps its reason.
+- A lost mob actor task (one that ends without its loop returning, as on a
+  panic or an abort) closes the mob's admission from its spawn wrapper,
+  before the task is reported lost, with the new
+  `MobAdmissionCloseReason::ActorLost` (it displays as "actor lost"); an
+  earlier close keeps its reason. Before, a lost actor left admission open,
+  so `acquire_owner` still handed out owner leases and `admission_closed()`
+  stayed `None`.
+- A composition dispatch failure at a loop boundary (a structural routing
+  failure, which stops the mob's actor) closes the mob's admission before the
+  actor stops, with the new `MobAdmissionCloseReason::DispatchFailed` (it
+  displays as "dispatch failure"); an earlier close keeps its reason. Before,
+  the actor stopped with admission open, so `acquire_owner` still handed out
+  owner leases and `admission_closed()` stayed `None`. With the closes above,
+  no mob actor exit leaves admission open.
 
 ## [0.9.3] - 2026-10-18
 

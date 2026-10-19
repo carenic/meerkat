@@ -42,8 +42,19 @@ fn runtime_actor_future(
 /// Publishes how the actor task ended: `Returned` once the actor future
 /// returned, `Lost` when the task ends any other way (a panic or an abort
 /// drops this guard without the future returning).
+///
+/// A lost task closes the mob's admission first (D67,
+/// `MobAdmissionCloseReason::ActorLost`): the actor closes it on its own
+/// exits, but a lost task never reaches them. The guard shares the mob's
+/// ownership state (the `Arc` every handle holds) and a clone of the
+/// actor's admission sender, so the close is decided under the same lock as
+/// owner acquisition and published on the same channel. The clone drops with
+/// the guard, so the channel still closes when the task ends.
 struct ActorTaskEndGuard {
     observations: Option<Arc<super::MemberLifecycleObservations>>,
+    ownership: Arc<super::admission_close::MobOwnership>,
+    admission_closed_tx:
+        tokio::sync::watch::Sender<Option<super::admission_close::MobAdmissionCloseReason>>,
 }
 
 impl ActorTaskEndGuard {
@@ -53,11 +64,28 @@ impl ActorTaskEndGuard {
             observations.record_actor_task_end(super::ActorTaskEnd::Returned);
         }
     }
+
+    /// Close admission for a task that ended without its future returning,
+    /// keeping an earlier close's reason.
+    fn close_admission_for_lost_task(&self) {
+        use super::admission_close::{
+            CloseDecision, CloseRequest, MobAdmissionCloseReason, MobBusy,
+        };
+        if let CloseDecision::Closed { reason, .. } = self.ownership.decide(
+            CloseRequest::Unconditional(MobAdmissionCloseReason::ActorLost),
+            MobBusy::default,
+        ) {
+            self.admission_closed_tx.send_replace(Some(reason));
+        }
+    }
 }
 
 impl Drop for ActorTaskEndGuard {
     fn drop(&mut self) {
         if let Some(observations) = self.observations.take() {
+            // Closed before `Lost` is published, so whoever observes the
+            // lost task also observes the close.
+            self.close_admission_for_lost_task();
             observations.record_actor_task_end(super::ActorTaskEnd::Lost);
         }
     }
@@ -362,7 +390,7 @@ impl OrchestratorResumeNotification {
 }
 
 #[cfg(feature = "runtime-adapter")]
-async fn drive_recovered_placed_lifecycle_intent(
+pub(super) async fn drive_recovered_placed_lifecycle_intent(
     handle: MobHandle,
     intent: mob_dsl::PlacedCompletionLifecycleIntentKind,
 ) {
@@ -384,7 +412,12 @@ async fn drive_recovered_placed_lifecycle_intent(
         };
         match result {
             Ok(()) => return,
-            Err(MobError::ActorCommandChannelClosed) => return,
+            // The actor has exited, or it refuses the intent for the rest of
+            // its life: a Reset is in the Closing set, so once admission is
+            // closed (a failed Shutdown, a stand-down) no retry can run it.
+            // The durable intent stays recorded, and the next start drives
+            // it again.
+            Err(MobError::ActorCommandChannelClosed | MobError::AdmissionClosed { .. }) => return,
             Err(error) => {
                 tracing::warn!(
                     mob_id = %handle.mob_id(),
@@ -10261,6 +10294,9 @@ impl MobBuilder {
             // non-owning; the token is attached only to the returned handle.
             let ownership = super::admission_close::MobOwnership::new();
             let (admission_closed_tx, admission_closed_rx) = tokio::sync::watch::channel(None);
+            // The actor task's end guard closes admission if the task is lost.
+            let task_end_ownership = Arc::clone(&ownership);
+            let task_end_admission_closed_tx = admission_closed_tx.clone();
             let handle = MobHandle {
                 // Explicit launch-site mint (A16): the launching process IS the
                 // owning operator — not ambient inference (gotcha #19).
@@ -10626,6 +10662,11 @@ impl MobBuilder {
                     )),
                 });
             }
+            // A mob restored with an admitted destroy (its durable
+            // MobDestroying marker) starts with admission closed, before its
+            // handle escapes: nothing is spawned into it, and no owner lease
+            // is granted, before the destroy's retry runs.
+            actor.close_admission_if_destroy_admitted();
             // A17 recovery trigger (DEC-P6E-11): obligations survive via event
             // replay, subscriptions do not — re-derive pending remote-turn
             // obligations from recovered machine state and keep their members'
@@ -10913,6 +10954,8 @@ impl MobBuilder {
             }
             let actor_task_end = ActorTaskEndGuard {
                 observations: Some(Arc::clone(&handle.lifecycle_observations)),
+                ownership: task_end_ownership,
+                admission_closed_tx: task_end_admission_closed_tx,
             };
             tokio::spawn(async move {
                 runtime_actor_future(actor, command_rx).await;
