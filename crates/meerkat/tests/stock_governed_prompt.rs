@@ -75,7 +75,10 @@ use meerkat_llm_core::{
     LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest, LlmStream, PreparedLlmRequest,
 };
 use meerkat_runtime::completion::CompletionOutcome;
-use meerkat_runtime::input::{Input, PromptInput};
+use meerkat_runtime::input::{
+    ExternalEventInput, Input, InputDurability, InputHeader, InputOrigin, InputVisibility,
+    PromptInput,
+};
 use meerkat_runtime::input_state::StoredInputState;
 use meerkat_runtime::meerkat_machine::MeerkatMachine;
 use meerkat_runtime::service_ext::SessionServiceRuntimeExt;
@@ -1313,6 +1316,22 @@ async fn a_refused_caller_leaves_the_sessions_binding_and_results() {
         ),
         "operator-named: the earlier result stays disclosed, its binding unchanged"
     );
+    // A host's administrative outcome is a local operator's report: a
+    // host-authenticated composition refuses it before any binding.
+    let refused = realm
+        .stock
+        .bind_host_outcome(
+            &realm.machine,
+            &session.session_id,
+            host_outcome(external()),
+            session.controller.clone(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
+        "a host outcome here: {:?}",
+        refused.map(drop)
+    );
     let (input, pending) = realm
         .stock
         .bind_caller_prompt(
@@ -1687,5 +1706,186 @@ async fn a_bundle_operation_runs_beside_its_refused_sibling_and_after_reopen() {
         vec![READ_ENTRY.to_string()],
         "the old registration is not used"
     );
+    realm.close(vec![session]).await;
+}
+
+/// The origin of a host's administrative outcome: an external event source.
+fn external() -> InputOrigin {
+    InputOrigin::External {
+        source_name: "connector-finalization".to_owned(),
+    }
+}
+
+/// An administrative outcome the operator's own process reports, as an
+/// external event of `source`.
+fn host_outcome(source: InputOrigin) -> ExternalEventInput {
+    ExternalEventInput {
+        header: InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id: meerkat_core::lifecycle::InputId::new(),
+            timestamp: chrono::Utc::now(),
+            source,
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: None,
+            correlation_id: None,
+        },
+        event_type: "connector_finalization".to_owned(),
+        payload: json!({"outcome": "persisted", "generation": 2}),
+        blocks: None,
+        handling_mode: meerkat_core::types::HandlingMode::Queue,
+        render_metadata: None,
+        objective_id: None,
+    }
+}
+
+/// An administrative outcome the operator's own process reports binds as
+/// the stock ingress's own original: the requester is the ingress, a
+/// runtime host, under the host-outcome labels and this process's own
+/// observation, with no represented subject; it is admitted under the
+/// operator's grants and its turn runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_outcome_is_the_stock_ingress_own_original() {
+    let _turn = CONTROLLER_CREDENTIAL.lock().await;
+    let root = tempfile::tempdir().expect("state root");
+    let log = root.path().join("records.log");
+    provision(root.path(), &log, "controller-host-outcome").await;
+    let principals = StockPrincipals::for_local_operator(&realm()).expect("local operator");
+    let model = ScriptedModel::new("controller-host-outcome", vec![Step::Finish(FINAL)]);
+    let realm = open_as(root.path(), DEFAULT_STOCK_AGENT, model.clone()).await;
+    let session = realm.session(Vec::new()).await;
+    let (input, pending) = realm
+        .stock
+        .bind_host_outcome(
+            &realm.machine,
+            &session.session_id,
+            host_outcome(external()),
+            session.controller.clone(),
+        )
+        .await
+        .expect("the host's outcome binds");
+    let Input::ExternalEvent(event) = &input else {
+        panic!("a bound external event");
+    };
+    let association = event
+        .header
+        .authority_association
+        .as_ref()
+        .expect("the bound association")
+        .candidate();
+    assert_eq!(
+        association.requester, principals.ingress_actor,
+        "the stock ingress itself is the requester"
+    );
+    assert_eq!(association.requester.kind, PrincipalKind::RuntimeHost);
+    assert!(association.represented_subject.is_none());
+    assert!(
+        association
+            .original_work
+            .work
+            .as_str()
+            .starts_with("host-outcome-"),
+        "{}",
+        association.original_work.work.as_str()
+    );
+    assert_eq!(
+        association.root_event.resource.domain.namespace,
+        "host-outcome-events"
+    );
+    assert_eq!(
+        association
+            .original_authentication
+            .resource
+            .domain
+            .namespace,
+        "host-outcome-authentication"
+    );
+    let key = event
+        .header
+        .idempotency_key
+        .as_ref()
+        .expect("the event key");
+    assert!(key.0.starts_with("rkat-host-outcome-"), "{}", key.0);
+    let (_, text) = realm.admitted(&session, input, pending).await;
+    assert_eq!(text, FINAL);
+    assert_eq!(model.requests().len(), 1);
+    realm.close(vec![session]).await;
+}
+
+/// An external event is no prompt of the operator: `bind_prompt` refuses
+/// it, typed and before any write, and a host's outcome binds only as a
+/// durable external event of external origin. The refusals come before the
+/// session's destination binding: on a session with no registration they
+/// are the same, never the destination's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outcome_binds_only_as_the_hosts_external_event() {
+    let _turn = CONTROLLER_CREDENTIAL.lock().await;
+    let root = tempfile::tempdir().expect("state root");
+    let log = root.path().join("records.log");
+    provision(root.path(), &log, "controller-outcome-refusals").await;
+    let model = ScriptedModel::new("controller-outcome-refusals", vec![Step::Finish(FINAL)]);
+    let realm = open_as(root.path(), DEFAULT_STOCK_AGENT, model.clone()).await;
+    let session = realm.session(Vec::new()).await;
+    let unregistered = SessionId::new();
+    for target in [&session.session_id, &unregistered] {
+        let refused = realm
+            .stock
+            .bind_prompt(
+                &realm.machine,
+                target,
+                Input::ExternalEvent(host_outcome(external())),
+                session.controller.clone(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
+            "an event as a prompt: {:?}",
+            refused.map(drop)
+        );
+        for (label, origin) in [
+            ("operator", InputOrigin::Operator),
+            ("system", InputOrigin::System),
+        ] {
+            let refused = realm
+                .stock
+                .bind_host_outcome(
+                    &realm.machine,
+                    target,
+                    host_outcome(origin),
+                    session.controller.clone(),
+                )
+                .await;
+            assert!(
+                matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
+                "{label} origin: {:?}",
+                refused.map(drop)
+            );
+        }
+        for (label, durability) in [
+            ("derived", InputDurability::Derived),
+            ("ephemeral", InputDurability::Ephemeral),
+        ] {
+            let mut outcome = host_outcome(external());
+            outcome.header.durability = durability;
+            let refused = realm
+                .stock
+                .bind_host_outcome(&realm.machine, target, outcome, session.controller.clone())
+                .await;
+            assert!(
+                matches!(refused, Err(StockGovernanceError::RequesterUnsupported(_))),
+                "{label} durability: {:?}",
+                refused.map(drop)
+            );
+        }
+    }
+    assert!(model.requests().is_empty(), "nothing was submitted");
+    let (_, text) = realm
+        .prompt(&session, "hello")
+        .await
+        .expect("the operator's prompt still binds");
+    assert_eq!(text, FINAL);
     realm.close(vec![session]).await;
 }

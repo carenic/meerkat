@@ -4,6 +4,9 @@
 //! still validate issuers, current authority, relationships, source attributes
 //! and operation entry. Identifiers are exact owner-declared values: no prefix,
 //! wildcard, domain inference or arbitrary policy-expression implication is used.
+//! A resource-domain bound may also name the typed authorities that own its
+//! domains ([`DomainBound::OwnedBy`]); a namespace stays opaque, matched only
+//! exactly and never by prefix or wildcard.
 
 use std::collections::BTreeSet;
 
@@ -162,6 +165,183 @@ pub struct ActionRef {
 pub struct ResourceDomain {
     pub authority: PrincipalRef,
     pub namespace: String,
+}
+
+/// A resource-domain bound: exact domains, or every domain whose typed
+/// authority is one of a non-empty set of owners. Namespaces stay opaque.
+///
+/// Each match set has one canonical form, so structural equality is semantic
+/// equality: `OwnedBy` is never empty (no owner is `Exact` with no domains),
+/// and it covers every namespace of its owners, so it never equals a finite
+/// `Exact` set. A reader that cannot interpret a bound kind must treat it as
+/// naming nothing (deny or unavailable), never as permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "bound",
+    content = "values",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+#[non_exhaustive]
+pub enum DomainBound {
+    Unrestricted,
+    Exact(BTreeSet<ResourceDomain>),
+    /// Every domain whose authority is one of these principals, under any
+    /// namespace. It isolates applications only as far as each application's
+    /// domains carry an authority that no other application shares.
+    OwnedBy(BTreeSet<PrincipalRef>),
+}
+
+impl<'de> Deserialize<'de> for DomainBound {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // As for `SetBound`: empty struct variants reject the reserved payload.
+        #[derive(Deserialize)]
+        #[serde(tag = "bound", rename_all = "snake_case", deny_unknown_fields)]
+        enum Wire {
+            Unrestricted {},
+            Exact { values: BTreeSet<ResourceDomain> },
+            OwnedBy { values: BTreeSet<PrincipalRef> },
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Unrestricted {} => Self::Unrestricted,
+            Wire::Exact { values } => Self::Exact(values),
+            // The canonical form of no owner is `Exact` with no domains; an
+            // encoded empty owner set is refused rather than reinterpreted.
+            Wire::OwnedBy { values } if values.is_empty() => {
+                return Err(serde::de::Error::custom(
+                    "an owned_by domain bound names at least one owner",
+                ));
+            }
+            Wire::OwnedBy { values } => Self::OwnedBy(values),
+        })
+    }
+}
+
+impl DomainBound {
+    /// `OwnedBy(owners)` in canonical form: no owner permits no domain.
+    fn owned_by(owners: BTreeSet<PrincipalRef>) -> Self {
+        if owners.is_empty() {
+            Self::Exact(BTreeSet::new())
+        } else {
+            Self::OwnedBy(owners)
+        }
+    }
+
+    fn matches(&self, value: &ResourceDomain) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Exact(values) => values.contains(value),
+            Self::OwnedBy(owners) => owners.contains(&value.authority),
+        }
+    }
+
+    /// Exact set intersection of the two match sets, in canonical form.
+    fn meet(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Unrestricted, bound) | (bound, Self::Unrestricted) => bound.clone(),
+            (Self::Exact(left), Self::Exact(right)) => {
+                Self::Exact(left.intersection(right).cloned().collect())
+            }
+            (Self::Exact(domains), Self::OwnedBy(owners))
+            | (Self::OwnedBy(owners), Self::Exact(domains)) => Self::Exact(
+                domains
+                    .iter()
+                    .filter(|domain| owners.contains(&domain.authority))
+                    .cloned()
+                    .collect(),
+            ),
+            (Self::OwnedBy(left), Self::OwnedBy(right)) => {
+                Self::owned_by(left.intersection(right).cloned().collect())
+            }
+        }
+    }
+}
+
+/// The conjunctive resource-domain restriction, including any unresolved
+/// contributing facts, with the same contract as [`ExactRestriction`] plus the
+/// owner-scoped bound ([`DomainBound::OwnedBy`]).
+///
+/// Known bounds are retained even when an unresolved fact prevents use. There
+/// is intentionally no `Default`: an omitted field cannot become unrestricted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainRestriction {
+    bound: DomainBound,
+    unresolved: BTreeSet<UnresolvedConstraint>,
+}
+
+impl DomainRestriction {
+    /// The mathematical identity for conjunction; this does not issue a grant.
+    #[must_use]
+    pub fn unrestricted() -> Self {
+        Self {
+            bound: DomainBound::Unrestricted,
+            unresolved: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn exact(values: impl IntoIterator<Item = ResourceDomain>) -> Self {
+        Self {
+            bound: DomainBound::Exact(values.into_iter().collect()),
+            unresolved: BTreeSet::new(),
+        }
+    }
+
+    /// Every domain whose typed authority is one of `owners`, under any
+    /// namespace. No owner is `exact([])`, which permits no domain.
+    #[must_use]
+    pub fn owned_by(owners: impl IntoIterator<Item = PrincipalRef>) -> Self {
+        Self {
+            bound: DomainBound::owned_by(owners.into_iter().collect()),
+            unresolved: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn unresolved(fact: UnresolvedConstraint) -> Self {
+        Self {
+            bound: DomainBound::Unrestricted,
+            unresolved: BTreeSet::from([fact]),
+        }
+    }
+
+    /// Inspect bounds for diagnostics only; unresolved facts still prevent use.
+    #[must_use]
+    pub fn bound(&self) -> &DomainBound {
+        &self.bound
+    }
+
+    #[must_use]
+    pub fn unresolved_facts(&self) -> &BTreeSet<UnresolvedConstraint> {
+        &self.unresolved
+    }
+
+    #[must_use]
+    pub fn check(&self, value: &ResourceDomain) -> BoundMatch {
+        if !self.unresolved.is_empty() {
+            return BoundMatch::Unresolved(self.unresolved.clone());
+        }
+        if self.known_bound_matches(value) {
+            BoundMatch::Matches
+        } else {
+            BoundMatch::OutsideBounds
+        }
+    }
+
+    fn known_bound_matches(&self, value: &ResourceDomain) -> bool {
+        self.bound.matches(value)
+    }
+
+    /// Retain both operands' restrictions. No operand can replace its parent:
+    /// the known bound is the exact intersection of both match sets.
+    #[must_use]
+    pub fn conjoin(&self, other: &Self) -> Self {
+        Self {
+            bound: self.bound.meet(&other.bound),
+            unresolved: self.unresolved.union(&other.unresolved).copied().collect(),
+        }
+    }
 }
 
 /// An exact processing principal or authority-declared processing route.
@@ -555,7 +735,7 @@ impl DelegationDepth {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionRestrictions {
     pub actions: ExactRestriction<ActionRef>,
-    pub resource_domains: ExactRestriction<ResourceDomain>,
+    pub resource_domains: DomainRestriction,
     pub processors: ExactRestriction<ProcessorRef>,
     pub audiences: ExactRestriction<AudienceRef>,
     pub lifetime: LifetimeRestriction,
@@ -600,7 +780,7 @@ impl ExecutionRestrictions {
     pub fn unrestricted() -> Self {
         Self {
             actions: ExactRestriction::unrestricted(),
-            resource_domains: ExactRestriction::unrestricted(),
+            resource_domains: DomainRestriction::unrestricted(),
             processors: ExactRestriction::unrestricted(),
             audiences: ExactRestriction::unrestricted(),
             lifetime: LifetimeRestriction::unrestricted(),
