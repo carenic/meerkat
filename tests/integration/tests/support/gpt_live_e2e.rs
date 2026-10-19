@@ -1674,6 +1674,27 @@ mod assistant_quiet_tests {
         assert_eq!(outcome, Some((ms(0), QuietPoll::Unmeasured)));
     }
 
+    /// L1: playback is judged on every poll, not once at the start. Frames
+    /// grow, then the browser reports a processor error: from that poll the
+    /// audio clause is unmeasured, so a wait that requires it fails with the
+    /// typed error instead of going quiet 3 s after the last growth.
+    #[test]
+    fn a_processor_error_mid_wait_fails_a_wait_that_requires_it() {
+        let outcome = Script::new().run(PlaybackAudioPolicy::Required, ms(20_000), |at, script| {
+            if at <= ms(1_000) {
+                script.decoded += 960;
+            }
+            let snapshot = json!({
+                "processor_supported": true,
+                "processor_errors": u64::from(at >= ms(1_500)),
+                "decoded_non_silent_frames": script.decoded,
+            });
+            script.audio_measured = PlaybackAudio::from_snapshot(&snapshot)
+                == Ok(PlaybackAudio::Measured(script.decoded));
+        });
+        assert_eq!(outcome, Some((ms(1_500), QuietPoll::Unmeasured)));
+    }
+
     /// L1: S97 and S98 run on the other clauses and the report says so.
     #[test]
     fn unmeasured_playback_is_reported_by_a_best_effort_wait() {
