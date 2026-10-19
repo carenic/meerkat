@@ -6116,6 +6116,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// retaining the source mutation guard from observation through child
     /// commit. `None` selects the exact current transcript end under that same
     /// guard.
+    ///
+    /// Without a `target` the fork runs under the default fork instruction
+    /// policy with no activation window, so a source with activated host
+    /// instructions is refused with [`SessionError::ForkInstructionRefused`]
+    /// before anything is committed. For another policy, pass a `target` that
+    /// carries it, or call [`Self::fork_durable_session_with_planned_identity`].
     pub async fn fork_durable_session(
         &self,
         source_session_id: &SessionId,
@@ -6136,6 +6142,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// Create a durable fork and retain the exact source provenance observed
     /// under the source transcript mutation guard.
+    ///
+    /// Without a `target` the fork runs under the default fork instruction
+    /// policy with no activation window, so a source with activated host
+    /// instructions is refused with [`SessionError::ForkInstructionRefused`]
+    /// before anything is committed. For another policy, pass a `target` that
+    /// carries it, or call [`Self::fork_durable_session_with_planned_identity`].
     pub async fn fork_durable_session_with_provenance(
         &self,
         source_session_id: &SessionId,

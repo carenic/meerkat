@@ -7206,14 +7206,6 @@ impl MobBuilder {
         self
     }
 
-    /// Inject a [`meerkat_client::RealtimeSessionFactory`] for mob-provisioned
-    /// members that open a realtime channel (W2-E / issue #264).
-    ///
-    /// Tests use this to point mob members at a deterministic in-process
-    /// mock (`mock_realtime_ws::RealtimeMockServer`) instead of a live
-    /// OpenAI endpoint. The factory is carried through to [`MobHandle`]
-    /// so test harnesses can wire it into a `RealtimeWsHost` bound to the
-    /// same runtime.
     /// Set the host policy for the activation rows a durable fork child of
     /// this mob's members inherits: `fork_member`, `fork_off`, the bounded
     /// and turn-boundary forks, and council participants forked from this
@@ -7231,6 +7223,14 @@ impl MobBuilder {
         self
     }
 
+    /// Inject a [`meerkat_client::RealtimeSessionFactory`] for mob-provisioned
+    /// members that open a realtime channel (W2-E / issue #264).
+    ///
+    /// Tests use this to point mob members at a deterministic in-process
+    /// mock (`mock_realtime_ws::RealtimeMockServer`) instead of a live
+    /// OpenAI endpoint. The factory is carried through to [`MobHandle`]
+    /// so test harnesses can wire it into a `RealtimeWsHost` bound to the
+    /// same runtime.
     pub fn with_realtime_session_factory(
         mut self,
         factory: Arc<dyn meerkat_client::RealtimeSessionFactory>,

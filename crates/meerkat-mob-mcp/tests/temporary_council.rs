@@ -2925,21 +2925,112 @@ async fn a_participant_of_an_activated_member_ends_the_council_with_the_typed_re
         calls_before,
         "no participant reached the model"
     );
-    // The refused slot's create call was issued, so cleanup keeps the
-    // council's conservative reconciliation debt for it, as for any failed
-    // create; nothing else is owed and the temporary mob is gone.
+    // The owner refused the create, typed, before committing anything: the
+    // slot settles as `Refused` in the sealed record, so cleanup has nothing
+    // to revoke and owes nothing for it.
+    let record = fixture
+        .state
+        .temporary_council()
+        .load(&fixture.council_id("activated-default"))
+        .await
+        .expect("load")
+        .expect("record present");
+    assert_eq!(
+        record.result.as_ref().map(|result| &result.exit_reason),
+        Some(&outcome.result.exit_reason),
+        "the sealed record carries the typed exit"
+    );
+    assert_eq!(
+        record
+            .participant(0)
+            .expect("participant 0 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::Refused
+    );
+    assert_eq!(
+        record
+            .participant(1)
+            .expect("participant 1 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::NotAttempted
+    );
     assert!(
         outcome.cleanup.temporary_mob_destroyed,
         "cleanup: {:?}",
         outcome.cleanup
     );
     assert!(
+        outcome.cleanup.revoked_participants.is_empty(),
+        "nothing is revoked for the refused slot: {:?}",
+        outcome.cleanup
+    );
+    assert!(
+        outcome.cleanup.debts.is_empty() && outcome.cleanup.settled(),
+        "the refused slot leaves no cleanup debt: {:?}",
+        outcome.cleanup
+    );
+    fixture.teardown().await;
+}
+
+/// Control: a create that fails with any other error keeps its slot
+/// `Pending`, so cleanup still reconciles it by its request id and records the
+/// unknown outcome as debt. Only the typed fork instruction refusal settles a
+/// slot as `Refused`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_fails_untyped_keeps_its_slot_pending_with_debt() {
+    let fixture = CouncilFixture::new_with(role_script, |state, _root| {
+        let inner: Arc<dyn meerkat_mob::store::ForkedParticipantStore> =
+            Arc::new(meerkat_mob::store::InMemoryForkedParticipantStore::new());
+        state.with_forked_participant_store(Arc::new(FlakyCapabilityStore::failing_reservation(
+            inner, 1,
+        )))
+    });
+    fixture.seed_source_mob(&["researcher", "reviewer"]).await;
+
+    let request =
+        two_participant_request(&fixture, "create-fails", MergeBackPolicy::NoMerge, 1, 240);
+    let council_id = request.council_id.clone();
+    let outcome = fixture
+        .state
+        .temporary_council()
+        .run(request)
+        .await
+        .expect("the council reaches a terminal outcome");
+    match &outcome.result.exit_reason {
+        TemporaryCouncilExitReason::ParticipantSeatingFailed {
+            participant_order,
+            detail,
+        } => {
+            assert_eq!(*participant_order, 0);
+            assert!(
+                detail.contains("capability creation failed"),
+                "an untyped create failure: {detail}"
+            );
+        }
+        other => panic!("expected a seating failure, got {other:?}"),
+    }
+    let record = fixture
+        .state
+        .temporary_council()
+        .load(&council_id)
+        .await
+        .expect("load")
+        .expect("record present");
+    assert_eq!(
+        record
+            .participant(0)
+            .expect("participant 0 custody")
+            .acquisition,
+        TemporaryCouncilAcquisition::Pending
+    );
+    let request_id = council_id.capability_request_id(0).expect("request id");
+    assert!(
         outcome
             .cleanup
             .debts
             .iter()
-            .all(|debt| debt.subject.ends_with(":p0")),
-        "only the refused slot's create is reconciled: {:?}",
+            .any(|debt| debt.subject == format!("capability:{request_id}")),
+        "the unknown create outcome is reconciled as debt: {:?}",
         outcome.cleanup
     );
     fixture.teardown().await;

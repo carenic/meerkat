@@ -147,8 +147,11 @@ them.
   instead of `AgentError::ConfigError(String)`. Its error class and wire code
   are unchanged.
 - Council records: `TemporaryCouncilExitReason` gains
-  `ParticipantForkInstructionRefused { participant_order, refusal }`. A 0.9.3
-  reader of a record that holds it cannot decode its exit reason.
+  `ParticipantForkInstructionRefused { participant_order, refusal }`, and
+  `TemporaryCouncilAcquisition` gains `Refused`: the owner refused that
+  participant's create before committing anything, so cleanup neither revokes
+  nor records debt for the slot. A 0.9.3 reader of a record that holds either
+  cannot decode it.
 - Mixed versions: a 0.9.3 member host does not know the fork instruction
   policy. A controller with `reactivate_inherited` gets the typed refusal cause
   `member_host_unsupported` from it; under the other policies the controller

@@ -164,8 +164,10 @@ participant runs its first council turn as soon as it is seated, so under the
 default policy the fork is refused before anything is committed and the council
 ends with the typed `participant_fork_instruction_refused` exit reason. It
 carries the participant's order and the typed refusal, and it is the same for
-local and host-placed sources. With `reactivate_inherited` the participant
-starts with its own activation of every key that was effective in its source.
+local and host-placed sources. Nothing was created for the refused
+participant, so cleanup has nothing to revoke and records no cleanup debt for
+its slot. With `reactivate_inherited` the participant starts with its own
+activation of every key that was effective in its source.
 A member host older than this release cannot take the policy; asking it to
 re-activate ends the council with the refusal cause `member_host_unsupported`.
 
