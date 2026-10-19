@@ -57,6 +57,7 @@ Since 0.9.4 a Rust host can read which member incarnation held which session.
 `MobHandle::member_binding_history()` folds the mob's durable member journal
 and Core's identity intent rows, read in one store transaction, into a
 `MemberBindingHistory`. `MobReadHandle` (`read_handle()`) has the same reads.
+It is not `mob/member_history`, which pages a member's transcript.
 
 | Read | Answers |
 |------|---------|
