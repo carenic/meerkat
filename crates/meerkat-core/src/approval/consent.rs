@@ -3925,17 +3925,13 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl crate::AgentToolDispatcher for ConsumingTool {
         fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
-            [Arc::new(crate::types::ToolDef {
-                audience: Default::default(),
-                name: "read_file".into(),
-                description: String::new(),
-                input_schema: serde_json::json!({"type": "object"}),
-                provenance: Some(crate::types::ToolProvenance {
-                    kind: crate::types::ToolSourceKind::Builtin,
-                    source_id: "fixture".into(),
-                    artifact: None,
-                }),
-            })]
+            [Arc::new(
+                crate::types::ToolDef::new("read_file", "", serde_json::json!({"type": "object"}))
+                    .with_provenance(crate::types::ToolProvenance::new(
+                        crate::types::ToolSourceKind::Builtin,
+                        "fixture",
+                    )),
+            )]
             .into()
         }
 
