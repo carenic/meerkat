@@ -13,6 +13,8 @@
 # - an archive whose sha256 does not match the pin, tampered or truncated and
 #   from either path, still fails the lane before the binary reaches PATH or
 #   runs;
+# - an installed sccache exports SCCACHE_IGNORE_SERVER_IO_ERROR=1, so a server
+#   that stops answering mid-job degrades a compile to plain rustc;
 # - a server that does not start leaves the lane without sccache too, and the
 #   stats lines the start step prints never fail it;
 # - every later step of the action runs only once sccache is installed.
@@ -190,6 +192,8 @@ installed() {
   check "$1: SCCACHE_PATH names the installed binary" \
     has_line github-env "SCCACHE_PATH=$case_dir/runner-temp/sccache-install/bin/sccache"
   check "$1: RUSTC_WRAPPER is left to the job" lacks_prefix github-env "RUSTC_WRAPPER="
+  check "$1: a server I/O error degrades a compile to plain rustc" \
+    has_line github-env "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
   check "$1: the verified binary ran once, for its version, without the token" ran_once_without_token
   check "$1: no warning" no_warning
 }
@@ -199,6 +203,7 @@ not_installed() {
   check "$1: it empties RUSTC_WRAPPER for the later steps" has_line github-env "RUSTC_WRAPPER="
   check "$1: nothing reaches PATH" is_empty github-path
   check "$1: no SCCACHE_PATH is exported" lacks_prefix github-env "SCCACHE_PATH="
+  check "$1: no sccache setting is exported" lacks_prefix github-env "SCCACHE_IGNORE_SERVER_IO_ERROR="
   check "$1: no partial archive is left" no_archive_left
   check "$1: no sccache binary ran" never_ran
 }
@@ -207,6 +212,7 @@ fails_closed() {
   check "$1: the sha256 check is what failed" sha_check_failed
   check "$1: nothing reaches PATH" is_empty github-path
   check "$1: no SCCACHE_PATH is exported" lacks_prefix github-env "SCCACHE_PATH="
+  check "$1: no sccache setting is exported" lacks_prefix github-env "SCCACHE_IGNORE_SERVER_IO_ERROR="
   check "$1: RUSTC_WRAPPER is left to the job" lacks_prefix github-env "RUSTC_WRAPPER="
   check "$1: no installed output" is_empty github-output
   check "$1: nothing was extracted" no_binary

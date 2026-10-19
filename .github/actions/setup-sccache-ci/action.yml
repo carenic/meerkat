@@ -108,6 +108,11 @@ runs:
         tar -xzf "${archive}" -C "${dir}/bin" --strip-components=1 "${name}/sccache"
         echo "${dir}/bin" >> "${GITHUB_PATH}"
         echo "SCCACHE_PATH=${dir}/bin/sccache" >> "${GITHUB_ENV}"
+        # A server that stops answering mid-job (an I/O error between the
+        # sccache client and its server) degrades a compile to a plain rustc
+        # run instead of failing it, as in the workflows that install sccache
+        # through sccache-action.
+        echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
         "${dir}/bin/sccache" --version
         echo "installed=true" >> "${GITHUB_OUTPUT}"
 
