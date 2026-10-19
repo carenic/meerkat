@@ -1329,6 +1329,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -1340,6 +1349,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -2849,6 +2869,55 @@
           "end"
         ],
         "type": "object"
+      },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
@@ -6155,6 +6224,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",
@@ -26200,6 +26352,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -26211,6 +26372,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -27812,6 +27984,55 @@
           "end"
         ],
         "type": "object"
+      },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
@@ -31190,6 +31411,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",
@@ -39568,6 +39872,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -39579,6 +39892,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -42923,6 +43247,55 @@
           "end"
         ],
         "type": "object"
+      },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
@@ -46720,6 +47093,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -54643,6 +55099,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -54654,6 +55119,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -60962,6 +61438,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -66118,6 +66643,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -77502,6 +78110,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -77513,6 +78130,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -81671,6 +82299,55 @@
         ],
         "type": "object"
       },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
         "enum": [
@@ -85467,6 +86144,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SupervisorRotationOperationId": {
         "description": "Stable identifier for one supervisor-rotation operation.\n\nThe UUID is validated at every string/serde ingress boundary. Keeping the\ninner value private prevents callers from constructing an unchecked raw\nstring identifier that could diverge between submission, observation, and\ndurable receipts.",
@@ -93189,6 +93949,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -93200,6 +93969,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -94709,6 +95489,55 @@
           "end"
         ],
         "type": "object"
+      },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
@@ -98088,6 +98917,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SurfaceMetadata": {
         "description": "Opaque caller-owned metadata shared across public surfaces.",
@@ -154881,6 +155793,15 @@
           {
             "description": "Context compaction completed successfully.",
             "properties": {
+              "estimated_history_tokens_after": {
+                "description": "Estimated history tokens the rewrite left, in the unit of\n`CompactionStarted::estimated_history_tokens`; comparing the two\nshows how much the compaction recovered. `None` for a completion\nrecorded before 0.9.4, or when the rewritten history could not be\nmeasured.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "messages_after": {
                 "description": "Messages after compaction.",
                 "format": "uint",
@@ -154892,6 +155813,17 @@
                 "format": "uint",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "summary_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/CompactionSummarySource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Who wrote the summary, and for a provider call how much of the\nhistory its source carried. `None` only for a completion an\nearlier version recorded before it reported the source."
               },
               "summary_tokens": {
                 "description": "Tokens consumed by the summary.",
@@ -156401,6 +157333,55 @@
           "end"
         ],
         "type": "object"
+      },
+      "CompactionSummarySource": {
+        "description": "Who produced a compaction summary.",
+        "oneOf": [
+          {
+            "description": "The summarization LLM call: a real provider request.",
+            "properties": {
+              "kind": {
+                "const": "provider_call",
+                "type": "string"
+              },
+              "source_bound": {
+                "$ref": "#/$defs/SummarizationSourceBound",
+                "description": "How much of the history the call's source carried."
+              }
+            },
+            "required": [
+              "kind",
+              "source_bound"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A configured host curator; no provider request was made.",
+            "properties": {
+              "kind": {
+                "const": "host_curator",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The mechanical capacity fallback; no provider request backs the\nsummary. When the provider answered first and stopped at the model\ncontext window, that call is still charged to the session, apart from\nthis outcome.",
+            "properties": {
+              "kind": {
+                "const": "mechanical_fallback",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ConfinementRefusal": {
         "description": "Bounded operation-local diagnostics. Never expose an environment value,\ncredential path, gate token, or secret-bearing command line in this error.",
@@ -159745,6 +160726,89 @@
           "key"
         ],
         "type": "object"
+      },
+      "SummarizationSourceBound": {
+        "description": "How much of the history being compacted a summarization source carries.",
+        "oneOf": [
+          {
+            "description": "Every message, nothing cut to fit the budget.",
+            "properties": {
+              "kind": {
+                "const": "whole",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Every message, with the texts too large for the budget cut around an\nomission marker the summarizing model sees.",
+            "properties": {
+              "kind": {
+                "const": "trimmed",
+                "type": "string"
+              },
+              "through": {
+                "$ref": "#/$defs/SummarizationTrimStage",
+                "description": "The last kind of text cut to fit."
+              }
+            },
+            "required": [
+              "kind",
+              "through"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Only the newest `kept` of the history's `of` user requests; everything\nelse is omitted.",
+            "properties": {
+              "kept": {
+                "description": "User requests the source carries.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "requests_only",
+                "type": "string"
+              },
+              "of": {
+                "description": "User requests in the history being compacted.",
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "kept",
+              "of"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SummarizationTrimStage": {
+        "description": "The kinds of text a summarization source is trimmed through, in order:\ntool results first, user requests last.",
+        "oneOf": [
+          {
+            "const": "tool_results",
+            "description": "Tool results.",
+            "type": "string"
+          },
+          {
+            "const": "context",
+            "description": "System prompts and assistant text, with oversized tool-call arguments\nreplaced by their size.",
+            "type": "string"
+          },
+          {
+            "const": "user_requests",
+            "description": "User requests.",
+            "type": "string"
+          }
+        ]
       },
       "SystemNoticeBlock": {
         "description": "Typed runtime-authored transcript metadata.\n\nThese blocks are the durable contract for comms, tool/MCP state, auth,\nbackground work, and other runtime facts. They are never user-authored text.",

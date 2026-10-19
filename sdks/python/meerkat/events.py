@@ -427,12 +427,51 @@ class CompactionStarted(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class SummarizationSourceBound:
+    """How much of the history a compaction summary's source carried.
+
+    ``kind`` is ``whole``, ``trimmed`` (with ``through``: ``tool_results``,
+    ``context`` or ``user_requests``) or ``requests_only`` (the newest ``kept``
+    of ``of`` user requests). A kind this SDK version does not know is
+    ``unknown``, with the wire object in ``raw``.
+    """
+
+    kind: str = "unknown"
+    through: str | None = None
+    kept: int | None = None
+    of: int | None = None
+    raw_kind: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionSummarySource:
+    """Who wrote a compaction summary.
+
+    ``kind`` is ``provider_call`` (with ``source_bound``), ``host_curator`` or
+    ``mechanical_fallback``. A kind this SDK version does not know is
+    ``unknown``, with the wire object in ``raw``.
+    """
+
+    kind: str = "unknown"
+    source_bound: SummarizationSourceBound | None = None
+    raw_kind: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class CompactionCompleted(Event):
     """Context compaction finished."""
 
     summary_tokens: int = 0
     messages_before: int = 0
     messages_after: int = 0
+    # None only for a completion recorded before the source was reported.
+    summary_source: CompactionSummarySource | None = None
+    # Estimated history tokens the rewrite left, in the unit of
+    # CompactionStarted.estimated_history_tokens. None for a completion
+    # recorded before it was reported, or when the history was not measured.
+    estimated_history_tokens_after: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1314,6 +1353,52 @@ def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
     )
 
 
+_SUMMARIZATION_TRIM_STAGES = frozenset({"tool_results", "context", "user_requests"})
+
+
+def _parse_summarization_source_bound(raw: Any) -> SummarizationSourceBound:
+    if not isinstance(raw, dict):
+        raise ValueError("summary_source.source_bound must be object")
+    kind = _require_str(raw, "kind")
+    if kind == "whole":
+        return SummarizationSourceBound(kind=kind)
+    if kind == "trimmed":
+        through = _require_str(raw, "through")
+        if through in _SUMMARIZATION_TRIM_STAGES:
+            return SummarizationSourceBound(kind=kind, through=through)
+    elif kind == "requests_only":
+        return SummarizationSourceBound(
+            kind=kind,
+            kept=_require_non_negative_int(raw, "kept"),
+            of=_require_non_negative_int(raw, "of"),
+        )
+    return SummarizationSourceBound(
+        kind="unknown",
+        raw_kind=kind,
+        raw=dict(raw),
+    )
+
+
+def _parse_compaction_summary_source(raw: Any) -> CompactionSummarySource | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("summary_source must be object")
+    kind = _require_str(raw, "kind")
+    if kind == "provider_call":
+        return CompactionSummarySource(
+            kind=kind,
+            source_bound=_parse_summarization_source_bound(raw.get("source_bound")),
+        )
+    if kind in {"host_curator", "mechanical_fallback"}:
+        return CompactionSummarySource(kind=kind)
+    return CompactionSummarySource(
+        kind="unknown",
+        raw_kind=kind,
+        raw=dict(raw),
+    )
+
+
 def _parse_stream_truncation_reason(raw: Any) -> StreamTruncationReason:
     if not isinstance(raw, dict):
         raise ValueError("stream_truncated.reason must be object")
@@ -1742,6 +1827,16 @@ def parse_event(raw: dict[str, Any]) -> Event:
                 kwargs["reason"] = _parse_interaction_failure_reason(raw.get("reason"))
             elif f == "reason" and cls is StreamTruncated:
                 kwargs["reason"] = _parse_stream_truncation_reason(raw.get("reason"))
+            elif f == "summary_source" and cls is CompactionCompleted:
+                kwargs["summary_source"] = _parse_compaction_summary_source(
+                    raw.get("summary_source"),
+                )
+            elif f == "estimated_history_tokens_after" and cls is CompactionCompleted:
+                kwargs[f] = (
+                    None
+                    if raw.get(f) is None
+                    else _require_non_negative_int(raw, f)
+                )
             elif f == "payload" and cls is ToolConfigChanged:
                 payload_raw = raw["payload"]
                 assert isinstance(payload_raw, dict)

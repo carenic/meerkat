@@ -619,6 +619,7 @@ impl SessionAgent for CompactionSessionAgent {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: self.boundary_index,
+            last_rewrite_history_tokens: None,
         };
         if self.compactor.should_compact(&context) {
             self.seen_last_user_messages
@@ -759,6 +760,16 @@ impl Compactor for TrackingCompactor {
 
     fn max_summary_tokens(&self) -> u32 {
         32
+    }
+
+    fn prepare_for_summarization(
+        &self,
+        messages: &[meerkat_core::types::Message],
+        _budget: Option<meerkat_core::compact::SummarizationSourceBudget>,
+    ) -> meerkat_core::compact::SummarizationSource {
+        meerkat_core::compact::SummarizationSource::whole(
+            meerkat_core::types::materialize_latest_system_prompt_versions(messages),
+        )
     }
 
     fn rebuild_history(

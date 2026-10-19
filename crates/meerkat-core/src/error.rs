@@ -803,6 +803,22 @@ pub enum AgentError {
         hook_id: HookId,
         reason: crate::hooks::HookFailureReason,
     },
+
+    /// A live client replacement named a model other than the session's
+    /// durable identity. A model change goes through
+    /// `Agent::hot_swap_llm_identity`, which publishes the client, the
+    /// durable identity and the active model profile together.
+    #[error(
+        "replacing the client cannot change the session's model from {}:{durable_model} to {}:{requested_model}; change it with hot_swap_llm_identity",
+        .durable_provider.as_str(),
+        .requested_provider.as_str()
+    )]
+    ClientModelChangeRequiresHotSwap {
+        durable_provider: crate::Provider,
+        durable_model: String,
+        requested_provider: crate::Provider,
+        requested_model: String,
+    },
 }
 
 impl From<crate::OperationAuthorizationError> for AgentError {

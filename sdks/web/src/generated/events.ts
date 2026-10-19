@@ -223,6 +223,15 @@ export interface CompactionRewriteRange {
   start: number;
 }
 
+export type CompactionSummarySource = {
+  kind: "provider_call";
+  source_bound: SummarizationSourceBound;
+} | {
+  kind: "host_curator";
+} | {
+  kind: "mechanical_fallback";
+};
+
 export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed" | "untrusted_configuration_source";
 
 export type ContentBlock = {
@@ -793,6 +802,19 @@ export interface StructuredProviderExtension {
   namespace: string;
 }
 
+export type SummarizationSourceBound = {
+  kind: "whole";
+} | {
+  kind: "trimmed";
+  through: SummarizationTrimStage;
+} | {
+  kept: number;
+  kind: "requests_only";
+  of: number;
+};
+
+export type SummarizationTrimStage = "tool_results" | "context" | "user_requests";
+
 export type SystemNoticeBlock = {
   content?: ContentBlock[];
   direction: SystemNoticeDirection;
@@ -1234,8 +1256,10 @@ export interface CompactionStartedEvent {
 }
 
 export interface CompactionCompletedEvent {
+  estimated_history_tokens_after?: number | null;
   messages_after: number;
   messages_before: number;
+  summary_source?: CompactionSummarySource | null;
   summary_tokens: number;
   type: "compaction_completed";
 }

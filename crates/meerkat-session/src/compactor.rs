@@ -4,7 +4,8 @@
 
 use meerkat_core::compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionResult,
-    CompactionSummary, Compactor,
+    CompactionSummary, Compactor, SummarizationSource, SummarizationSourceBound,
+    SummarizationSourceBudget,
 };
 use meerkat_core::types::{
     AssistantBlock, BlockAssistantMessage, ContentBlock, Message,
@@ -24,21 +25,12 @@ Include:
 
 Be concise and structured. Prioritize information the next context needs to act, not narrate.";
 
-/// Fraction of the normal compaction threshold available to the source
-/// excerpt sent to the summarization model.
-///
-/// The threshold is normally 4/5 of the model context window. Capping the raw
-/// UTF-8 excerpt at 1/4 of that threshold leaves room for JSON escaping, the
-/// compaction prompt, and the summary response even when a single tool result
-/// jumps from a healthy request to beyond the context window in one boundary.
-const SUMMARIZATION_SOURCE_BUDGET_DENOMINATOR: u64 = 4;
 const RETAINED_HISTORY_BUDGET_DENOMINATOR: u64 = 2;
-const MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES: u64 = 4 * 1024;
+const MIN_RETAINED_HISTORY_BUDGET_BYTES: u64 = 4 * 1024;
 /// The smallest a trimmed text is cut to while bounding a summarization
 /// source; below it, the next role is trimmed instead.
 const MIN_TRIMMED_TEXT_BYTES: usize = 512;
 const TRIMMED_TEXT_MARKER: &str = "\n[... trimmed for the compaction source ...]\n";
-const REQUESTS_ONLY_SOURCE_PREFIX: &str = "[Bounded compaction source. The projected transcript is larger than the safe summarization window even with every tool result and message trimmed. The user requests are kept, newest included; everything else is omitted.]\n";
 
 /// Default compaction strategy implementation.
 pub struct DefaultCompactor {
@@ -51,13 +43,17 @@ impl DefaultCompactor {
         Self { config }
     }
 
-    fn summarization_source_budget_bytes(&self) -> usize {
-        let budget = self
-            .config
-            .auto_compact_threshold
-            .div_ceil(SUMMARIZATION_SOURCE_BUDGET_DENOMINATOR)
-            .max(MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES);
-        usize::try_from(budget).unwrap_or(usize::MAX)
+    /// The serialized-byte budget of the summarization source: `budget`, the
+    /// summarizing model's, or this compactor's threshold rule when that
+    /// model declares no context window.
+    fn summarization_source_budget_bytes(
+        &self,
+        budget: Option<SummarizationSourceBudget>,
+    ) -> usize {
+        let budget = budget.unwrap_or_else(|| {
+            SummarizationSourceBudget::from_compaction_threshold(self.config.auto_compact_threshold)
+        });
+        usize::try_from(budget.bytes()).unwrap_or(usize::MAX)
     }
 
     fn retained_history_budget_bytes(
@@ -68,7 +64,7 @@ impl DefaultCompactor {
             .config
             .auto_compact_threshold
             .div_ceil(RETAINED_HISTORY_BUDGET_DENOMINATOR)
-            .max(MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES);
+            .max(MIN_RETAINED_HISTORY_BUDGET_BYTES);
         if let Some(pressure) = pressure
             && let Some(request_cap) = pressure.effective_cap(self.config.max_request_bytes)
         {
@@ -185,6 +181,16 @@ enum TrimRole {
     User,
 }
 
+impl TrimRole {
+    fn stage(self) -> meerkat_core::compact::SummarizationTrimStage {
+        match self {
+            Self::ToolResults => meerkat_core::compact::SummarizationTrimStage::ToolResults,
+            Self::Context => meerkat_core::compact::SummarizationTrimStage::Context,
+            Self::User => meerkat_core::compact::SummarizationTrimStage::UserRequests,
+        }
+    }
+}
+
 fn serialized_len(messages: &[Message]) -> Result<usize, serde_json::Error> {
     serde_json::to_vec(messages).map(|encoded| encoded.len())
 }
@@ -296,15 +302,34 @@ fn largest_text(messages: &[Message], role: TrimRole) -> usize {
         .unwrap_or(0)
 }
 
+/// The note opening the last-resort source, naming how many of the
+/// history's user requests the source carries.
+fn requests_only_note(kept: usize, of: usize) -> String {
+    format!(
+        "[Bounded compaction source. The projected transcript is larger than the safe summarization window even with every tool result and message trimmed. Only the newest {kept} of the {of} user requests are kept, in their original order; everything else is omitted.]\n"
+    )
+}
+
+/// The user requests of `messages`, newest first.
+fn user_requests_newest_first(
+    messages: &[Message],
+) -> impl Iterator<Item = &meerkat_core::types::UserMessage> {
+    messages.iter().rev().filter_map(|message| match message {
+        Message::User(user) if !user.transcript_role.is_compaction_summary() => Some(user),
+        _ => None,
+    })
+}
+
 /// The last-resort source: only the user requests, newest first while the
 /// source's final serialized size (envelope and JSON escaping included)
 /// stays within `budget`, in transcript order. The newest request is always
 /// kept, cut further if it alone does not fit.
-fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
+fn requests_only_source(messages: &[Message], budget: usize) -> SummarizationSource {
+    let of = user_requests_newest_first(messages).count();
     let source = |newest_first: &[String]| {
         let lines: String = newest_first.iter().rev().map(String::as_str).collect();
         vec![Message::User(meerkat_core::types::UserMessage::text(
-            format!("{REQUESTS_ONLY_SOURCE_PREFIX}{lines}"),
+            format!("{}{lines}", requests_only_note(newest_first.len(), of)),
         ))]
     };
     let fits = |candidate: &[Message]| serialized_len(candidate).is_ok_and(|len| len <= budget);
@@ -312,10 +337,7 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
     // message carries a new timestamp, whose serialized width varies.
     let mut kept: Vec<String> = Vec::new();
     let mut checked = source(&kept);
-    for user in messages.iter().rev().filter_map(|message| match message {
-        Message::User(user) if !user.transcript_role.is_compaction_summary() => Some(user),
-        _ => None,
-    }) {
+    for user in user_requests_newest_first(messages) {
         let mut text = user.text_content();
         trim_text(&mut text, MIN_TRIMMED_TEXT_BYTES);
         let mut candidate = kept.clone();
@@ -333,8 +355,10 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
             loop {
                 cap /= 2;
                 trim_text(&mut text, cap);
-                let built = source(&[format!("- {text}\n")]);
+                let newest = vec![format!("- {text}\n")];
+                let built = source(&newest);
                 if fits(&built) || cap <= TRIMMED_TEXT_MARKER.len() {
+                    kept = newest;
                     checked = built;
                     break;
                 }
@@ -342,7 +366,13 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
         }
         break;
     }
-    checked
+    SummarizationSource {
+        messages: checked,
+        bound: SummarizationSourceBound::RequestsOnly {
+            kept: kept.len(),
+            of,
+        },
+    }
 }
 
 /// Bound an oversized typed projection to `budget` serialized bytes, by
@@ -352,19 +382,36 @@ fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
 /// dropped from the typed projection; only a source that cannot fit even
 /// fully trimmed falls back to the user requests alone. The original
 /// session messages are never mutated.
-fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<Message> {
-    let projected_bytes = match serialized_len(&messages) {
+fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> SummarizationSource {
+    let projected = serialized_len(&messages);
+    // Unreachable for in-memory messages: every `Message` serializes
+    // infallibly (string-keyed maps, raw JSON that was validated when it was
+    // built, non-finite floats written as null). The branch is defence in
+    // depth: debug builds flag it, and a release build degrades to a note
+    // that carries none of the user requests, which `RequestsOnly { kept: 0 }`
+    // states exactly.
+    debug_assert!(
+        projected.is_ok(),
+        "a compaction source projection always serializes"
+    );
+    let projected_bytes = match projected {
         Ok(projected_bytes) => projected_bytes,
         Err(error) => {
-            return vec![Message::User(meerkat_core::types::UserMessage::text(
-                format!(
-                    "[Compaction source projection could not be serialized: {error}. Continue with a mechanical handoff summary.]"
-                ),
-            ))];
+            return SummarizationSource {
+                messages: vec![Message::User(meerkat_core::types::UserMessage::text(
+                    format!(
+                        "[Compaction source projection could not be serialized: {error}. Continue with a mechanical handoff summary.]"
+                    ),
+                ))],
+                bound: SummarizationSourceBound::RequestsOnly {
+                    kept: 0,
+                    of: user_requests_newest_first(&messages).count(),
+                },
+            };
         }
     };
     if projected_bytes <= budget {
-        return messages;
+        return SummarizationSource::whole(messages);
     }
     let user_rows = messages
         .iter()
@@ -388,7 +435,12 @@ fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<
                     trimmed_through = ?role,
                     "bounded oversized compaction summarization source by trimming"
                 );
-                return bounded;
+                return SummarizationSource {
+                    messages: bounded,
+                    bound: SummarizationSourceBound::Trimmed {
+                        through: role.stage(),
+                    },
+                };
             }
         }
     }
@@ -463,8 +515,8 @@ impl Compactor for DefaultCompactor {
         // Cadence is a cost policy, not recovery authority. It may suppress a
         // provider-reported high-water mark while the current transcript is
         // still below both live pressure thresholds, but it must never veto a
-        // history or exact-byte crossing. One large tool result can make the
-        // very next request impossible, including when the previous
+        // crossing that compacting can recover. One large tool result can make
+        // the very next request impossible, including when the previous
         // compaction happened fewer than `min_turns_between_compactions`
         // boundaries ago.
         //
@@ -473,7 +525,62 @@ impl Compactor for DefaultCompactor {
         // survives compaction untouched, so a forecast crossing that cadence
         // could not veto would compact on every boundary forever without
         // reducing the crossing.
-        let requires_capacity_recovery = history_trigger || byte_trigger;
+        //
+        // A history crossing is recoverable only while the last rewrite got
+        // the history under the threshold. A rewrite keeps the System rows,
+        // the in-flight request and the recent turns, and adds a summary; when
+        // what it left is still at or above the threshold, that floor crosses
+        // on its own, and compacting again pays for a summary that recovers
+        // nothing. Such a crossing waits for the cadence like the forecast,
+        // unless the request no longer fits the model window and what arrived
+        // since that rewrite is at least the overage: that growth is the only
+        // content a rewrite can still remove. Without a request budget fact
+        // (a model that declares no context window, or a request the budget
+        // could not measure) there is no overage, so the escape never applies:
+        // with the floor over the threshold every history crossing waits for
+        // the cadence however large the growth, and only the request-byte
+        // crossing still bypasses it.
+        //
+        // The byte crossing keeps its bypass. On the exact path the rebuilt
+        // request must shrink and fit its cap, or the turn fails as
+        // irreducible. On the estimated path a rewrite keeps the System rows,
+        // the summary and at most two retention budgets of verbatim rows, so
+        // its bytes stay under a request-byte threshold measured in megabytes
+        // unless the System rows alone approach the provider's request cap,
+        // which also puts the history far over the token threshold and the
+        // request over the model window.
+        let history_floor_crosses = ctx
+            .last_rewrite_history_tokens
+            .is_some_and(|left| left >= self.config.auto_compact_threshold);
+        let removable_growth_covers_overage = ctx
+            .request_context_budget
+            .as_ref()
+            .filter(|budget| budget.state != meerkat_core::ContextBudgetState::Within)
+            .zip(ctx.last_rewrite_history_tokens)
+            .is_some_and(|(budget, left)| {
+                ctx.estimated_history_tokens.saturating_sub(left) >= budget.overage_tokens
+            });
+        let history_recovers =
+            history_trigger && (!history_floor_crosses || removable_growth_covers_overage);
+        if history_trigger
+            && !history_recovers
+            && ctx
+                .last_compaction_boundary_index
+                .is_some_and(|last| ctx.session_boundary_index == last.saturating_add(1))
+        {
+            tracing::warn!(
+                last_rewrite_history_tokens = ctx.last_rewrite_history_tokens,
+                estimated_history_tokens = ctx.estimated_history_tokens,
+                threshold = self.config.auto_compact_threshold,
+                min_turns_between_compactions = self.config.min_turns_between_compactions,
+                "compaction cannot bring the history under its threshold: the last rewrite left \
+                 the history at or above it, so the System rows, the kept request, the recent \
+                 turns and the summary cross it on their own; history crossings now wait for the \
+                 compaction cadence. Raise auto_compact_threshold above that floor, omit it so it \
+                 derives from the model window, or shrink the System rows"
+            );
+        }
+        let requires_capacity_recovery = history_recovers || byte_trigger;
         if !requires_capacity_recovery
             && let Some(last) = ctx.last_compaction_boundary_index
             && ctx.session_boundary_index.saturating_sub(last)
@@ -515,11 +622,15 @@ impl Compactor for DefaultCompactor {
         input_trigger || history_trigger || byte_trigger || forecast_trigger
     }
 
-    fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
+    fn prepare_for_summarization(
+        &self,
+        messages: &[Message],
+        budget: Option<SummarizationSourceBudget>,
+    ) -> SummarizationSource {
         let messages = materialize_latest_system_prompt_versions(messages);
         bound_summarization_projection(
             project_messages_for_summarization(&messages),
-            self.summarization_source_budget_bytes(),
+            self.summarization_source_budget_bytes(budget),
         )
     }
 
@@ -818,6 +929,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 0,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -834,6 +946,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 7, // Only 2 boundaries since last compaction, threshold is 3
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -850,11 +963,148 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 6,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
             "an already-oversized history must recover even immediately after a prior compaction"
         );
+    }
+
+    /// A history crossing is capacity recovery only while compacting can get
+    /// under the threshold. When the last rewrite already left the history at
+    /// or above it, the floor crosses on its own: the crossing waits for the
+    /// cadence like an ordinary trigger instead of paying for a summary at
+    /// every boundary, and compaction still runs once the cadence allows it.
+    #[test]
+    fn history_crossing_waits_for_the_cadence_when_the_last_rewrite_left_it_over() {
+        let c = DefaultCompactor::new(make_config());
+        let just_after = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 0,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(101_000),
+        };
+        assert!(
+            !c.should_compact(&just_after),
+            "a rewrite that left the history over the threshold cannot recover it at the next boundary"
+        );
+        let after_cadence = CompactionContext {
+            session_boundary_index: 8,
+            ..just_after
+        };
+        assert!(
+            c.should_compact(&after_cadence),
+            "the crossing still compacts once the cadence allows it"
+        );
+    }
+
+    /// Control: a rewrite that got the history under the threshold keeps the
+    /// bypass, so new content that crosses again is recovered at once.
+    #[test]
+    fn history_crossing_bypasses_the_cadence_when_the_last_rewrite_got_under() {
+        let c = DefaultCompactor::new(make_config());
+        let ctx = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 0,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(40_000),
+        };
+        assert!(c.should_compact(&ctx));
+    }
+
+    /// With the floor over the threshold, the bypass returns only when the
+    /// request no longer fits the model window and what arrived since the
+    /// last rewrite covers the overage: that growth is the only content a
+    /// rewrite can still remove. Without such growth the cadence holds.
+    #[test]
+    fn floor_over_threshold_bypasses_only_for_growth_that_covers_the_window_overage() {
+        let threshold = 6_000;
+        let compactor = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: threshold,
+            ..make_config()
+        });
+        let profile = windowed_profile_witness(10_000);
+        let messages = vec![Message::User(UserMessage::text("t".repeat(80_000)))];
+        let budget =
+            meerkat_core::context_budget_fact_for_messages(&messages, &[], 2_048, &profile)
+                .expect("declared window must classify");
+        assert_ne!(
+            budget.state,
+            meerkat_core::ContextBudgetState::Within,
+            "the request must be projected beyond the window"
+        );
+        let overage = budget.overage_tokens;
+        assert!(overage > 0);
+        let ctx = meerkat_core::agent::compact::build_compaction_context(
+            &messages,
+            0,
+            Some(budget),
+            None,
+            Some(5),
+            6,
+        );
+        let history = ctx.estimated_history_tokens;
+        assert!(
+            history.saturating_sub(overage) >= threshold,
+            "every case below must keep the floor over the threshold"
+        );
+
+        let no_growth = CompactionContext {
+            last_rewrite_history_tokens: Some(history),
+            ..ctx.clone()
+        };
+        assert!(
+            !compactor.should_compact(&no_growth),
+            "nothing removable arrived since the last rewrite: the cadence holds"
+        );
+        let short_of_overage = CompactionContext {
+            last_rewrite_history_tokens: Some(history - overage + 1),
+            ..ctx.clone()
+        };
+        assert!(
+            !compactor.should_compact(&short_of_overage),
+            "growth below the overage cannot make the request fit"
+        );
+        let covers_overage = CompactionContext {
+            last_rewrite_history_tokens: Some(history - overage),
+            ..ctx
+        };
+        assert!(
+            compactor.should_compact(&covers_overage),
+            "growth that covers the overage is removable: the bypass fires"
+        );
+    }
+
+    /// The byte crossing keeps its bypass whatever the last rewrite left.
+    #[test]
+    fn byte_crossing_keeps_its_bypass_after_a_rewrite_that_left_the_history_over() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            max_request_bytes: Some(9_000_000),
+            ..make_config()
+        });
+        let ctx = CompactionContext {
+            last_input_tokens: 0,
+            message_count: 100,
+            estimated_history_tokens: 105_000,
+            estimated_request_bytes: 8_000_000,
+            request_context_budget: None,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: Some(5),
+            session_boundary_index: 6,
+            last_rewrite_history_tokens: Some(101_000),
+        };
+        assert!(c.should_compact(&ctx));
     }
 
     #[test]
@@ -869,6 +1119,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 1,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx));
     }
@@ -887,6 +1138,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx));
 
@@ -900,6 +1152,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(c.should_compact(&ctx2));
     }
@@ -921,6 +1174,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 42,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -945,6 +1199,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&ctx));
     }
@@ -967,6 +1222,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -995,6 +1251,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             !c.should_compact(&ctx),
@@ -1025,6 +1282,7 @@ mod tests {
             )),
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 6,
+            last_rewrite_history_tokens: None,
         };
         assert!(
             c.should_compact(&ctx),
@@ -1236,6 +1494,7 @@ mod tests {
             provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
+            last_rewrite_history_tokens: None,
         };
         assert!(!c.should_compact(&neither));
 
@@ -1302,7 +1561,7 @@ mod tests {
             Message::User(UserMessage::text("recent turn")),
         ];
 
-        let summary_input = c.prepare_for_summarization(&messages);
+        let summary_input = c.prepare_for_summarization(&messages, None).messages;
         assert!(summary_input.iter().all(
             |message| !matches!(message, Message::System(system) if system.content == "version one")
         ));
@@ -1796,6 +2055,76 @@ mod tests {
         assert!(matches!(&result[1], ContentBlock::Text { text } if text == "two"));
     }
 
+    /// The summarizing model's budget bounds the source, not this
+    /// compactor's threshold rule: a large model budget passes a source the
+    /// threshold rule trims, and a small one trims it.
+    #[test]
+    fn prepare_for_summarization_bounds_the_source_by_the_given_budget() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 1_000,
+            ..make_config()
+        });
+        let middle = "MARKER-IN-THE-MIDDLE";
+        let half = "x".repeat(15_000);
+        let messages = vec![Message::User(UserMessage::text(format!(
+            "{half}{middle}{half}"
+        )))];
+        let source_bytes = serde_json::to_vec(&messages).unwrap().len();
+
+        let SummarizationSource {
+            messages: by_threshold,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::UserRequests
+            }
+        );
+        let threshold_bytes = c.summarization_source_budget_bytes(None);
+        assert!(serde_json::to_vec(&by_threshold).unwrap().len() <= threshold_bytes);
+        assert!(
+            !serde_json::to_string(&by_threshold)
+                .unwrap()
+                .contains(middle)
+        );
+
+        let large = SummarizationSourceBudget::from_compaction_threshold(400_000);
+        assert!(source_bytes <= usize::try_from(large.bytes()).unwrap());
+        let SummarizationSource {
+            messages: by_large_budget,
+            bound,
+        } = c.prepare_for_summarization(&messages, Some(large));
+        assert_eq!(bound, SummarizationSourceBound::Whole);
+        assert!(
+            serde_json::to_string(&by_large_budget)
+                .unwrap()
+                .contains(middle),
+            "a source within the budget is kept whole"
+        );
+
+        let small = SummarizationSourceBudget::from_compaction_threshold(40_000);
+        let SummarizationSource {
+            messages: by_small_budget,
+            bound,
+        } = c.prepare_for_summarization(&messages, Some(small));
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::UserRequests
+            }
+        );
+        assert!(
+            serde_json::to_vec(&by_small_budget).unwrap().len()
+                <= usize::try_from(small.bytes()).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&by_small_budget)
+                .unwrap()
+                .contains(middle)
+        );
+    }
+
     #[test]
     fn prepare_for_summarization_projects_user_and_tool_media() {
         use meerkat_core::types::ToolResult;
@@ -1823,7 +2152,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(prepared.len(), 2);
 
         // User message: text preserved, image replaced
@@ -1863,8 +2192,8 @@ mod tests {
         use meerkat_core::types::ToolResult;
 
         let config = CompactionConfig {
-            // Production scaling uses 4/5 of the active model context. A
-            // 100k threshold gives this test a 25k raw source budget.
+            // Without the summarizing model's budget, a 100k threshold gives
+            // this test a 25k source budget.
             auto_compact_threshold: 100_000,
             ..make_config()
         };
@@ -1879,7 +2208,16 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let SummarizationSource {
+            messages: prepared,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
+        assert_eq!(
+            bound,
+            SummarizationSourceBound::Trimmed {
+                through: meerkat_core::compact::SummarizationTrimStage::ToolResults
+            }
+        );
         assert_eq!(
             prepared.len(),
             messages.len(),
@@ -1898,9 +2236,9 @@ mod tests {
         assert!(text.contains("trimmed for the compaction source"));
         let bounded = serde_json::to_vec(&prepared).unwrap().len();
         assert!(
-            bounded <= c.summarization_source_budget_bytes(),
+            bounded <= c.summarization_source_budget_bytes(None),
             "bounded source was {bounded} bytes for a {} byte budget",
-            c.summarization_source_budget_bytes()
+            c.summarization_source_budget_bytes(None)
         );
 
         // The last-resort source (user requests only) is bounded in the same
@@ -1911,7 +2249,7 @@ mod tests {
             auto_compact_threshold: 1_000,
             ..make_config()
         });
-        let budget = c.summarization_source_budget_bytes();
+        let budget = c.summarization_source_budget_bytes(None);
         let messages: Vec<Message> = (0..8)
             .map(|n| {
                 Message::User(UserMessage::text(format!(
@@ -1921,7 +2259,10 @@ mod tests {
             })
             .collect();
         assert!(serde_json::to_vec(&messages).unwrap().len() > budget);
-        let prepared = c.prepare_for_summarization(&messages);
+        let SummarizationSource {
+            messages: prepared,
+            bound,
+        } = c.prepare_for_summarization(&messages, None);
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.len() <= budget,
@@ -1929,16 +2270,31 @@ mod tests {
             source.len()
         );
         assert!(source.contains("req-7"), "the newest request is kept");
+        // The source says how many of the requests it carries, in its text
+        // and in its bound.
+        let SummarizationSourceBound::RequestsOnly { kept, of } = bound else {
+            panic!("an over-budget source falls back to the requests: {bound:?}");
+        };
+        assert_eq!(of, 8);
+        assert!((1..8).contains(&kept), "kept {kept} of 8");
+        assert!(source.contains(&format!("Only the newest {kept} of the 8 user requests")));
+        assert_eq!(
+            (0..8)
+                .filter(|n| source.contains(&format!("req-{n}")))
+                .count(),
+            kept,
+            "the note counts exactly the requests the source carries"
+        );
 
         // The returned source is the exact message that was measured: at a
         // budget equal to one measured source, every returned source stays
         // within it (a rebuilt message would carry a new timestamp of
         // varying serialized width).
-        let tight = serde_json::to_vec(&requests_only_source(&messages[7..], usize::MAX))
+        let tight = serde_json::to_vec(&requests_only_source(&messages[7..], usize::MAX).messages)
             .unwrap()
             .len();
         for _ in 0..500 {
-            let returned = requests_only_source(&messages, tight);
+            let returned = requests_only_source(&messages, tight).messages;
             assert!(
                 serde_json::to_vec(&returned).unwrap().len() <= tight,
                 "the returned requests-only source exceeds the budget it was checked against"
@@ -1971,7 +2327,7 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
 
         match &prepared[0] {
             Message::User(user) => {
@@ -2345,7 +2701,7 @@ mod tests {
             )),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(prepared.len(), 2);
 
         if let Message::BlockAssistant(a) = &prepared[1] {
@@ -2380,7 +2736,7 @@ mod tests {
             Message::User(UserMessage::text("Second".to_string())),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         assert_eq!(
             prepared.len(),
             2,
@@ -2583,17 +2939,17 @@ mod tests {
             )]),
         ];
 
-        let prepared = c.prepare_for_summarization(&messages);
+        let prepared = c.prepare_for_summarization(&messages, None).messages;
         let source = serde_json::to_string(&prepared).unwrap();
         assert!(
             source.contains(request),
             "the middle request reaches the summarizer source"
         );
         assert!(
-            source.len() <= c.summarization_source_budget_bytes(),
+            source.len() <= c.summarization_source_budget_bytes(None),
             "the source ({} bytes) stays within its budget ({} bytes)",
             source.len(),
-            c.summarization_source_budget_bytes()
+            c.summarization_source_budget_bytes(None)
         );
     }
 }

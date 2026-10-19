@@ -10365,6 +10365,9 @@ mod auth_clear_default_hot_swap_tests;
 #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod brain_swap_runtime_loop_ab_tests;
+#[cfg(all(test, feature = "session-compaction", not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod compaction_summary_budget_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

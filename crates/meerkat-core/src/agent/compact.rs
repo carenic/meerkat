@@ -546,7 +546,16 @@ pub fn build_compaction_context(
         provider_request_pressure,
         last_compaction_boundary_index,
         session_boundary_index,
+        last_rewrite_history_tokens: None,
     }
+}
+
+/// The history estimate `build_compaction_context` reports for `messages`,
+/// or `None` when it cannot be measured.
+pub(crate) fn estimated_history_tokens(messages: &[Message]) -> Option<u64> {
+    estimate_transcript_pressure(messages)
+        .ok()
+        .map(|pressure| pressure.tokens)
 }
 
 /// Best-effort count of prior LLM boundaries for older sessions that do not
@@ -592,6 +601,7 @@ pub fn load_compaction_cadence(
                 session_boundary_index: infer_session_boundary_index(session.messages()),
                 last_compaction_boundary_index: None,
                 last_compaction_attempt_boundary_index: None,
+                last_rewrite_history_tokens: None,
             };
             persist_compaction_cadence(session, &cadence)
                 .map_err(CompactionCadenceError::PersistFailed)?;
@@ -655,6 +665,10 @@ pub(crate) struct CompactionInvocation<'a> {
     pub(crate) window: CompactionWindow<'a>,
     pub(crate) request_pressure: Option<crate::ProviderRequestPressure>,
     pub(crate) parent_revision: String,
+    /// Source budget of the client this attempt summarizes on, from its
+    /// registry-owned limits; `None` when that model declares no context
+    /// window.
+    pub(crate) summarization_budget: Option<crate::compact::SummarizationSourceBudget>,
 }
 
 /// Exact canonical unmeasured transcript subset incorporated by this attempt.
@@ -766,6 +780,7 @@ where
         window,
         request_pressure,
         parent_revision,
+        summarization_budget,
     } = invocation;
     let CompactionWindow {
         messages,
@@ -841,7 +856,10 @@ where
         let compaction_prompt = compactor.compaction_prompt();
         let max_summary_tokens = compactor.max_summary_tokens();
 
-        let mut compaction_messages = compactor.prepare_for_summarization(model_messages);
+        let crate::compact::SummarizationSource {
+            messages: mut compaction_messages,
+            bound: source_bound,
+        } = compactor.prepare_for_summarization(model_messages, summarization_budget);
         compaction_messages.push(Message::User(crate::types::UserMessage::text(
             compaction_prompt.to_string(),
         )));
@@ -940,7 +958,11 @@ where
                     client.model(),
                 )?;
                 summary_usage_identity_dispute = dispute;
-                (summary, usage, CompactionSummarySource::ProviderCall)
+                (
+                    summary,
+                    usage,
+                    CompactionSummarySource::ProviderCall { source_bound },
+                )
             }
             Err(e) if is_compaction_capacity_error(&e) && !observation_source.has_observations => {
                 tracing::warn!(
@@ -1151,10 +1173,16 @@ impl ValidatedCompactionRewrite {
 }
 
 /// Who produced a compaction summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CompactionSummarySource {
     /// The summarization LLM call: a real provider request.
-    ProviderCall,
+    ProviderCall {
+        /// How much of the history the call's source carried.
+        source_bound: crate::compact::SummarizationSourceBound,
+    },
     /// A configured host curator; no provider request was made.
     HostCurator,
     /// The mechanical capacity fallback; no provider request backs the
@@ -1291,6 +1319,16 @@ mod tests {
         }
         fn max_summary_tokens(&self) -> u32 {
             100
+        }
+
+        fn prepare_for_summarization(
+            &self,
+            messages: &[Message],
+            _budget: Option<crate::compact::SummarizationSourceBudget>,
+        ) -> crate::compact::SummarizationSource {
+            crate::compact::SummarizationSource::whole(
+                crate::types::materialize_latest_system_prompt_versions(messages),
+            )
         }
         fn rebuild_history(
             &self,
@@ -1444,6 +1482,7 @@ mod tests {
                 },
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
+                summarization_budget: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -1736,6 +1775,7 @@ mod tests {
                 },
                 request_pressure: None,
                 parent_revision: session.transcript_revision().unwrap(),
+                summarization_budget: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -1910,10 +1950,27 @@ mod tests {
             session_boundary_index: 7,
             last_compaction_boundary_index: Some(4),
             last_compaction_attempt_boundary_index: Some(6),
+            last_rewrite_history_tokens: Some(61_234),
         };
         persist_compaction_cadence(&mut session, &cadence).unwrap();
 
         assert_eq!(load_compaction_cadence(&mut session).unwrap(), cadence);
+    }
+
+    /// Cadence metadata written before 0.9.4 has no rewrite evidence: it reads
+    /// as `None` (no evidence, so a history crossing still bypasses the
+    /// cadence), and a cadence without evidence writes no field for an older
+    /// binary to meet.
+    #[test]
+    fn compaction_cadence_without_rewrite_evidence_reads_and_writes_as_before() {
+        let legacy = serde_json::json!({
+            "session_boundary_index": 7,
+            "last_compaction_boundary_index": 4,
+            "last_compaction_attempt_boundary_index": 6
+        });
+        let cadence: SessionCompactionCadence = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(cadence.last_rewrite_history_tokens, None);
+        assert_eq!(serde_json::to_value(&cadence).unwrap(), legacy);
     }
 
     #[test]

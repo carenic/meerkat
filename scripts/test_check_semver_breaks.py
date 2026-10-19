@@ -367,6 +367,11 @@ Failed in:
                 "crates/meerkat-mob/src/runtime/session_service.rs:1433",
                 ("MobSessionService", "runtime_adapter"),
             ),
+            "trait_method_default_impl_removed": (
+                "trait method meerkat_core::compact::Compactor::prepare_for_summarization "
+                "in file crates/meerkat-core/src/compact.rs:515",
+                ("Compactor", "prepare_for_summarization"),
+            ),
             "enum_discriminants_undefined_non_unit_variant": (
                 "enum DslRejectionKind in crates/meerkat-core/src/handles.rs:756",
                 ("DslRejectionKind",),

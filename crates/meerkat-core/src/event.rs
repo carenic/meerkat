@@ -574,7 +574,8 @@ impl From<&AgentError> for AgentErrorClass {
             // was previously represented as (a `ConfigError`).
             AgentError::DurableSnapshotSyncUnsupported
             | AgentError::ModelFallbackResumeHeld { .. }
-            | AgentError::ControlAppendBlockedByCallbackBatch => Self::Config,
+            | AgentError::ControlAppendBlockedByCallbackBatch
+            | AgentError::ClientModelChangeRequiresHotSwap { .. } => Self::Config,
         }
     }
 }
@@ -2626,6 +2627,18 @@ pub enum AgentEvent {
         messages_before: usize,
         /// Messages after compaction.
         messages_after: usize,
+        /// Who wrote the summary, and for a provider call how much of the
+        /// history its source carried. `None` only for a completion an
+        /// earlier version recorded before it reported the source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_source: Option<crate::agent::compact::CompactionSummarySource>,
+        /// Estimated history tokens the rewrite left, in the unit of
+        /// `CompactionStarted::estimated_history_tokens`; comparing the two
+        /// shows how much the compaction recovered. `None` for a completion
+        /// recorded before 0.9.4, or when the rewritten history could not be
+        /// measured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        estimated_history_tokens_after: Option<u64>,
     },
 
     /// Context compaction failed (non-fatal — agent continues with uncompacted history).
@@ -3258,9 +3271,26 @@ pub fn format_verbose_event_with_config(
             summary_tokens,
             messages_before,
             messages_after,
-        } => Some(format!(
-            "  ✓ Compaction complete: {messages_before} → {messages_after} messages, {summary_tokens} summary tokens"
-        )),
+            summary_source,
+            estimated_history_tokens_after,
+        } => {
+            let source = match summary_source {
+                Some(crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Trimmed { .. },
+                }) => ", from a trimmed source".to_string(),
+                Some(crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound:
+                        crate::compact::SummarizationSourceBound::RequestsOnly { kept, of },
+                }) => format!(", from the newest {kept} of {of} user requests"),
+                _ => String::new(),
+            };
+            let left = estimated_history_tokens_after
+                .map(|tokens| format!(", ~{tokens} history tokens left"))
+                .unwrap_or_default();
+            Some(format!(
+                "  ✓ Compaction complete: {messages_before} → {messages_after} messages, {summary_tokens} summary tokens{source}{left}"
+            ))
+        }
         AgentEvent::CompactionFailed { reason } => {
             Some(format!("  ✗ Compaction failed (continuing): {reason}"))
         }
@@ -3378,6 +3408,84 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A completion recorded before the summary source existed still reads,
+    /// with no source, and writes back to the same bytes; a current one
+    /// carries the typed source on the wire.
+    #[test]
+    fn compaction_completed_summary_source_is_typed_and_backward_compatible() {
+        let legacy = serde_json::json!({
+            "type": "compaction_completed",
+            "summary_tokens": 5,
+            "messages_before": 9,
+            "messages_after": 2,
+        });
+        let parsed: AgentEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEvent::CompactionCompleted {
+                summary_source: None,
+                estimated_history_tokens_after: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+
+        let current = AgentEvent::CompactionCompleted {
+            summary_tokens: 5,
+            messages_before: 9,
+            messages_after: 2,
+            summary_source: Some(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::RequestsOnly {
+                        kept: 3,
+                        of: 40,
+                    },
+                },
+            ),
+            estimated_history_tokens_after: Some(61_234),
+        };
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::json!({
+                "type": "compaction_completed",
+                "summary_tokens": 5,
+                "messages_before": 9,
+                "messages_after": 2,
+                "summary_source": {
+                    "kind": "provider_call",
+                    "source_bound": {"kind": "requests_only", "kept": 3, "of": 40},
+                },
+                "estimated_history_tokens_after": 61234,
+            })
+        );
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(serde_json::to_value(&current).unwrap()).unwrap(),
+            AgentEvent::CompactionCompleted {
+                estimated_history_tokens_after: Some(61_234),
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(
+                crate::agent::compact::CompactionSummarySource::ProviderCall {
+                    source_bound: crate::compact::SummarizationSourceBound::Trimmed {
+                        through: crate::compact::SummarizationTrimStage::UserRequests,
+                    },
+                }
+            )
+            .unwrap(),
+            serde_json::json!({
+                "kind": "provider_call",
+                "source_bound": {"kind": "trimmed", "through": "user_requests"},
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(crate::agent::compact::CompactionSummarySource::HostCurator)
+                .unwrap(),
+            serde_json::json!({"kind": "host_curator"})
+        );
+    }
 
     #[test]
     fn message_scoped_events_are_backward_compatible_and_carry_the_id() {
@@ -4317,6 +4425,15 @@ mod tests {
                 summary_tokens: 2048,
                 messages_before: 42,
                 messages_after: 8,
+                summary_source: Some(
+                    crate::agent::compact::CompactionSummarySource::ProviderCall {
+                        source_bound: crate::compact::SummarizationSourceBound::RequestsOnly {
+                            kept: 3,
+                            of: 40,
+                        },
+                    },
+                ),
+                estimated_history_tokens_after: Some(30_000),
             },
             AgentEvent::CompactionFailed {
                 reason: CompactionFailureReason::LlmFailed {
@@ -5188,6 +5305,10 @@ mod tests {
                 summary_tokens: 1,
                 messages_before: 3,
                 messages_after: 1,
+                summary_source: Some(
+                    crate::agent::compact::CompactionSummarySource::MechanicalFallback,
+                ),
+                estimated_history_tokens_after: None,
             },
             AgentEvent::CompactionFailed {
                 reason: CompactionFailureReason::EmptySummary,

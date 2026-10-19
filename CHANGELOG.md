@@ -263,6 +263,55 @@ them.
   an update of either (`scripts/ci-action-pins.mjs` fails a configuration
   that could).
 
+- `meerkat-core`: a compaction summary reports what its source carried.
+  `Compactor::prepare_for_summarization` takes the summarization source budget
+  and returns the source with its bound, `(messages: &[Message], budget:
+  Option<SummarizationSourceBudget>) -> SummarizationSource`, and has no
+  default implementation: every compactor states how it bounds the transcript
+  it sends to the model that writes the summary. The budget is that model's
+  (`SummarizationSourceBudget::for_summary_model`), `None` when the model
+  declares no context window. `CompactionSummarySource` is `#[non_exhaustive]`
+  and its `ProviderCall` variant carries the call's `source_bound`, and
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `summary_source`, `None` only for one recorded before this release (on the
+  wire the field is optional). A
+  compactor that used the default keeps its old behaviour by returning
+  `SummarizationSource::whole(meerkat_core::materialize_latest_system_prompt_versions(messages))`
+  and ignoring the budget; to fit the summarizing model, it also bounds the
+  result by the budget and reports the bound, as `DefaultCompactor` does. The
+  implementors in this repository (`DefaultCompactor` and the test
+  compactors) are updated; no published example implements the trait.
+- `meerkat-core`: `Agent::replace_client` and
+  `Agent::replace_client_with_request_policy`, and through them the ephemeral
+  service's `SessionService::set_session_client`, no longer change the
+  session's model. A client, or a request-policy model, whose provider or
+  model differs from the session's durable identity is refused with
+  `AgentError::ClientModelChangeRequiresHotSwap` before anything changes: such
+  a swap left the durable identity and the active model profile, which size
+  the context and compaction budgets, on the previous model. Change the model
+  with `Agent::hot_swap_llm_identity` or
+  `SessionService::hot_swap_session_llm_identity`, which publish the client,
+  the durable identity and the profile together. A replacement client for the
+  same model, or any client on a session without a durable identity, is
+  accepted as before.
+- `meerkat-core`: a compaction rewrite records the history it left.
+  `SessionCompactionCadence` and `CompactionContext` gain
+  `last_rewrite_history_tokens`, the estimated history tokens the last rewrite
+  left (`None` before the first), which `Compactor::should_compact` reads; the
+  session persists it with its compaction cadence.
+  `AgentEvent::CompactionCompleted` and `CompactionProjectionIntent` gain
+  `estimated_history_tokens_after`, the same estimate in the unit of
+  `estimated_history_tokens`, `None` for one recorded before this release or
+  when the history could not be measured (on the wire the field is optional;
+  the Python SDK reads it as `CompactionCompleted.estimated_history_tokens_after`
+  and the TypeScript SDK as
+  `CompactionCompletedEvent.estimatedHistoryTokensAfter`). A
+  `CompactionContext` built by hand keeps the previous decisions with
+  `last_rewrite_history_tokens: None`. A 0.9.3 binary ignores the persisted
+  field and drops it when it next writes the cadence; back on this release,
+  that session compacts as before until its next rewrite records the field
+  again, so a downgrade and upgrade cost at most one extra summary call.
+
 ### Added
 
 - `LocalGrantAuthority::resolve_lineage_observed`,
@@ -362,6 +411,22 @@ them.
   classification of a native web-search call's stop reason for every
   provider's executor.
 
+- `meerkat-core`: `SummarizationSourceBudget`, the serialized-byte budget for
+  the transcript a compactor sends to the summarizing model.
+  `for_summary_model` derives it from that model's context window and
+  `from_compaction_threshold` from a compaction threshold.
+- `meerkat-core`: `SummarizationSource` and `SummarizationSourceBound`
+  (`whole`, `trimmed` with the last `SummarizationTrimStage` cut, or
+  `requests_only` with how many of the user requests it kept);
+  `CompactionSummarySource` is serializable and exported from the crate root.
+  The `compaction_completed` wire event carries it as `summary_source`, and
+  the Python (`CompactionCompleted.summary_source`) and TypeScript
+  (`CompactionCompletedEvent.summarySource`) SDKs parse it; a kind they do
+  not know parses to `unknown` with the wire object.
+- `meerkat-core`: `AgentError::ClientModelChangeRequiresHotSwap`, a
+  configuration-class error that names the durable and the requested provider
+  and model and points to `hot_swap_llm_identity`.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -424,6 +489,35 @@ them.
   `0x1F` is `31`, `~` is `null`). Quote a value with leading zeros, such as
   a file mode (`'0755'`), to keep it as text: unquoted, `0755` is `755.0`
   (upstream serde-saphyr issue #225).
+
+- The compaction summary is sized for the model that writes it: the
+  session's active model (after any model fallback) or the admitted
+  controller's. Its source may take two bytes per token of that model's
+  context window left after `max_summary_tokens` (capped by a declared input
+  ceiling, at least 4 KiB), instead of a quarter of the compaction threshold.
+  With the model-aware default threshold that is about ten times more (for a
+  200,000-token window, about 390 KB instead of 40 KB), so a summary call can
+  cost more input tokens as the model window grows; it never costs more than
+  the history being compacted plus the compaction prompt, because the source
+  is never larger than that history. A model with a small window and a large
+  explicit threshold gets a source its window holds instead of one sized for
+  the threshold; only a window too small for the 4 KiB minimum still
+  overflows, and the capacity fallback then writes a mechanical summary. A
+  model that declares no context window keeps the threshold rule.
+- Compaction no longer pays for a summary at every boundary when no rewrite
+  can get the history under the threshold. A history crossing bypassed
+  `min_turns_between_compactions` as capacity recovery even when the last
+  rewrite had left the history over the threshold, for example when the
+  System rows alone exceed an explicit `auto_compact_threshold`: every
+  boundary compacted again and paid for a summary call that recovered
+  nothing. Such a crossing now waits for the cadence, and a warning names the
+  remedies (raise `auto_compact_threshold` above that floor, omit it so it
+  derives from the model window, or shrink the System rows). A history
+  crossing still bypasses the cadence while the last rewrite got the history
+  under the threshold, and when the request no longer fits the model window
+  and the history added since that rewrite covers the overage; a model that
+  declares no context window has no overage, so there it waits. The
+  request-byte crossing keeps its bypass.
 
 ### Fixed
 
@@ -686,6 +780,10 @@ them.
 - A native web search cut at its output cap (`max_tokens`) or paused by the
   provider's server-tool loop (`pause_turn`) keeps its status and answer and
   now says, in its `error`, that the answer may be incomplete (#1887).
+
+- `meerkat-session`: the last-resort compaction source (user requests only)
+  no longer claims to keep every user request. Its note says it carries the
+  newest N of the M requests, and the completion reports the same counts.
 
 ## [0.9.3] - 2026-10-18
 

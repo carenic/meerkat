@@ -151,6 +151,7 @@ mod wasm_task;
 pub mod web_search;
 
 // Re-export main types at crate root
+pub use agent::compact::CompactionSummarySource;
 pub use agent::{
     Agent, AgentBuildPolicyError, AgentBuilder, AgentControlStateError, AgentExecutionSnapshot,
     AgentLlmClient, AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch,
@@ -220,6 +221,8 @@ pub use compact::{
     CompactionCuratorError, CompactionDiscard, CompactionResult, CompactionRetained,
     CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
     ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
+    SummarizationSource, SummarizationSourceBound, SummarizationSourceBudget,
+    SummarizationTrimStage,
 };
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,
