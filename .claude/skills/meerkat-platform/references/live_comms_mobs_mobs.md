@@ -31,6 +31,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   before Stop runs only after Resume. The result carries `stop_report` with
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
+  A member reported `reload_required` needs a durability reload: it starts no
+  turn until it is reloaded, and the reloaded member stays held until Resume.
   A spawn that finishes into a stopped mob leaves it stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately

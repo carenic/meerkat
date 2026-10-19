@@ -636,12 +636,16 @@ pub struct MobShutdownReport {
     pub members: BTreeMap<AgentIdentity, MemberShutdownOutcome>,
     /// What the Shutdown did to each autonomous member's run: a run current
     /// when it reached the member is cancelled immediately
-    /// ([`MemberStopRun::CancelledByShutdown`](super::stop_report::MemberStopRun::CancelledByShutdown)).
+    /// ([`MemberStopRun::CancelledByShutdown`](super::stop_report::MemberStopRun::CancelledByShutdown)),
+    /// and a member whose registration is durability-degraded is reported
+    /// [`MemberStopRun::ReloadRequired`](super::stop_report::MemberStopRun::ReloadRequired).
     pub runs: BTreeMap<AgentIdentity, super::stop_report::MemberStopRun>,
     /// Whether each roster member's run starts were held by the Shutdown:
     /// `Held` (locally, or through a remote member's host when the Shutdown
-    /// stopped that member), `NotHoldable`, or `DelegatedToHost` for a remote
-    /// member the Shutdown did not contact.
+    /// stopped that member), `NotHoldable`, `DelegatedToHost` for a remote
+    /// member the Shutdown did not contact, or `ReloadRequired` for a local
+    /// member whose durability-degraded registration refused the hold (its
+    /// teardown discards it).
     pub run_starts: BTreeMap<AgentIdentity, super::stop_report::MemberRunStarts>,
 }
 

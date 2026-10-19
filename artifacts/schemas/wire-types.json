@@ -119276,7 +119276,7 @@
         "type": "boolean"
       },
       "stop_report": {
-        "description": "For `stop`: what the stop did to each member's run and whether its\nrun starts are held (#1500). A member reported `not_holdable` may\nstill start a turn while the mob is stopped."
+        "description": "For `stop`: what the stop did to each member's run and whether its\nrun starts are held (#1500). A member reported `not_holdable` may\nstill start a turn while the mob is stopped. A member reported\n`reload_required` needs a durability reload: it starts no turn until\nit is reloaded, and the reloaded member stays held until resume."
       }
     },
     "required": [

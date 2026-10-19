@@ -5147,14 +5147,45 @@ impl SessionBackend {
                 starts: MemberRunStarts::Held,
             });
         }
-        let hold = adapter
-            .hold_run_starts(&session_id, meerkat_runtime::RunStartHoldReason::MobStop)
-            .await
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "holding run starts for '{session_id}' failed: {error}"
-                ))
-            })?;
+        // A durability-degraded registration refuses the hold at its
+        // durability gate. Confirmed by `durability_reload_required`, that
+        // refusal is the member's typed outcome: the registration starts no
+        // run until a reload replaces it, and a Shutdown's teardown discards
+        // it. A refusal the read does not confirm means a concurrent reload
+        // published a healthy registration meanwhile; that one is held, and
+        // the hold is tried at most once more.
+        let mut retried = false;
+        let hold = loop {
+            match adapter
+                .hold_run_starts(&session_id, meerkat_runtime::RunStartHoldReason::MobStop)
+                .await
+            {
+                Ok(hold) => break hold,
+                Err(error @ meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }) => {
+                    if adapter
+                        .durability_reload_required(&session_id)
+                        .await
+                        .is_some()
+                    {
+                        return Ok(MemberStopOutcome {
+                            run: MemberStopRun::ReloadRequired,
+                            starts: MemberRunStarts::ReloadRequired,
+                        });
+                    }
+                    if retried {
+                        return Err(MobError::Internal(format!(
+                            "holding run starts for '{session_id}' failed: {error}"
+                        )));
+                    }
+                    retried = true;
+                }
+                Err(error) => {
+                    return Err(MobError::Internal(format!(
+                        "holding run starts for '{session_id}' failed: {error}"
+                    )));
+                }
+            }
+        };
         let run = match (hold.current_run, cancel) {
             (None, _) => MemberStopRun::NoRun,
             (Some(run_id), MemberRunCancel::Leave) => MemberStopRun::LeftRunning { run_id },
@@ -14255,14 +14286,27 @@ impl MobProvisioner for SessionBackend {
         };
         // An unregistered runtime is released too: the release unstages the
         // reason, so its registration applies no hold for it.
-        adapter
-            .release_run_starts(&session_id, reason)
+        let Err(error) = adapter.release_run_starts(&session_id, reason).await else {
+            return Ok(());
+        };
+        // A durability-degraded registration refuses the release at its
+        // durability gate, after the release unstaged the reason. What the
+        // release is for already holds: no registration applies the reason
+        // again, the degraded one starts no run, and its own hold goes with
+        // it at the reload or the discard that replaces it.
+        if matches!(
+            error,
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+        ) && adapter
+            .durability_reload_required(&session_id)
             .await
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "releasing run starts for '{session_id}' failed: {error}"
-                ))
-            })
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(MobError::Internal(format!(
+            "releasing run starts for '{session_id}' failed: {error}"
+        )))
     }
 
     async fn stage_member_registration_run_start_hold(

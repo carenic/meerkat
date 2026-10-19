@@ -254,7 +254,25 @@ them.
   borrowed machine state under the authority lock, and samples the phase
   after an input in the same critical section as the transition.
 
+- `meerkat-mob`: `MemberStopRun::ReloadRequired` and
+  `MemberRunStarts::ReloadRequired`, the stop outcome of a member whose
+  runtime registration needs a durability reload (see Changed). Both enums are
+  `#[non_exhaustive]`.
+
 ### Changed
+
+- `meerkat-mob`: a mob Shutdown or Stop of a local member whose runtime
+  registration is durability-degraded reports the member's run and run
+  starts as `ReloadRequired`, where it failed or waited on the degraded
+  registration. That registration starts no run until a reload replaces it;
+  a Shutdown's teardown discards it and unregisters the cold successor, and
+  the `MobStop` a Stop staged first holds the reloaded registration until
+  Resume. An autonomous member's stop skips its comms-drain abort and its run
+  settlement for such a registration (the discard aborts and joins the drain
+  itself). Resume releases such a member. A Shutdown now holds every
+  member's run starts and reports the first failure in roster order instead
+  of stopping at it. On the wire, `stop_report` reports such a member with
+  `run` and `starts` `reload_required`.
 
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
@@ -506,6 +524,16 @@ them.
   unregister that waits for the gate before it stages its final unregister
   also ends typed and releases its teardown coordinator, so the
   reload-required discard can run.
+
+### Known limitations
+
+- `meerkat-mob`: in a multi-host mob, while a remote member's runtime needs
+  a durability reload, a Stop fails with an internal bridge rejection
+  (`MobError::BridgeCommandRejected`, cause `internal`), and so does a
+  Shutdown when that member is `AutonomousHost`: the member's host refuses
+  the run-start hold. A failed Stop rolls back and the mob stays Running; a
+  failed Shutdown keeps every member and can be retried. Reload that member
+  on its host, then retry.
 
 ## [0.9.3] - 2026-10-18
 
