@@ -250,6 +250,19 @@ impl HandleDslAuthority {
         input: mm_dsl::MeerkatMachineInput,
         context: &'static str,
     ) -> Result<mm_dsl::MeerkatMachineTransition, DslTransitionError> {
+        self.apply_input_with_transition_and_sample(input, context, |_| ())
+            .map(|(transition, ())| transition)
+    }
+
+    /// [`Self::apply_input_with_transition`], also running `sample` over the
+    /// state the transition produced while the authority mutex is still
+    /// held, so the transition and the sample are one coherent observation.
+    pub(crate) fn apply_input_with_transition_and_sample<S>(
+        &self,
+        input: mm_dsl::MeerkatMachineInput,
+        context: &'static str,
+        sample: impl FnOnce(&mm_dsl::MeerkatMachineState) -> S,
+    ) -> Result<(mm_dsl::MeerkatMachineTransition, S), DslTransitionError> {
         MeerkatMachineFieldlessRuntimeInternalInput::reject_raw_dsl_input(&input)
             .map_err(|reason| DslTransitionError::no_matching(context, reason))?;
         self.ensure_durability_ready(context)?;
@@ -275,7 +288,8 @@ impl HandleDslAuthority {
                 "run starts are held: the member's mob is stopped",
             ));
         }
-        Ok(transition)
+        let sampled = sample(guard.state());
+        Ok((transition, sampled))
     }
 
     /// Apply a DSL input, run `sample` on the emitted effects *while still
