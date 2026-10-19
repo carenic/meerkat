@@ -47,6 +47,10 @@ them.
   `LocalAuthorizationPublication::change_in_progress` answers it for the local
   owners, and the native run and audit wrappers forward it.
   `OwnerChangeWait::trace` records one wait as the debug event below.
+- `ToolDispatchContext::remaining_tool_time`: the tool time a fenced
+  dispatch has left, measured from its start against its plan's effective
+  timeout, for a tool that waits inside its body. The `web_search` helper's
+  owner-change wait is bounded by it.
 
 ### Fixed
 
@@ -75,8 +79,9 @@ them.
   consequence policy), inside the tool's timeout; the review check point
   runs on the decision prepared after the wait, so a reviewed tool whose
   decision changed meanwhile is reviewed once more (see below) and no review
-  is reused. The `web_search` tool's helper model request asks again under
-  the same delegate operation. A compaction summary waits within the same
+  is reused. The `web_search` tool's helper model request waits within the
+  call's remaining tool time and asks again under the same delegate
+  operation. A compaction summary waits within the same
   bounds, and past them the refusal still fails its compaction. When the
   body entry or the gate's staging waits out a change after recording its
   `Entry` record, it records another for the decision checked after the

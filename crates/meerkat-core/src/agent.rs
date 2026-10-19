@@ -1693,6 +1693,18 @@ impl ToolDispatchContext {
         self.work_authorization.as_ref()
     }
 
+    /// The tool time this fenced dispatch has left now, measured from the
+    /// dispatch's start against its plan's effective timeout. `None` without
+    /// a tool timeout, and for a context outside a fenced dispatch. A tool
+    /// that waits inside its body (for example out an owner change after a
+    /// refused delegate request) bounds the wait by it, so the wait never
+    /// turns the refusal into the dispatch's timeout.
+    pub fn remaining_tool_time(&self) -> Option<std::time::Duration> {
+        self.staging_wait
+            .as_ref()
+            .and_then(|wait| wait.deadline.remaining())
+    }
+
     /// Identity of the staged run this dispatch belongs to, when its native
     /// owner recorded one. A producer that outlives the call (fork_off, a
     /// council) retains it so the completion can resume exactly this work.
