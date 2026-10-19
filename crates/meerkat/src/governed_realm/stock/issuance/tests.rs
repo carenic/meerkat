@@ -334,19 +334,35 @@ fn the_selection_file_reads_the_legacy_forms_and_selects_per_server() {
     let older = &file.agents[DEFAULT_STOCK_AGENT];
     assert_eq!(older.operation.as_ref(), Some(&operation));
     assert_eq!(older.controller.as_ref(), Some(&controller));
-    // An older selection's single worker grant stands in for every target.
+    // An older selection's single worker grant stands in for every target,
+    // and is the whole work basis, the catalog's base work included.
     assert_eq!(older.server_lineage("alpha"), Some(&operation));
     assert_eq!(older.server_lineage("beta"), Some(&operation));
-    assert_eq!(older.catalog_lineage(), Some(&operation));
+    assert_eq!(
+        older.prompt_selection().map(|(basis, _)| basis),
+        Some(WorkAuthorityBasis::GrantLineage {
+            lineage: vec![operation]
+        })
+    );
 
     // Once a per-target grant exists, each target has only its own.
     let mut current = older.clone();
     current.mcp.insert("alpha".to_string(), alpha.clone());
     assert_eq!(current.server_lineage("alpha"), Some(&alpha));
     assert_eq!(current.server_lineage("beta"), None);
-    assert_eq!(current.catalog_lineage(), None);
+    assert!(matches!(
+        current.prompt_selection(),
+        Some((
+            WorkAuthorityBasis::TargetedGrantLineages { base: None, .. },
+            _
+        ))
+    ));
     current.catalog = Some(catalog.clone());
-    assert_eq!(current.catalog_lineage(), Some(&catalog));
+    assert!(matches!(
+        current.prompt_selection(),
+        Some((WorkAuthorityBasis::TargetedGrantLineages { base: Some(base), .. }, _))
+            if base == std::slice::from_ref(&catalog)
+    ));
     current.replace(&bundle_slot("mail", "read_mail"), alpha.clone());
     assert_eq!(current.get(&bundle_slot("mail", "read_mail")), Some(&alpha));
 
@@ -667,7 +683,7 @@ async fn bundle_operation_grants_are_selected_independently_and_retained_across_
     assert_eq!(refs.get(&bundle_slot("mail", "send_draft")), None);
     assert_eq!(refs.get(&bundle_slot("mail", "read_mail")), Some(&read));
     assert_eq!(refs.server_lineage("alpha"), Some(&alpha));
-    assert_eq!(refs.catalog_lineage(), Some(&catalog));
+    assert_eq!(refs.get(&StockGrantSlot::Catalog), Some(&catalog));
     let owner = restore_owner(root, "governed").unwrap();
     assert!(!resolves(&owner, &send, "agent-a"));
     assert!(resolves(&owner, &read, "agent-a"));
@@ -1276,7 +1292,6 @@ fn a_per_server_selection_never_falls_back_to_the_older_worker_grant() {
     refs.mcp.insert("alpha".to_string(), alpha.clone());
     assert_eq!(refs.server_lineage("alpha"), Some(&alpha));
     assert_eq!(refs.server_lineage("beta"), None);
-    assert_eq!(refs.catalog_lineage(), None);
     let (basis, selected_controller) = refs.prompt_selection().expect("selected");
     assert_eq!(selected_controller, controller);
     assert_eq!(
@@ -1423,7 +1438,6 @@ async fn removing_the_last_target_never_resurrects_the_older_worker_grant() {
     for server in ["alpha", "beta"] {
         assert_eq!(refs.server_lineage(server), None, "{server}");
     }
-    assert_eq!(refs.catalog_lineage(), None);
     assert_eq!(
         refs.prompt_selection().map(|(basis, _)| basis),
         Some(WorkAuthorityBasis::TargetedGrantLineages {
@@ -1497,7 +1511,6 @@ async fn revoking_the_last_target_of_an_older_mixed_selection_never_resurrects_i
     for server in ["alpha", "beta"] {
         assert_eq!(refs.server_lineage(server), None, "{server}");
     }
-    assert_eq!(refs.catalog_lineage(), None);
     assert_eq!(
         refs.prompt_selection().map(|(basis, _)| basis),
         Some(WorkAuthorityBasis::TargetedGrantLineages {
@@ -2133,7 +2146,7 @@ async fn a_reviewed_installation_is_granted_only_while_it_is_unchanged() {
     let refs = &file.agents["agent-a"];
     assert_eq!(refs.server_lineage("alpha"), Some(&granted.issued));
     assert_eq!(
-        refs.catalog_lineage(),
+        refs.get(&StockGrantSlot::Catalog),
         Some(&catalog),
         "unrelated, preserved"
     );

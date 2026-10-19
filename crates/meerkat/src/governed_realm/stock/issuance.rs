@@ -547,15 +547,6 @@ impl AgentGrantRefs {
         }
     }
 
-    /// The lineage selected for the tool catalog, the same way.
-    pub fn catalog_lineage(&self) -> Option<&GrantLineageRef> {
-        if self.legacy_only() {
-            self.operation.as_ref()
-        } else {
-            self.catalog.as_ref()
-        }
-    }
-
     /// The work basis and controller lineage of the agent's prompts, or
     /// `None` until the operator selected its controller and a worker grant.
     /// An older selection's single worker grant is the whole basis; otherwise

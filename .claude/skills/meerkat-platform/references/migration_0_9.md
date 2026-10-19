@@ -154,8 +154,9 @@ under `### Breaking`. The common ones:
 - `ApprovalStore::put` is replaced by `put_if_current(expected, record)` plus a
   required `get`, and `ApprovalStoreError::Backend` by `NotCommitted`,
   `Contended`, `Conflict` and `CommitUnknown`.
-- `SessionAgentMandate::new(executor, servers, catalog, represented_subject)`
-  selects a grant lineage per MCP server.
+- `SessionAgentMandate::new(executor, servers, represented_subject)` selects a
+  grant lineage per MCP server (through 0.9.3 it also took a `catalog`
+  lineage that nothing read).
 - New variants on `McpError`, `MobError`, `MobEventKind`,
   `meerkat_contracts::ErrorCode`, `AuthError` / `TokenStoreError` (typed
   credential access) and many generated machine-authority enums. Exact-pin the

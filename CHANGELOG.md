@@ -55,6 +55,17 @@ them.
   whichever registration of that session asks. Read the id with
   `registration.session_id()`; a closure provider is
   `Fn(&RuntimeSessionRegistrationWitness, SessionAgentBinding) -> Option<..>`.
+- `SessionAgentMandate::new` drops its `catalog` argument: it is now
+  `new(executor, servers, represented_subject)`. `SessionAgentMandate::catalog_lineage`
+  and the stock realm's `AgentGrantRefs::catalog_lineage` are removed. Nothing
+  read the mandate's catalog lineage: the agent's tool catalog is base work,
+  whose lineage the work's authority basis selects
+  (`AgentGrantRefs::prompt_selection` still places the catalog grant there). A
+  mandate now selects at least one MCP server (`AgentMandateError::NoSelection`
+  otherwise, whose message now says so). A stock selection that grants only
+  the catalog therefore binds no session agent: every configured MCP server
+  stays unavailable, as before, and the registration's binding stays free for
+  a server mandate.
 
 ### Added
 
@@ -102,6 +113,12 @@ them.
   notifications only shorten it. It still refuses when the sweep cannot
   start. A runtime delivery owner on such a store keeps its store watch on
   the sweep alone instead of reporting cross-process wake unavailable.
+- `meerkat-auth-core` and `rkat` no longer depend on the `webbrowser` crate,
+  which nothing called any more (a browser opens through
+  `HostLaunchExemption::browser_opener`). Builds drop it and its platform
+  subtree (`jni`, `objc2`, `ndk-context` and related crates). The launch-site
+  scanner and Clippy's `webbrowser::open` entries stay, so a reintroduced call
+  is still caught.
 
 ### Fixed
 
@@ -191,6 +208,20 @@ them.
   spawn, then panics in `watch()` and again in its `Drop` while the first
   panic unwinds. The registration now contains the panic, leaks that
   watcher instead of dropping it, and leaves the watch on its sweep.
+- The `meerkat-contracts`, `meerkat-runtime` and `rkat` packages build their
+  tests standalone. From rkat 0.8.1, meerkat-runtime 0.8.11 and
+  meerkat-contracts 0.8.26 through 0.9.3, their tests embedded files from
+  outside their own package, which no published package contains, so
+  `cargo test` in the unpacked published crate failed to compile
+  (meerkat-runtime's with the `sqlite-store` feature, meerkat-contracts'
+  with `schema`). rkat's mobpack help-versus-docs contract test embedded the
+  repository's `docs/`, and from 0.8.43 rkat's binary tests also embedded
+  meerkat-runtime's released-realm `config.toml`. meerkat-runtime's tests
+  embedded meerkat-core's synthetic 0.8.10 recovery-migration session, and
+  meerkat-contracts' tests meerkat-core's compiled-policy v1 fixtures. Each
+  crate now embeds its own byte-identical copy, pinned to the original's
+  SHA-256. The mobpack help test still reads `docs/`, so it stays out of the
+  rkat package and runs in the repository only.
 
 ## [0.9.3] - 2026-10-18
 

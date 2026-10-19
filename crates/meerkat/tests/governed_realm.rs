@@ -1069,6 +1069,77 @@ async fn per_server_grants_decide_each_server_by_its_own() {
     );
 }
 
+/// A selection that grants the agent only its tool catalog binds no session
+/// agent. The catalog is base work, which the work basis authorizes; a
+/// session's agent mandate carries MCP server lineages only. So every
+/// configured server stays unavailable, and the registration's set-once
+/// binding stays free for a later server mandate.
+#[tokio::test]
+async fn a_catalog_only_selection_binds_no_session_agent() {
+    use meerkat::governed_realm::stock::StockGovernance;
+    use meerkat::governed_realm::stock::issuance::{
+        StockGrantRequest, StockGrantTarget, grant_stock_agent,
+    };
+    use meerkat_runtime::meerkat_machine::SessionAgentMandate;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = realm_paths(tmp.path());
+    drop(open(tmp.path(), RealmGovernance::Ungoverned).await);
+    let reader = read_only_fixture();
+    install(&paths, reader.clone()).await;
+    let (realm, principals) = govern_as_operator(tmp.path()).await;
+    let catalog = grant_stock_agent(
+        tmp.path(),
+        "governed",
+        &principals,
+        &StockGrantRequest {
+            agent: "agent-a".to_string(),
+            target: StockGrantTarget::Catalog,
+            expires_in_ms: None,
+        },
+    )
+    .await
+    .expect("issued and selected")
+    .issued;
+
+    let stock = StockGovernance::new_for_agent(realm, principals.clone(), "agent-a")
+        .expect("agent principal");
+    let bundle = open(tmp.path(), RealmGovernance::Stock(Arc::clone(&stock))).await;
+    let machine = bundle.runtime_adapter();
+    let session = SessionId::new();
+    machine
+        .register_session(session.clone())
+        .await
+        .expect("registration");
+    let bindings = machine
+        .prepare_bindings(session.clone())
+        .await
+        .expect("bindings");
+    stock
+        .bind_session_agent(&machine, &session, [reader.name.as_str()])
+        .await
+        .expect("the host binds the agent's selection");
+    assert_eq!(
+        bindings
+            .configured_mcp_attachment()
+            .map(|authority| authority.authorize_configured(&reader)),
+        Some(Err(McpAttachmentRefusal::Unavailable)),
+        "a catalog grant never covers a configured server"
+    );
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    let servers = std::collections::BTreeMap::from([(reader.name.clone(), vec![catalog])]);
+    machine
+        .bind_session_agent_mandate(
+            &registration,
+            SessionAgentMandate::new(principals.executor.clone(), servers, None)
+                .expect("a server mandate"),
+        )
+        .await
+        .expect("the catalog-only selection left the registration unbound");
+}
+
 /// The fixture server installed under another name with a ceiling of `add`.
 fn adder_fixture() -> McpServerConfig {
     let mut server = read_only_fixture();
