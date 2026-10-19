@@ -28,7 +28,7 @@ use meerkat_core::{CommsCommand, HandlingMode, PeerRoute, SendReceipt};
 use meerkat_mob::runtime::bridge_protocol::{
     BridgeCommand, BridgeEventCursor, BridgeRejectionCause, BridgeReply, BridgeTurnOutcomeAck,
     MaterializeLaunchMode, MaterializeLaunchOutcome, PortableMcpDecl, WireFlowTurnOutcome,
-    portable_member_spec_digest,
+    WireSpawnContinuityIntent, portable_member_spec_digest,
 };
 use meerkat_mob::runtime::host_actor::{
     MaterializedMemberRow, MobHostActorError, MobHostBindingRecord,
@@ -909,6 +909,75 @@ async fn resume_launch_on_ephemeral_substrate_rejects_realm_backend_unavailable(
         .await
         .expect("typed reply");
     assert_rejected(&reply, &BridgeRejectionCause::RealmBackendUnavailable);
+
+    fixture.shutdown().await;
+}
+
+// ===========================================================================
+// T8c - Fresh launch on an ephemeral substrate: a DurableIdentity spec is
+// refused RealmBackendUnavailable; the same spec as Ephemeral materializes
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_durable_identity_on_ephemeral_substrate_is_refused_but_ephemeral_materializes() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = spawn_host_daemon_fixture(HostFixtureOptions::named("mat-t8c-host").ephemeral())
+        .await
+        .expect("ephemeral member fixture");
+    let probe = spawn_peer_comms_endpoint("mat-t8c-probe", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    raw_bind(&probe, &fixture, "mob-t8c", 1).await;
+
+    // A durable identity needs durable sessions even on a Fresh launch.
+    let mut durable_spec = sample_portable_member_spec("mob-t8c", "b2", "worker");
+    durable_spec.overlay.continuity_intent = WireSpawnContinuityIntent::DurableIdentity {
+        continuity_key: "b2".to_string(),
+    };
+    let durable = sample_materialize_payload(
+        &probe,
+        1,
+        durable_spec,
+        1,
+        1,
+        MaterializeLaunchMode::Fresh {},
+    );
+    let reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &BridgeCommand::MaterializeMember(durable),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("typed reply");
+    assert_rejected(&reply, &BridgeRejectionCause::RealmBackendUnavailable);
+    let record = fixture.host_binding_record("mob-t8c").await;
+    assert!(
+        record.materialized.is_empty(),
+        "the refused durable identity leaves no machine row"
+    );
+
+    // The same identity at the same tuple, spawned Ephemeral, needs no
+    // durable sessions: it materializes on this substrate.
+    let ephemeral = sample_materialize_payload(
+        &probe,
+        1,
+        sample_portable_member_spec("mob-t8c", "b2", "worker"),
+        1,
+        1,
+        MaterializeLaunchMode::Fresh {},
+    );
+    let reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &BridgeCommand::MaterializeMember(ephemeral),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("typed reply");
+    assert!(
+        matches!(reply, BridgeReply::MemberMaterialized(_)),
+        "an Ephemeral spec materializes on an ephemeral substrate, got {reply:?}"
+    );
 
     fixture.shutdown().await;
 }
