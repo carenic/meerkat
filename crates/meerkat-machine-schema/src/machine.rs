@@ -76,6 +76,7 @@ const NATIVE_MOB_MACHINE_HELPERS: &[&str] = &[
     "mob_coordination_resource_claim_inactive_at",
     // WAVE G2 machine folds (#181 respawn generation, #351 membership reconcile).
     "mob_machine_next_respawn_generation",
+    "mob_machine_next_minted_generation",
     "mob_machine_u64_is_exact_successor",
     "mob_machine_optional_u64_is_exact_successor",
     "mob_machine_members_to_spawn",

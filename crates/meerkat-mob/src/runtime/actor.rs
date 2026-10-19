@@ -15534,33 +15534,24 @@ impl MobActor {
         }
     }
 
-    /// Spawn-lane generation mint (ADJ-24): a fresh identity starts at
-    /// `Generation::INITIAL`; an identity with retired machine history mints
-    /// the machine-owned monotone successor through
-    /// [`Self::compute_respawn_generation`] so the replacement tuple always
-    /// sorts above every recorded incarnation (host Superseding, never
-    /// StaleFence). The discriminating fact is the machine's own
-    /// `identity_runtime_generations` counter.
+    /// Spawn-lane generation mint (ADJ-24): every spawn takes its generation
+    /// from the machine through [`Self::compute_respawn_generation`], so the
+    /// replacement tuple always sorts above every recorded incarnation (host
+    /// Superseding, never StaleFence), across a reset and a restart too. The
+    /// shell never decides that an identity is fresh: the machine mints
+    /// `Generation::INITIAL` only for an identity with neither a retained
+    /// generation nor a recovered high-water.
     fn mint_spawn_generation(
         &self,
         agent_identity: &AgentIdentity,
     ) -> Result<crate::ids::Generation, MobError> {
-        let dsl_identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
-        if self
-            .dsl_authority
-            .state()
-            .identity_runtime_generations
-            .contains_key(&dsl_identity)
-        {
-            self.compute_respawn_generation(agent_identity)
-        } else {
-            Ok(crate::ids::Generation::INITIAL)
-        }
+        self.compute_respawn_generation(agent_identity)
     }
 
-    /// Read-only MobMachine probe for the next monotone respawn generation. The
-    /// machine owns the per-identity generation counter (seeded by Spawn/Reset),
-    /// so this fully replaces the former shell-side `snapshot.generation.next()`
+    /// Read-only MobMachine probe for the next monotone generation. The
+    /// machine owns the per-identity generation counter (seeded by Spawn/Reset)
+    /// and the generation high-water resume recovers from the whole log, so
+    /// this fully replaces the former shell-side `snapshot.generation.next()`
     /// increment.
     fn compute_respawn_generation(
         &self,
@@ -27759,6 +27750,9 @@ impl MobActor {
                         identity_to_runtime: dsl.identity_to_runtime.clone(),
                         identity_runtime_generations: dsl.identity_runtime_generations.clone(),
                         identity_runtime_fence_tokens: dsl.identity_runtime_fence_tokens.clone(),
+                        identity_generation_highwater: dsl.identity_generation_highwater.clone(),
+                        identity_generation_highwater_sealed: dsl
+                            .identity_generation_highwater_sealed,
                         member_profile_names: dsl.member_profile_names.clone(),
                         member_runtime_modes: dsl.member_runtime_modes.clone(),
                         member_peer_ids: dsl.member_peer_ids.clone(),

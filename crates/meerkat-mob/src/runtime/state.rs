@@ -171,6 +171,11 @@ pub(crate) struct MobDslT2Snapshot {
         crate::machines::mob_machine::AgentIdentity,
         crate::machines::mob_machine::FenceToken,
     >,
+    pub identity_generation_highwater: std::collections::BTreeMap<
+        crate::machines::mob_machine::AgentIdentity,
+        crate::machines::mob_machine::Generation,
+    >,
+    pub identity_generation_highwater_sealed: bool,
     pub member_profile_names:
         std::collections::BTreeMap<crate::machines::mob_machine::AgentIdentity, String>,
     pub member_runtime_modes: std::collections::BTreeMap<
