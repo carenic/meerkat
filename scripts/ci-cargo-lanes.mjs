@@ -99,7 +99,9 @@
 // wave take runners first. The measurements are ROW_DURATIONS
 // (--row-durations), regenerated from green runs with
 // scripts/ci-row-durations.mjs; a stale entry only moves a row between
-// waves, never out of the plan.
+// waves, never out of the plan. A row is measured under its rowKey, its name
+// without the member count of a packed row, so a repack that moves line
+// counts keeps the row's measurement while its anchor stays the same.
 //
 // Cargo.lock. A lock change that is the only global path is scoped: the
 // package entries the diff adds, removes or changes (version, source,
@@ -509,28 +511,56 @@ export const ROW_DURATIONS = "scripts/ci-row-durations.json";
 export const WAVE_LANES = ["clippy", "main-unit", "closure-tests", "feature-check"];
 const MEASURED_LANES = ["unit", ...WAVE_LANES];
 
-// The measured row durations, `<lane>:<row name>` to whole seconds.
+// The measured row durations, `<lane>:<rowKey>` to whole seconds.
 export function readRowDurations(path) {
-  const data = JSON.parse(readFileSync(path, "utf8"));
-  if (data?.schema_version !== 1 || !data.rows || typeof data.rows !== "object" || Array.isArray(data.rows)) {
-    throw new Error(`${path} is not a schema-1 row-duration table`);
+  return checkRowDurations(JSON.parse(readFileSync(path, "utf8")), path);
+}
+
+// A row-duration table's rows, or an error: schema 2, every key a measured
+// lane and a rowKey, whole positive seconds. The generator checks the table
+// it writes with this too, so it cannot write one the planner refuses.
+export function checkRowDurations(data, label) {
+  if (data?.schema_version !== 2 || !data.rows || typeof data.rows !== "object" || Array.isArray(data.rows)) {
+    throw new Error(`${label} is not a schema-2 row-duration table`);
   }
   for (const [key, seconds] of Object.entries(data.rows)) {
     if (!MEASURED_LANES.includes(key.slice(0, key.indexOf(":"))) || !Number.isInteger(seconds) || seconds <= 0) {
-      throw new Error(`${path}: row ${JSON.stringify(key)} has no measured lane or no whole positive seconds`);
+      throw new Error(`${label}: row ${JSON.stringify(key)} has no measured lane or no whole positive seconds`);
+    }
+    const row = key.slice(key.indexOf(":") + 1);
+    if (rowKey(row) !== row) {
+      throw new Error(`${label}: row ${JSON.stringify(key)} carries a member count, so it matches no row; regenerate the table with scripts/ci-row-durations.mjs`);
     }
   }
   return data.rows;
+}
+
+// The key a row is measured under: its name without the member count of a
+// packed row ("+N" after the anchor that names it). Packing is by Rust line
+// count, so a merge that moves line counts changes N but not the anchor:
+// "core+12" is "core", "openai+8 bazel set" is "openai bazel set", and
+// "tests meerkat 1/5+3" is "tests meerkat 1/5". A lane's rows have disjoint
+// members, so their anchors, and their keys, differ.
+export function rowKey(name) {
+  return name.replace(/\+\d+(?= |$)/, "");
 }
 
 // A lane's rows in their two waves, by name.
 export function waveOf(lane, rows, durations) {
   const names = rows.map((row) => row.name);
   if (new Set(names).size !== names.length) throw new Error(`internal error: ${lane} rows repeat a name`);
+  const named = new Map();
+  for (const name of names) {
+    const key = rowKey(name);
+    if (named.has(key)) {
+      throw new Error(`internal error: ${lane} rows ${JSON.stringify(named.get(key))} and ${JSON.stringify(name)} share the measurement key ${JSON.stringify(key)}`);
+    }
+    named.set(key, name);
+  }
   const lookup = lane === "main-unit" ? [lane, "unit"] : [lane];
   const wave = { first: [], rest: [] };
   for (const row of rows) {
-    const seconds = lookup.map((name) => durations[`${name}:${row.name}`]).find((value) => value !== undefined);
+    const seconds = lookup.map((name) => durations[`${name}:${rowKey(row.name)}`]).find((value) => value !== undefined);
     wave[seconds === undefined || seconds >= WAVE_FIRST_SECONDS ? "first" : "rest"].push(row.name);
   }
   return wave;
