@@ -3774,6 +3774,18 @@ mod tests {
     /// tool results, then the durable system notice written at the next
     /// model boundary, then the model's next assistant message.
     fn durable_in_turn_notice_transcript() -> Vec<Message> {
+        durable_in_turn_transcript_with(Message::SystemNotice(
+            meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            ),
+        ))
+    }
+
+    /// The same transcript with `steer_row` as the row the steer wrote after
+    /// the tool results: a system notice, or the User row of a text-only
+    /// prompt steer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
         vec![
             Message::User(UserMessage::text("start the job")),
             Message::BlockAssistant(BlockAssistantMessage::new(
@@ -3790,10 +3802,7 @@ mod tests {
                 "lookup result".to_string(),
                 false,
             )]),
-            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
-                meerkat_core::SystemNoticeKind::Generic,
-                "background job finished",
-            )),
+            steer_row,
             Message::BlockAssistant(BlockAssistantMessage::new(
                 vec![AssistantBlock::Text {
                     text: "noted".to_string(),
@@ -3802,6 +3811,11 @@ mod tests {
                 StopReason::EndTurn,
             )),
         ]
+    }
+
+    /// The User row a text-only prompt steer writes into the running turn.
+    fn durable_in_turn_user_row() -> Message {
+        Message::User(UserMessage::text("also check the second file"))
     }
 
     #[test]
@@ -3839,6 +3853,41 @@ mod tests {
                 .all(|item| item["role"] != "system" && item["role"] != "developer"),
             "a mid-conversation notice never becomes a system/developer row"
         );
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_openai_body() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gpt-5.2",
+            durable_in_turn_transcript_with(durable_in_turn_user_row()),
+        );
+        let body = client.build_request_body(&request).unwrap();
+        let input = body["input"].as_array().expect("responses input array");
+        let call_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call")
+            .expect("function_call item");
+        let output_index = input
+            .iter()
+            .position(|item| item["type"] == "function_call_output")
+            .expect("function_call_output item");
+        assert_eq!(input[call_index]["call_id"], "call_1");
+        assert_eq!(input[output_index]["call_id"], "call_1");
+        assert!(
+            output_index > call_index,
+            "the tool output follows its call"
+        );
+        let steer_index = input
+            .iter()
+            .position(|item| item.to_string().contains("also check the second file"))
+            .expect("steer user item");
+        assert_eq!(
+            steer_index,
+            output_index + 1,
+            "the steer's User row directly follows the tool output"
+        );
+        assert_eq!(input[steer_index]["role"], "user");
     }
 
     fn assistant_image_block() -> AssistantBlock {

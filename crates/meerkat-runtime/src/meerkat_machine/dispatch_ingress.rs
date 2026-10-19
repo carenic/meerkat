@@ -635,7 +635,10 @@ impl MeerkatMachine {
         ),
         RuntimeDriverError,
     > {
-        let live_boundary_plan = {
+        // Held until this function returns: a durable Steer's place in the
+        // session's durable Steer order (`DurableSteerOrder`).
+        let mut durable_work = None;
+        let live_boundary_plan = loop {
             let driver = witness.driver.lock().await;
             let Some(run_id) = driver.current_run_id() else {
                 tracing::debug!(
@@ -655,8 +658,11 @@ impl MeerkatMachine {
             // FIFO is per machine-owned delivery class: a durable delivery
             // occupies its own boundary slot (and may wait across a closed
             // window), so it never pushes a later request-only steer to a
-            // follow-up turn, and vice versa. Within a class the earliest
-            // admission keeps the head.
+            // follow-up turn, and vice versa. Within the request-only class
+            // the earliest admission keeps the head. Within the durable class
+            // each boundary takes one delivery, oldest first: a later durable
+            // steer waits for the older one's work to settle and then joins
+            // the following boundary, or follows it to its follow-up turn.
             let ingress = driver.driver_ingress();
             let candidate_is_durable =
                 semantics_class_is_durable(ingress.runtime_semantics(input_id));
@@ -665,9 +671,34 @@ impl MeerkatMachine {
                 semantics_class_is_durable(ingress.runtime_semantics(candidate))
                     == candidate_is_durable
             });
-            if steer_queue.iter().any(|candidate| candidate == input_id)
-                && class_head != Some(input_id)
-            {
+            let in_steer_lane = steer_queue.iter().any(|candidate| candidate == input_id);
+            if in_steer_lane && candidate_is_durable {
+                let order = ingress.durable_steer_order();
+                let mut settled = std::pin::pin!(order.settled().notified());
+                settled.as_mut().enable();
+                let work = durable_work.get_or_insert_with(|| order.begin(input_id));
+                match work.turn(class_head) {
+                    crate::driver::ephemeral::DurableSteerTurn::Prepare => {}
+                    crate::driver::ephemeral::DurableSteerTurn::Wait => {
+                        drop(driver);
+                        drop(held_mutation_gate);
+                        settled.await;
+                        held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
+                        continue;
+                    }
+                    crate::driver::ephemeral::DurableSteerTurn::FollowUp => {
+                        // It keeps its steer-lane state behind the earlier
+                        // one, so the follow-up turn delivers both in order.
+                        drop(driver);
+                        return Ok(Self::durable_live_boundary_fallback(
+                            session_id,
+                            input_id,
+                            held_mutation_gate,
+                            &"an earlier durable steer in the lane takes its follow-up turn",
+                        ));
+                    }
+                }
+            } else if in_steer_lane && class_head != Some(input_id) {
                 drop(driver);
                 held_mutation_gate = self
                     .normalize_live_boundary_queued_fallback(
@@ -683,7 +714,7 @@ impl MeerkatMachine {
                 tracing::debug!(
                     session_id = %session_id,
                     input_id = %input_id,
-                    "later live-boundary candidate retained durable FIFO behind earlier active-run admission"
+                    "later request-only live-boundary candidate retained FIFO behind earlier active-run admission"
                 );
                 return Ok((
                     held_mutation_gate,
@@ -728,7 +759,7 @@ impl MeerkatMachine {
                     .await;
                 return Err(error);
             };
-            if semantics.live_boundary_delivery()
+            break if semantics.live_boundary_delivery()
                 == Some(crate::ingress_types::LiveBoundaryDeliveryClass::DurableAppend)
             {
                 // The durable payload is exactly the appends the fallback
@@ -783,7 +814,7 @@ impl MeerkatMachine {
                     ));
                 }
                 (run_id, LiveBoundaryDeliveryPlan::RequestOnly(contexts))
-            }
+            };
         };
         let (run_id, contexts) = match live_boundary_plan {
             (run_id, LiveBoundaryDeliveryPlan::RequestOnly(contexts)) => (run_id, contexts),

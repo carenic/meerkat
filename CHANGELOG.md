@@ -111,6 +111,21 @@ them.
   0.9.3 asked the host about a caller equal to that principal, and could
   admit it.
 
+- Behaviour (no type change): every content steer admitted while a turn runs
+  (a prompt, a peer message, request or lifecycle notice, an external event or
+  a local flow step) is now written into the running turn's transcript at a
+  model boundary (`MeerkatMachine` delivery class `DurableAppend`) or, when it
+  carries something only a fresh turn applies or is a directed delivery,
+  taken by exactly one follow-up turn. Before, peer message and request
+  steers and text-only prompt steers reached exactly one model request and
+  never the transcript. Hosts and consoles now see their rows in history,
+  `boundary_append_applied` when the runner writes them, and one
+  `peer_content_ingested` per incoming comms notice. Durable steers join one
+  per boundary, in arrival order: a steer admitted while an earlier one still
+  waits joins the boundary after it, in the same run, instead of falling back
+  to the follow-up turn; steers still waiting when the run ends take the
+  follow-up turn in arrival order.
+
 ### Added
 
 - `LocalGrantAuthority::resolve_lineage_observed`,
@@ -229,6 +244,18 @@ them.
   and a whole scripted turn with three tool calls about 23% less.
 
 ### Fixed
+
+- A peer message or request steered into a running turn was shown to the
+  model for one request and then lost (`meerkat-runtime`,
+  `meerkat-machine-schema`):
+  the machine classified it request-only, so it was consumed when it was
+  injected, never written to the transcript, missing from every later request
+  of the run and from history, and no `peer_content_ingested` event was
+  published for it. Text-only prompt steers, external-event steers and local
+  flow-step steers lost the same way. They now take the durable in-turn path
+  (see Breaking): one transcript row, committed with the run, recovered by
+  exactly one follow-up turn when its image is discarded or the process stops
+  mid-run. Pre-existing in 0.9.2 and 0.9.3.
 
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its

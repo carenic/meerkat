@@ -13,9 +13,13 @@
 //! - when the model is streaming and then returns tool calls, the notice waits
 //!   for that next boundary of the same run;
 //! - when the model is streaming and then answers without another boundary,
-//!   exactly one follow-up turn carries the notice;
-//! - a request-only peer steer is unchanged: the next request only, never the
-//!   transcript.
+//!   exactly one follow-up turn carries the notice.
+//!
+//! Every other content steer (a peer message, request or lifecycle notice, a
+//! text-only prompt, an external event, a local flow step) joins the running
+//! turn the same way, and a peer steer emits exactly one
+//! `peer_content_ingested`. Three peer steers admitted inside one gated
+//! boundary each land exactly once, in arrival order.
 //!
 //! The scripted client is installed through BOTH
 //! `SessionRuntime::set_default_llm_client` and
@@ -48,8 +52,23 @@ const TURN_PROMPT: &str = "DURABLE-STEER-TURN run several tools";
 const FINAL_TEXT: &str = "DURABLE-STEER-FINAL";
 const FOLLOW_UP_ACK: &str = "DURABLE-STEER-FOLLOW-UP";
 const NOTICE_TOKEN: &str = "DURABLE-NOTICE-TOKEN-8R";
-const PEER_TOKEN: &str = "REQUEST-ONLY-PEER-TOKEN-5V";
+const PEER_MESSAGE_TOKEN: &str = "DURABLE-PEER-MESSAGE-TOKEN-5V";
+const PEER_REQUEST_TOKEN: &str = "DURABLE-PEER-REQUEST-TOKEN-6W";
+const PEER_LIFECYCLE_TOKEN: &str = "DURABLE-PEER-LIFECYCLE-TOKEN-7X";
+const TEXT_PROMPT_TOKEN: &str = "DURABLE-TEXT-PROMPT-TOKEN-8Y";
+const EXTERNAL_EVENT_TOKEN: &str = "DURABLE-EXTERNAL-EVENT-TOKEN-9Z";
+const FLOW_STEP_TOKEN: &str = "DURABLE-FLOW-STEP-TOKEN-2A";
+const LATE_PEER_TOKEN: &str = "DURABLE-LATE-PEER-TOKEN-3B";
+const ORDERED_PEER_TOKENS: [&str; 3] = [
+    "DURABLE-PEER-FIRST-4C",
+    "DURABLE-PEER-SECOND-5D",
+    "DURABLE-PEER-THIRD-6E",
+];
 const WAIT: Duration = Duration::from_secs(60);
+/// How long each `probe_step` tool call takes in the three-steer scenario,
+/// so a durable steer that prepares after the previous one joined usually
+/// catches the following boundary. The assertions hold either way.
+const ORDERED_STEP_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
@@ -82,10 +101,11 @@ impl Hold {
 struct GateTools {
     defs: Arc<[Arc<meerkat_core::ToolDef>]>,
     hold: Arc<Hold>,
+    step_delay: Duration,
 }
 
 impl GateTools {
-    fn new(hold: Arc<Hold>) -> Self {
+    fn new(hold: Arc<Hold>, step_delay: Duration) -> Self {
         let defs = ["probe_block", "probe_step"]
             .iter()
             .map(|name| {
@@ -99,7 +119,11 @@ impl GateTools {
             })
             .collect::<Vec<_>>()
             .into();
-        Self { defs, hold }
+        Self {
+            defs,
+            hold,
+            step_delay,
+        }
     }
 }
 
@@ -115,6 +139,8 @@ impl meerkat_core::AgentToolDispatcher for GateTools {
     ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
         if call.name == "probe_block" {
             self.hold.hold().await;
+        } else if !self.step_delay.is_zero() {
+            tokio::time::sleep(self.step_delay).await;
         }
         Ok(
             meerkat_core::ToolResult::new(call.id.to_string(), format!("{} ok", call.name), false)
@@ -403,35 +429,102 @@ fn durable_notice_steer() -> meerkat_runtime::Input {
     meerkat_runtime::Input::Prompt(prompt)
 }
 
-fn request_only_peer_steer() -> meerkat_runtime::Input {
+fn steer_header(source: meerkat_runtime::InputOrigin) -> meerkat_runtime::InputHeader {
+    meerkat_runtime::InputHeader {
+        ingress_context: None,
+        retained_resume: None,
+        authority_association: None,
+        id: meerkat_core::lifecycle::InputId::new(),
+        timestamp: chrono::Utc::now(),
+        source,
+        durability: meerkat_runtime::InputDurability::Durable,
+        visibility: meerkat_runtime::InputVisibility::default(),
+        idempotency_key: None,
+        supersession_key: None,
+        correlation_id: None,
+    }
+}
+
+fn steer_metadata() -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+        handling_mode: Some(HandlingMode::Steer),
+        ..Default::default()
+    }
+}
+
+/// A peer steer as the comms bridge admits it: a canonical peer id, no
+/// directed interaction, no system prompts or injected context.
+fn peer_steer(convention: meerkat_runtime::PeerConvention, token: &str) -> meerkat_runtime::Input {
     meerkat_runtime::Input::Peer(meerkat_runtime::PeerInput {
         directed_interaction_id: None,
         objective_id: None,
         system_prompts: Vec::new(),
         injected_context: Vec::new(),
         sender_taint: None,
-        header: meerkat_runtime::InputHeader {
-            ingress_context: None,
-            retained_resume: None,
-            authority_association: None,
-            id: meerkat_core::lifecycle::InputId::new(),
-            timestamp: chrono::Utc::now(),
-            source: meerkat_runtime::InputOrigin::Peer {
-                peer_id: "durable-steer-peer".into(),
-                display_identity: None,
-                runtime_id: None,
-            },
-            durability: meerkat_runtime::InputDurability::Durable,
-            visibility: meerkat_runtime::InputVisibility::default(),
-            idempotency_key: None,
-            supersession_key: None,
-            correlation_id: None,
-        },
-        convention: Some(meerkat_runtime::PeerConvention::Message),
-        content: ContentInput::Text(PEER_TOKEN.to_string()),
+        header: steer_header(meerkat_runtime::InputOrigin::Peer {
+            peer_id: uuid::Uuid::new_v4().to_string(),
+            display_identity: None,
+            runtime_id: None,
+        }),
+        convention: Some(convention),
+        content: ContentInput::Text(token.to_string()),
         payload: None,
         handling_mode: Some(HandlingMode::Steer),
     })
+}
+
+fn peer_message_steer(token: &str) -> meerkat_runtime::Input {
+    peer_steer(meerkat_runtime::PeerConvention::Message, token)
+}
+
+fn peer_request_steer(token: &str) -> meerkat_runtime::Input {
+    peer_steer(
+        meerkat_runtime::PeerConvention::Request {
+            request_id: format!("req-{}", uuid::Uuid::new_v4()),
+            intent: "durable_steer_probe".into(),
+        },
+        token,
+    )
+}
+
+fn peer_lifecycle_steer(token: &str) -> meerkat_runtime::Input {
+    peer_steer(
+        meerkat_runtime::PeerConvention::Lifecycle {
+            kind: meerkat_core::comms::PeerLifecycleKind::PeerAdded,
+        },
+        token,
+    )
+}
+
+fn text_prompt_steer(token: &str) -> meerkat_runtime::Input {
+    meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+        token,
+        Some(steer_metadata()),
+    ))
+}
+
+fn external_event_steer(token: &str) -> meerkat_runtime::Input {
+    meerkat_runtime::Input::ExternalEvent(meerkat_runtime::ExternalEventInput {
+        header: steer_header(meerkat_runtime::InputOrigin::External {
+            source_name: "webhook".into(),
+        }),
+        event_type: "webhook".into(),
+        payload: json!({ "body": token }),
+        blocks: None,
+        handling_mode: HandlingMode::Steer,
+        render_metadata: None,
+        objective_id: None,
+    })
+}
+
+fn flow_step_steer(token: &str) -> meerkat_runtime::Input {
+    meerkat_runtime::mob_adapter::create_flow_step_input(
+        "durable-steer-step",
+        ContentInput::Text(token.to_string()),
+        "durable-steer-flow",
+        0,
+        Some(steer_metadata()),
+    )
 }
 
 fn notice_rows(messages: &[Message]) -> usize {
@@ -444,8 +537,12 @@ fn notice_rows(messages: &[Message]) -> usize {
         .count()
 }
 
-fn mentions(messages: &[Message], token: &str) -> bool {
-    format!("{messages:?}").contains(token)
+/// Messages of one model request that carry `token`, whatever their role.
+fn token_rows(messages: &[Message], token: &str) -> usize {
+    messages
+        .iter()
+        .filter(|message| format!("{message:?}").contains(token))
+        .count()
 }
 
 struct Outcome {
@@ -453,9 +550,19 @@ struct Outcome {
     /// Index of the first gated-turn request recorded after the steer.
     first_after_gate: usize,
     history: Vec<Value>,
+    /// `peer_content_ingested` events the target session published.
+    peer_ingested: usize,
 }
 
-async fn run_scenario(gate: Gate, steer: meerkat_runtime::Input) -> Outcome {
+async fn run_scenario(gate: Gate, steers: Vec<meerkat_runtime::Input>) -> Outcome {
+    run_scenario_with(gate, steers, Duration::ZERO).await
+}
+
+async fn run_scenario_with(
+    gate: Gate,
+    steers: Vec<meerkat_runtime::Input>,
+    step_delay: Duration,
+) -> Outcome {
     let temp = tempfile::TempDir::new().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let hold = Arc::new(Hold::default());
@@ -464,7 +571,7 @@ async fn run_scenario(gate: Gate, steer: meerkat_runtime::Input) -> Outcome {
         hold: Arc::clone(&hold),
         gate,
     });
-    let gate_tools = Arc::new(GateTools::new(Arc::clone(&hold)));
+    let gate_tools = Arc::new(GateTools::new(Arc::clone(&hold), step_delay));
     let (router, mob_state) = make_stack(temp.path(), client, gate_tools).await;
     let runtime = mob_state
         .session_service()
@@ -485,6 +592,24 @@ async fn run_scenario(gate: Gate, steer: meerkat_runtime::Input) -> Outcome {
         .resolve_bridge_session_id(&AgentIdentity::from(TARGET))
         .await
         .expect("target session");
+    let mut events = meerkat_mob::MobSessionService::subscribe_session_events(
+        mob_state.session_service().as_ref(),
+        &session,
+    )
+    .await
+    .expect("subscribe to the target's session events");
+    let peer_ingested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ingested = Arc::clone(&peer_ingested);
+    let event_reader = tokio::spawn(async move {
+        while let Some(envelope) = futures::StreamExt::next(&mut events).await {
+            if matches!(
+                envelope.payload,
+                meerkat_core::AgentEvent::PeerContentIngested { .. }
+            ) {
+                ingested.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
 
     let spec = BoundedResultSpec::new("turn", 16 * 1024).expect("bounded result spec");
     let work = handle
@@ -523,11 +648,13 @@ async fn run_scenario(gate: Gate, steer: meerkat_runtime::Input) -> Outcome {
     }
     let first_after_gate = requests.lock().unwrap().len();
 
-    let (outcome, _completion) = runtime
-        .accept_input_with_completion(&session, steer)
-        .await
-        .expect("steer admitted while the turn runs");
-    assert!(outcome.is_accepted());
+    for steer in steers {
+        let (outcome, _completion) = runtime
+            .accept_input_with_completion(&session, steer)
+            .await
+            .expect("steer admitted while the turn runs");
+        assert!(outcome.is_accepted());
+    }
     // Let the ingress prepare its boundary delivery before releasing.
     tokio::time::sleep(Duration::from_millis(300)).await;
     hold.released.store(true, Ordering::SeqCst);
@@ -553,11 +680,14 @@ async fn run_scenario(gate: Gate, steer: meerkat_runtime::Input) -> Outcome {
     }
     let history = session_history(&router, &session).await;
     let requests = requests.lock().unwrap().clone();
+    event_reader.abort();
+    let peer_ingested = peer_ingested.load(Ordering::SeqCst);
     let _ = mob_state.mob_destroy(&mob_id).await;
     Outcome {
         requests,
         first_after_gate,
         history,
+        peer_ingested,
     }
 }
 
@@ -572,6 +702,16 @@ fn history_notice_positions(history: &[Value]) -> Vec<usize> {
         .filter(|(_, row)| {
             history_role(row) == "system_notice" && row.to_string().contains(NOTICE_TOKEN)
         })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Transcript rows that carry `token`, whatever their role.
+fn history_token_positions(history: &[Value], token: &str) -> Vec<usize> {
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.to_string().contains(token))
         .map(|(index, _)| index)
         .collect()
 }
@@ -619,21 +759,65 @@ fn assert_in_turn_delivery(outcome: &Outcome) {
     );
 }
 
+/// A content steer joined the running turn at the gated boundary: every
+/// request of the run after the gate carries it exactly once, the transcript
+/// holds it once between the boundary's tool results and the next assistant
+/// message, no follow-up turn runs, and `peer_ingested` ingestion events were
+/// published.
+fn assert_steer_joins_the_running_turn(outcome: &Outcome, token: &str, peer_ingested: usize) {
+    let requests = &outcome.requests;
+    assert!(
+        requests.iter().all(|request| request.in_turn),
+        "no follow-up turn runs"
+    );
+    for request in &requests[..outcome.first_after_gate] {
+        assert_eq!(token_rows(&request.messages, token), 0);
+    }
+    let after = &requests[outcome.first_after_gate..];
+    assert!(after.len() >= 3, "three requests follow the gate");
+    for (index, request) in after.iter().enumerate() {
+        assert_eq!(
+            token_rows(&request.messages, token),
+            1,
+            "request {index} after the gate carries the steer once, as every later one of the run"
+        );
+    }
+    let positions = history_token_positions(&outcome.history, token);
+    assert_eq!(
+        positions.len(),
+        1,
+        "one transcript row: {:?}",
+        outcome.history
+    );
+    let at = positions[0];
+    assert_eq!(history_role(&outcome.history[at - 1]), "tool_results");
+    assert_eq!(history_role(&outcome.history[at + 1]), "block_assistant");
+    assert_eq!(
+        assistant_run_ids(&outcome.history).len(),
+        1,
+        "every assistant message belongs to the one running run"
+    );
+    assert_eq!(
+        outcome.peer_ingested, peer_ingested,
+        "peer_content_ingested events"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_fast_durable_steer_joins_the_running_turn_after_its_tool_results() {
-    let outcome = run_scenario(Gate::Tool, durable_notice_steer()).await;
+    let outcome = run_scenario(Gate::Tool, vec![durable_notice_steer()]).await;
     assert_in_turn_delivery(&outcome);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_fast_durable_steer_waits_while_the_model_streams_for_the_next_boundary() {
-    let outcome = run_scenario(Gate::ModelThenTools, durable_notice_steer()).await;
+    let outcome = run_scenario(Gate::ModelThenTools, vec![durable_notice_steer()]).await;
     assert_in_turn_delivery(&outcome);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_fast_durable_steer_without_a_later_boundary_takes_exactly_one_follow_up() {
-    let outcome = run_scenario(Gate::ModelThenAnswer, durable_notice_steer()).await;
+    let outcome = run_scenario(Gate::ModelThenAnswer, vec![durable_notice_steer()]).await;
     let in_turn_hits = outcome
         .requests
         .iter()
@@ -652,26 +836,121 @@ async fn e2e_fast_durable_steer_without_a_later_boundary_takes_exactly_one_follo
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_fast_request_only_peer_steer_stays_request_local() {
-    let outcome = run_scenario(Gate::Tool, request_only_peer_steer()).await;
-    let requests = &outcome.requests;
-    assert!(
-        requests.iter().all(|request| request.in_turn),
-        "no follow-up turn runs"
+async fn e2e_fast_peer_message_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![peer_message_steer(PEER_MESSAGE_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, PEER_MESSAGE_TOKEN, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_peer_request_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![peer_request_steer(PEER_REQUEST_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, PEER_REQUEST_TOKEN, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_peer_lifecycle_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![peer_lifecycle_steer(PEER_LIFECYCLE_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, PEER_LIFECYCLE_TOKEN, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_text_prompt_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![text_prompt_steer(TEXT_PROMPT_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, TEXT_PROMPT_TOKEN, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_external_event_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![external_event_steer(EXTERNAL_EVENT_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, EXTERNAL_EVENT_TOKEN, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_flow_step_steer_joins_the_running_turn_once() {
+    let outcome = run_scenario(Gate::Tool, vec![flow_step_steer(FLOW_STEP_TOKEN)]).await;
+    assert_steer_joins_the_running_turn(&outcome, FLOW_STEP_TOKEN, 0);
+}
+
+/// A peer steer admitted while the model streams its final answer has no
+/// later boundary: exactly one follow-up turn writes it, and it is ingested
+/// once.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_peer_steer_without_a_later_boundary_takes_exactly_one_follow_up() {
+    let outcome = run_scenario(
+        Gate::ModelThenAnswer,
+        vec![peer_message_steer(LATE_PEER_TOKEN)],
+    )
+    .await;
+    let in_turn_hits = outcome
+        .requests
+        .iter()
+        .filter(|request| request.in_turn && token_rows(&request.messages, LATE_PEER_TOKEN) > 0)
+        .count();
+    assert_eq!(in_turn_hits, 0, "no boundary opened in the running turn");
+    let follow_ups = outcome
+        .requests
+        .iter()
+        .filter(|request| !request.in_turn)
+        .collect::<Vec<_>>();
+    assert_eq!(follow_ups.len(), 1, "exactly one follow-up turn");
+    assert_eq!(token_rows(&follow_ups[0].messages, LATE_PEER_TOKEN), 1);
+    assert_eq!(
+        history_token_positions(&outcome.history, LATE_PEER_TOKEN).len(),
+        1
     );
-    let after = &requests[outcome.first_after_gate..];
-    assert!(mentions(&after[0].messages, PEER_TOKEN));
-    assert!(
-        after[1..]
+    assert_eq!(assistant_run_ids(&outcome.history).len(), 2);
+    assert_eq!(outcome.peer_ingested, 1, "peer_content_ingested events");
+}
+
+/// Three peer steers admitted inside one gated boundary each
+/// land exactly once, in arrival order, and once a request carries one, every
+/// later request carries it once. Where each lands (one per boundary, the
+/// last possibly in the follow-up turn) is pinned exactly by the runtime
+/// test `three_peer_steers_in_one_gated_boundary_land_once_each_in_arrival_order`.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_fast_three_peer_steers_in_one_gated_boundary_land_once_each_in_arrival_order() {
+    let outcome = run_scenario_with(
+        Gate::Tool,
+        ORDERED_PEER_TOKENS
             .iter()
-            .all(|request| !mentions(&request.messages, PEER_TOKEN)),
-        "request-only context reaches exactly one request"
+            .map(|token| peer_message_steer(token))
+            .collect(),
+        ORDERED_STEP_DELAY,
+    )
+    .await;
+    let mut rows = Vec::new();
+    let mut first_requests = Vec::new();
+    for token in ORDERED_PEER_TOKENS {
+        let positions = history_token_positions(&outcome.history, token);
+        assert_eq!(
+            positions.len(),
+            1,
+            "{token}: one transcript row: {:?}",
+            outcome.history
+        );
+        rows.push(positions[0]);
+        let first = outcome
+            .requests
+            .iter()
+            .position(|request| token_rows(&request.messages, token) > 0)
+            .unwrap_or_else(|| panic!("{token} reaches a request"));
+        assert!(first >= outcome.first_after_gate);
+        for request in &outcome.requests[first..] {
+            assert_eq!(
+                token_rows(&request.messages, token),
+                1,
+                "{token} stays in every later request exactly once"
+            );
+        }
+        first_requests.push(first);
+    }
+    assert!(
+        rows.windows(2).all(|pair| pair[0] < pair[1]),
+        "transcript rows in arrival order: {rows:?}"
     );
     assert!(
-        outcome
-            .history
-            .iter()
-            .all(|row| !row.to_string().contains(PEER_TOKEN)),
-        "request-only context never enters the transcript"
+        first_requests.windows(2).all(|pair| pair[0] <= pair[1]),
+        "first delivery in arrival order: {first_requests:?}"
     );
+    assert_eq!(outcome.peer_ingested, 3, "peer_content_ingested events");
 }

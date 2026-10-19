@@ -23,6 +23,18 @@
 \* job) runs it at a lane-sized bound; run a deeper bound by hand with:
 \*   specs/machines/meerkat_machine/durable_in_turn_steer_audit.sh 22
 \*
+\* The safety run admits the late input as a Prompt. That stands for every
+\* content input kind: the admission writes the kind only into
+\* input_is_prompt, whose values nothing in the generated model reads, so each
+\* kind reaches the Prompt run's states up to that flag (at bound 16 a
+\* PeerMessage-only run reaches exactly as many states as the Prompt run).
+\* The runner checks both premises on the generated model and fails if either
+\* stops holding; DURABLE_STEER_AUDIT_ALL_KINDS=1 runs the safety run over
+\* every content kind. The runner then requires, once per content kind, that
+\* TLC reaches a durable join of the late input (AuditLateNeverJoins violated
+\* with AuditLateKinds narrowed to that kind), so the admission lets every
+\* kind join and the exactly-once invariants are not vacuous for any of them.
+\*
 \* Scope limit: the generated model has no crash action, so durable-row
 \* recovery (RecoverInputLifecycle and durable-tail adoption after a process
 \* dies mid-run) is outside this audit. The Rust test
@@ -32,6 +44,10 @@ EXTENDS model
 
 \* Upper bound on model_step_count, including the deterministic prefix.
 CONSTANT AuditMaxSteps
+
+\* Admission input kinds the late Steer input may take: Prompt in the safety
+\* run (every content kind on request), one kind per reachability goal run.
+CONSTANT AuditLateKinds
 
 AuditRun == "runid_1"
 AuditSession == "sessionid_1"
@@ -56,10 +72,11 @@ AuditPrefix ==
     \/ model_step_count = 6 /\ StartConversationRunRunning(AuditRun, "ConversationTurn", "conversation", FALSE, FALSE, 0)
     \/ model_step_count = 7 /\ PrimitiveAppliedConversation(AuditRun)
 
-\* The late Steer input under every turn-append shape the shell can report.
+\* The late Steer input of the audited kinds under every turn-append shape the
+\* shell can report.
 AuditLateAdmission ==
-    \/ \E shape \in AdmissionTurnAppendShapeValues :
-        ResolveAdmissionPlanRequestedSteerRunning(AuditLate, None, None, "Prompt", Some("Steer"), "Ordinary", shape, FALSE, None, TRUE, TRUE, FALSE)
+    \/ \E kind \in AuditLateKinds : \E shape \in AdmissionTurnAppendShapeValues :
+        ResolveAdmissionPlanRequestedSteerRunning(AuditLate, None, None, kind, Some("Steer"), "Ordinary", shape, FALSE, None, TRUE, TRUE, FALSE)
     \/ SteerAcceptedRunning(AuditLate)
 
 AuditTurn ==
@@ -139,4 +156,9 @@ AuditPublishedJoinIsStaged ==
 \* A joined input is never stageable for a follow-up while its join is live.
 AuditJoinedInputNotInAnyLane ==
     \A input \in DOMAIN input_live_boundary_join_run : input \notin DOMAIN input_lane
+
+\* Reachability goal, never a safety property: the runner requires TLC to
+\* report it violated for each content kind, proving the late input of that
+\* kind joins the running run within the bound.
+AuditLateNeverJoins == AuditLate \notin DOMAIN input_live_boundary_join_run
 ====

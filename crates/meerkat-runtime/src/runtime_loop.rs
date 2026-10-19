@@ -56,12 +56,18 @@ struct StampedInput {
     own_interaction: bool,
 }
 
-fn stamp_input(
+/// The turn metadata `input` carries of its own, before the admission
+/// semantics stamp execution facts onto it: a prompt's or flow step's
+/// caller-authored metadata, and the handling mode, render metadata, System
+/// prompts and objective an external event or peer input brings. Admission
+/// reads it to decide whether a running turn can honour the input
+/// ([`crate::input::admission_turn_append_shape`]); [`for_input`] stamps the
+/// rest onto the same value, so the two can never disagree.
+pub(crate) fn input_own_turn_metadata(
     input: &Input,
-    semantics: crate::ingress_types::RuntimeInputSemantics,
-) -> StampedInput {
+) -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
     use meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata;
-    let mut metadata = match input {
+    match input {
         Input::Prompt(prompt) => prompt.turn_metadata.clone().unwrap_or_default(),
         Input::FlowStep(flow_step) => flow_step.turn_metadata.clone().unwrap_or_default(),
         Input::ExternalEvent(event) => RuntimeTurnMetadata {
@@ -88,7 +94,14 @@ fn stamp_input(
             ..Default::default()
         },
         _ => RuntimeTurnMetadata::default(),
-    };
+    }
+}
+
+fn stamp_input(
+    input: &Input,
+    semantics: crate::ingress_types::RuntimeInputSemantics,
+) -> StampedInput {
+    let mut metadata = input_own_turn_metadata(input);
     // Directed terminal publication is runtime-minted capability data. Never
     // preserve IDs supplied through caller-authored turn metadata.
     metadata.directed_interaction_ids.clear();

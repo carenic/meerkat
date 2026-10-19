@@ -2723,6 +2723,18 @@ mod tests {
     /// tool results, then the durable system notice written at the next
     /// model boundary, then the model's next assistant message.
     fn durable_in_turn_notice_transcript() -> Vec<Message> {
+        durable_in_turn_transcript_with(Message::SystemNotice(
+            meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            ),
+        ))
+    }
+
+    /// The same transcript with `steer_row` as the row the steer wrote after
+    /// the tool results: a system notice, or the User row of a text-only
+    /// prompt steer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
         vec![
             Message::User(UserMessage::text("start the job")),
             Message::BlockAssistant(BlockAssistantMessage::new(
@@ -2739,10 +2751,7 @@ mod tests {
                 "lookup result".to_string(),
                 false,
             )]),
-            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
-                meerkat_core::SystemNoticeKind::Generic,
-                "background job finished",
-            )),
+            steer_row,
             Message::BlockAssistant(BlockAssistantMessage::new(
                 vec![AssistantBlock::Text {
                     text: "noted".to_string(),
@@ -2751,6 +2760,11 @@ mod tests {
                 StopReason::EndTurn,
             )),
         ]
+    }
+
+    /// The User row a text-only prompt steer writes into the running turn.
+    fn durable_in_turn_user_row() -> Message {
+        Message::User(UserMessage::text("also check the second file"))
     }
 
     #[test]
@@ -2787,6 +2801,35 @@ mod tests {
             "the notice renders as user content: {}",
             messages[3]
         );
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_anthropic_body() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let request = LlmRequest::new(
+            "claude-sonnet-4-6",
+            durable_in_turn_transcript_with(durable_in_turn_user_row()),
+        );
+        let body = client.build_request_body(&request).unwrap();
+        let messages = body["messages"].as_array().expect("messages array");
+        let roles = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "user", "assistant"]
+        );
+        // The tool_result still opens the message right after the tool_use;
+        // the steer's User row is a separate later user message, never
+        // merged in front of the tool result.
+        let tool_result_message = messages[2]["content"]
+            .as_array()
+            .expect("tool result blocks");
+        assert_eq!(tool_result_message.len(), 1);
+        assert_eq!(tool_result_message[0]["type"], "tool_result");
+        assert_eq!(tool_result_message[0]["tool_use_id"], "call_1");
+        assert_eq!(messages[3]["content"], "also check the second file");
     }
 
     fn assistant_image_block() -> AssistantBlock {

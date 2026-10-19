@@ -240,6 +240,113 @@ pub struct EphemeralRuntimeDriver {
     /// It names its run; a stale value fails the caller's active-run check.
     /// Passive data, never permission.
     staged_retained_work: StagedRetainedWork,
+    /// Order of the durable-class live-boundary Steer work of this session.
+    /// Shared with clones (rollback snapshots never restore it): it tracks
+    /// live ingress tasks, not runtime state.
+    durable_steer_order: Arc<DurableSteerOrder>,
+}
+
+/// Session-local order of durable-class live-boundary Steer deliveries.
+///
+/// Each boundary of a running run accepts one durable delivery, so durable
+/// Steer inputs prepare one at a time, oldest first in the steer lane. A
+/// durable Steer whose live-boundary work finds an older durable Steer still
+/// in the lane waits until that one's work settles, then reads the lane
+/// again: once the older one has joined the run it prepares for the next
+/// boundary, and if the older one went back to its follow-up turn it follows
+/// it there. The generated lanes stay the order authority; this only
+/// sequences the live ingress tasks and is never persisted.
+#[derive(Debug, Default)]
+pub(crate) struct DurableSteerOrder {
+    state: std::sync::Mutex<DurableSteerOrderState>,
+    settled: crate::tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct DurableSteerOrderState {
+    /// Durable Steer inputs whose live-boundary work is still running.
+    working: HashSet<InputId>,
+    /// The one of them preparing its boundary delivery, if any.
+    preparing: Option<InputId>,
+}
+
+/// What a durable Steer's live-boundary work does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableSteerTurn {
+    /// It is the oldest durable Steer in the steer lane and no other durable
+    /// delivery is preparing: prepare it for the next boundary.
+    Prepare,
+    /// An older durable Steer's work, or the previous delivery's, is still
+    /// running: wait for it to settle.
+    Wait,
+    /// An older durable Steer waits in the lane with no work running (it went
+    /// back to its follow-up turn): follow it there, in order.
+    FollowUp,
+}
+
+/// One durable Steer's membership in [`DurableSteerOrder`] for as long as its
+/// live-boundary work runs. Dropping it (on every return, error or
+/// cancellation) ends the work and its preparation and wakes the waiters.
+pub(crate) struct DurableSteerWork {
+    order: Arc<DurableSteerOrder>,
+    input_id: InputId,
+}
+
+impl DurableSteerOrder {
+    fn state(&self) -> std::sync::MutexGuard<'_, DurableSteerOrderState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Start `input_id`'s live-boundary work.
+    pub(crate) fn begin(self: &Arc<Self>, input_id: &InputId) -> DurableSteerWork {
+        self.state().working.insert(input_id.clone());
+        DurableSteerWork {
+            order: Arc::clone(self),
+            input_id: input_id.clone(),
+        }
+    }
+
+    /// Notified whenever some durable Steer's work settles. Enable the
+    /// `Notified` before [`DurableSteerWork::turn`] reads the order, so a
+    /// settlement after the read still wakes the wait.
+    pub(crate) fn settled(&self) -> &crate::tokio::sync::Notify {
+        &self.settled
+    }
+}
+
+impl DurableSteerWork {
+    /// Decide this work's next step. `oldest` is the oldest durable Steer in
+    /// the steer lane, read under the session mutation gate with this input
+    /// still in the lane. `Prepare` makes this work the preparing one.
+    pub(crate) fn turn(&self, oldest: Option<&InputId>) -> DurableSteerTurn {
+        let mut state = self.order.state();
+        match oldest {
+            Some(oldest) if oldest == &self.input_id => match &state.preparing {
+                Some(preparing) if preparing != &self.input_id => DurableSteerTurn::Wait,
+                _ => {
+                    state.preparing = Some(self.input_id.clone());
+                    DurableSteerTurn::Prepare
+                }
+            },
+            Some(oldest) if state.working.contains(oldest) => DurableSteerTurn::Wait,
+            _ => DurableSteerTurn::FollowUp,
+        }
+    }
+}
+
+impl Drop for DurableSteerWork {
+    fn drop(&mut self) {
+        {
+            let mut state = self.order.state();
+            state.working.remove(&self.input_id);
+            if state.preparing.as_ref() == Some(&self.input_id) {
+                state.preparing = None;
+            }
+        }
+        self.order.settled.notify_waiters();
+    }
 }
 
 /// Wrapper around the DSL authority that provides `Debug` output.
@@ -352,7 +459,13 @@ impl EphemeralRuntimeDriver {
             admission_order: HashSet::new(),
             live_boundary_join_witnesses: HashMap::new(),
             staged_retained_work: StagedRetainedWork::default(),
+            durable_steer_order: Arc::new(DurableSteerOrder::default()),
         }
+    }
+
+    /// The session's durable live-boundary Steer order (shell coordination).
+    pub(crate) fn durable_steer_order(&self) -> Arc<DurableSteerOrder> {
+        Arc::clone(&self.durable_steer_order)
     }
 
     pub(crate) fn set_work_authorization_host(

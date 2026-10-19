@@ -2615,6 +2615,18 @@ mod tests {
     /// tool results, then the durable system notice written at the next
     /// model boundary, then the model's next assistant message.
     fn durable_in_turn_notice_transcript() -> Vec<Message> {
+        durable_in_turn_transcript_with(Message::SystemNotice(
+            meerkat_core::SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "background job finished",
+            ),
+        ))
+    }
+
+    /// The same transcript with `steer_row` as the row the steer wrote after
+    /// the tool results: a system notice, or the User row of a text-only
+    /// prompt steer.
+    fn durable_in_turn_transcript_with(steer_row: Message) -> Vec<Message> {
         vec![
             Message::User(UserMessage::text("start the job")),
             Message::BlockAssistant(BlockAssistantMessage::new(
@@ -2631,10 +2643,7 @@ mod tests {
                 "lookup result".to_string(),
                 false,
             )]),
-            Message::SystemNotice(meerkat_core::SystemNoticeMessage::new(
-                meerkat_core::SystemNoticeKind::Generic,
-                "background job finished",
-            )),
+            steer_row,
             Message::BlockAssistant(BlockAssistantMessage::new(
                 vec![AssistantBlock::Text {
                     text: "noted".to_string(),
@@ -2643,6 +2652,11 @@ mod tests {
                 StopReason::EndTurn,
             )),
         ]
+    }
+
+    /// The User row a text-only prompt steer writes into the running turn.
+    fn durable_in_turn_user_row() -> Message {
+        Message::User(UserMessage::text("also check the second file"))
     }
 
     #[test]
@@ -2665,6 +2679,39 @@ mod tests {
             "the functionResponse immediately follows its functionCall"
         );
         assert!(contents[3].to_string().contains("background job finished"));
+    }
+
+    #[test]
+    fn durable_in_turn_user_row_after_tool_results_builds_a_valid_gemini_body() {
+        let client = GeminiClient::new("test-key".to_string());
+        let request = LlmRequest::new(
+            "gemini-3-pro",
+            durable_in_turn_transcript_with(durable_in_turn_user_row()),
+        );
+        let body = client
+            .build_request_body(&request)
+            .expect("a User row after tool results is a valid Gemini contents sequence");
+        let contents = body["contents"].as_array().expect("contents array");
+        let roles = contents
+            .iter()
+            .map(|content| content["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "model", "user", "user", "model"]);
+        assert!(contents[1]["parts"][0].get("functionCall").is_some());
+        let response_parts = contents[2]["parts"].as_array().expect("response parts");
+        assert_eq!(
+            response_parts.len(),
+            1,
+            "the steer text is not merged into the functionResponse content"
+        );
+        assert!(
+            response_parts[0].get("functionResponse").is_some(),
+            "the functionResponse immediately follows its functionCall"
+        );
+        assert_eq!(
+            contents[3]["parts"][0]["text"],
+            "also check the second file"
+        );
     }
     use tokio::net::TcpListener;
 
