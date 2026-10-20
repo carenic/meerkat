@@ -213,7 +213,15 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   every member's run starts and reports the first failure in roster order. An
   autonomous member whose registration degrades after the stop held its run
   starts reports its run `ReloadRequired` and its starts `Held` (the cancel
-  of its current run was not dispatched).
+  of its current run was not dispatched). A Resume refuses with
+  `MobError::MemberReloadRequired`, naming the member, while a local member
+  needs a durability reload, before anything moves; until its reload such a
+  member starts no run, requests to it are refused the same way, and its
+  member status and member list entry carry an error naming the reload. A
+  reload while the mob is Stopped answers
+  `MemberReloadDisposition::Discarded`, and the next Resume completes the
+  member's revival. **Do:** reload the member with
+  `MobHandle::reload_member_registration`, then Resume.
   Known limitation: in a multi-host mob, a remote member that needs a reload
   still makes a Stop fail with `MobError::BridgeCommandRejected` (cause
   `internal`), and a Shutdown too when that member is `AutonomousHost`; a

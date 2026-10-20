@@ -36,16 +36,18 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
   local member whose registration needs a durability reload is reported with
   `run` and `starts` `reload_required` instead of failing the Stop; a remote
-  one still fails it (reload it on its host, then retry). Since 0.9.4 a
-  member reloaded while the mob is stopped stays held until Resume, as does
-  one spawned into a stopped mob or held again after a failed Resume;
-  retire, Shutdown and destroy release the hold for the members they dispose
-  of, so a later registration of the same session is not held, and a mob
-  reopened in the same process holds its members only if it is restored
-  stopped. A resume finishes a Stop an earlier process left half done
-  before it returns the mob (waiting up to 5 s), so the mob reads Stopped.
-  An attempt still running after 5 s (held on a member or a placed
-  completion) goes on in the background; wait for `MobStopped`.
+  one still fails it (reload it on its host, then retry). A Resume refuses
+  with `MEMBER_RELOAD_REQUIRED` while a local member needs a durability
+  reload; reload it (a reload while Stopped answers `discarded`), then Resume.
+  Since 0.9.4 a member reloaded while the mob is stopped stays held until
+  Resume, as does one spawned into a stopped mob or held again after a failed
+  Resume; retire, Shutdown and destroy release the hold for the members they
+  dispose of, so a later registration of the same session is not held, and a
+  mob reopened in the same process holds its members only if it is restored
+  stopped. A resume finishes a Stop an earlier process left half done before
+  it returns the mob (waiting up to 5 s), so the mob reads Stopped. An attempt
+  still running after 5 s (held on a member or a placed completion) goes on in
+  the background; wait for `MobStopped`.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
   and reports each member. Since 0.9.4 an admitted Shutdown closes admission
