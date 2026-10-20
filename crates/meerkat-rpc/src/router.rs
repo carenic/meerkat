@@ -17139,7 +17139,8 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
     }
 
     /// With `inherited_instructions: reactivate_inherited` the fork commits a
-    /// child that carries its own activation of the inherited key.
+    /// child that carries its own activation of the inherited key, and the
+    /// child runs its first turn.
     #[tokio::test]
     async fn session_fork_at_reactivates_when_asked() {
         let (router, _notif_rx) = test_router().await;
@@ -17185,6 +17186,23 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         assert_eq!(
             own[0]["instruction_activation"]["supersedes"],
             "activation-1"
+        );
+
+        // The child activates the inherited key itself, so the turn-time
+        // activation gate admits its first turn.
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &forked_id,
+                    "prompt": "Follow up on the branch",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "the re-activated child runs its first turn: {turn_resp:?}"
         );
     }
 
