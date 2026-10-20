@@ -138,8 +138,10 @@
 // current estimates require comparison with hosted results. On d1dda1482 the
 // runtime unit lane models 15.1 minutes, not a measured completion guarantee.
 // The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
-// surrogate packing cap and not a measured timing. It is 17 since the runtime
-// lane, whose closure counts its self dev-dependency, modelled 16.2 minutes.
+// surrogate packing cap and not a measured timing. It is 18, the gate's lane
+// execution budget, since the runtime lane modelled 17.1 minutes while its
+// measured runs took 6-12 minutes (pull-request runs 39337274765, 39360046041,
+// 39388235216 and 39394366439: 684, 693, 715 and 359 s).
 // The enforced limits are the CI gate's: 1080 s of lane execution and 1200 s
 // push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
 // CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
@@ -279,7 +281,7 @@ const NULL_SHA = "0000000000000000000000000000000000000000";
 const LINK_COST_PER_DEP = 8000;
 const COST_UNITS_PER_MINUTE = 35000;
 const LANE_SETUP_MINUTES = 1;
-export const PR_UNIT_BUDGET_MINUTES = 17;
+export const PR_UNIT_BUDGET_MINUTES = 18;
 // Packages whose unit tests run long get a unit lane of their own, so their
 // test time does not stack on other crates' builds; the line-and-closure
 // model counts only the build. xtask's lib and bin tests (the governance

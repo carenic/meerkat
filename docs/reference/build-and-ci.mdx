@@ -352,7 +352,7 @@ lines, either as its own lane (16 min compile plus 4.5 min of tests) or as a
 dependent crate rebuilding mob under its own feature unification (rkat, rpc:
 17 min). The chain is computed from cargo metadata, and the classifier's cost
 model (`1 + (lines + 8000 x dependency closure) / 35000` minutes, with a
-17-minute surrogate packing cap per pull-request unit lane; the cap is a
+18-minute surrogate packing cap per pull-request unit lane; the cap is a
 model threshold, not a measured timing) is asserted by the self-test for every
 other crate. Clippy of a changed mob-chain crate still runs in the pull
 request over its lib and bin targets (`--all-targets` of meerkat-mob took
