@@ -19110,6 +19110,33 @@ ORDER BY runtime_id";
                     .expect("a session runtime bound to its mob runtime is not misbound")
             );
             assert_eq!(visited, 1);
+            drop(custody);
+
+            // Any other runtime must still name itself.
+            let placed_runtime = LogicalRuntimeId::new("placed-member-runtime:1");
+            store
+                .commit_machine_lifecycle(
+                    &placed_runtime,
+                    MachineLifecycleCommit::new_with_binding(
+                        RuntimeState::Idle,
+                        crate::store::MachineLifecycleBindingFacts::new(
+                            Some("placed-member-runtime:2".to_string()),
+                            Some(1),
+                            Some(1),
+                            Some("epoch-1".to_string()),
+                        ),
+                        crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            let custody = RuntimeStore::try_controller_mutation_custody(&store, &claim)
+                .expect("actual backend administration custody");
+            assert!(
+                custody.visit_runtimes(&mut |_| false).is_err(),
+                "a non-session runtime bound to another runtime stays misbound"
+            );
         }
 
         #[test]
