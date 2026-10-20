@@ -1331,6 +1331,15 @@ them.
   `WholeBlobMediaStage`), and `new_head_canonical_with_staged_media` opens with
   them.
 
+- `meerkat-core`: `IncrementalSessionStore` gains
+  `stage_legacy_inline_images` and
+  `activate_head_canonical_store_with_staged_images`, both with defaults
+  (stage nothing; activate as `activate_head_canonical_store`), so existing
+  backends are unchanged. The SQLite session store implements them: the first
+  stores the images its not yet activated legacy sessions hold inline in a
+  blob store, and the second activates the store with those images as blob
+  references.
+
 ### Changed
 
 - `meerkat`: `PersistenceBundle::require_hosting_mode(HostingMode::Multiprocess)`
@@ -2688,6 +2697,10 @@ them.
   first stores the images in the realm blob store, then lays the session out
   with them as blob references; the body and the blob row are kept as they
   were, and an open stopped after storing the images finishes on the next one.
+  The SQLite session store's own activation of such a legacy session
+  (`IncrementalSessionStore::activate_head_canonical_store_with_staged_images`,
+  after `stage_legacy_inline_images`) crosses it the same way, and one whose
+  images were not staged refuses the whole activation, writing nothing.
 - `meerkat-session`: a session whose turns each add large images, such as a
   tool that returns camera snapshots, no longer compacts on every turn.
   Before compacting, the agent stores inline media as blob references, and
@@ -2708,7 +2721,12 @@ them.
   servers and the SDKs) takes that path. Before activation it stores a
   realm's legacy inline images in the realm's `blobs` directory, so such a
   realm opens on every surface. A realm with nothing to activate opens
-  exactly as before, without reading any session.
+  exactly as before, without reading any session. A realm an external
+  storage provider serves with a SQLite session store opens the same way:
+  before its store-wide activation the open stores the legacy sessions'
+  inline images in the provider's blob store
+  (`IncrementalSessionStore::stage_legacy_inline_images`) and then activates
+  with them; a store with nothing to stage activates exactly as before.
 
 ### Known limitations
 
@@ -2747,13 +2765,6 @@ them.
   `misfired` although its admitted input ran; nothing runs twice. Use
   `catch_up_within` with a window longer than the lease to keep crash
   recovery.
-- A realm served by an external storage provider whose session store is
-  SQLite does not open when it holds a session that a 0.8.x build compacted
-  with images inline in its history (screenshot or browser tool results, for
-  example). The open refuses with "compact rewrite delta carries inline
-  media", and the sessions' data stays intact; earlier 0.9.x releases refuse
-  the same realm the same way. 0.9.4.1 converts these sessions at open.
-  Built-in realms (`rkat`, REST, RPC and the SDKs) open them in this release.
 
 ## [0.9.3] - 2026-10-18
 
