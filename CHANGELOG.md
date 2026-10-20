@@ -1616,10 +1616,11 @@ them.
   `RealtimeSessionOpenProjectionError::Backpressured`, not an internal session
   error. A host admits live opens one at a time per process and queues none,
   and an open keeps that admission until its provider has acknowledged its
-  seed: for a WebRTC channel, through the client's offer and the provider's
-  answer. A second open during that setup (two people starting voice, or a
-  voice call and another live channel) was refused, and surfaces reported it
-  as an internal failure the caller could not tell from a broken host.
+  seed: for a provider-brokered WebRTC channel (the provider answers the
+  client's offer), through that offer and answer. A second open during that
+  setup (two people starting voice, or a voice call and another live
+  channel) was refused, and surfaces reported it as an internal failure the
+  caller could not tell from a broken host.
   `rkat-rpc` `live/open` now answers it with the retryable `SessionBusy` code
   (-32002) and a member live host with `MemberLiveError::Unavailable`.
   Clients retry with backoff; the open succeeds once the other open's setup
