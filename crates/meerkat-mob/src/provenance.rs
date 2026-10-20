@@ -13,13 +13,21 @@ use serde::{Deserialize, Serialize};
 /// read is refused instead
 /// ([`crate::MobError::ProvenanceUnavailable`]), so no variant stands for a
 /// failed read.
+///
+/// A create for a caller session records whether that session made it with
+/// its own create capability (the agent mob tools' `mob_create`, whose
+/// answer grants the session manage over the mob): such a create records
+/// [`Self::OperatorSession`] or [`Self::OperatorMember`]. A create a host
+/// makes for a caller session records [`Self::Session`] or
+/// [`Self::Member`]: the session is the mob's caller and owner, and the
+/// create grants it nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MobProvenance {
-    /// A member created the mob: exactly one hosted roster named the caller
-    /// session, as `creator_identity` at `creator_generation` of the mob
-    /// `parent_mob_id` at `parent_incarnation`.
+    /// A create for a member's session: exactly one hosted roster named the
+    /// caller session, as `creator_identity` at `creator_generation` of the
+    /// mob `parent_mob_id` at `parent_incarnation`.
     Member {
         parent_mob_id: MobId,
         parent_incarnation: MobIncarnationId,
@@ -29,8 +37,8 @@ pub enum MobProvenance {
     },
     /// The host or console created the mob, with no caller session.
     Host,
-    /// A caller session created the mob, and no hosted roster named that
-    /// session: the mob set was restored and every roster was read.
+    /// A create for a caller session that no hosted roster named: the mob
+    /// set was restored and every roster was read.
     Session { session_id: SessionId },
     /// More than one hosted roster named the caller session. No roster is
     /// picked: the mob has no member creator.
@@ -38,4 +46,17 @@ pub enum MobProvenance {
     /// The mob was created before its creation was recorded (a store from
     /// before 0.9.4), so its creator is not known.
     Unrecorded,
+    /// The caller session created the mob with its own create capability,
+    /// and no hosted roster named that session: [`Self::Session`] for a
+    /// session's own create.
+    OperatorSession { session_id: SessionId },
+    /// The caller session created the mob with its own create capability as
+    /// a member: [`Self::Member`] for a member session's own create.
+    OperatorMember {
+        parent_mob_id: MobId,
+        parent_incarnation: MobIncarnationId,
+        creator_identity: AgentIdentity,
+        creator_generation: Generation,
+        owner_session: SessionId,
+    },
 }
