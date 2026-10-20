@@ -51,7 +51,9 @@ pub struct ControllerModelSelection {
 #[serde(rename_all = "snake_case")]
 pub enum ControllerCredentialRequirement {
     /// The route uses credential material whose lifecycle native admission
-    /// must hold.
+    /// must hold. The one route whose key has no lifecycle is the synthetic
+    /// env-var default
+    /// ([`ControllerModelSelection::uses_synthetic_env_default_credential`]).
     #[default]
     Required,
     /// The resolved connection is explicitly authless: there is no credential
@@ -117,6 +119,26 @@ impl ControllerModelSelection {
 
     pub fn credential(&self) -> &AuthCredentialIdentity {
         &self.credential
+    }
+
+    /// Whether this is the selection the provider factory pins for the
+    /// synthetic env-var default route: no auth binding is recorded and the
+    /// credential is the `env_default` realm's. A configured binding always
+    /// records its auth binding.
+    ///
+    /// Native admission holds no credential lease for this route, by design.
+    /// Its key is the host process's own environment: no AuthMachine
+    /// lifecycle exists for it (nothing logs it in, refreshes, revokes or
+    /// releases it), and the factory never publishes a lease for it, since a
+    /// lease would make the synthetic route durable credential identity,
+    /// which [`crate::BindingOrigin::SyntheticEnvDefault`] forbids. Requiring
+    /// a lease would refuse the route on every governed host.
+    pub fn uses_synthetic_env_default_credential(&self) -> bool {
+        self.auth_binding.is_none()
+            && matches!(
+                &self.credential,
+                AuthCredentialIdentity::Binding(binding) if binding.realm.is_env_default()
+            )
     }
 
     pub fn backend_profile_id(&self) -> &str {
@@ -607,6 +629,54 @@ mod tests {
             mutate(&mut changed);
             assert!(!selected.matches_model_facts(&changed));
         }
+    }
+
+    /// Only the factory's env-default pin is the env-default route: no
+    /// recorded auth binding and a credential in the `env_default` realm.
+    #[test]
+    fn only_the_unrecorded_env_default_credential_is_the_env_default_route() {
+        let env_default = crate::AuthBindingRef {
+            realm: crate::RealmId::parse("env_default").unwrap(),
+            binding: crate::BindingId::parse("default").unwrap(),
+            profile: None,
+            origin: crate::BindingOrigin::SyntheticEnvDefault,
+        };
+        let route = |auth_binding: Option<crate::AuthBindingRef>,
+                     credential: AuthCredentialIdentity| {
+            ControllerModelSelection::new(
+                SessionLlmIdentity {
+                    auth_binding,
+                    ..identity()
+                },
+                credential,
+                "controller-profile-canary".to_owned(),
+                "openai".to_owned(),
+            )
+        };
+        let env_credential = AuthCredentialIdentity::from_auth_binding(&env_default);
+        assert!(route(None, env_credential.clone()).uses_synthetic_env_default_credential());
+        assert!(
+            !route(
+                Some(crate::AuthBindingRef {
+                    origin: crate::BindingOrigin::Configured,
+                    ..env_default.clone()
+                }),
+                env_credential,
+            )
+            .uses_synthetic_env_default_credential(),
+            "a recorded binding is a configured route"
+        );
+        assert!(!selection().uses_synthetic_env_default_credential());
+        let configured = AuthCredentialIdentity::Binding(identity().auth_binding.unwrap());
+        assert!(
+            !route(None, configured).uses_synthetic_env_default_credential(),
+            "an unrecorded binding outside env_default is not the env-default route"
+        );
+        let account = AuthCredentialIdentity::Account(crate::connection::CredentialAccountRef {
+            realm: crate::RealmId::parse("env_default").unwrap(),
+            account: crate::connection::CredentialAccountId::parse("account").unwrap(),
+        });
+        assert!(!route(None, account).uses_synthetic_env_default_credential());
     }
 
     #[test]

@@ -16694,6 +16694,93 @@ mod tests {
         );
     }
 
+    /// The factory pins the env-var default route's controller with exactly
+    /// the selection governed credential custody admits without a lease: no
+    /// recorded auth binding, the `env_default` credential, and the inline
+    /// secret's credential requirement. The factory publishes no lease for
+    /// that route, so a governed host could never admit it otherwise.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn env_default_fallback_pins_the_lease_free_env_default_route() {
+        use meerkat_llm_core::provider_runtime::{
+            ProviderAuthError, ProviderClientError, ProviderRuntime, ProviderRuntimeRegistry,
+            ResolvedConnection, ResolverEnvironment, StaticLease, ValidatedBinding,
+        };
+
+        struct InlineKeyOpenAiRuntime;
+
+        #[async_trait::async_trait]
+        impl ProviderRuntime for InlineKeyOpenAiRuntime {
+            fn provider_id(&self) -> Provider {
+                Provider::OpenAI
+            }
+
+            async fn resolve_binding(
+                &self,
+                binding: &ValidatedBinding,
+                _env: &ResolverEnvironment,
+            ) -> Result<ResolvedConnection, ProviderAuthError> {
+                Ok(ResolvedConnection {
+                    provider: Provider::OpenAI,
+                    backend: binding.backend(),
+                    backend_profile: Arc::clone(binding.backend_profile()),
+                    credential_identity: binding.credential_identity().clone(),
+                    auth_lease: Arc::new(StaticLease::inline_secret(
+                        "test-openai-key".to_string(),
+                        meerkat_core::AuthMetadata::default(),
+                        None,
+                        "test",
+                    )),
+                })
+            }
+
+            fn build_client(
+                &self,
+                _connection: ResolvedConnection,
+            ) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+                Ok(Arc::new(meerkat_client::TestClient::default()))
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let provider_registry =
+            ProviderRuntimeRegistry::empty().with_runtime(Arc::new(InlineKeyOpenAiRuntime));
+        let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        factory.provider_registry = Arc::new(provider_registry);
+
+        let session = Session::new();
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let mut build = AgentBuildConfig::new("gpt-5.4");
+        build.provider = Some(Provider::OpenAI);
+        build.resume_session = Some(session);
+        build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings);
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let agent = factory
+            .build_agent(build, &Config::default())
+            .await
+            .unwrap();
+        let controller = agent
+            .pin_controller_client()
+            .expect("the selected controller pins");
+        let selection = controller.selection();
+        assert_eq!(selection.auth_binding(), None);
+        assert!(selection.credential().realm().is_env_default());
+        assert_eq!(
+            selection.credential_requirement(),
+            meerkat_core::ControllerCredentialRequirement::Required,
+            "the inline secret keeps the route credential-required"
+        );
+        assert!(
+            selection.uses_synthetic_env_default_credential(),
+            "governed custody must recognize the factory's env-default route"
+        );
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn hot_swap_env_default_fallback_does_not_publish_auth_lease() {

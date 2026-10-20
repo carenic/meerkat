@@ -299,6 +299,145 @@ async fn an_authless_claim_the_live_client_no_longer_reports_is_refused() {
     assert_unaccepted(&machine, &session, &id).await;
 }
 
+/// `selection` on the synthetic env-var default route, as the provider
+/// factory pins it: no auth binding is recorded (the env default never
+/// becomes durable identity), the credential is the one the provider
+/// registry derives for the `env_default` binding, and its inline secret
+/// keeps the route credential-required. `recorded_binding` instead records a
+/// configured binding for that credential, the shape of every route that
+/// publishes a lease. The per-call profile keeps each fixture's lease key
+/// its own.
+fn on_env_default_route(
+    selection: &ControllerModelSelection,
+    recorded_binding: bool,
+) -> ControllerModelSelection {
+    let env_default = meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("env_default").unwrap(),
+        binding: meerkat_core::BindingId::parse("default").unwrap(),
+        profile: Some(
+            meerkat_core::ProfileId::parse(format!("custody-{}", uuid::Uuid::new_v4())).unwrap(),
+        ),
+        origin: meerkat_core::BindingOrigin::SyntheticEnvDefault,
+    };
+    let credential = meerkat_core::AuthCredentialIdentity::from_auth_binding(&env_default);
+    ControllerModelSelection::new(
+        meerkat_core::SessionLlmIdentity {
+            model: selection.model().into(),
+            provider: selection.provider(),
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: recorded_binding.then(|| meerkat_core::AuthBindingRef {
+                origin: meerkat_core::BindingOrigin::Configured,
+                ..env_default
+            }),
+        },
+        credential,
+        selection.backend_profile_id().into(),
+        selection.backend_kind().into(),
+    )
+    .with_credential_requirement(meerkat_core::ControllerCredentialRequirement::Required)
+}
+
+/// A pending governed input whose selected controller is on the env-var
+/// default route (see [`on_env_default_route`]).
+async fn pending_env_default(recorded_binding: bool) -> (MeerkatMachine, SessionId, Input) {
+    let (configuration, mut prompt, _, _) = mutable_controller_configuration(true);
+    let mut candidate = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .unwrap()
+        .candidate()
+        .clone();
+    let selection = candidate.controller_model.as_ref().unwrap();
+    candidate.controller_model = Some(on_env_default_route(selection, recorded_binding));
+    prompt.header_mut().authority_association =
+        Some(InputAuthorityAssociation::new(candidate).unwrap());
+    pending_controller_input(configuration, prompt).await
+}
+
+/// A stock host's env-var key (the synthetic env default) has no credential
+/// lifecycle to hold: the factory publishes no lease for it by design, and
+/// none can ever exist. Governed admission accepts the route without one and
+/// synthesizes none.
+#[tokio::test]
+async fn the_env_default_controller_is_admitted_without_a_credential_lease() {
+    let (machine, session, prompt) = pending_env_default(false).await;
+    let id = prompt.id().clone();
+    let key = LeaseKey::from_credential_identity(&identity(&prompt));
+    let outcome = attempt(&machine, &session, prompt).await;
+    assert!(
+        matches!(&outcome, Ok(crate::accept::AcceptOutcome::Accepted { input_id, .. }) if *input_id == id),
+        "the env-default controller must be admitted without a lease: {outcome:?}"
+    );
+    let snapshot = machine.generated_auth_lease_handle().snapshot(&key);
+    assert_eq!(snapshot.phase, None, "no lease is published or synthesized");
+    assert!(!snapshot.credential_present);
+}
+
+/// A selection that records an auth binding is a configured route, even for
+/// a credential named in the env_default realm: it still needs its lease.
+#[tokio::test]
+async fn a_recorded_binding_on_the_env_default_credential_still_needs_its_lease() {
+    let (machine, session, prompt) = pending_env_default(true).await;
+    let id = prompt.id().clone();
+    let outcome = attempt(&machine, &session, prompt).await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(RuntimeDriverError::ControllerReadinessUnavailable {
+                reason: ControllerReadinessFailure::CredentialUnusable {
+                    disposition: CredentialUseDisposition::LeaseAbsent
+                }
+            })
+        ),
+        "a recorded binding is lease-bound: {outcome:?}"
+    );
+    assert_unaccepted(&machine, &session, &id).await;
+}
+
+/// The env-default route is honored without a lease only while the live
+/// selected client still reports it: once the client reports a configured
+/// route, the pinned env-default claim is refused, not used to skip the
+/// lease.
+#[tokio::test]
+async fn an_env_default_claim_the_live_client_no_longer_reports_is_refused() {
+    let (machine, session, prompt) = pending_env_default(false).await;
+    let ingress = prompt.header().ingress_context.as_ref().unwrap().clone();
+    let pinned = ingress.controller_client().unwrap().selection().clone();
+    let client = Arc::new(SwitchingClient {
+        model: pinned.model().to_owned(),
+        selection: std::sync::Mutex::new(pinned.clone()),
+    });
+    let context = NativeIngressContext::from_trusted_ingress(
+        &prompt,
+        ingress.requester().clone(),
+        ingress.ingress_actor().clone(),
+        ingress.realm().clone(),
+        ingress.authentication().clone(),
+    )
+    .unwrap()
+    .with_controller_client(
+        &prompt,
+        ControllerModelClient::new(pinned.clone(), client.clone()),
+    )
+    .unwrap();
+    let prompt = prompt.with_ingress_context(context).unwrap();
+    *client.selection.lock().unwrap() = on_env_default_route(&pinned, true);
+    let id = prompt.id().clone();
+    let outcome = attempt(&machine, &session, prompt).await;
+    assert!(
+        matches!(
+            &outcome,
+            Err(RuntimeDriverError::ControllerReadinessUnavailable {
+                reason: ControllerReadinessFailure::AuthorityChanged
+            })
+        ),
+        "a pinned env-default claim must not outlive its route: {outcome:?}"
+    );
+    assert_unaccepted(&machine, &session, &id).await;
+}
+
 #[tokio::test]
 async fn exported_handle_release_retains_consumed_controller_until_real_run_terminal() {
     let (machine, session, prompt) = pending().await;
