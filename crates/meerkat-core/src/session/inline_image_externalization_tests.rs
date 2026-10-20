@@ -271,3 +271,91 @@ fn a_session_without_inline_images_is_left_alone() {
     session.push(Message::User(UserMessage::text("no photos here")));
     assert!(session.with_inline_images_externalized().unwrap().is_none());
 }
+
+/// A content-addressed append (an occurrence whose parent rows were
+/// rematerialized after its base, here with the base's images already
+/// externalized) keeps its kind and commit, but its parent row prefix is
+/// re-derived to extend the preceding endpoint, as the layout requires;
+/// its parent materializes with its images as blob references.
+#[test]
+fn a_content_addressed_append_is_re_derived_from_its_preceding_endpoint() {
+    let (source, _) = compacted_session_with_inline_images(2);
+    let state = source.transcript_history_state().unwrap().unwrap();
+    let mut records = commits(&source)
+        .into_iter()
+        .map(|commit| TranscriptRewriteRecord {
+            parent_body: state.materialize_revision(&commit.parent_revision).unwrap(),
+            revision_body: state.materialize_revision(&commit.revision).unwrap(),
+            commit,
+            digest_format: 0,
+        })
+        .collect::<Vec<_>>();
+    // The second occurrence's parent holds its base's rows with their images
+    // already externalized: the same content, different row bytes.
+    let base_len = records[0].revision_body.messages.len();
+    let mut rematerialized = crate::image_content::InlineImageCollector::default();
+    let mut rematerialized_any = false;
+    for message in &mut records[1].parent_body.messages[..base_len] {
+        rematerialized_any |= rematerialized.externalize(message);
+    }
+    assert!(rematerialized_any, "the base rows hold an inline image");
+    let graph = TranscriptHistoryState::from_rewrite_records(records)
+        .unwrap()
+        .expect("a graph");
+    assert_eq!(
+        graph.parent_transitions()[1],
+        TranscriptRewriteParentTransition::ContentAddressedAppend
+    );
+    // As decoded, its parent row prefix is the rematerialized rows' own
+    // baseline, which does not extend the preceding endpoint.
+    let appended_rows = |edge: &TranscriptRevisionEdge| {
+        edge.parent_advance()
+            .appended()
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let decoded_edges = graph.edges();
+    assert_ne!(
+        decoded_edges[1].parent_row_prefix(),
+        &decoded_edges[0]
+            .result_witness()
+            .row_prefix()
+            .extend_serialized_rows(&appended_rows(&decoded_edges[1]))
+            .unwrap()
+    );
+
+    let mut collector = crate::image_content::InlineImageCollector::default();
+    let externalized = graph
+        .with_bodies_rewritten(&mut |message| collector.externalize(message))
+        .unwrap()
+        .expect("the graph holds inline images");
+    assert_eq!(
+        externalized.parent_transitions(),
+        graph.parent_transitions()
+    );
+    assert_eq!(
+        externalized.commits().cloned().collect::<Vec<_>>(),
+        graph.commits().cloned().collect::<Vec<_>>()
+    );
+    let edges = externalized.edges();
+    assert_eq!(
+        edges[1].parent_row_prefix(),
+        &edges[0]
+            .result_witness()
+            .row_prefix()
+            .extend_serialized_rows(&appended_rows(&edges[1]))
+            .unwrap()
+    );
+    let parent = externalized
+        .materialize_revision(edges[1].parent_revision())
+        .unwrap();
+    let parent = serde_json::to_string(&parent.messages).unwrap();
+    for payload in collector.into_payloads() {
+        assert!(!parent.contains(payload.data.as_str()));
+    }
+    assert!(
+        parent.contains("\"blob_id\""),
+        "the parent names its images by blob id"
+    );
+}
