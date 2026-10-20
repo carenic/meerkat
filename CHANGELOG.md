@@ -302,6 +302,15 @@ them.
   Maintenance from an older binary takes only the fence lock and does not
   wait for a kept connection: run maintenance with the same release as the
   hosts.
+- `meerkat-runtime`: a fenced write whose `RuntimeStoreWriteFence` answers
+  `Backoff` while the writer holds an async lock (the in-memory runtime
+  store's fenced writes, and `MeerkatMachine`'s publication of a registered
+  session) is tried again for up to 2 seconds before the `Backoff` is
+  reported, with the lock released between attempts and each attempt
+  re-reading what it writes. The trait's documentation now says
+  `execute_if_current` never waits beyond its own I/O, so a caller that holds
+  an async lock may call it provided it retries a `Backoff` the same way; a
+  fence caller in another crate that holds an async lock should do so too.
 
 ### Fixed
 

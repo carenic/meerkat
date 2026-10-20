@@ -6171,6 +6171,12 @@ pub enum RuntimeStoreWriteFenceOutcome {
 /// boundary. The caller defensively treats a successful target operation as
 /// Applied even if a fence implementation then returns a contradictory result.
 /// Implementations must not re-enter the same RuntimeStore from this callback.
+///
+/// `execute_if_current` never waits beyond its own I/O: an authority that is
+/// busy answers Backoff at once. A caller may therefore call it while holding
+/// an async lock other tasks need, provided it retries a Backoff the way the
+/// built-in callers do: release the lock, pause, re-observe and try again,
+/// within a bound.
 pub trait RuntimeStoreWriteFence: Send + Sync {
     fn execute_if_current(
         &self,
@@ -6260,6 +6266,57 @@ pub(crate) fn execute_optional_runtime_store_target_write<T>(
         RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
             Err(RuntimeStoreError::WriteFenceBackoff { reason })
         }
+    }
+}
+
+/// How long a fenced write whose caller holds an async lock retries a fence
+/// that answers [`RuntimeStoreWriteFenceOutcome::Backoff`].
+///
+/// Such a caller cannot wait inside the fence: the wait would block its
+/// thread while it holds a lock other tasks need. Between attempts it
+/// releases the lock and pauses, and each attempt re-observes what it
+/// writes. Past this bound it reports the Backoff, as it did at once before.
+/// The SQLite identity fence answers Backoff while a convergence-status
+/// commit holds the mob database's write lock across its fsync; a bound of a
+/// few such commits lets an actuation through instead of losing to the next
+/// status write every time.
+pub(crate) const FENCE_BACKOFF_RETRY_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The first pause between two fence attempts; each pause doubles, up to
+/// [`FENCE_BACKOFF_MAX_PAUSE`].
+const FENCE_BACKOFF_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(5);
+const FENCE_BACKOFF_MAX_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The retry policy of a fenced write whose caller holds an async lock
+///. Each attempt takes the caller's lock, re-observes what it writes
+/// and runs one fence attempt. After an attempt the fence answered with
+/// Backoff, the caller releases the lock and calls [`Self::pause`].
+#[derive(Debug, Default)]
+pub(crate) struct FenceBackoffRetry {
+    /// Set at the first pause, so a write the fence admits at once reads no
+    /// clock.
+    deadline: Option<crate::tokio::time::Instant>,
+    pause: std::time::Duration,
+}
+
+impl FenceBackoffRetry {
+    /// Wait before the next attempt and return `true`, or return `false`
+    /// once the bound has passed: the caller then reports the Backoff.
+    pub(crate) async fn pause(&mut self) -> bool {
+        let now = crate::tokio::time::Instant::now();
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| now + FENCE_BACKOFF_RETRY_BOUND);
+        if now >= deadline {
+            return false;
+        }
+        self.pause = if self.pause.is_zero() {
+            FENCE_BACKOFF_FIRST_PAUSE
+        } else {
+            (self.pause * 2).min(FENCE_BACKOFF_MAX_PAUSE)
+        };
+        crate::tokio::time::sleep(self.pause.min(deadline - now)).await;
+        true
     }
 }
 

@@ -14884,3 +14884,408 @@ mod tests {
         contract_tests::test_list(&store).await;
     }
 }
+
+/// A runtime store that holds an async lock around an identity fence
+/// retries a contended fence with that lock released between attempts, so a
+/// mob.db write lock held across a slow status commit delays the fenced write
+/// instead of refusing it, and blocks no other task meanwhile.
+#[cfg(all(test, feature = "runtime-adapter"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod identity_fence_contention_tests {
+    use super::*;
+    use crate::identity::{
+        IdentityActuationPermit, IdentityActuatorTarget, IdentityIntent, IdentityLeaseClaimOutcome,
+        IdentityStoredObservation,
+    };
+    use meerkat_runtime::store::RuntimeStoreWriteFence;
+    use meerkat_runtime::{
+        MeerkatMachine, RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
+        RuntimeStoreError, RuntimeStoreWriteFenceOutcome,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// How long the holder keeps mob.db's write lock: a slow status commit.
+    const HOLD: Duration = Duration::from_millis(300);
+
+    /// An adopted identity with a current lease in a SQLite identity store.
+    struct AdoptedIdentity {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        store: SqliteMobIdentityStore,
+        mob_id: MobId,
+        identity: AgentIdentity,
+        session: DesiredSessionTarget,
+        intent: IdentityIntentRecord,
+        lease: crate::identity::IdentityLeaseClaim,
+    }
+
+    async fn adopted_identity() -> AdoptedIdentity {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mob.db");
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let store = stores.identity_store();
+        let mob_id = MobId::from("fence-contention-mob");
+        let identity = AgentIdentity::from("worker-1");
+        let (request, compiled) = crate::identity::identity_adoption_fixture(
+            mob_id.clone(),
+            identity.clone(),
+            "fence-contention-1",
+            meerkat_core::SessionId::new(),
+        );
+        store
+            .adopt_member_identity_declaration(&request, &compiled)
+            .await
+            .unwrap();
+        let lease = match store
+            .claim_or_renew_identity_lease(
+                &mob_id,
+                &identity,
+                "controller",
+                "inc-a",
+                IDENTITY_LEASE_MAX_TTL_MS,
+            )
+            .await
+            .unwrap()
+        {
+            IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+            other => panic!("expected a fresh lease, got {other:?}"),
+        };
+        let intent = match store
+            .observe_identity_intent(&mob_id, &identity)
+            .await
+            .unwrap()
+        {
+            IdentityStoredObservation::Valid(intent) => intent,
+            other => panic!("expected the adopted intent, got {other:?}"),
+        };
+        let IdentityIntent::Present { session, .. } = &intent.intent else {
+            panic!("the adopted intent is present");
+        };
+        let session = session.clone();
+        AdoptedIdentity {
+            _dir: dir,
+            path,
+            store,
+            mob_id,
+            identity,
+            session,
+            intent,
+            lease,
+        }
+    }
+
+    impl AdoptedIdentity {
+        /// The identity's runtime write fence for `observed`, as the actor
+        /// prepares it before a runtime registration.
+        fn runtime_fence(
+            &self,
+            observed: &RuntimeSessionLifecycleObservation,
+        ) -> Arc<dyn RuntimeStoreWriteFence> {
+            let permit = IdentityActuationPermit {
+                mob_id: self.mob_id.clone(),
+                identity: self.identity.clone(),
+                target: IdentityActuatorTarget::Runtime,
+                intent_revision: self.intent.intent_revision,
+                intent_digest: self.intent.intent_digest.clone(),
+                intent_authority_digest: self.intent.authority_digest.clone(),
+                lease_epoch: self.lease.epoch,
+                lease_holder_id: self.lease.holder_id.clone(),
+                lease_incarnation_id: self.lease.incarnation_id.clone(),
+                lease_expires_at_ms: self.lease.expires_at_ms,
+                target_observation: crate::store::identity_runtime_target_observation_version(
+                    observed,
+                ),
+            };
+            self.store
+                .prepare_runtime_write_fence(permit, self.session.clone(), observed)
+                .unwrap()
+        }
+    }
+
+    /// Another connection takes mob.db's write lock and holds it for `hold`,
+    /// as a status commit does across a slow fsync. Returns once the lock is
+    /// held; the thread returns when it released the lock.
+    fn hold_mob_db(path: &Path, hold: Duration) -> std::thread::JoinHandle<Instant> {
+        let (holding, held) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let mut conn = Connection::open(&path).unwrap();
+            let lock = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            holding.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(lock);
+            Instant::now()
+        });
+        held.recv().unwrap();
+        holder
+    }
+
+    /// Wraps a fence: just before its `at`-th call, mob.db is held for
+    /// [`HOLD`]. Records when each call started and when each operation ran,
+    /// and counts the calls that returned.
+    struct HoldMobDbAt {
+        inner: Arc<dyn RuntimeStoreWriteFence>,
+        path: PathBuf,
+        at: usize,
+        call_starts: std::sync::Mutex<Vec<Instant>>,
+        operations: std::sync::Mutex<Vec<Instant>>,
+        /// How many calls have returned.
+        returned: tokio::sync::watch::Sender<usize>,
+        holder: std::sync::Mutex<Option<std::thread::JoinHandle<Instant>>>,
+    }
+
+    impl HoldMobDbAt {
+        fn new(inner: Arc<dyn RuntimeStoreWriteFence>, path: &Path, at: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                path: path.to_path_buf(),
+                at,
+                call_starts: std::sync::Mutex::new(Vec::new()),
+                operations: std::sync::Mutex::new(Vec::new()),
+                returned: tokio::sync::watch::Sender::new(0),
+                holder: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// When the holder released mob.db.
+        fn released_at(&self) -> Instant {
+            self.holder
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the holder ran")
+                .join()
+                .unwrap()
+        }
+
+        fn call_starts(&self) -> Vec<Instant> {
+            self.call_starts.lock().unwrap().clone()
+        }
+
+        fn operations(&self) -> Vec<Instant> {
+            self.operations.lock().unwrap().clone()
+        }
+
+        /// Records a call's start; the `at`-th call first has mob.db held.
+        fn before_call(&self) {
+            let call = {
+                let mut starts = self.call_starts.lock().unwrap();
+                starts.push(Instant::now());
+                starts.len()
+            };
+            if call == self.at {
+                *self.holder.lock().unwrap() = Some(hold_mob_db(&self.path, HOLD));
+            }
+        }
+
+        fn after_call(&self) {
+            self.returned.send_modify(|returned| *returned += 1);
+        }
+
+        /// `operation`, recording when it runs.
+        fn recorded<'a>(
+            &'a self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + 'a>,
+        ) -> Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + 'a> {
+            Box::new(move || {
+                self.operations.lock().unwrap().push(Instant::now());
+                operation()
+            })
+        }
+    }
+
+    impl RuntimeStoreWriteFence for HoldMobDbAt {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            self.before_call();
+            let outcome = self.inner.execute_if_current(self.recorded(operation));
+            self.after_call();
+            outcome
+        }
+    }
+
+    /// Counts ticks of a task on the test's runtime until it is aborted.
+    fn ticker() -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        (ticks, task)
+    }
+
+    /// A read issued while the writer paused between two attempts finished
+    /// well before the writer's next attempt: the writer released its lock
+    /// for the pause. `next_start` is the start of that next attempt.
+    fn assert_read_ran_during_the_pause(read_at: Instant, next_start: Instant) {
+        let margin = next_start.saturating_duration_since(read_at);
+        assert!(
+            margin >= Duration::from_millis(10),
+            "the read finished {margin:?} before the next attempt; a writer that keeps its \
+             lock across the pause lets it run only just before that attempt"
+        );
+    }
+
+    /// RED-3: the in-memory store's fenced lifecycle CAS (the first fence
+    /// call of a registration) meets mob.db held. It retries until the holder
+    /// releases and registers; a plain read of the same store issued during
+    /// a 40 ms pause runs in that pause, and a ticker on this one-thread
+    /// runtime keeps ticking.
+    #[tokio::test]
+    async fn an_in_memory_lifecycle_cas_waits_out_a_held_identity_fence_with_its_lock_released() {
+        // The pause after the fourth Backoff is 40 ms (5, 10, 20, 40).
+        const READ_AFTER_CALLS: usize = 4;
+        let adopted = adopted_identity().await;
+        let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .unwrap();
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 1);
+        let (ticks, ticker) = ticker();
+        let reader = tokio::spawn({
+            let store = store.clone();
+            let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+            let mut returned = fence.returned.subscribe();
+            async move {
+                returned
+                    .wait_for(|returned| *returned >= READ_AFTER_CALLS)
+                    .await
+                    .unwrap();
+                meerkat_runtime::RuntimeStore::load_machine_lifecycle_record(
+                    store.as_ref(),
+                    &runtime_id,
+                )
+                .await
+                .unwrap();
+                Instant::now()
+            }
+        });
+
+        let ticks_before = ticks.load(Ordering::SeqCst);
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
+        ticker.abort();
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the fenced registration rides out the held lock: {outcome:?}"
+        );
+        assert!(
+            ticked > 5,
+            "the runtime's only thread kept running other tasks: {ticked} ticks"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(
+            operations.len(),
+            2,
+            "the CAS and the publication each ran their operation once"
+        );
+        assert!(
+            operations[0] >= released_at,
+            "the CAS wrote once the holder released mob.db"
+        );
+        let starts = fence.call_starts();
+        assert!(
+            starts.len() > READ_AFTER_CALLS + 1,
+            "the CAS retried the contended fence: {} calls",
+            starts.len()
+        );
+        let read_at = reader.await.unwrap();
+        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// RED-4: the live-map publication (the second fence call) meets mob.db
+    /// held. It retries until the holder releases and publishes; a read of
+    /// the machine's session map issued during a 40 ms pause runs in that
+    /// pause and sees nothing published yet.
+    #[tokio::test]
+    async fn a_registration_publication_waits_out_a_held_identity_fence_with_the_map_released() {
+        // Call 1 is the CAS; the publication's attempts are calls 2, 3, ...,
+        // and the pause after its fourth Backoff (call 5) is 40 ms.
+        const READ_AFTER_CALLS: usize = 5;
+        let adopted = adopted_identity().await;
+        let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let machine = Arc::new(
+            MeerkatMachine::persistent(
+                store.clone(),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            )
+            .unwrap(),
+        );
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 2);
+        let (ticks, ticker) = ticker();
+        let reader = tokio::spawn({
+            let machine = Arc::clone(&machine);
+            let session_id = session_id.clone();
+            let mut returned = fence.returned.subscribe();
+            async move {
+                returned
+                    .wait_for(|returned| *returned >= READ_AFTER_CALLS)
+                    .await
+                    .unwrap();
+                let published = machine.contains_session(&session_id).await;
+                (published, Instant::now())
+            }
+        });
+
+        let ticks_before = ticks.load(Ordering::SeqCst);
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
+        ticker.abort();
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the publication rides out the held lock: {outcome:?}"
+        );
+        assert!(
+            ticked > 5,
+            "the runtime's only thread kept running other tasks: {ticked} ticks"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(operations.len(), 2);
+        assert!(
+            operations[1] >= released_at,
+            "the publication ran once the holder released mob.db"
+        );
+        let starts = fence.call_starts();
+        assert!(
+            starts.len() > READ_AFTER_CALLS + 1,
+            "the publication retried the contended fence: {} calls",
+            starts.len()
+        );
+        let (published_during_wait, read_at) = reader.await.unwrap();
+        assert!(
+            !published_during_wait,
+            "nothing is published before the fence admits the publication"
+        );
+        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        assert!(machine.contains_session(&session_id).await);
+    }
+}
