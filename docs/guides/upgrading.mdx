@@ -657,6 +657,14 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   redelivery finds the delivery already failed records `delivery_failed`
   (0.9.3: `completed`). **Do:** a custom `ScheduleTargetDelivery` resolves a
   deduplicated replay's completion from the original input's outcome.
+  Known limitation: a delivery whose executor crashes after the target
+  admitted its input is reclaimed only inside the occurrence's misfire
+  window. Under the default `skip` policy (a 30 s grace) and the hosts' 60 s
+  claim lease the reclaim comes too late, so the occurrence ends `misfired`
+  although its admitted input ran (nothing runs twice). To keep crash
+  recovery, use the `catch_up_within` misfire policy with a `window_seconds`
+  comfortably longer than the lease (the claim's own delay and a driver tick
+  count too).
 - **macOS stdio MCP servers close as soon as they exit**, as on Linux; 0.9.3
   waited about 8 s per stdio server (the EOF grace, SIGTERM, the TERM grace,
   SIGKILL) at every close, removal, reload, session end and shutdown.
