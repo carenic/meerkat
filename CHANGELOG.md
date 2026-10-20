@@ -2425,13 +2425,20 @@ them.
   seconds with their locks released.
 - An intent-managed identity could stay in `Backoff` for good after its
   member retirement ran past the budget its reconcile pass gave it (30
-  seconds), as on slow storage with many identities adopting at once. Once
-  the retirement had durably started the member read as recovering, which
-  identity reconciliation only waits on, and nothing finished the
+  seconds), as on slow storage with many identities adopting at once, or
+  failed at a stage after it had durably started (a storage or host error).
+  Once the retirement had durably started the member read as recovering,
+  which identity reconciliation only waits on, and nothing finished the
   retirement. Identity reconciliation now owns a retirement it started until
-  it settles, as an operator retirement does: it runs under the lifecycle
-  hang guard, a failure after the durable start settles as stuck and is
-  re-driven on resume, and a shutdown interrupts it instead of waiting.
+  it settles: it runs under the lifecycle hang guard, a shutdown interrupts
+  it instead of waiting, and a failure after the durable start settles as
+  stuck and is re-driven on the identity's next backoff pass (250 ms
+  doubling, at most 60 s apart), so the identity converges once the error
+  clears. A stopped mob re-drives it when it is resumed. Every re-drive of a
+  stuck retirement (this one, a mob resume or
+  `MobHandle::redrive_retirement`) now keeps a host's refusal of the
+  member's registration, so a member its host refused at a restart is
+  retired on the refused member's path again, as its first attempt was.
 - An intent-managed identity (`meerkat-mob`) whose lease the previous process
   still held when the mob restarted converges once that lease expires, at
   most 30 s after the previous process last renewed it. Nothing woke the
@@ -2733,11 +2740,6 @@ them.
   `misfired` although its admitted input ran; nothing runs twice. Use
   `catch_up_within` with a window longer than the lease to keep crash
   recovery.
-- Identity reconciliation (`meerkat-mob`): a genuine storage or host error
-  after an identity's member retirement has durably started leaves the
-  identity in `Backoff` until the mob is resumed, the host process restarts
-  or the host calls `MobHandle::redrive_retirement`, any of which recovers
-  it.
 
 ## [0.9.3] - 2026-10-18
 
