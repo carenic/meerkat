@@ -220,6 +220,21 @@ Insert a mob's handle before its members run turns. Lookups:
 `MobHandle::member_of_session`, `MobStorage::stored_member_of_session` and
 `stored_members_by_session`, `MobMcpState::session_member_matches`.
 
+Creator grant after a restart (since 0.9.4): a session's persisted mob
+operator authority binds no mob, so the manage grant a create returned was
+gone after a restart. The agent mob tools now re-derive it from the mob's
+creation record, for the incarnation the mob runs at, while the session may
+still create mobs: for `MobProvenance::Session` naming that session (a session
+a host passes as the owner session of a create counts), and for `Member` only
+while the session is still the recorded member's bridge session at the
+recorded generation in the recorded parent incarnation. `Host`, `Ambiguous`
+and `Unrecorded` records, other sessions, later generations and a session
+whose operator removed its create capability get no grant. Known limitation: a
+creating member that was reset to its next generation over the same session no
+longer manages the mob after a restart, because the record names its earlier
+generation; before the restart the session keeps the grant its create
+returned, and an operator grant over the mob restores manage.
+
 Unresumable stores at restore (since 0.9.4): one persisted mob whose resume is
 refused no longer fails `MobMcpState`'s whole restore (0.9.3 then failed every
 mob verb and brought no mob back). That mob is left unrestored with its store

@@ -70,7 +70,10 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   creation record disagrees with its log, or that holds a finished destroy,
   refuses resume (`IncarnationInconsistent`, `IncarnationDestroyed`), and a
   delivery scope from an earlier incarnation gets `IncarnationMismatch`. Such
-  a store no longer stops a server's other mobs from restoring.
+  a store no longer stops a server's other mobs from restoring. After a
+  restart, the session that created a mob with the agent mob tools manages
+  it again (not a creating member reset to a later generation since; an
+  operator grant restores manage).
 
 ## Admission close (Rust hosts)
 
