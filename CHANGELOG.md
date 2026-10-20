@@ -1266,6 +1266,18 @@ them.
   opt-in `turn_projection_cost` benchmarks (ignored timing tests in
   `meerkat-runtime` and `meerkat`) a snapshot read takes about 25% less time
   and a whole scripted turn with three tool calls about 23% less.
+- WebSocket and WebRTC live channels forward each observation as it arrives,
+  so a transcript frame can reach the client before its row commits, and the
+  persisted transcript lags the frames while another turn runs on the
+  session. If the session refuses a row, the channel closes with an error
+  frame (`reason: "projection_error"`) naming the row's kind (`row`), its
+  provider item id (`item_id`) and how many later rows were not applied
+  (`unapplied_rows`). Once 16 MiB of rows wait for the session, the channel
+  closes with `reason: "projection_backlog_full"`; every row it observed
+  still commits. Rows still waiting when the channel closes commit after the
+  close, in order. A local WebRTC barge-in now discards queued output audio
+  before its interrupt commits, and an interrupt the session refuses closes
+  the channel with that error frame.
 - `meerkat-runtime`: `MeerkatMachine::cancel_input_if_present` and
   `cancel_tracked_input_for_member_incarnation` no longer re-read an input
   caught between lifecycle steps (neither queued nor terminal, with no run
@@ -2190,11 +2202,17 @@ them.
   and speech said before a typed message landed after that message's
   answer, so the turn answering it did not see it. The transport now holds
   the boundary across the rows it already has, for at most 64 rows or about
-  a second at a time, so a queued turn waits at most that long for them. A
-  WebSocket or WebRTC live channel still takes the boundary once per row, and
-  its transport forwards nothing behind a row that waits, so its voice goes
-  silent while a member turn runs and arrives in a burst when the turn ends
-  (see `docs/guides/realtime.mdx`). (#1821)
+  a second at a time, so a queued turn waits at most that long for them.
+  WebSocket and WebRTC live channels hold it the same way across their
+  consecutive transcript rows (see `docs/guides/realtime.mdx`). (#1821)
+- Voice audio on WebSocket and WebRTC live channels no longer pauses while
+  another turn runs on the same session. The transport applied each
+  transcript row to the session before it forwarded anything behind it, and a
+  row waits for a running turn, so the assistant's voice (and on WebSocket
+  the user's microphone audio too) stopped until that turn ended and then
+  arrived in a burst. The rows now wait in an ordered queue off the media
+  path and commit in arrival order once the turn ends; on WebRTC an
+  interruption stops the queued output audio at once.
 - A persisted mob whose resume is refused at restore no longer fails the
   whole restore of `MobMcpState` (`meerkat-mob-mcp`). One such store, for
   example one whose creation record disagrees with its log

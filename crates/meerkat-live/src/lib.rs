@@ -10,6 +10,7 @@
 //! admission.
 
 pub mod host;
+mod projection_queue;
 pub mod provider_webrtc;
 pub mod transport;
 #[cfg(feature = "webrtc")]

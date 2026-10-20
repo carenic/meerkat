@@ -1774,6 +1774,13 @@ pub enum LiveAdapterHostError {
     PlaybackTerminalSettlementFailed(String),
     #[error("playback terminal command was accepted but its host receipt failed: {0}")]
     PlaybackTerminalAcceptedButReceiptFailed(String),
+    /// A live transport's queue of rows waiting for the session (behind a
+    /// running member turn) reached its bound. The transport ends the
+    /// channel instead of reading on; every row it queued is still applied.
+    #[error(
+        "live projection queue reached its {bound_bytes}-byte bound while the session's turn boundary was held"
+    )]
+    ProjectionBacklogFull { bound_bytes: usize },
 }
 
 impl LiveAdapterHostError {
@@ -1808,6 +1815,7 @@ impl LiveAdapterHostError {
             Self::PlaybackTerminalAcceptedButReceiptFailed(_) => {
                 "playback_terminal_accepted_but_receipt_failed"
             }
+            Self::ProjectionBacklogFull { .. } => "projection_backlog_full",
         }
     }
 }
