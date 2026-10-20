@@ -233,6 +233,9 @@ fn live_open_projection_error_code(error: &RealtimeSessionOpenProjectionError) -
             meerkat_client::error::LlmError::InvalidInputShape { .. },
         ) => crate::error::INVALID_PARAMS,
         RealtimeSessionOpenProjectionError::Summary(_) => crate::error::INTERNAL_ERROR,
+        // Another open on this host holds the process's open-projection
+        // admission: busy, and the same open succeeds on a later retry.
+        RealtimeSessionOpenProjectionError::Backpressured => crate::error::SESSION_BUSY,
         RealtimeSessionOpenProjectionError::Session(_)
         | RealtimeSessionOpenProjectionError::SessionMismatch { .. }
         | RealtimeSessionOpenProjectionError::Seed(
@@ -2540,6 +2543,15 @@ mod tests {
         assert_eq!(
             super::live_open_projection_error_code(&unsupported_shape),
             error::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn a_backpressured_live_open_is_a_retryable_busy_not_an_internal_error() {
+        let refused = RealtimeSessionOpenProjectionError::Backpressured;
+        assert_eq!(
+            super::live_open_projection_error_code(&refused),
+            error::SESSION_BUSY
         );
     }
 

@@ -39,6 +39,10 @@ them.
 
 ### Breaking
 
+- `meerkat`: `session_runtime::live_orchestration::RealtimeSessionOpenProjectionError`
+  gains the variant `Backpressured`: a live open refused because another
+  live open on the host still holds the process's open-projection admission
+  (see Fixed). Code that matches the enum exhaustively adds an arm for it.
 - `meerkat-mob`: `SqliteMobObserverDrainReport` gains the field
   `retained_registrations: usize`: notification registrations of the
   drained observer's change watches that were still running when the drain
@@ -1607,6 +1611,16 @@ them.
 
 ### Fixed
 
+- A live open refused because another live open on the same host was still
+  being prepared is now the typed, retryable
+  `RealtimeSessionOpenProjectionError::Backpressured`, not an internal session
+  error. The host admits one live open projection at a time and queues none,
+  so two opens at the same moment (two people starting voice, or a voice call
+  and another live channel) refused the second, and surfaces reported it as
+  an internal failure the caller could not tell from a broken host. `rkat-rpc`
+  `live/open` now answers it with the `SessionBusy` code (-32002) and a
+  member live host with `MemberLiveError::Unavailable`; the same open
+  succeeds when retried once the other open has been prepared.
 - `meerkat-mob`: a mob restarts when one of its members has a durable tail
   ahead of the runtime boundary it last committed. A turn's durable rows can
   land after that boundary when a retirement cancels the turn mid-way, or when
