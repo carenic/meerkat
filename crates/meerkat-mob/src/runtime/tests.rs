@@ -63763,6 +63763,11 @@ struct RuntimeTurnContentBarrier {
 
 struct RuntimeBackedRealCommsSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<meerkat_comms::CommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// service created: a respawn keeps its predecessor's restrictions.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
@@ -63823,6 +63828,7 @@ impl RuntimeBackedRealCommsSessionService {
     fn with_runtime_adapter(runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             session_comms_names: RwLock::new(HashMap::new()),
@@ -63915,6 +63921,14 @@ impl RuntimeBackedRealCommsSessionService {
             .write()
             .await
             .insert(session_id.clone(), comms_name);
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                meerkat_core::PredecessorToolRestrictions::from_build_request(req.build.as_ref())
+                    .map_err(|error| error.to_string()),
+            );
 
         if let Some(permit) = actor_materialization_permit
             && let Err(error) = permit.commit()
@@ -64482,6 +64496,25 @@ impl SessionServiceControlExt for RuntimeBackedRealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RuntimeBackedRealCommsSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
