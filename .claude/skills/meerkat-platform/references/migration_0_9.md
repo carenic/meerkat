@@ -308,6 +308,14 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `force_cancel_member` / `cancel_all_work` on a member needing a durability
   reload answer `MemberReloadRequired` (-32029, HTTP 409, exit 49): reload it
   with `reload_member_registration`, then cancel again.
+- Respawn: a respawned local member keeps its predecessor's launch tool access
+  policy and inherited visibility ceiling (never widened) and its recorded
+  auth binding when its profile stays on that provider; a respawn whose
+  restrictions cannot be established (a lost session included) is refused
+  before anything is retired with
+  `MobError::RespawnPredecessorRestrictionsUnavailable`; retire and spawn
+  instead. A custom `MobSessionService` delegates
+  `predecessor_tool_restrictions` (default `Unsupported` refuses respawns).
 - Mob incarnations: a mob keeps its `MobIncarnationId` across resume (stored
   in a creation record; pre-0.9.4 mobs get one at their first resume as
   `Unrecorded`), so operator grants survive a resume and a creating session

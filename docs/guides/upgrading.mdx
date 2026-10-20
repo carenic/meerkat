@@ -187,6 +187,24 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   A member `MobBuilder::resume` recreates on a fresh session is isolated the
   same way when its host refuses it, and the other members resume; 0.9.3
   failed the whole resume.
+- **A respawned member keeps the restrictions it was spawned under:**
+  `MobHandle::respawn` and the `mob_respawn` tool give the successor the
+  predecessor's launch tool access policy and inherited visibility ceiling, as
+  its session recorded them, intersected with the successor's own and never
+  widened. It keeps the recorded auth binding only when its own spec names
+  none and its profile resolves to that binding's provider. 0.9.3 built the
+  successor from the profile alone, so a member spawned under its spawner's
+  tool ceiling came back without it. A respawn whose predecessor's
+  restrictions cannot be established (including a Broken member whose session
+  was lost, which 0.9.3 respawned), whose successor profile cannot be resolved
+  or whose member changes meanwhile is refused before anything is retired,
+  with the new `MobError::RespawnPredecessorRestrictionsUnavailable` (no
+  dedicated wire code; its message is
+  `respawn of member <id> refused: <reason>`). **Do:** retire such a member
+  and spawn a fresh one; a custom `MobSessionService` that wraps a Meerkat
+  session service delegates the new `predecessor_tool_restrictions` (its
+  default, `Unsupported`, refuses the respawns of its members). See
+  [Preserve restrictions across respawn](/guides/authorization-integration#preserve-restrictions-across-respawn).
 - **Stop and Shutdown of a member whose registration needs a durability
   reload** report its run and run starts as `ReloadRequired` (the new
   `MemberStopRun::ReloadRequired` and `MemberRunStarts::ReloadRequired`, wire
