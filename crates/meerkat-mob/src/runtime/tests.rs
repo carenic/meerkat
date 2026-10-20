@@ -577,6 +577,47 @@ fn factory_policy_session(mut session: Session, model: String, max_tokens: u32) 
     session
 }
 
+/// Record a build's restrictions in the session body as the factory does: the
+/// launch policy (an explicit one, else the restored one, else the legacy
+/// effective policy) and a canonical visibility record when none exists.
+fn factory_recorded_restrictions(
+    mut session: Session,
+    build: Option<&meerkat_core::service::SessionBuildOptions>,
+) -> Session {
+    if let Ok(Some(mut metadata)) = session.try_session_metadata() {
+        let launch = build
+            .and_then(|build| build.tool_access_policy.clone())
+            .or_else(|| {
+                metadata
+                    .tooling
+                    .spawn_tool_access_policy
+                    .clone()
+                    .map_or_else(
+                        || metadata.tooling.tool_access_policy.clone(),
+                        meerkat_core::ops::SpawnToolAccessPolicy::into_launch,
+                    )
+            });
+        metadata.tooling.spawn_tool_access_policy = Some(
+            meerkat_core::ops::SpawnToolAccessPolicy::from_launch(launch),
+        );
+        session
+            .set_session_metadata(metadata)
+            .expect("test metadata serializes");
+    }
+    if matches!(session.try_tool_visibility_state(), Ok(None)) {
+        let mut raw = serde_json::to_value(&session).expect("test session serializes");
+        raw.get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test session metadata is an object")
+            .insert(
+                meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+                serde_json::json!({}),
+            );
+        session = serde_json::from_value(raw).expect("test session deserializes");
+    }
+    session
+}
+
 fn test_llm_identity(model: impl Into<String>) -> SessionLlmIdentity {
     SessionLlmIdentity {
         model: model.into(),
@@ -1681,6 +1722,8 @@ struct CreateSessionRecord {
     /// binding (`ResumeOverrideMask::application_tool_policy`).
     has_policy_registry: bool,
     application_tool_policy_masked: bool,
+    /// The auth binding the build names.
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1929,6 +1972,11 @@ impl TestRuntimeControlBarrier {
 
 struct MockSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<MockCommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// mock created, as a session owner records them.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     live_session_data: RwLock<HashMap<SessionId, Session>>,
     persisted_sessions: RwLock<HashMap<SessionId, Session>>,
@@ -2208,14 +2256,27 @@ struct MockSessionService {
     /// One permit per interrupt that entered its gate.
     interrupt_gate_entered: tokio::sync::Notify,
     runtime_boundary_acknowledgements: RwLock<Vec<RuntimeBoundaryAcknowledgement>>,
+    /// Cleared by [`Self::keep_no_durable_sessions`]: the service then reports
+    /// that it keeps no durable sessions, as an ephemeral service does.
+    keeps_durable_sessions: AtomicBool,
 }
 
 impl MockSessionService {
+    /// Drop this owner's record of a session's spawner restrictions, as a
+    /// session whose evidence is missing or unknown.
+    fn forget_tool_restrictions(&self, session_id: &SessionId) {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             live_session_data: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
             resume_authority_gate: tokio::sync::Mutex::new(()),
             persisted_session_revisions: RwLock::new(HashMap::new()),
@@ -2363,7 +2424,13 @@ impl MockSessionService {
             interrupt_gates: RwLock::new(HashMap::new()),
             interrupt_gate_entered: tokio::sync::Notify::new(),
             runtime_boundary_acknowledgements: RwLock::new(Vec::new()),
+            keeps_durable_sessions: AtomicBool::new(true),
         }
+    }
+
+    /// Report, from now on, that this service keeps no durable sessions.
+    fn keep_no_durable_sessions(&self) {
+        self.keeps_durable_sessions.store(false, Ordering::SeqCst);
     }
 
     async fn fail_subscribe_for_session(&self, session_id: SessionId) {
@@ -2464,6 +2531,19 @@ impl MockSessionService {
             .iter()
             .filter(|(session_id, _)| persisted_ids.contains(*session_id))
             .map(|(session_id, name)| (session_id.clone(), name.clone()))
+            .collect();
+        // A persisted session's restriction record is part of its committed
+        // body, so it survives the restart with it.
+        *restarted
+            .tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self
+            .tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(session_id, _)| persisted_ids.contains(*session_id))
+            .map(|(session_id, record)| (session_id.clone(), record.clone()))
             .collect();
         restarted
     }
@@ -3775,7 +3855,12 @@ impl MockSessionService {
                         .map(|b| b.override_web_search)
                         .unwrap_or(ToolCategoryOverride::Inherit),
                     tool_access_policy: build.and_then(|b| b.tool_access_policy.clone()),
-                    spawn_tool_access_policy: None,
+                    // Recorded as the factory records it on every build.
+                    spawn_tool_access_policy: Some(
+                        meerkat_core::ops::SpawnToolAccessPolicy::from_launch(
+                            build.and_then(|b| b.tool_access_policy.clone()),
+                        ),
+                    ),
                     application_tool_policy: build
                         .map(|b| b.application_tool_policy.clone())
                         .unwrap_or(meerkat_core::ApplicationToolPolicyBinding::Unmanaged),
@@ -3811,6 +3896,64 @@ impl MockSessionService {
             session
                 .set_build_state(build_state)
                 .expect("mock session build state should serialize");
+        }
+        {
+            // This owner keeps its own record for a session it created and
+            // now resumes; a session it never recorded resolves from the
+            // request (a resumed body without a record is refused).
+            let mut records = self
+                .tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(records.get(&session_id), Some(Ok(_))) {
+                // Mirror the factory's launch-policy restore: a resumed body
+                // recorded before the launch part was kept separately
+                // restores its effective policy as the launch policy, and
+                // the build records it.
+                let mut build = req.build.clone();
+                if let Some(resumed) = build
+                    .as_mut()
+                    .and_then(|build| build.resume_session.as_mut())
+                    && let Ok(Some(mut metadata)) = resumed.try_session_metadata()
+                    && metadata.tooling.spawn_tool_access_policy.is_none()
+                {
+                    metadata.tooling.spawn_tool_access_policy =
+                        Some(meerkat_core::ops::SpawnToolAccessPolicy::from_launch(
+                            metadata.tooling.tool_access_policy.clone(),
+                        ));
+                    resumed
+                        .set_session_metadata(metadata)
+                        .expect("mock resumed metadata should serialize");
+                }
+                // A resumed body without a canonical visibility record (and no
+                // legacy inherited filter) builds with the default state.
+                if let Some(resumed) = build
+                    .as_mut()
+                    .and_then(|build| build.resume_session.as_mut())
+                    && matches!(resumed.try_tool_visibility_state(), Ok(None))
+                    && resumed
+                        .metadata()
+                        .get(meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY)
+                        .is_none()
+                {
+                    let mut raw = serde_json::to_value(&*resumed)
+                        .expect("mock resumed session should serialize");
+                    raw.get_mut("metadata")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("mock resumed session metadata is an object")
+                        .insert(
+                            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+                            serde_json::json!({}),
+                        );
+                    *resumed = serde_json::from_value(raw)
+                        .expect("mock resumed session should deserialize");
+                }
+                records.insert(
+                    session_id.clone(),
+                    meerkat_core::PredecessorToolRestrictions::from_build_request(build.as_ref())
+                        .map_err(|error| error.to_string()),
+                );
+            }
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
         self.live_session_data
@@ -3940,6 +4083,10 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .is_some_and(|build| build.resume_override_mask.application_tool_policy),
+                auth_binding: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.auth_binding.clone()),
             });
 
         let mcp_server_names: Vec<String> = req
@@ -4931,6 +5078,27 @@ impl MobSessionService for MockSessionService {
         Ok(Some(Vec::new()))
     }
 
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| {
+                SessionError::Unsupported(format!(
+                    "no inherited tool restriction evidence for session {session_id}"
+                ))
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &SessionId,
@@ -5300,7 +5468,7 @@ impl MobSessionService for MockSessionService {
     }
 
     fn supports_persistent_sessions(&self) -> bool {
-        true
+        self.keeps_durable_sessions.load(Ordering::SeqCst)
     }
 
     fn supports_runtime_turn_apply(&self) -> bool {
@@ -5937,6 +6105,7 @@ struct TerminalAppendGate {
 
 struct FaultInjectedMobEventStore {
     events: RwLock<Vec<MobEvent>>,
+    creation: RwLock<Option<crate::store::MobCreationRecord>>,
     event_tx: tokio::sync::broadcast::Sender<MobEvent>,
     external_deliveries: InMemoryMobEventStore,
     fail_on_kind: RwLock<HashSet<&'static str>>,
@@ -5979,7 +6148,33 @@ impl SqliteWriteThenErrorMobEventStore {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl private::MobEventStoreSealed for SqliteWriteThenErrorMobEventStore {}
+#[async_trait]
+impl private::MobEventStoreSealed for SqliteWriteThenErrorMobEventStore {
+    async fn creation_record(
+        &self,
+    ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+        private::MobEventStoreSealed::creation_record(&self.inner).await
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        provenance: &crate::MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        private::MobEventStoreSealed::append_creation(&self.inner, event, incarnation, provenance)
+            .await
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+        private::MobEventStoreSealed::assign_legacy_incarnation(&self.inner, mob_id, incarnation)
+            .await
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
@@ -6040,6 +6235,7 @@ impl FaultInjectedMobEventStore {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4096);
         Self {
             events: RwLock::new(Vec::new()),
+            creation: RwLock::new(None),
             event_tx,
             external_deliveries: InMemoryMobEventStore::new(),
             fail_on_kind: RwLock::new(HashSet::new()),
@@ -6199,7 +6395,54 @@ impl FaultInjectedMobEventStore {
     }
 }
 
-impl private::MobEventStoreSealed for FaultInjectedMobEventStore {}
+#[async_trait]
+impl private::MobEventStoreSealed for FaultInjectedMobEventStore {
+    async fn creation_record(
+        &self,
+    ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+        Ok(self.creation.read().await.clone())
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: meerkat_core::service::MobIncarnationId,
+        provenance: &crate::MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        let kind_label = Self::kind_label(&event.kind);
+        if self.fail_on_kind.read().await.contains(kind_label) {
+            return Err(MobStoreError::Internal(format!(
+                "fault-injected append failure for {kind_label}"
+            )));
+        }
+        let mut events = self.events.write().await;
+        let mut creation = self.creation.write().await;
+        let stored = crate::store::append_creation_in_memory(
+            &mut events,
+            &mut creation,
+            event,
+            incarnation,
+            provenance,
+        )?;
+        let _ = self.event_tx.send(stored.clone());
+        Ok(stored)
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+        let events = self.events.read().await;
+        let mut creation = self.creation.write().await;
+        crate::store::assign_legacy_incarnation_in_memory(
+            &events,
+            &mut creation,
+            mob_id,
+            incarnation,
+        )
+    }
+}
 
 #[async_trait]
 impl MobEventStore for FaultInjectedMobEventStore {
@@ -6445,6 +6688,7 @@ impl MobEventStore for FaultInjectedMobEventStore {
             ));
         }
         self.events.write().await.clear();
+        crate::store::finalize_creation_in_memory(&mut *self.creation.write().await);
         self.external_deliveries.clear().await?;
         Ok(())
     }
@@ -7601,7 +7845,7 @@ fn sample_definition_with_mob_tools() -> MobDefinition {
 
 fn generated_mob_operator_authority_with_scope(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated create-only mob authority should be accepted");
@@ -7614,7 +7858,7 @@ fn generated_mob_operator_authority_with_scope(
 
 fn generated_mob_operator_authority_with_spawn_profile(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
     profile: &str,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     // Create-only authority with NO manage scope on the target mob, granted a
@@ -7636,12 +7880,12 @@ fn generated_mob_operator_authority_with_spawn_profile(
     .expect("generated mob authority should grant a spawnable profile")
 }
 
-/// A mob runtime start mints one incarnation that every handle clone shares.
-/// A mob created again under the same id, or resumed after a shutdown, is
-/// another incarnation, so operator scope granted for the first never
-/// reaches it.
+/// A create mints the mob's incarnation once; every handle clone shares it,
+/// and a resume by a later runtime reads it back from the creation record, so
+/// operator scope granted for the mob still reaches it. A mob created again
+/// under the same id is another incarnation, which that scope never reaches.
 #[tokio::test]
-async fn each_mob_runtime_start_mints_a_new_incarnation() {
+async fn a_mob_keeps_its_incarnation_across_resume() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -7650,7 +7894,8 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
         .create()
         .await
         .expect("create mob");
-    let incarnation = created.incarnation();
+    let live = created.live_incarnation();
+    let incarnation = live.incarnation();
     assert_eq!(created.clone().incarnation(), incarnation);
     assert_eq!(created.observer().incarnation(), incarnation);
     let mob_id = created.mob_id().clone();
@@ -7661,7 +7906,7 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
     let (recreated, _recreated_service) = create_test_mob(sample_definition()).await;
     assert_eq!(recreated.mob_id(), &mob_id);
     assert_ne!(recreated.incarnation(), incarnation);
-    let authority = generated_mob_operator_authority_with_scope(mob_id.as_str(), incarnation);
+    let authority = generated_mob_operator_authority_with_scope(mob_id.as_str(), live);
     assert!(authority.can_manage_mob(mob_id.as_str(), incarnation));
     assert!(!authority.can_manage_mob(mob_id.as_str(), recreated.incarnation()));
     recreated
@@ -7669,16 +7914,467 @@ async fn each_mob_runtime_start_mints_a_new_incarnation() {
         .await
         .expect("stop the recreated runtime");
 
-    // The first mob resumed by a later runtime is another incarnation too.
+    // The first mob resumed by a later runtime keeps its incarnation, and
+    // the grant made before the restart still reaches it.
     let resumed_service = Arc::new(MockSessionService::new());
     let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(resumed.incarnation(), incarnation);
+    assert!(authority.can_manage_mob(mob_id.as_str(), resumed.incarnation()));
+    assert_eq!(
+        storage
+            .creation_incarnation()
+            .await
+            .expect("read the record"),
+        Some(incarnation)
+    );
+}
+
+/// The creation record of a persistent store, written with the mob's
+/// `MobCreated` and read back by every resume.
+async fn persistent_creation_record(
+    database: &std::path::Path,
+) -> Option<crate::store::MobCreationRecord> {
+    let storage = MobStorage::persistent(database).expect("reopen persistent mob storage");
+    crate::store::private::MobEventStoreSealed::creation_record(storage.events.as_ref())
+        .await
+        .expect("read the creation record")
+}
+
+async fn resume_persistent(database: &std::path::Path) -> Result<MobHandle, MobError> {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    MobBuilder::for_resume(MobStorage::persistent(database).expect("reopen persistent mob storage"))
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .resume()
+        .await
+}
+
+/// A mob created before creation records existed (a store a 0.9.3 binary
+/// wrote, migrated to the current ledger) gets one migrated incarnation at
+/// its first resume, recorded before the resume continues with an
+/// `Unrecorded` provenance, and every later resume reuses it.
+#[tokio::test]
+async fn a_legacy_store_gets_one_migrated_incarnation_at_its_first_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let created = MobBuilder::new(
+        sample_definition(),
+        MobStorage::persistent(&database).expect("open persistent mob storage"),
+    )
+    .with_session_service(service)
+    .allow_ephemeral_sessions(true)
+    .create()
+    .await
+    .expect("create mob");
+    let created_incarnation = created.incarnation();
+    created.shutdown().await.expect("stop the first runtime");
+    drop(created);
+    // The store as a 0.9.3 binary left it: the log, and no creation record.
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute("DELETE FROM mob_runtime_incarnations", [])
+        .expect("drop the creation record");
+    assert_eq!(persistent_creation_record(&database).await, None);
+
+    let first = resume_persistent(&database).await.expect("first resume");
+    let migrated = first.incarnation();
+    assert_ne!(
+        migrated, created_incarnation,
+        "the legacy store's incarnation is minted at its first resume"
+    );
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the first resume records the incarnation");
+    assert_eq!(record.incarnation, migrated);
+    assert_eq!(record.origin, crate::store::MobCreationOrigin::Migrated);
+    assert_eq!(
+        first.provenance().await.expect("provenance"),
+        crate::MobProvenance::Unrecorded
+    );
+    first.shutdown().await.expect("stop the first resume");
+    drop(first);
+
+    let second = resume_persistent(&database).await.expect("second resume");
+    assert_eq!(second.incarnation(), migrated, "a later resume reuses it");
+    assert_eq!(
+        second.provenance().await.expect("provenance"),
+        crate::MobProvenance::Unrecorded,
+        "a legacy store's provenance never changes"
+    );
+}
+
+/// A store whose creation record has no `MobCreated` disagrees with itself:
+/// its resume is refused, typed, and the store is left as it was.
+#[tokio::test]
+async fn a_creation_record_without_its_mob_created_refuses_the_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let created = MobBuilder::new(
+        sample_definition(),
+        MobStorage::persistent(&database).expect("open persistent mob storage"),
+    )
+    .with_session_service(service)
+    .allow_ephemeral_sessions(true)
+    .create()
+    .await
+    .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the runtime");
+    drop(created);
+    rusqlite::Connection::open(&database)
+        .expect("open the store")
+        .execute("DELETE FROM mob_events", [])
+        .expect("drop the log, not through the destroy's clear");
+
+    let error = match resume_persistent(&database).await {
+        Ok(_) => panic!("a record without its MobCreated is not resumed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            MobError::IncarnationInconsistent {
+                mob_id: refused,
+                inconsistency: crate::IncarnationInconsistency::RecordWithoutCreation,
+            } if refused == &mob_id
+        ),
+        "{error:?}"
+    );
+    assert!(
+        persistent_creation_record(&database)
+            .await
+            .is_some_and(|record| !record.is_finalized()),
+        "the refused resume leaves the record as it was"
+    );
+}
+
+/// The destroy's event clear finalizes the creation record in the same
+/// write: the store then holds a finished destroy of that incarnation, which
+/// is not resumed. A create in the kept store replaces the finalized record
+/// with its own incarnation, and a raw `MobCreated` append over a record is
+/// refused.
+#[tokio::test]
+async fn a_destroyed_store_keeps_a_finalized_record_until_a_create_replaces_it() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let storage = MobStorage::persistent(&database).expect("open persistent mob storage");
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    let destroyed = created.incarnation();
+    created.destroy().await.expect("destroy the mob");
+    drop(created);
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the destroy keeps the record");
+    assert_eq!(record.incarnation, destroyed);
+    assert!(record.is_finalized(), "the event clear finalized it");
+
+    let error = match resume_persistent(&database).await {
+        Ok(_) => panic!("a finished destroy is not resumed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            MobError::IncarnationDestroyed { mob_id: refused, incarnation }
+                if refused == &mob_id && *incarnation == destroyed
+        ),
+        "{error:?}"
+    );
+
+    let raw = storage
+        .events
+        .append(NewMobEvent {
+            mob_id: mob_id.clone(),
+            timestamp: None,
+            kind: MobEventKind::MobCreated {
+                definition: Box::new(sample_definition()),
+            },
+        })
+        .await
+        .expect_err("a raw MobCreated over a creation record is refused");
+    assert!(
+        matches!(
+            &raw,
+            MobStoreError::IncarnationInconsistent {
+                inconsistency: crate::IncarnationInconsistency::RawCreationOverRecord,
+                ..
+            }
+        ),
+        "{raw:?}"
+    );
+
+    let recreated = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("a create in the kept store");
+    assert_ne!(recreated.incarnation(), destroyed);
+    let record = persistent_creation_record(&database)
+        .await
+        .expect("the create's record");
+    assert_eq!(record.incarnation, recreated.incarnation());
+    assert!(!record.is_finalized());
+    assert_eq!(record.origin, crate::store::MobCreationOrigin::Created);
+}
+
+/// A create records who created the mob: the host unless the builder is
+/// told otherwise, and exactly the provenance it was given. The record never
+/// changes across a resume.
+#[tokio::test]
+async fn a_create_records_its_provenance_once() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let host = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create a host mob");
+    assert_eq!(
+        host.provenance().await.expect("provenance"),
+        crate::MobProvenance::Host
+    );
+    // Both mobs use this test's mob id: the first releases its supervisor
+    // name before the second claims it.
+    host.shutdown().await.expect("stop the host mob");
+
+    let session_service = Arc::new(MockSessionService::new());
+    let _ = session_service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let session_id = SessionId::new();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(session_service)
+        .with_provenance(crate::MobProvenance::Session {
+            session_id: session_id.clone(),
+        })
+        .create()
+        .await
+        .expect("create a session's mob");
+    let expected = crate::MobProvenance::Session { session_id };
+    assert_eq!(created.provenance().await.expect("provenance"), expected);
+    created.shutdown().await.expect("stop the runtime");
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .with_provenance(crate::MobProvenance::Host)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.provenance().await.expect("provenance"),
+        expected,
+        "a resume keeps the recorded provenance"
+    );
+    assert_eq!(
+        storage
+            .creation_provenance()
+            .await
+            .expect("read the record"),
+        Some(expected)
+    );
+}
+
+/// A Stop an earlier runtime durably began and never finished (its quiesce
+/// marker is the last event of the log, as an unclean stop on a member that
+/// never settled leaves it) is finished before the resume hands the mob
+/// back. The handle's phase is Stopped as soon as the resume returns, the
+/// Stop is durable, and a host that lifts a stopped mob right after its
+/// resume runs it again. The resume used to hand back a Running mob that the
+/// recovered Stop left Stopped moments later, after such a host had read
+/// Running and skipped its lift, so no member accepted work.
+#[tokio::test]
+async fn a_resume_finishes_an_interrupted_stop_before_it_hands_the_mob_back() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id,
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Stop,
+            },
+        })
+        .await
+        .expect("record a Stop the first runtime began and never finished");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Stopped,
+        "the resume hands back the phase the interrupted Stop leaves"
+    );
+    assert_eq!(resumed.status().await.expect("status"), MobState::Stopped);
+    assert!(
+        storage
+            .events
+            .replay_all()
+            .await
+            .expect("replay the log")
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MobStopped)),
+        "the interrupted Stop is finished durably"
+    );
+
+    resumed
+        .resume()
+        .await
+        .expect("the host lifts the stopped mob");
+    assert_eq!(resumed.status().await.expect("status"), MobState::Running);
+}
+
+/// A Complete an earlier runtime durably began and never finished is
+/// finished before the resume hands the mob back, as an interrupted Stop
+/// is: the handle's phase is Completed as soon as the resume returns, and
+/// the Complete is durable.
+#[tokio::test]
+async fn a_resume_finishes_an_interrupted_complete_before_it_hands_the_mob_back() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let created = MobBuilder::new(sample_definition(), storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id,
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Complete,
+            },
+        })
+        .await
+        .expect("record a Complete the first runtime began and never finished");
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let resumed = MobBuilder::for_resume(storage.clone())
+        .with_session_service(resumed_service)
+        .resume()
+        .await
+        .expect("resume the mob");
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Completed,
+        "the resume hands back the phase the interrupted Complete leaves"
+    );
+    assert!(
+        storage
+            .events
+            .replay_all()
+            .await
+            .expect("replay the log")
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MobCompleted)),
+        "the interrupted Complete is finished durably"
+    );
+}
+
+/// The resume waits only a short, bounded time for the first attempt at a
+/// recovered Stop. Here the attempt does not answer (its driver is held, as
+/// a Stop held on a member would be): the resume returns as the bound ends,
+/// with the mob still Running as before, and the Stop lands in the
+/// background once the driver goes on.
+#[tokio::test(start_paused = true)]
+async fn a_resume_waits_only_a_bounded_time_for_a_recovered_stop_that_does_not_answer() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let definition = with_unique_mob_id(sample_definition(), "recovered-stop-held");
+    let created = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let mob_id = created.mob_id().clone();
+    created.shutdown().await.expect("stop the first runtime");
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id: mob_id.clone(),
+            timestamp: None,
+            kind: MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                intent: crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Stop,
+            },
+        })
+        .await
+        .expect("record a Stop the first runtime began and never finished");
+    let hold = Arc::new(tokio::sync::Notify::new());
+    crate::runtime::builder::RECOVERED_LIFECYCLE_DRIVER_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id.as_str().to_string(), Arc::clone(&hold));
+
+    let resumed_service = Arc::new(MockSessionService::new());
+    let _ = resumed_service.enable_runtime_adapter();
+    let started = tokio::time::Instant::now();
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(resumed_service)
         .resume()
         .await
         .expect("resume the mob");
-    assert_ne!(resumed.incarnation(), incarnation);
-    assert_ne!(resumed.incarnation(), recreated.incarnation());
+    let waited = started.elapsed();
+    let bound = crate::runtime::builder::RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT;
+    assert!(
+        waited >= bound && waited < bound + Duration::from_secs(1),
+        "the resume returns as the bound ends: waited {waited:?}"
+    );
+    assert_eq!(
+        resumed.status_observation_snapshot(),
+        MobState::Running,
+        "a Stop that has not answered leaves the mob as the resume found it"
+    );
+
+    crate::runtime::builder::RECOVERED_LIFECYCLE_DRIVER_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(mob_id.as_str());
+    hold.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while resumed.status().await.expect("status") != MobState::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Stop lands in the background once its driver goes on");
 }
 
 /// Create seals the generation high-water window of a fresh machine. Resume
@@ -13141,6 +13837,13 @@ impl SessionServiceControlExt for PersistedListingSessionService {
 
 #[async_trait]
 impl MobSessionService for PersistedListingSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.inner.predecessor_tool_restrictions(session_id).await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &SessionId,
@@ -13577,6 +14280,13 @@ impl SessionServiceControlExt for InactiveReadSessionService {
 
 #[async_trait]
 impl MobSessionService for InactiveReadSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.inner.predecessor_tool_restrictions(session_id).await
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
@@ -14401,6 +15111,7 @@ impl SessionAgentBuilder for OverlayProbeSessionAgentBuilder {
             .unwrap_or_default();
         let session =
             factory_policy_session(session, req.model.clone(), req.max_tokens.unwrap_or(1024));
+        let session = factory_recorded_restrictions(session, req.build.as_ref());
         Ok(OverlayProbeSessionAgent {
             session,
             provider_visible_tools: Arc::clone(&self.provider_visible_tools),
@@ -15971,6 +16682,255 @@ async fn test_existing_member_adoption_tool_update_and_resume_keep_identity_and_
         .session_metadata()
         .expect("adopted session metadata");
     assert_eq!(metadata.tooling.shell, ToolCategoryOverride::Enable);
+    resumed.shutdown().await.expect("shutdown resumed mob");
+}
+
+#[tokio::test]
+async fn an_adopted_identity_converges_once_the_previous_incarnations_lease_expires() {
+    // The previous incarnation's last lease renewal; long enough that the
+    // resumed actor's first pass observes it live.
+    const PREVIOUS_LEASE_TTL_MS: u64 = 4_000;
+
+    let definition = with_unique_mob_id(sample_definition(), "identity-await-lease");
+    let mob_id = definition.id.clone();
+    let event_store = InMemoryMobEventStore::new();
+    let runs = Arc::new(InMemoryMobRunStore::new());
+    let specs = Arc::new(InMemoryMobSpecStore::new());
+    let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
+    let identity_store = Arc::new(InMemoryMobIdentityStore::paired_with_event_store(
+        &event_store,
+        Arc::new(crate::store::SystemMobIdentityStoreClock),
+    ));
+    let events: Arc<dyn MobEventStore> = Arc::new(event_store);
+    let identity_status = Arc::new(InMemoryMobIdentityStatusStore::new());
+    let session_store_dyn: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        PersistentMockBuilder,
+        16,
+        session_store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    let storage = || MobStorage {
+        events: events.clone(),
+        runs: runs.clone(),
+        specs: specs.clone(),
+        definition_projection_composition:
+            crate::storage::DefinitionProjectionComposition::Independent,
+        runtime_metadata: runtime_metadata.clone(),
+        identity: identity_store.clone(),
+        identity_member: Some(identity_store.clone()),
+        identity_status: identity_status.clone(),
+        identity_status_projection_order: Default::default(),
+        realm_profiles: None,
+        forked_participants: None,
+    };
+    let base_prompt = || {
+        Arc::new(crate::StaticSpawnBasePromptSource(
+            "await lease test base prompt".to_string(),
+        ))
+    };
+    let handle = MobBuilder::new(definition, storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .create()
+        .await
+        .expect("create await-lease test mob");
+    let member = AgentIdentity::from("worker-1");
+    let mut spawn = SpawnMemberSpec::new(ProfileName::from("worker"), member.clone());
+    spawn.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spawn)
+        .await
+        .expect("spawn pre-existing member");
+    let session_id = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("session-backed member");
+    let adoption = crate::identity::AdoptMemberIdentityDeclaration {
+        mob_id: mob_id.clone(),
+        agent_identity: member.clone(),
+        request_id: crate::identity::IdentityAdoptionId::new("adopt-worker-1")
+            .expect("valid adoption id"),
+        precondition: crate::identity::IdentityAdoptionPrecondition::ExpectedAbsent,
+        declaration_scope: crate::identity::IdentityDeclarationScopeId::new("example-policy")
+            .expect("valid declaration scope"),
+        declaration_revision: 1,
+        session: crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::RequireExisting,
+        },
+        member: crate::identity::IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: None,
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: crate::identity::DesiredExecution::ControllingSession,
+        },
+        wiring_custody: crate::identity::IdentityWiringCustody::ExternalManaged,
+        owned_wiring: BTreeSet::new(),
+        convergence: crate::identity::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+    };
+    assert!(matches!(
+        handle
+            .adopt_member_identity_declaration(adoption)
+            .await
+            .expect("adopt existing member")
+            .adoption,
+        crate::identity::IdentityAdoptionOutcome::Adopted {
+            desired_revision: 1
+        }
+    ));
+    let converged = |status: &crate::identity::IdentityStoredObservation<
+        crate::identity::IdentityConvergenceStatus,
+    >,
+                     after_epoch: u64| {
+        matches!(
+            status,
+            crate::identity::IdentityStoredObservation::Valid(
+                crate::identity::IdentityConvergenceStatus {
+                    intent_revision: Some(1),
+                    decision: Some(crate::identity::IdentityReconcileDecision::Converged),
+                    lease_epoch: Some(epoch),
+                    ..
+                }
+            ) if *epoch > after_epoch
+        )
+    };
+    let adoption_convergence = tokio::time::timeout(Duration::from_secs(20), async {
+        while !converged(
+            &handle
+                .identity_convergence_status(&member)
+                .await
+                .expect("read adoption convergence"),
+            0,
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        adoption_convergence.is_ok(),
+        "adoption must converge before the restart; latest status: {:?}",
+        handle
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final adoption convergence")
+    );
+    let previous = match identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the converged identity lease")
+    {
+        crate::identity::IdentityStoredObservation::Valid(
+            crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            },
+        ) => claim,
+        other => panic!("a converged identity holds a live lease, got {other:?}"),
+    };
+
+    // The process ends without releasing the lease. Its last renewal is the
+    // short one below, so the lease is still live when the next incarnation
+    // starts and expires a few seconds later.
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown await-lease test mob");
+    let previous = match identity_store
+        .claim_or_renew_identity_lease(
+            &mob_id,
+            &member,
+            &previous.holder_id,
+            &previous.incarnation_id,
+            PREVIOUS_LEASE_TTL_MS,
+        )
+        .await
+        .expect("renew the previous incarnation's lease")
+    {
+        crate::identity::IdentityLeaseClaimOutcome::Renewed(claim)
+        | crate::identity::IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+        crate::identity::IdentityLeaseClaimOutcome::HeldByOther(other) => {
+            panic!("no other incarnation may hold the lease yet: {other:?}")
+        }
+    };
+    let resumed = MobBuilder::for_resume(storage())
+        .with_session_service(service.clone())
+        .with_spawn_base_prompt_source(base_prompt())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume within the previous incarnation's lease");
+
+    let mut awaited_lease = false;
+    let resumed_convergence = tokio::time::timeout(
+        Duration::from_millis(PREVIOUS_LEASE_TTL_MS) + Duration::from_secs(5),
+        async {
+            loop {
+                let status = resumed
+                    .identity_convergence_status(&member)
+                    .await
+                    .expect("read resumed convergence");
+                if converged(&status, previous.epoch) {
+                    break;
+                }
+                awaited_lease |= matches!(
+                    status,
+                    crate::identity::IdentityStoredObservation::Valid(
+                        crate::identity::IdentityConvergenceStatus {
+                            decision: Some(crate::identity::IdentityReconcileDecision::AwaitLease),
+                            ..
+                        }
+                    )
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+    let lease = identity_store
+        .observe_identity_lease(&mob_id, &member)
+        .await
+        .expect("read the identity lease after resume");
+    assert!(
+        resumed_convergence.is_ok(),
+        "the resumed incarnation must converge once the previous lease expires, not at the slow safety scan; latest status: {:?}; lease: {lease:?}",
+        resumed
+            .identity_convergence_status(&member)
+            .await
+            .expect("read final resumed convergence")
+    );
+    assert!(
+        awaited_lease,
+        "the resumed incarnation must first wait on the previous incarnation's live lease"
+    );
+    assert!(
+        matches!(
+            &lease,
+            crate::identity::IdentityStoredObservation::Valid(crate::identity::IdentityLeaseRecord {
+                active: Some(claim),
+                ..
+            }) if claim.incarnation_id != previous.incarnation_id && claim.epoch > previous.epoch
+        ),
+        "the resumed incarnation must hold the lease: {lease:?}"
+    );
     resumed.shutdown().await.expect("shutdown resumed mob");
 }
 
@@ -24426,6 +25386,178 @@ async fn test_stopped_missing_member_wire_is_rejected_by_machine_admission() {
     );
 }
 
+/// A respawn whose predecessor's spawner restrictions cannot be stated is
+/// refused locally, typed, before anything is retired: the member keeps its
+/// runtime and session.
+#[tokio::test]
+async fn respawn_without_predecessor_restriction_evidence_is_refused_before_retirement() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("w-1");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            AgentIdentity::from(member_id.as_str()),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn original member");
+    let original = handle
+        .get_member(&member_id)
+        .await
+        .unwrap()
+        .expect("original member exists");
+    let session_id = original
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("a session-backed member");
+    service.forget_tool_restrictions(&session_id);
+
+    let refused = handle.respawn(member_id.clone(), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a typed local refusal: {refused:?}"
+    );
+    let still = handle
+        .get_member(&member_id)
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
+    assert_eq!(still.member_ref.bridge_session_id(), Some(&session_id));
+}
+
+/// A worker profile on a declared provider, so a respawn can tell which
+/// provider its successor's build resolves to.
+fn bound_respawn_definition(id: &str) -> MobDefinition {
+    let mut definition = sample_definition();
+    definition.id = MobId::from(id);
+    if let Some(ProfileBinding::Inline(profile)) =
+        definition.profiles.get_mut(&ProfileName::from("worker"))
+    {
+        profile.provider = Some(meerkat_core::Provider::Anthropic);
+    }
+    definition
+}
+
+fn scoped_auth_binding() -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("tenant_a").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+async fn spawn_bound_worker(handle: &MobHandle, member: &AgentIdentity) {
+    let mut spec = SpawnMemberSpec::new("worker", member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec.auth_binding = Some(scoped_auth_binding());
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the bound worker");
+}
+
+/// A default respawn keeps the auth binding its predecessor's credentials
+/// resolved through when the successor builds on the same provider.
+#[tokio::test]
+async fn a_respawned_member_keeps_its_binding_on_the_same_provider() {
+    let (handle, service) = create_test_mob(bound_respawn_definition("respawn-binding-kept")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the predecessor builds through its binding"
+    );
+
+    handle
+        .respawn(member.clone(), None)
+        .await
+        .expect("respawn the bound worker");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the successor on the same provider keeps the binding"
+    );
+}
+
+/// A successor re-profiled to another provider does not receive the
+/// predecessor's binding, which serves only the provider it was recorded for:
+/// it respawns on its own provider's selection rather than failing its build
+/// after the predecessor's retirement.
+#[tokio::test]
+async fn a_successor_re_profiled_to_another_provider_selects_its_own_binding() {
+    let definition = bound_respawn_definition("respawn-binding-reprofiled");
+    let mut other_provider = definition
+        .resolve_inline_profile(&ProfileName::from("worker"))
+        .cloned()
+        .expect("an inline worker profile");
+    other_provider.provider = Some(meerkat_core::Provider::OpenAI);
+    let (handle, service) = create_test_mob(definition).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+
+    let mut successor = SpawnMemberSpec::new("worker", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    successor.override_profile = Some(other_provider);
+    handle
+        .respawn_with_successor_spec(successor)
+        .await
+        .expect("the re-profiled successor respawns");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        None,
+        "the successor on another provider selects its own binding"
+    );
+}
+
+/// A successor whose profile cannot be resolved is refused, typed, before the
+/// predecessor is retired: the member keeps its runtime and session.
+#[tokio::test]
+async fn a_successor_whose_profile_cannot_be_resolved_is_refused_before_retirement() {
+    let (handle, _service) =
+        create_test_mob(bound_respawn_definition("respawn-unresolved-successor")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    let original = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member exists");
+
+    let mut successor = SpawnMemberSpec::new("no-such-profile", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let refused = handle.respawn_with_successor_spec(successor).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a typed refusal before retirement: {refused:?}"
+    );
+    let still = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
+    assert_eq!(
+        still.member_ref.bridge_session_id(),
+        original.member_ref.bridge_session_id()
+    );
+}
+
 #[tokio::test]
 async fn test_cancel_all_work_after_respawn_preserves_stale_fence_error() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
@@ -25393,7 +26525,7 @@ async fn profile_tools_mob_true_rejects_deserialized_operator_authority_projecti
         serde_json::from_value(
             serde_json::to_value(generated_mob_operator_authority_with_scope(
                 handle.definition().id.as_str(),
-                handle.incarnation(),
+                handle.live_incarnation(),
             ))
             .unwrap(),
         )
@@ -25436,7 +26568,7 @@ async fn test_visible_mob_operator_reads_still_require_exact_scope() {
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25482,7 +26614,7 @@ async fn test_visible_mob_operator_tools_deny_before_arg_validation_when_scope_m
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25530,7 +26662,7 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         None,
         Some(generated_mob_operator_authority_with_scope(
             "different-mob",
-            meerkat_core::service::MobIncarnationId::mint(),
+            crate::tests::fresh_live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -25579,7 +26711,7 @@ async fn test_coarse_spawn_tool_admission_is_machine_routed() {
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             mob_id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -25657,7 +26789,7 @@ async fn forker_without_manage_scope_observes_and_retires_only_its_own_children(
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -25775,7 +26907,7 @@ async fn forker_force_cancels_only_running_members_it_owns() {
         None,
         Some(generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         )),
     )
@@ -26037,7 +27169,7 @@ async fn owned_member_tools_report_absent_targets_as_typed_not_found() {
         &forker,
         generated_mob_operator_authority_with_spawn_profile(
             &mob_id,
-            handle.incarnation(),
+            handle.live_incarnation(),
             "worker",
         ),
     )
@@ -26045,7 +27177,7 @@ async fn owned_member_tools_report_absent_targets_as_typed_not_found() {
     let manager_tools = owned_member_tool_dispatcher(
         &handle,
         &bystander,
-        generated_mob_operator_authority_with_scope(&mob_id, handle.incarnation()),
+        generated_mob_operator_authority_with_scope(&mob_id, handle.live_incarnation()),
     )
     .await;
 
@@ -26778,7 +27910,7 @@ async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() 
         None,
         Some(generated_mob_operator_authority_with_scope(
             mob_id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         )),
     )
     .expect("compose dispatcher")
@@ -35726,7 +36858,7 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
 }
 
 #[tokio::test]
-async fn test_respawn_broken_wired_member_replays_peer_endpoint_after_cold_service_restart() {
+async fn test_respawn_refuses_a_broken_member_whose_session_was_lost_after_cold_service_restart() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let mut definition = sample_definition();
@@ -35824,44 +36956,73 @@ async fn test_respawn_broken_wired_member_replays_peer_endpoint_after_cold_servi
         "resume must retain the broken member's generated peer endpoint before pruning stale trust"
     );
 
-    let receipt = resumed
-        .respawn(AgentIdentity::from("w-2"), None)
+    // The predecessor's session, and with it the owner's evidence of its
+    // inherited restrictions, is gone: respawn refuses before retiring
+    // anything and keeps the exact Broken member.
+    let before = resumed
+        .get_member(&AgentIdentity::from("w-2"))
         .await
-        .expect("respawn should repair broken wired member");
-    let repaired = resumed
+        .unwrap()
+        .expect("broken member in the roster");
+    let trusted_by_w1_before = restarted_service.trusted_peer_names(&sid_w1).await;
+    let refused = resumed.respawn(AgentIdentity::from("w-2"), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a lost predecessor session refuses the respawn, typed: {refused:?}"
+    );
+    let after = resumed
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agent_runtime_id, before.agent_runtime_id);
+    assert_eq!(after.fence_token, before.fence_token);
+    assert_eq!(after.bridge_session_id(), Some(&sid_w2));
+    let still_broken = resumed
         .member_status(&AgentIdentity::from("w-2"))
         .await
-        .expect("repaired member status");
-    let new_sid = repaired
-        .current_bridge_session_id
-        .clone()
-        .expect("respawned worker should have new session");
-    assert_ne!(new_sid, sid_w2);
+        .expect("broken member status");
     assert_eq!(
-        repaired.status,
-        crate::runtime::handle::MobMemberStatus::Active
+        still_broken.status,
+        crate::runtime::handle::MobMemberStatus::Broken
     );
-    let (runtime_id, fence_token) = repaired
-        .runtime_identity_fields()
-        .expect("repaired member should have runtime identity");
-    assert_eq!(runtime_id, &receipt.agent_runtime_id);
-    assert_eq!(fence_token, receipt.fence_token);
-    assert!(repaired.error.is_none());
     assert!(
-        !restarted_adapter.contains_session(&sid_w2).await,
-        "respawn must unregister the exact retired operation-owner registration"
+        still_broken
+            .current_bridge_session_id
+            .as_ref()
+            .is_none_or(|session| session == &sid_w2),
+        "no successor session was published"
     );
 
+    // No trust was installed for a successor, and the healthy sibling keeps
+    // working.
     let trusted_by_w1 = restarted_service.trusted_peer_names(&sid_w1).await;
+    assert_eq!(trusted_by_w1, trusted_by_w1_before);
     assert!(
-        trusted_by_w1.contains(&test_comms_name("worker", "w-2")),
-        "respawn should restore trust from healthy peer to repaired member"
+        !trusted_by_w1.contains(&test_comms_name("worker", "w-2")),
+        "the healthy peer holds no trust for the lost member"
     );
-    let trusted_by_w2 = restarted_service.trusted_peer_names(&new_sid).await;
-    assert!(
-        trusted_by_w2.contains(&test_comms_name("worker", "w-1")),
-        "respawn should restore trust from repaired member to healthy peer"
+    let sibling = resumed
+        .member_status(&AgentIdentity::from("w-1"))
+        .await
+        .expect("sibling status");
+    assert_eq!(
+        sibling.status,
+        crate::runtime::handle::MobMemberStatus::Active
     );
+    resumed
+        .member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("sibling member handle")
+        .internal_turn(ContentInput::from("still working".to_string()))
+        .await
+        .expect("the sibling accepts work after the refusal");
 }
 
 #[tokio::test]
@@ -36366,7 +37527,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
                 additional_instructions: None,
                 shell_env: None,
                 mob_tool_authority_context: None,
-                mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
+                mob_incarnation: Some(crate::tests::fresh_live_incarnation()),
                 tool_access_policy: None,
                 inherited_tool_filter: None,
                 system_prompt_override: None,
@@ -61369,6 +62530,11 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
 /// actual PeerRequest delivery between wired meerkats.
 struct RealCommsSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<meerkat_comms::CommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// service created.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     /// Durable documents are separate from the live comms/actor map. This
     /// test service advertises persistent-session support, so exact attachment
     /// replacement must be able to discard a live actor and rebuild it from
@@ -61398,6 +62564,7 @@ impl RealCommsSessionService {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
             archived_session_ids: RwLock::new(HashSet::new()),
             resume_authority_gate: tokio::sync::Mutex::new(()),
@@ -61641,6 +62808,14 @@ impl RealCommsSessionService {
                     )))
                 })?;
         }
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                meerkat_core::PredecessorToolRestrictions::from_build_request(req.build.as_ref())
+                    .map_err(|error| error.to_string()),
+            );
         let _authority_guard = self.resume_authority_gate.lock().await;
         self.archived_session_ids.write().await.remove(&session_id);
         self.persisted_sessions
@@ -61876,6 +63051,25 @@ impl SessionServiceControlExt for RealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RealCommsSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
@@ -62569,6 +63763,11 @@ struct RuntimeTurnContentBarrier {
 
 struct RuntimeBackedRealCommsSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<meerkat_comms::CommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// service created: a respawn keeps its predecessor's restrictions.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
@@ -62629,6 +63828,7 @@ impl RuntimeBackedRealCommsSessionService {
     fn with_runtime_adapter(runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             session_comms_names: RwLock::new(HashMap::new()),
@@ -62721,6 +63921,14 @@ impl RuntimeBackedRealCommsSessionService {
             .write()
             .await
             .insert(session_id.clone(), comms_name);
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                meerkat_core::PredecessorToolRestrictions::from_build_request(req.build.as_ref())
+                    .map_err(|error| error.to_string()),
+            );
 
         if let Some(permit) = actor_materialization_permit
             && let Err(error) = permit.commit()
@@ -63288,6 +64496,25 @@ impl SessionServiceControlExt for RuntimeBackedRealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RuntimeBackedRealCommsSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
@@ -73471,6 +74698,86 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     );
 }
 
+#[tokio::test]
+async fn a_refused_runtime_retire_for_a_retired_member_leaves_the_stopped_mob_running() {
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle.spawn_spec(spec).await.expect("spawn w-1");
+    let identity = AgentIdentity::from("w-1");
+    let session_id = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("session-backed");
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from("w-1");
+    let runtime_id = handle
+        .query_machine_state()
+        .await
+        .expect("query machine state")
+        .identity_to_runtime
+        .get(&dsl_identity)
+        .cloned()
+        .expect("w-1 has a runtime");
+    handle.retire(identity.clone()).await.expect("retire w-1");
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read roster after retirement")
+            .is_none(),
+        "the retirement completed"
+    );
+    handle.stop().await.expect("stop the mob");
+
+    // A runtime-retire route for w-1 that outlived its retirement, as a
+    // restart can leave one queued: its consumer refuses it (the runtime is
+    // gone), and the machine has no retiring member left to take the refusal.
+    let stale = super::composition::MobSeamEffect::routed(
+        crate::machines::mob_machine::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: dsl_identity,
+            agent_runtime_id: runtime_id,
+            session_id: crate::machines::mob_machine::SessionId::from_domain(&session_id),
+        },
+    )
+    .expect("a runtime retire is a routed effect");
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueueRoutedEffectForTest {
+            effect: stale,
+            reply_tx,
+        })
+        .await
+        .expect("queue the stale route")
+        .await
+        .expect("the actor answers the queue command")
+        .expect("the actor queues the stale route");
+
+    handle
+        .resume()
+        .await
+        .expect("the mob actor must survive the refused stale route and resume");
+    assert_eq!(
+        handle.status().await.expect("status after resume"),
+        MobState::Running
+    );
+    assert!(
+        handle
+            .query_machine_state()
+            .await
+            .expect("query machine state after resume")
+            .identity_to_runtime
+            .is_empty(),
+        "the stale route must not bring the retired member back"
+    );
+    assert!(!handle.actor_command_channel_closed_for_test());
+    handle.shutdown().await.expect("shutdown");
+}
+
 /// Lifecycle-notification failures during retirement remain best-effort.
 ///
 /// The notification may legitimately fail during concurrent teardown, but
@@ -82655,6 +83962,10 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
         MobError::ForkInstructionRefused { .. } => "fork_instruction_refused".to_string(),
+        MobError::IncarnationInconsistent { .. } => "incarnation_inconsistent".to_string(),
+        MobError::IncarnationDestroyed { .. } => "incarnation_destroyed".to_string(),
+        MobError::ProvenanceUnavailable { .. } => "provenance_unavailable".to_string(),
+        MobError::IncarnationMismatch { .. } => "incarnation_mismatch".to_string(),
         MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
         MobError::ShutdownInProgress { .. } => "shutdown_in_progress".to_string(),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
@@ -82732,6 +84043,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::ActorCommandTimedOut { .. } => "actor_command_timed_out".to_string(),
         MobError::MemberReloadRefused { .. } => "member_reload_refused".to_string(),
         MobError::HeldProvisionUnsupported { .. } => "held_provision_unsupported".to_string(),
+        MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
+            "respawn_predecessor_restrictions_unavailable".to_string()
+        }
         MobError::MemberReloadTimedOut { .. } => "member_reload_timed_out".to_string(),
         MobError::HeldSpawnUnsupported { .. } => "held_spawn_unsupported".to_string(),
         MobError::HeldSpawnAborted { .. } => "held_spawn_aborted".to_string(),
@@ -87311,7 +88625,7 @@ async fn dispatch_handles_bind_their_authority_lanes() {
         false,
         generated_mob_operator_authority_with_scope(
             handle.definition().id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         ),
     );
     assert!(
@@ -87338,7 +88652,7 @@ async fn dispatch_handles_bind_their_authority_lanes() {
         false,
         generated_mob_operator_authority_with_scope(
             handle.definition().id.as_str(),
-            handle.incarnation(),
+            handle.live_incarnation(),
         ),
     );
     assert!(
@@ -90442,6 +91756,10 @@ mod fork_job_terminal;
 mod held_spawn;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod host_outage_recovery;
+/// SQLite-backed intent-managed identities converge while convergence-status
+/// commits hold the mob database's write lock across a slow fsync.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod identity_fence_contention;
 /// Member binding history reads over real persistent stores, on the running
 /// mob and on its stopped store.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]

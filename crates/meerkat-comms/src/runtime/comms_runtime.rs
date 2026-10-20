@@ -6817,6 +6817,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "workspace-tests")]
     #[tokio::test]
     async fn classified_snapshot_carries_a_messages_signed_in_reply_to() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -2,7 +2,7 @@
 
 Status: proposed implementation contract amendment, 2026-10-01. This revision
 clarifies mutex scope, demand-driven recovery and phase binding after the lead,
-Homecore, OB3 and Toolkit reviewed its predecessor. Review of these exact revised bytes remains pending.
+the home-automation host, the console application and Toolkit reviewed its predecessor. Review of these exact revised bytes remains pending.
 No implementation or production-readiness acceptance follows from protocol
 verdicts.
 

@@ -22,7 +22,10 @@ pub struct MobStopReport {
 
 impl MobStopReport {
     /// Members whose run starts are not held: they may still start a turn
-    /// while the mob is Stopped.
+    /// while the mob is Stopped. A member reported
+    /// [`MemberRunStarts::ReloadRequired`] is not one: its degraded
+    /// registration starts no run, and the `MobStop` the Stop staged for it
+    /// first holds the registration a reload replaces it with until Resume.
     pub fn not_holdable(&self) -> impl Iterator<Item = (&AgentIdentity, &NotHoldableReason)> {
         self.members
             .iter()
@@ -30,7 +33,8 @@ impl MobStopReport {
                 MemberRunStarts::NotHoldable { reason } => Some((identity, reason)),
                 MemberRunStarts::Held
                 | MemberRunStarts::NotBound
-                | MemberRunStarts::DelegatedToHost => None,
+                | MemberRunStarts::DelegatedToHost
+                | MemberRunStarts::ReloadRequired => None,
             })
     }
 }
@@ -70,6 +74,14 @@ pub enum MemberStopRun {
     /// A remote member that cannot report its run (it lacks the run-start
     /// hold capability); the stop sent it the ambient interrupt.
     Interrupted,
+    /// The member's runtime registration is durability-degraded: it refused
+    /// the hold, or it degraded after the hold was placed and refused the
+    /// cancel of the run the hold found current (the run starts then report
+    /// `Held`, and nothing was dispatched). No outcome for its run is recorded
+    /// on that registration: durable truth decides it, at the reload that
+    /// replaces the registration or at the discard a mob Shutdown performs.
+    /// This does not say the run was cancelled.
+    ReloadRequired,
 }
 
 /// Whether a member's run starts are held until Resume.
@@ -93,6 +105,12 @@ pub enum MemberRunStarts {
     /// host owns its run starts and teardown; Shutdown never probes a remote
     /// host it is not otherwise stopping a member on.
     DelegatedToHost,
+    /// The member's runtime registration needs a durability reload: no run
+    /// starts on it until it is reloaded, and a mob Shutdown discards it
+    /// instead. No hold was placed on it. A Stop staged `MobStop` for the
+    /// member before the hold, so the registration a reload replaces it with
+    /// is held until Resume.
+    ReloadRequired,
 }
 
 /// Why a member's run starts could not be held.

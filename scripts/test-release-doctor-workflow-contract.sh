@@ -613,7 +613,7 @@ elif name == "web-sdk-bindgen-mismatch":
         raise SystemExit(f"fixture `{name}` expects one wasm-bindgen pin, found {count}")
 elif name == "web-sdk-unchecked-download":
     replace_once(
-        '          echo "${binaryen_sha256}  ${tools}/${binaryen_archive}" | sha256sum --check --strict\n',
+        '          echo "${binaryen_sha256}  ${tools}/${binaryen_archive}" | sha256sum --check --strict -\n',
         "",
     )
 elif name == "cache-xwin-dispatch-save":
@@ -818,7 +818,7 @@ elif name == "sccache-unchecked-install":
     # An install that never checks the tarball against the pinned sha256.
     replace_once(
         ".github/actions/setup-sccache-ci/action.yml",
-        '        echo "${SCCACHE_SHA256}  ${archive}" | sha256sum --check --strict\n',
+        '        echo "${SCCACHE_SHA256}  ${archive}" | sha256sum --check --strict -\n',
         "",
     )
 elif name == "semver-readiness-dispatch-save":
@@ -1224,7 +1224,7 @@ expect_tree_fail_named sccache-action-install "${TEST_ROOT}/sccache-action-insta
   ".github/actions/setup-sccache-ci installs sccache through sccache-action, which exports the job's Actions cache token to the run steps after it" release-caches
 mutate_tree sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked-install"
 expect_tree_fail_named sccache-unchecked-install "${TEST_ROOT}/sccache-unchecked-install" \
-  ".github/actions/setup-sccache-ci installs no sccache release checked against a pinned sha256 (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict)" release-caches
+  ".github/actions/setup-sccache-ci installs no sccache release checked against a pinned sha256 (SCCACHE_VERSION, SCCACHE_SHA256, sha256sum --check --strict -)" release-caches
 mutate_tree semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save"
 expect_tree_fail_named semver-readiness-dispatch-save "${TEST_ROOT}/semver-readiness-dispatch-save" \
   "release-semver-readiness.yml job \`semver\` saves a cache on a workflow_dispatch run" release-caches

@@ -48,6 +48,7 @@ use crate::event::{MemberRef, MobEvent, MobEventKind};
 use crate::ids::{AgentIdentity, AgentRuntimeId, FenceToken, Generation, MobId, ProfileName};
 use crate::machines::mob_machine as mob_dsl;
 use meerkat_core::lifecycle::{InputId, RunId as RuntimeRunId};
+use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::SessionId;
 use meerkat_runtime::{InputLifecycleState, InputTerminalOutcome};
 use serde::{Deserialize, Serialize};
@@ -56,21 +57,44 @@ use std::collections::BTreeMap;
 /// The serialized form version a [`MemberDeliveryScope`] is written with.
 /// Decoding any other version is a typed [`DeliveryScopeDecodeError`], so a
 /// future format change can never silently misread a persisted scope.
-pub const MEMBER_DELIVERY_SCOPE_VERSION: u32 = 1;
+pub const MEMBER_DELIVERY_SCOPE_VERSION: u32 = 2;
 
-/// One member's exact delivery scope: runtime incarnation, fence and session.
+/// The version written before scopes named their mob incarnation. It still
+/// decodes, as a [`ScopeIncarnation::Legacy`] scope.
+const LEGACY_MEMBER_DELIVERY_SCOPE_VERSION: u32 = 1;
+
+/// The mob incarnation a [`MemberDeliveryScope`] was captured at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeIncarnation {
+    /// Captured at this incarnation of the mob (version 2).
+    Bound(MobIncarnationId),
+    /// Decoded from a version-1 scope, written before scopes named their
+    /// incarnation. Only an incarnation assigned to a store from before
+    /// 0.9.4 at its first resume honours it; any other refuses it.
+    Legacy,
+}
+
+/// One member's exact delivery scope: the mob incarnation, the member's
+/// runtime incarnation, fence and session.
 ///
 /// Obtain it from [`MobHandle::capture_member_delivery_scope`]; it is not
 /// constructible from parts. Its serialized form carries an explicit
 /// `version` field (see [`MEMBER_DELIVERY_SCOPE_VERSION`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberDeliveryScope {
+    mob_incarnation: ScopeIncarnation,
     runtime_id: AgentRuntimeId,
     fence_token: FenceToken,
     session_id: SessionId,
 }
 
 impl MemberDeliveryScope {
+    /// The mob incarnation this scope was captured at.
+    pub fn mob_incarnation(&self) -> ScopeIncarnation {
+        self.mob_incarnation
+    }
+
     /// The member this scope belongs to.
     pub fn agent_identity(&self) -> &AgentIdentity {
         &self.runtime_id.identity
@@ -127,38 +151,57 @@ impl MemberDeliveryScope {
                 });
             }
         };
-        if version != u64::from(MEMBER_DELIVERY_SCOPE_VERSION) {
-            return Err(DeliveryScopeDecodeError::UnsupportedVersion { found: version });
+        let malformed = |error: serde_json::Error| DeliveryScopeDecodeError::Malformed {
+            reason: error.to_string(),
+        };
+        if version == u64::from(MEMBER_DELIVERY_SCOPE_VERSION) {
+            let wire: MemberDeliveryScopeV2 = serde_json::from_value(value).map_err(malformed)?;
+            return Ok(Self {
+                mob_incarnation: ScopeIncarnation::Bound(wire.mob_incarnation),
+                runtime_id: wire.runtime_id,
+                fence_token: wire.fence_token,
+                session_id: wire.session_id,
+            });
         }
-        let wire: MemberDeliveryScopeV1 =
-            serde_json::from_value(value).map_err(|error| DeliveryScopeDecodeError::Malformed {
-                reason: error.to_string(),
-            })?;
-        Ok(Self {
-            runtime_id: wire.runtime_id,
-            fence_token: wire.fence_token,
-            session_id: wire.session_id,
-        })
+        if version == u64::from(LEGACY_MEMBER_DELIVERY_SCOPE_VERSION) {
+            let wire: MemberDeliveryScopeV1 = serde_json::from_value(value).map_err(malformed)?;
+            return Ok(Self {
+                mob_incarnation: ScopeIncarnation::Legacy,
+                runtime_id: wire.runtime_id,
+                fence_token: wire.fence_token,
+                session_id: wire.session_id,
+            });
+        }
+        Err(DeliveryScopeDecodeError::UnsupportedVersion { found: version })
     }
 
-    /// The persisted form, carrying `version` = [`MEMBER_DELIVERY_SCOPE_VERSION`].
+    /// The persisted form, carrying `version` = [`MEMBER_DELIVERY_SCOPE_VERSION`]
+    /// and the mob incarnation. A [`ScopeIncarnation::Legacy`] scope keeps
+    /// its version-1 form, which names no incarnation.
     pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::to_value(self.to_wire()).unwrap_or(serde_json::Value::Null)
-    }
-
-    fn to_wire(&self) -> MemberDeliveryScopeV1 {
-        MemberDeliveryScopeV1 {
-            version: MEMBER_DELIVERY_SCOPE_VERSION,
-            runtime_id: self.runtime_id.clone(),
-            fence_token: self.fence_token,
-            session_id: self.session_id.clone(),
-        }
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 }
 
 impl Serialize for MemberDeliveryScope {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_wire().serialize(serializer)
+        match self.mob_incarnation {
+            ScopeIncarnation::Bound(mob_incarnation) => MemberDeliveryScopeV2 {
+                version: MEMBER_DELIVERY_SCOPE_VERSION,
+                mob_incarnation,
+                runtime_id: self.runtime_id.clone(),
+                fence_token: self.fence_token,
+                session_id: self.session_id.clone(),
+            }
+            .serialize(serializer),
+            ScopeIncarnation::Legacy => MemberDeliveryScopeV1 {
+                version: LEGACY_MEMBER_DELIVERY_SCOPE_VERSION,
+                runtime_id: self.runtime_id.clone(),
+                fence_token: self.fence_token,
+                session_id: self.session_id.clone(),
+            }
+            .serialize(serializer),
+        }
     }
 }
 
@@ -173,6 +216,16 @@ impl<'de> Deserialize<'de> for MemberDeliveryScope {
 #[serde(deny_unknown_fields)]
 struct MemberDeliveryScopeV1 {
     version: u32,
+    runtime_id: AgentRuntimeId,
+    fence_token: FenceToken,
+    session_id: SessionId,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberDeliveryScopeV2 {
+    version: u32,
+    mob_incarnation: MobIncarnationId,
     runtime_id: AgentRuntimeId,
     fence_token: FenceToken,
     session_id: SessionId,
@@ -211,6 +264,9 @@ pub enum ScopedRecoveryUnresolved {
     OriginalOwnerUnavailable { detail: String },
     /// The evidence read did not finish before the caller's deadline.
     EvidenceReadTimedOut,
+    /// The scope was captured at another incarnation of this mob, or is a
+    /// version-1 scope this incarnation does not honour. No session was read.
+    IncarnationNotHosted,
 }
 
 /// What a scoped recovery established about one delivery in its original
@@ -311,10 +367,46 @@ impl MobHandle {
                 })
             })?;
         Ok(MemberDeliveryScope {
+            mob_incarnation: ScopeIncarnation::Bound(self.incarnation()),
             runtime_id,
             fence_token,
             session_id,
         })
+    }
+
+    /// Refuse a scope captured at another incarnation of this mob with the
+    /// typed [`MobError::IncarnationMismatch`]. Every verb that acts on a
+    /// [`MemberDeliveryScope`] calls this first, before it reads or binds any
+    /// session, so a scope never reaches a mob created again under its id. A
+    /// version-1 scope ([`ScopeIncarnation::Legacy`]) is honoured only by an
+    /// incarnation assigned to a store from before 0.9.4.
+    pub async fn require_scope_incarnation(
+        &self,
+        scope: &MemberDeliveryScope,
+    ) -> Result<(), MobError> {
+        if self.hosts_scope_incarnation(scope).await? {
+            return Ok(());
+        }
+        Err(MobError::IncarnationMismatch {
+            mob_id: self.mob_id().clone(),
+            expected: match scope.mob_incarnation {
+                ScopeIncarnation::Bound(incarnation) => Some(incarnation),
+                ScopeIncarnation::Legacy => None,
+            },
+            current: Some(self.incarnation()),
+        })
+    }
+
+    async fn hosts_scope_incarnation(&self, scope: &MemberDeliveryScope) -> Result<bool, MobError> {
+        let migrated = match scope.mob_incarnation {
+            ScopeIncarnation::Bound(_) => false,
+            ScopeIncarnation::Legacy => self.incarnation_is_migrated().await?,
+        };
+        Ok(scope_incarnation_hosted(
+            scope.mob_incarnation,
+            self.incarnation(),
+            migrated,
+        ))
     }
 
     /// Recover one delivery's state from the exact session its scope names.
@@ -326,6 +418,10 @@ impl MobHandle {
     /// [`ScopedWorkState::Unresolved`]; an authoritative miss is
     /// [`ScopedWorkState::Absent`], which is never retry permission. The
     /// evidence read is bounded by `deadline`.
+    ///
+    /// A scope captured at another incarnation of this mob is
+    /// [`ScopedRecoveryUnresolved::IncarnationNotHosted`] once the authority
+    /// below is admitted, and no session is read.
     ///
     /// The scope only selects. The caller's current history-read authority
     /// (`ControlScope::ReadHistory`, as for
@@ -350,6 +446,13 @@ impl MobHandle {
         let read = async {
             self.admit_control_scope(mob_dsl::ControlScope::ReadHistory)
                 .await?;
+            // A scope from another incarnation of this mob names a session
+            // this incarnation never bound: it is never read.
+            if !self.hosts_scope_incarnation(scope).await? {
+                return Ok(ScopedWorkState::Unresolved {
+                    cause: ScopedRecoveryUnresolved::IncarnationNotHosted,
+                });
+            }
             let Some(runtime) = self.runtime_adapter.as_ref() else {
                 return Ok(ScopedWorkState::Unresolved {
                     cause: ScopedRecoveryUnresolved::RuntimeAdapterUnavailable,
@@ -998,6 +1101,19 @@ impl MobHandle {
     }
 }
 
+/// Whether a scope captured at `scope` belongs to the incarnation this mob
+/// runs at: the same incarnation, or a version-1 scope at a migrated one.
+fn scope_incarnation_hosted(
+    scope: ScopeIncarnation,
+    current: MobIncarnationId,
+    current_is_migrated: bool,
+) -> bool {
+    match scope {
+        ScopeIncarnation::Bound(incarnation) => incarnation == current,
+        ScopeIncarnation::Legacy => current_is_migrated,
+    }
+}
+
 /// Whether this mob's durable member history bound `scope`'s session to
 /// `scope`'s member incarnation and fence at any point.
 ///
@@ -1137,6 +1253,7 @@ mod tests {
 
     fn scope() -> MemberDeliveryScope {
         MemberDeliveryScope {
+            mob_incarnation: ScopeIncarnation::Bound(MobIncarnationId::mint()),
             runtime_id: AgentRuntimeId::new(AgentIdentity::from("worker"), Generation::new(3)),
             fence_token: FenceToken::new(7),
             session_id: SessionId::new(),
@@ -1162,10 +1279,10 @@ mod tests {
     #[test]
     fn an_unknown_version_is_a_typed_error() {
         let mut value = scope().to_json_value();
-        value["version"] = serde_json::json!(2);
+        value["version"] = serde_json::json!(3);
         assert_eq!(
             MemberDeliveryScope::from_json_value(value),
-            Err(DeliveryScopeDecodeError::UnsupportedVersion { found: 2 })
+            Err(DeliveryScopeDecodeError::UnsupportedVersion { found: 3 })
         );
     }
 
@@ -1182,6 +1299,72 @@ mod tests {
         assert!(matches!(
             MemberDeliveryScope::from_json_value(value),
             Err(DeliveryScopeDecodeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_version_one_scope_decodes_as_legacy_and_keeps_its_form() {
+        let bound = scope();
+        let mut value = bound.to_json_value();
+        let object = value.as_object_mut().expect("object");
+        object.remove("mob_incarnation");
+        object.insert("version".to_string(), serde_json::json!(1));
+        let legacy = MemberDeliveryScope::from_json_value(value.clone()).expect("decode v1");
+        assert_eq!(legacy.mob_incarnation(), ScopeIncarnation::Legacy);
+        assert_eq!(legacy.session_id(), bound.session_id());
+        assert_eq!(
+            legacy.to_json_value(),
+            value,
+            "a legacy scope keeps its v1 form"
+        );
+    }
+
+    #[test]
+    fn a_version_two_scope_without_its_incarnation_is_malformed() {
+        let mut value = scope().to_json_value();
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("mob_incarnation");
+        assert!(matches!(
+            MemberDeliveryScope::from_json_value(value),
+            Err(DeliveryScopeDecodeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_scope_incarnation_or_a_migrated_one_hosts_a_scope() {
+        let current = MobIncarnationId::mint();
+        let other = MobIncarnationId::mint();
+        assert!(scope_incarnation_hosted(
+            ScopeIncarnation::Bound(current),
+            current,
+            false
+        ));
+        assert!(scope_incarnation_hosted(
+            ScopeIncarnation::Bound(current),
+            current,
+            true
+        ));
+        assert!(!scope_incarnation_hosted(
+            ScopeIncarnation::Bound(other),
+            current,
+            false
+        ));
+        assert!(!scope_incarnation_hosted(
+            ScopeIncarnation::Bound(other),
+            current,
+            true
+        ));
+        assert!(scope_incarnation_hosted(
+            ScopeIncarnation::Legacy,
+            current,
+            true
+        ));
+        assert!(!scope_incarnation_hosted(
+            ScopeIncarnation::Legacy,
+            current,
+            false
         ));
     }
 

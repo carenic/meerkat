@@ -625,6 +625,7 @@ mod tests {
     #[derive(Default)]
     struct FaultInjectedEventStore {
         events: RwLock<Vec<MobEvent>>,
+        creation: RwLock<Option<crate::store::MobCreationRecord>>,
         fail_on_kind: RwLock<HashSet<&'static str>>,
     }
 
@@ -647,7 +648,46 @@ mod tests {
         }
     }
 
-    impl private::MobEventStoreSealed for FaultInjectedEventStore {}
+    #[async_trait]
+    impl private::MobEventStoreSealed for FaultInjectedEventStore {
+        async fn creation_record(
+            &self,
+        ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+            Ok(self.creation.read().await.clone())
+        }
+
+        async fn append_creation(
+            &self,
+            event: NewMobEvent,
+            incarnation: meerkat_core::service::MobIncarnationId,
+            provenance: &crate::MobProvenance,
+        ) -> Result<MobEvent, MobStoreError> {
+            let mut events = self.events.write().await;
+            let mut creation = self.creation.write().await;
+            crate::store::append_creation_in_memory(
+                &mut events,
+                &mut creation,
+                event,
+                incarnation,
+                provenance,
+            )
+        }
+
+        async fn assign_legacy_incarnation(
+            &self,
+            mob_id: &MobId,
+            incarnation: meerkat_core::service::MobIncarnationId,
+        ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+            let events = self.events.read().await;
+            let mut creation = self.creation.write().await;
+            crate::store::assign_legacy_incarnation_in_memory(
+                &events,
+                &mut creation,
+                mob_id,
+                incarnation,
+            )
+        }
+    }
 
     #[async_trait]
     impl MobEventStore for FaultInjectedEventStore {
@@ -749,7 +789,9 @@ mod tests {
         }
 
         async fn clear(&self) -> Result<(), MobStoreError> {
-            self.events.write().await.clear();
+            let mut events = self.events.write().await;
+            events.clear();
+            crate::store::finalize_creation_in_memory(&mut *self.creation.write().await);
             Ok(())
         }
     }

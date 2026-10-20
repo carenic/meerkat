@@ -554,8 +554,9 @@ same local candidate;
 any explicit root (`--state-root` or repeatable `--root`) restricts the
 sweep to exactly those roots. `--realm` focuses the sweep on one realm.
 Reports per-root realm inventory, schema-ledger state per database,
-dual-root twins, dangling session→blob references, and orphaned
-lease/lock/backup artifacts. Exit 0
+dual-root twins, dangling session→blob references, orphaned
+lease/lock/backup artifacts, and the SQLite lock profile the `rkat` binary
+runs with (a `sqlite-lock-profile` warning when a process-wide lock is on). Exit 0
 means no error-severity findings; exit 1 means errors were found.
 
 ```bash
@@ -567,7 +568,8 @@ sweeps the same roots (and honors the same `--realm` filter) as `storage
 doctor`. The dry run reads each realm's schema-ledger baseline read-only —
 no fence, no store opens, no mutation. `--apply` acquires the realm's
 exclusive maintenance fence (`--fence-wait-secs`, default 10, bounds the
-wait for in-flight store operations to drain), then per realm: stamps
+wait for in-flight store operations to drain and kept connections to close),
+then per realm: stamps
 ledgers by opening every store through its normal constructor under the
 held fence and reports state-root adoption (report-only — realms are used
 where they lie). Exact 0.8.10 session-state conversion is owned by each

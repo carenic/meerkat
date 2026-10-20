@@ -2767,6 +2767,7 @@ async fn factory_agent_settles_stale_review_locally_and_continues_with_sibling()
     assert_single_completion(&mut received);
 }
 
+#[cfg(feature = "workspace-tests")]
 #[tokio::test]
 async fn factory_agent_reviews_a_superseded_call_once_more_and_enters() {
     let world = ReviewWorld::new();

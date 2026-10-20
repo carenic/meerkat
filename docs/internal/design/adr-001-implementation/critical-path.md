@@ -57,7 +57,7 @@ Benchmarks require a separately confirmed quiet host window.
 
 After the first path, close real ingress/account policy and controller-mutation
 composition, persistent admission/recovery, all provider and operation families,
-Elephant and other sources, comms/gates, and surface adoption. The
+the knowledge service and other sources, comms/gates, and surface adoption. The
 [confinement and consent addendum](../adr-001-confinement-and-consent.md) adds
 actual process boundaries and existing-owner human consent. These are reviewed
 in slices, but a narrow profile is not the final product. Finish with adversarial
@@ -88,7 +88,7 @@ claiming a self-contained checks-and-audit slice.
 
 The final review packet is
 `b17de27b1043db434d4ef9c1b6df40fd07291637a9e9b94f8ab032a00246ceaa`.
-Root reports GCP, the downstream app and the operator deployment acceptance on the bus at 16:14 UTC.
+Root reports GCP, the downstream app and the operator deployment acceptance through the review message channel at 16:14 UTC.
 Toolkit verified the final two-paragraph delta, with closure relayed by GCP;
 all four reviewers have closed the UX r5 and E2E r7 designs. Design acceptance
 does not establish implementation coverage. The separate provider diagnostics
@@ -112,7 +112,7 @@ remain open.
 
 Sandbox, consent and persistent/detached production work remain held. Their
 isolated source and test proposals are preserved. The complete scope still
-includes all provider and operation families, Elephant and other sources,
+includes all provider and operation families, the knowledge service and other sources,
 communications, delegation, surfaces, recovery, explicit OS confinement and
 consent. Neither the foundation package tests, console slice nor accepted E2E
 design permits a narrow profile to be advertised as complete. Benchmarks still
@@ -157,11 +157,11 @@ slice; a different agent is implementing it. The
 independent-agent review: five stories, 32 named checkpoints, a complete
 feature/surface matrix, explicit missing integrations and bounded live-call costs.
 It is a design, not newly executed E2E coverage. Both proposals have been sent to
-the GCP lead, the downstream app, the operator deployment and Toolkit for focused bus review.
+the GCP lead, the downstream app, the operator deployment and Toolkit for focused project review.
 
 Console rendering and existing MobKit access administration do not install the
 new native authority producers. The full editor follows real authenticated
-owner contracts, starting with the calendar/account path and then Elephant.
+owner contracts, starting with the calendar/account path and then the knowledge service.
 This parallel frontend work does not authorize unfinished sandbox, consent or
 persistent Rust changes to bypass the audit and controller checkpoints.
 
@@ -179,7 +179,7 @@ a release-ready PR.
 3. Native admission, controller/account/grant custody, audit and archive guard
    (Mac).
 4. Persistent and detached native coverage, including durable owner recovery and
-   complete unloaded-work custody (VM `turbo-live`, after 3).
+   complete unloaded-work custody (the live-test VM, after 3).
 5. Full sources, communications, delegation and surface wiring, including Calendar
    association validation and exact non-prompt replay (Mac and Toolkit VM lane).
 6. Consent with authenticated late delivery and a fresh explicit attempt (Mac,
@@ -224,7 +224,7 @@ Status: historical coordination plan before the approved simplification.  The co
 
 The first integrated acceptance target is one explicitly qualified native prompt, from authenticated ingress through immutable native admission, current grant/control and source checks, surviving admission/consumption/attempt evidence, one actual physical model request, committed buffered result, and current-authorized observation. It uses the real SQLite runtime/session owner and independently surviving witness process. An in-memory Boolean witness, a receipt-only test or an adapter called outside native admission does not meet this target.
 
-Use one supported stateless model adapter and one qualified input/source profile. Unsupported capabilities refuse before their side effects. This is the first slice, not the full tool, communications, delegation, scheduling, Elephant and console implementation. The accepted ADR requirements for those surfaces remain open and follow this slice.
+Use one supported stateless model adapter and one qualified input/source profile. Unsupported capabilities refuse before their side effects. This is the first slice, not the full tool, communications, delegation, scheduling, knowledge-service and console implementation. The accepted ADR requirements for those surfaces remain open and follow this slice.
 
 The first acceptance fixture must cover success plus revoked permission, expired-before-release, lost admission acknowledgment, uncertain send and client restore. Count real transport sends. A denied attempt must send zero requests; an uncertain attempt must not resend. Recovered committed output must retain its observation identity and require current access without a new model call. Run the genuine adapter against a recording transport for deterministic fault injection, then qualify its real provider route separately. Neither substituted evidence nor a stub signature establishes production qualification.
 
@@ -235,7 +235,7 @@ The first acceptance fixture must cover success plus revoked permission, expired
 | M0: one coherent source checkpoint | Accepted prerequisite source composed on fixed main456dc09cb, canonical generation, focused integration tests and exact source manifest | Root integrates committed checkpoints; existing generated preparation and transaction-fenced observation agents finish their current checks. No repeated rebase for unrelated main changes; take the lead-required live declaration checkpoint once at the explicit handoff. |
 | M1a: durable native admission and recovery | Real input owner, exact qualified dedup and immutable association, witness-backed admission/consumption recovery; unsupported paths refuse | Root owns native integration after lead-confirmed live declaration handoff. Witness service owner supplies the actual journal and proof producer, not opaque data presented as trusted evidence. |
 | M1b: first physical governed request and observation | Real entry/anchor/one-use sink path, current time/custody checks, committed buffered observation, real fault cuts above | Root owns native/sink composition. Reviewers assess changed source and invariant evidence relative to the accepted checkpoint. |
-| M2: full ADR closure | Tools, sources including Elephant, comms, delegation, recovery, sinks and product profiles pass their explicit requirement/case inventory | Resume independent surface work only when it consumes the common path or demonstrably unblocks it. All 111 requirements and 57 explicit cases remain tracked. |
+| M2: full ADR closure | Tools, sources including the knowledge service, comms, delegation, recovery, sinks and product profiles pass their explicit requirement/case inventory | Resume independent surface work only when it consumes the common path or demonstrably unblocks it. All 111 requirements and 57 explicit cases remain tracked. |
 | Publication | Normal local required gates and fresh hosted CI on the exact reviewed PR head | Publication owner runs one consolidated gate after the source checkpoint. Unrelated failures are assigned and retained; no repeated blind full-suite retry or hook bypass. |
 
 Witness bootstrap and current time producers are on the M1 critical path. Pure formats alone do not clear those dependencies. Continuation/re-admission recovery semantics remain in the source contract, but optional feature expansion does not displace the first prompt path.
@@ -246,7 +246,7 @@ There are two independent host budgets: this Mac and the GCP build/model-check h
 
 The currently running Mac checks may finish. After that, only one coordinator-issued heavy build lease is active on this host at a time. Source reading, bounded editing and independent delta review continue in parallel. Each lease names the worktree/source, exact command group, expected warmed cost, start and end state. Use the existing isolated Rust lane, jobs2 and nextest4. Do not start a broad build merely because a subagent slot is free.
 
-Completed drain: Elephant normal publication, observed-input checks and generated preparation PREP-02. PREP-02 ran 08:26:21-08:41:51 UTC, including a stopped unpinned test carrier and one independently reviewed scoped lint repair. Elephant's identical-tree history repair then passed normal hooks and publication in under one minute. No broad gate was bypassed.
+Completed drain: knowledge-service normal publication, observed-input checks and generated preparation PREP-02. PREP-02 ran 08:26:21-08:41:51 UTC, including a stopped unpinned test carrier and one independently reviewed scoped lint repair. The knowledge service's identical-tree history repair then passed normal hooks and publication in under one minute. No broad gate was bypassed.
 
 On GCP, finish the already agreed CoreNext comparison, then request an explicit benchmark reservation from the lead with UTC start/end and host-quiescence evidence. During the reservation, no release compiler, TLC, tests or other heavy work is launched on that host. If unrelated owners cannot honor the reservation, record it as not measured and negotiate the next concrete slot; do not keep retrying into contention. Retention latency acceptance remains open until actual quiet-host measurements exist.
 
@@ -258,7 +258,7 @@ Root owns the integration lane and shared declaration schedule. Agents work in i
 
 Run focused changed-boundary checks first. Run the required broad publication gate once after the coherent candidate is reviewable. A failure is triaged against that exact head and assigned to its owner. Repeat only after a relevant repair, a diagnosed environmental correction or a concretely justified flake probe. A passing remote lane does not manufacture a local hook stamp.
 
-Observed publication cache correction: Elephant normal push inherited an Xcode SDKROOT that the earlier manual Clippy command did not have. Native build scripts therefore invalidated the same target cache and rebuilt. Future required manual prevalidation must match the inspected normal-hook environment. Keep the current push intact; no wrapper/tooling project is added to this critical path. Exact evidence is retained in `(operator-retained path)`.
+Observed publication cache correction: the knowledge service's normal push inherited an Xcode SDKROOT that the earlier manual Clippy command did not have. Native build scripts therefore invalidated the same target cache and rebuilt. Future required manual prevalidation must match the inspected normal-hook environment. Keep the current push intact; no wrapper/tooling project is added to this critical path. Exact evidence is retained in `(operator-retained path)`.
 
 Actual GCP reservation: 2026-10-01 09:00-09:45 UTC. The lead has coordinated all GCP agents; heavy work must end by08:58. Existing benchmark binaries, controller, idle threshold and preflight budgets are unchanged. CoreNext's comparison jobs finished before this reservation; its final evidence analysis is separate.
 
@@ -273,9 +273,9 @@ INTEGRATION-02 began at09:34:23UTC after the unrelated Goldfish Rust process had
 
 GCP reservation run2 actually ran09:10:05-09:25:26UTC after late compilers drained. Four20000-row cells and the first50000-row historical cell completed; the first50000-row paired cell exceeded the unchanged240s limit after29/32 claim rounds, and later cells never started. There were no compiler intrusions during the run, but substantial video-render CPU load occurred. The full comparison remains incomplete, and the50000-row comparison is NOT_MEASURED. No deadline or coverage requirement was weakened. Further GCP retries are deferred; the next performance reservation must account for all substantial CPU work, including renderers.
 
-Elephant PR4 at64e5a8d02eda56df6b34c9c448704e87eaabda23 has successful hosted CI36838043537. All configured required jobs passed; E2E was skipped by configuration. Prior failed secret-scan evidence remains retained. No merge or deployment occurred.
+Knowledge-service PR4 at64e5a8d02eda56df6b34c9c448704e87eaabda23 has successful hosted CI36838043537. All configured required jobs passed; E2E was skipped by configuration. Prior failed secret-scan evidence remains retained. No merge or deployment occurred.
 
-The native declaration handoff remains pending: turbo-live-b merged at8302972d (PR1387); root waits for the lead's explicit handoff-open message with the2b merge SHA before changing the reserved admission/live declarations. Source-only lower association contracts, witness physical journal, grant/control integration and measured-time producer continue in parallel.
+The native declaration handoff remains pending: the second live-path branch merged at8302972d (PR1387); root waits for the lead's explicit handoff-open message with the2b merge SHA before changing the reserved admission/live declarations. Source-only lower association contracts, witness physical journal, grant/control integration and measured-time producer continue in parallel.
 
 
 ## INTEGRATION-02 accepted checkpoint, 2026-10-01 09:52 UTC

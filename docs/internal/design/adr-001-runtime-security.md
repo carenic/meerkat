@@ -34,11 +34,11 @@ contracts cannot weaken this ADR's runtime invariants.
 
 ## Context
 
-Meerkat, MobKit, and Elephant have valuable but disconnected controls.
+Meerkat, MobKit, and the knowledge service have valuable but disconnected controls.
 MobKit authenticates console callers and applies agent-oriented ABAC at HTTP
 and SSE boundaries. Meerkat has typed principals, credential-binding witnesses,
 tool execution ceilings, argument-aware consequence policies, signed comms,
-and schedule ceilings. Elephant authorizes classified records and preserves
+and schedule ceilings. The knowledge service authorizes classified records and preserves
 some security provenance in derived knowledge. None alone establishes the
 authorization of a complete human-to-agent-to-knowledge-to-effect chain.
 
@@ -60,17 +60,17 @@ at the pinned baselines, not exploit demonstrations or claims about every host:
 | Meerkat's [tool gate][mk-tool] is outermost, and [provider-native tools][mk-native] are disabled under restricted compositions. | Extend the existing gate; do not build an independent competing ABAC wrapper. |
 | [InputHeader][mk-input] and [ToolDispatchContext][mk-context] lack general authenticated execution authority. | Add the missing carrier through existing admission and execution owners. |
 | [Tool-consequence observation][mk-observer] represents denied and indeterminate outcomes, with optional observation. | Existing telemetry cannot witness every allowed effect. |
-| Elephant's [policy principal][el-policy] has clearances and scopes but no actor; [MCP context][el-context] defaults record attribution to `mcp_tool`. | Preserve authenticated identity through resource decisions and mutations. |
+| The knowledge service's [policy principal][el-policy] has clearances and scopes but no actor; [MCP context][el-context] defaults record attribution to `mcp_tool`. | Preserve authenticated identity through resource decisions and mutations. |
 
 Baselines: Meerkat `54d14e91bd426fcaaafc156227b0b5ab0e23d9a6`,
-MobKit `e2795b5dbbabe224e2e912256d7b99e480b5c9c9`, Elephant
+MobKit `e2795b5dbbabe224e2e912256d7b99e480b5c9c9`, knowledge service
 `1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a`.
 
 ## Decision
 
 Create a first-class, feature-owned authorization capability in Meerkat.
 Share versioned protocol contracts and semantic conformance vectors with
-Elephant. The first profile does not share evaluator implementation code.
+the knowledge service. The first profile does not share evaluator implementation code.
 MobKit provides policy administration and observation, and enforces the common
 contract for its own operations, including console reads, blobs and delivery.
 Application rules remain application-owned. Resource and execution owners remain
@@ -87,7 +87,7 @@ The authorization feature owns the shared contract version and conformance
 corpus. Versions evolve independently of Meerkat's Rust release train; protocol
 negotiation refuses unsupported semantics or obligations. Both repositories run
 the same vectors for the same normalized inputs, policy-domain semantics and
-contract version, including Elephant's domain vectors. Different local policies
+contract version, including the knowledge service's domain vectors. Different local policies
 may legitimately decide differently; an adapter may not silently reinterpret
 the common contract. A later shared library would require its own compatibility
 and release policy, no dependency on Meerkat runtime or Core, and proof that it
@@ -220,7 +220,7 @@ mappings before introducing new public carriers:
 | `ApprovalPrincipalId` and machine principal keys | Typed projections through declared mappings, not independent identity resolvers. |
 | `OpaquePrincipalToken`, `MobToolAuthorityContext`, `MobControlPrincipal` | Domain capability/control lanes bound at their owning admission seams; not interchangeable requester identities. |
 | Member-tool, WorkGraph and fork grants | Domain restrictions or admission outcomes conjoined with requester authority; retain their current owners. |
-| Elephant `policy::Principal` | Domain attribute view derived from verified evidence, not a second identity authority. |
+| Knowledge service `policy::Principal` | Domain attribute view derived from verified evidence, not a second identity authority. |
 
 A surface-derived `MobControlPrincipal::Owner` or equivalent legacy admin path
 cannot establish a governed mandate. Trusted-embedded compatibility does not
@@ -412,12 +412,12 @@ hostname, storage directory or mere consumption of a resource. An independent
 resource service owns separate durable authority state, its own fenced entry
 and a declared authenticated cross-domain protocol. The trusted composition
 owner declares and persists that relationship in the negotiated profile; an
-adapter cannot choose it. Elephant remains independent when co-hosted or moved
+adapter cannot choose it. The knowledge service remains independent when co-hosted or moved
 to another machine. Consuming its data does not merge its owner into Meerkat.
 Domain assignment is per canonical authority/state contract, not a blanket
 service label. A separate handle exposing Meerkat-owned grant or revocation
 state remains same-domain for that state. Consuming a Meerkat-issued parent
-grant does not transfer ownership of Elephant's resource policy or entry;
+grant does not transfer ownership of the knowledge service's resource policy or entry;
 each authority enforces its own state under the negotiated cross-domain contract.
 
 In-process tool-policy providers and all replicas participating in Meerkat's
@@ -571,21 +571,21 @@ are normative when selected, preserve known source restrictions, record trust
 assumptions and create no historical execution authority. Ordinary ingestion,
 write, administration or model output cannot select these exceptions implicitly.
 
-### 6. Elephant federation
+### 6. Knowledge-service federation
 
-Elephant remains the resource authority for its spaces, records, classifications,
+The knowledge service remains the resource authority for its spaces, records, classifications,
 subject entities, evidence and derived knowledge. Meerkat owns runtime execution,
 context use and disclosure. Both applicable decisions must allow; neither may
-override the other. A common protocol does not copy Elephant ACLs into a
-Meerkat cache or make Meerkat an issuer for arbitrary Elephant clearances.
+override the other. A common protocol does not copy knowledge-service ACLs into a
+Meerkat cache or make Meerkat an issuer for arbitrary knowledge-service clearances.
 
-Preserve Elephant's record checks and domain predicates when conforming to the
+Preserve the knowledge service's record checks and domain predicates when conforming to the
 shared contract. Its [subject-aware projections][el-subjects], security-separated
 knowledge and [revocable wiki authority][el-wiki] are assets. Existing scope
 semantics, including special service grants, require differential conformance
 tests before migration. Contract migration must not broaden their meaning.
 
-Elephant's [literal `manage:wiki` grant][el-commission] is a privileged-service commissioning
+The knowledge service's [literal `manage:wiki` grant][el-commission] is a privileged-service commissioning
 contract from section 3: an unrestricted-subject manager can authorize bounded
 wiki processing across security envelopes without gaining direct read access
 to those inputs. A wildcard scope does not substitute for that literal grant.
@@ -595,12 +595,12 @@ operation or output destination cannot reuse the commissioning authority.
 
 The integration protocol carries issuer-qualified actor/requester identity,
 authenticated delegation, exact space, actions/resource bounds, audience,
-purpose, expiry and revocation evidence. Elephant validates the issuer's right
+purpose, expiry and revocation evidence. The knowledge service validates the issuer's right
 to attest each claim and maps it to local policy. A general static service token
 must not substitute for the caller's authority. Credential minting/exchange is a
 declared service with constrained delegation; prompts never receive secrets.
 
-Elephant returns only authorized data, with the governed result envelope from
+The knowledge service returns only authorized data, with the governed result envelope from
 section 5 and a correlated local decision receipt. Meerkat validates that the
 resource authority and response bind to the exact request before consuming it.
 Knowledge subjects describe entities a record is about; they are a different
@@ -612,7 +612,7 @@ Migration must first preserve empty subject restrictions as restrictive:
 Preserve domain semantics: `None` is unrestricted subject scope; `Some(empty)`
 admits no named subjects, but an explicit `handling:subjectless_ok` waiver on a
 record, together with caller clearance for it, can permit empty or incomplete
-subjects under Elephant's existing predicate. Named subjects must still be in
+subjects under the knowledge service's existing predicate. Named subjects must still be in
 the allowlist. This permission-bearing waiver is distinct from a restrictive
 handling caveat and cannot be unioned from one contributor onto another. Derived
 waiver validity requires every contributing source to authorize the exception.
@@ -720,7 +720,7 @@ decisions, not every packet that reached an unavailable process.
 Exporters and the console consume projections of committed receipts. Export
 lag or UI failure does not turn completed work into failure. A required receipt
 commit is semantic; optional telemetry is advisory. Existing runtime event
-projection and Elephant's mutable data-change journal retain their own purposes
+projection and the knowledge service's mutable data-change journal retain their own purposes
 and cannot be advertised as the complete security receipt store.
 
 ## Alternatives considered
@@ -730,7 +730,7 @@ and cannot be advertised as the complete security receipt store.
 | Extend only MobKit console ABAC | Rejected as the architecture: runtime tools, background work, alternate surfaces and disclosures remain outside its authority. |
 | Carry caller attributes and let arbitrary host callbacks decide independently | Rejected without the common composition contract: it leaves coverage, obligations, revocation and audit semantics to each leaf. Host policy providers remain supported behind the shared contract. |
 | Move all policy and lifecycle into Core or one security machine | Rejected: violates feature ownership and duplicates existing operation authorities. |
-| Adopt Elephant's current Principal/evaluator unchanged | Rejected: actor identity, generic delegation, policy lifecycle and effect audit are missing; domain policy semantics must be retained. |
+| Adopt the knowledge service's current Principal/evaluator unchanged | Rejected: actor identity, generic delegation, policy lifecycle and effect audit are missing; domain policy semantics must be retained. |
 | Use only signed capabilities | Insufficient alone: useful transport evidence, but resource attributes, current policy, source restrictions and effect settlement still need owners. |
 | Use only content taint or prompt instructions | Rejected: neither grants permission nor enforces recipient/resource-specific information use. |
 | Select a policy language first | Deferred: engine/backend choices follow the required contracts and conformance evidence. The shared contract must not depend on unproven general policy implication. |
@@ -738,7 +738,7 @@ and cannot be advertised as the complete security receipt store.
 ## Consequences
 
 Positive: one explicit contract across surfaces; policy authoring stays flexible;
-Elephant and Meerkat preserve domain ownership; delegated authority cannot grow
+the knowledge service and Meerkat preserve domain ownership; delegated authority cannot grow
 silently; source restrictions survive derived work; complete audit has a stated
 meaning and failure mode; generated catalogs can ratchet enforcement coverage.
 
@@ -776,7 +776,7 @@ surveillance; explicit product policy and behavior remain necessary.
    durability profile. Extend existing principal/tool-policy types deliberately.
 3. Implement one governed vertical slice with a deterministic provider and
    recorded sinks: authenticated person -> agent -> attenuated helper ->
-   Elephant read -> authorized model route -> authorized reply. Include cold
+   knowledge-service read -> authorized model route -> authorized reply. Include cold
    restart, context reset and a second independent caller. Measure per-action
    and per-model-attempt latency, receipt throughput and dependency-validation
    cost against declared workload budgets; show group-commit semantics and
@@ -818,7 +818,7 @@ after the sink already received bytes fails. Required cases:
 | Unchanged content revision with reclassified/tombstoned transitive source | Stored summaries/artifacts and cached output cannot authorize fresh use from historical evidence. |
 | Provider-held cache contains secret absent from current request; uncited context reaches curator | Full dependency domain follows output; unauthorized model invocation or publication refuses. |
 | Literal wiki service commissioning versus wildcard-only or subject-restricted manager | Authorized bounded service can process private inputs without granting requester direct reads; altered service parameters refuse. |
-| Subject scope None/empty/A, complete/partial/unknown subjects, waiver and caller clearance combinations | Preserve Elephant truth table; disallowed named subjects remain denied; one contributor cannot transfer a waiver. |
+| Subject scope None/empty/A, complete/partial/unknown subjects, waiver and caller clearance combinations | Preserve the knowledge service's truth table; disallowed named subjects remain denied; one contributor cannot transfer a waiver. |
 | Protected envelope carries canary person/source ID | Enforcement can resolve dependency while prompts, visible tool JSON, UI, traces and ordinary audit queries omit denied metadata. |
 | Governed bootstrap/restore/handoff without receipt capability | Refuse the profile before protected effects; no silent audit downgrade. |
 
@@ -827,7 +827,7 @@ are also required where their core operation or optional deployment profile is
 claimed. Moving product-specific cases out of this ADR does not waive them.
 
 Property tests must establish monotonic attenuation and policy combination.
-Differential tests must preserve Elephant domain rules. Generated coverage gates
+Differential tests must preserve knowledge-service domain rules. Generated coverage gates
 must reject any governed operation without a declaration. Adversarial review of
 this ADR is design evidence only; implementation acceptance requires executed
 fault and sink assertions against production ownership paths.
@@ -868,10 +868,10 @@ semantic versus advisory failure govern this decision.
 [mk-input]: https://github.com/lukacf/meerkat/blob/54d14e91bd426fcaaafc156227b0b5ab0e23d9a6/crates/meerkat-runtime/src/input.rs#L34
 [mk-context]: https://github.com/lukacf/meerkat/blob/54d14e91bd426fcaaafc156227b0b5ab0e23d9a6/crates/meerkat-core/src/agent.rs#L707
 [mk-observer]: https://github.com/lukacf/meerkat/blob/54d14e91bd426fcaaafc156227b0b5ab0e23d9a6/crates/meerkat-core/src/tool_consequence_policy.rs#L597
-[el-policy]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/policy/src/engine.rs#L23
-[el-context]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/mod.rs#L134
-[el-commission]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/knowledge_views.rs#L31
-[el-subjects]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/knowledge-views/src/lib.rs#L1253
-[el-wiki]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/pipeline/src/wiki_editorial.rs#L1004
-[el-empty]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/bin/elephant-api/src/authz.rs#L152
-[el-relabel]: https://github.com/lukacf/elephant/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/entities.rs#L844
+[el-policy]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/policy/src/engine.rs#L23
+[el-context]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/mod.rs#L134
+[el-commission]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/knowledge_views.rs#L31
+[el-subjects]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/knowledge-views/src/lib.rs#L1253
+[el-wiki]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/pipeline/src/wiki_editorial.rs#L1004
+[el-empty]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/bin/elephant-api/src/authz.rs#L152
+[el-relabel]: https://github.com/lukacf/meerkat-recall/blob/1aefaad2de68535ca5b588f58e8ed1ae1bf5b56a/crates/mcp/src/handlers/entities.rs#L844

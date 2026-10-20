@@ -435,10 +435,12 @@ pub(crate) enum RuntimeRevivalIntent {
     #[default]
     None,
     MissingLiveMaterialization,
-    /// `MobBuilder::resume` restoring a durable member at boot. It provisions
-    /// as `None` does; a host refusal of the registration it prepared comes
-    /// back typed (`MobError::MemberRegistrationRefused`), and the
-    /// transaction's own rollback removes that registration.
+    /// `MobBuilder::resume` restoring a member at boot: on its durable session,
+    /// or on a fresh one (as when the session service keeps no durable
+    /// sessions).
+    /// It provisions as `None` does; a host refusal of the registration it
+    /// prepared comes back typed (`MobError::MemberRegistrationRefused`), and
+    /// the transaction's own rollback removes that registration.
     ColdRestore,
 }
 
@@ -1434,6 +1436,34 @@ pub(super) fn classify_stop_member_cancel(
         ) => Ok(MemberStopRun::RunEndedBeforeCancel { run_id }),
         Err(error) => Err(error),
     }
+}
+
+/// The member stop's answer for a cancel the runtime refused after the
+/// stop's run-start hold was placed. A typed `RecoveryRepairBlocked` that
+/// `durability_reload_required` confirms means the registration degraded
+/// between the hold and the cancel, and the cancel's wait for the session's
+/// mutation gate ended on that degradation: the cancel dispatched nothing,
+/// so the run is the member's `ReloadRequired` run, never
+/// `CancelDispatched`, and the hold stays placed. Any other refusal fails the
+/// stop, as before.
+#[cfg(feature = "runtime-adapter")]
+async fn stop_member_cancel_refusal(
+    adapter: &MeerkatMachine,
+    session_id: &SessionId,
+    error: meerkat_runtime::RuntimeDriverError,
+    context: impl FnOnce() -> String,
+) -> Result<super::stop_report::MemberStopRun, MobError> {
+    if matches!(
+        error,
+        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+    ) && adapter
+        .durability_reload_required(session_id)
+        .await
+        .is_some()
+    {
+        return Ok(super::stop_report::MemberStopRun::ReloadRequired);
+    }
+    Err(MobError::Internal(format!("{}: {error}", context())))
 }
 
 /// What a force cancel or cancel-all-work did to the work the member had
@@ -2450,6 +2480,50 @@ pub(super) fn arm_owned_create_abort_failure_for_test(session_id: SessionId) {
     );
 }
 
+/// The channels of one armed [`STOP_MEMBER_CANCEL_TEST_HOOKS`] entry: the
+/// stop reached its cancel, the test lets the cancel run, and the cancel
+/// answered (signalled by dropping the sender when the stop returns).
+#[cfg(all(test, feature = "runtime-adapter"))]
+type StopMemberCancelTestHook = (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+);
+
+/// Test seam: parks a member stop that holds the session's run starts and
+/// found a run current, right before it cancels that run, so a test can
+/// degrade the registration between the hold and the cancel. Inert unless
+/// armed for the session.
+#[cfg(all(test, feature = "runtime-adapter"))]
+static STOP_MEMBER_CANCEL_TEST_HOOKS: std::sync::LazyLock<
+    StdMutex<HashMap<SessionId, StopMemberCancelTestHook>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Arm [`STOP_MEMBER_CANCEL_TEST_HOOKS`] for `session_id`. Returns the
+/// receiver that resolves once the stop reached its cancel, the sender that
+/// lets the cancel run, and the receiver that resolves once the cancel
+/// answered and the stop returned.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(super) fn arm_stop_member_cancel_for_test(
+    session_id: SessionId,
+) -> (
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let (answered_tx, answered_rx) = oneshot::channel();
+    assert!(
+        STOP_MEMBER_CANCEL_TEST_HOOKS
+            .lock()
+            .expect("stop member cancel hook")
+            .insert(session_id, (reached_tx, release_rx, answered_tx))
+            .is_none()
+    );
+    (reached_rx, release_tx, answered_rx)
+}
+
 /// Where a test pauses an owned actor transaction's cleanup.
 #[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2931,16 +3005,19 @@ pub(super) enum DegradedUnregisterStep {
     /// reasons it does not type apart: another owner still holds the
     /// registration's teardown (an unregister, stop-cleanup or unregister
     /// finalization coordinator), a user-interrupt dispatch on it has not
-    /// settled, or its cold recovery cannot run yet. It also refuses an
-    /// attachment without a teardown slot, which only guards the invariant
-    /// that every attachment has one. The exact unregister then joins that
-    /// owner, waits within its own deadline, or is refused until the repair
-    /// too, and a settlement retries the discard on its next call. A
-    /// registration whose runtime loop is still attached keeps its fence
-    /// until that loop hands it back, and the discard waits for that
-    /// handoff. A registration that no runtime loop holds (none was ever
-    /// attached, or its teardown completed) is not refused for a missing
-    /// handoff: nothing retains its mutation fence, and the discard takes it.
+    /// settled, its cold recovery cannot run yet, or a boundary commit or run
+    /// terminalization on it passed its commit deadline and the store has not
+    /// answered it yet. It also refuses an attachment without a teardown
+    /// slot, which only guards the invariant that every attachment has one.
+    /// The exact unregister then joins that owner, waits within its own
+    /// deadline, or is refused until the repair too (behind a commit past its
+    /// deadline, its wait for the session's mutation gate ends typed), and a
+    /// settlement retries the discard on its next call. A registration whose
+    /// runtime loop is still attached keeps its fence until that loop hands
+    /// it back, and the discard waits for that handoff. A registration that
+    /// no runtime loop holds (none was ever attached, or its teardown
+    /// completed) is not refused for a missing handoff: nothing retains its
+    /// mutation fence, and the discard takes it.
     Unchanged,
     /// The discard replaced the degraded process shell with `successor`, the
     /// exact cold registration it published, whose use starts at
@@ -5179,14 +5256,64 @@ impl SessionBackend {
                 starts: MemberRunStarts::Held,
             });
         }
-        let hold = adapter
-            .hold_run_starts(&session_id, meerkat_runtime::RunStartHoldReason::MobStop)
-            .await
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "holding run starts for '{session_id}' failed: {error}"
-                ))
-            })?;
+        // A durability-degraded registration refuses the hold at its
+        // durability gate. Confirmed by `durability_reload_required`, that
+        // refusal is the member's typed outcome: the registration starts no
+        // run until a reload replaces it, and a Shutdown's teardown discards
+        // it. A refusal the read does not confirm means a concurrent reload
+        // published a healthy registration meanwhile; that one is held, and
+        // the hold is tried at most once more.
+        let mut retried = false;
+        let hold = loop {
+            match adapter
+                .hold_run_starts(&session_id, meerkat_runtime::RunStartHoldReason::MobStop)
+                .await
+            {
+                Ok(hold) => break hold,
+                Err(error @ meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }) => {
+                    if adapter
+                        .durability_reload_required(&session_id)
+                        .await
+                        .is_some()
+                    {
+                        return Ok(MemberStopOutcome {
+                            run: MemberStopRun::ReloadRequired,
+                            starts: MemberRunStarts::ReloadRequired,
+                        });
+                    }
+                    if retried {
+                        return Err(MobError::Internal(format!(
+                            "holding run starts for '{session_id}' failed: {error}"
+                        )));
+                    }
+                    retried = true;
+                }
+                Err(error) => {
+                    return Err(MobError::Internal(format!(
+                        "holding run starts for '{session_id}' failed: {error}"
+                    )));
+                }
+            }
+        };
+        // Test seam between the hold and the cancel
+        // (`STOP_MEMBER_CANCEL_TEST_HOOKS`).
+        #[cfg(test)]
+        let _cancel_answered = if cancel != MemberRunCancel::Leave && hold.current_run.is_some() {
+            let hook = STOP_MEMBER_CANCEL_TEST_HOOKS
+                .lock()
+                .expect("stop member cancel hook")
+                .remove(&session_id);
+            match hook {
+                Some((reached_tx, release_rx, answered_tx)) => {
+                    let _ = reached_tx.send(());
+                    let _ = release_rx.await;
+                    Some(answered_tx)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let run = match (hold.current_run, cancel) {
             (None, _) => MemberStopRun::NoRun,
             (Some(run_id), MemberRunCancel::Leave) => MemberStopRun::LeftRunning { run_id },
@@ -5211,23 +5338,29 @@ impl SessionBackend {
                     meerkat_runtime::RuntimeDriverError::StaleAuthority { .. }
                     | meerkat_runtime::RuntimeDriverError::NotReady { .. },
                 ) => MemberStopRun::RunEndedBeforeCancel { run_id },
+                // Refused: `ReloadRequired` when the registration degraded
+                // after the hold, a failed stop otherwise.
                 Err(error) => {
-                    return Err(MobError::Internal(format!(
-                        "cancelling a run of '{session_id}' for shutdown failed: {error}"
-                    )));
+                    stop_member_cancel_refusal(adapter, &session_id, error, || {
+                        format!("cancelling a run of '{session_id}' for shutdown failed")
+                    })
+                    .await?
                 }
             },
-            (Some(run_id), MemberRunCancel::AtBoundary) => classify_stop_member_cancel(
+            (Some(run_id), MemberRunCancel::AtBoundary) => match classify_stop_member_cancel(
                 adapter
                     .cancel_after_boundary_run_if_current(&session_id, &run_id)
                     .await,
                 run_id,
-            )
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "cancelling a run of '{session_id}' failed: {error}"
-                ))
-            })?,
+            ) {
+                Ok(run) => run,
+                Err(error) => {
+                    stop_member_cancel_refusal(adapter, &session_id, error, || {
+                        format!("cancelling a run of '{session_id}' failed")
+                    })
+                    .await?
+                }
+            },
         };
         Ok(MemberStopOutcome {
             run,
@@ -5497,6 +5630,19 @@ impl SessionBackend {
             let observed_ops_binding = self.ops_adapter.capture_session_binding_witness(session_id);
 
             let Some(witness) = witness else {
+                // A registration that needs a durability reload is left to
+                // that reload, which discards it and publishes the cold
+                // successor. Its exact unregister refuses until that repair,
+                // so releasing it here would fail the whole Resume, and the
+                // member starts no run on it meanwhile. Nothing is discarded
+                // or rebuilt for it here.
+                if adapter
+                    .durability_reload_required(session_id)
+                    .await
+                    .is_some()
+                {
+                    return Ok(false);
+                }
                 // Captured under B: the exact registration any discarded
                 // unattached actor was built against. Discarding the actor
                 // alone leaves that registration's materialization claim
@@ -14470,14 +14616,27 @@ impl MobProvisioner for SessionBackend {
         };
         // An unregistered runtime is released too: the release unstages the
         // reason, so its registration applies no hold for it.
-        adapter
-            .release_run_starts(&session_id, reason)
+        let Err(error) = adapter.release_run_starts(&session_id, reason).await else {
+            return Ok(());
+        };
+        // A durability-degraded registration refuses the release at its
+        // durability gate, after the release unstaged the reason. What the
+        // release is for already holds: no registration applies the reason
+        // again, the degraded one starts no run, and its own hold goes with
+        // it at the reload or the discard that replaces it.
+        if matches!(
+            error,
+            meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+        ) && adapter
+            .durability_reload_required(&session_id)
             .await
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "releasing run starts for '{session_id}' failed: {error}"
-                ))
-            })
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(MobError::Internal(format!(
+            "releasing run starts for '{session_id}' failed: {error}"
+        )))
     }
 
     async fn stage_member_registration_run_start_hold(

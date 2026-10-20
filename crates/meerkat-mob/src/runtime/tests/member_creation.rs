@@ -94,7 +94,7 @@ async fn member_creation_operator_ingress_proves_owner_or_records_unproven() {
                 true,
                 generated_mob_operator_authority_with_scope(
                     handle.mob_id().as_str(),
-                    handle.incarnation(),
+                    handle.live_incarnation(),
                 ),
             ));
         // The owner is the dispatch context's origin session, as an agent
@@ -183,7 +183,7 @@ async fn member_creation_operator_capture_fault_is_classified_traced_and_admits_
             true,
             generated_mob_operator_authority_with_scope(
                 handle.mob_id().as_str(),
-                handle.incarnation(),
+                handle.live_incarnation(),
             ),
         )),
         parent_session.clone(),
@@ -251,7 +251,7 @@ async fn member_creation_stale_origin_is_refused_on_owned_target_checks() {
             true,
             generated_mob_operator_authority_with_scope(
                 handle.mob_id().as_str(),
-                handle.incarnation(),
+                handle.live_incarnation(),
             ),
         ))
     };
@@ -361,7 +361,7 @@ async fn member_creation_some_origin_authority_matrix() {
                 true,
                 generated_mob_operator_authority_with_scope(
                     handle.mob_id().as_str(),
-                    handle.incarnation(),
+                    handle.live_incarnation(),
                 ),
             )),
             session,

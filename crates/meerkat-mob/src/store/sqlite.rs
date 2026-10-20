@@ -42,12 +42,18 @@ use super::{
     validate_identity_member_commit_authority, validate_identity_wiring_commit_authority,
     validate_initial_mob_created_events, validate_mob_event_write_authority,
 };
+use super::{
+    MobCreationOrigin, MobCreationRecord, creation_finalized_at_ms, encode_mob_provenance,
+    refuse_raw_creation_over_record, validate_creation_event,
+};
 #[cfg(feature = "runtime-adapter")]
 use super::{
     identity_runtime_fence_error, validate_identity_runtime_target_binding,
     validate_identity_runtime_write_authority,
 };
+use crate::MobProvenance;
 use crate::definition::MobDefinition;
+use crate::error::IncarnationInconsistency;
 use crate::error::MobError;
 use crate::event::{
     MobEvent, MobEventKind, NewMobEvent, decode_stored_mob_event, encode_stored_mob_event,
@@ -86,6 +92,7 @@ use crate::temporary_council::TemporaryCouncilId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meerkat_core::SessionId;
+use meerkat_core::service::MobIncarnationId;
 use meerkat_sqlite::watch::{
     SqliteChangeWatch, SqliteWatchControl, SqliteWatchJoin, SqliteWatchRegistration,
     SqliteWatchStopHandle, SqliteWatchTick,
@@ -318,6 +325,13 @@ CREATE TABLE IF NOT EXISTS mob_temporary_councils (
 CREATE TABLE IF NOT EXISTS mob_runtime_callback_claim_verifiers (
     mob_id TEXT PRIMARY KEY,
     verifier BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mob_runtime_incarnations (
+    mob_id TEXT PRIMARY KEY,
+    incarnation TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('created', 'migrated')),
+    provenance TEXT NOT NULL,
+    finalized_at_ms INTEGER
 )";
 
 // Literal released 0.8.10 base DDL. This is intentionally independent of
@@ -1244,6 +1258,18 @@ fn migration_0011_callback_claim_verifiers(tx: &Transaction<'_>) -> Result<(), r
     )
 }
 
+fn migration_0012_mob_runtime_incarnations(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        "CREATE TABLE mob_runtime_incarnations (
+             mob_id TEXT PRIMARY KEY,
+             incarnation TEXT NOT NULL,
+             origin TEXT NOT NULL CHECK (origin IN ('created', 'migrated')),
+             provenance TEXT NOT NULL,
+             finalized_at_ms INTEGER
+         );",
+    )
+}
+
 fn migration_0001_mob_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     tx.execute_batch(CREATE_SCHEMA_SQL)
 }
@@ -2102,6 +2128,164 @@ fn verify_released_0_9_2_mob_schema(conn: &Connection) -> Result<(), String> {
     )
 }
 
+// Frozen v11 catalog: the shape 0.9.3 shipped, immediately before the mob
+// creation records. Built from the frozen v10 catalog plus the released
+// migration 11, never from the current initializer, so a v11 database is
+// proven against the exact released shape before the one supported
+// v11 -> v12 transition runs.
+fn build_released_0_9_3_mob_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    build_released_0_9_2_mob_schema(tx)?;
+    migration_0011_callback_claim_verifiers(tx)
+}
+
+const RELEASED_0_9_3_MOB_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_events",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_event_meta",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_external_deliveries",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_run_remote_turn_intents",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_run_remote_turn_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_specs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_supervisors",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_host_authorities",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_host_binding_generation_highwaters",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_operator_requests",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_placed_spawns",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_operator_grants",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_event_cursors",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_member_live_cleanups",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_binding_overlays",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_store_meta",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_intents",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_leases",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_operation_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_statuses",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "realm_profiles",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_intent_mutation_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_convergence_resolution_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_identity_adoption_receipts",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_forked_participants",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_forked_participant_member_associations",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_temporary_councils",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "mob_runtime_callback_claim_verifiers",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_forked_participants_fork_session",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_events_mob_cursor",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_intents_session",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_intents_lineage",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "mob_identity_receipts_identity",
+    },
+];
+
+fn verify_released_0_9_3_mob_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &MOB_DOMAIN,
+        RELEASED_0_9_3_MOB_OBJECTS,
+        build_released_0_9_3_mob_schema,
+    )
+}
+
 /// The mob store bundle's schema domain in the per-file migration ledger.
 ///
 /// The oldest historical transition admitted by this binary is the exact
@@ -2192,9 +2376,14 @@ pub const MOB_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomai
             name: "callback-claim-verifiers",
             apply: migration_0011_callback_claim_verifiers,
         },
+        meerkat_sqlite::Migration {
+            version: 12,
+            name: "mob-incarnation",
+            apply: migration_0012_mob_runtime_incarnations,
+        },
     ],
     initialize_current: initialize_current_mob_schema,
-    allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
+    allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11, 12],
     bridge_recoverable_versions: &[],
     released_predecessors: &[
         meerkat_sqlite::SchemaPredecessor {
@@ -2221,8 +2410,16 @@ pub const MOB_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomai
             version: 10,
             verify: verify_released_0_9_2_mob_schema,
         },
+        meerkat_sqlite::SchemaPredecessor {
+            version: 11,
+            verify: verify_released_0_9_3_mob_schema,
+        },
     ],
     owned_objects: &[
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "mob_runtime_incarnations",
+        },
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
             name: "mob_runtime_callback_claim_verifiers",
@@ -2404,7 +2601,7 @@ mod schema_floor_tests {
         let report =
             meerkat_sqlite::apply_domain_migrations(&mut conn, &MOB_DOMAIN).expect("upgrade");
         assert_eq!(report.from_version, 3);
-        assert_eq!(report.to_version, 11);
+        assert_eq!(report.to_version, 12);
     }
 
     #[test]
@@ -3388,6 +3585,15 @@ pub struct SqliteMobIdentityStore {
     event_bus: Option<Arc<SqliteMobEventBus>>,
 }
 
+/// The identity store's runtime write fence: one IMMEDIATE transaction on
+/// mob.db that checks the identity's intent and lease and runs the runtime
+/// write inside it.
+///
+/// It opens mob.db with `ConnectionProfile::Maintenance { write: true }`:
+/// read-write access to the existing file without pragma mutation (no
+/// journal-mode change, no schema work), with the busy wait named per entry:
+/// none for `execute_if_current`, [`IDENTITY_RUNTIME_WRITE_FENCE_WAIT`] for
+/// `execute_if_current_blocking`.
 #[cfg(feature = "runtime-adapter")]
 struct SqliteIdentityRuntimeWriteFence {
     path: PathBuf,
@@ -3397,10 +3603,65 @@ struct SqliteIdentityRuntimeWriteFence {
     expected_session: DesiredSessionTarget,
 }
 
+/// How long the identity runtime write fence's bounded-wait entry
+/// (`execute_if_current_blocking`) waits for mob.db's write lock before it
+/// answers Backoff. Only a caller on a blocking thread takes that entry: the
+/// SQLite runtime store, inside its blocking tasks. `execute_if_current`
+/// still waits for nothing; an async caller that holds a lock retries its
+/// Backoff with the lock released instead.
+///
+/// Convergence statuses are written to mob.db right before each actuation,
+/// and a status commit holds the write lock across its fsync. Without a wait
+/// the fence lost to that commit on a host with slow disk writes, wrote
+/// another status and lost again on the next pass. Basis for 2 seconds: a
+/// convergence-status write took 4.4 ms at the median, 6.8 ms at the 99th
+/// percentile and 7.9 ms at most over 200 writes on a development host (the
+/// ignored `bench_convergence_status_write` test), so the bound covers
+/// commits through fsyncs some 250 times slower than that. A status commit
+/// slower than the bound still loses the fence, and the identity retries
+/// with backoff, as before.
+///
+/// While the fence waits it holds runtime.sqlite3's write lock (the runtime
+/// store's IMMEDIATE transaction). Under contention only:
+/// - other runtime writers wait on their 60-second busy timeout;
+/// - writers with a zero busy timeout are refused busy for up to the bound
+///   (controller custody, `try_controller_mutation_custody`);
+/// - WAL readers, the kept delivery-generation reader included, are not
+///   affected.
+///
+/// A status commit can therefore delay an actuation by at most the bound.
+/// The lock order is always runtime.sqlite3, then mob.db: no mob.db writer
+/// takes runtime.sqlite3. A holder in the other order would still meet a
+/// bounded wait and a Backoff, not a deadlock.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) const IDENTITY_RUNTIME_WRITE_FENCE_WAIT: Duration = Duration::from_secs(2);
+
 #[cfg(feature = "runtime-adapter")]
 impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence {
     fn execute_if_current(
         &self,
+        operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
+    ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
+    {
+        self.execute_waiting(Duration::ZERO, operation)
+    }
+
+    fn execute_if_current_blocking(
+        &self,
+        operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
+    ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
+    {
+        self.execute_waiting(IDENTITY_RUNTIME_WRITE_FENCE_WAIT, operation)
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl SqliteIdentityRuntimeWriteFence {
+    /// One fence attempt whose IMMEDIATE transaction on mob.db waits up to
+    /// `wait` for the write lock.
+    fn execute_waiting(
+        &self,
+        wait: Duration,
         operation: Box<dyn FnOnce() -> Result<(), meerkat_runtime::RuntimeStoreError> + '_>,
     ) -> Result<meerkat_runtime::RuntimeStoreWriteFenceOutcome, meerkat_runtime::RuntimeStoreError>
     {
@@ -3416,14 +3677,19 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
                 });
             }
         };
-        // Maintenance profile: read-write on the existing file, zero busy
-        // timeout for nonblocking admission, no pragma mutation. No schema
-        // preflight: a preflight refusal here would surface as an endlessly
-        // retried Backoff instead of a typed error, and the fence probe's
-        // SQL fails typed on a restructured file anyway.
-        let mut conn = match meerkat_sqlite::open(
+        // The Maintenance profile with this entry's wait (see the type). No
+        // schema preflight: a preflight refusal here would surface as an
+        // endlessly retried Backoff instead of a typed error, and the fence
+        // probe's SQL fails typed on a restructured file anyway.
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let mut conn = match meerkat_sqlite::open_with(
             &self.path,
             meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+            meerkat_sqlite::OpenOptions {
+                busy_timeout: Some(wait),
+                ..meerkat_sqlite::OpenOptions::default()
+            },
         ) {
             Ok(conn) => conn,
             Err(error) => {
@@ -3434,7 +3700,18 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
                 });
             }
         };
-        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate);
+        #[cfg(test)]
+        identity_fence_test_hooks::fence_attempt(&self.path, || {
+            identity_fence_test_hooks::FenceAttempt {
+                identity: self.permit.identity.clone(),
+                blocking: !wait.is_zero(),
+                started,
+                waited: started.elapsed(),
+                took_lock: tx.is_ok(),
+            }
+        });
+        let tx = match tx {
             Ok(tx) => tx,
             Err(error) if meerkat_sqlite::is_busy_or_locked(&error) => {
                 return Ok(meerkat_runtime::RuntimeStoreWriteFenceOutcome::Backoff {
@@ -3482,6 +3759,111 @@ impl meerkat_runtime::RuntimeStoreWriteFence for SqliteIdentityRuntimeWriteFence
         }
         operation()?;
         Ok(meerkat_runtime::RuntimeStoreWriteFenceOutcome::Applied)
+    }
+}
+
+/// Test hooks of the identity runtime write fence, keyed by mob database
+/// path: a fault-injection hold of convergence-status commits (a commit
+/// through a slow fsync) and a record of fence attempts. Unit tests only.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) mod identity_fence_test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use crate::identity::IdentityReconcileDecision;
+    use crate::ids::AgentIdentity;
+
+    /// One identity runtime write fence attempt on a recorded database.
+    #[derive(Debug, Clone)]
+    pub(crate) struct FenceAttempt {
+        pub(crate) identity: AgentIdentity,
+        /// Whether the attempt came through the bounded-wait entry.
+        pub(crate) blocking: bool,
+        pub(crate) started: Instant,
+        /// From the attempt's start until mob.db's write lock was taken or
+        /// refused.
+        pub(crate) waited: Duration,
+        pub(crate) took_lock: bool,
+    }
+
+    #[derive(Default)]
+    struct Hooks {
+        status_commit_holds: HashMap<PathBuf, StatusCommitHold>,
+        fence_attempts: HashMap<PathBuf, Vec<FenceAttempt>>,
+    }
+
+    /// How long a convergence-status commit holds its write transaction
+    /// open, and for which decision only (`None`: every status).
+    #[derive(Clone, Copy)]
+    struct StatusCommitHold {
+        hold: Duration,
+        only: Option<IdentityReconcileDecision>,
+    }
+
+    fn hooks() -> MutexGuard<'static, Hooks> {
+        static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
+        HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The stores key their database by its canonical path.
+    fn key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Every convergence-status commit to the database at `path` (with
+    /// `only`, every one whose decision is `only`) holds its write
+    /// transaction open for `hold` before it commits.
+    pub(crate) fn hold_status_commits(
+        path: &Path,
+        hold: Duration,
+        only: Option<IdentityReconcileDecision>,
+    ) {
+        hooks()
+            .status_commit_holds
+            .insert(key(path), StatusCommitHold { hold, only });
+    }
+
+    /// Records every identity runtime write fence attempt on the database
+    /// at `path` from now on.
+    pub(crate) fn record_fence_attempts(path: &Path) {
+        hooks().fence_attempts.entry(key(path)).or_default();
+    }
+
+    /// The fence attempts recorded on the database at `path`.
+    pub(crate) fn fence_attempts(path: &Path) -> Vec<FenceAttempt> {
+        hooks()
+            .fence_attempts
+            .get(&key(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drops every hook of the database at `path`.
+    pub(crate) fn release(path: &Path) {
+        let key = key(path);
+        let mut hooks = hooks();
+        hooks.status_commit_holds.remove(&key);
+        hooks.fence_attempts.remove(&key);
+    }
+
+    pub(super) fn before_status_commit(path: &Path, decision: Option<IdentityReconcileDecision>) {
+        let hold = hooks().status_commit_holds.get(path).copied();
+        if let Some(StatusCommitHold { hold, only }) = hold
+            && (only.is_none() || only == decision)
+        {
+            std::thread::sleep(hold);
+        }
+    }
+
+    pub(super) fn fence_attempt(path: &Path, attempt: impl FnOnce() -> FenceAttempt) {
+        if let Some(attempts) = hooks().fence_attempts.get_mut(path) {
+            attempts.push(attempt());
+        }
     }
 }
 
@@ -6051,6 +6433,8 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
             .map_err(|error| {
                 sqlite_identity_write_error(error, "replace identity convergence status")
             })?;
+            #[cfg(all(test, feature = "runtime-adapter"))]
+            identity_fence_test_hooks::before_status_commit(&path, status.decision);
             tx.commit().map_err(se)?;
             Ok(())
         })
@@ -7927,6 +8311,85 @@ fn validate_initial_mob_created_sqlite(
     validate_initial_mob_created_events(&[], proposed)
 }
 
+/// A raw append of `proposed`, refused when it holds a `MobCreated` and the
+/// store holds a creation record (see `refuse_raw_creation_over_record`).
+fn validate_raw_mob_created_sqlite(
+    tx: &Transaction<'_>,
+    proposed: &[NewMobEvent],
+) -> Result<(), MobStoreError> {
+    validate_initial_mob_created_sqlite(tx, proposed)?;
+    if !proposed
+        .iter()
+        .any(|event| matches!(&event.kind, MobEventKind::MobCreated { .. }))
+    {
+        return Ok(());
+    }
+    refuse_raw_creation_over_record(read_creation_record(tx)?.as_ref(), proposed)
+}
+
+/// The store's creation record ([`MobCreationRecord`]).
+fn read_creation_record(conn: &Connection) -> Result<Option<MobCreationRecord>, MobStoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT mob_id, incarnation, origin, provenance, finalized_at_ms
+             FROM mob_runtime_incarnations",
+        )
+        .map_err(se)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })
+        .map_err(se)?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (mob_id, incarnation, origin, provenance, finalized_at_ms) = row.map_err(se)?;
+        let incarnation = incarnation.parse().map_err(|error| {
+            MobStoreError::Serialization(format!("creation record of mob '{mob_id}': {error}"))
+        })?;
+        records.push(MobCreationRecord {
+            mob_id: MobId::from(mob_id),
+            incarnation,
+            origin: MobCreationOrigin::parse(&origin)?,
+            provenance,
+            finalized_at_ms,
+        });
+    }
+    match records.len() {
+        0 | 1 => Ok(records.pop()),
+        count => Err(MobStoreError::IncarnationInconsistent {
+            mob_id: records[0].mob_id.clone(),
+            inconsistency: IncarnationInconsistency::MultipleRecords {
+                count: u64::try_from(count).unwrap_or(u64::MAX),
+            },
+        }),
+    }
+}
+
+fn insert_creation_record(
+    tx: &Transaction<'_>,
+    record: &MobCreationRecord,
+) -> Result<(), MobStoreError> {
+    tx.execute(
+        "INSERT INTO mob_runtime_incarnations
+             (mob_id, incarnation, origin, provenance, finalized_at_ms)
+         VALUES (?1, ?2, ?3, ?4, NULL)",
+        params![
+            record.mob_id.as_str(),
+            record.incarnation.to_string(),
+            record.origin.as_str(),
+            record.provenance,
+        ],
+    )
+    .map_err(se)?;
+    Ok(())
+}
+
 #[async_trait]
 impl private::MobEventStoreSealed for SqliteMobEventStore {
     fn definition_resume_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
@@ -8192,6 +8655,118 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
             }
         }
         Ok(outcome)
+    }
+
+    async fn creation_record(&self) -> Result<Option<MobCreationRecord>, MobStoreError> {
+        let path = self.path.clone();
+        run_sqlite_task(move || {
+            let conn = open_connection(&path)?;
+            read_creation_record(&conn)
+        })
+        .await
+    }
+
+    async fn append_creation(
+        &self,
+        event: NewMobEvent,
+        incarnation: MobIncarnationId,
+        provenance: &MobProvenance,
+    ) -> Result<MobEvent, MobStoreError> {
+        validate_mob_event_write_authority(&event.kind)?;
+        let record = MobCreationRecord {
+            mob_id: validate_creation_event(&event)?.clone(),
+            incarnation,
+            origin: MobCreationOrigin::Created,
+            provenance: encode_mob_provenance(provenance)?,
+            finalized_at_ms: None,
+        };
+        let path = self.path.clone();
+        let stored = run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
+            // A finalized record is the finished destroy of an earlier mob
+            // in a store kept for reuse: this creation replaces it. A live
+            // record next to an empty log is a store that disagrees with
+            // itself, and nothing is written over it.
+            match read_creation_record(&tx)? {
+                Some(existing) if !existing.is_finalized() => {
+                    return Err(MobStoreError::IncarnationInconsistent {
+                        mob_id: existing.mob_id,
+                        inconsistency: IncarnationInconsistency::RecordWithoutCreation,
+                    });
+                }
+                Some(_) => {
+                    tx.execute(
+                        "DELETE FROM mob_runtime_incarnations WHERE finalized_at_ms IS NOT NULL",
+                        [],
+                    )
+                    .map_err(se)?;
+                }
+                None => {}
+            }
+            let cursor = next_event_cursor(&tx)?;
+            let stored = MobEvent {
+                cursor,
+                timestamp: event.timestamp.unwrap_or_else(Utc::now),
+                mob_id: event.mob_id,
+                kind: event.kind,
+            };
+            let encoded = encode_stored_mob_event(&stored)
+                .map_err(|e| MobStoreError::Serialization(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO mob_events (cursor, mob_id, event_json) VALUES (?1, ?2, ?3)",
+                params![cursor_to_i64(cursor)?, stored.mob_id.as_str(), encoded],
+            )
+            .map_err(se)?;
+            insert_creation_record(&tx, &record)?;
+            set_next_cursor(&tx, checked_event_cursor_successor(cursor)?)?;
+            tx.commit().map_err(se)?;
+            Ok(stored)
+        })
+        .await?;
+        self.event_bus.publish_committed(stored.clone());
+        Ok(stored)
+    }
+
+    async fn assign_legacy_incarnation(
+        &self,
+        mob_id: &MobId,
+        incarnation: MobIncarnationId,
+    ) -> Result<MobCreationRecord, MobStoreError> {
+        let record = MobCreationRecord {
+            mob_id: mob_id.clone(),
+            incarnation,
+            origin: MobCreationOrigin::Migrated,
+            provenance: encode_mob_provenance(&MobProvenance::Unrecorded)?,
+            finalized_at_ms: None,
+        };
+        let path = self.path.clone();
+        run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            if let Some(existing) = read_creation_record(&tx)? {
+                tx.commit().map_err(se)?;
+                return Ok(existing);
+            }
+            let has_events = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mob_events WHERE mob_id = ?1 LIMIT 1)",
+                    params![record.mob_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(se)?;
+            if !has_events {
+                return Err(MobStoreError::Internal(format!(
+                    "the store holds no events of mob '{}' to assign an incarnation to",
+                    record.mob_id
+                )));
+            }
+            insert_creation_record(&tx, &record)?;
+            tx.commit().map_err(se)?;
+            Ok(record)
+        })
+        .await
     }
 }
 
@@ -8839,7 +9414,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
-            validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
+            validate_raw_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
             let cursor = next_event_cursor(&tx)?;
             let stored = MobEvent {
                 cursor,
@@ -9067,7 +9642,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
-            validate_initial_mob_created_sqlite(&tx, &batch)?;
+            validate_raw_mob_created_sqlite(&tx, &batch)?;
             let mut cursor = next_event_cursor(&tx)?;
             let mut results = Vec::with_capacity(batch.len());
             for event in batch {
@@ -9139,6 +9714,14 @@ impl MobEventStore for SqliteMobEventStore {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute("DELETE FROM mob_events", []).map_err(se)?;
+            // The cleared log is a finished destroy: its creation record
+            // stays, finalized, until the store's files are removed.
+            tx.execute(
+                "UPDATE mob_runtime_incarnations SET finalized_at_ms = ?1
+                 WHERE finalized_at_ms IS NULL",
+                params![creation_finalized_at_ms()],
+            )
+            .map_err(se)?;
             tx.execute(
                 "INSERT OR REPLACE INTO mob_event_meta (key, value) VALUES (?1, ?2)",
                 params![EVENT_CURSOR_KEY, 1i64],
@@ -11566,7 +12149,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for retired in [
             "mob_identity_declaration_scopes",
@@ -11657,7 +12240,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            11
+            12
         );
         for table in [
             "mob_identity_intent_mutation_receipts",
@@ -11735,7 +12318,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         for table in [
             "mob_forked_participants",
             "mob_forked_participant_member_associations",
@@ -11772,7 +12355,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_forked_participant_member_associations"),
             "migration 9 must run when a released-v8 file is opened"
@@ -11790,7 +12373,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_temporary_councils"),
             "migration 10 must run when a released-v9 file is opened"
@@ -11808,7 +12391,7 @@ mod tests {
 
         drop(SqliteMobStores::open(&path).unwrap());
 
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(
             table_exists(&path, "mob_runtime_callback_claim_verifiers"),
             "migration 11 must run when a released-v10 file is opened"
@@ -11871,12 +12454,98 @@ mod tests {
         );
     }
 
-    /// A binary whose mob domain ends at v10 (0.9.2) refuses a store this
-    /// one migrated to v11, with the ledger's typed future-schema error and
-    /// without touching the file: downgrading after the migration is not
-    /// supported, and is never a misread.
+    /// No store method rewrites a creation record: the create's transaction
+    /// and the legacy assignment insert it, the destroy's event clear sets
+    /// its `finalized_at_ms` and nothing else, and a create in a kept store
+    /// deletes only a finalized one. Every SQL statement that names the table
+    /// is one of those (plus its reads and its schema), and the in-memory
+    /// stores write it only through the shared helpers.
     #[test]
-    fn a_v10_binary_refuses_a_v11_store_typed_and_unmutated() {
+    fn no_store_method_rewrites_a_creation_record() {
+        // The code before each file's `mod tests`, which this test is in.
+        fn shipped(source: &str) -> &str {
+            source
+                .split("\nmod tests {")
+                .next()
+                .expect("the source has code before its tests")
+        }
+        let sqlite = shipped(include_str!("sqlite.rs"));
+        let mut writes = Vec::new();
+        for (at, _) in sqlite.match_indices("mob_runtime_incarnations") {
+            // A Rust identifier that contains the name (the migration
+            // function) is not SQL.
+            if sqlite[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let start = sqlite[..at].rfind('"').map_or(0, |quote| quote + 1);
+            let end = sqlite[at..]
+                .find('"')
+                .map_or(sqlite.len(), |quote| at + quote);
+            let literal = &sqlite[start..end];
+            let statement = literal
+                .split(';')
+                .find(|statement| statement.contains("mob_runtime_incarnations"))
+                .expect("the literal names the table");
+            let statement = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+            let read_or_schema = statement == "mob_runtime_incarnations"
+                || statement.starts_with("CREATE TABLE")
+                || statement.starts_with("SELECT ");
+            if !read_or_schema {
+                writes.push(statement);
+            }
+        }
+        writes.sort();
+        assert_eq!(
+            writes,
+            [
+                "DELETE FROM mob_runtime_incarnations WHERE finalized_at_ms IS NOT NULL",
+                "INSERT INTO mob_runtime_incarnations (mob_id, incarnation, origin, provenance, \
+                 finalized_at_ms) VALUES (?1, ?2, ?3, ?4, NULL)",
+                "UPDATE mob_runtime_incarnations SET finalized_at_ms = ?1 WHERE \
+                 finalized_at_ms IS NULL",
+            ],
+            "the only SQL writes of a creation record"
+        );
+
+        let in_memory = shipped(include_str!("in_memory.rs"));
+        assert_eq!(
+            in_memory.matches("&mut aggregate.creation").count(),
+            3,
+            "the in-memory store hands its record to the three shared writers only"
+        );
+        let helpers = shipped(include_str!("mod.rs"));
+        assert_eq!(helpers.matches("*creation = Some(").count(), 2);
+        assert_eq!(helpers.matches(".finalized_at_ms = Some(").count(), 1);
+    }
+
+    #[test]
+    fn released_v11_migrates_to_canonical_current_schema() {
+        // v11 (the 0.9.3 head) became a frozen predecessor when migration 12
+        // landed. This proves the v11 verifier matches what migration 11
+        // actually produces, which is the only thing that keeps 12 legal as
+        // ledger head without a v12 verifier of its own.
+        let (_dir, path) = temp_db_path();
+        seed_released_predecessor(&path, 11, build_released_0_9_3_mob_schema);
+
+        drop(SqliteMobStores::open(&path).unwrap());
+
+        assert_eq!(ledger_version(&path), 12);
+        assert!(
+            table_exists(&path, "mob_runtime_incarnations"),
+            "migration 12 must run when a released-v11 file is opened"
+        );
+    }
+
+    /// A binary whose mob domain ends at v10 (0.9.2) refuses a store this
+    /// one migrated, with the ledger's typed future-schema error and without
+    /// touching the file: downgrading after the migration is not supported,
+    /// and is never a misread.
+    #[test]
+    fn a_v10_binary_refuses_a_current_store_typed_and_unmutated() {
         const RELEASED_0_9_2_MOB_DOMAIN: meerkat_sqlite::SchemaDomain =
             meerkat_sqlite::SchemaDomain {
                 migrations: MOB_DOMAIN.migrations.split_at(10).0,
@@ -11886,11 +12555,11 @@ mod tests {
             };
         let (_dir, path) = temp_db_path();
         drop(SqliteMobStores::open(&path).unwrap());
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
 
         let mut conn = Connection::open(&path).unwrap();
         let err = meerkat_sqlite::apply_domain_migrations(&mut conn, &RELEASED_0_9_2_MOB_DOMAIN)
-            .expect_err("a v10 binary must refuse a v11 store");
+            .expect_err("a v10 binary must refuse a v12 store");
         assert!(
             matches!(
                 err,
@@ -11898,8 +12567,44 @@ mod tests {
             ),
             "{err}"
         );
-        assert_eq!(ledger_version(&path), 11);
+        assert_eq!(ledger_version(&path), 12);
         assert!(table_exists(&path, "mob_runtime_callback_claim_verifiers"));
+    }
+
+    /// The mob creation records take ledger head 12, and a binary whose mob
+    /// domain ends at v11 (0.9.3) refuses a store at it, typed and without
+    /// touching the file: after a 0.9.4 binary opened a store, 0.9.3 cannot.
+    #[test]
+    fn a_v11_binary_refuses_a_v12_store_typed_and_unmutated() {
+        const RELEASED_0_9_3_MOB_DOMAIN: meerkat_sqlite::SchemaDomain =
+            meerkat_sqlite::SchemaDomain {
+                migrations: MOB_DOMAIN.migrations.split_at(11).0,
+                allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
+                released_predecessors: MOB_DOMAIN.released_predecessors.split_at(6).0,
+                ..MOB_DOMAIN
+            };
+        assert!(
+            !RELEASED_0_9_3_MOB_DOMAIN
+                .allowed_existing_versions
+                .contains(&12)
+        );
+        let (_dir, path) = temp_db_path();
+        drop(SqliteMobStores::open(&path).unwrap());
+        assert_eq!(ledger_version(&path), 12);
+        assert!(table_exists(&path, "mob_runtime_incarnations"));
+
+        let mut conn = Connection::open(&path).unwrap();
+        let err = meerkat_sqlite::apply_domain_migrations(&mut conn, &RELEASED_0_9_3_MOB_DOMAIN)
+            .expect_err("a v11 binary must refuse a v12 store");
+        assert!(
+            matches!(
+                err,
+                meerkat_sqlite::SqliteStoreError::SchemaFromTheFuture { .. }
+            ),
+            "{err}"
+        );
+        assert_eq!(ledger_version(&path), 12);
+        assert!(table_exists(&path, "mob_runtime_incarnations"));
     }
 
     #[test]
@@ -11984,16 +12689,21 @@ mod tests {
                     version: 10,
                     verify: verify_released_0_9_2_mob_schema,
                 },
-                // The requested "exact frozen v11 predecessor verifier".
                 meerkat_sqlite::SchemaPredecessor {
                     version: 11,
-                    verify: verify_released_0_9_2_mob_schema,
+                    verify: verify_released_0_9_3_mob_schema,
+                },
+                // The requested "exact frozen predecessor verifier" for the
+                // head version itself.
+                meerkat_sqlite::SchemaPredecessor {
+                    version: 12,
+                    verify: verify_released_0_9_3_mob_schema,
                 },
             ],
             ..MOB_DOMAIN
         };
         const WITHOUT_HEAD_FLOOR: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
-            allowed_existing_versions: &[3, 4, 7, 8, 9, 10],
+            allowed_existing_versions: &[3, 4, 7, 8, 9, 10, 11],
             ..MOB_DOMAIN
         };
 
@@ -15130,5 +15840,587 @@ mod tests {
         let db_path = dir.path().join("realm_profiles.db");
         let store = SqliteRealmProfileStore::open(&db_path).unwrap();
         contract_tests::test_list(&store).await;
+    }
+}
+
+/// A runtime store that holds an async lock around an identity fence
+/// retries a contended fence with that lock released between attempts, so a
+/// mob.db write lock held across a slow status commit delays the fenced write
+/// instead of refusing it, and blocks no other task meanwhile.
+#[cfg(all(test, feature = "runtime-adapter"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod identity_fence_contention_tests {
+    use super::*;
+    use crate::identity::{
+        IdentityActuationPermit, IdentityActuatorTarget, IdentityIntent, IdentityLeaseClaimOutcome,
+        IdentityStoredObservation,
+    };
+    use meerkat_runtime::store::RuntimeStoreWriteFence;
+    use meerkat_runtime::{
+        MeerkatMachine, RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
+        RuntimeStoreError, RuntimeStoreWriteFenceOutcome,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// How long the holder keeps mob.db's write lock: a slow status commit.
+    const HOLD: Duration = Duration::from_millis(300);
+
+    /// An adopted identity with a current lease in a SQLite identity store.
+    struct AdoptedIdentity {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        store: SqliteMobIdentityStore,
+        mob_id: MobId,
+        identity: AgentIdentity,
+        session: DesiredSessionTarget,
+        intent: IdentityIntentRecord,
+        lease: crate::identity::IdentityLeaseClaim,
+    }
+
+    async fn adopted_identity() -> AdoptedIdentity {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mob.db");
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let store = stores.identity_store();
+        let mob_id = MobId::from("fence-contention-mob");
+        let identity = AgentIdentity::from("worker-1");
+        let (request, compiled) = crate::identity::identity_adoption_fixture(
+            mob_id.clone(),
+            identity.clone(),
+            "fence-contention-1",
+            meerkat_core::SessionId::new(),
+        );
+        store
+            .adopt_member_identity_declaration(&request, &compiled)
+            .await
+            .unwrap();
+        let lease = match store
+            .claim_or_renew_identity_lease(
+                &mob_id,
+                &identity,
+                "controller",
+                "inc-a",
+                IDENTITY_LEASE_MAX_TTL_MS,
+            )
+            .await
+            .unwrap()
+        {
+            IdentityLeaseClaimOutcome::Acquired(claim) => claim,
+            other => panic!("expected a fresh lease, got {other:?}"),
+        };
+        let intent = match store
+            .observe_identity_intent(&mob_id, &identity)
+            .await
+            .unwrap()
+        {
+            IdentityStoredObservation::Valid(intent) => intent,
+            other => panic!("expected the adopted intent, got {other:?}"),
+        };
+        let IdentityIntent::Present { session, .. } = &intent.intent else {
+            panic!("the adopted intent is present");
+        };
+        let session = session.clone();
+        AdoptedIdentity {
+            _dir: dir,
+            path,
+            store,
+            mob_id,
+            identity,
+            session,
+            intent,
+            lease,
+        }
+    }
+
+    impl AdoptedIdentity {
+        /// The identity's runtime write fence for `observed`, as the actor
+        /// prepares it before a runtime registration.
+        fn runtime_fence(
+            &self,
+            observed: &RuntimeSessionLifecycleObservation,
+        ) -> Arc<dyn RuntimeStoreWriteFence> {
+            let permit = IdentityActuationPermit {
+                mob_id: self.mob_id.clone(),
+                identity: self.identity.clone(),
+                target: IdentityActuatorTarget::Runtime,
+                intent_revision: self.intent.intent_revision,
+                intent_digest: self.intent.intent_digest.clone(),
+                intent_authority_digest: self.intent.authority_digest.clone(),
+                lease_epoch: self.lease.epoch,
+                lease_holder_id: self.lease.holder_id.clone(),
+                lease_incarnation_id: self.lease.incarnation_id.clone(),
+                lease_expires_at_ms: self.lease.expires_at_ms,
+                target_observation: crate::store::identity_runtime_target_observation_version(
+                    observed,
+                ),
+            };
+            self.store
+                .prepare_runtime_write_fence(permit, self.session.clone(), observed)
+                .unwrap()
+        }
+    }
+
+    /// Another connection takes mob.db's write lock and holds it for `hold`,
+    /// as a status commit does across a slow fsync. Returns once the lock is
+    /// held; the thread returns when it released the lock.
+    fn hold_mob_db(path: &Path, hold: Duration) -> std::thread::JoinHandle<Instant> {
+        let (holding, held) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let mut conn = Connection::open(&path).unwrap();
+            let lock = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            holding.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(lock);
+            Instant::now()
+        });
+        held.recv().unwrap();
+        holder
+    }
+
+    /// Wraps a fence: just before its `at`-th call, mob.db is held for
+    /// [`HOLD`]. Records when each call started and when each operation ran,
+    /// and counts the calls that returned.
+    struct HoldMobDbAt {
+        inner: Arc<dyn RuntimeStoreWriteFence>,
+        path: PathBuf,
+        at: usize,
+        call_starts: std::sync::Mutex<Vec<Instant>>,
+        operations: std::sync::Mutex<Vec<Instant>>,
+        /// How many calls have returned.
+        returned: tokio::sync::watch::Sender<usize>,
+        holder: std::sync::Mutex<Option<std::thread::JoinHandle<Instant>>>,
+    }
+
+    impl HoldMobDbAt {
+        fn new(inner: Arc<dyn RuntimeStoreWriteFence>, path: &Path, at: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                path: path.to_path_buf(),
+                at,
+                call_starts: std::sync::Mutex::new(Vec::new()),
+                operations: std::sync::Mutex::new(Vec::new()),
+                returned: tokio::sync::watch::Sender::new(0),
+                holder: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// When the holder released mob.db.
+        fn released_at(&self) -> Instant {
+            self.holder
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the holder ran")
+                .join()
+                .unwrap()
+        }
+
+        fn call_starts(&self) -> Vec<Instant> {
+            self.call_starts.lock().unwrap().clone()
+        }
+
+        fn operations(&self) -> Vec<Instant> {
+            self.operations.lock().unwrap().clone()
+        }
+
+        /// Records a call's start; the `at`-th call first has mob.db held.
+        fn before_call(&self) {
+            let call = {
+                let mut starts = self.call_starts.lock().unwrap();
+                starts.push(Instant::now());
+                starts.len()
+            };
+            if call == self.at {
+                *self.holder.lock().unwrap() = Some(hold_mob_db(&self.path, HOLD));
+            }
+        }
+
+        fn after_call(&self) {
+            self.returned.send_modify(|returned| *returned += 1);
+        }
+
+        /// `operation`, recording when it runs.
+        fn recorded<'a>(
+            &'a self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + 'a>,
+        ) -> Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + 'a> {
+            Box::new(move || {
+                self.operations.lock().unwrap().push(Instant::now());
+                operation()
+            })
+        }
+    }
+
+    impl RuntimeStoreWriteFence for HoldMobDbAt {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            self.before_call();
+            let outcome = self.inner.execute_if_current(self.recorded(operation));
+            self.after_call();
+            outcome
+        }
+
+        fn execute_if_current_blocking(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            self.before_call();
+            let outcome = self
+                .inner
+                .execute_if_current_blocking(self.recorded(operation));
+            self.after_call();
+            outcome
+        }
+    }
+
+    /// Counts ticks of a task on the test's runtime until it is aborted.
+    fn ticker() -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        (ticks, task)
+    }
+
+    /// A read issued while the writer paused between two attempts finished
+    /// well before the writer's next attempt: the writer released its lock
+    /// for the pause. `next_start` is the start of that next attempt.
+    fn assert_read_ran_during_the_pause(read_at: Instant, next_start: Instant) {
+        let margin = next_start.saturating_duration_since(read_at);
+        assert!(
+            margin >= Duration::from_millis(10),
+            "the read finished {margin:?} before the next attempt; a writer that keeps its \
+             lock across the pause lets it run only just before that attempt"
+        );
+    }
+
+    /// RED-3: the in-memory store's fenced lifecycle CAS (the first fence
+    /// call of a registration) meets mob.db held. It retries until the holder
+    /// releases and registers; a plain read of the same store issued during
+    /// a 40 ms pause runs in that pause, and a ticker on this one-thread
+    /// runtime keeps ticking.
+    #[tokio::test]
+    async fn an_in_memory_lifecycle_cas_waits_out_a_held_identity_fence_with_its_lock_released() {
+        // The pause after the fourth Backoff is 40 ms (5, 10, 20, 40).
+        const READ_AFTER_CALLS: usize = 4;
+        let adopted = adopted_identity().await;
+        let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent(
+            store.clone(),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .unwrap();
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 1);
+        let (ticks, ticker) = ticker();
+        let reader = tokio::spawn({
+            let store = store.clone();
+            let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+            let mut returned = fence.returned.subscribe();
+            async move {
+                returned
+                    .wait_for(|returned| *returned >= READ_AFTER_CALLS)
+                    .await
+                    .unwrap();
+                meerkat_runtime::RuntimeStore::load_machine_lifecycle_record(
+                    store.as_ref(),
+                    &runtime_id,
+                )
+                .await
+                .unwrap();
+                Instant::now()
+            }
+        });
+
+        let ticks_before = ticks.load(Ordering::SeqCst);
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
+        ticker.abort();
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the fenced registration rides out the held lock: {outcome:?}"
+        );
+        assert!(
+            ticked > 5,
+            "the runtime's only thread kept running other tasks: {ticked} ticks"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(
+            operations.len(),
+            2,
+            "the CAS and the publication each ran their operation once"
+        );
+        assert!(
+            operations[0] >= released_at,
+            "the CAS wrote once the holder released mob.db"
+        );
+        let starts = fence.call_starts();
+        assert!(
+            starts.len() > READ_AFTER_CALLS + 1,
+            "the CAS retried the contended fence: {} calls",
+            starts.len()
+        );
+        let read_at = reader.await.unwrap();
+        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// RED-4: the live-map publication (the second fence call) meets mob.db
+    /// held. It retries until the holder releases and publishes; a read of
+    /// the machine's session map issued during a 40 ms pause runs in that
+    /// pause and sees nothing published yet.
+    #[tokio::test]
+    async fn a_registration_publication_waits_out_a_held_identity_fence_with_the_map_released() {
+        // Call 1 is the CAS; the publication's attempts are calls 2, 3, ...,
+        // and the pause after its fourth Backoff (call 5) is 40 ms.
+        const READ_AFTER_CALLS: usize = 5;
+        let adopted = adopted_identity().await;
+        let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let machine = Arc::new(
+            MeerkatMachine::persistent(
+                store.clone(),
+                Arc::new(meerkat_store::MemoryBlobStore::new()),
+            )
+            .unwrap(),
+        );
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 2);
+        let (ticks, ticker) = ticker();
+        let reader = tokio::spawn({
+            let machine = Arc::clone(&machine);
+            let session_id = session_id.clone();
+            let mut returned = fence.returned.subscribe();
+            async move {
+                returned
+                    .wait_for(|returned| *returned >= READ_AFTER_CALLS)
+                    .await
+                    .unwrap();
+                let published = machine.contains_session(&session_id).await;
+                (published, Instant::now())
+            }
+        });
+
+        let ticks_before = ticks.load(Ordering::SeqCst);
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        let ticked = ticks.load(Ordering::SeqCst) - ticks_before;
+        ticker.abort();
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the publication rides out the held lock: {outcome:?}"
+        );
+        assert!(
+            ticked > 5,
+            "the runtime's only thread kept running other tasks: {ticked} ticks"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(operations.len(), 2);
+        assert!(
+            operations[1] >= released_at,
+            "the publication ran once the holder released mob.db"
+        );
+        let starts = fence.call_starts();
+        assert!(
+            starts.len() > READ_AFTER_CALLS + 1,
+            "the publication retried the contended fence: {} calls",
+            starts.len()
+        );
+        let (published_during_wait, read_at) = reader.await.unwrap();
+        assert!(
+            !published_during_wait,
+            "nothing is published before the fence admits the publication"
+        );
+        assert_read_ran_during_the_pause(read_at, starts[READ_AFTER_CALLS]);
+        assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// A fence call through the bounded-wait entry on a blocking thread, as
+    /// the SQLite runtime store makes it: the outcome, whether the operation
+    /// ran, and how long the call took.
+    async fn blocking_fence_call(
+        fence: Arc<dyn RuntimeStoreWriteFence>,
+    ) -> (
+        Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError>,
+        bool,
+        Duration,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let ran = AtomicBool::new(false);
+            let started = Instant::now();
+            let outcome = fence.execute_if_current_blocking(Box::new(|| {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            (outcome, ran.into_inner(), started.elapsed())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The cold lifecycle observation of `session_id` in a fresh store.
+    async fn cold_observation(
+        session_id: &meerkat_core::SessionId,
+    ) -> RuntimeSessionLifecycleObservation {
+        MeerkatMachine::persistent(
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .unwrap()
+        .observe_cold_runtime_lifecycle(session_id)
+        .await
+        .unwrap()
+    }
+
+    /// RED-1: the SQLite runtime store's fenced lifecycle CAS runs in a
+    /// blocking task and takes the bounded-wait entry, so it waits inside its
+    /// one fence call for mob.db held by a status commit, and writes once the
+    /// holder releases.
+    #[tokio::test]
+    async fn a_sqlite_runtime_store_cas_waits_inside_the_fence_for_a_held_mob_database() {
+        let adopted = adopted_identity().await;
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new(runtime_dir.path().join("runtime.sqlite3"))
+                .unwrap(),
+        );
+        let machine =
+            MeerkatMachine::persistent(store, Arc::new(meerkat_store::MemoryBlobStore::new()))
+                .unwrap();
+        let session_id = adopted.session.session_id.clone();
+        let observed = machine
+            .observe_cold_runtime_lifecycle(&session_id)
+            .await
+            .unwrap();
+        let fence = HoldMobDbAt::new(adopted.runtime_fence(&observed), &adopted.path, 1);
+
+        let outcome = machine
+            .register_session_if_runtime_lifecycle_current(observed, fence.clone())
+            .await;
+        assert!(
+            matches!(outcome, RuntimeSessionRegistrationOutcome::Applied { .. }),
+            "the fenced registration rides out the held lock: {outcome:?}"
+        );
+        assert_eq!(
+            fence.call_starts().len(),
+            2,
+            "the CAS waited inside its one fence call, then the publication ran"
+        );
+        let released_at = fence.released_at();
+        let operations = fence.operations();
+        assert_eq!(operations.len(), 2);
+        assert!(
+            operations[0] >= released_at,
+            "the CAS wrote once the holder released mob.db"
+        );
+        assert!(machine.contains_session(&session_id).await);
+    }
+
+    /// C1: with nothing holding mob.db, the bounded-wait entry admits at once.
+    #[tokio::test]
+    async fn an_uncontended_bounded_fence_admits_without_waiting() {
+        let adopted = adopted_identity().await;
+        let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
+        let (outcome, ran, took) = blocking_fence_call(fence).await;
+        assert_eq!(outcome.unwrap(), RuntimeStoreWriteFenceOutcome::Applied);
+        assert!(ran);
+        assert!(
+            took < Duration::from_millis(500),
+            "no wait without contention: {took:?}"
+        );
+    }
+
+    /// C2: with mob.db held well past the documented 2 s bound, the
+    /// bounded-wait entry answers the contended Backoff once its wait is
+    /// spent, without running the operation, and waits about the bound. The
+    /// 3.5 s hold is fixed: a longer bound, or no bound, admits the operation
+    /// once the holder releases and fails the Backoff check.
+    #[tokio::test]
+    async fn a_bounded_fence_answers_backoff_once_its_wait_is_spent() {
+        let bound = IDENTITY_RUNTIME_WRITE_FENCE_WAIT;
+        let adopted = adopted_identity().await;
+        let fence = adopted.runtime_fence(&cold_observation(&adopted.session.session_id).await);
+        let holder = hold_mob_db(&adopted.path, Duration::from_millis(3500));
+        let (outcome, ran, took) = blocking_fence_call(fence).await;
+        holder.join().unwrap();
+        assert_eq!(
+            outcome.unwrap(),
+            RuntimeStoreWriteFenceOutcome::Backoff {
+                reason: "identity runtime write fence authority guard is contended".to_string(),
+            }
+        );
+        assert!(!ran, "a refused fence runs nothing");
+        assert!(
+            took >= bound && took < bound + Duration::from_secs(1),
+            "the fence waited the bound, no more: {took:?}"
+        );
+    }
+
+    /// The basis of [`IDENTITY_RUNTIME_WRITE_FENCE_WAIT`]: how long a
+    /// convergence-status write takes on this host, from its call to its
+    /// commit (the write lock is held from its BEGIN IMMEDIATE through the
+    /// commit's fsync). Prints numbers, asserts nothing about them:
+    ///
+    /// ```text
+    /// ./scripts/repo-cargo test -p meerkat-mob --lib -- --ignored --nocapture \
+    ///     bench_convergence_status_write
+    /// ```
+    #[tokio::test]
+    #[ignore = "measurement: prints convergence-status write latencies"]
+    async fn bench_convergence_status_write() {
+        const WRITES: usize = 200;
+        let adopted = adopted_identity().await;
+        let statuses = SqliteMobStores::open(&adopted.path)
+            .unwrap()
+            .identity_status_store();
+        let mut took = Vec::with_capacity(WRITES);
+        for write in 0..WRITES {
+            let status = crate::identity::IdentityConvergenceStatus {
+                identity: adopted.identity.clone(),
+                intent_revision: Some(1),
+                active_intent_revision: Some(1),
+                lease_epoch: Some(adopted.lease.epoch),
+                decision: Some(crate::identity::IdentityReconcileDecision::Backoff),
+                observed_at_ms: write as u64,
+                detail: Some("convergence-status write measurement".to_string()),
+            };
+            let started = Instant::now();
+            statuses
+                .replace_identity_convergence_status(&adopted.mob_id, &status)
+                .await
+                .unwrap();
+            took.push(started.elapsed());
+        }
+        took.sort();
+        println!(
+            "convergence-status writes: p50 {:?}, p99 {:?}, max {:?} over {WRITES}",
+            took[WRITES / 2],
+            took[WRITES * 99 / 100],
+            took[WRITES - 1]
+        );
     }
 }

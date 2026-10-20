@@ -50,6 +50,10 @@ use webrtc_media::Sample;
 use crate::host::{
     LiveAdapterHost, LiveAdapterHostError, LiveChannelId, ObservationOutcome, ObservationRouting,
 };
+use crate::projection_queue::{
+    LiveProjectionQueue, ProjectionFailureFrame, ProjectionReport, ProjectionRow,
+    observation_writes_session,
+};
 use crate::transport::{
     LiveChannelCloseFeedback, LiveChannelStatusFeedback, LiveTokenString, LiveWsState,
     live_ws_router, should_publish_observation,
@@ -120,6 +124,11 @@ struct OutgoingAudioControl {
     /// as a typed fact — this counter is the running total feeding that
     /// signal, not a transport-local truth with no live reader.
     dropped_packets: AtomicU64,
+    /// A local barge-in discarded queued output audio and its interrupt
+    /// signal is owed: the observation pump queues it on the channel's
+    /// projection queue, behind the rows observed before it.
+    barge_in_signal_owed: AtomicBool,
+    barge_in_signal_requested: Notify,
 }
 
 impl OutgoingAudioControl {
@@ -157,6 +166,24 @@ impl OutgoingAudioControl {
     #[cfg(test)]
     fn dropped_packets(&self) -> u64 {
         self.dropped_packets.load(Ordering::Relaxed)
+    }
+
+    /// Owe the session one barge-in interrupt signal (coalesced with any
+    /// signal still owed).
+    fn request_barge_in_signal(&self) {
+        self.barge_in_signal_owed.store(true, Ordering::Release);
+        self.barge_in_signal_requested.notify_one();
+    }
+
+    /// Resolves once a barge-in interrupt signal is owed, taking it.
+    /// Cancel-safe: the signal is taken only by the poll that returns.
+    async fn take_owed_barge_in_signal(&self) {
+        loop {
+            if self.barge_in_signal_owed.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            self.barge_in_signal_requested.notified().await;
+        }
     }
 }
 
@@ -1067,6 +1094,7 @@ pub trait LiveWebrtcAnswerTransport: Send + Sync {
 #[derive(Default)]
 struct AnswerConstructionTestState {
     last_peer: StdMutex<Option<Arc<RTCPeerConnection>>>,
+    last_outgoing_audio_control: StdMutex<Option<Arc<OutgoingAudioControl>>>,
     last_data_channel: StdMutex<Option<Weak<RTCDataChannel>>>,
     capture_peer: AtomicBool,
     capture_data_channel: AtomicBool,
@@ -1269,6 +1297,15 @@ impl LiveWebrtcState {
             return Err(construction.close_after(error).await);
         }
         let outgoing_audio_control = Arc::new(OutgoingAudioControl::default());
+        #[cfg(test)]
+        {
+            *self
+                .construction_test_state
+                .last_outgoing_audio_control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::clone(&outgoing_audio_control));
+        }
         let (outgoing_audio_tx, outgoing_audio_rx) =
             mpsc::channel::<OutgoingAudioPacket>(WEBRTC_AUDIO_QUEUE_CAPACITY);
         let peer_tasks = spawn_outgoing_audio_track_pump(
@@ -2155,30 +2192,18 @@ fn install_incoming_audio_handler(
                     continue;
                 }
                 if outgoing_audio_control.queued_packets() > 0 && pcm24k_le_has_speech(&pcm_24k) {
-                    // D223: lower the transport-local barge-in into the
-                    // canonical interrupt seam (the same `signal_turn_interrupt`
-                    // path adapter-observed barge-ins use) before discarding
-                    // queued output audio. If the typed seam rejects the
-                    // signal, there is no compensation path for already-lost
-                    // output, so fail closed through generated close feedback.
-                    let generation = match signal_barge_in_then_discard_output_audio(
-                        cleanup_context.host.as_ref(),
-                        &cleanup_context.channel_id,
-                        outgoing_audio_control.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(generation) => generation,
-                        Err(err) => {
-                            tracing::warn!(
-                                channel = %cleanup_context.channel_id,
-                                error = %err,
-                                "failed to lower WebRTC barge-in into the interrupt seam; closing before discarding output audio"
-                            );
-                            reject_failed_audio_input_handoff(&cleanup_context);
-                            break;
-                        }
-                    };
+                    // Stop the assistant's voice at once, then owe the
+                    // session the interrupt: the observation pump queues the
+                    // signal (the same `signal_turn_interrupt` seam
+                    // adapter-observed barge-ins use) behind the rows observed
+                    // before it, so this input path never waits for the
+                    // session's turn boundary. A rejected signal closes the
+                    // channel with a typed error frame (it replaces D223's
+                    // signal-before-discard: the interrupt can wait for a
+                    // whole member turn, while queued output can hold tens of
+                    // seconds of speech).
+                    let generation = outgoing_audio_control.discard_queued();
+                    outgoing_audio_control.request_barge_in_signal();
                     tracing::debug!(
                         channel = %cleanup_context.channel_id,
                         generation,
@@ -2221,15 +2246,6 @@ fn install_incoming_audio_handler(
     }));
 }
 
-async fn signal_barge_in_then_discard_output_audio(
-    host: &LiveAdapterHost,
-    channel_id: &LiveChannelId,
-    outgoing_audio_control: &OutgoingAudioControl,
-) -> Result<u64, LiveAdapterHostError> {
-    host.signal_transport_barge_in(channel_id).await?;
-    Ok(outgoing_audio_control.discard_queued())
-}
-
 async fn pump_observations_to_data_channel(
     context: DataChannelPumpContext,
     data_channel: Arc<RTCDataChannel>,
@@ -2269,11 +2285,45 @@ async fn pump_observations_to_data_channel(
         }
     };
     let mut close_feedback_recorded = false;
+    // The observations that write the session are applied by this channel's
+    // projection task, in arrival order, so a row waiting for the session's
+    // turn boundary (a running member turn) never stops this loop from
+    // forwarding the assistant's audio and events. The task holds only the
+    // host handle and its queue, never this peer's resources.
+    let mut projection = LiveProjectionQueue::spawn(Arc::clone(&host), channel_id.clone());
+    // Pinned across iterations: the report and barge-in arms must not cancel
+    // an observation read in flight.
+    let mut observation_fut = Box::pin(host.next_observation_raw(&channel_id));
     loop {
-        let observation = match tokio::select! {
+        let observation = tokio::select! {
             () = wait_for_peer_task_shutdown(&mut shutdown_rx) => return,
-            observation = host.next_observation_raw(&channel_id) => observation,
-        } {
+            report = projection.next_report() => {
+                if publish_projection_report(&data_channel, &channel_id, &mut projection, report).await {
+                    continue;
+                }
+                break;
+            }
+            () = outgoing_audio_control.take_owed_barge_in_signal() => {
+                // Its output audio was discarded when the barge-in was heard.
+                if let Err(error) = projection.enqueue(ProjectionRow::TransportBargeIn) {
+                    close_feedback_recorded = refuse_projection_backlog(
+                        host.as_ref(),
+                        close_feedback.as_ref(),
+                        &data_channel,
+                        &channel_id,
+                        &error,
+                    )
+                    .await;
+                    break;
+                }
+                continue;
+            }
+            observation = &mut observation_fut => {
+                observation_fut = Box::pin(host.next_observation_raw(&channel_id));
+                observation
+            }
+        };
+        let observation = match observation {
             Ok(Some(obs)) => obs,
             Ok(None) => break,
             Err(err) => {
@@ -2289,6 +2339,11 @@ async fn pump_observations_to_data_channel(
         let close_observation = observation_requires_generated_close(&observation);
         let publish_observation = should_publish_observation(&observation);
         if close_observation {
+            // The rows observed before a terminal observation land before
+            // its close, as when this loop applied each row itself.
+            if !drain_projection_before_close(&data_channel, &channel_id, &mut projection).await {
+                break;
+            }
             if !close_channel_with_generated_feedback(
                 host.as_ref(),
                 close_feedback.as_ref(),
@@ -2311,6 +2366,52 @@ async fn pump_observations_to_data_channel(
             break;
         }
 
+        // A session-writing row is queued for the projection task, which
+        // applies it in arrival order, and forwarded at once; if the session
+        // refuses it, the channel closes with an error frame naming the row
+        // and the later rows it did not apply. It is queued before it is
+        // forwarded: queueing never waits, and a row observed just before the
+        // peer goes away must still commit, as when this loop applied it
+        // before sending. An interruption or truncation also stops the
+        // assistant's queued voice at once. Every other observation writes no
+        // row and is applied here first, so a terminal observation is still
+        // visible only after its generated close, and a status may be
+        // recorded before rows queued ahead of it (a channel fact, not a
+        // transcript row).
+        if !close_observation && observation_writes_session(&observation) {
+            let interrupts_output = observation_interrupts_output(&observation);
+            let public_json = publish_observation.then(|| observation_json(&observation));
+            let queued = projection.enqueue(ProjectionRow::Observation(Box::new(observation)));
+            let forwarded = match public_json {
+                None => Ok(()),
+                Some(Ok(json)) => send_observation_json(&data_channel, json).await,
+                Some(Err(err)) => Err(err),
+            };
+            if let Err(err) = forwarded {
+                tracing::warn!(channel = %channel_id, error = %err, "failed to send WebRTC data-channel observation");
+                break;
+            }
+            if interrupts_output {
+                let generation = outgoing_audio_control.discard_queued();
+                tracing::debug!(
+                    channel = %channel_id,
+                    generation,
+                    "discarding queued WebRTC output audio after live interruption"
+                );
+            }
+            if let Err(error) = queued {
+                close_feedback_recorded = refuse_projection_backlog(
+                    host.as_ref(),
+                    close_feedback.as_ref(),
+                    &data_channel,
+                    &channel_id,
+                    &error,
+                )
+                .await;
+                break;
+            }
+            continue;
+        }
         let outcome = match host.apply_observation(&channel_id, &observation).await {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -2319,11 +2420,11 @@ async fn pump_observations_to_data_channel(
             }
         };
 
-        // Forward only after `apply_observation` has completed. In
-        // particular, an image's internal byte-bearing transcript event is
-        // filtered and its following `user_content_committed` receipt becomes
-        // visible only after canonical persistence. WebRTC clients must wait
-        // for that receipt before sending RTP audio that relies on the image.
+        // An image's internal byte-bearing transcript event is a queued row
+        // and is never published; its `user_content_committed` receipt is
+        // published from the projection task's report, only after canonical
+        // persistence. WebRTC clients must wait for that receipt before
+        // sending RTP audio that relies on the image.
         if publish_observation
             && let Err(err) = forward_observation_json(&data_channel, &observation).await
         {
@@ -2432,11 +2533,164 @@ async fn pump_observations_to_data_channel(
         }
     }
 
+    // The close does not wait for a running member turn: rows still queued
+    // land after it, in order, as the projection task outlives this loop.
+    drop(projection);
     if close_feedback_recorded {
         start_physical_cleanup(&cleanup_context);
     } else {
         spawn_peer_disconnect_cleanup(cleanup_context);
     }
+}
+
+/// Whether an observation stops the assistant's queued output: an
+/// interruption, a truncation of what was played, or a response that ended
+/// without completing (#1883), which commits nothing.
+fn observation_interrupts_output(observation: &LiveAdapterObservation) -> bool {
+    match observation {
+        LiveAdapterObservation::WithContextObservation { observation, .. } => {
+            observation_interrupts_output(observation)
+        }
+        LiveAdapterObservation::TurnInterrupted { .. }
+        | LiveAdapterObservation::AssistantTranscriptTruncated { .. }
+        | LiveAdapterObservation::TurnFailed { .. } => true,
+        _ => false,
+    }
+}
+
+/// Act on one report of the channel's projection task. `false` when the
+/// pump must end and close the channel.
+async fn publish_projection_report(
+    data_channel: &RTCDataChannel,
+    channel_id: &LiveChannelId,
+    projection: &mut LiveProjectionQueue,
+    report: Option<ProjectionReport>,
+) -> bool {
+    match report {
+        // Visible only after canonical persistence: the client's barrier for
+        // RTP audio that depends on the image.
+        Some(ProjectionReport::UserContentCommitted(receipt)) => {
+            match forward_observation_json(data_channel, &receipt).await {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(channel = %channel_id, error = %err, "failed to send durable WebRTC user-content receipt");
+                    false
+                }
+            }
+        }
+        Some(ProjectionReport::Terminal(code)) => {
+            tracing::info!(
+                channel = %channel_id,
+                ?code,
+                "WebRTC live channel projection reached a terminal outcome"
+            );
+            false
+        }
+        Some(ProjectionReport::Failed {
+            error,
+            row,
+            item_id,
+        }) => {
+            // Nothing more is queued from here on, so the count is exact.
+            projection.seal();
+            let frame = ProjectionFailureFrame::failed_row(
+                &error,
+                row,
+                item_id,
+                projection.unapplied_rows(),
+            );
+            tracing::warn!(
+                channel = %channel_id,
+                error = %error,
+                "live projection failed after its frames were published; closing channel"
+            );
+            send_final_error_frame(data_channel, channel_id, frame.to_json()).await;
+            false
+        }
+        None => {
+            tracing::warn!(channel = %channel_id, "live projection task ended; closing channel");
+            false
+        }
+    }
+}
+
+/// Seal the channel's projection queue and wait until every queued row is
+/// applied, publishing the receipts that arrive meanwhile. `false` when a row
+/// failed or terminalized the channel (the caller closes as for that report).
+async fn drain_projection_before_close(
+    data_channel: &RTCDataChannel,
+    channel_id: &LiveChannelId,
+    projection: &mut LiveProjectionQueue,
+) -> bool {
+    projection.seal();
+    loop {
+        match projection.next_report().await {
+            None => return true,
+            report @ Some(ProjectionReport::UserContentCommitted(_)) => {
+                // A receipt the client cannot be sent does not stop the
+                // close: the channel ends either way.
+                let _ =
+                    publish_projection_report(data_channel, channel_id, projection, report).await;
+            }
+            report => {
+                publish_projection_report(data_channel, channel_id, projection, report).await;
+                return false;
+            }
+        }
+    }
+}
+
+/// How long a closing pump waits for its last error frame to leave the data
+/// channel before the peer is torn down.
+const FINAL_ERROR_FRAME_FLUSH_BOUND: Duration = Duration::from_secs(1);
+
+/// Send the error frame a closing pump owes its client, and give it a bounded
+/// moment to leave the data channel: the cleanup that follows closes the peer,
+/// which drops data still buffered.
+async fn send_final_error_frame(
+    data_channel: &RTCDataChannel,
+    channel_id: &LiveChannelId,
+    json: String,
+) {
+    if let Err(err) = data_channel.send_text(json).await {
+        tracing::warn!(channel = %channel_id, error = %err, "failed to send WebRTC projection error frame");
+        return;
+    }
+    let flushed = tokio::time::timeout(FINAL_ERROR_FRAME_FLUSH_BOUND, async {
+        while data_channel.buffered_amount().await > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if flushed.is_err() {
+        tracing::warn!(channel = %channel_id, "WebRTC projection error frame was still buffered at close");
+    }
+}
+
+/// The projection queue reached its bound: tell the client with a typed
+/// error frame and close the channel as an error (every row queued so far is
+/// still applied). Returns whether the generated close was recorded.
+async fn refuse_projection_backlog(
+    host: &LiveAdapterHost,
+    close_feedback: &dyn LiveChannelCloseFeedback,
+    data_channel: &RTCDataChannel,
+    channel_id: &LiveChannelId,
+    error: &LiveAdapterHostError,
+) -> bool {
+    tracing::warn!(
+        channel = %channel_id,
+        error = %error,
+        "live projection queue refused a row; closing channel"
+    );
+    let frame = ProjectionFailureFrame::backlog_full(error);
+    send_final_error_frame(data_channel, channel_id, frame.to_json()).await;
+    close_channel_with_generated_feedback(
+        host,
+        close_feedback,
+        channel_id,
+        meerkat_core::LiveChannelCloseReason::Error,
+    )
+    .await
 }
 
 async fn wait_for_peer_task_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
@@ -2786,8 +3040,19 @@ async fn forward_observation_json(
     data_channel: &RTCDataChannel,
     observation: &LiveAdapterObservation,
 ) -> Result<(), LiveWebrtcError> {
+    send_observation_json(data_channel, observation_json(observation)?).await
+}
+
+/// One public observation as its wire JSON.
+fn observation_json(observation: &LiveAdapterObservation) -> Result<String, LiveWebrtcError> {
     let wire = WireLiveAdapterObservation::from(observation.clone());
-    let json = serde_json::to_string(&wire)?;
+    Ok(serde_json::to_string(&wire)?)
+}
+
+async fn send_observation_json(
+    data_channel: &RTCDataChannel,
+    json: String,
+) -> Result<(), LiveWebrtcError> {
     data_channel
         .send_text(json)
         .await
@@ -3387,6 +3652,33 @@ mod tests {
         assert_eq!(control.queued_packets(), 0);
     }
 
+    /// A failed response queued on the projection task never returns its
+    /// apply outcome (`TurnFailureProjected`) to the frame loop, so the frame
+    /// loop must stop the response's queued output audio itself, as for an
+    /// interruption: queued means it interrupts output.
+    #[test]
+    fn a_queued_failed_response_still_discards_the_queued_output_audio() {
+        let failed = LiveAdapterObservation::TurnFailed {
+            response_id: Some("resp_failed".to_string()),
+            failure: meerkat_core::live_adapter::LiveResponseFailure {
+                status: meerkat_core::live_adapter::LiveResponseFailureStatus::Failed,
+                reason: None,
+                code: Some("server_error".to_string()),
+                message: Some("provider failed".to_string()),
+            },
+            accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                    meerkat_core::Provider::Other,
+                    "webrtc-test",
+                ),
+            },
+        };
+        assert!(
+            !observation_writes_session(&failed) || observation_interrupts_output(&failed),
+            "a queued failure must discard the queued output audio on the frame loop"
+        );
+    }
+
     #[test]
     fn a_failed_response_discards_the_output_audio_queued_for_the_peer() {
         // #1883: a response that ended without completing commits nothing,
@@ -3441,34 +3733,6 @@ mod tests {
         // record — the two facts are independent.
         let _ = control.discard_queued();
         assert_eq!(control.dropped_packets(), 2);
-    }
-
-    #[tokio::test]
-    async fn barge_in_signal_rejection_keeps_queued_output_audio() {
-        // The interrupt/truncate authority must be accepted before WebRTC
-        // discards queued output audio. If the interrupt signal is rejected,
-        // the queue remains intact so the transport has not silently lost
-        // output before command authority.
-        let host = LiveAdapterHost::new(Arc::new(FailingLiveProjectionSink));
-        let channel_id = host
-            .open_channel_with_generated_test_machine_authority(SessionId::new())
-            .await
-            .unwrap();
-        let control = OutgoingAudioControl::default();
-        control.note_queued();
-        control.note_queued();
-
-        let result = signal_barge_in_then_discard_output_audio(&host, &channel_id, &control).await;
-
-        assert!(
-            matches!(result, Err(LiveAdapterHostError::ProjectionError(_))),
-            "barge-in rejection must surface instead of discarding output audio"
-        );
-        assert_eq!(
-            control.queued_packets(),
-            2,
-            "queued output audio must not be discarded before accepted interrupt authority"
-        );
     }
 
     #[tokio::test]
@@ -4242,6 +4506,244 @@ mod tests {
         );
 
         replacement_peer.close().await.unwrap();
+    }
+
+    /// The failure this fixes, over a real peer: a transcript row waiting for
+    /// the session's turn boundary (a running member turn) stopped the
+    /// channel's voice until the turn ended. While the member turn holds the
+    /// boundary, the assistant's audio and events keep reaching the browser,
+    /// an interruption (provider `TurnInterrupted`, or local speech over
+    /// queued output) stops the queued voice at once and the browser's audio
+    /// keeps reaching the provider; the rows land in arrival order after the
+    /// turn. A rejected interrupt row then closes the channel with a typed
+    /// error frame naming it (it replaces D223's signal-before-discard).
+    #[tokio::test]
+    async fn webrtc_voice_flows_and_interruptions_stop_it_at_once_while_rows_wait_for_a_member_turn()
+     {
+        use crate::projection_queue::test_support::{
+            GatedRecordingSink, turn_interrupted, user_final,
+        };
+
+        let sink = Arc::new(GatedRecordingSink::default());
+        let host = Arc::new(LiveAdapterHost::new(
+            Arc::clone(&sink) as Arc<dyn LiveProjectionSink>
+        ));
+        let channel_id = host
+            .open_channel_with_generated_test_machine_authority(SessionId::new())
+            .await
+            .unwrap();
+        let (adapter, mut command_rx, observation_tx) = RecordingAdapter::new();
+        host.attach_adapter(&channel_id, adapter).await.unwrap();
+        host.commit_status_with_generated_test_machine_authority(
+            &channel_id,
+            LiveAdapterStatus::Ready,
+        )
+        .await
+        .unwrap();
+        let state = LiveWebrtcState::new_for_test_with_generated_close_feedback(Arc::clone(&host));
+        let browser_peer = new_browser_peer().await;
+
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel::<String>();
+        let data_channel = browser_peer
+            .create_data_channel("meerkat.live", None)
+            .await
+            .unwrap();
+        data_channel.on_message(Box::new(move |message: DataChannelMessage| {
+            let data_tx = data_tx.clone();
+            Box::pin(async move {
+                if message.is_string
+                    && let Ok(text) = String::from_utf8(message.data.to_vec())
+                {
+                    let _ = data_tx.send(text);
+                }
+            })
+        }));
+        let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
+        data_channel.on_open(Box::new(move || {
+            let open_tx = open_tx.clone();
+            Box::pin(async move {
+                let _ = open_tx.send(()).await;
+            })
+        }));
+        let remote_audio_packets = Arc::new(AtomicUsize::new(0));
+        let remote_audio_counter = Arc::clone(&remote_audio_packets);
+        browser_peer.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
+            let remote_audio_counter = Arc::clone(&remote_audio_counter);
+            tokio::spawn(async move {
+                while track.read_rtp().await.is_ok() {
+                    remote_audio_counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Box::pin(async {})
+        }));
+        let outbound_audio: Arc<dyn TrackLocal + Send + Sync> =
+            Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: MIME_TYPE_OPUS.to_owned(),
+                    clock_rate: BROWSER_OPUS_SAMPLE_RATE,
+                    channels: 1,
+                    ..Default::default()
+                },
+                "audio".to_owned(),
+                "browser-test".to_owned(),
+            ));
+        browser_peer
+            .add_track(Arc::clone(&outbound_audio))
+            .await
+            .unwrap();
+        connect_browser_peer(&browser_peer, &state, &channel_id).await;
+        tokio::time::timeout(Duration::from_secs(5), open_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_observation_pump_to_start(&state).await;
+        let output = state
+            .construction_test_state
+            .last_outgoing_audio_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the answer registers its output audio control");
+
+        async fn expect_frame(
+            data_rx: &mut mpsc::UnboundedReceiver<String>,
+            needle: &str,
+        ) -> String {
+            let mut seen = Vec::new();
+            let found = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(text) = data_rx.recv().await {
+                    if text.contains(needle) {
+                        return Some(text);
+                    }
+                    seen.push(text);
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            found.unwrap_or_else(|| panic!("no frame containing {needle}; saw {seen:?}"))
+        }
+        async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
+        let audio_chunk = || LiveAdapterObservation::AssistantAudioChunk {
+            data: make_provider_pcm_24k(),
+            sample_rate_hz: PROVIDER_PCM_SAMPLE_RATE,
+            channels: MONO_CHANNELS,
+            response_id: Some("resp_1".into()),
+            item_id: Some("item_assistant".into()),
+            content_index: Some(0),
+        };
+
+        let member_turn = Arc::clone(&sink.gate).lock_owned().await;
+        observation_tx
+            .send(user_final("item_user", "hello"))
+            .await
+            .unwrap();
+        expect_frame(&mut data_rx, "user_transcript_final").await;
+        // Two seconds of speech: far more than the pacing pump plays before
+        // the interruption below.
+        for _ in 0..100 {
+            observation_tx.send(audio_chunk()).await.unwrap();
+        }
+        wait_until("the assistant's voice to reach the browser", || {
+            remote_audio_packets.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        wait_until("output audio to queue", || output.queued_packets() > 20).await;
+
+        let generation = output.generation();
+        observation_tx
+            .send(turn_interrupted("resp_1"))
+            .await
+            .unwrap();
+        expect_frame(&mut data_rx, "turn_interrupted").await;
+        wait_until("the interruption to discard queued output", || {
+            output.queued_packets() == 0 && output.generation() > generation
+        })
+        .await;
+
+        // Local speech over queued output: discarded at once, and the
+        // browser's audio still reaches the provider.
+        for _ in 0..50 {
+            observation_tx.send(audio_chunk()).await.unwrap();
+        }
+        wait_until("output audio to queue again", || {
+            output.queued_packets() > 10
+        })
+        .await;
+        let generation = output.generation();
+        let audio_track = outbound_audio
+            .as_any()
+            .downcast_ref::<TrackLocalStaticSample>()
+            .unwrap();
+        for _ in 0..5 {
+            audio_track
+                .write_sample(&Sample {
+                    data: Bytes::from(make_opus_packet()),
+                    duration: Duration::from_millis(20),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        wait_until("the local barge-in to discard queued output", || {
+            output.generation() > generation
+        })
+        .await;
+        let reached_provider = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match command_rx.recv().await {
+                    Some(LiveAdapterCommand::SendInput {
+                        chunk: LiveInputChunk::Audio { .. },
+                    }) => return true,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(
+            reached_provider,
+            "the browser's audio reaches the provider while a row waits"
+        );
+        assert!(
+            sink.applied().is_empty(),
+            "no row commits while the member turn holds the boundary"
+        );
+
+        // The queued interrupt rows land in order; the local barge-in's is
+        // refused, which closes the channel with a typed error frame.
+        sink.fail_row("transport_barge_in");
+        drop(member_turn);
+        let frame = expect_frame(&mut data_rx, "projection_error").await;
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["reason"], "projection_error");
+        assert_eq!(frame["row"], "transport_barge_in");
+        assert_eq!(frame["unapplied_rows"], 0);
+        assert_eq!(
+            sink.applied_rows(),
+            ["user_transcript_final", "turn_interrupted"],
+            "rows land in arrival order"
+        );
+        assert_eq!(sink.refused_rows(), ["transport_barge_in"]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.channel_status(&channel_id).await.ok() != Some(LiveAdapterStatus::Closed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refused interrupt closes the channel");
+        let _ = state.close_peer_checked(&channel_id).await;
+        browser_peer.close().await.unwrap();
     }
 
     #[tokio::test]

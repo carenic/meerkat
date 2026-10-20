@@ -42,7 +42,7 @@ mod inner {
         RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot,
         WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority,
         classify_machine_lifecycle_record, complete_compaction_projection_intent,
-        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence,
+        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence_blocking,
         head_canonical_activation_predecessor_matches, parsed_whole_blob_snapshot,
         prepare_input_state_batch_cas, prepare_machine_lifecycle_replacement,
         prepare_recovery_input_state_mutations, validate_input_state_batch_read_ids,
@@ -4796,6 +4796,360 @@ END";
         )
     }
 
+    /// The store's durable delivery generation read through a verified open
+    /// of its own (the fresh-open read path).
+    fn read_delivery_generation_fresh(path: &Path) -> Result<u64, RuntimeStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if !runtime_database_absent(path) {
+            delivery_generation_test_hooks::count_verified_open(path);
+        }
+        // A file that never used durable delivery reads zero.
+        let Some(conn) = open_runtime_delivery_read_connection(path)? else {
+            return Ok(0);
+        };
+        // A delivery file below version 3 (the counter's migration) not yet
+        // migrated by a write has no counter yet; its first delivery write
+        // migrates it. Decided on the version the open verified.
+        delivery_generation_at(&conn, Some(conn.version))
+    }
+
+    /// The generation row, on a connection whose delivery domain is at
+    /// `version` (`None`: no delivery domain): zero below version 3, the
+    /// counter's migration.
+    fn delivery_generation_at(
+        conn: &Connection,
+        version: Option<i64>,
+    ) -> Result<u64, RuntimeStoreError> {
+        if version.is_none_or(|version| version < 3) {
+            return Ok(0);
+        }
+        let generation: i64 = conn
+            .prepare_cached(
+                "SELECT generation FROM runtime_delivery_generation WHERE singleton = 1",
+            )
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        u64::try_from(generation).map_err(|_| {
+            RuntimeStoreError::ReadFailed(format!(
+                "runtime delivery generation {generation} is negative"
+            ))
+        })
+    }
+
+    /// Where a delivery owner reads its store's delivery generation from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeliveryGenerationReadPath {
+        /// One verified open, kept between reads under the presence lock.
+        Kept,
+        /// A verified open per read (`load_delivery_generation`).
+        Fresh,
+    }
+
+    /// The platform facts the read path is decided on.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ReaderPlatform {
+        Unix,
+        Windows,
+        /// Neither: no file identity (device and inode) to compare.
+        Other,
+    }
+
+    impl ReaderPlatform {
+        fn current() -> Self {
+            if cfg!(windows) {
+                Self::Windows
+            } else if cfg!(unix) {
+                Self::Unix
+            } else {
+                Self::Other
+            }
+        }
+    }
+
+    /// Windows keeps the fresh-open read path: no CI lane runs the kept reader
+    /// on Windows, so it would ship untested there. A platform without a file
+    /// identity keeps it too: a kept reader could not tell a file replaced at
+    /// its path from the one it opened.
+    fn delivery_generation_read_path(platform: ReaderPlatform) -> DeliveryGenerationReadPath {
+        match platform {
+            ReaderPlatform::Unix => DeliveryGenerationReadPath::Kept,
+            ReaderPlatform::Windows | ReaderPlatform::Other => DeliveryGenerationReadPath::Fresh,
+        }
+    }
+
+    /// A delivery owner's kept reader of the durable delivery generation:
+    /// one verified open, then one guarded snapshot read per tick.
+    ///
+    /// The connection stays open between reads under the database's presence
+    /// lock ([`meerkat_sqlite::KeptConnectionPresence`]), so maintenance waits
+    /// for it to close. Each read takes the shared fence guard first. Under
+    /// it, the read checks that the path still names the file the open
+    /// verified, then reads the schema cookie, the delivery domain's ledger
+    /// row and the generation in one snapshot. A refused guard closes the
+    /// connection and returns the refusal; a moved, replaced or missing file,
+    /// a changed schema or a changed ledger row closes it and opens again,
+    /// verified, in the same read.
+    struct KeptDeliveryGenerationReader {
+        path: PathBuf,
+        kept: Option<KeptDeliveryConnection>,
+    }
+
+    /// A kept delivery read connection. Fields drop in declaration order: the
+    /// connection closes, and finishes any checkpoint its close runs, before
+    /// the presence lock goes.
+    struct KeptDeliveryConnection {
+        conn: Connection,
+        _presence: meerkat_sqlite::KeptConnectionPresence,
+        /// The file the open verified.
+        identity: meerkat_sqlite::DatabaseFileIdentity,
+        /// `PRAGMA schema_version` when the open verified the domain.
+        schema_cookie: i64,
+        /// The delivery domain version the open verified (`None`: no
+        /// delivery domain yet).
+        version: Option<i64>,
+    }
+
+    impl KeptDeliveryGenerationReader {
+        fn new(path: PathBuf) -> Self {
+            Self { path, kept: None }
+        }
+
+        fn read_generation(&mut self) -> Result<u64, RuntimeStoreError> {
+            if let Some(kept) = self.kept.as_ref() {
+                #[cfg(any(test, feature = "test-support"))]
+                delivery_generation_test_hooks::before_kept_read(&self.path);
+                match kept.read(&self.path) {
+                    Ok(Some(generation)) => return Ok(generation),
+                    // No longer the database the open verified: open again.
+                    Ok(None) => self.kept = None,
+                    Err(error) => {
+                        self.kept = None;
+                        return Err(error);
+                    }
+                }
+            }
+            self.open_and_read()
+        }
+
+        /// A verified open, kept when the presence lock can be held; without
+        /// it the read takes the fresh-open path and keeps nothing.
+        fn open_and_read(&mut self) -> Result<u64, RuntimeStoreError> {
+            if runtime_database_absent(&self.path) {
+                meerkat_sqlite::OperationGuard::admit_missing_database(&self.path)
+                    .map_err(map_shared_sqlite_error)?;
+                return Ok(0);
+            }
+            // The guard first: while maintenance holds the fence the open is
+            // refused before it takes any presence.
+            let guard = meerkat_sqlite::OperationGuard::for_database(&self.path)
+                .map_err(map_shared_sqlite_error)?;
+            let Some(presence) = meerkat_sqlite::KeptConnectionPresence::acquire(&self.path) else {
+                drop(guard);
+                return read_delivery_generation_fresh(&self.path);
+            };
+            let conn = match meerkat_sqlite::open_with(
+                &self.path,
+                meerkat_sqlite::ConnectionProfile::Primary { create: false },
+                meerkat_sqlite::OpenOptions {
+                    schema_preflight: &[&RUNTIME_DELIVERY_DOMAIN],
+                    ..meerkat_sqlite::OpenOptions::default()
+                },
+            ) {
+                Ok(conn) => conn,
+                // Removed between the check and the open: still unprovisioned.
+                Err(_) if runtime_database_absent(&self.path) => return Ok(0),
+                Err(error) => return Err(map_shared_sqlite_error(error)),
+            };
+            #[cfg(any(test, feature = "test-support"))]
+            delivery_generation_test_hooks::count_verified_open(&self.path);
+            let identity = meerkat_sqlite::validate_database_file(&self.path)
+                .map_err(map_shared_sqlite_error)?;
+            // The cookie, the version the preflight verifies and the
+            // generation, in one snapshot: a schema or ledger change another
+            // process commits meanwhile is seen whole or not at all.
+            let snapshot = conn
+                .unchecked_transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let schema_cookie = schema_cookie(&snapshot)?;
+            let version =
+                meerkat_sqlite::preflight_domain_version(&snapshot, &RUNTIME_DELIVERY_DOMAIN)
+                    .map_err(map_shared_sqlite_error)?;
+            let generation = delivery_generation_at(&snapshot, version)?;
+            snapshot
+                .rollback()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            drop(guard);
+            // Kept only for a file with an identity to compare against later
+            // (the path still names a file: Kept runs where one is reported).
+            if let Some(identity) = identity {
+                self.kept = Some(KeptDeliveryConnection {
+                    conn,
+                    _presence: presence,
+                    identity,
+                    schema_cookie,
+                    version,
+                });
+            }
+            Ok(generation)
+        }
+    }
+
+    impl KeptDeliveryConnection {
+        /// One guarded read. `Ok(None)`: the connection no longer reads the
+        /// database at `path` as its open verified it.
+        fn read(&self, path: &Path) -> Result<Option<u64>, RuntimeStoreError> {
+            // A missing database is not the one the open verified. Checked
+            // before the guard, so the read plants no lock file next to it;
+            // the reopen admits it, as the fresh-open path does.
+            if runtime_database_absent(path) {
+                return Ok(None);
+            }
+            let _guard = meerkat_sqlite::OperationGuard::for_database(path)
+                .map_err(map_shared_sqlite_error)?;
+            // Under the guard no maintenance moves the file, so the identity
+            // compared here is the one this read reads.
+            if meerkat_sqlite::validate_database_file(path).map_err(map_shared_sqlite_error)?
+                != Some(self.identity)
+            {
+                return Ok(None);
+            }
+            let snapshot = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            // An unchanged cookie means no DDL since the open verified the
+            // schema; the ledger row is data, so it is read again.
+            if schema_cookie(&snapshot)? != self.schema_cookie
+                || meerkat_sqlite::domain_version(&snapshot, RUNTIME_DELIVERY_DOMAIN.name)
+                    .map_err(map_shared_sqlite_error)?
+                    != self.version
+            {
+                return Ok(None);
+            }
+            let generation = delivery_generation_at(&snapshot, self.version)?;
+            snapshot
+                .rollback()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            Ok(Some(generation))
+        }
+    }
+
+    fn schema_cookie(conn: &Connection) -> Result<i64, RuntimeStoreError> {
+        conn.prepare_cached("PRAGMA schema_version")
+            .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl crate::store::DeliveryGenerationReader for KeptDeliveryGenerationReader {
+        async fn read(&mut self) -> Result<u64, RuntimeStoreError> {
+            self.read_generation()
+        }
+
+        fn keeps_connection(&self) -> bool {
+            self.kept.is_some()
+        }
+
+        fn release(&mut self) {
+            self.kept = None;
+        }
+    }
+
+    /// Test hooks of the delivery-generation reads, keyed by database
+    /// path, so tests on their own databases do not meet.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub mod delivery_generation_test_hooks {
+        use std::collections::{HashMap, HashSet};
+        use std::path::{Path, PathBuf};
+        use std::sync::{Mutex, OnceLock, PoisonError};
+
+        type Hook = Box<dyn FnMut() + Send>;
+
+        #[derive(Default)]
+        struct Hooks {
+            fresh: HashSet<PathBuf>,
+            verified_opens: HashMap<PathBuf, u64>,
+            before_kept_read: HashMap<PathBuf, Hook>,
+        }
+
+        fn hooks() -> std::sync::MutexGuard<'static, Hooks> {
+            static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
+            HOOKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Readers made for the store at `path` from now on read through the
+        /// fresh-open path (the platform switch, forced in tests).
+        pub fn force_fresh_reads(path: &Path) {
+            hooks().fresh.insert(path.to_path_buf());
+        }
+
+        /// Verified opens of an existing database at `path` by
+        /// delivery-generation reads, kept or fresh (other delivery reads are
+        /// not counted).
+        pub fn verified_opens(path: &Path) -> u64 {
+            hooks().verified_opens.get(path).copied().unwrap_or(0)
+        }
+
+        /// Run `hook` at the start of each kept read of `path`, before its
+        /// guard (a verified open is not a kept read).
+        pub fn before_kept_read_guard(path: &Path, hook: impl FnMut() + Send + 'static) {
+            hooks()
+                .before_kept_read
+                .insert(path.to_path_buf(), Box::new(hook));
+        }
+
+        pub(super) fn forces_fresh(path: &Path) -> bool {
+            hooks().fresh.contains(path)
+        }
+
+        pub(super) fn count_verified_open(path: &Path) {
+            *hooks()
+                .verified_opens
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+        }
+
+        pub(super) fn before_kept_read(path: &Path) {
+            // Taken out while it runs, so the hook may use the store itself.
+            let hook = hooks().before_kept_read.remove(path);
+            if let Some(mut hook) = hook {
+                hook();
+                hooks()
+                    .before_kept_read
+                    .entry(path.to_path_buf())
+                    .or_insert(hook);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod delivery_generation_read_path_tests {
+        use super::{DeliveryGenerationReadPath, ReaderPlatform, delivery_generation_read_path};
+
+        /// Windows keeps the fresh-open read path: no CI lane runs the kept
+        /// reader there. A platform without a file identity keeps it too.
+        #[test]
+        fn only_unix_keeps_a_delivery_generation_reader() {
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Windows),
+                DeliveryGenerationReadPath::Fresh
+            );
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Other),
+                DeliveryGenerationReadPath::Fresh
+            );
+            assert_eq!(
+                delivery_generation_read_path(ReaderPlatform::Unix),
+                DeliveryGenerationReadPath::Kept
+            );
+        }
+    }
+
     /// Delivery-write connection: provisions the delivery domain on first
     /// use. This is the ONLY place the `runtime-delivery` ledger row is
     /// stamped — actually using durable delivery marks the file, opening a
@@ -4832,11 +5186,13 @@ END";
             .map_err(|error| map_runtime_connection_error(&path, "BEGIN IMMEDIATE", caller, error))
     }
 
+    /// Commits `tx` under `write_fence`'s bounded-wait entry: every caller
+    /// runs inside a blocking task.
     fn commit_runtime_transaction(
         tx: Transaction<'_>,
         write_fence: Option<&dyn RuntimeStoreWriteFence>,
     ) -> Result<(), RuntimeStoreError> {
-        crate::store::execute_optional_runtime_store_target_write(write_fence, || {
+        crate::store::execute_optional_runtime_store_target_write_blocking(write_fence, || {
             tx.commit()
                 .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))
         })
@@ -7237,6 +7593,180 @@ ORDER BY runtime_id";
         Ok(outcomes)
     }
 
+    /// Rewrite each runtime authority whose boundary is its physical head,
+    /// held in the flat row form, into the head's own row-lineage form.
+    ///
+    /// Activation before this release derived such a boundary with a flat
+    /// message-row prefix. For a session whose transcript was rewritten that
+    /// names a head the store never wrote, so the first mutation checked
+    /// against the authority was refused. A read-only scan first keeps only
+    /// the authorities whose token differs from their stored physical head
+    /// token, so an open with none takes no write lock here; each one kept
+    /// is rewritten in its own transaction, as a compare-and-set on the token
+    /// it holds, once the store proves its boundary is that head
+    /// ([`meerkat_store::sqlite_store::runtime_boundary_in_physical_row_lineage_in_txn`]).
+    /// An authority with a provisional tail, a boundary older than its
+    /// physical head, or one the proof refuses stays as it is, and its reads
+    /// refuse typed as before.
+    fn repair_flat_physical_head_boundaries(
+        conn: &mut Connection,
+    ) -> Result<(), RuntimeStoreError> {
+        let authorities = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT runtime_id, session_id, committed_head_token \
+                     FROM runtime_session_authority ORDER BY runtime_id",
+                )
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?
+        };
+        let candidates = {
+            let tx = conn
+                .transaction()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            let mut candidates = Vec::new();
+            for (runtime_id, session_id, committed_head_token) in authorities {
+                let Ok(session_id) = meerkat_core::types::SessionId::parse(&session_id) else {
+                    continue;
+                };
+                let stored_head_token =
+                    meerkat_store::sqlite_store::stored_head_token_for_runtime_in_txn(
+                        &tx,
+                        &session_id,
+                    )
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                if stored_head_token.is_some_and(|token| token != committed_head_token) {
+                    candidates.push((
+                        LogicalRuntimeId::new(runtime_id),
+                        session_id,
+                        committed_head_token,
+                    ));
+                }
+            }
+            tx.commit()
+                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            candidates
+        };
+        for (runtime_id, session_id, committed_head_token) in candidates {
+            let tx = begin_runtime_transaction(conn)?;
+            match repair_flat_physical_head_boundary_in_txn(
+                &tx,
+                &runtime_id,
+                &session_id,
+                &committed_head_token,
+            ) {
+                Ok(true) => {
+                    tx.commit()
+                        .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                    tracing::info!(
+                        runtime_id = %runtime_id,
+                        session_id = %session_id,
+                        "rewrote a flat runtime boundary into its physical head's row-lineage form"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        runtime_id = %runtime_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "left a runtime authority that disagrees with its physical head unchanged"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn repair_flat_physical_head_boundary_in_txn(
+        tx: &Transaction<'_>,
+        runtime_id: &LogicalRuntimeId,
+        session_id: &meerkat_core::types::SessionId,
+        listed_head_token: &str,
+    ) -> Result<bool, RuntimeStoreError> {
+        let stored_head_token =
+            meerkat_store::sqlite_store::stored_head_token_for_runtime_in_txn(tx, session_id)
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        if stored_head_token
+            .as_deref()
+            .is_none_or(|token| token == listed_head_token)
+            || load_head_canonical_provisional_tail_authority(tx, runtime_id)?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(RuntimeSessionAuthority::HeadCanonical(committed)) =
+            load_head_canonical_authority(tx, runtime_id)?
+        else {
+            return Ok(false);
+        };
+        if committed.session_id() != session_id
+            || committed.committed_head_token() != listed_head_token
+        {
+            return Ok(false);
+        }
+        let Some((physical_head, physical_head_token)) =
+            meerkat_store::sqlite_store::load_head_canonical_for_runtime_in_txn(tx, session_id)
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?
+        else {
+            return Ok(false);
+        };
+        let boundary =
+            meerkat_store::sqlite_store::runtime_boundary_in_physical_row_lineage_in_txn(
+                tx,
+                committed.boundary_head().clone(),
+                &physical_head,
+            )
+            .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+        if &boundary == committed.boundary_head() {
+            return Ok(false);
+        }
+        let repaired = HeadCanonicalStoreAuthority::issued(
+            session_id.clone(),
+            committed.store_revision(),
+            boundary,
+            physical_head_token,
+        )?;
+        let boundary_head_json = serde_json::to_vec(repaired.boundary_head())
+            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+        let store_revision = i64::try_from(repaired.store_revision()).map_err(|_| {
+            session_authority_conflict(
+                runtime_id,
+                "HeadCanonical store revision exceeds SQLite INTEGER",
+            )
+        })?;
+        let changed = tx
+            .execute(
+                "UPDATE runtime_session_authority \
+                 SET boundary_head_json = ?2, committed_head_token = ?3 \
+                 WHERE runtime_id = ?1 AND store_revision = ?4 AND committed_head_token = ?5",
+                params![
+                    runtime_id_text(runtime_id),
+                    boundary_head_json,
+                    repaired.committed_head_token(),
+                    store_revision,
+                    listed_head_token,
+                ],
+            )
+            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+        if changed != 1 {
+            return Err(session_authority_conflict(
+                runtime_id,
+                "runtime authority changed while its flat boundary was being rewritten",
+            ));
+        }
+        Ok(true)
+    }
+
     fn load_boundary_receipt(
         conn: &Connection,
         runtime_id: &LogicalRuntimeId,
@@ -8457,11 +8987,43 @@ ORDER BY runtime_id";
     /// Deserialize a persisted `StoredInputState` row through typed serde.
     /// `StoredInputState::deserialize` validates the mandatory
     /// `stored_input_state_version` byte against the generated persistence
-    /// version authority, so a missing or non-current row fails closed.
+    /// version authority, so a missing or unsupported stamp (outside 3..=7)
+    /// fails closed.
     fn deserialize_persisted_input_state(
         bytes: &[u8],
     ) -> Result<StoredInputState, RuntimeStoreError> {
         serde_json::from_slice(bytes).map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))
+    }
+
+    /// The durable input row as this binary encodes it, for the exact batch
+    /// CAS.
+    ///
+    /// The batch CAS compares a stored row with this binary's encoding of the
+    /// expected and replacement rows. A row an earlier release wrote keeps that
+    /// release's older `stored_input_state_version` stamp, so its bytes never
+    /// equal this binary's image of the very same typed row, and every CAS on
+    /// it would report a stale row for good: a terminal completion an earlier
+    /// release left pending could never be finalized. Such a row is compared as
+    /// the current typed decoder reads it, re-encoded. A row at the current
+    /// version is compared exactly as stored, and a row that does not decode
+    /// stays as stored, so any other difference is still stale.
+    fn input_row_in_current_encoding(stored: Vec<u8>) -> Vec<u8> {
+        use meerkat_core::generated::session_persistence_version_authority as version_authority;
+
+        #[derive(serde::Deserialize)]
+        struct StoredVersion {
+            stored_input_state_version: u32,
+        }
+        let current_version = version_authority::stored_input_state_version();
+        let earlier_release = serde_json::from_slice::<StoredVersion>(&stored)
+            .is_ok_and(|row| row.stored_input_state_version < current_version);
+        if !earlier_release {
+            return stored;
+        }
+        deserialize_persisted_input_state(&stored)
+            .ok()
+            .and_then(|row| serde_json::to_vec(&row).ok())
+            .unwrap_or(stored)
     }
 
     /// Encode a `u64` boundary-receipt sequence into the durable `INTEGER`
@@ -10943,6 +11505,7 @@ ORDER BY runtime_id";
                 &mut conn,
                 HeadCanonicalActivationSource::CoTenantSession,
             )?;
+            repair_flat_physical_head_boundaries(&mut conn)?;
             drop(conn);
             let (path, execution_custody) = bind_runtime_execution_custody(path)?;
             Ok(Self {
@@ -11505,7 +12068,7 @@ ORDER BY runtime_id";
                     insert_receipt(&tx, &runtime_id, receipt)?;
                 }
                 upsert_input_states(&tx, &runtime_id, &input_updates)?;
-                crate::store::execute_optional_runtime_store_target_write(
+                crate::store::execute_optional_runtime_store_target_write_blocking(
                     write_fence.as_deref(),
                     || {
                         tx.commit().map_err(|error| {
@@ -14857,28 +15420,22 @@ ORDER BY runtime_id";
         }
 
         async fn load_delivery_generation(&self) -> Result<u64, RuntimeStoreError> {
-            // A file that never used durable delivery reads zero.
-            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
-                return Ok(0);
-            };
-            // A delivery file below version 3 (the counter's migration) not
-            // yet migrated by a write has no counter yet; its first delivery
-            // write migrates it. Decided on the version the open verified.
-            if conn.version < 3 {
-                return Ok(0);
+            read_delivery_generation_fresh(&self.path)
+        }
+
+        fn delivery_generation_reader(
+            &self,
+        ) -> Option<Box<dyn crate::store::DeliveryGenerationReader>> {
+            #[cfg(any(test, feature = "test-support"))]
+            if delivery_generation_test_hooks::forces_fresh(&self.path) {
+                return None;
             }
-            let generation: i64 = conn
-                .query_row(
-                    "SELECT generation FROM runtime_delivery_generation WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
-            u64::try_from(generation).map_err(|_| {
-                RuntimeStoreError::ReadFailed(format!(
-                    "runtime delivery generation {generation} is negative"
-                ))
-            })
+            match delivery_generation_read_path(ReaderPlatform::current()) {
+                DeliveryGenerationReadPath::Kept => Some(Box::new(
+                    KeptDeliveryGenerationReader::new(self.path.clone()),
+                )),
+                DeliveryGenerationReadPath::Fresh => None,
+            }
         }
 
         async fn list_runtime_delivery_authorities(
@@ -16101,6 +16658,7 @@ ORDER BY runtime_id";
                     let Some(current) = current else {
                         return Ok(InputStateBatchCasOutcome::Stale);
                     };
+                    let current = input_row_in_current_encoding(current);
                     if current != row.expected_json {
                         all_expected = false;
                     }
@@ -16180,6 +16738,7 @@ ORDER BY runtime_id";
                     let Some(current) = current else {
                         return Ok(FencedInputStateBatchCasOutcome::Stale);
                     };
+                    let current = input_row_in_current_encoding(current);
                     if current != row.expected_json {
                         all_expected = false;
                     }
@@ -16193,7 +16752,7 @@ ORDER BY runtime_id";
 
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite input recovery fence lost its transaction".to_string(),
@@ -16312,7 +16871,7 @@ ORDER BY runtime_id";
 
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite recovery input fence lost its transaction".to_string(),
@@ -16848,7 +17407,7 @@ ORDER BY runtime_id";
                 let replacement_bytes = replacement.bytes;
                 let mut tx_slot = Some(tx);
                 let fence_outcome =
-                    execute_runtime_store_write_fence(write_fence.as_ref(), || {
+                    execute_runtime_store_write_fence_blocking(write_fence.as_ref(), || {
                         let tx = tx_slot.as_ref().ok_or_else(|| {
                             RuntimeStoreError::Internal(
                                 "SQLite lifecycle fence lost its transaction".to_string(),
@@ -17580,6 +18139,247 @@ ORDER BY runtime_id";
             })
             .await
             .map_err(|err| RuntimeStoreError::Internal(format!("Task join failed: {err}")))?
+        }
+    }
+
+    /// The bounded fence wait blocks its thread, so this store calls it only
+    /// on a blocking thread: inside a `spawn_blocking_holding_claim` closure,
+    /// or in `commit_runtime_transaction`, which only such closures call. The
+    /// in-memory store and the session publication take the fence's
+    /// immediate entry and retry a Backoff with their lock released.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod fence_wait_site_tests {
+        use std::ops::Range;
+
+        /// The store's fence helpers that take the bounded-wait entry.
+        const WAITING_HELPERS: [&str; 2] = [
+            "execute_runtime_store_write_fence_blocking",
+            "execute_optional_runtime_store_target_write_blocking",
+        ];
+
+        /// Where the comment or the string or character literal starting at
+        /// `at` ends (exclusive), or `None` when none starts there.
+        fn skipped_end(bytes: &[u8], at: usize) -> Option<usize> {
+            let rest = &bytes[at..];
+            if rest.starts_with(b"//") {
+                return Some(
+                    rest.iter()
+                        .position(|&byte| byte == b'\n')
+                        .map_or(bytes.len(), |offset| at + offset),
+                );
+            }
+            if rest.starts_with(b"/*") {
+                let (mut depth, mut end) = (0_usize, at);
+                while end < bytes.len() {
+                    if bytes[end..].starts_with(b"/*") {
+                        depth += 1;
+                        end += 2;
+                    } else if bytes[end..].starts_with(b"*/") {
+                        depth -= 1;
+                        end += 2;
+                        if depth == 0 {
+                            return Some(end);
+                        }
+                    } else {
+                        end += 1;
+                    }
+                }
+                return Some(end);
+            }
+            let after_identifier =
+                at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            if !after_identifier {
+                // Raw strings: r"..", r#".."#, br"..", br#".."#.
+                let prefix = if rest.starts_with(b"br") {
+                    2
+                } else {
+                    usize::from(rest.starts_with(b"r"))
+                };
+                if prefix > 0 {
+                    let hashes = rest[prefix..]
+                        .iter()
+                        .take_while(|&&byte| byte == b'#')
+                        .count();
+                    if rest.get(prefix + hashes) == Some(&b'"') {
+                        let mut closing = vec![b'"'];
+                        closing.extend(std::iter::repeat_n(b'#', hashes));
+                        let body = at + prefix + hashes + 1;
+                        return Some(
+                            bytes[body..]
+                                .windows(closing.len())
+                                .position(|window| window == closing.as_slice())
+                                .map_or(bytes.len(), |offset| body + offset + closing.len()),
+                        );
+                    }
+                }
+            }
+            match rest.first() {
+                Some(b'"') => {
+                    let mut end = at + 1;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += if bytes[end] == b'\\' { 2 } else { 1 };
+                    }
+                    Some((end + 1).min(bytes.len()))
+                }
+                // A character literal; a lifetime or a label stays code.
+                Some(b'\'') => {
+                    if rest.get(1) == Some(&b'\\') {
+                        let close = rest.get(3..)?.iter().position(|&byte| byte == b'\'')?;
+                        return Some(at + 3 + close + 1);
+                    }
+                    let width = match *rest.get(1)? {
+                        byte if byte < 0x80 => 1,
+                        byte if byte >= 0xF0 => 4,
+                        byte if byte >= 0xE0 => 3,
+                        _ => 2,
+                    };
+                    (rest.get(1 + width) == Some(&b'\'')).then_some(at + 2 + width)
+                }
+                _ => None,
+            }
+        }
+
+        /// `source` with comments and string and character literals blanked
+        /// byte for byte, so names and brackets are matched in code only.
+        fn code_only(source: &str) -> Vec<u8> {
+            let bytes = source.as_bytes();
+            let mut code = bytes.to_vec();
+            let mut at = 0;
+            while at < bytes.len() {
+                if let Some(end) = skipped_end(bytes, at) {
+                    for byte in &mut code[at..end] {
+                        if *byte != b'\n' {
+                            *byte = b' ';
+                        }
+                    }
+                    at = end;
+                } else {
+                    at += 1;
+                }
+            }
+            code
+        }
+
+        /// The offset of the `(` of every call of `name` in `code`; a
+        /// definition (`fn name(`) is not a call.
+        fn calls<'a>(code: &'a [u8], name: &'a str) -> impl Iterator<Item = usize> + 'a {
+            let name = name.as_bytes();
+            (0..code.len())
+                .filter(move |&at| {
+                    code[at..].starts_with(name)
+                        && code.get(at + name.len()) == Some(&b'(')
+                        && (at == 0
+                            || !(code[at - 1].is_ascii_alphanumeric() || code[at - 1] == b'_'))
+                        && !code[..at].ends_with(b"fn ")
+                })
+                .map(move |at| at + name.len())
+        }
+
+        /// Just past the bracket that closes the one at `open`.
+        fn closing(code: &[u8], open: usize) -> usize {
+            let opening = code[open];
+            let closing = if opening == b'(' { b')' } else { b'}' };
+            let mut depth = 0_usize;
+            for (offset, &byte) in code[open..].iter().enumerate() {
+                if byte == opening {
+                    depth += 1;
+                } else if byte == closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + offset + 1;
+                    }
+                }
+            }
+            code.len()
+        }
+
+        /// The body of `fn name`.
+        fn fn_body(code: &[u8], name: &str) -> Range<usize> {
+            let needle = format!("fn {name}(");
+            let at = code
+                .windows(needle.len())
+                .position(|window| window == needle.as_bytes())
+                .expect("the function exists");
+            let open = at
+                + code[at..]
+                    .iter()
+                    .position(|&byte| byte == b'{')
+                    .expect("the function has a body");
+            open..closing(code, open)
+        }
+
+        fn line(code: &[u8], at: usize) -> usize {
+            code[..at].split(|&byte| byte == b'\n').count()
+        }
+
+        #[test]
+        fn the_bounded_fence_wait_is_called_only_on_blocking_threads() {
+            let code = code_only(include_str!("sqlite.rs"));
+            let blocking: Vec<Range<usize>> = calls(&code, "spawn_blocking_holding_claim")
+                .map(|open| open..closing(&code, open))
+                .collect();
+            let on_blocking_thread = |at: usize| blocking.iter().any(|span| span.contains(&at));
+            let commit = fn_body(&code, "commit_runtime_transaction");
+            let mut waiting_calls = 0;
+            for name in WAITING_HELPERS {
+                for at in calls(&code, name) {
+                    waiting_calls += 1;
+                    assert!(
+                        on_blocking_thread(at) || commit.contains(&at),
+                        "sqlite.rs:{}: {name} outside a spawn_blocking_holding_claim closure",
+                        line(&code, at)
+                    );
+                }
+            }
+            assert!(
+                waiting_calls > 0,
+                "the store's fenced writes take the bounded wait"
+            );
+            let mut commits = 0;
+            for at in calls(&code, "commit_runtime_transaction") {
+                commits += 1;
+                assert!(
+                    on_blocking_thread(at),
+                    "sqlite.rs:{}: commit_runtime_transaction outside a \
+                     spawn_blocking_holding_claim closure",
+                    line(&code, at)
+                );
+            }
+            assert!(commits > 0, "the store commits fenced transactions");
+
+            for (file, source) in [
+                ("memory.rs", include_str!("memory.rs")),
+                (
+                    "session_management.rs",
+                    include_str!("../meerkat_machine/session_management.rs"),
+                ),
+            ] {
+                let code = code_only(source);
+                for name in WAITING_HELPERS
+                    .into_iter()
+                    .chain(["execute_if_current_blocking"])
+                {
+                    assert!(
+                        calls(&code, name).next().is_none(),
+                        "{file} calls {name}: an async site retries the immediate entry instead"
+                    );
+                }
+            }
+
+            // The trait's bounded entry is reached only through the helpers.
+            let code = code_only(include_str!("mod.rs"));
+            let entry_calls: Vec<usize> = calls(&code, "execute_if_current_blocking").collect();
+            let through = fn_body(&code, "execute_write_fence_through");
+            assert!(
+                entry_calls.len() == 1 && through.contains(&entry_calls[0]),
+                "mod.rs calls execute_if_current_blocking only in execute_write_fence_through: \
+                 lines {:?}",
+                entry_calls
+                    .iter()
+                    .map(|&at| line(&code, at))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -22509,6 +23309,306 @@ ORDER BY runtime_id";
             );
         }
 
+        /// The committed token of `session_id`'s runtime authority and the
+        /// stored token of its physical head, read straight from the file.
+        fn authority_and_physical_head_tokens(
+            path: &Path,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> (String, String) {
+            let conn =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap();
+            let authority = conn
+                .query_row(
+                    "SELECT committed_head_token FROM runtime_session_authority
+                     WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            let physical = conn
+                .query_row(
+                    "SELECT cas_token FROM session_heads WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            (authority, physical)
+        }
+
+        async fn head_canonical_authority(
+            store: &SqliteRuntimeStore,
+            runtime_id: &LogicalRuntimeId,
+        ) -> HeadCanonicalStoreAuthority {
+            let Some(RuntimeSessionAuthority::HeadCanonical(authority)) = store
+                .load_session_boundary_authority(runtime_id)
+                .await
+                .unwrap()
+            else {
+                panic!("{runtime_id}: no HeadCanonical authority");
+            };
+            authority
+        }
+
+        /// Compact `session_id` once more, prepare that rewrite from the
+        /// runtime authority's boundary as a restarted runtime does, and commit
+        /// it on `store`. Returns the rewritten head.
+        async fn commit_a_rewrite_from_the_runtime_authority(
+            store: &SqliteRuntimeStore,
+            session_store: &SqliteSessionStore,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> Result<meerkat_core::session_store::SessionHead, RuntimeStoreError> {
+            let runtime_id = LogicalRuntimeId::for_session(session_id);
+            let authority = head_canonical_authority(store, &runtime_id).await;
+            let mut session = session_store
+                .load(session_id)
+                .await
+                .unwrap()
+                .expect("converted session");
+            let end = session.messages().len() - 1;
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end },
+                    vec![Message::User(UserMessage::text(
+                        "the first compaction after the conversion",
+                    ))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            let rewrite =
+                meerkat_core::session_store::PreparedHeadCanonicalRewriteMutation::prepare(
+                    &session,
+                    authority.boundary_head().clone(),
+                )
+                .expect("the next rewrite prepares from the runtime authority");
+            let rewritten_head = rewrite.successor_head().clone();
+            let boundary =
+                BoundSessionCommit::head_canonical_rewrite_from_session(&session, rewrite).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await?;
+            Ok(rewritten_head)
+        }
+
+        /// A WholeBlob session whose transcript was compacted converts with
+        /// its physical head as the runtime authority: the authority's
+        /// committed token is the physical head's, in the file the conversion
+        /// leaves. A restarted runtime's next compaction, prepared from that
+        /// authority, is therefore accepted. The session without compactions
+        /// (the append-only control, checked first) converts with matching
+        /// tokens as before.
+        #[tokio::test]
+        async fn compacted_whole_blob_session_converts_with_its_physical_head_as_authority() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the WholeBlob bodies convert");
+            for session in [&plain, &re_anchored] {
+                let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+                assert_eq!(
+                    authority,
+                    physical,
+                    "{}: the converted runtime authority does not name the physical head",
+                    session.id()
+                );
+            }
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            for session in [&plain, &re_anchored] {
+                let rewritten = commit_a_rewrite_from_the_runtime_authority(
+                    &store,
+                    &session_store,
+                    session.id(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{}: the next compaction after the conversion is refused: {error}",
+                        session.id()
+                    )
+                });
+                let runtime_id = LogicalRuntimeId::for_session(session.id());
+                assert_eq!(
+                    head_canonical_authority(&store, &runtime_id)
+                        .await
+                        .boundary_head(),
+                    &rewritten
+                );
+            }
+        }
+
+        /// A SQLite realm (a WholeBlob v1 runtime database beside the session
+        /// store, in one file) whose co-tenant store keeps a compacted session
+        /// as a released blob row activates on open with the physical head as
+        /// the runtime authority, and the next compaction is accepted. The
+        /// session without compactions (the append-only control, checked
+        /// first) activates with matching tokens as before.
+        #[tokio::test]
+        async fn realm_activation_of_a_compacted_blob_row_takes_its_physical_head_as_authority() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let (re_anchored, plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            let millis = |at: std::time::SystemTime| {
+                i64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
+            };
+            for session in [&plain, &re_anchored] {
+                Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO sessions (
+                             session_id, created_at_ms, updated_at_ms, message_count,
+                             total_tokens, metadata_json, session_json
+                         ) VALUES (?1, ?2, ?3, ?4, 0, '{}', ?5)",
+                        params![
+                            session.id().to_string(),
+                            millis(session.created_at()),
+                            millis(session.updated_at()),
+                            i64::try_from(session.messages().len()).unwrap(),
+                            serde_json::to_vec(session).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+            }
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the realm activates its WholeBlob runtimes on open");
+            for session in [&plain, &re_anchored] {
+                let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+                assert_eq!(
+                    authority,
+                    physical,
+                    "{}: the activated runtime authority does not name the physical head",
+                    session.id()
+                );
+            }
+            for session in [&plain, &re_anchored] {
+                commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session.id())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: the next compaction after the realm activation is refused: {error}",
+                            session.id()
+                        )
+                    });
+            }
+        }
+
+        /// A file whose activation wrote a compacted session's boundary in
+        /// the flat row form (every build before this fix: a 0.9.3 realm, or
+        /// a standalone conversion) is repaired when the head-canonical store
+        /// opens it. The authority row is rewritten to the physical head
+        /// exactly, so the next compaction is accepted. An authority that
+        /// differs from its physical head in any other field is left as it
+        /// was written.
+        #[tokio::test]
+        async fn a_flat_activation_boundary_is_rewritten_to_its_physical_head_on_open() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let (re_anchored, _plain) = re_anchored_whole_blob_database(&path).await;
+            let session_store = meta_093_co_located_session_store(&path);
+            SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("the WholeBlob bodies convert");
+            let runtime_id = LogicalRuntimeId::for_session(re_anchored.id());
+            let physical = session_store
+                .load_head(re_anchored.id())
+                .await
+                .unwrap()
+                .expect("converted head");
+            let physical_token = meerkat_core::session_head_cas_token(&physical).unwrap();
+
+            // The boundary the activation derived before this fix: the frozen
+            // WholeBlob body's head with a flat message-row prefix.
+            let frozen =
+                deserialize_persisted_session(&serde_json::to_vec(&re_anchored).unwrap()).unwrap();
+            let rows = frozen
+                .messages()
+                .iter()
+                .map(|message| serde_json::to_vec(message).unwrap())
+                .collect::<Vec<_>>();
+            let flat = meerkat_core::session_store::SessionHead::from_session_with_proved_storage_authority(
+                &frozen,
+                physical.strand.clone(),
+                physical.rewrite_prefix.clone(),
+                meerkat_core::session_store::SessionMessageRowPrefixAccumulator::from_serialized_rows(&rows)
+                    .unwrap(),
+            )
+            .unwrap();
+            let flat_token = meerkat_core::session_head_cas_token(&flat).unwrap();
+            assert_ne!(
+                flat_token, physical_token,
+                "the compacted session has two forms"
+            );
+            let mut lineage = flat.clone();
+            lineage
+                .message_row_prefix
+                .clone_from(&physical.message_row_prefix);
+            lineage
+                .row_lineage_anchor
+                .clone_from(&physical.row_lineage_anchor);
+            assert_eq!(
+                lineage, physical,
+                "the flat form differs from the physical head only in its row commitment"
+            );
+            let write_authority = |head: &meerkat_core::session_store::SessionHead| {
+                let conn = Connection::open(&path).unwrap();
+                let changed = conn
+                    .execute(
+                        "UPDATE runtime_session_authority
+                         SET boundary_head_json = ?2, committed_head_token = ?3
+                         WHERE runtime_id = ?1",
+                        params![
+                            runtime_id_text(&runtime_id),
+                            serde_json::to_vec(head).unwrap(),
+                            meerkat_core::session_head_cas_token(head).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            };
+
+            // Not the physical head in another field: never rewritten.
+            let mut other = flat.clone();
+            other.updated_at += Duration::from_secs(1);
+            write_authority(&other);
+            drop(SqliteRuntimeStore::new_head_canonical(&path).expect("the file opens"));
+            assert_eq!(
+                authority_and_physical_head_tokens(&path, re_anchored.id()),
+                (
+                    meerkat_core::session_head_cas_token(&other).unwrap(),
+                    physical_token.clone()
+                ),
+                "an authority that is not the physical head must stay as written"
+            );
+
+            // The flat form of the physical head: rewritten on open.
+            write_authority(&flat);
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the file with a flat boundary opens");
+            assert_eq!(
+                authority_and_physical_head_tokens(&path, re_anchored.id()),
+                (physical_token.clone(), physical_token.clone()),
+                "the flat boundary was not rewritten to the physical head"
+            );
+            assert_eq!(
+                head_canonical_authority(&store, &runtime_id)
+                    .await
+                    .boundary_head(),
+                &physical
+            );
+            commit_a_rewrite_from_the_runtime_authority(&store, &session_store, re_anchored.id())
+                .await
+                .expect("the next compaction after the repair is accepted");
+        }
+
         /// The 0.9.3 sessions carrying every tool-config and MCP notice shape,
         /// as meerkat-core 0.9.3 serialized them: meerkat-core's cross-version
         /// fixture, written by its checked-in generator at tag v0.9.3.
@@ -24607,6 +25707,163 @@ ORDER BY runtime_id";
             let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
             assert_eq!(rows.len(), crate::store::MAX_INPUT_STATE_BATCH_CAS);
             assert!(rows.iter().all(|row| row.state.recovery_count == 7));
+        }
+
+        /// The pending terminal completion row a 0.9.2 binary wrote for a turn
+        /// that stopped at its completed-boundary commit, taken from a captured
+        /// directory with its prompt text and model name replaced by neutral
+        /// ones and its candidate digest recomputed. It carries stored input
+        /// state version 6, which 0.9.0 through 0.9.3 wrote.
+        const EARLIER_RELEASE_PENDING_RECEIPT_ROW: &str = concat!(
+            r#"{"stored_input_state_version":6,"input_id":"01a15641-4385-7710-aa5b-74ddbd9c"#,
+            r#"e3f1","current_state":"consumed","policy":{"version":1,"decision":{"apply_mo"#,
+            r#"de":"stage_run_start","wake_mode":"wake_if_idle","queue_mode":"fifo","consum"#,
+            r#"e_point":"on_run_complete","drain_policy":"queue_next_turn","routing_disposi"#,
+            r#"tion":"queue","record_transcript":true,"emit_operator_content":true,"policy_"#,
+            r#"version":1}},"runtime_semantics":{"boundary":"run_start","execution_kind":"c"#,
+            r#"ontent_turn","execution_handling_mode":null,"peer_response_terminal_apply_in"#,
+            r#"tent":null,"live_interrupt_required":false},"terminal_outcome":{"outcome_typ"#,
+            r#"e":"consumed"},"durability":"durable","attempt_count":1,"recovery_count":0,""#,
+            r#"history":[{"timestamp":"2026-10-19T22:21:20.134647734Z","from":"accepted","t"#,
+            r#"o":"queued","reason":"QueueAccepted"},{"timestamp":"2026-10-19T22:21:20.1434"#,
+            r#"25531Z","from":"queued","to":"staged","reason":"StageForRun(01a15641-438f-74"#,
+            r#"e0-b913-07c827a2fed6)"},{"timestamp":"2026-10-19T22:21:20.217337018Z","from""#,
+            r#":"staged","to":"applied","reason":"MarkApplied(01a15641-438f-74e0-b913-07c82"#,
+            r#"7a2fed6)"},{"timestamp":"2026-10-19T22:21:20.217337018Z","from":"applied","t"#,
+            r#"o":"applied_pending_consumption","reason":"MarkAppliedPendingConsumption(bou"#,
+            r#"ndary_sequence=1)"},{"timestamp":"2026-10-19T22:21:20.217374935Z","from":"ap"#,
+            r#"plied_pending_consumption","to":"consumed","reason":"Consume"}],"terminal_co"#,
+            r#"mpletion":{"input_id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","batch_ordinal""#,
+            r#":0,"batch_key":{"scope":"run","run_id":"01a15641-438f-74e0-b913-07c827a2fed6"#,
+            r#""},"owner_input_id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","candidate_digest"#,
+            r#"":"4baafa70ff40f5dd7d10a8989b10803f7025847a9bd6f47e141751009f6bb3e8","comple"#,
+            r#"tion_input_ids_digest":"aa375d8c846ea1970518c3025f79d40deea2b8c9bed7dac3d15e"#,
+            r#"75820828e813","requires_session_checkpoint":true,"candidate":{"candidate_typ"#,
+            r#"e":"run_result","result":{"text":"fixture reply 21","session_id":"01a15640-c"#,
+            r#"724-7302-9145-63c8ad263794","usage":{"input_tokens":300110,"output_tokens":1"#,
+            r#"6,"cache_creation_tokens":null,"cache_read_tokens":null},"run_usage":{"input"#,
+            r#"_tokens":20,"output_tokens":2,"cache_creation_tokens":null,"cache_read_token"#,
+            r#"s":null},"request_usage":[{"input_tokens":10,"output_tokens":1,"cache_creati"#,
+            r#"on_tokens":null,"cache_read_tokens":null,"accounting":{"provider":"self_host"#,
+            r#"ed","model":"fixture-model","presented_tokens":10,"convention":"open_ai_comp"#,
+            r#"atible_prompt_includes_cache_details","aggregation":"provider_inclusive_inpu"#,
+            r#"t_total"}},{"input_tokens":10,"output_tokens":1,"cache_creation_tokens":null"#,
+            r#","cache_read_tokens":null,"accounting":{"provider":"self_hosted","model":"fi"#,
+            r#"xture-model","presented_tokens":10,"convention":"open_ai_compatible_prompt_i"#,
+            r#"ncludes_cache_details","aggregation":"provider_inclusive_input_total"}}],"tu"#,
+            r#"rns":1,"tool_calls":0,"skill_diagnostics":{"source_health":{"state":"healthy"#,
+            r#"","invalid_ratio":0.0,"invalid_count":0,"total_count":14,"failure_streak":0,"#,
+            r#""handshake_failed":false},"quarantined":[]}}},"completion_input_ids":["01a15"#,
+            r#"641-4385-7710-aa5b-74ddbd9ce3f1"],"phase":{"phase":"pending"}},"scoped_desti"#,
+            r#"nation":{"kind":"never_scoped"},"persisted_input":{"input_type":"prompt","he"#,
+            r#"ader":{"id":"01a15641-4385-7710-aa5b-74ddbd9ce3f1","timestamp":"2026-10-19T2"#,
+            r#"2:21:20.133813573Z","source":{"type":"operator"},"durability":"durable","vis"#,
+            r#"ibility":{"transcript_eligible":true,"operator_eligible":true}},"content":"c"#,
+            r#"ycle 4 settle","turn_metadata":{"handling_mode":"queue","transcript_identity"#,
+            r#"":{"interaction_id":"3f21e967-fc11-4073-817e-ade10c232ab9"}}},"last_run_id":"#,
+            r#""01a15641-438f-74e0-b913-07c827a2fed6","last_boundary_sequence":1,"admission"#,
+            r#"_sequence":1000000010,"created_at":"2026-10-19T22:21:20.134580854Z","updated"#,
+            r#"_at":"2026-10-19T22:21:20.217374935Z"}"#,
+        );
+
+        /// A row an earlier release wrote differs from this binary's image of
+        /// the same typed row only by its older `stored_input_state_version`
+        /// stamp. The exact batch CAS reads such a row as that typed row, so a
+        /// receipt an earlier release left pending can be finalized, and still
+        /// refuses one whose content changed.
+        #[tokio::test]
+        async fn input_state_batch_cas_sqlite_reads_an_earlier_release_row_as_its_typed_row() {
+            use meerkat_core::generated::session_persistence_version_authority as version_authority;
+
+            let (_dir, store) = temp_store();
+            let runtime_id = LogicalRuntimeId::new("input-cas-earlier-release");
+            let input_id = InputId::from_uuid(
+                uuid::Uuid::parse_str("01a15641-4385-7710-aa5b-74ddbd9ce3f1").unwrap(),
+            );
+            let write_row = |bytes: &[u8]| {
+                open_runtime_connection(store.path())
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO runtime_input_states (runtime_id, input_id, state_json)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(runtime_id, input_id) DO UPDATE
+                         SET state_json = excluded.state_json",
+                        params![runtime_id_text(&runtime_id), input_id.0.to_string(), bytes],
+                    )
+                    .unwrap();
+            };
+            let read_row = || {
+                open_runtime_connection(store.path())
+                    .unwrap()
+                    .query_row(
+                        "SELECT state_json FROM runtime_input_states
+                         WHERE runtime_id = ?1 AND input_id = ?2",
+                        params![runtime_id_text(&runtime_id), input_id.0.to_string()],
+                        |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+                    )
+                    .unwrap()
+            };
+            let earlier = EARLIER_RELEASE_PENDING_RECEIPT_ROW;
+            write_row(earlier.as_bytes());
+            let expected = store
+                .load_input_state(&runtime_id, &input_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let completion = expected.state.terminal_completion.as_ref().unwrap();
+            assert!(completion.requires_session_checkpoint);
+            assert!(matches!(
+                completion.phase,
+                crate::input_state::InputTerminalCompletionPhase::Pending
+            ));
+            let current_stamp = format!(
+                "\"stored_input_state_version\":{}",
+                version_authority::stored_input_state_version()
+            );
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                earlier.replacen("\"stored_input_state_version\":6", &current_stamp, 1),
+                "only the version stamp differs from this binary's image of the row"
+            );
+            let mut replacement = expected.clone();
+            replacement.state.recovery_count = 1;
+            let replacement = persistable(replacement);
+
+            let changed = earlier.replacen("\"recovery_count\":0", "\"recovery_count\":3", 1);
+            assert_ne!(changed, earlier);
+            write_row(changed.as_bytes());
+            assert_eq!(
+                store
+                    .compare_and_swap_input_states_atomically(
+                        &runtime_id,
+                        std::slice::from_ref(&expected),
+                        std::slice::from_ref(&replacement),
+                    )
+                    .await
+                    .unwrap(),
+                InputStateBatchCasOutcome::Stale,
+                "an earlier-release row whose content changed is still stale"
+            );
+            assert_eq!(read_row(), changed.as_bytes());
+
+            write_row(earlier.as_bytes());
+            assert_eq!(
+                store
+                    .compare_and_swap_input_states_atomically(
+                        &runtime_id,
+                        std::slice::from_ref(&expected),
+                        std::slice::from_ref(&replacement),
+                    )
+                    .await
+                    .unwrap(),
+                InputStateBatchCasOutcome::Swapped,
+                "the earlier-release row holding the expected typed row must swap"
+            );
+            assert_eq!(
+                read_row(),
+                serde_json::to_vec(replacement.as_stored()).unwrap(),
+                "the swap writes the current encoding"
+            );
         }
 
         #[tokio::test]
@@ -28292,6 +29549,9 @@ ORDER BY runtime_id";
     }
 }
 
+#[cfg(all(feature = "sqlite-store", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub use inner::delivery_generation_test_hooks;
 #[cfg(feature = "sqlite-store")]
 pub use inner::{
     RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, StandaloneWholeBlobConversionReport,

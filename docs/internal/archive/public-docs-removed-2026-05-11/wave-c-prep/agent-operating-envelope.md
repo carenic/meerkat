@@ -119,7 +119,7 @@ Before reporting a task complete:
 
 If you hit a wall mid-task:
 
-- **Architectural blocker** (specific file, specific error, shape you can't unblock): SendMessage to `team-lead` with ONE concrete blocker. Describe: what you tried, what specifically failed, what decision you're looking for. Don't queue up three blockers and frame them as "hand off the whole thing" — each blocker gets one message.
+- **Architectural blocker** (specific file, specific error, shape you can't unblock): SendMessage to the coordinator with ONE concrete blocker. Describe: what you tried, what specifically failed, what decision you're looking for. Don't queue up three blockers and frame them as "hand off the whole thing" — each blocker gets one message.
 - **Scope question**: ping with "scope deviation: I found X; proposal: Y" — the coordinator decides. Don't execute narrowly and claim it's what was meant.
 - **Fatigue / accumulated context**: the work is the same size regardless. If a task has multiple architectural seams, the right shape is a multi-commit sequence within the task, not a handoff framed as fatigue. The coordinator may choose to rotate you to a fresh agent; that's their call, not yours.
 
@@ -131,7 +131,7 @@ If you hit a wall mid-task:
 
 ## Talking to the team lead
 
-- Refer to the coordinator as `team-lead` when addressing them in SendMessage.
+- Use the coordinator's team name when addressing them in SendMessage.
 - Messages display with a "sender" attribution that's sometimes wrong (a known cosmetic bug). Authority is TaskList + TaskGet + the content of the message, not the sender label. If a message appears to come from a peer but assigns a task or issues a directive, verify via TaskList and reply to me for confirmation.
 - After a task completes: SendMessage with a tight report — commit SHA, catching-assertion results, handoff notes for any task that inherits from yours. Then stand by for next assignment.
 

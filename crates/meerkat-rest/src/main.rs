@@ -123,6 +123,10 @@ const DEFAULT_TRACE_FILTER: &str =
     "meerkat_rest=info,rkat_rest=info,meerkat::host_confinement=info,tower_http=debug";
 
 fn main() -> ExitCode {
+    // SAFETY: the first statement of main: no other thread exists yet and
+    // nothing has used SQLite, as the switch requires.
+    #[allow(unsafe_code)]
+    let _ = unsafe { meerkat_sqlite::disable_memory_statistics_at_process_start() };
     // One documented worker-stack budget for every host binary; the main
     // future runs on a budgeted thread too, not the platform main thread.
     match meerkat_runtime::host_stack::run_host("rkat-rest", || async {

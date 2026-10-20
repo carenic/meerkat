@@ -31,35 +31,36 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   before Stop runs only after Resume. The result carries `stop_report` with
   each member's run outcome. A member reported not holdable (a remote host
   without `run_start_hold`) may still start a turn while the mob is stopped.
+  A member reported `reload_required` needs a durability reload: it starts no
+  turn until it is reloaded, and the reloaded member stays held until Resume.
   A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
-  member reloaded while the mob is stopped stays held until Resume, as does
-  one spawned into a stopped mob or held again after a failed Resume;
-  retire, Shutdown and destroy release the hold for the members they dispose
-  of, so a later registration of the same session is not held, and a mob
-  reopened in the same process holds its members only if it is restored
-  stopped.
+  local member whose registration needs a durability reload is reported with
+  `run` and `starts` `reload_required` instead of failing the Stop; a remote
+  one still fails it (reload it on its host, then retry). A Resume refuses
+  with `MEMBER_RELOAD_REQUIRED` while a local member needs a durability
+  reload; reload it (a reload while Stopped answers `discarded`), then Resume.
+  Since 0.9.4 a member reloaded while the mob is stopped stays held until
+  Resume, as does one spawned into a stopped mob or held again after a failed
+  Resume; retire, Shutdown and destroy release the hold for the members they
+  dispose of, so a later registration of the same session is not held, and a
+  mob reopened in the same process holds its members only if it is restored
+  stopped. A resume finishes a Stop an earlier process left half done before
+  it returns the mob (waiting up to 5 s), so the mob reads Stopped. An attempt
+  still running after 5 s (held on a member or a placed completion) goes on in
+  the background; wait for `MobStopped`.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
-  and reports each member. Since 0.9.4 a member reported
-  `UnregisterPending { stage, settlement, .. }` carries a
-  `MemberUnregisterSettlement` that keeps following its exact registration
-  after Shutdown returns (`try_state()`, `settle_within(deadline)`;
-  `HandedOver` when a later owner took the registration over), and a
-  durability-degraded member is unregistered after the reload-required
-  discard instead of staying registered until the process exits (details in
-  `references/mobs.md`). Since 0.9.4 an admitted Shutdown closes the mob's
-  admission before any teardown (reason `Shutdown`). While it runs, a command
-  the closed admission refuses (spawn, respawn, work, a flow run, wiring, a
-  host bind, a live commit, resume, reset, reload, an owner lease) fails with
-  `AdmissionClosed`, and every other request (stop, destroy, complete,
-  retirement, reads, `status()`) gets `MobError::ShutdownInProgress`:
-  retryable, wire `SESSION_BUSY`, data kind `mob_shutdown_in_progress`;
-  `stop()` returns it at once. 0.9.3 and earlier answered these with
-  `ActorCommandChannelClosed`, which now means only that the actor has
-  exited or is exiting. A Shutdown that fails keeps the actor serving with
-  admission closed: Stop, Shutdown and Destroy stay available. A command sent
-  while the actor exits after a shutdown now fails instead of waiting
-  forever. `MobError` is `#[non_exhaustive]` since 0.9.4.
+  and reports each member. Since 0.9.4 an admitted Shutdown closes admission
+  first (reason `Shutdown`): while it runs, commands the close refuses fail
+  with `AdmissionClosed` and every other request (stop, destroy, complete,
+  retirement, reads, `status()`) gets the retryable
+  `MobError::ShutdownInProgress` (wire `SESSION_BUSY`, data kind
+  `mob_shutdown_in_progress`); 0.9.3 answered `ActorCommandChannelClosed`,
+  which now means the actor has exited or is exiting. A member reported
+  `UnregisterPending` carries a `MemberUnregisterSettlement` that keeps
+  following its registration (`HandedOver` once a later owner took it), and a
+  durability-degraded member is now unregistered. Details in
+  `references/mobs.md`.
 - Destroy deletes the mob's database files only after its actor ended and its
   observer drained. Until then it answers `mob_destroy_incomplete` with
   `destroy_report` and `retryable: true` (JSON-RPC and MCP: internal error
@@ -70,29 +71,32 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   destroy keeps it closed while the retry stays available, and a mob restored
   with an unfinished destroy starts with admission closed, so nothing is
   spawned into it.
+- Since 0.9.4 a mob keeps its incarnation across resume (only destroy plus
+  create starts a new one), and opening a mob store migrates it to schema 12,
+  which 0.9.3 refuses: back up mob stores before upgrading. A store whose
+  creation record disagrees with its log, or that holds a finished destroy,
+  refuses resume (`IncarnationInconsistent`, `IncarnationDestroyed`), and a
+  delivery scope from an earlier incarnation gets `IncarnationMismatch`. Such
+  a store no longer stops a server's other mobs from restoring. After a
+  restart, the session that created a mob with the agent mob tools manages
+  it again (not a creating member reset to a later generation since; an
+  operator grant restores manage).
 
 ## Admission close (Rust hosts)
 
 Every exported `MobHandle` clone shares one owner token. When the last owner
-drops and the mob is idle, admission closes for good: spawn, respawn, work,
-flow runs, wiring, resume, reset, peer messages, live opens and host binds
-fail with `MobError::AdmissionClosed`, while stop, shutdown, destroy,
-retirement, cancellation and reads still work. `read_handle()`, `events()`
-and `observer()` are not owners. Use `acquire_owner()` for a temporary lease,
-`close_if_idle()` (`Closed`, `AlreadyClosed` or `Busy`) or
-`close_admission(reason)`, and watch `admission_closed()`. Mobs managed by
+drops and the mob is idle, admission closes for good: new work (spawn,
+respawn, work, flow runs, wiring, resume, reset, peer messages, live opens,
+host binds) fails with `MobError::AdmissionClosed`; stop, shutdown, destroy,
+retirement, cancellation and reads still work. `read_handle()`, `events()` and
+`observer()` are not owners; `acquire_owner()` takes a lease. Mobs managed by
 `rkat-rpc`, `rkat-rest` or `rkat-mcp` stay owned by the server's registry.
-
-Since 0.9.4 admission also closes, before the actor stops, when a Shutdown is
-admitted (`Shutdown`), a destroy is admitted (`Destroyed`), the actor
-fail-stops on an uncertain durable write or a failed durable recovery
-(`DurabilityFailStop`), the actor task is lost to a panic or abort
-(`ActorLost`), or a composition dispatch failure stops it (`DispatchFailed`).
-These are `MobAdmissionCloseReason` variants next to `IdleClose`,
-`LastOwnerReleased` and `StandDown`, and an earlier close keeps its reason.
-No actor exit leaves admission open: `acquire_owner()` is refused and
-`admission_closed()` names the reason, where 0.9.3 and earlier could still
-hand out an owner lease on a stopped actor.
+Since 0.9.4 every actor exit closes admission first with a typed
+`MobAdmissionCloseReason` (`Shutdown`, `Destroyed`, `DurabilityFailStop`,
+`ActorLost` or `DispatchFailed`, besides `IdleClose`, `LastOwnerReleased` and
+`StandDown`; an earlier close keeps its reason), so no `acquire_owner()`
+succeeds after it. `MobError` is `#[non_exhaustive]`. Details in
+`references/mobs.md`.
 
 ## Stopping and cancelling member work
 
@@ -128,7 +132,11 @@ hand out an owner lease on a stopped actor.
   (`session/archive`, REST `DELETE /sessions/{id}`, MCP `meerkat_archive`)
   re-drives it once per request.
 - `rkat mob respawn <MOB_ID> <AGENT_IDENTITY> [--initial-message <MSG>]`
-  (RPC `mob/respawn`) replaces the member under a new runtime binding.
+  (RPC `mob/respawn`) replaces the member under a new runtime binding. Since
+  0.9.4 the successor keeps its predecessor's spawn-time tool restrictions
+  (never widened) and, while the provider matches, its auth binding; a
+  respawn whose restrictions cannot be established (a lost-session Broken
+  member too) is refused before anything is retired, and the member is kept.
 - Since 0.9.4 a mob that was reset and then re-spawned a member under an
   identity it had before the reset resumes after a restart (0.9.3 and earlier
   failed that resume with an internal error), and the re-spawned member always
@@ -142,6 +150,19 @@ hand out an owner lease on a stopped actor.
   identity (live or retired) since the latest reset, without the actor queue.
   `MobStorage::read_member_binding_history(path)` reads a stopped mob's store
   read-only. Details in `references/mobs.md`.
+- Since 0.9.4 a host refusal of a restored member's registration (also one
+  the boot recreates on a fresh session) removes that registration and leaves
+  only that member Broken with
+  `MemberRegistrationRefused` (member status `registration_refusal`) until
+  repaired; retire, respawn and destroy still work. A destination the runtime
+  did not install is `MemberDestinationNotInstalled` (failure class
+  `runtime_rejected`, was `mob_rejected`). Rust
+  `MobHandle::retire_at_scope(&scope)` retires exactly the incarnation a
+  delivery scope names, never a successor.
+- Since 0.9.4 a respawned member gets a fresh health record, idle close
+  ignores retired members' work, a restarted placed member shows no
+  predecessor kickoff, and destroy reloads a member whose boundary commit
+  failed, then retries it once (`reloaded_members`).
 - `mob/spawn` also takes `labels`, `additional_instructions` (sections
   appended to the member's system prompt after its skills) and `context`: an
   opaque JSON application context for host build callbacks (a custom
@@ -204,6 +225,14 @@ hand out an owner lease on a stopped actor.
   job ... finished" entry.
 - The agent loop's default tool deadline does not cut `fork_off` or
   `council`; an explicit `tools.tool_timeouts.<tool>` still does.
+- Since 0.9.4 forking a member with activated host instructions follows the
+  host's fork instruction policy (`MobBuilder::with_fork_instruction_policy`).
+  By default `fork_off`, the self-starting member forks and council
+  participants are refused before commit (`fork_instruction_refused`, -32037;
+  a council ends `participant_fork_instruction_refused`) instead of
+  committing a child whose first turn failed; `reactivate_inherited`
+  re-activates the source's keys in the child. Upgrade member hosts before
+  their controller. Details in `references/mobs.md`.
 - `delegate` and `mob_spawn_member` accept `tooling`: `{mode:
   "inherit_parent"}` (default, with optional `allow_overlay` and
   `deny_overlay`), `{mode: "minimal"}` (comms tools only) or `{mode:
@@ -390,7 +419,7 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
 | `HOST_UNAVAILABLE` | -32026 | 503 | Member host unreachable |
 | `STALE_CURSOR` | -32027 | 410 | Re-read events from a fresh cursor |
 | `STALE_FENCE` | -32028 | 409 | Re-resolve the member |
-| `MEMBER_RELOAD_REQUIRED` | -32029 | 409 | Registration durability-degraded; needs `reload_member_registration` (Rust) |
+| `MEMBER_RELOAD_REQUIRED` | -32029 | 409 | Registration durability-degraded; needs `reload_member_registration` (Rust); since 0.9.4 also from `mob/force_cancel` and `cancel_all_work` |
 | `SESSION_RUNTIME_UNAVAILABLE` | -32032 | 503 | Runtime not available (for example a held child mob) |
 | `STALE_DELIVERY_SCOPE` | -32036 | 409 | Member session moved; re-capture the delivery scope |
 

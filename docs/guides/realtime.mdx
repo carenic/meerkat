@@ -363,7 +363,12 @@ flag, the live methods are not registered.
 
 The media transport and the session event log answer different questions.
 WebSocket or WebRTC carries low-latency channel input, output, and observations;
-committed turn content still lands in the canonical session transcript.
+committed turn content still lands in the canonical session transcript. Both
+transports forward each observation as it arrives, so a transcript frame can
+reach the client before its row commits (see
+[Transcript rows while the member's turn runs](#transcript-rows-while-the-members-turn-runs));
+the `user_content_committed` receipt for an image is still sent only once the
+image is persisted.
 
 The associated session-level `session/subscribe` event stream is a bounded
 live subscription. A lagging consumer receives a typed `stream_truncated`
@@ -851,8 +856,25 @@ member holds until that turn's own rows commit. While such a turn runs (for
 example voice-delegated work in the existing member, above), later live rows
 wait behind it, so the persisted transcript can lag the conversation by up to
 that turn's length. Once the turn's boundary commits, the waiting rows commit
-in their original order. These ordering guarantees hold per channel, not
-across channels of the same session.
+in their original order. On a GPT Live channel they all commit then, before a
+member turn queued behind them (a typed message, a second delegation) starts:
+the transport holds the boundary across the rows it already has, for at most
+64 rows or about a second at a time, so a queued turn waits at most that long
+for them. A WebSocket or WebRTC live channel queues its waiting rows in
+arrival order off the media path, so its voice, its other observations and the
+client's input keep flowing while a member turn runs, and holds the boundary
+the same way across consecutive transcript rows. A turn completion or
+interruption row takes the boundary on its own, so while member turns queued
+on the session run back to back, the rows after it wait for the next of those
+turns. Such a channel forwards each observation as it arrives, so a frame can
+reach the client before its row commits; if the session refuses a row, the
+channel closes with an error frame (`reason: "projection_error"`) naming the
+row's kind (`row`), its provider item id (`item_id`) and how many later rows
+were not applied (`unapplied_rows`). Once 16 MiB of rows wait, the channel
+closes with `reason: "projection_backlog_full"`; every row it already queued
+still commits. These ordering guarantees hold per channel, not across channels
+of the same session, and the rows of a closed channel that are still
+committing can interleave with a reopened channel's rows.
 
 A channel that closes while the member's turn runs does not wait for the turn.
 The rows still waiting are handed to the close, which commits them once the
@@ -865,7 +887,9 @@ later row can commit ahead of a row the close holds, and a channel reopened on
 the same session can commit its rows ahead of rows a closed channel still
 replays, so the transcript order can differ from the conversation; no row is
 lost. A close that fails before it commits leaves the rows it found deferred on
-the channel for its retry.
+the channel for its retry. On a WebSocket or WebRTC channel the rows its
+transport queued commit after the close in the same way, in order, also when
+the client disconnected, and are held in memory the same way.
 
 A row the session refuses for any other reason (for example an assistant output
 whose provider turn never reached the runtime) is not recorded. The session's
@@ -1097,7 +1121,12 @@ Output without playback evidence remains explicitly unmeasured.
 Canonical context appends are claimed by generated authority. A concurrent
 drain of the same pending edge defers without reminting send authority; an
 already acknowledged edge is not resent. A provider turn that wins the
-boundary also produces a typed deferral, not a projection failure. Local
+boundary also produces a typed deferral, not a projection failure. Rows from
+the session's other activity, such as a typed message and its reply, reach
+the voice model's context only between provider turns: while the provider
+holds a turn open, including a user turn it has not finished, they wait in
+order and are appended once that turn ends, and they remain in the session
+transcript meanwhile. Local
 cursor/row bookkeeping is serialized only during projection and receipt
 realization, never while waiting for a provider acknowledgement.
 Enqueue acknowledges store-sealed canonical staging, not provider delivery.
@@ -1234,9 +1263,9 @@ least one release.
 - **Ordinary/default composition uses OpenAI Realtime.** Its provider integration is OpenAI's Realtime API (`gpt-realtime-2`), not Azure OpenAI (`azure_openai`) or other providers. Public `gpt-live-1` uses the separate host-composed `openai-live` / execution-identity / WebRTC path above; the private experimental path is deprecated.
 - **One live channel per session.** A session has at most one live channel at a time. For per-member live channels in mobs, open channels against individual member sessions.
 - **Deferred sessions are model-gated.** `live/open` may materialize a deferred session whose resolved model is realtime-capable; a deferred non-realtime session is rejected before channel creation.
-- **Live rows wait for a running member turn.** Transcript rows commit in arrival order behind a running turn of the member, so the persisted transcript can lag the conversation by that turn's length; rows handed to a channel close are held in memory until they commit and are lost if the process exits first, and a row released mid-close can commit ahead of an earlier held row (see [Transcript rows while the member's turn runs](#transcript-rows-while-the-members-turn-runs)).
+- **Live rows wait for a running member turn.** Transcript rows commit in arrival order behind a running turn of the member, so the persisted transcript can lag the conversation by that turn's length (on a WebSocket or WebRTC channel, by each member turn queued behind it while turns run back to back; that channel's voice and events keep flowing meanwhile); rows handed to a channel close are held in memory until they commit and are lost if the process exits first, and a row released mid-close can commit ahead of an earlier held row (see [Transcript rows while the member's turn runs](#transcript-rows-while-the-members-turn-runs)).
 - **Ordinary Realtime refresh is not instruction/history replay.** Supported mutable settings such as visible tools can refresh; canonical `System`-sequence changes, model/provider swaps, and canonical transcript or user-content-registry rewrites require `live/close` + `live/open`. The adapter remains fixed to PCM 24 kHz mono, including after reopen.
-- **GPT Live may delegate a question asked over its own playback.** Public `gpt-live-1` sessions use client delegation for the whole session, and the provider's delegation events carry no typed reason, so Meerkat cannot keep a single turn native. A question that starts while the assistant is still speaking, before the cue for a delegated result has been sent, can be routed to the executor even when it asks about the conversation itself.
+- **GPT Live may delegate a question asked over its own playback.** Public `gpt-live-1` sessions use client delegation for the whole session, and the provider's delegation events carry no typed reason, so Meerkat cannot keep a single turn native. A question that starts while the assistant is still speaking, before the cue for a delegated result has been sent, can be routed to the executor even when it asks about the conversation itself. The user then hears the answer late, in the same voice, once the executor's turn has finished and its result has been spoken after at least 1.6 s of output silence; occasionally the voice instead resumes its earlier readout and never answers, and the question has to be asked again.
 
 ## See also
 

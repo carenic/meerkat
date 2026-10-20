@@ -1,5 +1,5 @@
 Covers: Meerkat 0.9 API surface changes: JSON-RPC methods and REST routes
-added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32036)
+added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32037)
 with HTTP status, input readiness kinds (`original_admission_pending`), and
 real `rkat` exit codes; Python, TypeScript and Web SDK changes (RunInput,
 CONNECTION_CLOSED stderr tail, wasm stack, 0.9.4 `run_failed` content-filtered
@@ -64,6 +64,7 @@ with the resumable session identity in `details`.
 | `APPROVAL_CONFLICT` | -32034 | 409 | Approval changed by another owner (0.9.0) |
 | `APPROVAL_COMMIT_UNKNOWN` | -32035 | 500 | Approval commit unknown; reconcile (0.9.0) |
 | `STALE_DELIVERY_SCOPE` | -32036 | 409 | Member session rotated; re-capture the delivery scope (0.9.0) |
+| `FORK_INSTRUCTION_REFUSED` | -32037 | 422 | A fork refused before commit by the fork instruction policy; `data.fork_instruction_refusal` names the cause and keys; CLI exit 57 (0.9.4) |
 | `INVALID_PARAMS` | -32602 | 400 | Invalid request |
 | `INTERNAL_ERROR` | -32603 | 500 | Unexpected failure |
 
@@ -309,6 +310,12 @@ CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo install rkat --locked
   `--config 'profile.release.package.meerkat-mob.opt-level=0'` lowers that
   one (to about 6 GiB). Under 8 GiB, prefer a prebuilt binary.
 - Builds need a C compiler and libc headers (bundled SQLite), no OpenSSL.
+  Since 0.9.4 set `LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0
+  -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"`
+  for a build outside the repository (`cargo install`, an embedding
+  application): it turns off SQLite's three process-wide locks, which the
+  repository's own builds and the release binaries already do; otherwise
+  `rkat storage doctor` warns `sqlite-lock-profile`.
 - Reduced builds are source-only. The repository keeps `rkat
   --no-default-features --features session-store`, `session-store,mcp` and
   `session-store,comms,mcp,workgraph` compiling; leaving out the mob graph
@@ -373,6 +380,42 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   (`Conflict`, `NotAdmitted`, `UnknownRuntime`, `Unavailable`).
 - `meerkat_sqlite::preflight_domain_version` runs the schema eligibility check
   and returns the ledger version it verified (`None` for a fresh domain).
+- Fork instruction policy: `SessionError::ForkInstructionRefused` (wire
+  `FORK_INSTRUCTION_REFUSED`; exhaustive matches handle it).
+  `SessionForkAtRequest`, `SessionForkReplaceRequest` and
+  `DurableSessionForkTarget` gain `inherited_instructions` (`None` is the
+  default policy) and `SessionForkResult` gains `reactivated_instruction_count`
+  (`prefix_message_count()` excludes those rows); struct literals set them.
+  New: `ForkInstructionPolicy` (`RequireExplicitActivation` default,
+  `ReactivateInherited`, `Refuse`) with `effective`, `ActivationWindow`,
+  `ForkInstructionRefusal` and `ForkInstructionRefusalCause`,
+  `Session::apply_fork_instruction_policy`, `Session::fork_reactivation_suffix_len`.
+  A turn refused because a fork child never activated its inherited keys
+  fails with `AgentError::InstructionActivation` (was `ConfigError(String)`;
+  same error class and wire code).
+- `CompletionWaitError` is `#[non_exhaustive]` (add a wildcard arm) and gains
+  `BoundaryRolledBack { run_id, detail }` and `DurableOutcomeUnknown { run_id }`
+  (predicates `is_boundary_rolled_back`, `is_durable_outcome_unknown`; both map
+  to the `AuthorityUnavailable` wait-failure observation).
+  `RuntimeStore::commit_outcome_deadline`, declared through
+  `RuntimeSessionAuthorityOps::commit_outcome_deadline` (decorators forward
+  it; a composed store adds the busy timeout of each lock-acquiring
+  transaction of its own; default `DEFAULT_COMMIT_OUTCOME_DEADLINE` = two
+  `COMMIT_BUSY_WINDOW`s of 60 s; `InMemoryRuntimeStore` declares none).
+- `RuntimeDriverError::InputTerminalNotYetReadable { input_id, reason }`
+  (retryable; the enum is `#[non_exhaustive]`):
+  `SessionServiceRuntimeExt::input_terminal_completion` on a session degraded
+  behind a commit past its deadline refuses with it instead of waiting for
+  the held driver; read again after the reload.
+- `ScheduleTargetDelivery::deliver_occurrence`: the completion of an exact
+  replay (a deduplicated redelivery) now decides the occurrence's terminal,
+  so it must resolve from the original input's own terminal outcome; the
+  driver never records a terminal at admission.
+- `MeerkatMachine::bind_scoped_context` refuses a destination whose
+  `context_generation` does not advance with
+  `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`
+  (was `Internal`). `PreparedSessionMaterialization::inserted_registration()`
+  says whether the materialization's own prepare inserted the registration.
 - `TurnStateHandle` gains provided methods `turn_phase`,
   `apply_turn_input_observing_phase` and `scalars` (`TurnStateScalars`);
   existing implementors keep working.
@@ -396,6 +439,25 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   digest-verified body; open `SqliteSessionStore` on the file first, write no
   session row before it returns, and never use it on a realm database. Report:
   `StandaloneWholeBlobConversionReport`.
+- SQLite lock profile: `meerkat_sqlite::lock_profile` with
+  `REQUIRED_LIBSQLITE3_FLAGS`, `SqliteLockProfile::compiled()` / `effective()`,
+  `check_lock_profile()` (`SqliteLockProfileMismatch` names the setting) and
+  `unsafe fn disable_memory_statistics_at_process_start()` (call it as the
+  first statement of `main`; `MemoryStatisticsOutcome` `Applied`, `AlreadyOff`
+  or `TooLate`, read back with `memory_statistics_outcome()`).
+  `StorageDiagnosis::sqlite_lock_profile` (`SqliteLockProfileReport`,
+  `SqliteMemoryStatisticsSwitch` in `meerkat-core`) is filled by the disk
+  diagnosis only.
+- Presence locks: `meerkat_sqlite::KeptConnectionPresence` (`<file>.mpresence`,
+  `presence_lock_path`), held shared by a kept connection for its whole life.
+  `ExclusiveFence` now also holds the presence lock: `try_acquire` takes both
+  or neither, and `acquire` waits for the presence lock within the same
+  deadline.
+- `RuntimeStore::delivery_generation_reader` (defaulted, `None` reads through
+  `load_delivery_generation`) returns an optional `DeliveryGenerationReader`
+  for a delivery owner's store ticks; `RuntimeDeliveryInbox::delivery_generation_reader`
+  and `KEPT_DELIVERY_READER_IDLE` (1 s). A store decorator forwards the method
+  to the store it wraps or keeps the default.
 - `meerkat_core::strand_layout_for_retained_history` lays out the retained part
   of a transcript graph, including one that retired its oldest occurrences,
   and returns `RetainedStrandLayout`; `strand_layout_for_history` still refuses

@@ -883,6 +883,16 @@ impl RuntimeDeliveryInbox {
         Ok(self.store.load_delivery_generation().await?)
     }
 
+    /// The store's reader of its delivery generation for a delivery owner's
+    /// store ticks, if the store keeps one; see
+    /// [`RuntimeStore::delivery_generation_reader`]. `None` reads through
+    /// [`Self::delivery_generation`].
+    pub fn delivery_generation_reader(
+        &self,
+    ) -> Option<Box<dyn crate::store::DeliveryGenerationReader>> {
+        self.store.delivery_generation_reader()
+    }
+
     /// How sessions on this inbox's store are hosted across processes
     /// (#1813): delivery owners route rows and wake by it.
     pub fn hosting_capability(&self) -> crate::session_hosting::HostingCapability {

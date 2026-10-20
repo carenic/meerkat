@@ -127,10 +127,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use super::custody_types::{
-    ForeignIncarnationLiveness, ForeignProcfsView, ProcessCustodyError,
-    ProcessCustodyRecoveryReport, ProcessCustodySweepReport, RecoveredToolProcess, ScopeSweep,
-    ToolProcessCessation, ToolProcessSpawner,
+    ForeignIncarnationLiveness, ProcessCustodyError, ProcessCustodyRecoveryReport,
+    ProcessCustodySweepReport, RecoveredToolProcess, ScopeSweep, ToolProcessCessation,
+    ToolProcessSpawner,
 };
+// Only the Linux procfs probe and the tests name it here; elsewhere this
+// import would be unused.
+#[cfg(any(target_os = "linux", test))]
+pub use super::custody_types::ForeignProcfsView;
 
 /// Directory, under a realm runtime root, that holds custody records.
 pub const PROCESS_CUSTODY_DIR: &str = "tool_process_custody";

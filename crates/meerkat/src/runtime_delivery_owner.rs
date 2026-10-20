@@ -41,8 +41,9 @@ use futures::future::{BoxFuture, FutureExt as _, Shared};
 use meerkat_core::SessionId;
 use meerkat_jobs::DetachedJobStore;
 use meerkat_runtime::{
-    ColdDeliveryOwnership, HostingCapability, HostingClaim, HostingRefused, LogicalRuntimeId,
-    RetainedNotificationRegistration, RuntimeDeliveryInbox, RuntimeDeliveryKind,
+    ColdDeliveryOwnership, DeliveryGenerationReader, HostingCapability, HostingClaim,
+    HostingRefused, KEPT_DELIVERY_READER_IDLE, LogicalRuntimeId, RetainedNotificationRegistration,
+    RuntimeDeliveryError, RuntimeDeliveryInbox, RuntimeDeliveryKind,
     RuntimeDeliveryOwnerAlreadyArmed, RuntimeDeliveryOwnership,
 };
 use tokio::sync::watch;
@@ -382,6 +383,16 @@ impl RuntimeDeliveryOwner {
         // seen by the pass or ticks the watch (at worst at the next sweep).
         let retained = Arc::new(OnceLock::new());
         let store_watch = StoreWake::start(&capability, self.store_sweep, &retained);
+        // Each tick of a watched store reads the delivery generation: through
+        // the store's kept reader when it keeps one. An unwatched
+        // store reads it only when a pass reconciles, and keeps nothing.
+        let generation_reader = if store_watch.is_watching() {
+            self.runtime_inbox
+                .delivery_generation_reader()
+                .map(std::sync::Mutex::new)
+        } else {
+            None
+        };
         let cold = meerkat_runtime::try_cold_delivery_ownership(&capability);
         let (stop, stop_rx) = watch::channel(false);
         let projects_owed = host.projects_owed_continuations();
@@ -402,6 +413,8 @@ impl RuntimeDeliveryOwner {
             capability,
             store_watch,
             last_delivery_generation: None,
+            generation_reader,
+            generation_reader_idle_at: None,
             cold,
             awaiting: HashMap::new(),
             stop: Some(stop_rx),
@@ -665,6 +678,14 @@ impl StoreWake {
         }
     }
 
+    fn is_watching(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Watching { .. } => true,
+            Self::NotShared | Self::Unavailable(_) => false,
+        }
+    }
+
     fn unavailable_reason(&self) -> Option<String> {
         match self {
             Self::Unavailable(reason) => Some(reason.clone()),
@@ -710,6 +731,17 @@ struct OwnerLoop {
     /// The store's durable delivery generation as last reconciled; a store
     /// tick reconciles only when it moved.
     last_delivery_generation: Option<u64>,
+    /// The store's kept reader of its delivery generation: on a
+    /// watched store whose store keeps one; `None` reads through the inbox.
+    /// One per owner, so one kept connection per runtime delivery inbox. The
+    /// loop reaches it only through `&mut self` (`Mutex::get_mut`, which never
+    /// locks); the mutex only makes the loop `Sync` for the `&OwnerLoop`
+    /// borrows its passes hold across awaits.
+    generation_reader: Option<std::sync::Mutex<Box<dyn DeliveryGenerationReader>>>,
+    /// When the kept reader closes its connection for quiet
+    /// ([`KEPT_DELIVERY_READER_IDLE`] after its last read); `None` while it
+    /// keeps nothing.
+    generation_reader_idle_at: Option<tokio::time::Instant>,
     cold: ColdDeliveryOwnership,
     /// The handle's retirement request. `None` once the handle is gone
     /// without one (detached): the owner then runs on its other signals.
@@ -754,6 +786,36 @@ struct AwaitingWait {
 }
 
 impl OwnerLoop {
+    /// The store's delivery generation, through the kept reader when there is
+    /// one. A read that leaves a connection kept restarts its idle bound.
+    async fn read_delivery_generation(&mut self) -> Result<u64, RuntimeDeliveryError> {
+        let Some(reader) = self.generation_reader.as_mut() else {
+            return self.ownership.inbox().delivery_generation().await;
+        };
+        let reader = reader
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let read = reader.read().await;
+        self.generation_reader_idle_at = reader
+            .keeps_connection()
+            .then(|| tokio::time::Instant::now() + KEPT_DELIVERY_READER_IDLE);
+        Ok(read?)
+    }
+
+    /// Close the kept reader's connection: once the store has been quiet for
+    /// [`KEPT_DELIVERY_READER_IDLE`], and before the owner calls into the host
+    /// (a delivery, a round of owed continuations, an address resolution),
+    /// which can wait.
+    fn release_generation_reader(&mut self) {
+        if let Some(reader) = self.generation_reader.as_mut() {
+            reader
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release();
+        }
+        self.generation_reader_idle_at = None;
+    }
+
     /// Answer a store tick with cheap reads: take cold-delivery ownership if
     /// its holder released it (or died), and return the awaiting delivery
     /// runtimes that have a recipient this process may now apply. Reconciles (sets
@@ -770,12 +832,18 @@ impl OwnerLoop {
         if !wake.reconcile {
             // One row read. Writes by sessions and other stores tick the
             // watch too; they cost only this read.
-            match self.ownership.inbox().delivery_generation().await {
+            match self.read_delivery_generation().await {
                 Ok(current) if self.last_delivery_generation == Some(current) => {}
                 Ok(_) | Err(_) => wake.reconcile = true,
             }
         }
         let applies_cold = self.cold.applies_cold_deliveries();
+        // Resolving an address calls into the host, which can wait (it can
+        // revive a member): the kept reader's connection closes first. Routes
+        // read the claim registry and keep it.
+        if self.awaiting.values().any(|wait| wait.via_address) {
+            self.release_generation_reader();
+        }
         let mut due = Vec::new();
         for (runtime_id, wait) in &self.awaiting {
             let recipients = if wait.via_address {
@@ -966,73 +1034,85 @@ async fn run_owner(mut owner: OwnerLoop) {
             reconcile: reconcile_failed || std::mem::take(&mut reconcile_owed),
             ..Wake::default()
         };
-        tokio::select! {
-            changed = owner.job_commits.changed() => {
-                if changed.is_err() {
-                    return;
+        // Waits for the next wake. The kept generation reader's idle bound
+        // also ends a wait, but only closes the reader's connection.
+        loop {
+            tokio::select! {
+                changed = owner.job_commits.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    wake.job_commit = true;
                 }
-                wake.job_commit = true;
-            }
-            changed = owner.inbox_commits.changed() => {
-                if changed.is_err() {
-                    return;
+                changed = owner.inbox_commits.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    wake.inbox_commit = true;
                 }
-                wake.inbox_commit = true;
-            }
-            changed = optional_changed(&mut owner.attachment_commits) => {
-                // A closed attachment signal means the runtime is gone.
-                if changed.is_err() {
-                    return;
-                }
-                wake.retry_blocked = true;
-            }
-            changed = optional_changed(&mut owner.run_settlements) => {
-                if changed.is_err() {
-                    return;
-                }
-                wake.retry_blocked = true;
-            }
-            changed = optional_changed(&mut owner.source_changes) => {
-                if changed.is_ok() {
+                changed = optional_changed(&mut owner.attachment_commits) => {
+                    // A closed attachment signal means the runtime is gone.
+                    if changed.is_err() {
+                        return;
+                    }
                     wake.retry_blocked = true;
-                    wake.source_change = true;
-                } else {
-                    // The bindings are gone: their hint ends here, once, and
-                    // is not polled again. It never stops the owner: the
-                    // host and the runtime signals keep their lifetime
-                    // checks, and the other wakes keep serving.
-                    owner.source_changes = None;
                 }
-            }
-            changed = optional_changed(&mut owner.owed_changes) => {
-                if changed.is_ok() {
+                changed = optional_changed(&mut owner.run_settlements) => {
+                    if changed.is_err() {
+                        return;
+                    }
                     wake.retry_blocked = true;
-                    wake.source_change = true;
-                } else {
-                    // The owing source is gone: its hint ends here, once.
-                    owner.owed_changes = None;
+                }
+                changed = optional_changed(&mut owner.source_changes) => {
+                    if changed.is_ok() {
+                        wake.retry_blocked = true;
+                        wake.source_change = true;
+                    } else {
+                        // The bindings are gone: their hint ends here, once, and
+                        // is not polled again. It never stops the owner: the
+                        // host and the runtime signals keep their lifetime
+                        // checks, and the other wakes keep serving.
+                        owner.source_changes = None;
+                    }
+                }
+                changed = optional_changed(&mut owner.owed_changes) => {
+                    if changed.is_ok() {
+                        wake.retry_blocked = true;
+                        wake.source_change = true;
+                    } else {
+                        // The owing source is gone: its hint ends here, once.
+                        owner.owed_changes = None;
+                    }
+                }
+                changed = owner.store_watch.tick() => {
+                    // The watch's sender lives as long as the watch this loop
+                    // owns; a closed one means the watch thread ended, and the
+                    // store is then reported unwatched.
+                    if changed.is_ok() {
+                        wake.store_tick = true;
+                    } else {
+                        owner.store_watch = StoreWake::Unavailable(
+                            "the store watch stopped".to_string(),
+                        );
+                        wake.reconcile = true;
+                    }
+                }
+                changed = optional_changed(&mut owner.stop) => {
+                    // The loop's top returns on a retirement request. A handle
+                    // gone without one was detached: its owner runs on.
+                    if changed.is_err() {
+                        owner.stop = None;
+                    }
+                }
+                () = generation_reader_idle(owner.generation_reader_idle_at) => {
+                    // The store has been quiet for the reader's idle bound:
+                    // close its connection. Nothing changed, so this is no
+                    // wake and runs no pass.
+                    owner.release_generation_reader();
+                    continue;
                 }
             }
-            changed = owner.store_watch.tick() => {
-                // The watch's sender lives as long as the watch this loop
-                // owns; a closed one means the watch thread ended, and the
-                // store is then reported unwatched.
-                if changed.is_ok() {
-                    wake.store_tick = true;
-                } else {
-                    owner.store_watch = StoreWake::Unavailable(
-                        "the store watch stopped".to_string(),
-                    );
-                    wake.reconcile = true;
-                }
-            }
-            changed = optional_changed(&mut owner.stop) => {
-                // The loop's top returns on a retirement request. A handle
-                // gone without one was detached: its owner runs on.
-                if changed.is_err() {
-                    owner.stop = None;
-                }
-            }
+            break;
         }
         // A wake arrived: a failed projection's retry owed to it joins the
         // pass it starts.
@@ -1045,6 +1125,15 @@ async fn optional_changed<T>(
 ) -> Result<(), watch::error::RecvError> {
     match signal {
         Some(signal) => signal.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when the kept generation reader's idle bound passes; never while
+/// it keeps nothing.
+async fn generation_reader_idle(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
 }
@@ -1103,6 +1192,9 @@ async fn run_pass(
     // `OwedRound`), before the inbox is collected, so the rows it commits
     // drain in this pass.
     if let Some(round) = owner.owed_round.take() {
+        // Projecting owed continuations calls into the host, which can wait:
+        // the kept reader's connection closes first.
+        owner.release_generation_reader();
         let projection = owner
             .host
             .project_owed_continuations(round.after.as_ref(), DELIVERY_PAGE)
@@ -1126,7 +1218,7 @@ async fn run_pass(
     if wake.reconcile {
         // Record the generation BEFORE reading the backlog, so a commit
         // landing during the read moves it again and wakes the next pass.
-        if let Ok(current) = owner.ownership.inbox().delivery_generation().await {
+        if let Ok(current) = owner.read_delivery_generation().await {
             owner.last_delivery_generation = Some(current);
         }
         match owner
@@ -1174,6 +1266,12 @@ async fn run_pass(
     let mut seen = HashSet::new();
     runtimes.retain(|runtime_id| seen.insert(runtime_id.clone()));
 
+    // Delivering calls into the host, which can wait: the kept reader's
+    // connection closes first, so maintenance never waits on a delivery. The
+    // next store tick opens it again.
+    if !runtimes.is_empty() {
+        owner.release_generation_reader();
+    }
     for runtime_id in runtimes {
         let (session_id, via_address) = match serving_session(owner, &runtime_id).await {
             Ok(ServingSession::Session(session_id)) => (session_id, false),

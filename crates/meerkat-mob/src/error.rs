@@ -206,6 +206,49 @@ impl std::fmt::Display for MobDefinitionProjectionMismatchKind {
     }
 }
 
+/// How a mob store's creation record and its event log disagree (see
+/// [`MobError::IncarnationInconsistent`]). The creation record names the
+/// incarnation the store's mob was created at; one record goes with each
+/// `MobCreated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IncarnationInconsistency {
+    /// A creation record that is not finalized, in a store whose log holds
+    /// no `MobCreated`.
+    RecordWithoutCreation,
+    /// The creation record names another mob than the store's `MobCreated`.
+    RecordOfAnotherMob { record_mob_id: MobId },
+    /// A finalized creation record (a finished destroy) next to a
+    /// `MobCreated` that no creation record names.
+    FinalizedRecordWithCreation,
+    /// More than one creation record in one store.
+    MultipleRecords { count: u64 },
+    /// A raw `MobCreated` append over a store that holds a creation record:
+    /// only the creation itself writes `MobCreated` with its record. Nothing
+    /// was written.
+    RawCreationOverRecord,
+}
+
+impl std::fmt::Display for IncarnationInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RecordWithoutCreation => {
+                f.write_str("its creation record has no MobCreated in the log")
+            }
+            Self::RecordOfAnotherMob { record_mob_id } => {
+                write!(f, "its creation record names mob '{record_mob_id}'")
+            }
+            Self::FinalizedRecordWithCreation => f.write_str(
+                "its creation record is finalized but the log holds a MobCreated it does not name",
+            ),
+            Self::MultipleRecords { count } => write!(f, "it holds {count} creation records"),
+            Self::RawCreationOverRecord => {
+                f.write_str("a raw MobCreated append would bypass its creation record")
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for MobMemberCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1468,6 +1511,57 @@ pub enum MobError {
         session_id: meerkat_core::types::SessionId,
         error: meerkat_runtime::RuntimeDriverError,
     },
+
+    /// The mob's store holds a creation record and an event log that
+    /// disagree, so the mob is not resumed (or the write that would make
+    /// them disagree is refused). The store is left as it was.
+    #[error("mob '{mob_id}' has an inconsistent creation record: {inconsistency}")]
+    IncarnationInconsistent {
+        mob_id: MobId,
+        inconsistency: IncarnationInconsistency,
+    },
+
+    /// The mob's store holds a finished destroy of `incarnation` (its
+    /// creation record is finalized) whose files are not removed yet. The
+    /// mob is not resumed.
+    #[error("mob '{mob_id}' at incarnation {incarnation} was destroyed")]
+    IncarnationDestroyed {
+        mob_id: MobId,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    },
+
+    /// A create by a caller session was refused because the hosted rosters
+    /// that could name that session could not all be read, so its provenance
+    /// is not known (see `meerkat_mob::MobProvenance`). `mob_id` names the
+    /// mob whose roster or creation record could not be read; it is `None`
+    /// while the host's mob set is not restored. Nothing was created; the
+    /// create can be retried once the named mob is readable (or destroyed)
+    /// and the mob set is restored.
+    #[error("{}", provenance_unavailable_message(mob_id.as_ref()))]
+    ProvenanceUnavailable { mob_id: Option<MobId> },
+
+    /// A member delivery scope captured at another incarnation of this mob
+    /// reached a scoped verb (see `meerkat_mob::MemberDeliveryScope`).
+    /// `expected` is the incarnation the scope names, `None` for a version-1
+    /// scope, which names none and is honoured only by an incarnation
+    /// assigned to a store from before 0.9.4. `current` is the incarnation
+    /// this mob runs at. Nothing was read or changed.
+    #[error("{}", incarnation_mismatch_message(mob_id, expected.as_ref(), current.as_ref()))]
+    IncarnationMismatch {
+        mob_id: MobId,
+        expected: Option<meerkat_core::service::MobIncarnationId>,
+        current: Option<meerkat_core::service::MobIncarnationId>,
+    },
+
+    /// A respawn was refused before anything was retired: the restrictions
+    /// the member inherited from its spawner (launch tool access policy and
+    /// visibility ceiling) could not be established for its successor, or
+    /// the member changed while they were read. The member keeps running.
+    #[error("respawn of member {agent_identity} refused: {reason}")]
+    RespawnPredecessorRestrictionsUnavailable {
+        agent_identity: String,
+        reason: String,
+    },
 }
 
 /// The stable token of the runtime verdict a member's destination install
@@ -1486,6 +1580,34 @@ fn destination_install_refusal_cause(error: &meerkat_runtime::RuntimeDriverError
         Verdict::Destroyed => "destroyed",
         Verdict::Internal(_) => "internal",
         _ => "other",
+    }
+}
+
+fn incarnation_mismatch_message(
+    mob_id: &MobId,
+    expected: Option<&meerkat_core::service::MobIncarnationId>,
+    current: Option<&meerkat_core::service::MobIncarnationId>,
+) -> String {
+    let expected = match expected {
+        Some(incarnation) => format!("incarnation {incarnation}"),
+        None => "no incarnation (a version-1 scope)".to_string(),
+    };
+    let current = match current {
+        Some(incarnation) => format!("runs at incarnation {incarnation}"),
+        None => "has no live incarnation here".to_string(),
+    };
+    format!("mob '{mob_id}' {current}; the delivery scope names {expected}")
+}
+
+fn provenance_unavailable_message(mob_id: Option<&MobId>) -> String {
+    match mob_id {
+        Some(mob_id) => format!(
+            "the creator of this mob cannot be recorded: the roster of mob '{mob_id}' could not \
+             be read"
+        ),
+        None => "the creator of this mob cannot be recorded: the host's mob set is not restored \
+                 yet"
+        .to_string(),
     }
 }
 
@@ -1651,6 +1773,13 @@ impl From<crate::store::MobStoreError> for MobError {
             crate::store::MobStoreError::FrameAtomicPersistenceUnavailable { operation } => {
                 Self::FrameAtomicPersistenceUnavailable { operation }
             }
+            crate::store::MobStoreError::IncarnationInconsistent {
+                mob_id,
+                inconsistency,
+            } => Self::IncarnationInconsistent {
+                mob_id,
+                inconsistency,
+            },
             other => Self::StorageError(Box::new(other)),
         }
     }
@@ -2128,7 +2257,12 @@ impl MobError {
             | Self::MemberSessionNotLive { .. }
             | Self::FlowNotFound(_)
             | Self::RunNotFound(_)
-            | Self::WorkNotFound(_) => MobFailureClass::TargetMissing,
+            | Self::WorkNotFound(_)
+            // The addressed incarnation is over for good: a finished destroy,
+            // or a scope captured at an incarnation this mob does not run at
+            // (a live handle's `current` is final).
+            | Self::IncarnationDestroyed { .. }
+            | Self::IncarnationMismatch { .. } => MobFailureClass::TargetMissing,
             Self::SessionUnavailableForResume { reason, .. } => match reason {
                 SessionResumeUnavailableReason::Absent => MobFailureClass::TargetMissing,
                 SessionResumeUnavailableReason::ArchivedNotRevivable => {
@@ -2168,9 +2302,10 @@ impl MobError {
             | Self::FlowTurnTimedOut => MobFailureClass::Transport,
             Self::Internal(_)
             | Self::WorkInputCompletionUnavailable { .. }
-            | Self::ExternalMemberCleanupUncertain { .. } => {
-                MobFailureClass::Internal
-            }
+            | Self::ExternalMemberCleanupUncertain { .. }
+            // The store disagrees with itself, as
+            // `ContradictoryDurableAuthority` above.
+            | Self::IncarnationInconsistent { .. } => MobFailureClass::Internal,
             Self::CallbackPending { .. }
             | Self::CallbackBatchPending { .. }
             | Self::RetirementInProgress { .. }
@@ -2199,7 +2334,11 @@ impl MobError {
             // The host refused the restored member: only an explicit repair
             // brings it back.
             | Self::MemberRegistrationRefused { .. }
-            | Self::MemberDestinationNotInstalled { .. } => MobFailureClass::RuntimeRejected,
+            | Self::MemberDestinationNotInstalled { .. }
+            // An explicit action closes it (declare the restored mob set, or
+            // destroy or repair the named held child), the same shape as
+            // `MemberReloadRequired`.
+            | Self::ProvenanceUnavailable { .. } => MobFailureClass::RuntimeRejected,
             _ => MobFailureClass::MobRejected,
         }
     }
@@ -2615,6 +2754,10 @@ mod tests {
                 session_id: meerkat_core::types::SessionId::new(),
                 reason: "durable authority unreadable".to_string(),
             },
+            MobError::RespawnPredecessorRestrictionsUnavailable {
+                agent_identity: "worker".to_string(),
+                reason: "no inherited tool restriction evidence".to_string(),
+            },
             MobError::MemberReloadTimedOut {
                 session_id: meerkat_core::types::SessionId::new(),
                 stage: "durability_reload_discard",
@@ -2746,6 +2889,21 @@ mod tests {
             MobError::FlowNotFound(FlowId::from("f")),
             MobError::RunNotFound(RunId::new()),
             MobError::WorkNotFound(WorkRef::new()),
+            MobError::IncarnationDestroyed {
+                mob_id: MobId::from("mob"),
+                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+            },
+            MobError::IncarnationMismatch {
+                mob_id: MobId::from("mob"),
+                expected: Some(meerkat_core::service::MobIncarnationId::mint()),
+                current: Some(meerkat_core::service::MobIncarnationId::mint()),
+            },
+            // A version-1 scope at an incarnation that does not honour it.
+            MobError::IncarnationMismatch {
+                mob_id: MobId::from("mob"),
+                expected: None,
+                current: Some(meerkat_core::service::MobIncarnationId::mint()),
+            },
         ];
         for err in &missing {
             assert_eq!(
@@ -2804,6 +2962,23 @@ mod tests {
             (
                 MobError::Internal("i".to_string()),
                 MobFailureClass::Internal,
+            ),
+            (
+                MobError::IncarnationInconsistent {
+                    mob_id: MobId::from("mob"),
+                    inconsistency: IncarnationInconsistency::RecordWithoutCreation,
+                },
+                MobFailureClass::Internal,
+            ),
+            (
+                MobError::ProvenanceUnavailable {
+                    mob_id: Some(MobId::from("mob")),
+                },
+                MobFailureClass::RuntimeRejected,
+            ),
+            (
+                MobError::ProvenanceUnavailable { mob_id: None },
+                MobFailureClass::RuntimeRejected,
             ),
             // A variant outside every explicit arm falls through to the
             // mob-rejected default.

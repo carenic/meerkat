@@ -40,8 +40,8 @@ each choice.
 | Human consent | The existing approval owner maintains request, decision, and expiry audit records. Native R3 consent (since 0.9.0) adds authenticated action-bound decisions and conditional consumption at entry; a restored consent record is history only. See [Human consent](#human-consent). |
 | OS confinement | Required confinement covers shell launches (foreground, background and recovered monitors), command hooks and local MCP stdio servers, with backends on macOS and Linux; on other platforms a required launch refuses. Containers count only for the isolation they really provide. |
 | Console access administration | The Access panel edits Meta console ABAC, not native tool, source or account grants. Console projection does not activate native governance. |
-| Publication and overhead | The explicit native and fixed-host JSONL profiles have normal publication and recorded CI qualification. Completed measurements have not met the cheap-default target: the representative study's six conditional mean comparisons missed their threshold. Full-platform and per-operation p99 acceptance remain open; the implementation checkpoint retains the exact measurements and their limits. |
-| Full application coverage | Tool/source access, peers, schedules, memory/history/export, Elephant, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
+| Publication and overhead | The explicit native profile and the fixed-host JSONL profile ship in the published crates (`meerkat-runtime`'s `local-authorization` feature and `meerkat_rpc::governed_jsonl`). Authorization adds preparation and recording work to each operation; measure that overhead in your deployment. |
+| Full application coverage | Tool/source access, peers, schedules, memory/history/export, knowledge services, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
 
 Do not label a deployment fully governed while it has an unguarded path that can
 perform one of its declared protected operations. An unsupported required
@@ -113,10 +113,10 @@ or destination through trusted owner data. If an adapter knows only that an
 opaque server operation is requested, authorize that conservative whole capability
 or leave it unavailable. Do not pretend a model-supplied label proves a finer rule.
 
-For Elephant, keep query and fetch enforcement in Elephant as well as the
+For a knowledge service, keep query and fetch enforcement in that service as well as the
 Meerkat invocation check. Agree on qualified identities and action/resource
 vocabulary; test allowed reads, denied writes, wrong represented subjects, and
-cross-domain identity collisions. Do not copy Elephant's policy database into
+cross-domain identity collisions. Do not copy the knowledge service's policy database into
 Meerkat or treat a document citation as permission.
 
 ## 3. Bind the actual operation at its execution owner
@@ -308,15 +308,46 @@ TypeScript and Python validators.
 
 ### Preserve restrictions across respawn
 
-`MobHandle::respawn` retires a member and spawns its successor in a fresh
-session with the same profile, labels, wiring, binding (or placement), profile
-and model overrides and runtime mode. It does not copy restrictions the
-predecessor received at spawn time, such as its `SpawnMemberSpec`
-`tool_access_policy` or `inherited_tool_filter` (the inherited tool visibility
-ceiling). To keep them, respawn with `respawn_with_successor_spec` and a spec
-that carries them again, or re-apply them in a `SpawnMemberCustomizer`, which
-also runs for respawns (`SpawnSource::Respawn`). A surviving profile name or
-session reference cannot reconstruct lost restrictions.
+Since 0.9.4 a respawned local member keeps the restrictions it was spawned
+under. `MobHandle::respawn`, `respawn_with_successor_spec` and the
+`mob_respawn` tool give the successor the predecessor's launch tool access
+policy and inherited tool visibility ceiling, as the predecessor's session
+recorded them, intersected with the successor's own. A successor spec or a
+`SpawnMemberCustomizer` can narrow them, never widen them; a host that means
+to widen them retires the member and spawns a new one. The successor keeps the
+auth binding the predecessor's session recorded only when its own spec names
+none and its profile resolves to the provider that binding was recorded for. A
+successor re-profiled to another provider, or to one that cannot be told,
+selects its own binding as a fresh spawn does.
+
+For a member with a local session, the successor's profile and provider are
+resolved before anything is retired. The respawn is refused before
+retirement, and the member is kept, when the predecessor's restrictions cannot
+be established, the successor's profile cannot be resolved, or the member
+changes while they are read. The refusal is
+`MobError::RespawnPredecessorRestrictionsUnavailable`; it has no dedicated wire
+error code in 0.9.4, and on the wire its message reads
+`respawn of member <id> refused: <reason>`. This includes a member whose
+session was lost, for example a Broken member after a cold restart whose
+session store no longer has it: respawn no longer repairs it. A host that
+meets this refusal keeps the other members working and returns local feedback
+to the agent that asked for the respawn. A surviving profile name or session
+reference cannot reconstruct lost restrictions.
+
+Current limits:
+
+- A recorded binding that has since been removed from the realm
+  configuration, or re-pointed to another provider, is not checked before
+  retirement: the successor's build then fails after the predecessor is
+  retired (`MobRespawnError::SpawnAfterRetireWithCause`). Name a binding in a
+  spawn customizer, or retire and spawn.
+- A peer-only member whose generation was never bound to a local session
+  carries no session restrictions; its successor keeps the launch policy and
+  ceiling its own spec inherits. The respawn of a placed (remote) member is
+  unchanged.
+- A custom session service that wraps a built-in one must delegate
+  `MobSessionService::predecessor_tool_restrictions`. Its default reports
+  `Unsupported`, which refuses the respawns of that service's members.
 
 Explicit retirement and a fresh spawn are separate governed operations under
 current authorization and inherited restrictions. They do not recover lost

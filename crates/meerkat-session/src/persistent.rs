@@ -2527,6 +2527,12 @@ pub struct PersistentSessionService<B: SessionAgentBuilder> {
     /// Wakes projections parked on a held turn boundary when a channel is
     /// released so they can return `Busy` without waiting for the turn.
     live_projection_release_changed: tokio::sync::Notify,
+    /// Turn boundaries held for one live channel's projections, see
+    /// [`PersistentSessionService::hold_live_channel_projection_boundary`].
+    /// That channel's projections take the held boundary instead of queueing
+    /// for it. An entry is removed when its hold ends or the channel's close
+    /// releases the channel.
+    live_channel_projection_holds: Arc<LiveChannelProjectionHolds>,
     /// Wakes waiters when a live transcript held ahead of the store can stop
     /// being refused: a runtime turn's boundary commit was acknowledged, a
     /// full persist landed, or the live actor was synchronized from or
@@ -2634,8 +2640,74 @@ struct SessionMutationGuard {
     /// turn: the runtime loop holds the turn-finalization boundary and the
     /// service holds the recovery gate for that whole turn, so the caller is
     /// already inside both.
-    _turn_finalization_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _turn_finalization_guard: Option<TurnBoundaryCustody>,
     _recovery_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// How a [`SessionMutationGuard`] holds the turn-finalization boundary.
+enum TurnBoundaryCustody {
+    /// Acquired for this mutation alone.
+    Owned {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
+    /// Taken from a live channel's projection hold. The boundary stays held
+    /// until the hold and every guard taken under it are gone, so a hold that
+    /// ends mid-mutation never opens the boundary under the write.
+    Shared {
+        _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    },
+}
+
+impl From<tokio::sync::OwnedMutexGuard<()>> for TurnBoundaryCustody {
+    fn from(guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self::Owned { _guard: guard }
+    }
+}
+
+type LiveChannelProjectionHolds = std::sync::Mutex<
+    HashMap<(SessionId, meerkat_core::LiveChannelId), Arc<tokio::sync::OwnedMutexGuard<()>>>,
+>;
+
+/// A session's turn-finalization boundary held for one live channel's
+/// projections, from
+/// [`PersistentSessionService::hold_live_channel_projection_boundary`].
+///
+/// The service's hold entry owns the boundary; this handle only ends it.
+/// Dropping it, or the channel's release revoking the entry, ends the hold:
+/// the channel's projections queue for the boundary again, and the boundary
+/// is released as soon as no mutation taken under the hold is still running.
+#[doc(hidden)]
+#[must_use = "dropping the hold releases the boundary at once"]
+pub struct LiveChannelProjectionBoundaryHold {
+    holds: Arc<LiveChannelProjectionHolds>,
+    key: (SessionId, meerkat_core::LiveChannelId),
+    boundary: std::sync::Weak<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::fmt::Debug for LiveChannelProjectionBoundaryHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveChannelProjectionBoundaryHold")
+            .field("session_id", &self.key.0)
+            .field("channel_id", &self.key.1)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LiveChannelProjectionBoundaryHold {
+    fn drop(&mut self) {
+        let mut holds = self
+            .holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A release may already have revoked this hold, and a later hold may
+        // own the entry now: remove only this hold's own entry.
+        if holds
+            .get(&self.key)
+            .is_some_and(|held| std::ptr::eq(Arc::as_ptr(held), self.boundary.as_ptr()))
+        {
+            holds.remove(&self.key);
+        }
+    }
 }
 
 /// Body-free description of the committed transcript boundary a concurrent
@@ -5364,7 +5436,104 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .live_session_authority_with(id, LiveAuthorityObservation::Published)
                 .await;
         }
+        if Self::is_transcript_revision_conflict(&result)
+            && self.settle_ended_live_turn_durable_tail(id).await
+        {
+            result = self
+                .live_session_authority_with(id, LiveAuthorityObservation::Published)
+                .await;
+        }
         result
+    }
+
+    /// Settle the durable tail of a hosted live session whose runtime turn
+    /// ended without its boundary commit.
+    ///
+    /// A turn that ends after its end-of-run checkpoint applied the
+    /// HeadCanonical provisional tail, but without the boundary commit (a
+    /// retirement's boundary cancel lands between the two), leaves the
+    /// physical head ahead of the RuntimeStore authority while this service
+    /// still hosts the session's live actor. Nothing in this process commits
+    /// that tail any more: every committed read of the session fails closed
+    /// with the typed `TranscriptRevisionConflict`, and resume recovery
+    /// answers `Busy` for the live actor, so only a restart would settle it.
+    /// An observation that still conflicts after its retries runs the same
+    /// store-owned, machine-authorized durable-tail recovery a restart runs,
+    /// and only when all of these hold:
+    /// - the profile is HeadCanonical;
+    /// - this service hosts the session's live actor, so no other process
+    ///   commits it;
+    /// - the store records a provisional tail for the session;
+    /// - the per-session recovery gate is free (a holder owns the tail).
+    ///
+    /// The recovery machine refuses a runtime that is not quiescent, and a
+    /// held or refused tail is left intact. Returns whether the store now
+    /// names a settled boundary, so the caller observes once more.
+    async fn settle_ended_live_turn_durable_tail(&self, id: &SessionId) -> bool {
+        if self.runtime_store.session_persistence_profile()
+            != RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            return false;
+        }
+        if !matches!(self.inner.has_live_session(id).await, Ok(true)) {
+            return false;
+        }
+        match self
+            .runtime_store
+            .load_head_canonical_provisional_tail(&Self::runtime_id_for_session(id))
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "could not observe the provisional tail of a live session whose read conflicts"
+                );
+                return false;
+            }
+        }
+        let recovery_gate = self.recovery_gate_for_session(id).await;
+        let Ok(_recovery_guard) = recovery_gate.try_lock_owned() else {
+            return false;
+        };
+        match self.store_owned_durable_tail_recovery_outcome(id).await {
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Committed { .. }, _)) => {
+                tracing::info!(
+                    session_id = %id,
+                    "settled the durable tail a live session's ended turn left ahead of its runtime boundary"
+                );
+                self.note_live_authority_advanced(id);
+                true
+            }
+            Ok((
+                meerkat_runtime::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. },
+                _,
+            )) => true,
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Held, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery held the tail of a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+            Ok((meerkat_runtime::recovery::DurableTailRecoveryOutcome::Refused, _)) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "durable-tail recovery refused the tail of a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    %error,
+                    "durable-tail recovery failed for a live session whose turn ended without its boundary commit"
+                );
+                false
+            }
+        }
     }
 
     /// Ask the generated document machine to classify pure live-vs-store
@@ -5841,7 +6010,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .discard_stale_live_session_if_needed(id, LiveStalenessPosition::TurnBoundaryHeld)
             .await?;
         Ok(SessionMutationGuard {
-            _turn_finalization_guard: Some(turn_finalization_guard),
+            _turn_finalization_guard: Some(turn_finalization_guard.into()),
             _recovery_guard: Some(recovery_guard),
         })
     }
@@ -5979,7 +6148,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .discard_stale_live_session_if_needed(id, LiveStalenessPosition::TurnBoundaryHeld)
             .await?;
         Ok(SessionMutationGuard {
-            _turn_finalization_guard: Some(turn_finalization_guard),
+            _turn_finalization_guard: Some(turn_finalization_guard.into()),
             _recovery_guard: Some(recovery_guard),
         })
     }
@@ -9305,6 +9474,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             turn_finalization_gates: Mutex::new(HashMap::new()),
             live_projection_released_channels: std::sync::Mutex::new(HashMap::new()),
             live_projection_release_changed: tokio::sync::Notify::new(),
+            live_channel_projection_holds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             live_authority_advanced: tokio::sync::Notify::new(),
             live_uncommitted_terminal_sessions: std::sync::Mutex::new(HashSet::new()),
             event_projection_faults: Arc::new(Mutex::new(HashMap::new())),
@@ -11682,7 +11852,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .map_err(crate::control_error_into_session_error)?;
         }
         Ok(SessionMutationGuard {
-            _turn_finalization_guard: Some(turn_finalization_guard),
+            _turn_finalization_guard: Some(turn_finalization_guard.into()),
             _recovery_guard: Some(recovery_guard),
         })
     }
@@ -11729,6 +11899,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .entry(id.clone())
             .or_default()
             .insert(channel_id.clone());
+        // A projection hold of the released channel ends here: removing its
+        // entry releases the boundary once no mutation taken under the hold
+        // is running, and the channel's later projections queue for the
+        // boundary (refused with `Busy` while it is held) like any other.
+        self.live_channel_projection_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(id.clone(), channel_id.clone()));
         self.live_projection_release_changed.notify_waiters();
     }
 
@@ -11849,34 +12027,119 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
         channel_id: &meerkat_core::LiveChannelId,
     ) -> Result<SessionMutationGuard, SessionError> {
-        let gate = self.turn_finalization_gate_for_session(id).await;
-        let turn_finalization_guard = match Arc::clone(&gate).try_lock_owned() {
-            Ok(guard) => guard,
-            Err(_) => {
-                let lock = Arc::clone(&gate).lock_owned();
-                tokio::pin!(lock);
-                loop {
-                    let changed = self.live_projection_release_changed.notified();
-                    tokio::pin!(changed);
-                    changed.as_mut().enable();
-                    if self.live_projection_turn_boundary_released(id, channel_id) {
-                        return Err(SessionError::Busy { id: id.clone() });
-                    }
-                    tokio::select! {
-                        guard = &mut lock => break guard,
-                        () = &mut changed => {}
-                    }
-                }
-            }
-        };
+        if let Some(held) = self.held_live_channel_projection_boundary(id, channel_id) {
+            return self
+                .realtime_transcript_mutation_guard_with_turn_boundary(
+                    id,
+                    TurnBoundaryCustody::Shared { _guard: held },
+                )
+                .await;
+        }
+        let turn_finalization_guard = self
+            .acquire_turn_boundary_for_live_channel(id, channel_id)
+            .await?;
         self.realtime_transcript_mutation_guard_with_turn_boundary(id, turn_finalization_guard)
             .await
+    }
+
+    /// Take the turn-finalization boundary for a projection from one live
+    /// channel: at once when it is free; otherwise wait for it, unless the
+    /// channel's close has released the channel, in which case the wait ends
+    /// with [`SessionError::Busy`] so the transport can defer the projection.
+    async fn acquire_turn_boundary_for_live_channel(
+        &self,
+        id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, SessionError> {
+        let gate = self.turn_finalization_gate_for_session(id).await;
+        if let Ok(guard) = Arc::clone(&gate).try_lock_owned() {
+            return Ok(guard);
+        }
+        let lock = Arc::clone(&gate).lock_owned();
+        tokio::pin!(lock);
+        loop {
+            let changed = self.live_projection_release_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.live_projection_turn_boundary_released(id, channel_id) {
+                return Err(SessionError::Busy { id: id.clone() });
+            }
+            tokio::select! {
+                guard = &mut lock => return Ok(guard),
+                () = &mut changed => {}
+            }
+        }
+    }
+
+    /// Hold the session's turn-finalization boundary for one live channel's
+    /// projections, so a transport applies the rows it already has under one
+    /// acquisition instead of one acquisition per row (#1821).
+    ///
+    /// The boundary is taken by the rule a projection from that channel
+    /// follows: at once when free, otherwise after the running turn, and
+    /// [`SessionError::Busy`] once the channel's close has released the
+    /// channel. While the hold lives, that channel's projections run under
+    /// the held boundary instead of queueing for it; the runtime loop and
+    /// every other writer wait as they would for a running turn. Without it,
+    /// a turn queued while rows waited behind the running one takes the
+    /// boundary after the first of them lands, so the rest wait for that turn
+    /// too. The caller must drop the hold before it waits for anything else.
+    ///
+    /// [`Self::release_live_projection_turn_boundary_waiters`] revokes the
+    /// channel's hold and releases the boundary once no mutation taken under
+    /// the hold is running; the channel's later projections queue (and are
+    /// refused with `Busy`) as without one. A released channel gets no hold.
+    #[doc(hidden)]
+    pub async fn hold_live_channel_projection_boundary(
+        &self,
+        id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) -> Result<LiveChannelProjectionBoundaryHold, SessionError> {
+        if self.live_projection_turn_boundary_released(id, channel_id) {
+            return Err(SessionError::Busy { id: id.clone() });
+        }
+        let boundary = Arc::new(
+            self.acquire_turn_boundary_for_live_channel(id, channel_id)
+                .await?,
+        );
+        let key = (id.clone(), channel_id.clone());
+        let hold = LiveChannelProjectionBoundaryHold {
+            holds: Arc::clone(&self.live_channel_projection_holds),
+            key: key.clone(),
+            boundary: Arc::downgrade(&boundary),
+        };
+        // The entry is the boundary's only owner outside the guards taken
+        // under it, so a revoke that removes it releases the boundary at once.
+        self.live_channel_projection_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, boundary);
+        // A release marks the channel before it revokes holds, so a release
+        // racing this registration is seen here or revokes the entry itself.
+        if self.live_projection_turn_boundary_released(id, channel_id) {
+            drop(hold);
+            return Err(SessionError::Busy { id: id.clone() });
+        }
+        Ok(hold)
+    }
+
+    /// The boundary a live channel's projection hold currently holds.
+    fn held_live_channel_projection_boundary(
+        &self,
+        id: &SessionId,
+        channel_id: &meerkat_core::LiveChannelId,
+    ) -> Option<Arc<tokio::sync::OwnedMutexGuard<()>>> {
+        self.live_channel_projection_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(id.clone(), channel_id.clone()))
+            .cloned()
     }
 
     async fn realtime_transcript_mutation_guard_with_turn_boundary(
         &self,
         id: &SessionId,
-        turn_finalization_guard: tokio::sync::OwnedMutexGuard<()>,
+        turn_finalization_guard: impl Into<TurnBoundaryCustody>,
     ) -> Result<SessionMutationGuard, SessionError> {
         self.realtime_transcript_mutation_guard_with_turn_boundary_and_policy(
             id,
@@ -11889,9 +12152,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     async fn realtime_transcript_mutation_guard_with_turn_boundary_and_policy(
         &self,
         id: &SessionId,
-        turn_finalization_guard: tokio::sync::OwnedMutexGuard<()>,
+        turn_finalization_guard: impl Into<TurnBoundaryCustody>,
         sync_policy: LiveDurableSyncPolicy,
     ) -> Result<SessionMutationGuard, SessionError> {
+        let turn_finalization_guard = turn_finalization_guard.into();
         let recovery_gate = self.recovery_gate_for_session(id).await;
         let recovery_guard = recovery_gate.lock_owned().await;
         match self.live_session_authority(id).await? {

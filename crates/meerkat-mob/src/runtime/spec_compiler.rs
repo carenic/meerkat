@@ -133,7 +133,7 @@ pub(crate) struct CompileMemberSpecParams<'a> {
     pub mob_id: &'a MobId,
     /// The incarnation of the controlling mob the operator authority minted
     /// for a `tools.mob` member is bound to.
-    pub mob_incarnation: meerkat_core::service::MobIncarnationId,
+    pub mob_incarnation: meerkat_core::service::LiveMobIncarnation,
     pub profile_name: &'a ProfileName,
     pub agent_identity: &'a AgentIdentity,
     /// AFTER override/realm/inherited-open resolution.
@@ -851,7 +851,7 @@ mod tests {
     ) -> CompileMemberSpecParams<'a> {
         CompileMemberSpecParams {
             mob_id,
-            mob_incarnation: meerkat_core::service::MobIncarnationId::mint(),
+            mob_incarnation: crate::tests::fresh_live_incarnation(),
             profile_name,
             agent_identity: identity,
             profile,

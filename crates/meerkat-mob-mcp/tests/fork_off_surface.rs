@@ -22,6 +22,7 @@ use std::time::Duration;
 use meerkat_client::LlmRequest;
 use meerkat_core::agent::AgentToolDispatcher;
 use meerkat_core::event::BackgroundJobTerminalStatus;
+use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::{SystemNoticeBlock, SystemNoticeKind, ToolCallView};
 use meerkat_core::{
     ContentInput, HandlingMode, Message, SessionId, ToolDispatchOutcome, ToolError,
@@ -172,17 +173,17 @@ fn routed_script(
 // Surfaces and calls
 // ===========================================================================
 
-/// The incarnation the live mob `mob_id` runs at in `state`: the binding a
-/// grant over that mob names.
+/// The incarnation the live mob `mob_id` runs at in `state`, as its handle's
+/// witness: the binding a grant over that mob names.
 async fn live_incarnation(
     state: &MobMcpState,
     mob_id: &str,
-) -> meerkat_core::service::MobIncarnationId {
+) -> meerkat_core::service::LiveMobIncarnation {
     state
         .handle_for(&meerkat_mob::MobId::from(mob_id))
         .await
         .expect("live mob handle")
-        .incarnation()
+        .live_incarnation()
 }
 
 /// A member's fork authority: it may spawn its own role, nothing else. No
@@ -190,7 +191,7 @@ async fn live_incarnation(
 /// ownership admission.
 fn forker_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
@@ -210,7 +211,7 @@ fn forker_authority(
 /// source mob whose members participate.
 fn convener_authority(
     mob_id: &str,
-    incarnation: meerkat_core::service::MobIncarnationId,
+    incarnation: meerkat_core::service::LiveMobIncarnation,
 ) -> meerkat_core::service::MobToolAuthorityContext {
     let authority = meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
         .expect("generated authority");
@@ -1695,8 +1696,13 @@ async fn a_member_address_of_a_mob_gone_for_good_is_retired() {
         .generation
         .get();
     let mob_id = fixture.source_mob_id();
-    let address =
-        meerkat::member_delivery_address(mob_id.as_str(), "worker", generation).expect("address");
+    let address = meerkat::member_delivery_address(
+        mob_id.as_str(),
+        handle.incarnation(),
+        "worker",
+        generation,
+    )
+    .expect("address");
     let bindings = Arc::clone(
         &fixture
             .continuations
@@ -1722,7 +1728,9 @@ async fn a_member_address_of_a_mob_gone_for_good_is_retired() {
         meerkat::AddressResolution::Retired,
         "a mob this state destroyed never serves again"
     );
-    let never = meerkat::member_delivery_address("never-existed", "worker", 1).expect("address");
+    let never =
+        meerkat::member_delivery_address("never-existed", MobIncarnationId::mint(), "worker", 1)
+            .expect("address");
     assert_eq!(
         bindings.resolve_address(&never).await,
         meerkat::AddressResolution::Retired,
@@ -1739,7 +1747,8 @@ async fn a_member_address_of_a_mob_gone_for_good_is_retired() {
     .expect("construct runtime authority")
     .into_shared();
     fixture.bind_continuations(&inserting);
-    let late = meerkat::member_delivery_address("late-mob", "worker", 1).expect("address");
+    let late = meerkat::member_delivery_address("late-mob", MobIncarnationId::mint(), "worker", 1)
+        .expect("address");
     assert_eq!(
         bindings.resolve_address(&late).await,
         meerkat::AddressResolution::NotServed,
@@ -2179,7 +2188,7 @@ async fn spawned_by_survives_resume_restart_and_successor_respawn() {
     let forker_after_restart = bind_surface(
         &restarted,
         forker.session.clone(),
-        forker_authority(mob_id.as_str(), restored.incarnation()),
+        forker_authority(mob_id.as_str(), restored.live_incarnation()),
     );
     // The restored mob's fork re-link pass reads its children's status
     // concurrently; the forker's check neither waits on it nor is refused.
@@ -2962,8 +2971,9 @@ async fn a_status_read_strands_only_an_owner_whose_records_prove_it_gone() {
         "mere absence is not retirement: {status:?}"
     );
 
-    let address = meerkat::member_delivery_address("foreign-mob", "absent", 1)
-        .expect("foreign member address");
+    let address =
+        meerkat::member_delivery_address("foreign-mob", MobIncarnationId::mint(), "absent", 1)
+            .expect("foreign member address");
     let member = meerkat::ContinuationOwner::Member {
         mob_id: "foreign-mob".to_string(),
         identity: "absent".to_string(),
@@ -3010,6 +3020,142 @@ async fn a_status_read_strands_only_an_owner_whose_records_prove_it_gone() {
         "the host's complete mob set proves that mob gone"
     );
     fixture.teardown().await;
+}
+
+/// A mob destroyed and created again under its id is a new mob incarnation
+/// whose generations start over. A row still owed to the destroyed mob's
+/// member (a detached job's late completion, say) names that mob
+/// incarnation, so the delivery pass finds it retired and the row strands:
+/// it never reaches the new member under the same identity and generation,
+/// whose own rows the pass applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_owed_to_a_destroyed_mobs_member_never_reaches_the_mob_created_again() {
+    let fixture =
+        CouncilFixture::new_runtime_backed(routed_script(RequestLog::default(), Vec::new()));
+    fixture.seed_source_mob(&["worker"]).await;
+    let mob_id = fixture.source_mob_id();
+    let worker = AgentIdentity::from("worker");
+    let handle = source_handle(&fixture).await;
+    let destroyed = handle.incarnation();
+    let generation = handle
+        .roster()
+        .await
+        .get_by_identity(&worker)
+        .expect("worker")
+        .generation
+        .get();
+    let owed_address =
+        meerkat::member_delivery_address(mob_id.as_str(), destroyed, "worker", generation)
+            .expect("address");
+    // A handle kept here would own the mob database's observer, and the
+    // destroy would leave its storage cleanup outstanding.
+    drop(handle);
+    fixture
+        .state
+        .mob_destroy(&mob_id)
+        .await
+        .expect("destroy the mob");
+
+    fixture.seed_source_mob(&["worker"]).await;
+    let handle = source_handle(&fixture).await;
+    assert_ne!(
+        handle.incarnation(),
+        destroyed,
+        "a create starts a new mob incarnation"
+    );
+    assert_eq!(
+        handle
+            .roster()
+            .await
+            .get_by_identity(&worker)
+            .expect("worker")
+            .generation
+            .get(),
+        generation,
+        "the new mob's generations start over"
+    );
+    drop(handle);
+    let successor_session = member_session(&fixture, "worker").await;
+
+    let owner = meerkat::ContinuationOwner::Member {
+        mob_id: mob_id.to_string(),
+        identity: "worker".to_string(),
+    };
+    let late = meerkat::ContinuationOwnerService::new(
+        fixture
+            .continuations
+            .as_ref()
+            .expect("the fixture's continuations")
+            .inbox
+            .clone(),
+        Arc::new(ForeignMember(owed_address.clone())),
+        fixture
+            .runtime_adapter
+            .clone()
+            .expect("runtime-backed fixture"),
+    );
+    let owed = late
+        .submit(&owner, member_result("owed"), 1)
+        .await
+        .expect("commit the destroyed member's row");
+    assert_eq!(owed.address, owed_address.0);
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let current = continuations
+        .submit(&owner, member_result("current"), 2)
+        .await
+        .expect("commit the new member's row");
+    assert_ne!(
+        current.address, owed.address,
+        "the new member has its own address"
+    );
+
+    let applied = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let meerkat::ContinuationStatus::Applied { session, .. } = continuations
+                .continuation_status(&owner, &current.key)
+                .await
+                .expect("status")
+            {
+                break session;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the delivery pass applies the new member's row");
+    assert_eq!(applied, successor_session);
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &owed.key)
+            .await
+            .expect("status"),
+        meerkat::ContinuationStatus::Stranded {
+            receipt: owed.clone(),
+            cause: meerkat::StrandedCause::OwnerRetired,
+        },
+        "the destroyed member's row is never applied to the new member"
+    );
+    fixture.teardown().await;
+}
+
+/// A host result owed to a mob member under the key `tasks:{key}`.
+fn member_result(key: &str) -> meerkat::ContinuationDelivery {
+    meerkat::ContinuationDelivery {
+        key: meerkat::ContinuationKey::new(format!("tasks:{key}")).expect("key"),
+        result: meerkat::ContinuationResultRef {
+            producer: meerkat::ContinuationProducer::Host {
+                namespace: "tasks".to_string(),
+            },
+            producer_id: key.to_string(),
+            result_digest: format!("sha256:{key}"),
+            summary: None,
+        },
+        body: format!("task {key} finished").into(),
+        handling: meerkat::ContinuationHandling::Queue,
+    }
 }
 
 /// An ephemeral session whose live actor is discarded without archiving

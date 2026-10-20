@@ -11,7 +11,11 @@
 
 use super::*;
 use crate::runtime::actor::ShutdownUnregisterOutcome;
-use crate::runtime::{MemberUnregisterSettlement, MemberUnregisterState};
+use crate::runtime::stop_report::{MemberRunStarts, MemberStopRun};
+use crate::runtime::{
+    MemberShutdownOutcome, MemberUnregisterSettlement, MemberUnregisterState, MobShutdownReport,
+    ShutdownOptions,
+};
 
 /// Bound for test steps that must happen promptly; it only turns a hang into
 /// a failure.
@@ -779,5 +783,264 @@ async fn a_no_handoff_discard_leaves_a_registration_a_loop_reached_before_the_fe
     assert!(
         adapter.durability_reload_required(&session).await.is_some(),
         "the registration is still durability-degraded"
+    );
+}
+
+/// The isolation mob's definition with AutonomousHost workers.
+fn autonomous_isolation_definition() -> MobDefinition {
+    let mut definition = sample_definition();
+    let worker = definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .expect("inline worker profile");
+    worker.runtime_mode = crate::MobRuntimeMode::AutonomousHost;
+    // Deliveries in these tests are external (the operator console path).
+    worker.external_addressable = true;
+    definition
+}
+
+/// Shut `mob` down whole and check that its degraded member 0 and its
+/// healthy member 1 are both unregistered: member 0's run-start hold reports
+/// `ReloadRequired` instead of failing on the degraded registration, and the
+/// teardown discards that registration and unregisters the cold successor.
+async fn whole_shutdown_settles_the_degraded_member(mob: &IsolationMob) -> MobShutdownReport {
+    let report = tokio::time::timeout(
+        STEP,
+        mob.handle.shutdown_with_report(
+            ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(5)),
+        ),
+    )
+    .await
+    .expect("the shutdown returns within its deadline")
+    .expect("the shutdown succeeds");
+    for index in 0..2 {
+        assert!(
+            matches!(
+                report.members.get(mob.member(index)),
+                Some(MemberShutdownOutcome::Unregistered)
+            ),
+            "member {index}: {report:?}"
+        );
+        assert!(
+            mob.adapter
+                .current_session_registration_witness(mob.session(index))
+                .await
+                .is_none(),
+            "member {index}'s session has no registration left"
+        );
+    }
+    assert_eq!(
+        report.run_starts.get(mob.member(0)),
+        Some(&MemberRunStarts::ReloadRequired),
+        "the degraded member's run starts: {report:?}"
+    );
+    assert_eq!(
+        report.run_starts.get(mob.member(1)),
+        Some(&MemberRunStarts::Held),
+        "the healthy member's run starts: {report:?}"
+    );
+    report
+}
+
+/// A whole Shutdown of a member degraded by a failed boundary commit, whose
+/// exited runtime loop retains the session's mutation fence, returns: the
+/// run-start hold reports the member `ReloadRequired` (it no longer fails the
+/// Shutdown), and the teardown discards the degraded registration and
+/// unregisters the cold successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_a_member_degraded_by_a_failed_boundary_commit() {
+    let mob = create_isolation_mob(2).await;
+    mob.degrade_member(0).await;
+    // The store recovers; the registration stays degraded until disposed.
+    mob.store.fail_commit(mob.session(0), false);
+    whole_shutdown_settles_the_degraded_member(&mob).await;
+}
+
+/// The same for a member marked `ReloadRequired` while idle: its runtime
+/// loop is parked and alive, and no handoff retains the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_a_member_degraded_while_idle() {
+    let mob = create_isolation_mob(2).await;
+    assert!(
+        mob.adapter
+            .force_session_durability_reload_required_for_test(mob.session(0))
+            .await,
+        "member 0's registration is marked ReloadRequired"
+    );
+    whole_shutdown_settles_the_degraded_member(&mob).await;
+}
+
+/// An AutonomousHost member degraded by a failed boundary commit: its stop
+/// task reports the run `ReloadRequired` and skips the comms-drain abort and
+/// the run settlement, which would wait on the degraded registration until
+/// the hang guard, so the Shutdown reaches its teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_an_autonomous_member_degraded_by_a_failed_boundary_commit() {
+    let mob = create_isolation_mob_with_definition(2, autonomous_isolation_definition()).await;
+    mob.degrade_autonomous_member(0).await;
+    mob.store.fail_commit(mob.session(0), false);
+    let report = whole_shutdown_settles_the_degraded_member(&mob).await;
+    assert_eq!(
+        report.runs.get(mob.member(0)),
+        Some(&MemberStopRun::ReloadRequired),
+        "the degraded member's run: {report:?}"
+    );
+}
+
+/// The same for an AutonomousHost member marked `ReloadRequired` while idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_an_autonomous_member_degraded_while_idle() {
+    let mob = create_isolation_mob_with_definition(2, autonomous_isolation_definition()).await;
+    assert!(
+        mob.adapter
+            .force_session_durability_reload_required_for_test(mob.session(0))
+            .await,
+        "member 0's registration is marked ReloadRequired"
+    );
+    let report = whole_shutdown_settles_the_degraded_member(&mob).await;
+    assert_eq!(
+        report.runs.get(mob.member(0)),
+        Some(&MemberStopRun::ReloadRequired),
+        "the degraded member's run: {report:?}"
+    );
+}
+
+/// Drive member 0 of `mob`, an AutonomousHost member, into the window
+/// between a stop's run-start hold and its cancel of the run the hold found
+/// current, and return what `stop` answered. That run is the member's kickoff
+/// keep-alive turn, parked until released. Before the cancel, the turn is
+/// released and the run's boundary commit takes the session's mutation gate
+/// while the store holds it; the cancel waits for the gate, and the store then
+/// fails the commit, which degrades the registration during that wait. The
+/// failed commit's fence keeps the gate, so the cancel never finds it free.
+async fn degrade_between_hold_and_cancel<T>(
+    mob: &IsolationMob,
+    stop: impl std::future::Future<Output = T> + Send + 'static,
+) -> T
+where
+    T: Send + 'static,
+{
+    let session_id = mob.session(0).clone();
+    tokio::time::timeout(STEP, mob.service.wait_keep_alive_turn_entered(&session_id))
+        .await
+        .expect("member 0's kickoff turn is current");
+    let (cancel_reached, release_cancel, cancel_answered) =
+        crate::runtime::provisioner::arm_stop_member_cancel_for_test(session_id.clone());
+    let stopping = tokio::spawn(stop);
+    tokio::time::timeout(STEP, cancel_reached)
+        .await
+        .expect("the stop holds member 0 and reaches its cancel")
+        .expect("the cancel hook stays armed");
+
+    // The run's boundary commit takes the session's mutation gate and waits
+    // in the store, which fails it once released.
+    mob.store.park_commits(&session_id);
+    mob.store.fail_commit(&session_id, true);
+    mob.service.release_keep_alive_turn(&session_id).await;
+    wait_until("member 0's boundary commit to park", STEP, || async {
+        mob.store.parked_commit_arrivals(&session_id) == 1
+    })
+    .await;
+
+    // The cancel waits for the gate behind the commit; the commit then fails,
+    // and the registration degrades during that wait.
+    let parked = mob
+        .adapter
+        .arm_mutation_gate_wait_observer_for_test(session_id.clone());
+    release_cancel
+        .send(())
+        .expect("the stop waits at its cancel");
+    tokio::time::timeout(STEP, parked)
+        .await
+        .expect("the cancel waits for the gate behind the commit")
+        .expect("the wait observer stays armed until the wait");
+    mob.store.release_commits();
+    let _ = tokio::time::timeout(STEP, cancel_answered)
+        .await
+        .expect("the cancel answers once the registration degrades");
+    assert!(
+        mob.adapter
+            .durability_reload_required(&session_id)
+            .await
+            .is_some(),
+        "the failed boundary commit degraded member 0's registration"
+    );
+    // The store recovers; the registration stays degraded until disposed.
+    mob.store.fail_commit(&session_id, false);
+    tokio::time::timeout(STEP, stopping)
+        .await
+        .expect("the stop returns")
+        .expect("the stop task completes")
+}
+
+/// A Stop of an AutonomousHost member whose registration degrades between
+/// the Stop's run-start hold and its boundary cancel: the cancel is refused
+/// typed, and the member reports its run `ReloadRequired` with its run starts
+/// `Held` instead of failing the Stop. Without that mapping the refusal
+/// failed the Stop as an internal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_reports_reload_required_for_a_member_degraded_between_its_hold_and_its_cancel() {
+    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
+    let handle = mob.handle.clone();
+    let report = degrade_between_hold_and_cancel(&mob, async move { handle.stop().await })
+        .await
+        .expect("the stop succeeds");
+    let outcome = report
+        .members
+        .get(mob.member(0))
+        .expect("member 0's stop outcome");
+    assert_eq!(outcome.run, MemberStopRun::ReloadRequired, "{report:?}");
+    assert_eq!(outcome.starts, MemberRunStarts::Held, "{report:?}");
+    assert_eq!(
+        report.not_holdable().count(),
+        0,
+        "the held member is not reported as able to start a turn: {report:?}"
+    );
+}
+
+/// The same window under a whole Shutdown, whose cancel is the immediate
+/// exact hard cancel: the member reports its run `ReloadRequired` with its
+/// run starts `Held`, and the teardown still discards the degraded
+/// registration and unregisters the cold successor. Without that mapping the
+/// refusal failed the Shutdown as an internal error; before the hard cancel's
+/// gate wait ended on a degradation, it waited behind the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_shutdown_settles_a_member_degraded_between_its_hold_and_its_cancel() {
+    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
+    let handle = mob.handle.clone();
+    let report = degrade_between_hold_and_cancel(&mob, async move {
+        handle
+            .shutdown_with_report(
+                ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(20)),
+            )
+            .await
+    })
+    .await
+    .expect("the shutdown succeeds");
+    assert_eq!(
+        report.runs.get(mob.member(0)),
+        Some(&MemberStopRun::ReloadRequired),
+        "member 0's run: {report:?}"
+    );
+    assert_eq!(
+        report.run_starts.get(mob.member(0)),
+        Some(&MemberRunStarts::Held),
+        "member 0's run starts: {report:?}"
+    );
+    assert!(
+        matches!(
+            report.members.get(mob.member(0)),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "member 0: {report:?}"
+    );
+    assert!(
+        mob.adapter
+            .current_session_registration_witness(mob.session(0))
+            .await
+            .is_none(),
+        "member 0's session has no registration left"
     );
 }

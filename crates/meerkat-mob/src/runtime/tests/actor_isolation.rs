@@ -815,6 +815,39 @@ impl IsolationMob {
         assert!(self.store.failed_commits() >= 1);
     }
 
+    /// [`Self::degrade_member`] for an AutonomousHost member. Its current run
+    /// is its kickoff keep-alive turn, which a delivery does not end in this
+    /// mock, so the turn is released instead: the run's boundary commit then
+    /// fails and the runtime registration is durability-degraded.
+    async fn degrade_autonomous_member(&self, index: usize) {
+        let session_id = self.session(index).clone();
+        self.store.fail_commit(&session_id, true);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.service.wait_keep_alive_turn_entered(&session_id),
+        )
+        .await
+        .expect("member's kickoff turn is current");
+        self.service.release_keep_alive_turn(&session_id).await;
+        let adapter = Arc::clone(&self.adapter);
+        wait_until(
+            &format!("member {index} runtime degraded to ReloadRequired"),
+            Duration::from_secs(5),
+            || {
+                let adapter = Arc::clone(&adapter);
+                let session_id = session_id.clone();
+                async move {
+                    adapter
+                        .durability_reload_required(&session_id)
+                        .await
+                        .is_some()
+                }
+            },
+        )
+        .await;
+        assert!(self.store.failed_commits() >= 1);
+    }
+
     /// One `QueryPhase` round trip; `Err(())` when it misses `budget`.
     async fn probe(&self, budget: Duration) -> Result<Duration, ()> {
         let started = Instant::now();

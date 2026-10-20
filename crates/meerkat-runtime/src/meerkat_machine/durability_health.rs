@@ -56,6 +56,10 @@ struct DurabilityHealthRecord {
     /// this record's lock. The provisional cold-install state is not a
     /// degradation, so it never sets it.
     degraded: crate::tokio::sync::watch::Sender<bool>,
+    /// Owned store writes (input admissions) whose caller stopped waiting at
+    /// the store's commit outcome deadline and whose store has not answered
+    /// yet. Each still holds the session's mutation gate.
+    writes_past_deadline: usize,
 }
 
 /// Cloneable durability gate shared by the runtime entry and its persistent
@@ -140,6 +144,27 @@ impl DurabilityHealthHandle {
         })
     }
 
+    /// Begin an owned store write of this session that its caller waits for
+    /// only until the store's commit outcome deadline (see
+    /// [`OwnedStoreWrite`]).
+    pub(crate) fn begin_owned_store_write(&self) -> OwnedStoreWrite {
+        OwnedStoreWrite {
+            state: Arc::new(Mutex::new(OwnedStoreWriteState::InFlight)),
+            health: self.clone(),
+        }
+    }
+
+    /// Whether an owned store write of this session is past its commit
+    /// outcome deadline and its store has not answered: the write still
+    /// holds the session's mutation gate.
+    pub(crate) fn has_owned_write_past_deadline(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .writes_past_deadline
+            > 0
+    }
+
     /// The retained cause of a real degradation, or `None` while the session
     /// is Ready or still in its provisional cold install.
     fn degradation_cause(&self) -> Option<DurabilityReloadRequired> {
@@ -165,6 +190,93 @@ impl DurabilityHealthHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state
             .clone()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedStoreWriteState {
+    /// The caller waits for the write.
+    InFlight,
+    /// The caller stopped waiting at the deadline; the store has not
+    /// answered.
+    PastDeadline,
+    /// The store answered (or the write ended without an answer).
+    Answered,
+}
+
+/// One owned store write of a persistent session (an input admission) that
+/// its caller waits for only until the store's declared commit outcome
+/// deadline. The write owns the session's mutation gate and keeps it until
+/// the store answers. The caller's deadline and the write's answer settle
+/// this record under one lock, so a write that answers as the deadline
+/// passes is either taken by the caller or never counted as past it.
+#[derive(Debug, Clone)]
+pub(crate) struct OwnedStoreWrite {
+    state: Arc<Mutex<OwnedStoreWriteState>>,
+    health: DurabilityHealthHandle,
+}
+
+impl OwnedStoreWrite {
+    /// The caller's deadline passed. Unless the write answered first, count
+    /// it as past its deadline until it answers, so the reload-required
+    /// discard refuses instead of waiting for the gate the write holds, and
+    /// degrade the session with `operation` and `reason`. Returns `false`
+    /// when the write had answered: the caller takes its answer.
+    pub(crate) fn mark_past_deadline(
+        &self,
+        operation: &'static str,
+        reason: impl Into<String>,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state != OwnedStoreWriteState::InFlight {
+            return false;
+        }
+        *state = OwnedStoreWriteState::PastDeadline;
+        {
+            let mut record = self
+                .health
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            record.writes_past_deadline = record.writes_past_deadline.saturating_add(1);
+        }
+        self.health.mark_reload_required(operation, reason);
+        true
+    }
+
+    /// Settle the write as answered once dropped: the write holds it across
+    /// its store call and drops it before it hands the gate back, so a
+    /// write that panics settles too.
+    pub(crate) fn answer_on_drop(self) -> OwnedStoreWriteAnswer {
+        OwnedStoreWriteAnswer(self)
+    }
+
+    fn answered(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == OwnedStoreWriteState::PastDeadline {
+            let mut record = self
+                .health
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            record.writes_past_deadline = record.writes_past_deadline.saturating_sub(1);
+        }
+        *state = OwnedStoreWriteState::Answered;
+    }
+}
+
+/// Settles its [`OwnedStoreWrite`] as answered when dropped.
+pub(crate) struct OwnedStoreWriteAnswer(OwnedStoreWrite);
+
+impl Drop for OwnedStoreWriteAnswer {
+    fn drop(&mut self) {
+        self.0.answered();
     }
 }
 
@@ -251,6 +363,7 @@ pub(super) fn begin_registration_cold_install()
             )),
             cold_install_open: true,
             degraded: crate::tokio::sync::watch::channel(false).0,
+            writes_past_deadline: 0,
         })),
     };
     let authority = DurabilityRehydrationAuthority {
@@ -262,6 +375,34 @@ pub(super) fn begin_registration_cold_install()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An owned store write past its deadline degrades the session and
+    /// counts as past it until its store answers; one that answered first
+    /// is the caller's to take and is never counted.
+    #[test]
+    fn an_owned_write_counts_past_its_deadline_only_until_it_answers() {
+        let (health, rehydration) = begin_registration_cold_install();
+        rehydration.mark_ready().unwrap();
+
+        let write = health.begin_owned_store_write();
+        let answer = write.clone().answer_on_drop();
+        assert!(write.mark_past_deadline("runtime_admission_deadline", "no outcome"));
+        assert!(health.has_owned_write_past_deadline());
+        assert_eq!(
+            health.require_ready().unwrap_err().operation(),
+            "runtime_admission_deadline"
+        );
+        drop(answer);
+        assert!(!health.has_owned_write_past_deadline());
+
+        let (health, rehydration) = begin_registration_cold_install();
+        rehydration.mark_ready().unwrap();
+        let write = health.begin_owned_store_write();
+        drop(write.clone().answer_on_drop());
+        assert!(!write.mark_past_deadline("runtime_admission_deadline", "no outcome"));
+        assert!(!health.has_owned_write_past_deadline());
+        assert!(health.require_ready().is_ok());
+    }
 
     #[test]
     fn cold_install_is_the_only_ready_transition_and_degradation_is_monotonic() {

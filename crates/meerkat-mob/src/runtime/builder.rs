@@ -14,6 +14,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 const MOB_COMMAND_CHANNEL_CAPACITY: usize = 4096;
 
+/// How long a resume waits for the answer to the first attempt at a
+/// recovered Stop or Complete before it hands the mob back anyway. The
+/// attempt then finishes, or is retried, in the background: a Stop held on
+/// a member or a placed completion can take up to its own hang guards, and
+/// a host that must see the phase such a slow Stop leaves waits for it
+/// itself (its `MobStopped` in the mob's event stream).
+pub(super) const RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 type RuntimeStartFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<MobHandle, MobError>> + Send + 'static>,
@@ -393,7 +402,19 @@ impl OrchestratorResumeNotification {
 pub(super) async fn drive_recovered_placed_lifecycle_intent(
     handle: MobHandle,
     intent: mob_dsl::PlacedCompletionLifecycleIntentKind,
+    mut first_attempt_answered: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
+    #[cfg(test)]
+    {
+        let hold = RECOVERED_LIFECYCLE_DRIVER_HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(handle.mob_id().as_str())
+            .cloned();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+    }
     let mut retry_delay = std::time::Duration::from_millis(25);
     loop {
         if handle.command_tx.is_closed() {
@@ -410,6 +431,11 @@ pub(super) async fn drive_recovered_placed_lifecycle_intent(
                 .map(|_| ())
                 .map_err(|error| MobError::Internal(error.to_string())),
         };
+        // The resume waiting on the first attempt returns once it is
+        // answered, whatever the answer; later attempts run unwatched.
+        if let Some(answered) = first_attempt_answered.take() {
+            let _ = answered.send(());
+        }
         match result {
             Ok(()) => return,
             // The actor has exited, or it refuses the intent for the rest of
@@ -438,6 +464,12 @@ pub(super) async fn drive_recovered_placed_lifecycle_intent(
 #[cfg(test)]
 static NEXT_TEST_ACTOR_RUNTIME_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+/// Test seam: the recovery driver of a mob named here waits for the notify
+/// before its first attempt, as a Stop whose answer does not come.
+#[cfg(test)]
+pub(super) static RECOVERED_LIFECYCLE_DRIVER_HOLDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Notify>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 #[cfg(test)]
 static LATEST_TEST_ACTOR_RUNTIME_BY_MOB: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
@@ -678,6 +710,8 @@ pub struct MobBuilder {
     /// The verifier of the created mob's callback claim token; see
     /// [`MobBuilder::with_callback_claim_verifier`].
     callback_claim_verifier: Option<crate::MobClaimVerifier>,
+    /// Who creates the mob; see [`MobBuilder::with_provenance`].
+    provenance: Option<crate::MobProvenance>,
 }
 
 enum BuilderMode {
@@ -7071,8 +7105,9 @@ struct RuntimeWiring {
     command_tx: mpsc::Sender<super::scope_gate::RoutedMobCommand>,
     command_rx: mpsc::Receiver<super::scope_gate::RoutedMobCommand>,
     composition_binding: super::composition::MobCompositionBinding,
-    /// The incarnation this runtime start mints, shared by the preview
-    /// handle, the launched handle and the actor.
+    /// The incarnation this runtime runs at, shared by the preview handle,
+    /// the launched handle and the actor: the one its create minted, read
+    /// back from the mob's creation record on resume.
     incarnation: meerkat_core::service::MobIncarnationId,
 }
 
@@ -7176,6 +7211,7 @@ impl MobBuilder {
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
             callback_claim_verifier: None,
+            provenance: None,
         }
     }
 
@@ -7260,6 +7296,7 @@ impl MobBuilder {
             restored_member_run_start_holds: BTreeMap::new(),
             start_destroy_admission: None,
             callback_claim_verifier: None,
+            provenance: None,
         }
     }
 
@@ -7272,6 +7309,18 @@ impl MobBuilder {
     /// ignores it: a resumed mob keeps the verifier it has.
     pub fn with_callback_claim_verifier(mut self, verifier: crate::MobClaimVerifier) -> Self {
         self.callback_claim_verifier = Some(verifier);
+        self
+    }
+
+    /// Record `provenance`, who creates the mob, with its creation: `create`
+    /// writes it in the transaction of the mob's first event, and it is never
+    /// rewritten ([`MobHandle::provenance`]). A create without one records
+    /// [`crate::MobProvenance::Host`]: the host created the mob, with no
+    /// caller session. A host that creates mobs for caller sessions passes
+    /// the provenance it found for the caller. Resume ignores it: a resumed
+    /// mob keeps the provenance it was created with.
+    pub fn with_provenance(mut self, provenance: crate::MobProvenance) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -7594,6 +7643,7 @@ impl MobBuilder {
                 // Nor a restored destroy to admit.
                 start_destroy_admission: _,
                 callback_claim_verifier,
+                provenance,
             } = builder;
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
@@ -7712,18 +7762,28 @@ impl MobBuilder {
                     Some((storage.runtime_metadata.clone(), definition.id.clone()));
             }
 
+            // The incarnation this create starts, minted once here: the mob's
+            // creation record keeps it, and every resume of the mob reads it
+            // back instead of minting another.
+            let incarnation = meerkat_core::service::MobIncarnationId::mint();
+            let provenance = provenance.unwrap_or(crate::MobProvenance::Host);
             let created = Box::pin(async move {
-                // Emit MobCreated event first
+                // The mob's first event, MobCreated, and its creation record
+                // commit together.
                 let definition_for_event = (*definition).clone();
                 storage
                     .events
-                    .append(NewMobEvent {
-                        mob_id: definition.id.clone(),
-                        timestamp: None,
-                        kind: MobEventKind::MobCreated {
-                            definition: Box::new(definition_for_event),
+                    .append_creation(
+                        NewMobEvent {
+                            mob_id: definition.id.clone(),
+                            timestamp: None,
+                            kind: MobEventKind::MobCreated {
+                                definition: Box::new(definition_for_event),
+                            },
                         },
-                    })
+                        incarnation,
+                        &provenance,
+                    )
                     .await?;
                 if let Some(owner_bridge_event) = owner_bridge_event {
                     storage
@@ -7779,6 +7839,7 @@ impl MobBuilder {
 
                 let start_result = Self::start_runtime(
                     definition,
+                    incarnation,
                     Roster::new(),
                     dsl_authority,
                     storage.events.clone(),
@@ -7837,6 +7898,46 @@ impl MobBuilder {
         })
     }
 
+    /// The incarnation a resume runs at: the one the mob's creation record
+    /// names. A mob created before creation records existed (a store from
+    /// before 0.9.4) gets its one migrated incarnation here, recorded before
+    /// the resume continues: a failed recording fails the resume, so the mob
+    /// never runs without an incarnation.
+    #[cfg(feature = "runtime-adapter")]
+    async fn resumed_incarnation(
+        storage: &MobStorage,
+        mob_id: &crate::MobId,
+        creation: Option<crate::store::MobCreationRecord>,
+    ) -> Result<meerkat_core::service::MobIncarnationId, MobError> {
+        let record = match creation {
+            Some(record) => record,
+            None => {
+                storage
+                    .events
+                    .assign_legacy_incarnation(
+                        mob_id,
+                        meerkat_core::service::MobIncarnationId::mint(),
+                    )
+                    .await?
+            }
+        };
+        if record.is_finalized() {
+            return Err(MobError::IncarnationInconsistent {
+                mob_id: mob_id.clone(),
+                inconsistency: crate::IncarnationInconsistency::FinalizedRecordWithCreation,
+            });
+        }
+        if &record.mob_id != mob_id {
+            return Err(MobError::IncarnationInconsistent {
+                mob_id: mob_id.clone(),
+                inconsistency: crate::IncarnationInconsistency::RecordOfAnotherMob {
+                    record_mob_id: record.mob_id,
+                },
+            });
+        }
+        Ok(record.incarnation)
+    }
+
     /// Resume a mob from persisted events.
     ///
     /// Resume behavior:
@@ -7881,6 +7982,8 @@ impl MobBuilder {
             restored_member_run_start_holds,
             start_destroy_admission,
             callback_claim_verifier: _,
+            // A resumed mob keeps the provenance it was created with.
+            provenance: _,
         } = self;
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;
@@ -7933,11 +8036,26 @@ impl MobBuilder {
                     .map(|actual| actual.event_cursor()),
             });
         }
-        let definition = definition.ok_or_else(|| {
-            MobError::Internal(
-                "cannot resume mob: no MobCreated event found in storage".to_string(),
-            )
-        })?;
+        // The creation record names the incarnation the mob was created at.
+        // Without a MobCreated it is a finished destroy (finalized) or a
+        // store that disagrees with itself; neither is resumed.
+        let creation = storage.events.creation_record().await?;
+        let Some(definition) = definition else {
+            return Err(match creation {
+                Some(record) if record.is_finalized() => MobError::IncarnationDestroyed {
+                    mob_id: record.mob_id,
+                    incarnation: record.incarnation,
+                },
+                Some(record) => MobError::IncarnationInconsistent {
+                    mob_id: record.mob_id,
+                    inconsistency: crate::IncarnationInconsistency::RecordWithoutCreation,
+                },
+                None => MobError::Internal(
+                    "cannot resume mob: no MobCreated event found in storage".to_string(),
+                ),
+            });
+        };
+        let incarnation = Self::resumed_incarnation(&storage, &definition.id, creation).await?;
         MobSupervisorBridge::preflight_ingress_ownership(
             definition
                 .backend
@@ -8326,9 +8444,8 @@ impl MobBuilder {
                 command_tx: command_tx.clone(),
                 command_rx,
                 composition_binding,
-                // A resumed mob is a new incarnation: no grant from before
-                // this process names it.
-                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+                // The incarnation the mob was created at: a resume keeps it.
+                incarnation,
             };
             let per_spawn_external_tools: super::handle::PerSpawnExternalTools = Arc::default();
             let preview_handle = MobHandle {
@@ -9689,7 +9806,7 @@ impl MobBuilder {
                             additional_instructions: restore_spec.additional_instructions.clone(),
                             shell_env: restore_spec.shell_env.clone(),
                             mob_tool_authority_context: None,
-                            mob_incarnation: Some(tool_handle.incarnation()),
+                            mob_incarnation: Some(tool_handle.live_incarnation()),
                             inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                             tool_access_policy: restore_spec.tool_access_policy.clone(),
                             system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -9959,7 +10076,7 @@ impl MobBuilder {
                 additional_instructions: restore_spec.additional_instructions.clone(),
                 shell_env: restore_spec.shell_env.clone(),
                 mob_tool_authority_context: None,
-                mob_incarnation: Some(tool_handle.incarnation()),
+                mob_incarnation: Some(tool_handle.live_incarnation()),
                 inherited_tool_filter: restore_spec.inherited_tool_filter.clone(),
                 tool_access_policy: restore_spec.tool_access_policy.clone(),
                 system_prompt_override: restore_spec.system_prompt_override.clone(),
@@ -10006,7 +10123,9 @@ impl MobBuilder {
                 direct_member_incarnation: None,
                 ops_registry: None,
                 generated_self_owned_operation_owner: None,
-                runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                // A host refusal of the recreated member's registration comes
+                // back typed, as on the durable arm above.
+                runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::ColdRestore,
                 held_bound: None,
             };
             let admitted_bridge_session_id =
@@ -10029,7 +10148,33 @@ impl MobBuilder {
                     &admitted_bridge_session_id,
                     "resume_fresh_member_session_provision_owner",
                 )?);
-            let receipt = provisioner.provision_member(provision_request).await?;
+            let receipt = match provisioner.provision_member(provision_request).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    // A host refusal of this member's registration breaks only
+                    // this member, as on the durable arm: the seed records the
+                    // refusal's code, and the transaction's own rollback
+                    // already removed the registration the host was asked
+                    // about. Any other failure still fails the resume.
+                    let registration_refusal = match &error {
+                        MobError::MemberRegistrationRefused { call, .. } => *call,
+                        _ => return Err(error),
+                    };
+                    tool_handle.restore_diagnostics.write().await.insert(
+                        entry.agent_identity.clone(),
+                        super::handle::RestoreFailureDiagnostic {
+                            bridge_session_id: Some(bridge_session_id.clone()),
+                            reason: format!(
+                                "failed to recreate the session of member '{}': {error}",
+                                entry.agent_identity
+                            ),
+                            hold: None,
+                            registration_refusal: Some(registration_refusal),
+                        },
+                    );
+                    continue;
+                }
+            };
             let created_bridge_session_id = receipt
                 .member_ref
                 .bridge_session_id()
@@ -10352,6 +10497,7 @@ impl MobBuilder {
     #[inline(never)]
     fn start_runtime(
         definition: Arc<MobDefinition>,
+        incarnation: meerkat_core::service::MobIncarnationId,
         initial_roster: Roster,
         mut dsl_authority: Box<crate::machines::mob_machine::MobMachineAuthority>,
         events: Arc<dyn MobEventStore>,
@@ -10444,7 +10590,7 @@ impl MobBuilder {
                 command_tx,
                 command_rx,
                 composition_binding,
-                incarnation: meerkat_core::service::MobIncarnationId::mint(),
+                incarnation,
             };
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
             let explicit_resume_operations =
@@ -10759,7 +10905,7 @@ impl MobBuilder {
 
             let mut actor = MobActor {
                 definition,
-                incarnation,
+                incarnation: handle.live_incarnation(),
                 roster,
                 events,
                 placed_completion_durable_index,
@@ -11044,6 +11190,10 @@ impl MobBuilder {
                 | (crate::machines::mob_machine::MobPhase::Destroyed, _) => None,
                 (_, intent) => intent,
             };
+            // The answer to the first attempt at a recovered Stop or
+            // Complete: the start waits for it before it hands the mob back
+            // (see its end).
+            let mut recovered_phase_intent_first_attempt = None;
             let recovered_retirements = if resume_destroy_cleanup {
                 Vec::new()
             } else {
@@ -11157,10 +11307,26 @@ impl MobBuilder {
             });
             } else if let Some(intent) = recovered_lifecycle_retry_intent {
                 let lifecycle_handle = handle.non_owning();
+                let first_attempt_answered = if matches!(
+                    intent,
+                    mob_dsl::PlacedCompletionLifecycleIntentKind::Stop
+                        | mob_dsl::PlacedCompletionLifecycleIntentKind::Complete
+                ) {
+                    let (answered, first_attempt) = tokio::sync::oneshot::channel();
+                    recovered_phase_intent_first_attempt = Some(first_attempt);
+                    Some(answered)
+                } else {
+                    None
+                };
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
-                    drive_recovered_placed_lifecycle_intent(lifecycle_handle, intent).await;
+                    drive_recovered_placed_lifecycle_intent(
+                        lifecycle_handle,
+                        intent,
+                        first_attempt_answered,
+                    )
+                    .await;
                 });
             }
             if remote_intent_reconciler_enabled {
@@ -11270,7 +11436,25 @@ impl MobBuilder {
                 actor_task_end.returned();
             });
 
-            Ok(handle.with_root_owner())
+            let handle = handle.with_root_owner();
+            // A Stop or Complete an earlier process durably began and never
+            // finished is finished by the recovery driver above. The mob is
+            // handed back once the driver's first attempt is answered, so its
+            // phase is the one that intent leaves: a host that reads the
+            // phase right after the resume, and lifts a stopped mob, lifts it
+            // as it does after a completed Stop. Answered in the background,
+            // the Stop landed after that read, and the mob stayed Stopped
+            // with every member's work refused. The wait is short and bounded
+            // (RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT): an attempt that is
+            // refused, or still running when it ends (a Stop held on a member
+            // or a placed completion), goes on in the background as before,
+            // and a host that must see the phase it leaves waits for it.
+            if let Some(first_attempt) = recovered_phase_intent_first_attempt {
+                let _ =
+                    tokio::time::timeout(RECOVERED_PHASE_INTENT_FIRST_ATTEMPT_WAIT, first_attempt)
+                        .await;
+            }
+            Ok(handle)
         })
     }
 }

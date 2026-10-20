@@ -756,6 +756,69 @@ pipeline (SessionDocumentMachine classifies, MeerkatMachine authorizes,
 RuntimeStore realizes) is documented in
 [Machine Authority](/reference/machine-authority#durable-tail-recovery-ownership).
 
+### Boundary commits with no durable answer
+
+Since 0.9.4 a persistent session's boundary commit or run terminalization that
+reports no durable outcome within its store's declared deadline marks the
+session reload-required. The deadline is `RuntimeStore::commit_outcome_deadline`:
+120 seconds for the SQLite store (two 60-second busy windows). In 0.9.3 and
+earlier such a commit (a stalled disk or a hung network filesystem, for
+example) kept the session's mutation gate for good, so every later wait for the
+gate, a mob destroy's retirement of the member and a force cancel included,
+waited for it.
+
+- The runtime loop stops waiting and leaves the commit running; the commit
+  keeps the session's mutation gate until the store answers.
+- The run's completion waiters fail with `CompletionWaitError::DurableOutcomeUnknown`,
+  and a run whose boundary commit is rejected fails them with
+  `CompletionWaitError::BoundaryRolledBack`. A JSON-RPC `turn/start` waiting on
+  the run answers `-32603` with `data.reason` `completion_authority_unavailable`.
+  The input stays durably admitted: read it after the reload instead of
+  resubmitting it. The public error class is still authority unavailable and
+  only the message names the case, so resubmit only with an idempotency key.
+- Until the store answers, a reload refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked`; afterwards it replaces the
+  registration from durable truth.
+- Once the session degrades, the waits for its mutation gate that serve live
+  work end with `RecoveryRepairBlocked` instead of waiting for the holder:
+  input admission, an exact-run interrupt and its reconciliation, the recover
+  and destroy control commands, comms aborts, explicit stops, unregisters,
+  closing an idle registration, member effects and the admitted-original read
+  among them. Reads that take no gate answer without the held driver: whether
+  the session has active inputs answers busy, an input's terminal completion
+  refuses with the retryable `RuntimeDriverError::InputTerminalNotYetReadable`
+  (read it again after the reload), a stopped run's contributor terminal is
+  unknown, and the other reads refuse with `RecoveryRepairBlocked`.
+- A mob member's tracked turn stays pending, as on `AuthorityUnavailable`. A
+  scheduled delivery waits for the input's own terminal outcome: it keeps its
+  lease and re-reads that outcome for up to 5 lease periods (5 minutes at the
+  default 60-second lease), then ends `delivery_failed` with
+  `runtime_completion_authority_unavailable`, and the detail names the bound
+  and the last cause. Nothing in that wait reloads the session (see
+  [Scheduling](/guides/scheduling)).
+
+An input admission whose store write never answers has the same deadline
+since 0.9.4. Past it the admission refuses with the retryable
+`RuntimeDriverError::RecoveryRepairBlocked`, naming the input, and the session
+needs a reload (`runtime_admission_deadline`), so the session's next admission,
+its next run and a reload of it end typed instead of waiting for the store. The
+write keeps running and keeps the gate until the store answers, so the input
+may still be admitted: resubmit it with the same idempotency key, or read it
+after the reload. Sessions without durable state, and stores that declare no
+deadline, admit as before.
+
+Writes that no deadline covers still hold the session's gate until the store
+answers: registration, unregister, control writes, recovery, the runtime
+loop's writes other than a run's boundary commit and terminalization (a run's
+staging, for example), and the live-boundary work that follows an admission.
+
+A store declares the deadline through
+`RuntimeSessionAuthorityOps::commit_outcome_deadline`, so a pure decorator
+forwards it. A composed store whose commit runs lock-acquiring transactions of
+its own declares its inner store's deadline plus each such transaction's busy
+timeout. The default is `DEFAULT_COMMIT_OUTCOME_DEADLINE`; `InMemoryRuntimeStore`
+declares none.
+
 ### Storage mechanics (schema ledger, fence, durability classes)
 
 Every SQLite file in a realm carries a `meerkat_schema(domain, version)`
@@ -765,7 +828,12 @@ binary refuses typed (`SchemaFromTheFuture`) — a rollback candidate fails
 certification cleanly instead of crash-looping. Each database also has a
 sibling `<file>.mfence` lock file: store operations hold a shared
 per-operation guard, and offline maintenance (`rkat storage migrate`) takes
-the exclusive side after in-flight operations drain. Backup artifacts
+the exclusive side after in-flight operations drain. A connection kept open
+between operations (a runtime delivery owner's generation reader) also holds
+`<file>.mpresence` shared, and maintenance takes that lock exclusively after
+the fence lock, so it waits for the connection to close. Maintenance creates
+the presence file next to every database it fences, and `rkat storage doctor`
+inventories it with the fence lock file. Backup artifacts
 written by maintenance use the registered `*.pre-<version>-<timestamp>`
 naming that `rkat storage doctor` inventories and `rkat storage prune`
 owns.

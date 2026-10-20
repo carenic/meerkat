@@ -400,7 +400,7 @@ path = ".rkat/skills"
     fn test_parse_http_repo() {
         let toml = r#"
 [[repositories]]
-name = "elephant"
+name = "external-http"
 source_uuid = "dc256086-0d2f-4f61-a307-320d4148107f"
 type = "http"
 url = "http://localhost:8080/api"
@@ -433,7 +433,7 @@ auth = { scheme = "header", name = "X-API-Key", value = "secret" }
     fn test_parse_http_repo_bearer_auth() {
         let toml = r#"
 [[repositories]]
-name = "elephant"
+name = "external-http"
 source_uuid = "dc256086-0d2f-4f61-a307-320d4148107f"
 type = "http"
 url = "https://skills.example/api"
@@ -524,7 +524,7 @@ auth = { scheme = "bearer", token = "secret" }
         // time — no half-set credential state is representable.
         let toml = r#"
 [[repositories]]
-name = "elephant"
+name = "external-http"
 source_uuid = "dc256086-0d2f-4f61-a307-320d4148107f"
 type = "http"
 url = "https://skills.example/api"

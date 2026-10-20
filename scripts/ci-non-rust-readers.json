@@ -13,7 +13,9 @@
         "target": "test:host_launch_sites",
         "scope": "target",
         "tests": [
-          "every_process_launch_in_shipped_code_is_confined_or_a_typed_exemption"
+          "every_process_launch_in_shipped_code_is_confined_or_a_typed_exemption",
+          "the_mob_incarnation_witness_has_one_constructor",
+          "the_mob_incarnation_witness_is_made_only_at_the_listed_sites"
         ],
         "sources": [
           "crates/meerkat/tests/host_launch_sites.rs"
@@ -37,6 +39,19 @@
         ],
         "sources": [
           "tests/integration/tests/phase6_cleanup_sweep.rs"
+        ]
+      },
+      {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "every_host_binary_depends_on_meerkat_sqlite_unconditionally",
+          "every_host_binary_switches_allocator_statistics_off_first",
+          "every_workspace_binary_is_a_host_or_exempt_with_a_reason"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
         ]
       },
       {
@@ -130,6 +145,17 @@
       }
     ],
     ".cargo/config.toml": [
+      {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "cargo_and_bazel_set_the_declared_sqlite_flags"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
+        ]
+      },
       {
         "package": "xtask",
         "target": "test:buildbuddy_static_lanes",
@@ -538,6 +564,17 @@
     ],
     "MODULE.bazel": [
       {
+        "package": "meerkat-sqlite",
+        "target": "test:lock_profile_sources",
+        "scope": "target",
+        "tests": [
+          "cargo_and_bazel_set_the_declared_sqlite_flags"
+        ],
+        "sources": [
+          "crates/meerkat-sqlite/tests/lock_profile_sources.rs"
+        ]
+      },
+      {
         "package": "xtask",
         "target": "test:buildbuddy_static_lanes",
         "scope": "target",
@@ -595,6 +632,21 @@
         ],
         "sources": [
           "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "clippy.toml": [
+      {
+        "package": "meerkat",
+        "target": "test:host_launch_sites",
+        "scope": "target",
+        "tests": [
+          "clippy_disallows_every_process_launch_api",
+          "clippy_disallows_the_mob_incarnation_witness_constructor",
+          "the_launch_lint_is_allowed_only_at_the_listed_launch_sites"
+        ],
+        "sources": [
+          "crates/meerkat/tests/host_launch_sites.rs"
         ]
       }
     ],

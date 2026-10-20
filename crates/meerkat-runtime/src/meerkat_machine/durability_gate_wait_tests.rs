@@ -968,15 +968,33 @@ async fn an_owned_runtime_stop_request_behind_a_holder_ends_typed_once_the_sessi
 
 /// The bindings of an attached actor recovery own no rollback: the
 /// bindings-owned unregister answers false at once, without waiting for the
-/// gate the recovery lease holds.
+/// gate the recovery lease holds. The attachment comes from an actor
+/// materialization, as in production: an attached actor recovery needs the
+/// canonical runtime handle bundle only that path publishes.
 #[tokio::test]
 async fn attached_recovery_bindings_roll_back_nothing_while_the_lease_holds_the_gate() {
     let machine = persistent_machine();
-    let session_id = registered_with_runtime_loop(&machine).await;
-    let attachment = machine
-        .current_executor_attachment_witness(&session_id)
+    let session_id = SessionId::new();
+    let mut prepared = machine
+        .prepare_session_materialization(session_id.clone())
         .await
-        .expect("the attached runtime loop has a witness");
+        .expect("prepare the actor materialization");
+    crate::begin_session_runtime_actor_materialization(prepared.bindings())
+        .expect("claim the initial actor construction")
+        .commit()
+        .expect("record the initial actor");
+    let attachment = match prepared
+        .ensure_executor_attachment(|_witness| Box::new(IdleExecutor))
+        .await
+        .expect("attach an executor through the actor claim")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => {
+            pending.commit().await.expect("commit the attachment")
+        }
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("a fresh actor materialization reused {witness:?}")
+        }
+    };
     let recovery = machine
         .prepare_attached_session_actor_recovery(&attachment)
         .await

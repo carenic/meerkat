@@ -3527,6 +3527,288 @@ impl InheritedToolVisibilityAuthority {
             ..Default::default()
         }
     }
+
+    /// The ceiling admitting only what both ceilings admit.
+    ///
+    /// Identity is preserved, never reinterpreted: a name both sides witness
+    /// under different identities is not admitted by an allow-ceiling, and
+    /// such a conflict in any other ceiling cannot be fitted that way and is
+    /// refused.
+    pub fn narrowed_with(&self, other: &Self) -> Result<Self, InheritedVisibilityConflict> {
+        let conflicting: BTreeSet<ToolName> = other
+            .witnesses
+            .iter()
+            .filter(|(name, witness)| {
+                self.witnesses
+                    .get(*name)
+                    .is_some_and(|retained| retained != *witness)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut filter = self.filter.narrowed_by(&other.filter);
+        if !conflicting.is_empty() {
+            let ToolFilter::Allow(names) = &filter else {
+                return Err(InheritedVisibilityConflict {
+                    names: conflicting.into_iter().collect(),
+                });
+            };
+            filter = ToolFilter::Allow(
+                names
+                    .iter()
+                    .filter(|name| !conflicting.contains(name.as_str()))
+                    .cloned()
+                    .collect(),
+            );
+        }
+        let mut witnesses = self.witnesses.clone();
+        for (name, witness) in &other.witnesses {
+            if !conflicting.contains(name) {
+                witnesses
+                    .entry(name.clone())
+                    .or_insert_with(|| witness.clone());
+            }
+        }
+        Ok(Self { filter, witnesses })
+    }
+}
+
+/// Two inherited visibility ceilings witness the same tool names under
+/// different identities, and the combined ceiling cannot drop them.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("inherited tool visibility ceilings conflict on the identity of {names:?}")]
+pub struct InheritedVisibilityConflict {
+    pub names: Vec<ToolName>,
+}
+
+/// A session's inherited tool-visibility ceiling, as its owner knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InheritedVisibilityEvidence {
+    /// The session is known to have inherited no visibility ceiling.
+    Unrestricted,
+    /// The session's inherited ceiling.
+    Ceiling(InheritedToolVisibilityAuthority),
+}
+
+/// The restrictions a session inherited from its spawner, as its owner
+/// knows them: the launch tool access policy, the visibility ceiling and the
+/// auth binding its credentials resolve through.
+///
+/// A successor that replaces the session (a respawn) must keep them. Only a
+/// session owner issues this: from the session's committed record, or from
+/// the exact build handoff it installed when it created the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredecessorToolRestrictions {
+    launch: crate::ops::SpawnToolAccessPolicy,
+    visibility: InheritedVisibilityEvidence,
+    auth_binding: Option<crate::AuthBindingRef>,
+    /// The provider the session's build resolved its credentials for through
+    /// `auth_binding`; `None` when the owner does not know it.
+    auth_provider: Option<crate::Provider>,
+}
+
+/// Why a session owner cannot state a session's inherited restrictions.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PredecessorRestrictionsError {
+    /// The session predates recording its launch tool access policy.
+    #[error("the session has no recorded launch tool access policy")]
+    MissingLaunchPolicy,
+    /// The session has no canonical tool-visibility record.
+    #[error("the session has no canonical tool visibility record")]
+    MissingVisibilityRecord,
+    /// The recorded inherited ceiling names tools whose identity witnesses
+    /// are gone: the ceiling cannot be handed on, and it is not "unrestricted".
+    #[error("the recorded inherited tool ceiling has no identity witness for {names:?}")]
+    MissingInheritedWitnesses { names: Vec<ToolName> },
+    /// The session's committed metadata does not decode.
+    #[error("the session's committed restriction metadata is malformed: {0}")]
+    Malformed(String),
+}
+
+impl PredecessorToolRestrictions {
+    /// The restrictions an owner handed to the build that created a session:
+    /// its resolved launch policy (`None` is unrestricted) and its inherited
+    /// ceiling (`None` is none inherited).
+    pub fn from_build_handoff(
+        launch: Option<crate::ops::ToolAccessPolicy>,
+        visibility: Option<InheritedToolVisibilityAuthority>,
+    ) -> Self {
+        Self {
+            launch: crate::ops::SpawnToolAccessPolicy::from_launch(launch),
+            visibility: visibility.map_or(
+                InheritedVisibilityEvidence::Unrestricted,
+                InheritedVisibilityEvidence::Ceiling,
+            ),
+            auth_binding: None,
+            auth_provider: None,
+        }
+    }
+
+    /// The same restrictions, with the auth binding the session's build
+    /// resolved its credentials through and the provider it resolved them
+    /// for (`None` when unknown).
+    pub fn with_auth_binding(
+        mut self,
+        auth_binding: Option<crate::AuthBindingRef>,
+        auth_provider: Option<crate::Provider>,
+    ) -> Self {
+        self.auth_binding = auth_binding;
+        self.auth_provider = auth_provider;
+        self
+    }
+
+    /// The restrictions a build request resolves to, for a session owner
+    /// that records them without building an agent. A resumed session (build
+    /// intent `Resume`) keeps
+    /// its own recorded restrictions: an explicit launch policy replaces the
+    /// recorded one (as the factory resolves it) and an explicit ceiling
+    /// narrows the recorded one. A fresh session has exactly the request's
+    /// restrictions.
+    pub fn from_build_request(
+        build: Option<&crate::service::SessionBuildOptions>,
+    ) -> Result<Self, PredecessorRestrictionsError> {
+        let explicit_launch = build
+            .and_then(|build| build.tool_access_policy.clone())
+            .filter(|policy| !matches!(policy, crate::ops::ToolAccessPolicy::Inherit));
+        let explicit_ceiling = build.and_then(|build| build.initial_tool_visibility_state.clone());
+        let explicit_auth_binding = build.and_then(|build| build.auth_binding.clone());
+        let explicit_provider = build.and_then(|build| build.provider);
+        // Only a build that continues a session has recorded restrictions; a
+        // minted session's carrier holds a pre-assigned id and nothing else.
+        let resumed = build.and_then(|build| match build.session_build_intent() {
+            crate::service::SessionBuildIntent::Resume => build.resume_session.as_ref(),
+            crate::service::SessionBuildIntent::Mint => None,
+        });
+        let Some(resumed) = resumed else {
+            return Ok(Self::from_build_handoff(explicit_launch, explicit_ceiling)
+                .with_auth_binding(explicit_auth_binding, explicit_provider));
+        };
+        let recorded = Self::from_committed_session(resumed)?;
+        let launch = match explicit_launch {
+            Some(policy) => crate::ops::SpawnToolAccessPolicy::from_launch(Some(policy)),
+            None => recorded.launch,
+        };
+        let visibility = match (recorded.visibility, explicit_ceiling) {
+            (visibility, None) => visibility,
+            (InheritedVisibilityEvidence::Unrestricted, Some(explicit)) => {
+                InheritedVisibilityEvidence::Ceiling(explicit)
+            }
+            (InheritedVisibilityEvidence::Ceiling(recorded), Some(explicit)) => {
+                InheritedVisibilityEvidence::Ceiling(
+                    recorded.narrowed_with(&explicit).map_err(|error| {
+                        PredecessorRestrictionsError::Malformed(error.to_string())
+                    })?,
+                )
+            }
+        };
+        // A resume re-resolves the session's recorded binding unless the
+        // build names one, as the factory does.
+        let auth_binding = explicit_auth_binding.or(recorded.auth_binding);
+        let auth_provider = explicit_provider.or(recorded.auth_provider);
+        Ok(Self {
+            launch,
+            visibility,
+            auth_binding,
+            auth_provider,
+        })
+    }
+
+    /// The restrictions recorded in a session's committed body. Missing
+    /// evidence is an error, never "unrestricted".
+    pub fn from_committed_session(session: &Session) -> Result<Self, PredecessorRestrictionsError> {
+        let metadata = session
+            .try_session_metadata()
+            .map_err(|error| PredecessorRestrictionsError::Malformed(error.to_string()))?;
+        let auth_binding = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.auth_binding.clone());
+        let auth_provider = metadata.as_ref().map(|metadata| metadata.provider);
+        let launch = metadata
+            .and_then(|metadata| metadata.tooling.spawn_tool_access_policy)
+            .ok_or(PredecessorRestrictionsError::MissingLaunchPolicy)?;
+        let state = session
+            .try_tool_visibility_state()
+            .map_err(|error| PredecessorRestrictionsError::Malformed(error.to_string()))?
+            .ok_or(PredecessorRestrictionsError::MissingVisibilityRecord)?;
+        let witnessed = |name: &str| {
+            state
+                .filter_witnesses
+                .get(name)
+                .is_some_and(ToolVisibilityWitness::has_identity_witness)
+        };
+        // A recorded ceiling name whose identity witness is gone cannot be
+        // handed on as the same tool, and dropping it would change the
+        // ceiling, so the evidence is unusable.
+        let filter = state.inherited_base_filter.clone();
+        if let ToolFilter::Allow(names) | ToolFilter::Deny(names) = &filter {
+            let mut missing: Vec<ToolName> = names
+                .iter()
+                .filter(|name| !witnessed(name.as_str()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                return Err(PredecessorRestrictionsError::MissingInheritedWitnesses {
+                    names: missing,
+                });
+            }
+        }
+        let visibility = if filter == ToolFilter::All {
+            InheritedVisibilityEvidence::Unrestricted
+        } else {
+            let witnesses = state
+                .filter_witnesses
+                .into_iter()
+                .filter(|(name, _)| match &filter {
+                    ToolFilter::Allow(names) | ToolFilter::Deny(names) => {
+                        names.contains(name.as_str())
+                    }
+                    ToolFilter::All => false,
+                })
+                .collect();
+            InheritedVisibilityEvidence::Ceiling(
+                InheritedToolVisibilityAuthority::from_generated_composition_authority(
+                    filter, witnesses,
+                ),
+            )
+        };
+        Ok(Self {
+            launch,
+            visibility,
+            auth_binding,
+            auth_provider,
+        })
+    }
+
+    /// The inherited launch policy (`None` is unrestricted).
+    pub fn launch_policy(&self) -> Option<crate::ops::ToolAccessPolicy> {
+        self.launch.clone().into_launch()
+    }
+
+    /// The inherited visibility ceiling, if any.
+    pub fn inherited_visibility(&self) -> Option<&InheritedToolVisibilityAuthority> {
+        match &self.visibility {
+            InheritedVisibilityEvidence::Unrestricted => None,
+            InheritedVisibilityEvidence::Ceiling(authority) => Some(authority),
+        }
+    }
+
+    /// The auth binding the session's credentials resolve through (`None`
+    /// when its build named none).
+    pub fn auth_binding(&self) -> Option<&crate::AuthBindingRef> {
+        self.auth_binding.as_ref()
+    }
+
+    /// The recorded auth binding, only for a build on the provider it was
+    /// recorded for. A binding serves one provider, so a successor on another
+    /// provider (or an unknown one) gets none and selects its own.
+    pub fn auth_binding_for_provider(
+        &self,
+        provider: crate::Provider,
+    ) -> Option<&crate::AuthBindingRef> {
+        self.auth_binding
+            .as_ref()
+            .filter(|_| self.auth_provider == Some(provider))
+    }
 }
 
 /// Canonical durable session-local tool visibility intent.
@@ -17862,6 +18144,243 @@ mod tests {
                 member: "alice".to_string(),
             }),
         }
+    }
+
+    fn session_with_recorded_restrictions(
+        launch: Option<crate::ops::SpawnToolAccessPolicy>,
+        visibility: Option<SessionToolVisibilityState>,
+    ) -> Session {
+        let mut session = Session::new();
+        let mut metadata = metadata_seam_session_metadata();
+        metadata.tooling.spawn_tool_access_policy = launch;
+        session.set_session_metadata(metadata).expect("metadata");
+        if let Some(state) = visibility {
+            session
+                .set_tool_visibility_state(
+                    AuthorizedSessionToolVisibilityState::from_generated_authority(state),
+                )
+                .expect("visibility");
+        }
+        session
+    }
+
+    /// A committed session states the auth binding its credentials resolve
+    /// through beside its restrictions, so a successor can keep it.
+    #[test]
+    fn predecessor_restrictions_carry_the_recorded_auth_binding() {
+        let recorded = crate::AuthBindingRef {
+            realm: crate::RealmId::parse("tenant_a").unwrap(),
+            binding: crate::BindingId::parse("scoped").unwrap(),
+            profile: None,
+            origin: crate::BindingOrigin::Configured,
+        };
+        let mut session = session_with_recorded_restrictions(
+            Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+            Some(SessionToolVisibilityState::default()),
+        );
+        let mut metadata = session
+            .try_session_metadata()
+            .expect("metadata decodes")
+            .expect("metadata present");
+        metadata.auth_binding = Some(recorded.clone());
+        session.set_session_metadata(metadata).expect("metadata");
+        let restrictions = PredecessorToolRestrictions::from_committed_session(&session)
+            .expect("the session states its restrictions");
+        assert_eq!(restrictions.auth_binding(), Some(&recorded));
+        let recorded_provider = session
+            .try_session_metadata()
+            .expect("metadata decodes")
+            .expect("metadata present")
+            .provider;
+        assert_eq!(
+            restrictions.auth_binding_for_provider(recorded_provider),
+            Some(&recorded),
+            "a successor on the recorded provider keeps the binding"
+        );
+        let other_provider = if recorded_provider == crate::Provider::OpenAI {
+            crate::Provider::Anthropic
+        } else {
+            crate::Provider::OpenAI
+        };
+        assert_eq!(
+            restrictions.auth_binding_for_provider(other_provider),
+            None,
+            "a successor on another provider selects its own binding"
+        );
+        assert_eq!(restrictions.launch_policy(), None);
+        assert!(restrictions.inherited_visibility().is_none());
+    }
+
+    fn shell_deny() -> crate::ops::ToolAccessPolicy {
+        crate::ops::ToolAccessPolicy::DenyList(["shell"].into_iter().collect())
+    }
+
+    fn kept_ceiling_state() -> SessionToolVisibilityState {
+        SessionToolVisibilityState {
+            inherited_base_filter: ToolFilter::Allow(["kept".to_string()].into_iter().collect()),
+            filter_witnesses: [(
+                ToolName::from("kept"),
+                ToolVisibilityWitness {
+                    last_seen_provenance: Some(crate::types::ToolProvenance {
+                        kind: crate::types::ToolSourceKind::Callback,
+                        source_id: "kept".into(),
+                        artifact: None,
+                    }),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A resumed session's recorded restrictions survive a build request
+    /// that names none of its own; a fresh default request is known
+    /// unrestricted.
+    #[test]
+    fn a_resumed_build_keeps_its_recorded_restrictions_without_fresh_overrides() {
+        let resumed = session_with_recorded_restrictions(
+            Some(crate::ops::SpawnToolAccessPolicy::from_launch(Some(
+                shell_deny(),
+            ))),
+            Some(kept_ceiling_state()),
+        );
+        let build = crate::service::SessionBuildOptions {
+            resume_session: Some(resumed),
+            ..Default::default()
+        };
+        let restrictions = PredecessorToolRestrictions::from_build_request(Some(&build))
+            .expect("recorded restrictions");
+        assert_eq!(restrictions.launch_policy(), Some(shell_deny()));
+        assert_eq!(
+            restrictions
+                .inherited_visibility()
+                .map(|authority| authority.filter().clone()),
+            Some(kept_ceiling_state().inherited_base_filter)
+        );
+
+        let fresh = PredecessorToolRestrictions::from_build_request(Some(
+            &crate::service::SessionBuildOptions::default(),
+        ))
+        .expect("fresh default");
+        assert_eq!(fresh.launch_policy(), None);
+        assert!(fresh.inherited_visibility().is_none());
+
+        // A minted session's pre-assigned carrier records nothing: its
+        // restrictions are exactly the request's, even when the carrier
+        // happens to hold metadata.
+        let minted = crate::service::SessionBuildOptions {
+            resume_session: Some(session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(Some(
+                    shell_deny(),
+                ))),
+                Some(kept_ceiling_state()),
+            )),
+            resume_session_intent: crate::service::SessionBuildIntent::Mint,
+            ..Default::default()
+        };
+        let minted = PredecessorToolRestrictions::from_build_request(Some(&minted))
+            .expect("a minted request");
+        assert_eq!(minted.launch_policy(), None);
+        assert!(minted.inherited_visibility().is_none());
+        let bare_carrier = crate::service::SessionBuildOptions {
+            resume_session: Some(Session::new()),
+            resume_session_intent: crate::service::SessionBuildIntent::Mint,
+            tool_access_policy: Some(shell_deny()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PredecessorToolRestrictions::from_build_request(Some(&bare_carrier))
+                .expect("a minted carrier")
+                .launch_policy(),
+            Some(shell_deny())
+        );
+    }
+
+    /// A broader successor ceiling never widens the predecessor's.
+    #[test]
+    fn a_broader_successor_ceiling_keeps_the_predecessor_ceiling() {
+        let predecessor = PredecessorToolRestrictions::from_committed_session(
+            &session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                Some(kept_ceiling_state()),
+            ),
+        )
+        .expect("recorded");
+        let state = kept_ceiling_state();
+        let mut witnesses = state.filter_witnesses.clone();
+        witnesses.insert(
+            ToolName::from("extra"),
+            ToolVisibilityWitness {
+                last_seen_provenance: Some(crate::types::ToolProvenance {
+                    kind: crate::types::ToolSourceKind::Callback,
+                    source_id: "extra".into(),
+                    artifact: None,
+                }),
+            },
+        );
+        let broader = InheritedToolVisibilityAuthority::from_generated_composition_authority(
+            ToolFilter::Allow(
+                ["kept".to_string(), "extra".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            witnesses,
+        );
+        let kept = predecessor
+            .inherited_visibility()
+            .expect("a ceiling")
+            .narrowed_with(&broader)
+            .expect("no identity conflict");
+        assert_eq!(kept.filter(), &state.inherited_base_filter);
+    }
+
+    /// Missing evidence is never read as unrestricted.
+    #[test]
+    fn missing_restriction_evidence_is_an_error_not_unrestricted() {
+        assert_eq!(
+            PredecessorToolRestrictions::from_committed_session(
+                &session_with_recorded_restrictions(None, Some(kept_ceiling_state()))
+            ),
+            Err(PredecessorRestrictionsError::MissingLaunchPolicy)
+        );
+        assert_eq!(
+            PredecessorToolRestrictions::from_committed_session(
+                &session_with_recorded_restrictions(
+                    Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                    None,
+                )
+            ),
+            Err(PredecessorRestrictionsError::MissingVisibilityRecord)
+        );
+        // A recorded ceiling whose identity witness is gone is unavailable
+        // evidence, reported by name.
+        let unwitnessed = SessionToolVisibilityState {
+            inherited_base_filter: ToolFilter::Deny(["lost".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PredecessorToolRestrictions::from_committed_session(
+                &session_with_recorded_restrictions(
+                    Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                    Some(unwitnessed),
+                )
+            ),
+            Err(PredecessorRestrictionsError::MissingInheritedWitnesses {
+                names: vec![ToolName::from("lost")],
+            })
+        );
+        // A present canonical record whose ceiling is All is known
+        // unrestricted.
+        let known = PredecessorToolRestrictions::from_committed_session(
+            &session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                Some(SessionToolVisibilityState::default()),
+            ),
+        )
+        .expect("a present All record");
+        assert!(known.inherited_visibility().is_none());
+        assert_eq!(known.launch_policy(), None);
     }
 
     /// Lockstep pin: the metadata-only partial decode must read the exact

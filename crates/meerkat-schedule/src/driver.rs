@@ -166,7 +166,10 @@ pub trait ScheduleTargetDelivery: Send + Sync {
     ///
     /// Implementations must durably deduplicate `identity.idempotency_key`
     /// before acknowledging admission. `Ok` means the returned dispatch
-    /// describes either that first admission or an exact replay. An ordinary
+    /// describes either that first admission or an exact replay. The
+    /// completion of an exact replay resolves from the original input's own
+    /// terminal outcome: the driver waits for it exactly as it waits for a
+    /// first admission, and never records a terminal at admission. An ordinary
     /// `Err` is permitted only when no target-side effect was admitted. If an
     /// implementation cannot prove whether admission happened, it must return
     /// [`ScheduleDomainError::DeliveryRepairDeferred`] so the occurrence stays
@@ -768,17 +771,14 @@ impl ScheduleDriver {
                 .effects()
                 .iter()
                 .any(|effect| matches!(effect, OccurrenceLifecycleEffect::DispatchAccepted));
-            let accepted_shape_is_valid = match accepted_commit.successor().phase {
-                OccurrencePhase::Dispatching => has_dispatch_accepted,
-                OccurrencePhase::Completed => {
-                    has_dispatch_accepted
-                        && accepted_commit
-                            .effects()
-                            .iter()
-                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Completed))
-                }
-                _ => false,
-            };
+            // Both admission outcomes leave the occurrence Dispatching. A
+            // deduplicated admission proves only that the target admitted
+            // this stable identity once: the occurrence waits for that
+            // input's own terminal outcome exactly as it waits for an
+            // accepted one, through the completion the adapter returned.
+            let accepted_shape_is_valid = accepted_commit.successor().phase
+                == OccurrencePhase::Dispatching
+                && has_dispatch_accepted;
             if !accepted_shape_is_valid || !accepted_commit.supersession_acks().is_empty() {
                 return Err(ScheduleDomainError::Internal(
                     "committed dispatch-accepted transition carried an incomplete or invalid lifecycle result"
@@ -786,9 +786,6 @@ impl ScheduleDriver {
                 ));
             }
             dispatching = accepted_commit.successor().clone();
-            if dispatching.phase == OccurrencePhase::Completed {
-                return Ok(true);
-            }
         }
 
         let refetched_id = dispatching.occurrence_id.clone();
@@ -2072,9 +2069,9 @@ mod tests {
             receipt.correlation_id = Some(identity.correlation_id.clone());
             // This fixture exercises the case where a newly accepted
             // delivery loses its completion authority and must remain
-            // reclaimable. `AdmissionDeduplicated` is instead durable
-            // exactly-once success evidence and the occurrence machine
-            // terminalizes it immediately.
+            // reclaimable. A deduplicated admission would wait for its
+            // completion the same way: the occurrence machine records no
+            // terminal at admission for either outcome.
             receipt.runtime_outcome = Some(RuntimeDeliveryOutcome::AdmissionAccepted);
             Ok(DeliveryDispatch {
                 receipt,
@@ -2176,6 +2173,10 @@ mod tests {
         effect_keys: Arc<Mutex<BTreeSet<String>>>,
         external_effect_count: Arc<Mutex<usize>>,
         admissions: Arc<Mutex<Vec<RuntimeDeliveryOutcome>>>,
+        /// When set, a deduplicated replay answers with the original
+        /// effect's own Completed terminal instead of an unavailable
+        /// completion authority.
+        replay_answers_original_completion: bool,
     }
 
     #[async_trait]
@@ -2200,6 +2201,7 @@ mod tests {
             };
             let admission_was_deduplicated =
                 admission == RuntimeDeliveryOutcome::AdmissionDeduplicated;
+            let replay_answers_original_completion = self.replay_answers_original_completion;
             self.admissions.lock().await.push(admission.clone());
             let mut receipt = DeliveryReceipt::new(
                 occurrence.occurrence_id.clone(),
@@ -2213,7 +2215,7 @@ mod tests {
                 correlation_id: Some(identity.correlation_id.clone()),
                 materialized_session_id: None,
                 completion: Box::pin(async move {
-                    if admission_was_deduplicated {
+                    if admission_was_deduplicated && !replay_answers_original_completion {
                         Err(ScheduleDomainError::DeliveryCompletionFailed {
                             reason: DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable,
                             detail: "original completion channel did not survive the crash"
@@ -2221,6 +2223,86 @@ mod tests {
                         })
                     } else {
                         Ok(DeliveryTerminal::completed(None))
+                    }
+                }),
+            })
+        }
+    }
+
+    /// A target that admits one input per stable idempotency key and settles
+    /// it only when the test says so. A redelivery under the same key
+    /// deduplicates and returns a completion that waits for that same
+    /// existing input, the way a runtime-backed host attaches a replay to the
+    /// original input's own outcome.
+    #[derive(Default)]
+    struct KeyedInputDelivery {
+        inputs: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Sender<Option<DeliveryTerminal>>>>>,
+        admissions: Arc<Mutex<Vec<RuntimeDeliveryOutcome>>>,
+    }
+
+    impl KeyedInputDelivery {
+        /// Settle the input admitted under `idempotency_key` with `terminal`.
+        async fn settle(&self, idempotency_key: &str, terminal: DeliveryTerminal) {
+            let inputs = self.inputs.lock().await;
+            let input = inputs
+                .get(idempotency_key)
+                .expect("the settled input was admitted under its stable key");
+            input.send_replace(Some(terminal));
+        }
+
+        async fn wait_for_admission_count(&self, expected: usize) {
+            for _ in 0..50 {
+                if self.admissions.lock().await.len() >= expected {
+                    return;
+                }
+                sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for {expected} keyed input admissions");
+        }
+    }
+
+    #[async_trait]
+    impl ScheduleTargetDelivery for KeyedInputDelivery {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let (admission, mut terminal_rx) = {
+                let mut inputs = self.inputs.lock().await;
+                match inputs.get(&identity.idempotency_key) {
+                    Some(existing) => (
+                        RuntimeDeliveryOutcome::AdmissionDeduplicated,
+                        existing.subscribe(),
+                    ),
+                    None => {
+                        let (terminal_tx, terminal_rx) = tokio::sync::watch::channel(None);
+                        inputs.insert(identity.idempotency_key.clone(), terminal_tx);
+                        (RuntimeDeliveryOutcome::AdmissionAccepted, terminal_rx)
+                    }
+                }
+            };
+            self.admissions.lock().await.push(admission.clone());
+            let mut receipt = DeliveryReceipt::new(
+                occurrence.occurrence_id.clone(),
+                occurrence.attempt_count,
+                DeliveryReceiptStage::DispatchAccepted,
+            );
+            receipt.correlation_id = Some(identity.correlation_id.clone());
+            receipt.runtime_outcome = Some(admission);
+            Ok(DeliveryDispatch {
+                receipt,
+                correlation_id: Some(identity.correlation_id.clone()),
+                materialized_session_id: None,
+                completion: Box::pin(async move {
+                    loop {
+                        let settled = terminal_rx.borrow_and_update().clone();
+                        if let Some(terminal) = settled {
+                            return Ok(terminal);
+                        }
+                        if terminal_rx.changed().await.is_err() {
+                            return Err(ScheduleDomainError::DriverStopped);
+                        }
                     }
                 }),
             })
@@ -4244,6 +4326,12 @@ mod tests {
         Ok(())
     }
 
+    /// The replay after a crash deduplicates at the target, and the
+    /// occurrence then waits for the completion the replay returned instead
+    /// of recording Completed at admission. This fake answers the replay
+    /// with an unavailable completion authority, so the occurrence ends
+    /// DeliveryFailed with the class that failure maps to, and the receipt
+    /// history keeps the deduplicated admission without a Completed receipt.
     #[tokio::test]
     async fn crash_after_effect_before_observation_deduplicates_on_replay()
     -> Result<(), ScheduleDomainError> {
@@ -4302,16 +4390,307 @@ mod tests {
                 RuntimeDeliveryOutcome::AdmissionDeduplicated
             ]
         );
+        let recovered = wait_for_occurrence_phase(
+            &service,
+            &schedule.schedule_id,
+            OccurrencePhase::DeliveryFailed,
+        )
+        .await?;
+        assert_eq!(recovered.occurrence_id, intent.occurrence_id);
+        // RuntimeCompletionAuthorityUnavailable resolves through the generated
+        // DeliveryCompletionFailureInternalError arm.
+        assert_eq!(
+            recovered.failure_class,
+            Some(OccurrenceFailureClass::InternalError)
+        );
+        assert!(
+            recovered
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("original completion channel")),
+            "the failure keeps the completion's own detail: {:?}",
+            recovered.failure_detail
+        );
+        assert_eq!(
+            *delivery.external_effect_count.lock().await,
+            1,
+            "the failed replay must not repeat the external effect"
+        );
+        let receipts = store.list_receipts(&intent.occurrence_id).await?;
+        assert!(
+            receipts.iter().any(|receipt| {
+                receipt.stage == DeliveryReceiptStage::DispatchAccepted
+                    && receipt.runtime_outcome
+                        == Some(RuntimeDeliveryOutcome::AdmissionDeduplicated)
+            }),
+            "the receipt history keeps the deduplicated admission: {receipts:?}"
+        );
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.stage != DeliveryReceiptStage::Completed),
+            "a deduplicated admission records no Completed receipt: {receipts:?}"
+        );
+        Ok(())
+    }
+
+    /// The control for the replay above: when the deduplicated replay's
+    /// completion answers with the original effect's own Completed terminal,
+    /// the occurrence ends Completed from that terminal, after a
+    /// DispatchAccepted receipt that keeps the deduplicated admission.
+    #[tokio::test]
+    async fn crash_after_effect_replay_completes_from_the_original_terminal()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("crash-after-effect-original-completion".into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let intent =
+            claim_and_start_dispatch_without_waiter(&store, Duration::milliseconds(25)).await?;
+        let identity = ScheduleDeliveryIdentity::for_occurrence(&intent);
+        let delivery = Arc::new(IdempotentDelivery {
+            replay_answers_original_completion: true,
+            ..IdempotentDelivery::default()
+        });
+
+        // The external target applies the effect, then this process dies
+        // before it can persist DispatchAccepted.
+        let _unobserved = delivery.deliver_occurrence(&intent, &identity).await?;
+
+        sleep(std::time::Duration::from_millis(35)).await;
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "recovery-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        driver.tick_once().await?;
+        wait_for_admission_count(&delivery, 2).await;
+
         let recovered =
             wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
                 .await?;
         assert_eq!(recovered.occurrence_id, intent.occurrence_id);
         assert_eq!(recovered.failure_class, None);
+        assert_eq!(*delivery.external_effect_count.lock().await, 1);
+        assert_eq!(
+            delivery.admissions.lock().await.as_slice(),
+            &[
+                RuntimeDeliveryOutcome::AdmissionAccepted,
+                RuntimeDeliveryOutcome::AdmissionDeduplicated
+            ]
+        );
         let receipts = store.list_receipts(&intent.occurrence_id).await?;
-        assert!(receipts.iter().any(|receipt| {
-            receipt.stage == DeliveryReceiptStage::Completed
-                && receipt.runtime_outcome == Some(RuntimeDeliveryOutcome::AdmissionDeduplicated)
-        }));
+        let accepted_at = receipts
+            .iter()
+            .position(|receipt| {
+                receipt.stage == DeliveryReceiptStage::DispatchAccepted
+                    && receipt.runtime_outcome
+                        == Some(RuntimeDeliveryOutcome::AdmissionDeduplicated)
+            })
+            .expect("the receipt history keeps the deduplicated admission");
+        let completed_at = receipts
+            .iter()
+            .position(|receipt| receipt.stage == DeliveryReceiptStage::Completed)
+            .expect("the original terminal records a Completed receipt");
+        assert!(
+            accepted_at < completed_at,
+            "Completed follows the deduplicated admission: {receipts:?}"
+        );
+        Ok(())
+    }
+
+    /// Dispatch, process restart, reclaim, deduplicated redelivery: the first
+    /// process admitted the input and died before it recorded the admission.
+    /// A new driver reclaims the occurrence (attempt 2), the redelivery
+    /// deduplicates onto the existing input, and the occurrence waits for
+    /// that input's own terminal. Returns the waiting occurrence.
+    async fn reclaim_onto_a_pending_existing_input(
+        store: &Arc<dyn ScheduleStore>,
+        service: &ScheduleService,
+        delivery: &Arc<KeyedInputDelivery>,
+        name: &str,
+    ) -> Result<(crate::ScheduleId, ScheduleDeliveryIdentity, Occurrence), ScheduleDomainError>
+    {
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some(name.into()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let intent =
+            claim_and_start_dispatch_without_waiter(store, Duration::milliseconds(25)).await?;
+        let identity = ScheduleDeliveryIdentity::for_occurrence(&intent);
+
+        // The first process admits the input, then dies with its completion
+        // waiter before it records DispatchAccepted. The input stays pending
+        // at the target.
+        drop(delivery.deliver_occurrence(&intent, &identity).await?);
+
+        // The restarted process reclaims the lapsed lease well inside the
+        // Skip grace window and redelivers under the same stable identity.
+        sleep(std::time::Duration::from_millis(35)).await;
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            store.clone(),
+            Arc::new(ReadyProbe),
+            delivery.clone(),
+            "restarted-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: Duration::seconds(30),
+            },
+        );
+        driver.tick_once().await?;
+        delivery.wait_for_admission_count(2).await;
+        assert_eq!(
+            delivery.admissions.lock().await.as_slice(),
+            &[
+                RuntimeDeliveryOutcome::AdmissionAccepted,
+                RuntimeDeliveryOutcome::AdmissionDeduplicated
+            ]
+        );
+
+        let waiting = wait_for_occurrence_phase(
+            service,
+            &schedule.schedule_id,
+            OccurrencePhase::AwaitingCompletion,
+        )
+        .await?;
+        assert_eq!(waiting.occurrence_id, intent.occurrence_id);
+        assert_eq!(waiting.attempt_count, 2);
+        // The deduplicated admission is no terminal: while the existing input
+        // is still pending, the occurrence keeps waiting for it.
+        sleep(std::time::Duration::from_millis(30)).await;
+        let still_waiting = service
+            .list_occurrences(&schedule.schedule_id)
+            .await?
+            .into_iter()
+            .find(|occurrence| occurrence.occurrence_id == intent.occurrence_id)
+            .expect("the reclaimed occurrence is listed");
+        assert_eq!(
+            still_waiting.phase,
+            OccurrencePhase::AwaitingCompletion,
+            "a deduplicated admission must wait for the existing input's outcome"
+        );
+        assert_eq!(still_waiting.attempt_count, 2);
+        Ok((schedule.schedule_id, identity, still_waiting))
+    }
+
+    /// Failure case: the existing input behind a reclaimed,
+    /// deduplicated redelivery fails, and the occurrence records that
+    /// input's failure class instead of Completed. Before the dedup arm
+    /// waited, the occurrence recorded Completed at the deduplicated
+    /// admission; restoring that (`to Completed` in
+    /// DispatchDeduplicatedFromDispatching) fails this test.
+    #[tokio::test]
+    async fn reclaimed_dedup_admission_records_the_existing_inputs_failure()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let delivery = Arc::new(KeyedInputDelivery::default());
+        let (schedule_id, identity, waiting) = reclaim_onto_a_pending_existing_input(
+            &store,
+            &service,
+            &delivery,
+            "reclaimed-dedup-failure",
+        )
+        .await?;
+
+        delivery
+            .settle(
+                &identity.idempotency_key,
+                DeliveryTerminal::runtime_completion(
+                    RuntimeCompletionOutcome::Abandoned,
+                    Some("the existing input was abandoned".to_string()),
+                    None,
+                ),
+            )
+            .await;
+
+        let failed =
+            wait_for_occurrence_phase(&service, &schedule_id, OccurrencePhase::DeliveryFailed)
+                .await?;
+        assert_eq!(failed.occurrence_id, waiting.occurrence_id);
+        assert_eq!(failed.attempt_count, 2);
+        // An abandoned runtime completion resolves through the generated
+        // RuntimeCompletionRuntimeRejected arm.
+        assert_eq!(
+            failed.failure_class,
+            Some(OccurrenceFailureClass::RuntimeRejected)
+        );
+        let receipts = store.list_receipts(&waiting.occurrence_id).await?;
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.stage != DeliveryReceiptStage::Completed),
+            "the failed existing input records no Completed receipt: {receipts:?}"
+        );
+        Ok(())
+    }
+
+    /// Success case: the existing input behind a reclaimed,
+    /// deduplicated redelivery completes, and the occurrence ends Completed
+    /// from that input's own terminal.
+    #[tokio::test]
+    async fn reclaimed_dedup_admission_records_the_existing_inputs_completion()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let delivery = Arc::new(KeyedInputDelivery::default());
+        let (schedule_id, identity, waiting) = reclaim_onto_a_pending_existing_input(
+            &store,
+            &service,
+            &delivery,
+            "reclaimed-dedup-completion",
+        )
+        .await?;
+
+        delivery
+            .settle(
+                &identity.idempotency_key,
+                DeliveryTerminal::runtime_completion(
+                    RuntimeCompletionOutcome::Completed,
+                    None,
+                    None,
+                ),
+            )
+            .await;
+
+        let completed =
+            wait_for_occurrence_phase(&service, &schedule_id, OccurrencePhase::Completed).await?;
+        assert_eq!(completed.occurrence_id, waiting.occurrence_id);
+        assert_eq!(completed.attempt_count, 2);
+        assert_eq!(completed.failure_class, None);
         Ok(())
     }
 

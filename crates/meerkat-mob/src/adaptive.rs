@@ -3909,7 +3909,7 @@ mod tests {
             additional_instructions: None,
             shell_env: None,
             mob_tool_authority_context: None,
-            mob_incarnation: Some(meerkat_core::service::MobIncarnationId::mint()),
+            mob_incarnation: Some(crate::tests::fresh_live_incarnation()),
             tool_access_policy: None,
             inherited_tool_filter: None,
             system_prompt_override: None,

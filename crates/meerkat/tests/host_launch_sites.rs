@@ -3,6 +3,10 @@
 //! exemptions ([`meerkat_core::HostLaunchExemption`]). A launch site this
 //! inventory does not classify fails the test until it is classified here,
 //! and a classified site that is gone fails it too.
+//!
+//! The other method `clippy.toml` disallows, the mob incarnation witness
+//! constructor, has its own inventory here (`WITNESS_SITES`): both rely on
+//! the same lint, so the lint's allows are counted against both lists.
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
@@ -144,6 +148,45 @@ const SITES: &[(&str, &str, usize, Launch)] = &[
         "libc::posix_spawn(",
         1,
         Launch::ConfinementBackend,
+    ),
+];
+
+/// Where a witness site's code is compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum WitnessSite {
+    /// Shipped library or binary code, under its own
+    /// `#[allow(clippy::disallowed_methods)]`.
+    Shipped,
+    /// Test code: a helper whose grants name no running mob.
+    Test,
+}
+
+/// The mob incarnation witness constructor, as `clippy.toml` disallows it.
+const WITNESS_CONSTRUCTOR: &str = "meerkat_core::service::LiveMobIncarnation::witnessed";
+
+/// Every use of the witness constructor outside its definition: the file,
+/// whether the code is shipped or test code, and how many uses the file has.
+/// Shipped code makes a witness only in `MobHandle::live_incarnation`, so a
+/// mob operator grant binds only an incarnation a mob runtime of this
+/// process runs or ran at; a test site is a helper whose grants name no
+/// running mob. The doc examples of the grant functions are outside the
+/// count, as all comments are.
+const WITNESS_SITES: &[(&str, WitnessSite, usize)] = &[
+    (
+        "crates/meerkat-mob/src/runtime/handle.rs",
+        WitnessSite::Shipped,
+        1,
+    ),
+    ("crates/meerkat-mob/src/tests/mod.rs", WitnessSite::Test, 1),
+    (
+        "crates/meerkat-runtime/src/mob_operator_authority.rs",
+        WitnessSite::Test,
+        1,
+    ),
+    (
+        "crates/meerkat/tests/factory_build_agent.rs",
+        WitnessSite::Test,
+        1,
     ),
 ];
 
@@ -528,6 +571,157 @@ fn identifier_continues(chars: &[char], index: usize) -> bool {
     index > 0 && (chars[index - 1].is_alphanumeric() || chars[index - 1] == '_')
 }
 
+/// The uses of the witness constructor in `code` (comments and literals
+/// blanked): every path that ends in the associated function `witnessed`
+/// (`<type>::witnessed`), however the type is spelled or aliased. A local
+/// variable of that name is not a path, and the definition (`fn witnessed`)
+/// is not one either.
+fn witness_uses(code: &str) -> usize {
+    let bytes = code.as_bytes();
+    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    code.match_indices("witnessed")
+        .filter(|(at, name)| {
+            let end = at + name.len();
+            let ends = end == bytes.len() || !identifier(bytes[end]);
+            ends && code[..*at].trim_end().ends_with("::")
+        })
+        .count()
+}
+
+/// `text` without whitespace.
+fn compact(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// Whether `character` continues an identifier.
+fn is_identifier_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// The attributes right before `start` in `code` (comments and literals
+/// blanked), outermost first, each without whitespace.
+fn attributes_before(code: &str, start: usize) -> Vec<String> {
+    let mut rest = code[..start].trim_end();
+    let mut attributes = Vec::new();
+    while rest.ends_with(']') {
+        let bytes = rest.as_bytes();
+        let mut depth = 0usize;
+        let mut open = None;
+        for index in (0..bytes.len()).rev() {
+            match bytes[index] {
+                b']' => depth += 1,
+                b'[' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open.filter(|&open| open > 0 && bytes[open - 1] == b'#') else {
+            break;
+        };
+        attributes.push(compact(&rest[open - 1..]));
+        rest = rest[..open - 1].trim_end();
+    }
+    attributes.reverse();
+    attributes
+}
+
+/// The body, between its braces, of the first block that opens at or after
+/// `from` in `code` (comments and literals blanked).
+fn block_after(code: &str, from: usize) -> Option<&str> {
+    let open = from + code[from..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, byte) in code.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&code[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What `code` (comments and literals blanked) does with a type named
+/// `name`, beyond naming it.
+#[derive(Debug, Default)]
+struct TypeUses<'a> {
+    /// Its `struct` declarations.
+    declarations: usize,
+    /// The bodies of its inherent `impl` blocks.
+    inherent_impls: Vec<&'a str>,
+    /// The traits implemented for it (`for <path>name`).
+    trait_impls: usize,
+    /// Its renames (`name as ..`), under which it could be built unseen.
+    renames: usize,
+    /// Every place it is built or destructured by name outside its
+    /// declaration: `name(..)` and `name { 0: .. }`.
+    constructions: usize,
+}
+
+fn type_uses<'a>(code: &'a str, name: &str) -> TypeUses<'a> {
+    let mut uses = TypeUses::default();
+    for (at, _) in code.match_indices(name) {
+        let after = &code[at + name.len()..];
+        if code[..at].ends_with(is_identifier_char) || after.starts_with(is_identifier_char) {
+            continue;
+        }
+        // The word before the type, past any path to it (`crate::service::`)
+        // and the generics of an `impl<..>`.
+        let mut before = code[..at].trim_end();
+        while let Some(path) = before.strip_suffix("::") {
+            let path = path.trim_end();
+            before = path.trim_end_matches(is_identifier_char).trim_end();
+        }
+        if before.ends_with('>') && !before.ends_with("->") {
+            let mut depth = 0usize;
+            for (index, character) in before.char_indices().rev() {
+                match character {
+                    '>' => depth += 1,
+                    '<' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            before = before[..index].trim_end();
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let previous = &before[before.trim_end_matches(is_identifier_char).len()..];
+        let after = after.trim_start();
+        match previous {
+            "struct" => uses.declarations += 1,
+            "for" => uses.trait_impls += 1,
+            "impl" if after.starts_with('{') => {
+                if let Some(body) = block_after(code, at) {
+                    uses.inherent_impls.push(body);
+                }
+            }
+            _ if after.starts_with("as") && !after[2..].starts_with(is_identifier_char) => {
+                uses.renames += 1;
+            }
+            _ if after.starts_with('(') => uses.constructions += 1,
+            _ if after.starts_with('{') && compact(&after[1..]).starts_with("0:") => {
+                uses.constructions += 1;
+            }
+            _ => {}
+        }
+    }
+    uses
+}
+
 /// Every launch expression in `code` with its count: each launch pattern,
 /// and each exemption's `HostLaunchExemption::<constructor>(`.
 fn launches(code: &str) -> BTreeMap<String, usize> {
@@ -807,7 +1001,10 @@ fn manifest_launch_lint_entries(manifest: &toml::Table) -> Vec<String> {
 /// as starting a process themselves (the confinement backend, a confined
 /// kind's trusted-host branch, the exemptions' one constructor), once per
 /// launch expression there; an exempt launch goes through its exemption's
-/// fixed-program constructor and needs none. `SITES` stays the one list.
+/// fixed-program constructor and needs none. `SITES` stays the one list of
+/// launches. The same lint fences the mob incarnation witness constructor,
+/// so a shipped witness site `WITNESS_SITES` lists allows it once per use
+/// too, and nothing else does.
 ///
 /// Nothing turns the lint off in bulk either: the workspace has one Clippy
 /// configuration file (a crate's own `clippy.toml` or `.clippy.toml` would
@@ -827,6 +1024,11 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
     let mut expected: BTreeMap<String, usize> = BTreeMap::new();
     for (file, _, count, launch) in SITES {
         if !matches!(launch, Launch::Exempt(_)) {
+            *expected.entry((*file).to_string()).or_default() += count;
+        }
+    }
+    for (file, site, count) in WITNESS_SITES {
+        if *site == WitnessSite::Shipped {
             *expected.entry((*file).to_string()).or_default() += count;
         }
     }
@@ -858,7 +1060,8 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
     assert_eq!(
         found, expected,
         "shipped code allows the process launch lint exactly once per launch expression \
-         of the sites SITES lists as launching themselves, and nowhere else"
+         of the sites SITES lists as launching themselves, once per use at the shipped \
+         witness sites WITNESS_SITES lists, and nowhere else"
     );
 
     let relative = |path: &Path| {
@@ -903,6 +1106,310 @@ fn the_launch_lint_is_allowed_only_at_the_listed_launch_sites() {
         bulk.is_empty(),
         "nothing turns the process launch lint off in bulk:\n{}",
         bulk.join("\n")
+    );
+}
+
+/// The mob incarnation witness is made only where `WITNESS_SITES` says:
+/// every use of the constructor in the workspace's Rust sources, shipped
+/// or test code, is listed with its count, and a listed site that is gone
+/// fails too.
+#[test]
+fn the_mob_incarnation_witness_is_made_only_at_the_listed_sites() {
+    let root = repo_root();
+    let mut found: BTreeMap<(String, WitnessSite), usize> = BTreeMap::new();
+    let mut scanned = 0usize;
+    for path in walk_rust_sources(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let relative = relative.trim_start_matches("./").to_string();
+        // The workspace's Rust sources; a checkout nested in the tree (an
+        // agent worktree) is another workspace.
+        if !["crates/", "examples/", "tests/"]
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+        {
+            continue;
+        }
+        scanned += 1;
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let uses = witness_uses(&blank_comments_and_literals(&source));
+        if uses == 0 {
+            continue;
+        }
+        let shipped = if is_shipped_source(&relative) {
+            witness_uses(&shipped_code(&source))
+        } else {
+            0
+        };
+        if shipped > 0 {
+            found.insert((relative.clone(), WitnessSite::Shipped), shipped);
+        }
+        if uses > shipped {
+            found.insert((relative, WitnessSite::Test), uses - shipped);
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the workspace sources were not found under {} ({scanned} files)",
+        root.display()
+    );
+    let expected: BTreeMap<(String, WitnessSite), usize> = WITNESS_SITES
+        .iter()
+        .map(|(file, site, count)| (((*file).to_string(), *site), *count))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the mob incarnation witness is made only at the sites WITNESS_SITES lists, with \
+         these counts"
+    );
+    assert_eq!(
+        WITNESS_SITES
+            .iter()
+            .filter(|(_, site, _)| *site == WitnessSite::Shipped)
+            .map(|(file, _, count)| (*file, *count))
+            .collect::<Vec<_>>(),
+        [("crates/meerkat-mob/src/runtime/handle.rs", 1)],
+        "shipped code makes a witness only in MobHandle::live_incarnation"
+    );
+}
+
+/// Clippy refuses every call of the witness constructor
+/// (`disallowed_methods`, which resolves aliased imports and calls through
+/// re-exports), with a reason that names the way to get a witness.
+#[test]
+fn clippy_disallows_the_mob_incarnation_witness_constructor() {
+    let path = repo_root().join("clippy.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let config: toml::Table = text
+        .parse()
+        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+    let entry = config
+        .get("disallowed-methods")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .find(|entry| entry.get("path").and_then(toml::Value::as_str) == Some(WITNESS_CONSTRUCTOR))
+        .unwrap_or_else(|| panic!("clippy.toml disallows {WITNESS_CONSTRUCTOR}"));
+    let reason = entry
+        .get("reason")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("MobHandle::live_incarnation"),
+        "the clippy.toml entry for {WITNESS_CONSTRUCTOR} names the way to get a witness: {reason:?}"
+    );
+}
+
+/// The witness use count sees every spelling of a path to the constructor
+/// and skips its definition, other names and a variable called `witnessed`.
+#[test]
+fn the_witness_scan_counts_every_use_but_the_definition() {
+    let source = r#"
+impl LiveMobIncarnation {
+    pub fn witnessed(incarnation: MobIncarnationId) -> Self { Self(incarnation) }
+}
+use meerkat_core::service::LiveMobIncarnation as Witness;
+fn calls() {
+    let _ = LiveMobIncarnation::witnessed(id);
+    let _ = Witness:: witnessed (id);
+    let make = meerkat_core::service::LiveMobIncarnation::witnessed;
+    // LiveMobIncarnation::witnessed(in_a_comment)
+    let _ = "LiveMobIncarnation::witnessed(in_a_literal)";
+    let witnessed = Probe::witnessed_filter(unwitnessed());
+    if witnessed {}
+}
+"#;
+    assert_eq!(witness_uses(&blank_comments_and_literals(source)), 3);
+}
+
+/// The witness has one constructor, the type half of the fence the
+/// inventory above completes: the service module declares
+/// `LiveMobIncarnation` as a tuple struct over a private `MobIncarnationId`
+/// with exactly these derives (no `Default`, no serde), builds it only in
+/// `witnessed`, and no file of the workspace implements a trait for it. So
+/// no `From`, `Default`, `Deserialize` or second constructor goes around
+/// `witnessed`, whose calls the inventory counts. The type and `witnessed`
+/// are declared where `WITNESS_CONSTRUCTOR` says: `clippy.toml` lets that
+/// path go unresolved (`allow-invalid`), so a moved constructor would end
+/// the lint without an error.
+#[test]
+fn the_mob_incarnation_witness_has_one_constructor() {
+    let root = repo_root();
+    let read = |relative: &str| {
+        let path = root.join(relative);
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        blank_comments_and_literals(&source)
+    };
+
+    // Where the constructor is declared: the module WITNESS_CONSTRUCTOR names.
+    assert_eq!(
+        WITNESS_CONSTRUCTOR.strip_suffix("::LiveMobIncarnation::witnessed"),
+        Some("meerkat_core::service"),
+        "WITNESS_CONSTRUCTOR names the witness constructor in meerkat_core::service"
+    );
+    assert!(
+        compact(&read("crates/meerkat-core/src/lib.rs")).contains("pubmodservice;"),
+        "meerkat_core declares its service module public"
+    );
+    let service_path = "crates/meerkat-core/src/service/mod.rs";
+    let service = read(service_path);
+
+    // The declaration: a private field, and exactly these derives.
+    let declaration = "pub struct LiveMobIncarnation(MobIncarnationId);";
+    assert_eq!(
+        service.matches(declaration).count(),
+        1,
+        "{service_path} declares `{declaration}`, its field private"
+    );
+    let declared_at = service.find(declaration).expect("declared");
+    assert_eq!(
+        attributes_before(&service, declared_at),
+        ["#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]"],
+        "LiveMobIncarnation derives no Default and no serde: neither may make a witness"
+    );
+
+    // The one inherent impl builds the tuple once, in `witnessed`, which is
+    // public but hidden from the docs.
+    let uses = type_uses(&service, "LiveMobIncarnation");
+    assert_eq!(uses.declarations, 1);
+    assert_eq!(
+        uses.inherent_impls.len(),
+        1,
+        "{service_path} has one inherent impl of LiveMobIncarnation"
+    );
+    let body = compact(uses.inherent_impls[0]);
+    assert_eq!(
+        (
+            body.matches("Self(").count(),
+            body.matches("Self{0:").count()
+        ),
+        (1, 0),
+        "the inherent impl of LiveMobIncarnation builds the tuple once: {body}"
+    );
+    assert!(
+        body.contains("pubfnwitnessed(incarnation:MobIncarnationId)->Self{Self(incarnation)}"),
+        "the one construction is `witnessed`: {body}"
+    );
+    let witnessed_at = service
+        .find("pub fn witnessed(")
+        .expect("witnessed is declared");
+    assert_eq!(
+        attributes_before(&service, witnessed_at),
+        ["#[doc(hidden)]"],
+        "witnessed is hidden from the docs"
+    );
+
+    // No other construction in meerkat-core, whose service module and its
+    // children can reach the private field, and no trait impl anywhere.
+    let mut core_constructions = Vec::new();
+    let mut trait_impls = Vec::new();
+    let mut scanned = 0usize;
+    for path in walk_rust_sources(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let relative = relative.trim_start_matches("./").to_string();
+        if !["crates/", "examples/", "tests/"]
+            .iter()
+            .any(|prefix| relative.starts_with(prefix))
+        {
+            continue;
+        }
+        scanned += 1;
+        let code = read(&relative);
+        let uses = type_uses(&code, "LiveMobIncarnation");
+        if uses.trait_impls > 0 {
+            trait_impls.push((relative.clone(), uses.trait_impls));
+        }
+        if relative.starts_with("crates/meerkat-core/src/") {
+            let outside_the_impl = uses.inherent_impls.len()
+                - usize::from(relative == service_path && !uses.inherent_impls.is_empty());
+            let declared_elsewhere = if relative == service_path {
+                uses.declarations.saturating_sub(1)
+            } else {
+                uses.declarations
+            };
+            let found = (
+                uses.constructions,
+                uses.renames,
+                outside_the_impl,
+                declared_elsewhere,
+            );
+            if found != (0, 0, 0, 0) {
+                core_constructions.push((relative, found));
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "the workspace sources were not found under {} ({scanned} files)",
+        root.display()
+    );
+    assert_eq!(
+        core_constructions,
+        Vec::<(String, (usize, usize, usize, usize))>::new(),
+        "meerkat-core builds LiveMobIncarnation only in `witnessed`: (constructions by name, \
+         renames, further inherent impls, further declarations) per file"
+    );
+    assert_eq!(
+        trait_impls,
+        Vec::<(String, usize)>::new(),
+        "no trait is implemented for LiveMobIncarnation (a From, Default or Deserialize impl \
+         would make a witness around `witnessed`)"
+    );
+}
+
+/// The type scan sees the declaration, inherent and trait impls behind any
+/// path or generics, renames and constructions by name, and skips a return
+/// type before a body, a generic argument, comments and literals.
+#[test]
+fn the_type_scan_sees_impls_renames_and_constructions() {
+    let source = r#"
+pub struct LiveMobIncarnation(MobIncarnationId);
+impl LiveMobIncarnation {
+    pub fn witnessed(incarnation: MobIncarnationId) -> Self { Self(incarnation) }
+}
+impl<T> super::LiveMobIncarnation { fn other() {} }
+impl From<MobIncarnationId> for crate::service::LiveMobIncarnation {
+    fn from(incarnation: MobIncarnationId) -> Self { Self(incarnation) }
+}
+impl Default for LiveMobIncarnation { fn default() -> Self { todo!() } }
+use super::LiveMobIncarnation as Witness;
+fn build(id: MobIncarnationId) -> LiveMobIncarnation {
+    let _ = LiveMobIncarnation (id);
+    let _ = LiveMobIncarnation { 0: id };
+    let _: Option<LiveMobIncarnation> = None;
+    // LiveMobIncarnation(in_a_comment)
+    let _ = "LiveMobIncarnation(in_a_literal)";
+    let _ = MyLiveMobIncarnation(id);
+    LiveMobIncarnation::witnessed(id)
+}
+"#;
+    let code = blank_comments_and_literals(source);
+    let uses = type_uses(&code, "LiveMobIncarnation");
+    assert_eq!(uses.declarations, 1);
+    assert_eq!(uses.inherent_impls.len(), 2);
+    assert!(compact(uses.inherent_impls[0]).contains("Self(incarnation)"));
+    assert_eq!(uses.trait_impls, 2);
+    assert_eq!(uses.renames, 1);
+    assert_eq!(uses.constructions, 2);
+    let declared_at = code
+        .find("pub struct LiveMobIncarnation")
+        .expect("declared");
+    assert!(attributes_before(&code, declared_at).is_empty());
+    let attributed = "#[derive(Debug)]\n#[doc(hidden)]\nstruct Probe;";
+    assert_eq!(
+        attributes_before(attributed, attributed.find("struct").expect("declared")),
+        ["#[derive(Debug)]", "#[doc(hidden)]"]
     );
 }
 

@@ -341,13 +341,31 @@ surface, not the old live-adapter/docs-refresh snapshot:
     running session with `hot_swap_llm_identity` /
     `hot_swap_session_llm_identity`.
   - Governed realms: `bind_prompt` binds only operator prompts; host-reported
-    outcomes use `bind_host_outcome`.
+    outcomes use `bind_host_outcome`; an environment model key's route now
+    reaches the controller grant, which admits it only when a `--route` key
+    names it (0.9.3 refused it as an unusable controller credential).
   - The tool configuration change bit is `settled`, not `persisted` (rows
     stored before 0.9.4 keep `persisted`); a 0.9.3 SDK against a 0.9.4
     `rkat-rpc` fails on `tool_config_changed`, so upgrade SDKs together.
   - Realtime: a response the provider ends without completing it arrives as
     the non-terminal `turn_failed` live observation (route on
     `failure.status`); nothing of it is committed and it is not retried.
+  - Forks of a source with activated host instructions that start the
+    child's first turn themselves (`fork_off`, council participants, RPC
+    `session/fork_at` / `session/fork_replace`) are refused with
+    `FORK_INSTRUCTION_REFUSED` unless the host sets, or the RPC call passes
+    as `inherited_instructions`, the `reactivate_inherited` policy; upgrade
+    member hosts before their controller.
+  - In-turn steers are written into the running turn's transcript (or one
+    follow-up turn), and a 0.9.3 peer that checks signatures drops a 0.9.4
+    `reply_to_peer` reply, so upgrade comms peers together.
+  - Mobs keep their incarnation across resume (operator grants survive it);
+    mob stores migrate to schema 12, which 0.9.3 refuses, so back them up;
+    the operator grant functions take `MobHandle::live_incarnation()`.
+  - Release binaries build SQLite without its process-wide locks; a
+    `cargo install rkat` or embedding build sets `LIBSQLITE3_FLAGS` itself
+    (see the deploying guide, "SQLite Lock Profile"); `rkat storage doctor`
+    warns `sqlite-lock-profile`.
 - **0.9.0 (2026-10-13).** Breaking changes and an upgrade checklist are in
   `references/migration_0_9.md`. In short:
   - MobKit is now Meta in Core's public surface, with no aliases: JSON-RPC
@@ -1218,13 +1236,13 @@ tools.
 
 ```toml
 # Default: three providers + Copilot backend; no persistent realm/comms/MCP/skills/memory/live activation
-meerkat = "=0.9.3"
+meerkat = "=0.9.4"
 
 # Single provider, minimal
-meerkat = { version = "=0.9.3", default-features = false, features = ["anthropic"] }
+meerkat = { version = "=0.9.4", default-features = false, features = ["anthropic"] }
 
 # Add persistence + memory + comms + live channels
-meerkat = { version = "=0.9.3", features = [
+meerkat = { version = "=0.9.4", features = [
     "jsonl-store", "session-store", "session-compaction",
     "memory-store-session", "comms", "mcp", "skills",
     "openai-realtime", "live", "live-webrtc"
@@ -1255,7 +1273,7 @@ surfaces. The default `rkat` feature set includes `memory-store` and
 builds:
 
 ```bash
-cargo install rkat --version "=0.9.3" --no-default-features --features "anthropic,openai,session-store,mcp"
+cargo install rkat --version "=0.9.4" --no-default-features --features "anthropic,openai,session-store,mcp"
 ```
 
 Disabled features return typed errors (e.g. `SessionError::PersistenceDisabled`) — no panics.

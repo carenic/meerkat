@@ -57,6 +57,32 @@ impl NativeWorkAuthorizationAttachment {
     }
 }
 
+/// What native admission holds for the credential of the controller an
+/// input selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialHold {
+    /// The route's credential lifecycle: its lease must be Authorized.
+    Lease,
+    /// Nothing: the route has no credential lifecycle. Its resolved
+    /// connection is explicitly authless, or it is the synthetic env-var
+    /// default, whose key is the host process's own environment and never
+    /// has a lease
+    /// ([`meerkat_core::ControllerModelSelection::uses_synthetic_env_default_credential`]).
+    NoLifecycle,
+}
+
+impl CredentialHold {
+    fn of(selection: &meerkat_core::ControllerModelSelection) -> Self {
+        if selection.credential_requirement().is_required()
+            && !selection.uses_synthetic_env_default_credential()
+        {
+            Self::Lease
+        } else {
+            Self::NoLifecycle
+        }
+    }
+}
+
 /// Stack-local custody, not a serializable permission or a reusable admission.
 pub(crate) enum NativeCredentialCustody {
     Ungoverned,
@@ -66,17 +92,17 @@ pub(crate) enum NativeCredentialCustody {
         host: Arc<dyn NativeWorkAuthorizationHost>,
         authority: GeneratedAuthLeaseHandle,
         input_id: meerkat_core::InputId,
-        requirement: meerkat_core::ControllerCredentialRequirement,
+        hold: CredentialHold,
     },
 }
 
-/// The governed host, credential authority, lease key and credential
-/// requirement of the controller an input selects.
+/// The governed host, credential authority, lease key and credential hold of
+/// the controller an input selects.
 type SelectedCredential = (
     Arc<dyn NativeWorkAuthorizationHost>,
     GeneratedAuthLeaseHandle,
     LeaseKey,
-    meerkat_core::ControllerCredentialRequirement,
+    CredentialHold,
 );
 
 impl NativeCredentialCustody {
@@ -115,18 +141,20 @@ impl NativeCredentialCustody {
                 .ok_or_else(crate::input_authority::unavailable)?
         };
         let key = LeaseKey::from_credential_identity(controller.selection().credential());
-        // The requirement is the actual resolved connection's, projected into
-        // the pinned selection; the live client must still report that exact
-        // selection, so a pinned authless claim cannot outlive its route.
-        let requirement = controller.selection().credential_requirement();
-        if !requirement.is_required()
+        // The hold follows the actual resolved connection's requirement and
+        // the factory's env-default route, both projected into the pinned
+        // selection. A route held without a lease must still be the live
+        // client's exact selection, so a pinned authless or env-default claim
+        // cannot outlive its route.
+        let hold = CredentialHold::of(controller.selection());
+        if hold == CredentialHold::NoLifecycle
             && controller.client().controller_model_selection().as_ref()
                 != Some(controller.selection())
         {
             return Err(unavailable(ControllerReadinessFailure::AuthorityChanged));
         }
         let authority = host.credential_authority()?;
-        Ok(Some((host.host().clone(), authority, key, requirement)))
+        Ok(Some((host.host().clone(), authority, key, hold)))
     }
 
     pub(crate) async fn acquire(
@@ -134,7 +162,7 @@ impl NativeCredentialCustody {
         input: &Input,
         _persistent: bool,
     ) -> Result<Self, RuntimeDriverError> {
-        let Some((host, authority, key, requirement)) = Self::selected(slot, input)? else {
+        let Some((host, authority, key, hold)) = Self::selected(slot, input)? else {
             return Ok(Self::Ungoverned);
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -155,12 +183,12 @@ impl NativeCredentialCustody {
                 host,
                 authority,
                 input_id: input.id().clone(),
-                requirement,
+                hold,
             })
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (host, authority, key, requirement);
+            let _ = (host, authority, key, hold);
             Err(unavailable(ControllerReadinessFailure::UnsupportedScope))
         }
     }
@@ -169,7 +197,7 @@ impl NativeCredentialCustody {
         slot: &NativeWorkAuthorizationSlot,
         input: &Input,
     ) -> Result<Self, RuntimeDriverError> {
-        let Some((host, authority, key, requirement)) = Self::selected(slot, input)? else {
+        let Some((host, authority, key, hold)) = Self::selected(slot, input)? else {
             return Ok(Self::Ungoverned);
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -181,12 +209,12 @@ impl NativeCredentialCustody {
                 host,
                 authority,
                 input_id: input.id().clone(),
-                requirement,
+                hold,
             })
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (host, authority, key, requirement);
+            let _ = (host, authority, key, hold);
             Err(unavailable(ControllerReadinessFailure::UnsupportedScope))
         }
     }
@@ -213,9 +241,9 @@ impl NativeCredentialCustody {
                 host,
                 authority,
                 input_id,
-                requirement,
+                hold,
             } => {
-                let Some((current_host, current_authority, current_key, current_requirement)) =
+                let Some((current_host, current_authority, current_key, current_hold)) =
                     Self::selected(slot, input)?
                 else {
                     return Err(unavailable(ControllerReadinessFailure::AuthorityChanged));
@@ -224,15 +252,15 @@ impl NativeCredentialCustody {
                     || !Arc::ptr_eq(host, &current_host)
                     || !Arc::ptr_eq(&authority.clone_handle(), &current_authority.clone_handle())
                     || guard.lease_key() != &current_key
-                    || *requirement != current_requirement
+                    || *hold != current_hold
                 {
                     return Err(unavailable(ControllerReadinessFailure::AuthorityChanged));
                 }
-                // An explicitly authless route has no credential lifecycle to
-                // hold: its resolver published none and none is synthesized.
-                // The host, selection, grant and input checks above and in
-                // native admission still apply.
-                if !current_requirement.is_required() {
+                // An explicitly authless route and the env-var default have no
+                // credential lifecycle to hold: their resolver published no
+                // lease and none is synthesized. The host, selection, grant
+                // and input checks above and in native admission still apply.
+                if current_hold == CredentialHold::NoLifecycle {
                     return Ok(());
                 }
                 let disposition = authority

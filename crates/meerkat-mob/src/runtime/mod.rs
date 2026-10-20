@@ -426,7 +426,8 @@ pub use delegation::{
 pub use delivery_scope::{
     DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberBinding, MemberBindingHistory,
     MemberBindingHistoryReadError, MemberBindingState, MemberDeliveryScope,
-    MemberIdentityManagement, ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
+    MemberIdentityManagement, ScopeIncarnation, ScopedRecoveryUnresolved, ScopedWorkRecovery,
+    ScopedWorkState,
 };
 #[cfg(all(feature = "runtime-adapter", any(test, feature = "test-support")))]
 #[doc(hidden)]

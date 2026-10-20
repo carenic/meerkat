@@ -943,6 +943,7 @@ impl InteractionTerminalPublicationError {
             crate::RuntimeDriverError::ControllerReadinessUnavailable { .. }
             | crate::RuntimeDriverError::ControllerInUse
             | crate::RuntimeDriverError::UnregisterFinalizationOutcomeUnknown { .. }
+            | crate::RuntimeDriverError::InputTerminalNotYetReadable { .. }
             | crate::RuntimeDriverError::UnregisterInProgress { .. }
             | crate::RuntimeDriverError::RuntimeStopInProgress { .. }
             | crate::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }
@@ -1041,7 +1042,9 @@ async fn finalize_publish_and_resolve_runtime_terminals(
 /// terminalization of a persistent session before it stops waiting: the
 /// store's declared commit outcome deadline, with the session durability
 /// health that a missed deadline degrades. Read once when the loop starts,
-/// before any of its commits can hold the session driver lock.
+/// before any of its commits can hold the session driver lock. An input
+/// admission reads the same declaration from the driver it holds before its
+/// owned store write.
 #[derive(Clone)]
 pub(crate) struct RuntimeLoopCommitDeadline {
     deadline: std::time::Duration,
@@ -1057,6 +1060,16 @@ impl RuntimeLoopCommitDeadline {
             deadline,
             durability_health,
         }
+    }
+
+    /// The declared deadline.
+    pub(crate) fn deadline(&self) -> std::time::Duration {
+        self.deadline
+    }
+
+    /// The session durability health a missed deadline degrades.
+    pub(crate) fn durability_health(&self) -> &crate::meerkat_machine::DurabilityHealthHandle {
+        &self.durability_health
     }
 
     /// The same declaration measured in busy windows of `window` instead of

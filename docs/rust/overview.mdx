@@ -52,7 +52,7 @@ adapter types remain owned by `meerkat-live`.
   <Step title="Add the dependency">
     ```toml
     [dependencies]
-    meerkat = "=0.9.3"
+    meerkat = "=0.9.4"
     tokio = { version = "1", features = ["full"] }
     ```
   </Step>
@@ -62,17 +62,17 @@ adapter types remain owned by `meerkat-live`.
     <CodeGroup>
     ```toml Default (all providers, no storage)
     [dependencies]
-    meerkat = "=0.9.3"
+    meerkat = "=0.9.4"
     ```
 
     ```toml Add persistence
     [dependencies]
-    meerkat = { version = "=0.9.3", features = ["sqlite-store", "session-store"] }
+    meerkat = { version = "=0.9.4", features = ["sqlite-store", "session-store"] }
     ```
 
     ```toml Full native harness
     [dependencies]
-    meerkat = { version = "=0.9.3", features = [
+    meerkat = { version = "=0.9.4", features = [
         "sqlite-store", "session-store", "session-compaction",
         "memory-store-session", "atif", "comms", "mcp", "skills",
         "schedule", "workgraph", "openai-realtime", "live",
@@ -82,7 +82,7 @@ adapter types remain owned by `meerkat-live`.
 
     ```toml Minimal (single provider)
     [dependencies]
-    meerkat = { version = "=0.9.3", default-features = false, features = ["anthropic"] }
+    meerkat = { version = "=0.9.4", default-features = false, features = ["anthropic"] }
     ```
     </CodeGroup>
   </Step>
@@ -116,6 +116,17 @@ adapter types remain owned by `meerkat-live`.
 | `test-realtime-fixtures` | Test-only deterministic realtime fixtures | No |
 </Accordion>
 
+<Note>
+Meerkat's stores run on the SQLite that `libsqlite3-sys` bundles, whose
+defaults put every connection in the process behind three process-wide locks.
+Build your application with
+`LIBSQLITE3_FLAGS="-DSQLITE_DEFAULT_MEMSTATUS=0 -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS"`
+(for example in the `[env]` table of your workspace's `.cargo/config.toml`),
+and call `meerkat_sqlite::disable_memory_statistics_at_process_start()` from
+the `meerkat-sqlite` crate as the first statement of `main`. See
+[SQLite Lock Profile](/guides/deploying#sqlite-lock-profile).
+</Note>
+
 ---
 
 ## Quick start
@@ -131,8 +142,8 @@ transitive dependencies are not available as direct crate imports.
 
 ```toml
 [dependencies]
-meerkat = { version = "=0.9.3", features = ["sqlite-store", "session-store"] }
-meerkat-store = "=0.9.3"
+meerkat = { version = "=0.9.4", features = ["sqlite-store", "session-store"] }
+meerkat-store = "=0.9.4"
 tokio = { version = "1", features = ["full"] }
 ```
 

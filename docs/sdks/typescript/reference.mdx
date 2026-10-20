@@ -95,6 +95,18 @@ The package exports more than the core session lifecycle. The `MeerkatClient` al
   `liveWebrtcAnswer`, `liveInterrupt`, `liveTruncate`, `liveRefresh`, and
   `parseLiveObservation`
 
+`forkSessionAt` and `forkSessionReplace` take `inheritedInstructions` in their
+options, the fork instruction policy for the instruction activations the
+prefix carries: `"require_explicit_activation"` (the default),
+`"reactivate_inherited"` or `"refuse"`. A forked child is not materialized, so
+under the default and under `"refuse"` a prefix that carries activation rows is
+refused before anything is committed with `FORK_INSTRUCTION_REFUSED`, whose
+`details` carry the typed `fork_instruction_refusal` (cause and keys). With
+`"reactivate_inherited"` the child gets its own activation of every key that
+was effective in the source, and `SessionForkResult.reactivatedInstructionCount`
+counts those rows. A child runs under its source's session configuration; see
+[what a fork child inherits](/api/rpc#what-a-fork-child-inherits).
+
 Approval calls maintain audit records only; they do not automatically gate,
 authorize, or execute an action. Records persist when the RPC persistence
 bundle exposes a store path. See [JSON-RPC approvals](/api/rpc#approvals).
@@ -1010,7 +1022,7 @@ source UUID explicitly when multiple sources provide that name.
 
 ```typescript
 import { CONTRACT_VERSION } from "@rkat/sdk";
-console.log(CONTRACT_VERSION);  // "0.9.3"
+console.log(CONTRACT_VERSION);  // "0.9.4"
 ```
 
 - While the major version is `0`, minor versions must match exactly between SDK and server.

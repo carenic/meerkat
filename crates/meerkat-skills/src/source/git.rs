@@ -961,8 +961,12 @@ mod tests {
         )
         .unwrap()
         .expect("an https repository takes the token");
+        // Served where the source serves it: under the system temporary
+        // directory first. The canonical tempdir is longer (on macOS by
+        // `/private` and its own level) than a socket address may be.
         let served =
-            credential::CredentialSocket::serve(&token, std::slice::from_ref(&base), None).unwrap();
+            credential::CredentialSocket::serve(&token, &credential::socket_parents(&base), None)
+                .unwrap();
         let options = token
             .config_options(&credential::TokenRoute::new(Some(served.path())))
             .unwrap();

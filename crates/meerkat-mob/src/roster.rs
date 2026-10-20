@@ -57,6 +57,15 @@ pub struct MobMemberKickoffSnapshot {
     pub updated_at: SystemTime,
 }
 
+/// Local session authority of a member's current generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemberLocalSession {
+    /// The generation is bound to this local session.
+    Bound(SessionId),
+    /// The generation never had a local session.
+    NeverBound,
+}
+
 /// A single member entry in the roster.
 ///
 /// Public fields use the identity-native model (0.6). Bridge-level fields
@@ -695,6 +704,32 @@ impl RosterEntry {
     #[doc(hidden)]
     pub fn bridge_session_id(&self) -> Option<&SessionId> {
         self.member_ref.bridge_session_id()
+    }
+
+    /// Local session authority of this generation, as its journaled record
+    /// states it.
+    ///
+    /// The member reference starts as the generation's sanitized
+    /// `MemberSpawned` reference. Within the retained generation, its session
+    /// only ever moves toward `Some`: a journaled `MemberSessionBindingRecovered`
+    /// and the restore-time setters can bind or rebind a session, and peer
+    /// replacement rewrites only already sessionless references. A backend
+    /// peer reference without a session therefore proves the generation was
+    /// never bound locally. The machine's current binding map is not this
+    /// history: a release during retirement empties it and leaves this
+    /// reference bound. A placed member's session lives on its host and is
+    /// not described here.
+    pub(crate) fn local_session(&self) -> MemberLocalSession {
+        match &self.member_ref {
+            MemberRef::Session { session_id }
+            | MemberRef::BackendPeer {
+                session_id: Some(session_id),
+                ..
+            } => MemberLocalSession::Bound(session_id.clone()),
+            MemberRef::BackendPeer {
+                session_id: None, ..
+            } => MemberLocalSession::NeverBound,
+        }
     }
 
     /// Canonical comms peer ID for this roster entry.
@@ -1396,6 +1431,73 @@ mod tests {
         );
         let entry = roster.get(&AgentIdentity::from("ext-2")).unwrap();
         assert_eq!(entry.bridge_session_id(), None);
+    }
+
+    /// A peer-only spawn proves no local session only until the generation
+    /// is bound: a later journaled binding stays part of its history, also
+    /// after a retirement start releases it.
+    #[test]
+    fn local_session_history_follows_the_journaled_binding() {
+        let peer_only = MemberRef::BackendPeer {
+            peer_id: "peer-ext-3".to_string(),
+            address: "https://backend.example.invalid/mesh/ext-3".to_string(),
+            pubkey: [9u8; 32],
+            bootstrap_token: None,
+            session_id: None,
+        };
+        let spawned = make_event(
+            1,
+            spawned_kind(
+                "ext-3",
+                "worker",
+                MobRuntimeMode::TurnDriven,
+                peer_only,
+                BTreeMap::new(),
+            ),
+        );
+        let identity = AgentIdentity::from("ext-3");
+        let never_bound = Roster::project(std::slice::from_ref(&spawned));
+        assert_eq!(
+            never_bound.get(&identity).map(RosterEntry::local_session),
+            Some(MemberLocalSession::NeverBound)
+        );
+
+        let bound = session_id();
+        let recovered = make_event(
+            2,
+            MobEventKind::MemberSessionBindingRecovered(
+                crate::event::MemberSessionBindingRecoveredEvent::new(
+                    identity.clone(),
+                    AgentRuntimeId::initial(identity.clone()),
+                    bound.clone(),
+                ),
+            ),
+        );
+        // A retirement that releases the binding keeps the generation's
+        // history: the member stays Bound, never NeverBound.
+        let releasing = make_event(
+            3,
+            MobEventKind::MemberRetirementStarted {
+                agent_identity: identity.clone(),
+                agent_runtime_id: AgentRuntimeId::initial(identity.clone()),
+                generation: Generation::INITIAL,
+                role: ProfileName::from("worker"),
+                releasing: Some(bound.clone()),
+                session_id: Some(bound.clone()),
+                retiring_peer_endpoint: None,
+                preserve_machine_topology: false,
+            },
+        );
+        let roster = Roster::project(&[spawned.clone(), recovered.clone()]);
+        assert_eq!(
+            roster.get(&identity).map(RosterEntry::local_session),
+            Some(MemberLocalSession::Bound(bound.clone()))
+        );
+        let released = Roster::project(&[spawned, recovered, releasing]);
+        assert_eq!(
+            released.get(&identity).map(RosterEntry::local_session),
+            Some(MemberLocalSession::Bound(bound))
+        );
     }
 
     #[test]

@@ -261,11 +261,17 @@ operation. `Applied` means that operation ran exactly once. `Conflict` and
 `Backoff` mean it did not run, so neither durable transcript nor live session
 projection advances.
 
-The fence must acquire external lifecycle authority without waiting, reread
-its canonical facts, and retain its serialization guard while invoking the
-target publication. This avoids lock inversion with an external retirement
-path that already owns lifecycle authority and is waiting for Meerkat's safe
-boundary. MobKit uses the seam for stable identity, generation, session, and
+The fence must acquire external lifecycle authority without waiting on
+anything that can wait for Meerkat, reread its canonical facts, and retain its
+serialization guard while invoking the target publication. This avoids lock
+inversion with an external retirement path that already owns lifecycle
+authority and is waiting for Meerkat's safe boundary. `execute_if_current`
+waits for nothing; a caller that holds an async lock retries its Backoff with
+the lock released. A caller already on a blocking thread, such as the SQLite
+RuntimeStore, uses `execute_if_current_blocking`, where an implementation may
+wait a bounded time for a lock whose holders never wait for Meerkat (the
+SQLite identity fence waits up to 2 seconds for its database's write lock).
+MobKit uses the seam for stable identity, generation, session, and
 fencing-token continuity. Meerkat does not persist or interpret a transient
 runtime alias, and the fence remains a precondition on the existing
 RuntimeStore commit rather than another activation authority. RuntimeStore

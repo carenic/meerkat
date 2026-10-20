@@ -83,6 +83,7 @@ pub mod member_creation;
 mod mob_machine;
 mod portable_profile;
 pub mod profile;
+pub mod provenance;
 mod roster;
 pub mod run;
 pub mod runtime;
@@ -122,8 +123,9 @@ pub use definition::{
 pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    MemberProvisionFailureCause, MemberRegistrationHookCall, MemberRuntimeDetachment,
-    MobDefinitionProjectionMismatchKind, MobError, MobFailureClass, RuntimeEffectKind,
+    IncarnationInconsistency, MemberProvisionFailureCause, MemberRegistrationHookCall,
+    MemberRuntimeDetachment, MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
+    RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, ForkJobTerminalEvent, MemberWireEdge, MobEvent, MobEventKind,
@@ -172,6 +174,7 @@ pub use mob_machine::{
     canonical_mob_machine_runtime_internal_input_variant_manifest,
     canonical_mob_machine_runtime_internal_manifest,
 };
+pub use provenance::MobProvenance;
 pub use storage::{
     MobDefinitionProjectionHealth, MobDefinitionRevision, MobDefinitionSnapshot, MobStorage,
 };
@@ -344,8 +347,8 @@ pub use runtime::{
 pub use runtime::{
     DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberBinding, MemberBindingHistory,
     MemberBindingHistoryReadError, MemberBindingState, MemberDeliveryScope,
-    MemberIdentityManagement, ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
-    WorkAdmissionStage,
+    MemberIdentityManagement, ScopeIncarnation, ScopedRecoveryUnresolved, ScopedWorkRecovery,
+    ScopedWorkState, WorkAdmissionStage,
 };
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{

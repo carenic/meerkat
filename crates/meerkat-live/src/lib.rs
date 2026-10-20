@@ -10,6 +10,7 @@
 //! admission.
 
 pub mod host;
+mod projection_queue;
 pub mod provider_webrtc;
 pub mod transport;
 #[cfg(feature = "webrtc")]
@@ -21,10 +22,11 @@ pub use host::{
     LiveAssistantOutputAddress, LiveChannelCloseCommitAuthority, LiveChannelCloseCommitTarget,
     LiveChannelCloseObservation, LiveChannelCloseProjectionLease, LiveChannelId,
     LiveChannelOpenAuthority, LiveChannelStatusCommitAuthority, LiveChannelStatusObservation,
-    LiveCommandAcceptanceKind, LiveCommandQueueAcceptance, LiveProjectionError, LiveProjectionSink,
-    LiveRefreshQueueAcceptance, LiveToolDispatchError, LiveToolDispatchTimeout, LiveToolDispatcher,
-    LiveTranscriptIdentity, LiveTranscriptIdentityError, NoOpProjectionSink, ObservationOutcome,
-    ObservationRouting, ToolDispatchSkipReason,
+    LiveCommandAcceptanceKind, LiveCommandQueueAcceptance, LiveProjectionBoundaryHold,
+    LiveProjectionError, LiveProjectionSink, LiveRefreshQueueAcceptance, LiveToolDispatchError,
+    LiveToolDispatchTimeout, LiveToolDispatcher, LiveTranscriptIdentity,
+    LiveTranscriptIdentityError, NoOpProjectionSink, ObservationOutcome, ObservationRouting,
+    ToolDispatchSkipReason,
 };
 pub use provider_webrtc::{
     LiveProviderInputLatency, LiveQuietAppendTiming, LiveRuntimeBindingFence,

@@ -73,7 +73,7 @@ const REMOTE_CLOSE_BOUND: Duration = McpStdioCloseBounds::DEFAULT.close_bound();
 
 /// How often a stdio server's process is checked for exit (without reaping
 /// it) while its close waits.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 const STDIO_LEADER_EXIT_POLL: Duration = Duration::from_millis(10);
 
 /// How long a stdio MCP server gets to exit on its own when its connection
@@ -89,9 +89,10 @@ const STDIO_LEADER_EXIT_POLL: Duration = Duration::from_millis(10);
 /// plus a fixed backstop after the kill. A server is "settled" once its
 /// process was seen to exit and every holder of its stdout was seen to close
 /// it; these deadlines decide only when to escalate. Where either cannot be
-/// seen (off Linux and Android the exit cannot be seen without reaping, and a
-/// stdout witness can be missing or fail), the close does not settle early:
-/// the server keeps its graces and is escalated against at each deadline.
+/// seen (off Linux, Android and macOS the exit cannot be seen without
+/// reaping, and a stdout witness can be missing or fail), the close does not
+/// settle early: the server keeps its graces and is escalated against at each
+/// deadline.
 /// Off Unix the server process alone is waited for and `term_grace` is not
 /// used. Both graces are at most [`Self::MAX_GRACE`];
 /// [`Self::IMMEDIATE`] escalates at once.
@@ -239,8 +240,8 @@ pub enum McpStdioLeaderExitObservation {
         phase: McpStdioClosePhase,
         errno: Option<i32>,
     },
-    /// This platform cannot see the exit without reaping it (off Linux and
-    /// Android).
+    /// This platform cannot see the exit without reaping it (off Linux,
+    /// Android and macOS).
     Unobservable,
 }
 
@@ -382,7 +383,7 @@ struct StdioChild {
     #[cfg(unix)]
     stdout_witness: Option<StdoutWitness>,
     /// Test hook: runs right before the close's final leader check.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     before_final_check: Option<Box<dyn FnOnce() + Send>>,
     /// Test hooks shared with the custody: the gate before the close's reap
     /// and the count of direct-child kills.
@@ -744,7 +745,7 @@ impl StdioChildCustody {
                 process_group,
                 #[cfg(unix)]
                 stdout_witness,
-                #[cfg(all(test, target_os = "linux"))]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 before_final_check: None,
                 #[cfg(all(test, unix))]
                 reap_gate: Arc::clone(&self.reap_gate),
@@ -791,8 +792,8 @@ impl StdioChildCustody {
     /// deadline. Then, while the leader is still unreaped (so its id cannot
     /// have been reused), the group gets one more SIGKILL, which signals any
     /// member the server left behind; the group id is disarmed; and only then
-    /// is the leader reaped, once, by the same backstop deadline. On Linux and
-    /// Android, while the leader is still taken as this process's child (not
+    /// is the leader reaped, once, by the same backstop deadline. On Linux,
+    /// Android and macOS, while the leader is still taken as this process's child (not
     /// seen to exit, or seen to exit and unreaped), a non-blocking check right
     /// before each escalation and the final group signal confirms it: once it
     /// is not (`ECHILD`), its group id is no longer held, so the group is not
@@ -999,19 +1000,19 @@ impl StdioChildCustody {
     }
 
     /// Test hook: whether a close task owns the process.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn is_closing(&self) -> bool {
         matches!(*lock_slot(&self.slot), CustodySlot::Closing { .. })
     }
 
     /// Test hook: whether the process is still held, with no close started.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn is_held(&self) -> bool {
         matches!(*lock_slot(&self.slot), CustodySlot::Held(_))
     }
 
     /// Test hook: wait until a close task has finished (or was dropped).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) async fn close_finished(&self) {
         let mut progress = self.close_progress.subscribe();
         while !matches!(
@@ -1024,7 +1025,7 @@ impl StdioChildCustody {
 
     /// Test hook: run `hook` right before the held process's close makes its
     /// final leader check.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn before_final_check(&self, hook: impl FnOnce() + Send + 'static) {
         if let CustodySlot::Held(held) = &mut *lock_slot(&self.slot) {
             held.before_final_check = Some(Box::new(hook));
@@ -1105,7 +1106,11 @@ async fn close_held(
 
     let deadlines = CloseDeadlines::new(started, bounds);
     let leader = held.child.id();
-    let mut leader_exit = if cfg!(any(target_os = "linux", target_os = "android")) {
+    let mut leader_exit = if cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos"
+    )) {
         McpStdioLeaderExitObservation::NotSeen
     } else {
         McpStdioLeaderExitObservation::Unobservable
@@ -1218,7 +1223,7 @@ async fn close_held(
     }
     drop(witness_reader);
     if held.process_group.is_some() {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         if let Some(before_final_check) = held.before_final_check.take() {
             before_final_check();
         }
@@ -1293,7 +1298,7 @@ fn leader_lost_to_another_reaper(leader_exit: McpStdioLeaderExitObservation) -> 
 /// Non-blocking check of a leader the close still takes as its child (not
 /// seen to exit, or seen to exit and unreaped): records its exit, or the
 /// loss of the observation.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn recheck_leader(
     leader: Option<u32>,
     leader_exit: &mut McpStdioLeaderExitObservation,
@@ -1315,7 +1320,10 @@ fn recheck_leader(
 }
 
 /// The leader's exit cannot be checked without reaping it here.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
 fn recheck_leader(
     _leader: Option<u32>,
     _leader_exit: &mut McpStdioLeaderExitObservation,
@@ -1408,9 +1416,44 @@ fn poll_leader_exit(leader: Option<u32>) -> Result<bool, Option<i32>> {
     }
 }
 
+/// Whether `leader` has exited, without reaping it, on macOS: the same
+/// non-blocking `waitid` with `WNOWAIT` through libc, since nix does not
+/// expose `waitid` on Apple targets. With `WNOHANG` and no change, `si_pid`
+/// stays zero. Only an exit, a kill or a dump counts as an exit: XNU's
+/// `waitid` skips a stopped child without `WSTOPPED`, and the `si_code`
+/// check keeps it that way should that ever differ.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn poll_leader_exit(leader: Option<u32>) -> Result<bool, Option<i32>> {
+    use nix::libc;
+    let Some(pid) = leader else {
+        return Err(None);
+    };
+    let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+    loop {
+        // SAFETY: `siginfo_t` is a plain C record of integers and raw
+        // pointers, for which all zero bytes are a valid value.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live `siginfo_t` owned by this frame and is the
+        // only buffer `waitid` writes; nothing else is passed by pointer.
+        let rc = unsafe { libc::waitid(libc::P_PID, pid, &raw mut info, flags) };
+        if rc == 0 {
+            return Ok(info.si_pid != 0
+                && matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                ));
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            errno => return Err(errno),
+        }
+    }
+}
+
 /// Resolves once `leader` has exited, without reaping it:
 /// [`poll_leader_exit`] retried on a short timer so the wait stays abortable.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 async fn wait_leader_exit(leader: Option<u32>) -> Result<(), Option<i32>> {
     while !poll_leader_exit(leader)? {
         tokio::time::sleep(STDIO_LEADER_EXIT_POLL).await;
@@ -1420,7 +1463,10 @@ async fn wait_leader_exit(leader: Option<u32>) -> Result<(), Option<i32>> {
 
 /// The server process's exit cannot be observed without reaping it here;
 /// the close never polls this.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
 async fn wait_leader_exit(_leader: Option<u32>) -> Result<(), Option<i32>> {
     std::future::pending().await
 }
@@ -5307,7 +5353,7 @@ pub mod tests {
     /// environment sets; an unbound server's environment is unchanged. A
     /// binding that names an operation the server does not list (a bare
     /// name for a prefixed tool) is refused at connect.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_connector_bound_stdio_server_starts_with_its_expected_binding() {
         use crate::stdio_test_fixture::{PidReport, sh_mcp_server_args_listing};
@@ -5377,7 +5423,7 @@ pub mod tests {
     /// returns. (Fails-old: rmcp gave the server up to 3 s after EOF, then
     /// killed only the direct child, so a wrapped server's grandchild outlived
     /// `close`.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn close_returns_after_the_stdio_servers_process_group_exits() {
         use crate::stdio_test_fixture::{PidReport, process_exited, sh_mcp_server_args};
@@ -5408,7 +5454,7 @@ pub mod tests {
 
     /// A failed handshake terminates the spawned server before the error is
     /// returned. (Fails-old: the transport drop only scheduled the kill.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn failed_handshake_returns_after_the_stdio_server_exits() {
         // Closes its stdout (the handshake fails on EOF) but keeps running.
@@ -5498,7 +5544,7 @@ pub mod tests {
     }
 
     /// Connect a stdio server whose close uses `bounds`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn connect_stdio_with_bounds(
         config: &McpServerConfig,
         bounds: McpStdioCloseBounds,
@@ -5519,7 +5565,7 @@ pub mod tests {
     }
 
     /// Close `conn`, which owns its stdio server's close.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn close_owned(conn: McpConnection) -> McpStdioCloseReceipt {
         conn.close_with_receipt()
             .await
@@ -5561,7 +5607,7 @@ pub mod tests {
     /// sent: with no other member left, a signal sent after the reap would
     /// find no group. (Fails-old: close SIGKILLed the group right after EOF,
     /// so the work never finished.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn close_lets_a_server_join_its_work_after_stdin_eof() {
         use crate::stdio_test_fixture::{process_group_gone, sh_mcp_server_script};
@@ -5602,11 +5648,25 @@ pub mod tests {
             McpStdioWitnessOutcome::Closed(McpStdioClosePhase::Eof)
         );
         assert_eq!((receipt.sigterm, receipt.sigkill), (None, None));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             receipt.final_group_signal,
             Some(McpStdioSignalOutcome::Sent),
             "the final group signal must precede the leader's reap"
         );
+        // Darwin refuses a group signal with EPERM when the group's only
+        // member is the leader that has exited and is not reaped yet (a
+        // zombie cannot be signalled). EPERM rather than ESRCH still shows
+        // the group, and so its unreaped leader, existed when it was sent.
+        #[cfg(target_os = "macos")]
+        {
+            let zombie_group = McpStdioSignalOutcome::Failed(nix::libc::EPERM);
+            assert!(
+                receipt.final_group_signal == Some(McpStdioSignalOutcome::Sent)
+                    || receipt.final_group_signal == Some(zombie_group),
+                "the final group signal must precede the leader's reap: {receipt:?}"
+            );
+        }
         assert!(
             matches!(&receipt.leader, McpStdioLeaderOutcome::Reaped(status) if status.success()),
             "{receipt:?}"
@@ -5624,7 +5684,7 @@ pub mod tests {
 
     /// A server that ignores EOF but handles SIGTERM gets the SIGTERM at the
     /// EOF deadline and exits through its handler within the TERM grace.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn close_signals_sigterm_at_the_eof_deadline() {
         use crate::stdio_test_fixture::sh_mcp_server_script;
@@ -5667,7 +5727,7 @@ pub mod tests {
     /// A server that ignores both EOF and SIGTERM is killed at the TERM
     /// deadline, settles in the kill phase, and has exited, with its group,
     /// when close returns.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn close_kills_a_server_that_ignores_eof_and_sigterm() {
         use crate::stdio_test_fixture::{process_exited, process_group_gone, sh_mcp_server_script};
@@ -5710,7 +5770,7 @@ pub mod tests {
     /// A server that exits on EOF but leaves a process in its group that
     /// does not hold its stdout settles on EOF, and the final group signal
     /// ends what it left.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn close_ends_what_a_server_leaves_in_its_group() {
         use crate::stdio_test_fixture::{PidReport, exits_within, sh_mcp_server_script};
@@ -5750,7 +5810,7 @@ pub mod tests {
     /// A server that exits on EOF while a process it left still holds its
     /// stdout has not settled: the open witness keeps it out of the EOF
     /// phase, and the SIGTERM ends the holder.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn an_orphan_holding_stdout_keeps_the_close_out_of_the_eof_phase() {
         use crate::stdio_test_fixture::sh_mcp_server_script;
@@ -5779,7 +5839,7 @@ pub mod tests {
 
     /// A server that closes its stdout on EOF but keeps running has not
     /// exited: a closed witness alone does not settle the close.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_server_closing_stdout_on_eof_is_not_taken_as_exited() {
         use crate::stdio_test_fixture::sh_mcp_server_script;
@@ -5810,7 +5870,7 @@ pub mod tests {
     /// settle it: the close keeps its graces and escalates at each deadline,
     /// and the receipt says the witness was absent rather than closed.
     /// (Fails-old: the server's exit settled a close without a witness.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_missing_witness_does_not_settle_the_close() {
         use crate::stdio_test_fixture::sh_mcp_server_script;
@@ -5846,7 +5906,7 @@ pub mod tests {
     /// A witness whose read fails is reported as a read error, distinct from
     /// a closed or absent one, and like an absent one it cannot settle the
     /// close. (Fails-old: the server's exit settled the close.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_failing_witness_is_reported_as_a_read_error() {
         use crate::stdio_test_fixture::sh_mcp_server_script;
@@ -5913,7 +5973,7 @@ pub mod tests {
     /// escalated against on time: an expired deadline is acted on before
     /// more output. (Fails-old: ready output was always taken before the
     /// expired deadline, so the close never escalated.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn busy_stdout_does_not_postpone_escalation() {
         let custody = StdioChildCustody::with_bounds(graces(200, 200));
@@ -5941,7 +6001,7 @@ pub mod tests {
 
     /// A server that closes its stdout on EOF and then cleans up keeps its
     /// grace for the cleanup: a closed stdout is not taken as its exit, which
-    /// off Linux and Android cannot be seen at all. (Fails-old: off Linux a
+    /// off Linux, Android and macOS cannot be seen at all. (Fails-old: off Linux a
     /// closed witness settled the close, and the final SIGKILL cut the
     /// cleanup short.)
     #[cfg(unix)]
@@ -5968,9 +6028,22 @@ pub mod tests {
             receipt.witness,
             McpStdioWitnessOutcome::Closed(McpStdioClosePhase::Eof)
         );
-        if cfg!(any(target_os = "linux", target_os = "android")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos"
+        )) {
             assert_eq!(receipt.settled_in, Some(McpStdioClosePhase::Eof));
             assert_eq!(receipt.sigterm, None);
+            // The exit was seen without reaping: the close's own reap took it.
+            assert_eq!(
+                receipt.leader_exit,
+                McpStdioLeaderExitObservation::Exited(McpStdioClosePhase::Eof)
+            );
+            assert!(
+                matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),
+                "{receipt:?}"
+            );
         } else {
             assert_eq!(receipt.settled_in, None);
             assert_eq!(
@@ -5987,7 +6060,7 @@ pub mod tests {
     /// before the close ever watched the server. (Fails-old: `ECHILD` counted
     /// as the server's exit, and an expired deadline signalled the group
     /// without checking.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_server_reaped_elsewhere_is_reported_lost() {
         for bounds in [graces(20_000, 20_000), McpStdioCloseBounds::IMMEDIATE] {
@@ -6029,7 +6102,7 @@ pub mod tests {
     /// the loss clears the settlement, the group is not signalled, and the
     /// failed reap of our own is reported as such. (Fails-old: the receipt
     /// kept `settled_in` beside a lost leader.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_server_reaped_elsewhere_after_settling_is_not_settled() {
         let custody = StdioChildCustody::with_bounds(graces(20_000, 20_000));
@@ -6069,7 +6142,7 @@ pub mod tests {
     }
 
     /// Poll `future` once and drop it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn poll_once_and_drop<F: std::future::Future>(future: F) {
         let mut future = std::pin::pin!(future);
         std::future::poll_fn(|cx| {
@@ -6084,7 +6157,7 @@ pub mod tests {
     /// once the close is first polled, and finishes on its own. (Fails-old:
     /// the cancel ran before the close task existed, so the dropped close
     /// left the process held with no close started.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_close_dropped_during_its_cancel_still_closes() {
         use crate::stdio_test_fixture::sh_mcp_server_args;
@@ -6128,7 +6201,7 @@ pub mod tests {
     /// dropped after its close finished, but before it was polled again,
     /// leaves the receipt to a join. (Fails-old: the receipt was handed to
     /// the dropped waiter's channel, so the join got nothing.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_receipt_sent_to_a_dropped_waiter_is_kept() {
         let custody = StdioChildCustody::with_bounds(graces(20_000, 20_000));
@@ -6157,7 +6230,7 @@ pub mod tests {
     /// Two closes of one custody: exactly one owns it and returns the
     /// receipt; the other reports that the close is owned elsewhere instead
     /// of vouching for it, and a later one that it was closed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn concurrent_terminates_have_exactly_one_owner() {
         use crate::stdio_test_fixture::sh_mcp_server_args;
@@ -6203,7 +6276,7 @@ pub mod tests {
     /// in a task of its own, escalates on its deadlines, and a later join
     /// gets the receipt the dropped wait left. (Fails-old: dropping the wait
     /// cancelled the close, and the group was SIGKILLed at once.)
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn a_dropped_close_wait_leaves_the_close_running() {
         use crate::stdio_test_fixture::{PidReport, exits_within, sh_mcp_server_args};
@@ -6256,7 +6329,7 @@ pub mod tests {
     /// Only dropping the close task itself, as its runtime shuts down,
     /// cancels a close: the held child's drop still kills the whole group,
     /// and the custody records the close as abandoned rather than closed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_close_cancelled_with_its_runtime_still_kills_the_group() {
         use crate::stdio_test_fixture::{PidReport, exits_within, sh_mcp_server_args};

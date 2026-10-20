@@ -2116,7 +2116,42 @@ mod tests {
         }
     }
 
-    impl private::MobEventStoreSealed for WriteThenErrorEventStore {}
+    #[async_trait]
+    impl private::MobEventStoreSealed for WriteThenErrorEventStore {
+        async fn creation_record(
+            &self,
+        ) -> Result<Option<crate::store::MobCreationRecord>, MobStoreError> {
+            private::MobEventStoreSealed::creation_record(&self.inner).await
+        }
+
+        async fn append_creation(
+            &self,
+            event: NewMobEvent,
+            incarnation: meerkat_core::service::MobIncarnationId,
+            provenance: &crate::MobProvenance,
+        ) -> Result<MobEvent, MobStoreError> {
+            private::MobEventStoreSealed::append_creation(
+                &self.inner,
+                event,
+                incarnation,
+                provenance,
+            )
+            .await
+        }
+
+        async fn assign_legacy_incarnation(
+            &self,
+            mob_id: &MobId,
+            incarnation: meerkat_core::service::MobIncarnationId,
+        ) -> Result<crate::store::MobCreationRecord, MobStoreError> {
+            private::MobEventStoreSealed::assign_legacy_incarnation(
+                &self.inner,
+                mob_id,
+                incarnation,
+            )
+            .await
+        }
+    }
 
     #[async_trait]
     impl MobEventStore for WriteThenErrorEventStore {

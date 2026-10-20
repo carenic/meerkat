@@ -13211,6 +13211,600 @@ mod tests {
         assert!(turn_resp.error.is_none(), "the child runs: {turn_resp:?}");
     }
 
+    /// The durable stores of one RPC server, which a later server opens again
+    /// as a restarted process would.
+    struct ReopenableServerStores {
+        sessions: Arc<dyn meerkat::SessionStore>,
+        runtime: Arc<dyn meerkat_runtime::RuntimeStore>,
+        blobs: Arc<dyn meerkat_core::BlobStore>,
+    }
+
+    impl ReopenableServerStores {
+        fn new() -> Self {
+            Self {
+                sessions: Arc::new(meerkat::MemoryStore::new()),
+                runtime: Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                blobs: memory_blob_store(),
+            }
+        }
+
+        /// A new server over these stores: its runtime, and a router over it.
+        fn open_server(
+            &self,
+            root: &std::path::Path,
+        ) -> (
+            MethodRouter,
+            Arc<SessionRuntime>,
+            mpsc::Receiver<RpcNotification>,
+        ) {
+            let config = anthropic_test_config();
+            let config_store: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
+                config.clone(),
+                meerkat_models::canonical(),
+            ));
+            let persistence = meerkat::PersistenceBundle::new(
+                Arc::clone(&self.sessions),
+                Arc::clone(&self.runtime),
+                Arc::clone(&self.blobs),
+            )
+            .expect("construct runtime authority");
+            let runtime = SessionRuntime::new(
+                AgentFactory::new(root.join("sessions")),
+                config,
+                10,
+                persistence,
+                NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime");
+            runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
+            runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
+                Arc::clone(&config_store),
+                root.join("config_state.json"),
+            )));
+            let runtime = Arc::new(runtime);
+            let (notif_tx, notif_rx) = mpsc::channel(100);
+            let router = MethodRouter::new(
+                Arc::clone(&runtime),
+                config_store,
+                NotificationSink::new(notif_tx),
+            )
+            .expect("construct runtime authority");
+            (router, runtime, notif_rx)
+        }
+    }
+
+    /// After the RPC server restarts, an idle persisted session has no
+    /// runtime registration in the new server: sessions are registered when
+    /// they are created, run a turn or open a live channel, and persisted
+    /// ones recover lazily. Every transcript edit on that idle session is
+    /// still admitted instead of answering SESSION_BUSY as if the session
+    /// were active: two concurrent `session/fork_at` calls, which both find
+    /// the session unregistered, each commit a child, and
+    /// `session/fork_replace`, `session/rewrite_transcript`,
+    /// `session/restore_transcript_revision` and
+    /// `session/update_system_prompt` apply. The session then runs its next
+    /// turn. A session archived before the restart is still not found.
+    ///
+    /// Not pinned here: an edit refused as busy over a durable input still
+    /// pending after the restart. A clean shutdown abandons a queued input
+    /// (`Abandoned { reason: Stopped }`), so only a crash leaves one pending,
+    /// and a test cannot restore the row because its persistence record is
+    /// crate-private to the runtime. That needs a child-process harness like
+    /// `tests/lazy_resume_uncommitted_terminal.rs`. The edit's registration
+    /// recovers the input ledger before the busy verdict reads it.
+    #[tokio::test]
+    async fn transcript_edits_on_an_idle_session_are_admitted_after_a_server_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let stores = ReopenableServerStores::new();
+        let (router, runtime, _notif_rx) = stores.open_server(temp.path());
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "system_prompt": "You are a test assistant.",
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let archived_create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "Archive me" }),
+            ))
+            .await
+            .unwrap();
+        let archived_id = result_value(&archived_create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let archive_resp = router
+            .dispatch(make_request(
+                "session/archive",
+                serde_json::json!({ "session_id": &archived_id }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            archive_resp.error.is_none(),
+            "the second session is archived: {archive_resp:?}"
+        );
+
+        // The first server stops; a new one opens the same stores.
+        tokio::time::timeout(Duration::from_secs(60), runtime.try_shutdown())
+            .await
+            .expect("the first server shuts down in bounded time")
+            .expect("the first server shuts down");
+        drop(router);
+        drop(runtime);
+        let (router, runtime, _notif_rx) = stores.open_server(temp.path());
+        let parsed_session_id = SessionId::parse(&session_id).expect("session id");
+        assert!(
+            !runtime
+                .runtime_adapter()
+                .contains_session(&parsed_session_id)
+                .await,
+            "the restarted server has not registered the idle session"
+        );
+
+        let history_resp = router
+            .dispatch(make_request(
+                "session/history",
+                serde_json::json!({ "session_id": &session_id }),
+            ))
+            .await
+            .unwrap();
+        let history = result_value(&history_resp);
+        let messages = history["messages"].as_array().unwrap();
+        let system_index = messages
+            .iter()
+            .position(|message| message["role"] == "system")
+            .unwrap_or_else(|| panic!("the session holds its System message: {history}"));
+        let hello_index = messages
+            .iter()
+            .position(|message| message["role"] == "user" && message["content"] == "Hello")
+            .unwrap_or_else(|| panic!("the session holds its first user message: {history}"));
+        let revision_resp = router
+            .dispatch(make_request(
+                "session/transcript_revision",
+                serde_json::json!({ "session_id": &session_id, "revision": "current" }),
+            ))
+            .await
+            .unwrap();
+        let original_revision = result_value(&revision_resp)["revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let fork_at_request = || {
+            make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": hello_index + 1,
+                    "running_behavior": "reject"
+                }),
+            )
+        };
+        let (first_fork, second_fork) = tokio::join!(
+            router.dispatch(fork_at_request()),
+            router.dispatch(fork_at_request()),
+        );
+        let first_fork = first_fork.unwrap();
+        let second_fork = second_fork.unwrap();
+        let fork_replace = router
+            .dispatch(make_request(
+                "session/fork_replace",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": hello_index,
+                    "replacement": {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": "Edited hello"
+                        }
+                    },
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        let rewrite = router
+            .dispatch(make_request(
+                "session/rewrite_transcript",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "selection": {
+                        "type": "message_range",
+                        "start": hello_index,
+                        "end": hello_index + 1
+                    },
+                    "replacement": [{ "role": "user", "content": "Hello again" }],
+                    "reason": { "kind": "test", "note": "rewrite after a server restart" },
+                    "expected_parent_revision": &original_revision
+                }),
+            ))
+            .await
+            .unwrap();
+        let restore = router
+            .dispatch(make_request(
+                "session/restore_transcript_revision",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "revision": &original_revision,
+                    "reason": { "kind": "test", "note": "restore after a server restart" }
+                }),
+            ))
+            .await
+            .unwrap();
+        let update = router
+            .dispatch(make_request(
+                "session/update_system_prompt",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "key": "persona",
+                    "target_message_index": system_index,
+                    "content": "You are an edited test assistant."
+                }),
+            ))
+            .await
+            .unwrap();
+        let refused: Vec<String> = [
+            ("session/fork_at (first)", &first_fork),
+            ("session/fork_at (second)", &second_fork),
+            ("session/fork_replace", &fork_replace),
+            ("session/rewrite_transcript", &rewrite),
+            ("session/restore_transcript_revision", &restore),
+            ("session/update_system_prompt", &update),
+        ]
+        .into_iter()
+        .filter_map(|(method, response)| {
+            response
+                .error
+                .as_ref()
+                .map(|error| format!("{method}: {} {}", error.code, error.message))
+        })
+        .collect();
+        assert!(
+            refused.is_empty(),
+            "every transcript edit on the idle session is admitted after the restart: {refused:#?}"
+        );
+        let first_child = result_value(&first_fork)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_child = result_value(&second_fork)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            first_child != session_id && second_child != session_id && first_child != second_child,
+            "each concurrent fork commits its own child: {first_child} {second_child}"
+        );
+        assert_eq!(result_value(&update)["status"], "applied", "{update:?}");
+
+        // The registration the edits left serves the session's next turn.
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "prompt": "Follow up after the restart",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "the edited session runs its next turn: {turn_resp:?}"
+        );
+
+        let archived_fork = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &archived_id,
+                    "message_index": 1,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        let archived_error = archived_fork
+            .error
+            .as_ref()
+            .unwrap_or_else(|| panic!("an archived session is not forked: {archived_fork:?}"));
+        assert_eq!(
+            archived_error.code,
+            error::SESSION_NOT_FOUND,
+            "an archived session is not found after the restart: {archived_error:?}"
+        );
+    }
+
+    /// The control for the restart case above: a transcript edit on a
+    /// session whose turn is in flight is still refused with SESSION_BUSY,
+    /// and the session's turn finishes unaffected.
+    #[tokio::test]
+    async fn transcript_edits_on_a_session_with_a_turn_in_flight_answer_session_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (router, _notif_rx) = test_router_with_llm(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        }))
+        .await;
+        // The created session's first turn runs to completion.
+        release.add_permits(1);
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "system_prompt": "You are a test assistant.",
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut seen = calls.subscribe();
+        let turn = {
+            let router = router.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                router
+                    .dispatch(make_request(
+                        "turn/start",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "prompt": "a turn in flight",
+                        }),
+                    ))
+                    .await
+                    .expect("turn/start response")
+            })
+        };
+        tokio::time::timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the second turn reaches the provider")
+            .expect("call counter stays open");
+
+        let fork_resp = router
+            .dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 1,
+                    "running_behavior": "reject"
+                }),
+            ))
+            .await
+            .unwrap();
+        let update_resp = router
+            .dispatch(make_request(
+                "session/update_system_prompt",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "key": "persona",
+                    "target_message_index": 0,
+                    "content": "You are an edited test assistant."
+                }),
+            ))
+            .await
+            .unwrap();
+        for (method, response) in [
+            ("session/fork_at", &fork_resp),
+            ("session/update_system_prompt", &update_resp),
+        ] {
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("{method} is refused while a turn runs: {response:?}"));
+            assert_eq!(error.code, error::SESSION_BUSY, "{method}: {error:?}");
+            assert!(
+                error.message.contains("is active"),
+                "{method} is refused as an active session: {error:?}"
+            );
+        }
+
+        release.add_permits(1);
+        let turn = tokio::time::timeout(FAILURE_BOUND, turn)
+            .await
+            .expect("the turn finishes once released")
+            .expect("turn task");
+        assert!(turn.error.is_none(), "the turn in flight: {:?}", turn.error);
+    }
+
+    /// A transcript edit on a session whose durability gate requires a
+    /// reload is refused with the runtime's typed reload-required refusal,
+    /// not with SESSION_BUSY: the session is not busy, and no retry admits
+    /// the edit until the session is reloaded. The session is registered
+    /// after a server restart without a runtime loop, so the refusal is the
+    /// admission's own.
+    #[tokio::test]
+    async fn transcript_edits_on_a_session_that_needs_a_durability_reload_answer_its_typed_refusal()
+    {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let temp = tempfile::tempdir().unwrap();
+        let stores = ReopenableServerStores::new();
+        let (router, runtime, _notif_rx) = stores.open_server(temp.path());
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "system_prompt": "You are a test assistant.",
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        tokio::time::timeout(Duration::from_secs(60), runtime.try_shutdown())
+            .await
+            .expect("the first server shuts down in bounded time")
+            .expect("the first server shuts down");
+        drop(router);
+        drop(runtime);
+        let (router, _runtime, _notif_rx) = stores.open_server(temp.path());
+        let parsed_session_id = SessionId::parse(&session_id).expect("session id");
+        router
+            .runtime_adapter
+            .prepare_bindings(parsed_session_id.clone())
+            .await
+            .expect("register the idle session without a runtime loop");
+        assert!(
+            router
+                .runtime_adapter
+                .force_session_durability_reload_required_for_test(&parsed_session_id)
+                .await,
+            "the registered session owns a real persistent durability gate"
+        );
+
+        let fork_resp = tokio::time::timeout(
+            FAILURE_BOUND,
+            router.dispatch(make_request(
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 1,
+                    "running_behavior": "reject"
+                }),
+            )),
+        )
+        .await
+        .expect("session/fork_at answers in bounded time")
+        .unwrap();
+        let update_resp = tokio::time::timeout(
+            FAILURE_BOUND,
+            router.dispatch(make_request(
+                "session/update_system_prompt",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "key": "persona",
+                    "target_message_index": 0,
+                    "content": "You are an edited test assistant."
+                }),
+            )),
+        )
+        .await
+        .expect("session/update_system_prompt answers in bounded time")
+        .unwrap();
+        for (method, response) in [
+            ("session/fork_at", &fork_resp),
+            ("session/update_system_prompt", &update_resp),
+        ] {
+            let error = response.error.as_ref().unwrap_or_else(|| {
+                panic!("{method} is refused on a session that needs a reload: {response:?}")
+            });
+            assert_ne!(
+                error.code,
+                error::SESSION_BUSY,
+                "{method} is not refused as busy: {error:?}"
+            );
+            assert!(
+                error
+                    .message
+                    .contains("durability reload required after `test_reload_required_discard`"),
+                "{method} carries the typed reload-required refusal: {error:?}"
+            );
+        }
+    }
+
+    /// A transcript edit on a session whose durability gate requires a
+    /// reload while its runtime loop is still attached (the session ran its
+    /// first turn in this server) answers the typed reload-required refusal
+    /// in bounded time: neither edit waits on the degraded session.
+    #[tokio::test]
+    async fn transcript_edit_on_a_reload_required_session_with_an_attached_runtime_loop_answers() {
+        // Bounds a failure only; the passing path never waits for it.
+        const STEP_BOUND: Duration = Duration::from_secs(45);
+        let (router, _notif_rx) = test_router().await;
+        let create_resp = tokio::time::timeout(
+            STEP_BOUND,
+            router.dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "Hello",
+                    "system_prompt": "You are a test assistant.",
+                }),
+            )),
+        )
+        .await
+        .expect("session/create answers in bounded time")
+        .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed_session_id = SessionId::parse(&session_id).expect("session id");
+        assert!(
+            router
+                .runtime_adapter
+                .force_session_durability_reload_required_for_test(&parsed_session_id)
+                .await,
+            "the created session owns a real persistent durability gate"
+        );
+
+        for (method, params) in [
+            (
+                "session/fork_at",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "message_index": 1,
+                    "running_behavior": "reject"
+                }),
+            ),
+            (
+                "session/update_system_prompt",
+                serde_json::json!({
+                    "session_id": &session_id,
+                    "key": "persona",
+                    "target_message_index": 0,
+                    "content": "You are an edited test assistant."
+                }),
+            ),
+        ] {
+            let response = tokio::time::timeout(
+                STEP_BOUND,
+                router.dispatch(make_request(method, params)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{method} on a reload-required session did not answer within {STEP_BOUND:?}")
+            })
+            .unwrap();
+            let error = response.error.as_ref().unwrap_or_else(|| {
+                panic!("{method} is refused on a session that needs a reload: {response:?}")
+            });
+            assert_ne!(
+                error.code,
+                error::SESSION_BUSY,
+                "{method} is not refused as busy: {error:?}"
+            );
+            assert!(
+                error
+                    .message
+                    .contains("durability reload required after `test_reload_required_discard`"),
+                "{method} carries the typed reload-required refusal: {error:?}"
+            );
+        }
+    }
+
     /// A router over a runtime store the test can also reach.
     async fn test_router_with_runtime_store() -> (
         MethodRouter,
@@ -17139,7 +17733,8 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
     }
 
     /// With `inherited_instructions: reactivate_inherited` the fork commits a
-    /// child that carries its own activation of the inherited key.
+    /// child that carries its own activation of the inherited key, and the
+    /// child runs its first turn.
     #[tokio::test]
     async fn session_fork_at_reactivates_when_asked() {
         let (router, _notif_rx) = test_router().await;
@@ -17185,6 +17780,23 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         assert_eq!(
             own[0]["instruction_activation"]["supersedes"],
             "activation-1"
+        );
+
+        // The child activates the inherited key itself, so the turn-time
+        // activation gate admits its first turn.
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": &forked_id,
+                    "prompt": "Follow up on the branch",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "the re-activated child runs its first turn: {turn_resp:?}"
         );
     }
 

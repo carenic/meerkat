@@ -312,6 +312,12 @@ const IDENTITY_RECONCILE_SAFETY_PAGE_INTERVAL: Duration = Duration::from_secs(5 
 /// visited over successive keyset pages; no timer wake materializes all
 /// identities.
 const IDENTITY_RECONCILE_SAFETY_PAGE_LIMIT: usize = 64;
+/// Margin past another incarnation's observed lease expiry, so the wake that
+/// re-observes the identity lands after the store-sealed expiry instant.
+const IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN: Duration = Duration::from_millis(100);
+/// Re-check interval while another incarnation holds the lease and no expiry
+/// can be read from it.
+const IDENTITY_RECONCILE_LEASE_RECHECK: Duration = Duration::from_secs(1);
 /// Exponential actuation-backoff schedule for identities whose member
 /// actuation keeps failing. Before this existed, the "Backoff" disposition
 /// was a status label over an immediate requeue: the terminal-completion
@@ -423,6 +429,24 @@ enum IdentityReconcilePassDisposition {
 enum IdentitySessionLoadErrorClass {
     Malformed,
     Unavailable,
+}
+
+/// Whether a session read failed because the committed runtime boundary no
+/// longer names the session's physical head: its store refused the read as a
+/// transcript revision conflict.
+fn is_transcript_revision_conflict(error: &meerkat_core::service::SessionError) -> bool {
+    matches!(
+        error,
+        meerkat_core::service::SessionError::Store(error)
+            if error
+                .downcast_ref::<meerkat_core::SessionStoreError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        meerkat_core::SessionStoreError::TranscriptRevisionConflict { .. }
+                    )
+                })
+    )
 }
 
 /// Classify a session read failure by its typed cause. Durable corruption and
@@ -1377,6 +1401,21 @@ fn identity_reconcile_backoff_delay(consecutive_failures: u32) -> Duration {
         .min(IDENTITY_RECONCILE_BACKOFF_CAP)
 }
 
+/// Delay before re-observing an identity whose lease another incarnation
+/// holds: the observed expiry plus a small margin, bounded by the longest
+/// lease lifetime so a skewed expiry cannot strand the identity, or a
+/// one-second re-check when no expiry is observable.
+fn identity_lease_wait_delay(expires_at_ms: Option<u64>, now_ms: u64) -> Duration {
+    expires_at_ms.map_or(IDENTITY_RECONCILE_LEASE_RECHECK, |expires_at_ms| {
+        Duration::from_millis(
+            expires_at_ms
+                .saturating_sub(now_ms)
+                .min(IDENTITY_RECONCILE_LEASE_TTL_MS),
+        )
+        .saturating_add(IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN)
+    })
+}
+
 /// Bound repeated retry diagnostics without making a persistent incident
 /// silent. Attempt one is visible immediately; identical retries then report
 /// only at power-of-two checkpoints while durable convergence status retains
@@ -1437,7 +1476,9 @@ fn identity_member_actuation_disposition(
 mod identity_recovery_slice_tests {
     use super::{
         IDENTITY_RECONCILE_BACKOFF_BASE, IDENTITY_RECONCILE_BACKOFF_CAP,
-        IdentityMemberActuationDisposition, identity_actuation_error_disposition,
+        IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN, IDENTITY_RECONCILE_LEASE_RECHECK,
+        IDENTITY_RECONCILE_LEASE_TTL_MS, IdentityMemberActuationDisposition,
+        identity_actuation_error_disposition, identity_lease_wait_delay,
         identity_member_actuation_disposition, identity_reconcile_backoff_delay,
         identity_reconcile_failure_should_log,
         identity_reconciliation_slice_unsupported_obligation,
@@ -1529,6 +1570,24 @@ mod identity_recovery_slice_tests {
         assert_eq!(logged, vec![1, 2, 4, 8, 16]);
         assert!(!identity_reconcile_failure_should_log(0));
         assert!(!identity_reconcile_failure_should_log(u32::MAX));
+    }
+
+    #[test]
+    fn a_lease_wait_ends_just_after_the_observed_expiry_within_one_lease_lifetime() {
+        let margin = IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN;
+        assert_eq!(
+            identity_lease_wait_delay(Some(12_000), 10_000),
+            std::time::Duration::from_secs(2) + margin
+        );
+        assert_eq!(identity_lease_wait_delay(Some(9_000), 10_000), margin);
+        assert_eq!(
+            identity_lease_wait_delay(Some(u64::MAX), 10_000),
+            std::time::Duration::from_millis(IDENTITY_RECONCILE_LEASE_TTL_MS) + margin
+        );
+        assert_eq!(
+            identity_lease_wait_delay(None, 10_000),
+            IDENTITY_RECONCILE_LEASE_RECHECK
+        );
     }
 }
 
@@ -5749,7 +5808,7 @@ enum SpawnProvisionInput {
 struct DeferredResumeProvision {
     definition: Arc<MobDefinition>,
     /// The incarnation of the mob the member is rebuilt in.
-    mob_incarnation: meerkat_core::service::MobIncarnationId,
+    mob_incarnation: meerkat_core::service::LiveMobIncarnation,
     realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
     profile_name: ProfileName,
     agent_identity: AgentIdentity,
@@ -6378,6 +6437,78 @@ enum SpawnEnqueueOrigin {
         origin: Option<RespawnOrigin>,
         restore_wiring: Option<RestoreWiringPlan>,
     },
+}
+
+/// Compose the predecessor's spawner restrictions into its successor's spec,
+/// after customization: the successor keeps every inherited restriction and
+/// narrows it with its own, never widening. It keeps the predecessor's auth
+/// binding only when its own spec names none and its build resolves to the
+/// provider the binding was recorded for (`successor_provider`); a binding
+/// serves one provider, so a successor re-profiled to another provider, or to
+/// one that cannot be told, selects its own as a fresh spawn does.
+fn keep_predecessor_restrictions(
+    agent_identity: &AgentIdentity,
+    spec: &mut super::handle::SpawnMemberSpec,
+    retained: &meerkat_core::PredecessorToolRestrictions,
+    successor_provider: Option<meerkat_core::Provider>,
+) -> Result<(), MobError> {
+    let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+        agent_identity: agent_identity.to_string(),
+        reason,
+    };
+    // `Inherit` at this seam is host authority, so it adds no restriction.
+    let own_policy = spec
+        .tool_access_policy
+        .take()
+        .filter(|policy| !matches!(policy, meerkat_core::ops::ToolAccessPolicy::Inherit));
+    spec.tool_access_policy = match (own_policy, retained.launch_policy()) {
+        (None, retained) => retained,
+        (own, None) => own,
+        // A customizer that re-applies the retained policy adds nothing.
+        (Some(own), Some(retained)) if own == retained => Some(retained),
+        (Some(own), Some(retained)) => Some(without_repeated_constraints(
+            own.conjoin(retained)
+                .map_err(|error| refuse(error.to_string()))?,
+        )),
+    };
+    spec.inherited_tool_filter = match (
+        spec.inherited_tool_filter.take(),
+        retained.inherited_visibility(),
+    ) {
+        (None, retained) => retained.cloned(),
+        (own, None) => own,
+        (Some(own), Some(retained)) => Some(
+            retained
+                .narrowed_with(&own)
+                .map_err(|error| refuse(error.to_string()))?,
+        ),
+    };
+    if spec.auth_binding.is_none() {
+        spec.auth_binding = successor_provider
+            .and_then(|provider| retained.auth_binding_for_provider(provider))
+            .cloned();
+    }
+    Ok(())
+}
+
+/// A conjunction keeps each constraint once, so a policy re-applied at every
+/// respawn does not grow with each generation.
+fn without_repeated_constraints(
+    policy: meerkat_core::ops::ToolAccessPolicy,
+) -> meerkat_core::ops::ToolAccessPolicy {
+    match policy {
+        meerkat_core::ops::ToolAccessPolicy::Constraints(constraints) => {
+            let mut kept: Vec<meerkat_core::ops::ToolAccessConstraint> =
+                Vec::with_capacity(constraints.len());
+            for constraint in constraints {
+                if !kept.contains(&constraint) {
+                    kept.push(constraint);
+                }
+            }
+            meerkat_core::ops::ToolAccessPolicy::Constraints(kept)
+        }
+        other => other,
+    }
 }
 
 struct RespawnSnapshot {
@@ -7530,10 +7661,10 @@ pub(super) enum ResumePostCommitMemberOutcome {
 
 pub(super) struct MobActor {
     pub(super) definition: Arc<MobDefinition>,
-    /// The incarnation this runtime start minted (see
-    /// [`super::MobHandle::incarnation`]). Mob operator scope minted for
-    /// members of this mob is bound to it.
-    pub(super) incarnation: meerkat_core::service::MobIncarnationId,
+    /// The incarnation this runtime start minted, as the witness its
+    /// launched handle hands out (see [`super::MobHandle::live_incarnation`]).
+    /// Mob operator scope minted for members of this mob is bound to it.
+    pub(super) incarnation: meerkat_core::service::LiveMobIncarnation,
     pub(super) roster: Arc<RwLock<RosterAuthority>>,
     pub(super) events: Arc<dyn MobEventStore>,
     pub(super) placed_completion_durable_index: Arc<std::sync::Mutex<PlacedCompletionDurableIndex>>,
@@ -12505,6 +12636,31 @@ impl MobActor {
         )
     }
 
+    /// Whether a routed effect still names the runtime the machine runs for
+    /// its member: the bound runtime for a binding or a retire, a live
+    /// runtime for an ingress.
+    fn routed_effect_targets_current_runtime(
+        state: &mob_dsl::MobMachineState,
+        effect: &super::composition::MobSeamEffect,
+    ) -> bool {
+        match effect.body() {
+            mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+                agent_identity,
+                agent_runtime_id,
+                ..
+            }
+            | mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+                agent_identity,
+                agent_runtime_id,
+                ..
+            } => state.identity_to_runtime.get(agent_identity) == Some(agent_runtime_id),
+            mob_dsl::MobMachineEffect::RequestRuntimeIngress {
+                agent_runtime_id, ..
+            } => state.live_runtime_ids.contains(agent_runtime_id),
+            _ => false,
+        }
+    }
+
     fn has_exact_queued_runtime_retire(
         &self,
         agent_identity: &mob_dsl::AgentIdentity,
@@ -12660,6 +12816,51 @@ impl MobActor {
                     // removed after that feedback transition commits; every
                     // tail effect remains FIFO-visible.
                     let feedback = refusal_feedback_input(&effect, &error)?;
+                    // Check the feedback against a copy of the machine first.
+                    // A guard rejection is not a machine closure, and applying
+                    // it here would end the whole actor.
+                    if let Err(rejection) = self.prepare_dsl_input_transition(
+                        feedback.clone(),
+                        "close_routed_effect_consumer_refusal",
+                    ) {
+                        let phase = self.dsl_authority.state().lifecycle_phase;
+                        if !Self::routed_effect_targets_current_runtime(
+                            self.dsl_authority.state(),
+                            &effect,
+                        ) {
+                            // The route outlived the runtime it names (its
+                            // member retired, or now runs another runtime), so
+                            // no phase of the machine takes its refusal. Drop
+                            // it rather than dispatch it again at every flush.
+                            tracing::warn!(
+                                mob_id = %self.definition.id,
+                                effect = ?effect.body(),
+                                refusal_code = %error.error_code(),
+                                rejection = %rejection,
+                                "dropping a refused routed effect that no longer names a runtime the mob machine runs (phase {phase:?})"
+                            );
+                            self.pending_routed_effects.remove(0);
+                            continue;
+                        }
+                        if phase == mob_dsl::MobPhase::Stopped {
+                            // The machine still runs this member but cannot
+                            // take the feedback while Stopped. Keep the head
+                            // queued, as the pending-detach deferral above
+                            // does: the first flush after activation
+                            // dispatches it again.
+                            tracing::warn!(
+                                mob_id = %self.definition.id,
+                                effect = ?effect.body(),
+                                refusal_code = %error.error_code(),
+                                rejection = %rejection,
+                                "deferring routed-effect refusal feedback: the mob machine cannot take it in phase {phase:?}"
+                            );
+                            return Ok(());
+                        }
+                        // In any other phase a rejection for a runtime the
+                        // machine still runs is a real disagreement between
+                        // the machine and this shell: report it as before.
+                    }
                     let transition = self.apply_dsl_input_collect_transition(
                         feedback,
                         "close_routed_effect_consumer_refusal",
@@ -14319,7 +14520,40 @@ impl MobActor {
             }
             projected.push(entry);
         }
+        #[cfg(feature = "runtime-adapter")]
+        for entry in &mut projected {
+            if entry.error.is_none()
+                && let Some(reload) = self
+                    .member_registration_reload_required(entry.current_bridge_session_id.as_ref())
+                    .await
+            {
+                entry.error = Some(reload);
+            }
+        }
         projected
+    }
+
+    /// The status error of a member whose local runtime registration needs a
+    /// durability reload. Such a member is non-serving until its reload: it
+    /// starts no run, and requests to it are refused typed.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn member_registration_reload_required(
+        &self,
+        bridge_session_id: Option<&SessionId>,
+    ) -> Option<String> {
+        let (Some(adapter), Some(session_id)) = (self.runtime_adapter.as_ref(), bridge_session_id)
+        else {
+            return None;
+        };
+        adapter
+            .durability_reload_required(session_id)
+            .await
+            .map(|required| {
+                format!(
+                    "runtime registration requires a reload: durability reload required after `{}`: {}",
+                    required.operation, required.reason
+                )
+            })
     }
 
     fn mob_handle_for_tools(&self) -> MobHandle {
@@ -14363,7 +14597,7 @@ impl MobActor {
             public_owner: None,
             ownership: Arc::clone(&self.ownership),
             admission_closed_rx: self.admission_closed_tx.subscribe(),
-            incarnation: self.incarnation,
+            incarnation: self.incarnation.incarnation(),
             registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
             realm_profile_store: self.realm_profile_store.clone(),
         }
@@ -17624,7 +17858,7 @@ impl MobActor {
                     other => return Ok(outcome(other.disposition())),
                 };
                 set_stage("live_session_revival");
-                let revival = Self::request_member_live_revival(
+                let revival = match Self::request_member_live_revival(
                     command_tx,
                     &entry.agent_identity,
                     &bridge_session_id,
@@ -17633,7 +17867,21 @@ impl MobActor {
                         publication: prior_publication,
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(revival) => revival,
+                    // A reload while the mob is Stopped: the degraded
+                    // registration is discarded and the successor published,
+                    // held by the MobStop the Stop staged. Only its revival
+                    // waits for Running, and the Resume completes it: its
+                    // explicit resume preparation materializes the member
+                    // over the published successor.
+                    Err(MobError::InvalidTransition {
+                        from: MobState::Stopped,
+                        to: MobState::Running,
+                    }) => return Ok(outcome(super::handle::MemberReloadDisposition::Discarded)),
+                    Err(error) => return Err(error),
+                };
                 let publication = match revival {
                     MemberLiveRevivalOutcome::Materialized(Some(publication)) => publication,
                     MemberLiveRevivalOutcome::Materialized(None) => {
@@ -17867,11 +18115,27 @@ impl DetachedMemberReadinessContext {
     ) -> Result<(), MobError> {
         let member_ref = &target.incarnation.member_ref;
         let expected_member = target.incarnation.expected_member.as_ref();
+        // A member whose runtime registration needs a durability reload has
+        // neither the drain abort nor the run settlement to wait for. Both
+        // would wait on the degraded registration: the abort behind the
+        // mutation fence a failed boundary commit retains, which only the
+        // reload-required discard releases, and the settlement for a run end
+        // no degraded registration can record. The discard (a Shutdown's
+        // teardown, or a reload) aborts and joins the drain itself, and the
+        // cold registration it publishes reads the run's outcome from durable
+        // truth. Until then the drain may keep re-arming, but it admits no
+        // input: admission waits for a durability-ready registration.
+        #[cfg(feature = "runtime-adapter")]
+        let reload_required = matches!(
+            target.outcome.run,
+            super::stop_report::MemberStopRun::ReloadRequired
+        );
         // Abort the comms drain but keep the session registered. A placed
         // member's session and drain belong to the member host; its exact
         // remote interrupt is the stop boundary.
         #[cfg(feature = "runtime-adapter")]
         if expected_member.is_none()
+            && !reload_required
             && let (Some(adapter), Some(session_id)) =
                 (&self.runtime_adapter, member_ref.bridge_session_id())
         {
@@ -17915,8 +18179,9 @@ impl DetachedMemberReadinessContext {
             // hold, set before the interrupt, keeps a queued input from
             // starting another run meanwhile.
             #[cfg(feature = "runtime-adapter")]
-            if let (Some(adapter), Some(session_id)) =
-                (&self.runtime_adapter, member_ref.bridge_session_id())
+            if !reload_required
+                && let (Some(adapter), Some(session_id)) =
+                    (&self.runtime_adapter, member_ref.bridge_session_id())
             {
                 stage.enter(AUTONOMOUS_MEMBER_STOP_RUN_SETTLEMENT_STAGE);
                 adapter.wait_current_run_settled(session_id).await;
@@ -18424,7 +18689,9 @@ impl MobActor {
     /// hosts (`local_only`), one after another. A remote member's host is not
     /// contacted during Shutdown, which never probes a placed member it has no
     /// live channel to. A Stop holds every member concurrently instead
-    /// ([`Self::hold_every_member_run_starts_concurrently`]).
+    /// ([`Self::hold_every_member_run_starts_concurrently`]). As there, every
+    /// member is held and the first failure in roster order is returned, so a
+    /// member whose hold failed leaves no later member unheld.
     async fn hold_all_member_run_starts(
         &mut self,
         local_only: bool,
@@ -18434,6 +18701,7 @@ impl MobActor {
             roster.list().cloned().collect::<Vec<_>>()
         };
         let mut outcomes = BTreeMap::new();
+        let mut first_error = None;
         for entry in &entries {
             if self.placed_member_carrier_dormant(&entry.agent_identity) {
                 outcomes.insert(
@@ -18445,7 +18713,13 @@ impl MobActor {
                 );
                 continue;
             }
-            let incarnation = self.autonomous_stop_interrupt_incarnation(entry)?;
+            let incarnation = match self.autonomous_stop_interrupt_incarnation(entry) {
+                Ok(incarnation) => incarnation,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             if local_only
                 && (incarnation.expected_member.is_some()
                     || incarnation.member_ref.bridge_session_id().is_none())
@@ -18456,7 +18730,7 @@ impl MobActor {
                 );
                 continue;
             }
-            let outcome = converge_autonomous_stop_member_result(
+            match converge_autonomous_stop_member_result(
                 self.provisioner
                     .stop_member_runtime(
                         &incarnation.member_ref,
@@ -18464,10 +18738,16 @@ impl MobActor {
                         false,
                     )
                     .await,
-            )?;
-            outcomes.insert(entry.agent_identity.clone(), outcome);
+            ) {
+                Ok(outcome) => {
+                    outcomes.insert(entry.agent_identity.clone(), outcome);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Ok(outcomes)
+        first_error.map_or(Ok(outcomes), Err)
     }
 
     /// Hold every member's run starts for a Stop (#1500), before any stop
@@ -20372,13 +20652,24 @@ impl MobActor {
             member_ref: member_ref.clone(),
             expected_member: None,
         };
-        if let Err(error) =
-            Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
+        match Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation).await
         {
-            tracing::warn!(
-                error = %error,
-                "holding a member spawned into a stopped mob failed"
-            );
+            Ok(outcome)
+                if outcome.starts == super::stop_report::MemberRunStarts::ReloadRequired =>
+            {
+                tracing::info!(
+                    "a member spawned into a stopped mob needs a durability reload: it starts no \
+                     run until it is reloaded, and the reloaded registration stays held until \
+                     resume"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "holding a member spawned into a stopped mob failed"
+                );
+            }
         }
     }
 
@@ -20402,18 +20693,56 @@ impl MobActor {
                 Ok(incarnation) => {
                     Self::stage_and_hold_member_run_starts(self.provisioner.as_ref(), &incarnation)
                         .await
-                        .map(|_| ())
                 }
                 Err(error) => Err(error),
             };
-            if let Err(error) = held {
-                tracing::warn!(
-                    agent_identity = %entry.agent_identity,
-                    error = %error,
-                    "re-holding a member's run starts after a failed resume failed"
-                );
+            match held {
+                Ok(outcome)
+                    if outcome.starts == super::stop_report::MemberRunStarts::ReloadRequired =>
+                {
+                    tracing::info!(
+                        agent_identity = %entry.agent_identity,
+                        "a member of the stopped mob needs a durability reload: it starts no run \
+                         until it is reloaded, and the reloaded registration stays held until \
+                         resume"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        agent_identity = %entry.agent_identity,
+                        error = %error,
+                        "re-holding a member's run starts after a failed resume failed"
+                    );
+                }
             }
         }
+    }
+
+    /// The first local member, in roster order, whose runtime registration
+    /// needs a durability reload, as the typed refusal a Resume answers.
+    #[cfg(feature = "runtime-adapter")]
+    async fn member_reload_required_before_resume(&self) -> Option<MobError> {
+        let adapter = self.runtime_adapter.as_ref()?;
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            let MemberRef::Session { session_id, .. } = &entry.member_ref else {
+                continue;
+            };
+            if let Some(required) = adapter.durability_reload_required(session_id).await {
+                return Some(MobError::MemberReloadRequired {
+                    member_id: entry.agent_identity.clone(),
+                    reason: format!(
+                        "durability reload required after `{}`: {}",
+                        required.operation, required.reason
+                    ),
+                });
+            }
+        }
+        None
     }
 
     fn finish_explicit_resume_attempt(
@@ -20458,6 +20787,18 @@ impl MobActor {
             MobState::Running,
             "resume_command_admission",
         ) {
+            let _ = reply_tx.send(Err(error));
+            return;
+        }
+        // A member whose runtime registration needs a durability reload
+        // cannot be resumed as it is: the attachment preparation, the
+        // readiness check and the operation-binding restore below all refuse
+        // its degraded registration. Refuse typed before anything moves,
+        // naming the member. Its reload is admitted while the mob is Stopped
+        // and publishes a successor the staged MobStop holds; the mob stays
+        // Stopped and held meanwhile.
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(error) = self.member_reload_required_before_resume().await {
             let _ = reply_tx.send(Err(error));
             return;
         }
@@ -25159,6 +25500,25 @@ impl MobActor {
                     None,
                 )
                 .await;
+                if preliminary == IdentityReconcileDecision::AwaitLease {
+                    // Another incarnation holds the lease. A holder that
+                    // crashed or stopped never releases it, and nothing else
+                    // wakes this identity when it expires (only the slow
+                    // safety scan would), so wait for that expiry.
+                    let expires_at_ms = match &lease_observation {
+                        IdentityStoredObservation::Valid(record) => {
+                            record.active.as_ref().map(|active| active.expires_at_ms)
+                        }
+                        IdentityStoredObservation::Missing
+                        | IdentityStoredObservation::Unsupported { .. }
+                        | IdentityStoredObservation::Malformed { .. } => None,
+                    };
+                    self.schedule_identity_reconcile_wait(
+                        identity,
+                        IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                        identity_lease_wait_delay(expires_at_ms, now_ms),
+                    );
+                }
             }
             return Ok(IdentityReconcilePassDisposition::Outcome(false));
         }
@@ -27854,6 +28214,11 @@ impl MobActor {
                     let _ = reply_tx.send(Ok(()));
                 }
                 #[cfg(test)]
+                MobCommand::QueueRoutedEffectForTest { effect, reply_tx } => {
+                    self.pending_routed_effects.push(effect);
+                    let _ = reply_tx.send(Ok(()));
+                }
+                #[cfg(test)]
                 MobCommand::ParkActorForObservationTest {
                     entered_tx,
                     release_rx,
@@ -30321,9 +30686,9 @@ impl MobActor {
         // MeerkatMachine) carries large debug poll frames. Run it on its own
         // task so those frames start at the worker loop rather than beneath
         // the actor run loop and restore frames: inline, the sum overflowed
-        // the 2 MiB worker-stack canary
-        // `mob_cold_restart_partial_resume_respawns_wired_member` once #1416
-        // widened the generated machine types. Binding preparation is
+        // the 2 MiB worker-stack canary (now
+        // `mob_cold_restart_resume_respawns_a_wired_member_whose_session_survived`)
+        // once #1416 widened the generated machine types. Binding preparation is
         // idempotent, so a late completion after a cancelled restore is
         // harmless (see `relieve_caller_stack`). Do not move this back inline:
         // that re-stacks the registration chain beneath the actor frames.
@@ -30517,9 +30882,7 @@ impl MobActor {
                 ));
             }
             if !io.session_service.has_live_session(session).await?
-                && io
-                    .session_service
-                    .load_persisted_session(session)
+                && Self::load_cleanup_session_settling_durable_tail(&io, session)
                     .await?
                     .is_none()
                 && !io
@@ -30572,6 +30935,39 @@ impl MobActor {
     #[cfg(not(feature = "runtime-adapter"))]
     async fn restore_local_cleanup_composition_delivery(&self) -> Result<(), MobError> {
         Ok(())
+    }
+
+    /// The persisted session a local cleanup delivery restores, read once its
+    /// durable tail is settled.
+    ///
+    /// A member whose last turn's durable rows landed after the runtime
+    /// boundary it committed (a mid-turn retirement's boundary cancel, or a
+    /// process death between the two commit points) reads as a transcript
+    /// revision conflict at that boundary. This read runs before the actor
+    /// admits any command, so the conflict would fail-stop the whole mob at
+    /// every start. The tail is settled first, through the store-owned
+    /// recovery the resume path runs (a proven continuation is adopted, an
+    /// unprovable one is kept intact), and the session is read once more; a
+    /// tail the recovery keeps still refuses, typed, as before.
+    #[cfg(feature = "runtime-adapter")]
+    async fn load_cleanup_session_settling_durable_tail(
+        io: &ResumeOperationBindingIo,
+        session: &SessionId,
+    ) -> Result<Option<meerkat_core::Session>, MobError> {
+        match io.session_service.load_persisted_session(session).await {
+            Err(error) if is_transcript_revision_conflict(&error) => {
+                tracing::info!(
+                    session_id = %session,
+                    "settling a durable tail ahead of its runtime boundary before restoring \
+                     local cleanup delivery"
+                );
+                io.session_service
+                    .materialize_session_resume_verdict(session)
+                    .await?;
+                Ok(io.session_service.load_persisted_session(session).await?)
+            }
+            loaded => Ok(loaded?),
+        }
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -45128,6 +45524,88 @@ impl MobActor {
         }
     }
 
+    /// The provider a respawn successor's build resolves to, read before the
+    /// predecessor is retired, exactly as the spawn resolves it: the spec's
+    /// profile override or its role's profile, with its model override, then
+    /// the profile's declared provider, the mob's model entry or the catalog.
+    /// A profile that cannot be resolved refuses the respawn.
+    async fn successor_build_provider(
+        &self,
+        agent_identity: &AgentIdentity,
+        spec: &super::handle::SpawnMemberSpec,
+    ) -> Result<Option<meerkat_core::Provider>, MobError> {
+        let mut profile = match &spec.override_profile {
+            Some(profile) => profile.clone(),
+            None => self
+                .definition
+                .resolve_profile(&spec.role_name, self.realm_profile_store.as_ref())
+                .await
+                .map_err(
+                    |error| MobError::RespawnPredecessorRestrictionsUnavailable {
+                        agent_identity: agent_identity.to_string(),
+                        reason: format!("the successor's profile cannot be resolved: {error}"),
+                    },
+                )?,
+        };
+        if let Some(model) = &spec.model_override {
+            profile.model.clone_from(model);
+        }
+        Ok(crate::portable_profile::resolved_profile_provider(
+            &profile,
+            &self.definition.models,
+        ))
+    }
+
+    /// The spawner restrictions of the member being respawned, as its
+    /// session's owner states them, or `None` when the member's journaled
+    /// record proves it never had local session authority in this
+    /// generation. Missing, unsupported or changed evidence refuses the
+    /// respawn before anything is retired, keeping the member.
+    async fn retained_predecessor_restrictions(
+        &self,
+        agent_identity: &AgentIdentity,
+        snapshot: &RespawnSnapshot,
+    ) -> Result<Option<meerkat_core::PredecessorToolRestrictions>, MobError> {
+        let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+            agent_identity: agent_identity.to_string(),
+            reason,
+        };
+        let current_local_session = |entry: Option<&RosterEntry>| {
+            entry
+                .filter(|entry| {
+                    entry.agent_runtime_id == snapshot.old_runtime_id
+                        && entry.fence_token == snapshot.old_fence_token
+                })
+                .map(RosterEntry::local_session)
+        };
+        let Some(local_session) =
+            current_local_session(self.roster.read().await.get(agent_identity))
+        else {
+            return Err(refuse(
+                "the member changed before its restrictions were read".to_string(),
+            ));
+        };
+        let session_id = match local_session {
+            crate::roster::MemberLocalSession::NeverBound => return Ok(None),
+            crate::roster::MemberLocalSession::Bound(session_id) => session_id,
+        };
+        let restrictions = self
+            .session_service
+            .predecessor_tool_restrictions(&session_id)
+            .await
+            .map_err(|error| refuse(error.to_string()))?;
+        // The read awaited: the member must still be the same incarnation,
+        // bound to the same session.
+        if current_local_session(self.roster.read().await.get(agent_identity))
+            != Some(crate::roster::MemberLocalSession::Bound(session_id))
+        {
+            return Err(refuse(
+                "the member changed while its restrictions were read".to_string(),
+            ));
+        }
+        Ok(Some(restrictions))
+    }
+
     async fn handle_respawn(
         &mut self,
         agent_identity: AgentIdentity,
@@ -45241,6 +45719,19 @@ impl MobActor {
             cleanup_retry = snapshot.cleanup_retry,
             "MobActor::handle_respawn captured snapshot"
         );
+                // The spawner restrictions the successor must keep, pinned
+                // before anything is retired. Placed members are owned by
+                // their hosting member and are not read here; a member that
+                // never had a local session carries no session restrictions,
+                // and its successor keeps the launch policy its own spec
+                // inherits.
+                let retained_restrictions = match placed_host {
+                    Some(_) => None,
+                    None => self
+                        .retained_predecessor_restrictions(&agent_identity, &snapshot)
+                        .await
+                        .map_err(MobRespawnError::from)?,
+                };
 
                 let original_identity = AgentIdentity::from(agent_identity.as_str());
                 let mut replacement_spec = match successor_spec {
@@ -45341,6 +45832,23 @@ impl MobActor {
             return Err(MobRespawnError::from(MobError::Internal(format!(
                 "spawn customizer cannot re-place respawn of '{original_identity}'"
             ))));
+                }
+
+                if let Some(retained) = &retained_restrictions {
+                    // Resolved here, before anything is retired: a successor
+                    // whose build cannot be resolved is refused with the
+                    // member kept, never lost after its retirement.
+                    let successor_provider = self
+                        .successor_build_provider(&agent_identity, &replacement_spec)
+                        .await
+                        .map_err(MobRespawnError::from)?;
+                    keep_predecessor_restrictions(
+                        &agent_identity,
+                        &mut replacement_spec,
+                        retained,
+                        successor_provider,
+                    )
+                    .map_err(MobRespawnError::from)?;
                 }
 
                 Ok::<_, MobRespawnError>((
@@ -61139,6 +61647,37 @@ mod routed_effect_containment_tests {
     }
 
     #[test]
+    fn a_refused_route_names_a_current_runtime_only_while_its_member_runs_it() {
+        let identity = mob_dsl::AgentIdentity::from("worker");
+        let runtime_id = mob_dsl::AgentRuntimeId::from("worker:1");
+        let mut state = mob_dsl::MobMachineAuthority::new().state().clone();
+        let retire = super::super::composition::MobSeamEffect::routed(
+            mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                session_id: mob_dsl::SessionId::from("session-worker"),
+            },
+        )
+        .expect("runtime retire is a generated routed effect");
+
+        assert!(
+            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            "a retired member runs no runtime"
+        );
+        state
+            .identity_to_runtime
+            .insert(identity.clone(), mob_dsl::AgentRuntimeId::from("worker:2"));
+        assert!(
+            !MobActor::routed_effect_targets_current_runtime(&state, &retire),
+            "a member that runs a later runtime does not own the route"
+        );
+        state.identity_to_runtime.insert(identity, runtime_id);
+        assert!(MobActor::routed_effect_targets_current_runtime(
+            &state, &retire
+        ));
+    }
+
+    #[test]
     fn actor_boundary_retries_closed_refusals_until_independent_tail_drains() {
         let session_id = SessionId::parse("019f0000-0000-7000-8000-000000000001")
             .expect("valid test session id");
@@ -63312,5 +63851,124 @@ impl SupervisorTrustInstaller {
                 "unknown supervisor binding variant during rollback".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod respawn_restriction_tests {
+    use super::*;
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    fn deny(name: &str) -> ToolAccessPolicy {
+        ToolAccessPolicy::DenyList([name].into_iter().collect())
+    }
+
+    fn recorded_binding() -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("tenant_a").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }
+    }
+
+    /// The predecessor's record: `launch`, no ceiling, and a binding recorded
+    /// for Anthropic.
+    fn retained(launch: Option<ToolAccessPolicy>) -> meerkat_core::PredecessorToolRestrictions {
+        meerkat_core::PredecessorToolRestrictions::from_build_handoff(launch, None)
+            .with_auth_binding(
+                Some(recorded_binding()),
+                Some(meerkat_core::Provider::Anthropic),
+            )
+    }
+
+    fn successor() -> super::super::handle::SpawnMemberSpec {
+        super::super::handle::SpawnMemberSpec::new("worker", AgentIdentity::from("w"))
+    }
+
+    fn composed(
+        own: Option<ToolAccessPolicy>,
+        retained: &meerkat_core::PredecessorToolRestrictions,
+    ) -> Option<ToolAccessPolicy> {
+        let mut spec = successor();
+        spec.tool_access_policy = own;
+        keep_predecessor_restrictions(&AgentIdentity::from("w"), &mut spec, retained, None)
+            .expect("the restrictions compose");
+        spec.tool_access_policy
+    }
+
+    /// A successor keeps the predecessor's launch policy: no policy of its own
+    /// (or `Inherit`) leaves it as it is, a policy of its own is conjoined with
+    /// it and never replaces it, and a policy re-applied at every respawn
+    /// does not grow the conjunction.
+    #[test]
+    fn a_successor_keeps_the_predecessor_launch_policy_and_never_widens_it() {
+        let shell = retained(Some(deny("shell")));
+        assert_eq!(composed(None, &shell), Some(deny("shell")));
+        assert_eq!(
+            composed(Some(ToolAccessPolicy::Inherit), &shell),
+            Some(deny("shell"))
+        );
+        let both = deny("other").conjoin(deny("shell")).expect("conjoin");
+        assert_eq!(composed(Some(deny("other")), &shell), Some(both.clone()));
+        assert_eq!(
+            composed(Some(deny("shell")), &shell),
+            Some(deny("shell")),
+            "re-applying the retained policy adds nothing"
+        );
+        assert_eq!(
+            composed(Some(deny("other")), &retained(Some(both.clone()))),
+            Some(both),
+            "a constraint already in the conjunction is kept once"
+        );
+        assert_eq!(
+            composed(Some(deny("other")), &retained(None)),
+            Some(deny("other")),
+            "an unrestricted predecessor leaves the successor's own policy"
+        );
+    }
+
+    /// The predecessor's binding is kept only for a successor that builds on
+    /// the provider it was recorded for, and never over the successor's own.
+    #[test]
+    fn a_successor_keeps_the_predecessor_binding_only_on_its_provider() {
+        let retained = retained(None);
+        let with_provider = |provider: Option<meerkat_core::Provider>| {
+            let mut spec = successor();
+            keep_predecessor_restrictions(
+                &AgentIdentity::from("w"),
+                &mut spec,
+                &retained,
+                provider,
+            )
+            .expect("the restrictions compose");
+            spec.auth_binding
+        };
+        assert_eq!(
+            with_provider(Some(meerkat_core::Provider::Anthropic)),
+            Some(recorded_binding())
+        );
+        assert_eq!(with_provider(Some(meerkat_core::Provider::OpenAI)), None);
+        assert_eq!(with_provider(None), None);
+
+        let own = meerkat_core::AuthBindingRef {
+            binding: meerkat_core::BindingId::parse("own").expect("binding id"),
+            ..recorded_binding()
+        };
+        let mut spec = successor();
+        spec.auth_binding = Some(own.clone());
+        keep_predecessor_restrictions(
+            &AgentIdentity::from("w"),
+            &mut spec,
+            &retained,
+            Some(meerkat_core::Provider::Anthropic),
+        )
+        .expect("the restrictions compose");
+        assert_eq!(
+            spec.auth_binding,
+            Some(own),
+            "the successor's own binding stands"
+        );
     }
 }

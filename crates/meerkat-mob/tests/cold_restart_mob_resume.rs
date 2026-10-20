@@ -1689,15 +1689,37 @@ async fn mob_destroy_session_children_stack_budget_scenario() {
     );
 }
 
-/// A broken wired member still needs its exact old-generation endpoint after
-/// a full service restart. The endpoint is required to retire reciprocal trust
-/// safely before spawning and wiring the replacement generation.
+/// A wired member whose session was lost in a full service restart cannot be
+/// respawned: its inherited restrictions can no longer be established, so the
+/// respawn is refused before anything is retired, the Broken member is kept,
+/// no trust is installed for it and its siblings keep working.
 #[test]
-fn mob_cold_restart_partial_resume_respawns_wired_member() {
-    run_partial_resume_respawn_with_stack(2 * 1024 * 1024, "production-stack");
+fn mob_cold_restart_partial_resume_refuses_respawn_of_a_member_whose_session_was_lost() {
+    run_cold_resume_scenario_with_stack(
+        2 * 1024 * 1024,
+        "production-stack",
+        mob_cold_restart_partial_resume_lost_member_scenario(),
+    );
 }
 
-fn run_partial_resume_respawn_with_stack(stack_size: usize, label: &str) {
+/// The 2 MiB worker-stack canary for the full cold-resume respawn chain: a
+/// wired member whose session survives the service restart is respawned,
+/// retiring its old generation's reciprocal trust before spawning and wiring
+/// the replacement generation.
+#[test]
+fn mob_cold_restart_resume_respawns_a_wired_member_whose_session_survived() {
+    run_cold_resume_scenario_with_stack(
+        2 * 1024 * 1024,
+        "production-stack",
+        mob_cold_restart_resume_surviving_member_respawn_scenario(),
+    );
+}
+
+fn run_cold_resume_scenario_with_stack(
+    stack_size: usize,
+    label: &str,
+    scenario: impl std::future::Future<Output = ()>,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Pin the requested stack explicitly. The production selector uses
@@ -1706,10 +1728,10 @@ fn run_partial_resume_respawn_with_stack(stack_size: usize, label: &str) {
         .thread_stack_size(stack_size)
         .build()
         .unwrap_or_else(|error| panic!("build {label} cold-resume runtime: {error}"));
-    runtime.block_on(mob_cold_restart_partial_resume_respawns_wired_member_scenario());
+    runtime.block_on(scenario);
 }
 
-async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
+async fn mob_cold_restart_resume_surviving_member_respawn_scenario() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
@@ -1719,6 +1741,122 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
     let definition = mob_definition(MobRuntimeMode::TurnDriven);
     let replacement_w2_comms_name = format!("{}/worker/w-2", definition.id);
     let lead_comms_name = format!("{}/lead/lead-1", definition.id);
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    for (profile, identity) in [("lead", "lead-1"), ("worker", "w-1"), ("worker", "w-2")] {
+        handle_1
+            .spawn_spec(SpawnMemberSpec::new(profile, AgentIdentity::from(identity)))
+            .await
+            .unwrap_or_else(|error| panic!("spawn {identity}: {error}"));
+    }
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+        .await
+        .expect("w1 session id");
+    let w2_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .await
+        .expect("w2 session id");
+    let old_w2_peer_id = service_1
+        .comms_runtime(&w2_sid)
+        .await
+        .expect("w2 comms runtime")
+        .peer_id()
+        .expect("w2 peer id");
+
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    for session_id in [&lead_sid, &w1_sid, &w2_sid] {
+        service_1
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session before cold restart");
+    }
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_1);
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume after cold restart");
+    for identity in ["lead-1", "w-1", "w-2"] {
+        assert_member_active(&member_entry(&handle_2, identity).await, "cold resume");
+    }
+    let lead_runtime = service_2
+        .comms_runtime(&lead_sid)
+        .await
+        .expect("resumed lead comms runtime");
+
+    let respawned = handle_2
+        .respawn(AgentIdentity::from("w-2"), None)
+        .await
+        .expect("respawn the surviving w2");
+    assert_eq!(respawned.identity, AgentIdentity::from("w-2"));
+    let new_w2_sid = handle_2
+        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .await
+        .expect("replacement w2 session id");
+    assert_ne!(new_w2_sid, w2_sid);
+    assert_member_active(&member_entry(&handle_2, "w-2").await, "after respawn");
+
+    let new_w2_runtime = service_2
+        .comms_runtime(&new_w2_sid)
+        .await
+        .expect("replacement w2 comms runtime");
+    let new_w2_peer_id = new_w2_runtime.peer_id().expect("replacement w2 peer id");
+    assert_ne!(
+        new_w2_peer_id, old_w2_peer_id,
+        "replacement generation must rotate its exact comms endpoint"
+    );
+    let lead_peers = lead_runtime.peers().await;
+    assert!(
+        lead_peers.iter().all(|peer| peer.peer_id != old_w2_peer_id),
+        "lead must not retain trust for the retired w2 generation"
+    );
+    assert!(
+        lead_peers.iter().any(|peer| {
+            peer.peer_id == new_w2_peer_id
+                && peer.name.as_str() == replacement_w2_comms_name.as_str()
+        }),
+        "lead must trust the exact replacement w2 endpoint"
+    );
+    assert!(
+        new_w2_runtime
+            .peers()
+            .await
+            .iter()
+            .any(|peer| peer.name.as_str() == lead_comms_name.as_str()),
+        "replacement w2 must trust the resumed lead"
+    );
+
+    handle_2.shutdown().await.expect("final shutdown");
+}
+
+async fn mob_cold_restart_partial_resume_lost_member_scenario() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let (service_1, store_1) = persistent_service(&paths, runtime_store_1.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let definition = mob_definition(MobRuntimeMode::TurnDriven);
+    let replacement_w2_comms_name = format!("{}/worker/w-2", definition.id);
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
         .with_default_llm_client(openai_test_client())
@@ -1802,49 +1940,70 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
         "cold resume must not retain live trust for the missing old generation"
     );
 
-    let repair = handle_2
-        .respawn(AgentIdentity::from("w-2"), None)
+    // w-2's session, and with it the owner's evidence of the restrictions
+    // it inherited, is gone. Respawn refuses before retiring anything and
+    // keeps the exact Broken member; retiring it and spawning a fresh member
+    // are separate, ordinary operations.
+    let w2 = AgentIdentity::from("w-2");
+    let before = handle_2
+        .get_member(&w2)
         .await
-        .expect("respawn broken wired w2");
-    assert_eq!(repair.identity, AgentIdentity::from("w-2"));
-    let new_w2_sid = handle_2
-        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .expect("roster query")
+        .expect("broken w2 in the roster");
+    let refused = handle_2.respawn(w2.clone(), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(meerkat_mob::MobRespawnError::Mob(
+                meerkat_mob::MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a lost predecessor session refuses the respawn, typed: {refused:?}"
+    );
+    let after = handle_2
+        .get_member(&w2)
         .await
-        .expect("replacement w2 session id");
-    assert_ne!(new_w2_sid, w2_sid);
-    assert_member_active(&member_entry(&handle_2, "w-2").await, "after repair");
+        .expect("roster query")
+        .expect("the member was not retired");
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agent_runtime_id, before.agent_runtime_id);
+    assert_eq!(after.fence_token, before.fence_token);
+    assert_eq!(after.bridge_session_id(), Some(&w2_sid));
+    assert_eq!(
+        member_entry(&handle_2, "w-2").await.status,
+        MobMemberStatus::Broken,
+        "the refused respawn keeps the Broken member"
+    );
 
-    let new_w2_runtime = service_2
-        .comms_runtime(&new_w2_sid)
-        .await
-        .expect("replacement w2 comms runtime");
-    let new_w2_peer_id = new_w2_runtime.peer_id().expect("replacement w2 peer id");
-    assert_ne!(
-        new_w2_peer_id, old_w2_peer_id,
-        "replacement generation must rotate its exact comms endpoint"
-    );
-    let lead_peers_after_repair = lead_before_repair.peers().await;
+    // No successor endpoint was trusted, and the old one stays untrusted.
+    let lead_peers_after_refusal = lead_before_repair.peers().await;
     assert!(
-        lead_peers_after_repair
+        lead_peers_after_refusal
             .iter()
-            .all(|peer| peer.peer_id != old_w2_peer_id),
-        "lead must not retain trust for the retired w2 generation"
+            .all(|peer| peer.peer_id != old_w2_peer_id
+                && peer.name.as_str() != replacement_w2_comms_name.as_str()),
+        "a refused respawn installs no trust for w2: {lead_peers_after_refusal:?}"
     );
-    assert!(
-        lead_peers_after_repair.iter().any(|peer| {
-            peer.peer_id == new_w2_peer_id
-                && peer.name.as_str() == replacement_w2_comms_name.as_str()
-        }),
-        "lead must trust the exact replacement w2 endpoint"
-    );
-    assert!(
-        new_w2_runtime
-            .peers()
-            .await
-            .iter()
-            .any(|peer| peer.name.as_str() == lead_comms_name.as_str()),
-        "replacement w2 must trust the resumed lead"
-    );
+
+    // The siblings stay usable after the refusal.
+    assert_member_active(&member_entry(&handle_2, "lead-1").await, "after refusal");
+    assert_member_active(&member_entry(&handle_2, "w-1").await, "after refusal");
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "lead-1",
+        "AFTER_REFUSAL_LEAD_TURN token-lead",
+        "after refusal",
+    )
+    .await;
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "AFTER_REFUSAL_W1_TURN token-w1",
+        "after refusal",
+    )
+    .await;
 
     handle_2.shutdown().await.expect("final shutdown");
 }
@@ -3291,4 +3450,535 @@ async fn a_scope_from_before_a_reset_never_retires_the_resumed_member() {
     );
 
     handle_2.shutdown().await.expect("final shutdown");
+}
+
+/// A mob whose retiring member has a durable tail ahead of its runtime
+/// boundary authority restarts. The power cut leaves the canonical head
+/// carrying a turn whose runtime boundary commit never became durable (the
+/// window a mid-turn retirement's boundary cancel also leaves); the member's
+/// retirement then starts and the process dies before it finishes. At the next
+/// start the actor restores that member's local cleanup delivery before it
+/// admits any command. The restore must settle the tail instead of refusing
+/// to read the session at the stale boundary, or the whole mob fail-stops and
+/// refuses its own restart.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_whose_retiring_member_has_a_durable_tail_restarts() {
+    // nextest runs each test in its own process: the actor's startup refusal
+    // is logged at ERROR, so show it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+
+    // ---------------- Lifetime 1 ----------------
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "retiring-tail-lifetime1",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        "retiring-tail-pre-cut-boundary",
+    )
+    .await;
+
+    // The next turn's durable row lands; its runtime boundary commit does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[retiring-tail] send during cut => {send_result:?}");
+    wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "retiring-tail-row",
+    )
+    .await;
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while power_store.prepared_boundary_commit_rejections() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "[retiring-tail] prepared boundary commit was never rejected under the cut"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load runtime session authority")
+        .expect("runtime session authority present");
+    let authority = authority
+        .head_canonical()
+        .expect("head-canonical boundary authority");
+    let ahead_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    assert_ne!(
+        meerkat_core::session_store::session_head_cas_token(&ahead_head)
+            .expect("ahead physical head has a canonical token"),
+        authority.committed_head_token(),
+        "the physical head must be ahead of the retained runtime authority"
+    );
+    assert!(
+        ahead_head.message_count > authority.boundary_head().message_count,
+        "the physical head must carry a strict continuation past the boundary"
+    );
+
+    // The member's retirement starts with the tail in place (as a
+    // reconciler's retirement of a member mid-turn does), then the process
+    // dies before it finishes.
+    let retire_result =
+        tokio::time::timeout(Duration::from_secs(10), handle_1.retire(identity.clone())).await;
+    eprintln!("[retiring-tail] retire during cut => {retire_result:?}");
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+
+    // ---------------- Lifetime 2 ----------------
+    power_store.set_cut(false);
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a stopped mob whose member has a durable tail must restart: {error}")
+        });
+    let status = handle_2.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the restarted mob must admit commands, not fail-stop before admission: {status:?}"
+    );
+    // The tail was settled by adoption: the runtime authority now names the
+    // physical head that carries the post-cut turn, which is kept, not lost.
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "retiring-tail-adopted-boundary",
+    )
+    .await;
+    let _ = handle_2.shutdown().await;
+}
+
+#[cfg(feature = "test-support")]
+const HELD_TURN_PROMPT: &str = "HELD_TURN token-sigma";
+
+/// A provider whose first request for the held prompt waits until the test
+/// releases it; every other request answers at once.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct HeldTurnClient {
+    held: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for HeldTurnClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, meerkat_client::LlmError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        use futures::StreamExt as _;
+        let events = vec![
+            meerkat_client::LlmEvent::TextDelta {
+                delta: "done".to_string(),
+                meta: None,
+            },
+            meerkat_client::LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    meerkat_core::Provider::OpenAI,
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            },
+            meerkat_client::LlmEvent::Done {
+                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
+            },
+        ];
+        let mentions_held_prompt = request.messages.iter().any(|message| {
+            !matches!(message, meerkat_core::Message::System(_))
+                && to_string(message).is_ok_and(|text| text.contains(HELD_TURN_PROMPT))
+        });
+        if mentions_held_prompt && !self.held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(
+                futures::stream::once(async move {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                })
+                .flat_map(move |()| futures::stream::iter(events.clone().into_iter().map(Ok))),
+            );
+        }
+        Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::OpenAI
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// A mob restarts after a member's retirement cancelled a turn at its
+/// boundary. The held provider call is released once the retirement has asked
+/// the turn to cancel at its boundary, so the turn's durable rows land and the
+/// run ends cancelled without committing that boundary. The retirement settles
+/// that tail in process (the runtime authority names the physical head again)
+/// and retires the member; the process then dies, and the next start must
+/// admit commands. A crash inside the window before the settle leaves the tail
+/// for the next start, whose cleanup restore settles it the same way.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mob_whose_member_retirement_cancelled_a_turn_at_its_boundary_restarts() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_mob::runtime::actor=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&paths.realm_db_path)
+            .expect("open HeadCanonical runtime store"),
+    );
+
+    // ---------------- Lifetime 1 ----------------
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(client.clone())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        "cancelled-tail-first",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        "cancelled-tail-first-boundary",
+    )
+    .await;
+    handle_1
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    let retire = tokio::spawn({
+        let handle = handle_1.clone();
+        let identity = identity.clone();
+        async move { handle.retire(identity).await }
+    });
+    sleep(Duration::from_millis(300)).await;
+    client.release.notify_one();
+    let retired = tokio::time::timeout(Duration::from_secs(60), retire)
+        .await
+        .expect("the retirement ends within its bound")
+        .expect("the retirement task completes");
+    assert!(
+        retired.is_ok(),
+        "the member's retirement settles the cancelled turn's tail and retires: {retired:?}"
+    );
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load runtime session authority")
+        .expect("runtime session authority present");
+    let authority = authority
+        .head_canonical()
+        .expect("head-canonical boundary authority");
+    let physical_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load physical head")
+        .expect("physical head exists");
+    assert_eq!(
+        meerkat_core::session_store::session_head_cas_token(&physical_head)
+            .expect("physical head has a canonical token"),
+        authority.committed_head_token(),
+        "the retirement settles the cancelled turn's tail: the runtime authority names the physical head"
+    );
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+
+    // ---------------- Lifetime 2 ----------------
+    let (service_2, _store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a mob whose member retirement cancelled a turn must restart: {error}")
+        });
+    let status = handle_2.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the restarted mob must admit commands, not fail-stop before admission: {status:?}"
+    );
+    let _ = handle_2.shutdown().await;
+}
+
+/// A member retired while its turn runs retires when the turn still reaches
+/// its boundary. The retirement asks the running turn to cancel at its
+/// boundary; the held provider call is then released inside the cooperative
+/// grace, so the turn's durable rows land and the run ends cancelled at the
+/// boundary, leaving the member's canonical head ahead of the runtime
+/// boundary it last committed. The rest of the retirement reads the session
+/// (its route observation first); those reads must settle the tail instead of
+/// refusing it, or the retirement stops after it durably started.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_retired_while_its_turn_reaches_the_boundary_retires() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_mob::runtime::actor::retirement_io=info,meerkat_runtime::recovery=info,\
+             meerkat_session::persistent=info,meerkat_mob::runtime::actor=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&paths.realm_db_path)
+            .expect("open HeadCanonical runtime store"),
+    );
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let client = Arc::new(HeldTurnClient::default());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(client.clone())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_HELD_TURN token-alpha",
+        "held-turn-first",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_HELD_TURN",
+        "held-turn-first-boundary",
+    )
+    .await;
+
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send(HELD_TURN_PROMPT.to_string(), HandlingMode::Queue)
+        .await
+        .expect("queue the held turn");
+    tokio::time::timeout(Duration::from_secs(30), client.entered.notified())
+        .await
+        .expect("the held turn's provider call is in flight");
+    let retire = tokio::spawn({
+        let handle = handle.clone();
+        let identity = identity.clone();
+        async move { handle.retire(identity).await }
+    });
+    // The retirement reaches its runtime quiesce and asks the turn to cancel
+    // at its boundary; the turn then finishes well inside the cooperative
+    // grace and reaches that boundary.
+    sleep(Duration::from_millis(300)).await;
+    client.release.notify_one();
+    let retired = tokio::time::timeout(Duration::from_secs(60), retire)
+        .await
+        .expect("the retirement ends within its bound")
+        .expect("the retirement task completes");
+    assert!(
+        retired.is_ok(),
+        "a member retired while its turn reaches the boundary must retire: {retired:?}"
+    );
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member leaves the roster"
+    );
+    let _ = handle.shutdown().await;
 }

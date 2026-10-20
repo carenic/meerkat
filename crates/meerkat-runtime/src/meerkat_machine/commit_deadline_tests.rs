@@ -3,7 +3,9 @@
 //! session instead of keeping the session's mutation gate and driver forever.
 //! The commit keeps running, and its late outcome settles the run's recovery
 //! carriers, so the reload-required discard replaces the registration once
-//! the store has answered.
+//! the store has answered. An input admission whose store write reports no
+//! durable outcome within the same deadline degrades its session the same
+//! way.
 //!
 //! The tests measure the store's declaration in short busy windows through
 //! the machine's test seam; the declaration itself is the store's.
@@ -250,9 +252,9 @@ async fn commit_past_its_deadline(
 
 /// Reads of the session's driver that take no gate answer while a commit
 /// past its deadline holds the driver: the active-input read answers busy,
-/// and the wake, the uncommitted-run-input read and the input's terminal
-/// completion refuse typed. Before, each waited for the driver, and so for
-/// the store.
+/// the wake and the uncommitted-run-input read refuse typed, and the input's
+/// terminal completion refuses as not readable yet. Before, each waited for the driver,
+/// and so for the store.
 #[tokio::test]
 async fn driver_reads_without_the_gate_answer_while_a_commit_past_its_deadline_holds_the_driver() {
     let store = declaring_store();
@@ -303,9 +305,9 @@ async fn driver_reads_without_the_gate_answer_while_a_commit_past_its_deadline_h
     assert!(
         matches!(
             terminal,
-            Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+            Err(RuntimeDriverError::InputTerminalNotYetReadable { .. })
         ),
-        "the terminal read refuses typed: {terminal:?}"
+        "the terminal read refuses as not readable yet: {terminal:?}"
     );
     hold.release(HeldStoreCommitRelease::Commit);
 }
@@ -611,4 +613,276 @@ async fn a_slow_commit_under_the_deadline_completes() {
         machine.is_durability_ready(&run.session_id).await,
         "a commit under the deadline does not degrade the session"
     );
+}
+
+/// Register a session with a runtime loop over an executor that holds any
+/// run it is given and is never released: the admission tests stop at the
+/// store.
+async fn register_session(machine: &Arc<MeerkatMachine>) -> SessionId {
+    let session_id = SessionId::new();
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(GatedExecutor {
+                gate: Arc::new(ExecutorGate {
+                    apply_entered: Notify::new(),
+                    release_apply: Notify::new(),
+                }),
+                fail: false,
+            }),
+        )
+        .await
+        .expect("register a session with a runtime loop");
+    session_id
+}
+
+/// The held admission's prompt and idempotency key; its resubmission
+/// carries both, as an exact replay must.
+const HELD_ADMISSION_TEXT: &str = "an admission whose store write is held";
+const HELD_ADMISSION_KEY: &str = "held-admission";
+
+/// A prompt that carries `key` as its idempotency key.
+fn keyed_prompt(text: &str, key: &str) -> crate::Input {
+    let mut input = prompt(text);
+    input.header_mut().idempotency_key = Some(crate::identifiers::IdempotencyKey::new(key));
+    input
+}
+
+/// The admission's typed, retryable refusal once its store write is past
+/// its deadline.
+fn admission_outcome_unknown(error: &RuntimeDriverError, input_id: &InputId) -> bool {
+    matches!(
+        error,
+        RuntimeDriverError::RecoveryRepairBlocked { reason, .. }
+            if reason.contains(&input_id.to_string())
+                && reason.contains("has not reported its durable outcome")
+                && reason.contains("same idempotency key")
+    )
+}
+
+/// How many of the store's input rows are `input_id`'s.
+async fn stored_rows(
+    store: &RuntimeCommitAtomicityStore,
+    session_id: &SessionId,
+    input_id: &InputId,
+) -> usize {
+    RuntimeStore::load_input_states(
+        store,
+        &crate::identifiers::LogicalRuntimeId::for_session(session_id),
+    )
+    .await
+    .expect("read the store's inputs")
+    .iter()
+    .filter(|row| {
+        matches!(
+            row,
+            crate::store::InputStateRow::Decoded(stored) if &stored.state.input_id == input_id
+        )
+    })
+    .count()
+}
+
+/// Hold an admission's store write and let the deadline pass. The admission
+/// answers the typed refusal within the bound, the session needs a reload
+/// for it, and the write keeps the gate while the store has not answered.
+async fn admission_past_its_deadline(
+    machine: &Arc<MeerkatMachine>,
+    store: &RuntimeCommitAtomicityStore,
+    session_id: &SessionId,
+    input: crate::Input,
+) -> super::tests::HeldStoreCommitControl {
+    let input_id = input.id().clone();
+    let hold = store.hold_next_admission_commit(&input_id);
+    let admitted = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.accept_input_with_completion(session_id, input),
+    )
+    .await
+    .expect("the admission answers while the store has not");
+    let refused = match admitted {
+        Ok((outcome, _)) => panic!("the admission answered before its store did: {outcome:?}"),
+        Err(error) => error,
+    };
+    assert!(
+        admission_outcome_unknown(&refused, &input_id),
+        "the admission refuses typed and retryable: {refused:?}"
+    );
+    tokio::time::timeout(TYPED_END_BOUND, hold.entered.notified())
+        .await
+        .expect("the admission's write reached the store");
+    let required = machine
+        .durability_reload_required(session_id)
+        .await
+        .expect("the deadline degraded the session");
+    assert_eq!(required.operation, "runtime_admission_deadline");
+    assert!(
+        gate_is_held(machine, session_id).await,
+        "the admission's write keeps the gate while the store has not answered"
+    );
+    hold
+}
+
+/// An admission whose store write never answers. At the store's declared
+/// deadline the admission answers a typed, retryable refusal and the session
+/// needs a reload (runtime_admission_deadline); a later admission's live
+/// wait for the gate ends typed, and a reload refuses typed while the write
+/// still holds the gate. Once the store commits late, the reload replaces
+/// the registration, the store holds the input, and a resubmission with the
+/// same idempotency key is deduplicated against it: admitted exactly once.
+/// Before, the admission held the gate and the driver until the store
+/// answered.
+#[tokio::test]
+async fn an_admission_the_store_never_answers_refuses_typed_at_the_deadline_and_lands_once() {
+    let store = declaring_store();
+    let machine = machine_over(&store, HUNG_BUSY_WINDOW);
+    let session_id = register_session(&machine).await;
+    let input = keyed_prompt(HELD_ADMISSION_TEXT, HELD_ADMISSION_KEY);
+    let input_id = input.id().clone();
+    let hold = admission_past_its_deadline(&machine, &store, &session_id, input).await;
+
+    let later = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.accept_input_with_completion(&session_id, prompt("a later input")),
+    )
+    .await
+    .expect("a later admission's wait for the gate ends");
+    match later {
+        Ok((outcome, _)) => {
+            panic!("a later admission passed the degraded gate: {outcome:?}")
+        }
+        Err(error) => assert!(
+            matches!(error, RuntimeDriverError::RecoveryRepairBlocked { .. }),
+            "the later gate wait ends typed: {error:?}"
+        ),
+    }
+    let witness = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("exact registration");
+    let refused = tokio::time::timeout(
+        TYPED_END_BOUND,
+        machine.recover_or_discard_reload_required_registration_if_current(&witness),
+    )
+    .await
+    .expect("the reload answers while the store has not");
+    assert!(
+        refused_until_the_store_answers(&refused),
+        "the reload refuses typed and retryable: {refused:?}"
+    );
+
+    hold.release(HeldStoreCommitRelease::Commit);
+    eventually("the late admission write hands the gate back", || {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move { !gate_is_held(&machine, &session_id).await }
+    })
+    .await;
+    let disposition = tokio::time::timeout(
+        Duration::from_secs(30),
+        machine.recover_or_discard_reload_required_registration_if_current(&witness),
+    )
+    .await
+    .expect("the reload ends")
+    .expect("the reload runs once the store has answered");
+    assert_eq!(
+        disposition,
+        ReloadRequiredRegistrationDisposition::Discarded
+    );
+    assert!(
+        machine.is_durability_ready(&session_id).await,
+        "the cold install is ready"
+    );
+    assert_eq!(
+        stored_rows(&store, &session_id, &input_id).await,
+        1,
+        "the late write admitted the input"
+    );
+    let (resubmitted, _) = tokio::time::timeout(
+        Duration::from_secs(30),
+        machine.accept_input_with_completion(
+            &session_id,
+            keyed_prompt(HELD_ADMISSION_TEXT, HELD_ADMISSION_KEY),
+        ),
+    )
+    .await
+    .expect("the resubmission ends")
+    .expect("the resubmission answers");
+    assert!(
+        matches!(
+            &resubmitted,
+            crate::accept::AcceptOutcome::Deduplicated { existing_id, .. }
+                if existing_id == &input_id
+        ),
+        "the resubmission is deduplicated against the late admission: {resubmitted:?}"
+    );
+}
+
+/// The store answers a past-deadline admission with an error. Once it has,
+/// the reload replaces the registration and the store holds no row for the
+/// input.
+#[tokio::test]
+async fn a_late_admission_failure_leaves_no_input_after_the_reload() {
+    let store = declaring_store();
+    let machine = machine_over(&store, HUNG_BUSY_WINDOW);
+    let session_id = register_session(&machine).await;
+    let input = prompt("an admission whose store write fails late");
+    let input_id = input.id().clone();
+    let hold = admission_past_its_deadline(&machine, &store, &session_id, input).await;
+    let witness = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("exact registration");
+
+    hold.release(HeldStoreCommitRelease::Fail);
+    eventually("the failed admission write hands the gate back", || {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move { !gate_is_held(&machine, &session_id).await }
+    })
+    .await;
+    let disposition = tokio::time::timeout(
+        Duration::from_secs(30),
+        machine.recover_or_discard_reload_required_registration_if_current(&witness),
+    )
+    .await
+    .expect("the reload ends")
+    .expect("the reload runs once the store has answered");
+    assert_eq!(
+        disposition,
+        ReloadRequiredRegistrationDisposition::Discarded
+    );
+    assert_eq!(
+        stored_rows(&store, &session_id, &input_id).await,
+        0,
+        "the failed write admitted nothing"
+    );
+}
+
+/// Control: an admission whose store write takes most of the default
+/// deadline is admitted, and its session stays ready.
+#[tokio::test]
+async fn a_slow_admission_under_the_deadline_is_admitted() {
+    let store = declaring_store();
+    let machine = machine_over(&store, SLOW_BUSY_WINDOW);
+    let session_id = register_session(&machine).await;
+    let input = prompt("a slow admission");
+    let input_id = input.id().clone();
+    // The deadline is two busy windows; the write takes 1.6 of them.
+    store.delay_next_admission_commit(&input_id, SLOW_BUSY_WINDOW.mul_f64(1.6));
+    let (outcome, _completion) = tokio::time::timeout(
+        Duration::from_secs(30),
+        machine.accept_input_with_completion(&session_id, input),
+    )
+    .await
+    .expect("the slow admission ends")
+    .expect("the slow admission is admitted");
+    assert!(
+        matches!(outcome, crate::accept::AcceptOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        machine.is_durability_ready(&session_id).await,
+        "an admission under the deadline does not degrade the session"
+    );
+    assert_eq!(stored_rows(&store, &session_id, &input_id).await, 1);
 }
