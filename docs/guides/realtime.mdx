@@ -1068,7 +1068,12 @@ Output without playback evidence remains explicitly unmeasured.
 Canonical context appends are claimed by generated authority. A concurrent
 drain of the same pending edge defers without reminting send authority; an
 already acknowledged edge is not resent. A provider turn that wins the
-boundary also produces a typed deferral, not a projection failure. Local
+boundary also produces a typed deferral, not a projection failure. Rows from
+the session's other activity, such as a typed message and its reply, reach
+the voice model's context only between provider turns: while the provider
+holds a turn open, including a user turn it has not finished, they wait in
+order and are appended once that turn ends, and they remain in the session
+transcript meanwhile. Local
 cursor/row bookkeeping is serialized only during projection and receipt
 realization, never while waiting for a provider acknowledgement.
 Enqueue acknowledges store-sealed canonical staging, not provider delivery.
