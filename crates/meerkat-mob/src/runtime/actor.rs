@@ -14432,7 +14432,40 @@ impl MobActor {
             }
             projected.push(entry);
         }
+        #[cfg(feature = "runtime-adapter")]
+        for entry in &mut projected {
+            if entry.error.is_none()
+                && let Some(reload) = self
+                    .member_registration_reload_required(entry.current_bridge_session_id.as_ref())
+                    .await
+            {
+                entry.error = Some(reload);
+            }
+        }
         projected
+    }
+
+    /// The status error of a member whose local runtime registration needs a
+    /// durability reload. Such a member is non-serving until its reload: it
+    /// starts no run, and requests to it are refused typed.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn member_registration_reload_required(
+        &self,
+        bridge_session_id: Option<&SessionId>,
+    ) -> Option<String> {
+        let (Some(adapter), Some(session_id)) = (self.runtime_adapter.as_ref(), bridge_session_id)
+        else {
+            return None;
+        };
+        adapter
+            .durability_reload_required(session_id)
+            .await
+            .map(|required| {
+                format!(
+                    "runtime registration requires a reload: durability reload required after `{}`: {}",
+                    required.operation, required.reason
+                )
+            })
     }
 
     fn mob_handle_for_tools(&self) -> MobHandle {
@@ -17737,7 +17770,7 @@ impl MobActor {
                     other => return Ok(outcome(other.disposition())),
                 };
                 set_stage("live_session_revival");
-                let revival = Self::request_member_live_revival(
+                let revival = match Self::request_member_live_revival(
                     command_tx,
                     &entry.agent_identity,
                     &bridge_session_id,
@@ -17746,7 +17779,21 @@ impl MobActor {
                         publication: prior_publication,
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(revival) => revival,
+                    // A reload while the mob is Stopped: the degraded
+                    // registration is discarded and the successor published,
+                    // held by the MobStop the Stop staged. Only its revival
+                    // waits for Running, and the Resume completes it: its
+                    // explicit resume preparation materializes the member
+                    // over the published successor.
+                    Err(MobError::InvalidTransition {
+                        from: MobState::Stopped,
+                        to: MobState::Running,
+                    }) => return Ok(outcome(super::handle::MemberReloadDisposition::Discarded)),
+                    Err(error) => return Err(error),
+                };
                 let publication = match revival {
                     MemberLiveRevivalOutcome::Materialized(Some(publication)) => publication,
                     MemberLiveRevivalOutcome::Materialized(None) => {
@@ -20584,6 +20631,32 @@ impl MobActor {
         }
     }
 
+    /// The first local member, in roster order, whose runtime registration
+    /// needs a durability reload, as the typed refusal a Resume answers.
+    #[cfg(feature = "runtime-adapter")]
+    async fn member_reload_required_before_resume(&self) -> Option<MobError> {
+        let adapter = self.runtime_adapter.as_ref()?;
+        let entries = {
+            let roster = self.roster.read().await;
+            roster.list().cloned().collect::<Vec<_>>()
+        };
+        for entry in entries {
+            let MemberRef::Session { session_id, .. } = &entry.member_ref else {
+                continue;
+            };
+            if let Some(required) = adapter.durability_reload_required(session_id).await {
+                return Some(MobError::MemberReloadRequired {
+                    member_id: entry.agent_identity.clone(),
+                    reason: format!(
+                        "durability reload required after `{}`: {}",
+                        required.operation, required.reason
+                    ),
+                });
+            }
+        }
+        None
+    }
+
     fn finish_explicit_resume_attempt(
         &mut self,
         result: Result<(), MobError>,
@@ -20626,6 +20699,18 @@ impl MobActor {
             MobState::Running,
             "resume_command_admission",
         ) {
+            let _ = reply_tx.send(Err(error));
+            return;
+        }
+        // A member whose runtime registration needs a durability reload
+        // cannot be resumed as it is: the attachment preparation, the
+        // readiness check and the operation-binding restore below all refuse
+        // its degraded registration. Refuse typed before anything moves,
+        // naming the member. Its reload is admitted while the mob is Stopped
+        // and publishes a successor the staged MobStop holds; the mob stays
+        // Stopped and held meanwhile.
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(error) = self.member_reload_required_before_resume().await {
             let _ = reply_tx.send(Err(error));
             return;
         }

@@ -803,6 +803,20 @@ impl MobActor {
                             .to_snapshot()
                             .with_preview_unavailable(preview_unavailable)
                     });
+                #[cfg(feature = "runtime-adapter")]
+                let result = match result {
+                    Ok(mut snapshot) => {
+                        if snapshot.error.is_none() {
+                            snapshot.error = self
+                                .member_registration_reload_required(
+                                    snapshot.current_bridge_session_id(),
+                                )
+                                .await;
+                        }
+                        Ok(snapshot)
+                    }
+                    Err(error) => Err(error),
+                };
                 self.settle_member_status_observation(&agent_identity, &waiters, result);
             }
             Ok(_) => self.drive_member_status_observation(agent_identity, waiters),

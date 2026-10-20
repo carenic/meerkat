@@ -879,7 +879,7 @@ async fn a_whole_shutdown_settles_a_member_degraded_while_idle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_whole_shutdown_settles_an_autonomous_member_degraded_by_a_failed_boundary_commit() {
     let mob = create_isolation_mob_with_definition(2, autonomous_isolation_definition()).await;
-    mob.degrade_member(0).await;
+    mob.degrade_autonomous_member(0).await;
     mob.store.fail_commit(mob.session(0), false);
     let report = whole_shutdown_settles_the_degraded_member(&mob).await;
     assert_eq!(
@@ -909,12 +909,12 @@ async fn a_whole_shutdown_settles_an_autonomous_member_degraded_while_idle() {
 
 /// Drive member 0 of `mob`, an AutonomousHost member, into the window
 /// between a stop's run-start hold and its cancel of the run the hold found
-/// current, and return what `stop` answered. The run is parked in its turn
-/// when the stop holds it. Before the cancel, the run's boundary commit takes
-/// the session's mutation gate and the store does not answer it; the cancel
-/// waits for the gate, and the registration degrades during that wait. The
-/// commit is released only once the cancel answered, so the cancel never
-/// finds the gate free.
+/// current, and return what `stop` answered. That run is the member's kickoff
+/// keep-alive turn, parked until released. Before the cancel, the turn is
+/// released and the run's boundary commit takes the session's mutation gate
+/// while the store holds it; the cancel waits for the gate, and the store then
+/// fails the commit, which degrades the registration during that wait. The
+/// failed commit's fence keeps the gate, so the cancel never finds it free.
 async fn degrade_between_hold_and_cancel<T>(
     mob: &IsolationMob,
     stop: impl std::future::Future<Output = T> + Send + 'static,
@@ -923,19 +923,9 @@ where
     T: Send + 'static,
 {
     let session_id = mob.session(0).clone();
-    let mut held_turns = mob.service.held_start_turn_entries();
-    let entered_before = *held_turns.borrow_and_update();
-    mob.service.hold_start_turns();
-    mob.send(0, "running when the stop holds its run starts")
+    tokio::time::timeout(STEP, mob.service.wait_keep_alive_turn_entered(&session_id))
         .await
-        .expect("the delivery to member 0 is admitted");
-    tokio::time::timeout(
-        STEP,
-        held_turns.wait_for(|entries| *entries > entered_before),
-    )
-    .await
-    .expect("member 0's run parks in its turn")
-    .expect("the turn hold counter stays open");
+        .expect("member 0's kickoff turn is current");
     let (cancel_reached, release_cancel, cancel_answered) =
         crate::runtime::provisioner::arm_stop_member_cancel_for_test(session_id.clone());
     let stopping = tokio::spawn(stop);
@@ -944,17 +934,18 @@ where
         .expect("the stop holds member 0 and reaches its cancel")
         .expect("the cancel hook stays armed");
 
-    // The run's boundary commit takes the session's mutation gate, and the
-    // store does not answer it yet.
+    // The run's boundary commit takes the session's mutation gate and waits
+    // in the store, which fails it once released.
     mob.store.park_commits(&session_id);
-    mob.service.release_held_start_turns();
+    mob.store.fail_commit(&session_id, true);
+    mob.service.release_keep_alive_turn(&session_id).await;
     wait_until("member 0's boundary commit to park", STEP, || async {
         mob.store.parked_commit_arrivals(&session_id) == 1
     })
     .await;
 
-    // The cancel waits for the gate behind the commit, and the registration
-    // degrades during that wait.
+    // The cancel waits for the gate behind the commit; the commit then fails,
+    // and the registration degrades during that wait.
     let parked = mob
         .adapter
         .arm_mutation_gate_wait_observer_for_test(session_id.clone());
@@ -965,16 +956,19 @@ where
         .await
         .expect("the cancel waits for the gate behind the commit")
         .expect("the wait observer stays armed until the wait");
-    assert!(
-        mob.adapter
-            .force_session_durability_reload_required_for_test(&session_id)
-            .await,
-        "member 0's registration degrades during the cancel's wait"
-    );
+    mob.store.release_commits();
     let _ = tokio::time::timeout(STEP, cancel_answered)
         .await
         .expect("the cancel answers once the registration degrades");
-    mob.store.release_commits();
+    assert!(
+        mob.adapter
+            .durability_reload_required(&session_id)
+            .await
+            .is_some(),
+        "the failed boundary commit degraded member 0's registration"
+    );
+    // The store recovers; the registration stays degraded until disposed.
+    mob.store.fail_commit(&session_id, false);
     tokio::time::timeout(STEP, stopping)
         .await
         .expect("the stop returns")

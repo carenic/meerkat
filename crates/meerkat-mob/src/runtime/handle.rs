@@ -14582,6 +14582,10 @@ impl MobHandle {
     /// re-attached (`Reattached`). `NotDegraded` is a success no-op and is
     /// reported only for a registration with a committed attachment. Placed
     /// members are reloaded by their member host and are rejected typed.
+    /// While the mob is Stopped the reload discards the degraded registration
+    /// and publishes its successor, which the Stop's staged `MobStop` holds,
+    /// and answers `Discarded`: the successor's revival waits for Running,
+    /// and the next Resume completes it.
     ///
     /// Reload shares the member's single-flight admission lane with delivery,
     /// while other members remain independent. Caller observation is bounded
