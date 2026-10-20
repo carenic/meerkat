@@ -1457,6 +1457,7 @@ rust_test(
         "src/comms_drain.rs",
         "src/handles/peer_comms.rs",
         "src/meerkat_machine/mod.rs",
+        "src/meerkat_machine/session_management.rs",
         "tests/fixtures/v0_8_10_recovery_migration_session.json",
     ],
     srcs = [
@@ -1475,7 +1476,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
     ],
     env = {
         "RUST_MIN_STACK": "8388608",

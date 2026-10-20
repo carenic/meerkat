@@ -98,6 +98,35 @@ fn assert_stale_fence(
     );
 }
 
+/// A scope from another incarnation of this mob (one destroyed and created
+/// again under its id) never reaches a step: the scoped retire refuses it
+/// with `IncarnationMismatch` and retires nothing. Control: the scope
+/// captured at this incarnation still retires its member.
+#[tokio::test]
+async fn a_scope_from_another_mob_incarnation_retires_nothing() {
+    let (handle, _service) = turn_driven_mob("k3-incarnation").await;
+    let (identity, _) = spawn_member(&handle, "k3-incarnation-member").await;
+    let scope = scope_of(&handle, &identity).await;
+    let mut foreign = serde_json::to_value(&scope).expect("the scope serializes");
+    foreign["mob_incarnation"] =
+        serde_json::Value::String(meerkat_core::service::MobIncarnationId::mint().to_string());
+    let foreign = MemberDeliveryScope::from_json_value(foreign).expect("the edited scope decodes");
+
+    let refused = retire_at_scope(&handle, &foreign)
+        .await
+        .expect_err("a scope from another mob incarnation is refused");
+    assert!(
+        matches!(refused, MobError::IncarnationMismatch { .. }),
+        "{refused:?}"
+    );
+    assert!(roster_has(&handle, &identity).await, "nothing was retired");
+
+    retire_at_scope(&handle, &scope)
+        .await
+        .expect("a scope from this incarnation retires its member");
+    assert!(!roster_has(&handle, &identity).await);
+}
+
 /// The scope captured before a respawn never retires the successor; the
 /// successor's own scope retires it; once no incarnation is current, both
 /// scopes answer `Ok(())` again (retry-safe after a lost reply).

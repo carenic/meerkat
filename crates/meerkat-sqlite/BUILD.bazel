@@ -413,7 +413,6 @@ rust_test(
     size = "medium",
     data = [
         ":package_runfiles",
-        "//:repo_governance_files",
     ],
     env = {
         "RUST_MIN_STACK": "8388608",
