@@ -278,17 +278,20 @@ them.
 ### Changed
 
 - `meerkat-mob`: a mob Shutdown or Stop of a local member whose runtime
-  registration is durability-degraded reports the member's run and run
-  starts as `ReloadRequired`, where it failed or waited on the degraded
-  registration. That registration starts no run until a reload replaces it;
-  a Shutdown's teardown discards it and unregisters the cold successor, and
-  the `MobStop` a Stop staged first holds the reloaded registration until
+  registration is durability-degraded reports the member's run and run starts
+  as `ReloadRequired`, where it failed or waited on the degraded registration.
+  An autonomous member whose registration degrades after the stop held its run
+  starts, so that the stop's cancel of its current run is refused, reports its
+  run `ReloadRequired` and its run starts `Held`: that cancel was not
+  dispatched. A degraded registration starts no run until a reload replaces
+  it; a Shutdown's teardown discards it and unregisters the cold successor,
+  and the `MobStop` a Stop staged first holds the reloaded registration until
   Resume. An autonomous member's stop skips its comms-drain abort and its run
   settlement for such a registration (the discard aborts and joins the drain
-  itself). Resume releases such a member. A Shutdown now holds every
-  member's run starts and reports the first failure in roster order instead
-  of stopping at it. On the wire, `stop_report` reports such a member with
-  `run` and `starts` `reload_required`.
+  itself). Resume releases such a member. A Shutdown now holds every member's
+  run starts and reports the first failure in roster order instead of stopping
+  at it. On the wire, `stop_report` reports such a member with `run` and
+  `starts` `reload_required`.
 
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
