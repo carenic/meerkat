@@ -1277,7 +1277,8 @@ them.
   with the realm blob store the converted runtimes hydrate from. Its two steps
   are public for a host that makes the blob store's writes durable between
   them: `stage_standalone_whole_blob_media` stores the images and writes
-  nothing to the database (it returns a `StandaloneWholeBlobMediaStage`), and
+  nothing to the database's sessions, bodies or authorities (it returns a
+  `StandaloneWholeBlobMediaStage`), and
   `convert_standalone_whole_blob_in_place_with_staged_media` converts with
   them.
 

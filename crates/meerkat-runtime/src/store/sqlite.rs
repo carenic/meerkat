@@ -11479,24 +11479,54 @@ ORDER BY runtime_id";
     /// ([`SqliteRuntimeStore::stage_standalone_whole_blob_media`]): every
     /// image the WholeBlob bodies it would seed hold inline, put into the
     /// realm blob store under its content address.
+    ///
+    /// Only the stage step fills one, so a conversion never takes an image
+    /// id the step did not store. The default stage is empty, and a
+    /// conversion given it refuses every body that holds inline images.
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     #[non_exhaustive]
     pub struct StandaloneWholeBlobMediaStage {
+        stored: std::collections::BTreeSet<meerkat_core::BlobId>,
+        runtimes: Vec<StandaloneWholeBlobMediaRuntime>,
+    }
+
+    impl StandaloneWholeBlobMediaStage {
         /// The content address of every image this stage stored.
-        pub stored: std::collections::BTreeSet<meerkat_core::BlobId>,
+        pub fn stored(&self) -> &std::collections::BTreeSet<meerkat_core::BlobId> {
+            &self.stored
+        }
+
         /// The runtimes whose bodies hold inline images, in the order the
         /// conversion takes them up.
-        pub runtimes: Vec<StandaloneWholeBlobMediaRuntime>,
+        pub fn runtimes(&self) -> &[StandaloneWholeBlobMediaRuntime] {
+            &self.runtimes
+        }
     }
 
     /// One runtime whose WholeBlob body holds inline images.
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[non_exhaustive]
     pub struct StandaloneWholeBlobMediaRuntime {
-        pub runtime_id: LogicalRuntimeId,
-        pub session_id: meerkat_core::types::SessionId,
+        runtime_id: LogicalRuntimeId,
+        session_id: meerkat_core::types::SessionId,
+        images: usize,
+    }
+
+    impl StandaloneWholeBlobMediaRuntime {
+        /// The runtime whose body holds the images.
+        pub fn runtime_id(&self) -> &LogicalRuntimeId {
+            &self.runtime_id
+        }
+
+        /// The session the runtime's body holds.
+        pub fn session_id(&self) -> &meerkat_core::types::SessionId {
+            &self.session_id
+        }
+
         /// Distinct images the body holds inline.
-        pub images: usize,
+        pub fn images(&self) -> usize {
+            self.images
+        }
     }
 
     /// SQLite-backed runtime store sharing the same sqlite file as `SqliteSessionStore`.
@@ -24024,10 +24054,10 @@ ORDER BY runtime_id";
                 .expect("the converted file reopens after the turn");
         }
 
-        /// The media stage writes nothing to the database: after it (a crash
-        /// before the conversion, say) the file is the WholeBlob database it
-        /// was, and staging and converting again finishes the conversion with
-        /// the same images.
+        /// The media stage writes nothing to the database's sessions, bodies
+        /// or authorities: after it (a crash before the conversion, say) the
+        /// file is the WholeBlob database it was, and staging and converting
+        /// again finishes the conversion with the same images.
         #[tokio::test]
         async fn a_conversion_stopped_after_its_media_stage_finishes_when_run_again() {
             let dir = TempDir::new().unwrap();
@@ -24041,9 +24071,9 @@ ORDER BY runtime_id";
                 .await
                 .expect("the images stage");
             let payloads = inline_image_payloads(&session);
-            assert_eq!(stage.stored.len(), payloads.len());
-            assert_eq!(stage.runtimes.len(), 1);
-            assert_eq!(stage.runtimes[0].images, payloads.len());
+            assert_eq!(stage.stored().len(), payloads.len());
+            assert_eq!(stage.runtimes().len(), 1);
+            assert_eq!(stage.runtimes()[0].images(), payloads.len());
             // The process stops here. The file is still the WholeBlob database.
             assert!(
                 session_store.load(session.id()).await.unwrap().is_none(),
