@@ -1945,6 +1945,16 @@ them.
   kickoff where that incarnation's spawn event sits; the incarnation's own
   kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
+### Known limitations
+
+- `meerkat-schedule`: a scheduled delivery whose executor crashes mid-delivery,
+  after the target admitted its input, is reclaimed only inside its misfire
+  window. Under the default `skip` policy (a 30 s grace) and the hosts' 60 s
+  claim lease the reclaim comes too late, so the occurrence is recorded
+  `misfired` although its admitted input ran; nothing runs twice. Use
+  `catch_up_within` with a window longer than the lease to keep crash
+  recovery.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking

@@ -407,7 +407,9 @@ Each dispatch also carries a stable occurrence-level delivery identity. If
 target admission succeeds but recording the receipt fails, recovery retries
 the same identity. Target hosts must reconcile or deduplicate that identity;
 the scheduler does not claim exactly-once behavior for arbitrary external
-effects.
+effects. A reclaim after a lapsed lease is still subject to the misfire
+policy: with `skip`, a lapse past the grace window ends `misfired`; keeping
+crash recovery needs `catch_up_within` with a window longer than the lease.
 
 Poisoned schedule and occurrence rows are isolated as typed per-row faults so
 healthy rows can continue. Hosts should surface the driver fault report rather
