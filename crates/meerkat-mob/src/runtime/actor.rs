@@ -14025,7 +14025,40 @@ impl MobActor {
             }
             projected.push(entry);
         }
+        #[cfg(feature = "runtime-adapter")]
+        for entry in &mut projected {
+            if entry.error.is_none()
+                && let Some(reload) = self
+                    .member_registration_reload_required(entry.current_bridge_session_id.as_ref())
+                    .await
+            {
+                entry.error = Some(reload);
+            }
+        }
         projected
+    }
+
+    /// The status error of a member whose local runtime registration needs a
+    /// durability reload. Such a member is non-serving until its reload: it
+    /// starts no run, and requests to it are refused typed.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) async fn member_registration_reload_required(
+        &self,
+        bridge_session_id: Option<&SessionId>,
+    ) -> Option<String> {
+        let (Some(adapter), Some(session_id)) = (self.runtime_adapter.as_ref(), bridge_session_id)
+        else {
+            return None;
+        };
+        adapter
+            .durability_reload_required(session_id)
+            .await
+            .map(|required| {
+                format!(
+                    "runtime registration requires a reload: durability reload required after `{}`: {}",
+                    required.operation, required.reason
+                )
+            })
     }
 
     fn mob_handle_for_tools(&self) -> MobHandle {

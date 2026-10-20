@@ -465,6 +465,17 @@ async fn a_resume_releases_a_member_still_degraded() {
             .is_some(),
         "the degraded registration stays until its reload"
     );
+    let status = tokio::time::timeout(STEP, mob.handle.member_status(mob.member(0)))
+        .await
+        .expect("the member status answers")
+        .expect("the member status reads");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires a reload")),
+        "the member's status names the reload it needs: {status:?}"
+    );
     let refused = tokio::time::timeout(STEP, mob.send(0, "sent to the degraded member"))
         .await
         .expect("the send answers");
