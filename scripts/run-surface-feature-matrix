@@ -15,11 +15,18 @@ run_cargo check --no-default-features \
   -p meerkat-rest \
   -p meerkat-mcp-server
 
+# meerkat-rpc has a dev-dependency on itself, so `meerkat-rpc/<feature>`
+# enables that dev-dependency's feature, which `check` never builds. Its row
+# names its own features bare. The shared row keeps the package prefix so
+# each feature applies only to the package that names it.
 run_cargo check --no-default-features \
   -p meerkat-rpc \
+  --features comms,mcp,workgraph
+
+run_cargo check --no-default-features \
   -p meerkat-rest \
   -p meerkat-mcp-server \
-  --features meerkat-rpc/comms,meerkat-rpc/mcp,meerkat-rpc/workgraph,meerkat-rest/comms,meerkat-rest/workgraph,meerkat-mcp-server/comms,meerkat-mcp-server/workgraph
+  --features meerkat-rest/comms,meerkat-rest/workgraph,meerkat-mcp-server/comms,meerkat-mcp-server/workgraph
 
 run_cargo check -p rkat --no-default-features --features session-store
 run_cargo check -p rkat --no-default-features --features session-store,mcp
