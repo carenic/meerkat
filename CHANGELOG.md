@@ -262,7 +262,9 @@ them.
   commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
   where they got `AuthorityUnavailable` with a message. In both cases the
   input stays durably admitted: read it after the reload instead of
-  resubmitting it. A reload refuses with the retryable
+  resubmitting it. The public error class is unchanged (authority
+  unavailable); the message names the case, so resubmit only with an
+  idempotency key. A reload refuses with the retryable
   `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
   replaces the registration from durable truth. A mob member's tracked turn
   stays pending on either failure, as on `AuthorityUnavailable`, and a
@@ -444,9 +446,32 @@ them.
   retirement of the member and a force cancel of it included. The commit's
   declared deadline now degrades the session (see Changed), those waits end
   typed, and a reload replaces the registration once the store has answered.
+- An input admission whose store write never answered kept the session's
+  mutation gate and driver until it did, so every later wait for the gate
+  waited for the store: the session's next admission, its next run and a
+  reload of it. The admission now waits for its write only as long as the
+  store's declared commit outcome deadline (120 s for the SQLite store).
+  Past it, the admission refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked`, naming the input, and the
+  session needs a reload (`runtime_admission_deadline`), so those waits end
+  typed. The write keeps running and keeps the gate until the store answers,
+  so the input may still be admitted: resubmit it with the same idempotency
+  key, or read it after the reload. A reload refuses with the same
+  retryable error until the store answers, then replaces the registration
+  from durable truth. Sessions without durable state, and stores that
+  declare no deadline (the in-memory store), admit as before.
 - A scheduled mob delivery whose redelivery found the delivery already failed
   (`meerkat-mob-mcp`) recorded the occurrence `completed`. It now records
   `delivery_failed` with the delivery's failure class.
+
+### Known limitations
+
+- A store that stops answering during registration, unregister or a control
+  write still holds the session's gate until it answers. So does one that
+  stops answering during the session's other writes under the gate that no
+  deadline covers: recovery, the runtime loop's writes other than a run's
+  boundary commit and terminalization (a run's staging, for example), and
+  the live-boundary work that follows an admission.
 
 ## [0.9.3] - 2026-10-18
 
