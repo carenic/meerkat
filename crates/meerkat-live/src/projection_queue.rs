@@ -154,11 +154,13 @@ fn observation_runs_under_boundary_hold(observation: &LiveAdapterObservation) ->
 /// it to its projection queue instead of applying it on its frame loop.
 ///
 /// Close observations (`Error`, a terminal status) are not rows: the
-/// transport drains the queue before it closes. Everything else (audio,
-/// status, scoped command rejections, raw receipts) writes no transcript row
-/// and is applied on the frame loop as before. A status can therefore be
-/// recorded before rows queued ahead of it; status is a channel fact, not a
-/// transcript row.
+/// transport drains the queue before it closes. A failed response
+/// (`TurnFailed`) is a row like a completed one: its projection discards what
+/// the response staged, so it must land after the response's rows that are
+/// still queued, never ahead of them. Everything else (audio, status, scoped
+/// command rejections, raw receipts) writes no transcript row and is applied
+/// on the frame loop as before. A status can therefore be recorded before
+/// rows queued ahead of it; status is a channel fact, not a transcript row.
 pub(crate) fn observation_writes_session(observation: &LiveAdapterObservation) -> bool {
     matches!(
         LiveAdapterHost::classify_observation(observation),
@@ -167,6 +169,7 @@ pub(crate) fn observation_writes_session(observation: &LiveAdapterObservation) -
             | ObservationRouting::AppendRealtimeTranscript
             | ObservationRouting::DispatchToolCall { .. }
             | ObservationRouting::SignalInterrupt
+            | ObservationRouting::SignalTurnFailed
     )
 }
 
@@ -536,6 +539,9 @@ pub(crate) mod test_support {
         applied_changed: tokio::sync::Notify,
         fail_row: StdMutex<Option<&'static str>>,
         refused: StdMutex<Vec<&'static str>>,
+        /// Assistant transcript deltas staged per response id, as the real
+        /// sinks stage and buffer them until the response completes or fails.
+        staged: StdMutex<std::collections::BTreeMap<String, usize>>,
     }
 
     struct TestBoundaryHold {
@@ -559,6 +565,36 @@ pub(crate) mod test_support {
 
         pub(crate) fn applied_rows(&self) -> Vec<&'static str> {
             self.applied().into_iter().map(|row| row.row).collect()
+        }
+
+        /// The assistant deltas still staged for `response_id`.
+        pub(crate) fn staged_for(&self, response_id: &str) -> usize {
+            self.staged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(response_id)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn stage(&self, response_id: Option<&str>) {
+            if let Some(response_id) = response_id {
+                *self
+                    .staged
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(response_id.to_string())
+                    .or_default() += 1;
+            }
+        }
+
+        fn drain_staged(&self, response_id: Option<&str>) {
+            if let Some(response_id) = response_id {
+                self.staged
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(response_id);
+            }
         }
 
         /// The writes the sink refused, in order.
@@ -678,9 +714,12 @@ pub(crate) mod test_support {
             &self,
             _session_id: &SessionId,
             delta: &str,
-            _identity: LiveTranscriptIdentity<'_>,
+            identity: LiveTranscriptIdentity<'_>,
         ) -> Result<(), LiveProjectionError> {
-            self.write("assistant_transcript_delta", delta, true).await
+            self.write("assistant_transcript_delta", delta, true)
+                .await?;
+            self.stage(identity.response_id);
+            Ok(())
         }
 
         async fn append_assistant_text_final(
@@ -798,7 +837,9 @@ pub(crate) mod test_support {
             response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
             self.write("turn_completed", response_id.unwrap_or_default(), false)
-                .await
+                .await?;
+            self.drain_staged(response_id);
+            Ok(())
         }
 
         async fn signal_turn_failed(
@@ -809,7 +850,9 @@ pub(crate) mod test_support {
             _accounting: meerkat_core::live_adapter::LiveResponseAccounting,
         ) -> Result<(), LiveProjectionError> {
             self.write("turn_failed", response_id.unwrap_or_default(), false)
-                .await
+                .await?;
+            self.drain_staged(response_id);
+            Ok(())
         }
 
         async fn signal_terminal_error(
@@ -902,6 +945,26 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn turn_failed(
+        response: &str,
+    ) -> meerkat_core::live_adapter::LiveAdapterObservation {
+        meerkat_core::live_adapter::LiveAdapterObservation::TurnFailed {
+            response_id: Some(response.to_string()),
+            failure: meerkat_core::live_adapter::LiveResponseFailure {
+                status: meerkat_core::live_adapter::LiveResponseFailureStatus::Failed,
+                reason: None,
+                code: Some("server_error".to_string()),
+                message: Some("provider failed".to_string()),
+            },
+            accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                    meerkat_core::Provider::Other,
+                    "projection-queue-test",
+                ),
+            },
+        }
+    }
+
     pub(crate) fn turn_interrupted(
         response: &str,
     ) -> meerkat_core::live_adapter::LiveAdapterObservation {
@@ -915,7 +978,8 @@ pub(crate) mod test_support {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::test_support::{
-        GatedRecordingSink, assistant_delta, assistant_final, turn_completed, user_final,
+        GatedRecordingSink, assistant_delta, assistant_final, turn_completed, turn_failed,
+        user_final,
     };
     use super::*;
     use meerkat_core::types::SessionId;
@@ -936,6 +1000,57 @@ mod tests {
             .unwrap();
         let queue = LiveProjectionQueue::spawn(Arc::clone(&host), channel_id.clone());
         (sink, host, channel_id, queue)
+    }
+
+    /// A response that fails while its rows are queued behind a member turn
+    /// leaves nothing staged once the queue drains. The failure is routed as
+    /// the transports route it: queued when `observation_writes_session`,
+    /// otherwise applied on the frame loop. More rows than one boundary hold
+    /// applies are queued, so a failure applied on the frame loop would get
+    /// the boundary between two holds, ahead of the response's last row, and
+    /// that row would stage again after the failure discarded the rest.
+    #[tokio::test]
+    async fn a_failed_response_behind_a_member_turn_leaves_nothing_staged() {
+        let (sink, host, channel_id, queue) = queue_with_gated_sink().await;
+        let member_turn = Arc::clone(&sink.gate).lock_owned().await;
+        let rows = BOUNDARY_HOLD_ROWS + 1;
+        for index in 0..rows {
+            queue
+                .enqueue(ProjectionRow::Observation(Box::new(assistant_delta(
+                    "item_failed",
+                    &format!("delta_{index}"),
+                    "x",
+                ))))
+                .unwrap();
+        }
+        // The projection task now waits for the boundary behind the member turn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let failed = turn_failed("resp_1");
+        let frame_loop = if observation_writes_session(&failed) {
+            queue
+                .enqueue(ProjectionRow::Observation(Box::new(failed)))
+                .unwrap();
+            None
+        } else {
+            let host = Arc::clone(&host);
+            let channel_id = channel_id.clone();
+            Some(tokio::spawn(async move {
+                host.apply_observation(&channel_id, &failed).await.unwrap();
+            }))
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(member_turn);
+        let applied = sink.wait_for_applied(rows + 1).await;
+        if let Some(frame_loop) = frame_loop {
+            frame_loop.await.unwrap();
+        }
+        assert_eq!(
+            sink.staged_for("resp_1"),
+            0,
+            "rows staged after the failure: {:?}",
+            sink.applied_rows()
+        );
+        assert_eq!(applied.last().map(|row| row.row), Some("turn_failed"));
     }
 
     /// Rows queued while a member turn holds the session's turn boundary land
