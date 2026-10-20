@@ -383,7 +383,7 @@ struct StdioChild {
     #[cfg(unix)]
     stdout_witness: Option<StdoutWitness>,
     /// Test hook: runs right before the close's final leader check.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     before_final_check: Option<Box<dyn FnOnce() + Send>>,
     /// Test hooks shared with the custody: the gate before the close's reap
     /// and the count of direct-child kills.
@@ -745,7 +745,7 @@ impl StdioChildCustody {
                 process_group,
                 #[cfg(unix)]
                 stdout_witness,
-                #[cfg(all(test, target_os = "linux"))]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 before_final_check: None,
                 #[cfg(all(test, unix))]
                 reap_gate: Arc::clone(&self.reap_gate),
@@ -1000,19 +1000,19 @@ impl StdioChildCustody {
     }
 
     /// Test hook: whether a close task owns the process.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn is_closing(&self) -> bool {
         matches!(*lock_slot(&self.slot), CustodySlot::Closing { .. })
     }
 
     /// Test hook: whether the process is still held, with no close started.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn is_held(&self) -> bool {
         matches!(*lock_slot(&self.slot), CustodySlot::Held(_))
     }
 
     /// Test hook: wait until a close task has finished (or was dropped).
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) async fn close_finished(&self) {
         let mut progress = self.close_progress.subscribe();
         while !matches!(
@@ -1025,7 +1025,7 @@ impl StdioChildCustody {
 
     /// Test hook: run `hook` right before the held process's close makes its
     /// final leader check.
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn before_final_check(&self, hook: impl FnOnce() + Send + 'static) {
         if let CustodySlot::Held(held) = &mut *lock_slot(&self.slot) {
             held.before_final_check = Some(Box::new(hook));
@@ -1223,7 +1223,7 @@ async fn close_held(
     }
     drop(witness_reader);
     if held.process_group.is_some() {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         if let Some(before_final_check) = held.before_final_check.take() {
             before_final_check();
         }
@@ -1419,8 +1419,9 @@ fn poll_leader_exit(leader: Option<u32>) -> Result<bool, Option<i32>> {
 /// Whether `leader` has exited, without reaping it, on macOS: the same
 /// non-blocking `waitid` with `WNOWAIT` through libc, since nix does not
 /// expose `waitid` on Apple targets. With `WNOHANG` and no change, `si_pid`
-/// stays zero. Darwin can also report a stopped child to `WEXITED`, so only
-/// an exit code counts as an exit.
+/// stays zero. Only an exit, a kill or a dump counts as an exit: XNU's
+/// `waitid` skips a stopped child without `WSTOPPED`, and the `si_code`
+/// check keeps it that way should that ever differ.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn poll_leader_exit(leader: Option<u32>) -> Result<bool, Option<i32>> {
@@ -1430,9 +1431,11 @@ fn poll_leader_exit(leader: Option<u32>) -> Result<bool, Option<i32>> {
     };
     let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
     loop {
-        // SAFETY: `info` is a zeroed `siginfo_t` owned by this frame, the one
-        // buffer `waitid` writes; nothing else is passed by pointer.
+        // SAFETY: `siginfo_t` is a plain C record of integers and raw
+        // pointers, for which all zero bytes are a valid value.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live `siginfo_t` owned by this frame and is the
+        // only buffer `waitid` writes; nothing else is passed by pointer.
         let rc = unsafe { libc::waitid(libc::P_PID, pid, &raw mut info, flags) };
         if rc == 0 {
             return Ok(info.si_pid != 0
@@ -6018,6 +6021,15 @@ pub mod tests {
         )) {
             assert_eq!(receipt.settled_in, Some(McpStdioClosePhase::Eof));
             assert_eq!(receipt.sigterm, None);
+            // The exit was seen without reaping: the close's own reap took it.
+            assert_eq!(
+                receipt.leader_exit,
+                McpStdioLeaderExitObservation::Exited(McpStdioClosePhase::Eof)
+            );
+            assert!(
+                matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),
+                "{receipt:?}"
+            );
         } else {
             assert_eq!(receipt.settled_in, None);
             assert_eq!(
