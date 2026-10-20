@@ -424,14 +424,13 @@ async fn a_stop_reports_a_degraded_member_reload_required_and_holds_its_reload()
     .await;
 }
 
-/// A Resume refuses typed while a member's registration still needs a
-/// durability reload, naming the member: its attachment preparation, its
-/// readiness check and its operation-binding restore would all refuse the
-/// degraded registration. Nothing moves: the mob stays Stopped and the
-/// member held. The member's reload, admitted while Stopped, publishes a
-/// successor the staged `MobStop` holds, and the Resume then releases it.
+/// Resume releases a member whose registration is still durability-degraded,
+/// as it is. Resume leaves the degraded registration to its reload: the
+/// member stays non-serving, and a request to it is refused typed
+/// (`MemberReloadRequired`) instead of waiting. The reload after Resume
+/// registers unheld, because Resume left no staged `MobStop`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
+async fn a_resume_releases_a_member_still_degraded() {
     let mob = persistent_single_member_mob("resume-degraded").await;
     assert!(
         mob.adapter
@@ -451,57 +450,37 @@ async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
         Some(MemberRunStarts::ReloadRequired),
         "{report:?}"
     );
-
-    let refused = tokio::time::timeout(STEP, mob.handle.resume())
+    tokio::time::timeout(STEP, mob.handle.resume())
         .await
         .expect("the resume answers")
-        .expect_err("a member that needs a reload blocks the resume");
-    let refused = match &refused {
-        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
-        other => other,
-    };
-    assert!(
-        matches!(
-            refused,
-            MobError::MemberReloadRequired { member_id, .. } if member_id == mob.member(0)
-        ),
-        "the resume names the member to reload: {refused:?}"
-    );
-    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Stopped);
+        .expect("the resume releases the degraded member");
+    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
+
+    // Resume left the degraded registration to its reload, and a request to
+    // the member is refused typed instead of waiting.
     assert!(
         mob.adapter
             .durability_reload_required(mob.session(0))
             .await
             .is_some(),
-        "the refused resume leaves the degraded registration to its reload"
+        "the degraded registration stays until its reload"
     );
-
-    // The reload while Stopped publishes a successor that applies the staged
-    // MobStop; its revival waits for Running.
-    let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
+    let refused = tokio::time::timeout(STEP, mob.send(0, "sent to the degraded member"))
         .await
-        .expect("the reload answers");
+        .expect("the send answers");
     assert!(
         matches!(
-            reload,
-            Err(MobError::InvalidTransition {
-                from: MobState::Stopped,
-                to: MobState::Running,
-            })
+            &refused,
+            Err(MobError::MemberReloadRequired { member_id, .. }) if member_id == mob.member(0)
         ),
-        "the reload's revival waits for Running: {reload:?}"
-    );
-    assert_eq!(
-        mob.adapter.run_starts_held_for_test(mob.session(0)).await,
-        Some(true),
-        "the reloaded registration stays held while Stopped"
+        "a request to the degraded member is refused typed: {refused:?}"
     );
 
-    tokio::time::timeout(STEP, mob.handle.resume())
+    // The reload's successor registers unheld: Resume left no staged MobStop.
+    tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
         .await
-        .expect("the resume answers")
-        .expect("the resume releases the reloaded member");
-    assert_eq!(mob.handle.status().await.expect("phase"), MobState::Running);
+        .expect("the reload answers")
+        .expect("the reload succeeds while the mob is Running");
     assert_eq!(
         mob.adapter.run_starts_held_for_test(mob.session(0)).await,
         Some(false),

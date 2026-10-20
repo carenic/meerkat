@@ -19876,13 +19876,27 @@ impl MobActor {
                                 .await
                         }
                         _ => {
-                            context
+                            match context
                                 .provisioner
                                 .ensure_runtime_session_state(&member_ref)
-                                .await?;
-                            context
-                                .ensure_mob_comms_drain(&agent_identity, &member_ref)
                                 .await
+                            {
+                                // A registration that needs a durability
+                                // reload has nothing to make ready: it starts
+                                // no run and admits no input until its reload
+                                // replaces it. Resume releases the member as
+                                // it is, and the reload readies it.
+                                Err(MobError::MemberRuntimeDetached {
+                                    detachment: crate::MemberRuntimeDetachment::ReloadRequired,
+                                    ..
+                                }) => Ok(()),
+                                result => {
+                                    result?;
+                                    context
+                                        .ensure_mob_comms_drain(&agent_identity, &member_ref)
+                                        .await
+                                }
+                            }
                         }
                     }
                 };
@@ -20122,32 +20136,6 @@ impl MobActor {
         }
     }
 
-    /// The first local member, in roster order, whose runtime registration
-    /// needs a durability reload, as the typed refusal a Resume answers.
-    #[cfg(feature = "runtime-adapter")]
-    async fn member_reload_required_before_resume(&self) -> Option<MobError> {
-        let adapter = self.runtime_adapter.as_ref()?;
-        let entries = {
-            let roster = self.roster.read().await;
-            roster.list().cloned().collect::<Vec<_>>()
-        };
-        for entry in entries {
-            let MemberRef::Session { session_id, .. } = &entry.member_ref else {
-                continue;
-            };
-            if let Some(required) = adapter.durability_reload_required(session_id).await {
-                return Some(MobError::MemberReloadRequired {
-                    member_id: entry.agent_identity.clone(),
-                    reason: format!(
-                        "durability reload required after `{}`: {}",
-                        required.operation, required.reason
-                    ),
-                });
-            }
-        }
-        None
-    }
-
     fn finish_explicit_resume_attempt(
         &mut self,
         result: Result<(), MobError>,
@@ -20190,18 +20178,6 @@ impl MobActor {
             MobState::Running,
             "resume_command_admission",
         ) {
-            let _ = reply_tx.send(Err(error));
-            return;
-        }
-        // A member whose runtime registration needs a durability reload
-        // cannot be resumed as it is: the attachment preparation, the
-        // readiness check and the operation-binding restore below all refuse
-        // its degraded registration. Refuse typed before anything moves,
-        // naming the member. Its reload is admitted while the mob is Stopped
-        // and publishes a successor the staged MobStop holds; the mob stays
-        // Stopped and held meanwhile.
-        #[cfg(feature = "runtime-adapter")]
-        if let Some(error) = self.member_reload_required_before_resume().await {
             let _ = reply_tx.send(Err(error));
             return;
         }
@@ -29910,6 +29886,19 @@ impl MobActor {
                 .archive_runtime_residue_present(&generated_owner_session_id)
                 .await
                 .map_err(|error| MobError::Internal(error.to_string()))?
+        {
+            return Ok(());
+        }
+        // A local member whose registration needs a durability reload keeps
+        // its bound operation identity for the cold successor its reload
+        // publishes; preparing bindings on the degraded registration would
+        // only refuse. Resume releases the member as it is.
+        if local_member_owner
+            && io
+                .adapter
+                .durability_reload_required(&generated_owner_session_id)
+                .await
+                .is_some()
         {
             return Ok(());
         }
