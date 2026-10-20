@@ -1164,7 +1164,8 @@ pub use store::{
 };
 #[cfg(feature = "sqlite-store")]
 pub use store::{
-    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobRuntimeConversion,
+    SqliteRuntimeStore, StandaloneWholeBlobConversionReport, StandaloneWholeBlobMediaRuntime,
+    StandaloneWholeBlobMediaStage, StandaloneWholeBlobRuntimeConversion,
     StandaloneWholeBlobSessionSource,
 };
 pub use traits::{

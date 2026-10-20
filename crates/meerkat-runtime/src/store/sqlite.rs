@@ -7061,6 +7061,7 @@ ORDER BY runtime_id";
         conn: &mut Connection,
         runtime_id: &LogicalRuntimeId,
         source: HeadCanonicalActivationSource,
+        media: Option<&StandaloneWholeBlobMediaStage>,
     ) -> Result<HeadCanonicalActivationOutcome, RuntimeStoreError> {
         let session_label = runtime_id
             .session_id()
@@ -7202,7 +7203,7 @@ ORDER BY runtime_id";
 
             heartbeat.set_phase(runtime_id, &expected_session_id, 1, None);
             let tx = begin_runtime_transaction(conn)?;
-            let current_source =
+            let mut current_source =
                 load_store_owned_head_canonical_activation_source_in_txn(&tx, runtime_id)?;
             observed_session_id = Some(current_source.session_id.to_string());
             observed_source_message_count = Some(current_source.message_count);
@@ -7249,6 +7250,15 @@ ORDER BY runtime_id";
                     // activations do not own.
                     (None, HeadCanonicalActivationSource::StandaloneWholeBlob) => {
                         refuse_seeding_beside_foreign_sessions_in_txn(&tx, runtime_id)?;
+                        // A media stage moved this body's inline images into
+                        // the realm blob store first; the seeded rows and the
+                        // derived boundary carry them as blob references. The
+                        // WholeBlob body itself is not rewritten.
+                        current_source.session = session_with_staged_media(
+                            runtime_id,
+                            current_source.session.clone(),
+                            media,
+                        )?;
                         let (head, token) =
                             meerkat_store::sqlite_store::seed_head_canonical_for_runtime_in_txn(
                                 &tx,
@@ -7482,6 +7492,103 @@ ORDER BY runtime_id";
         Ok(candidates)
     }
 
+    /// The inline images of `session`'s WholeBlob body moved out as blob
+    /// references, or `None` when it holds none. A body the transform cannot
+    /// externalize refuses typed, and nothing is discarded.
+    fn externalize_inline_images(
+        runtime_id: &LogicalRuntimeId,
+        session: &meerkat_core::Session,
+    ) -> Result<Option<meerkat_core::InlineImageExternalization>, RuntimeStoreError> {
+        session.with_inline_images_externalized().map_err(|error| {
+            RuntimeStoreError::Unsupported(format!(
+                "the inline images of runtime {}'s WholeBlob body cannot be externalized: {error}",
+                runtime_id_text(runtime_id)
+            ))
+        })
+    }
+
+    /// The session a standalone conversion seeds from `session`. With a
+    /// media stage, the body's inline images become blob references, and the
+    /// runtime refuses typed unless the stage stored every one of them: a body
+    /// that changed after its images were stored is not converted.
+    fn session_with_staged_media(
+        runtime_id: &LogicalRuntimeId,
+        session: meerkat_core::Session,
+        media: Option<&StandaloneWholeBlobMediaStage>,
+    ) -> Result<meerkat_core::Session, RuntimeStoreError> {
+        let Some(media) = media else {
+            return Ok(session);
+        };
+        let Some(externalized) = externalize_inline_images(runtime_id, &session)? else {
+            return Ok(session);
+        };
+        if let Some(unstored) = externalized
+            .payloads
+            .iter()
+            .find(|payload| !media.stored.contains(&payload.blob_id))
+        {
+            return Err(session_authority_conflict(
+                runtime_id,
+                format!(
+                    "the WholeBlob body holds inline image {} that the media stage did not store; stage the media again",
+                    unstored.blob_id.as_str()
+                ),
+            ));
+        }
+        Ok(externalized.session)
+    }
+
+    /// One runtime's inline images, read for a media stage.
+    struct PendingStandaloneMedia {
+        runtime_id: LogicalRuntimeId,
+        session_id: meerkat_core::types::SessionId,
+        payloads: Vec<meerkat_core::InlineImagePayload>,
+    }
+
+    /// The inline images of every WholeBlob body a standalone conversion
+    /// would seed, read over one snapshot that is rolled back, with the
+    /// order and skip rules of [`check_standalone_whole_blob_conversion`]: a
+    /// runtime already converted, or whose session the co-located store
+    /// holds, has nothing to stage.
+    fn collect_standalone_whole_blob_media(
+        conn: &mut Connection,
+    ) -> Result<Vec<PendingStandaloneMedia>, RuntimeStoreError> {
+        let order = head_canonical_activation_order(
+            conn,
+            HeadCanonicalActivationSource::StandaloneWholeBlob,
+        )?;
+        // Rolled back when it drops: this reads one snapshot and writes
+        // nothing.
+        let tx = begin_runtime_transaction(conn)?;
+        let held = meerkat_store::sqlite_store::held_session_ids_in_txn(&tx)
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        let mut pending = Vec::new();
+        for runtime_id in &order {
+            let authority = load_head_canonical_authority(&tx, runtime_id)?;
+            match (
+                authority.as_ref(),
+                load_head_canonical_activation_marker(&tx, runtime_id)?.map(|marker| marker.state),
+            ) {
+                // Converted, or refused typed by the conversion itself.
+                (Some(_), None | Some(HeadCanonicalActivationState::Complete))
+                | (None, Some(HeadCanonicalActivationState::Complete)) => continue,
+                (Some(_), Some(HeadCanonicalActivationState::InProgress)) | (None, _) => {}
+            }
+            let source = load_store_owned_head_canonical_activation_source_in_txn(&tx, runtime_id)?;
+            if held.contains(&source.session_id) {
+                continue;
+            }
+            if let Some(externalized) = externalize_inline_images(runtime_id, &source.session)? {
+                pending.push(PendingStandaloneMedia {
+                    runtime_id: runtime_id.clone(),
+                    session_id: source.session_id,
+                    payloads: externalized.payloads,
+                });
+            }
+        }
+        Ok(pending)
+    }
+
     /// The standalone conversion's read-only check, before it pins the
     /// file. In the order the conversion takes them up, every runtime it
     /// would activate has a WholeBlob body that is present, matches its
@@ -7493,6 +7600,7 @@ ORDER BY runtime_id";
     /// transactions repeat every check and stay authoritative.
     fn check_standalone_whole_blob_conversion(
         conn: &mut Connection,
+        media: Option<&StandaloneWholeBlobMediaStage>,
     ) -> Result<(), RuntimeStoreError> {
         let order = head_canonical_activation_order(
             conn,
@@ -7525,7 +7633,8 @@ ORDER BY runtime_id";
                 continue;
             }
             refuse_seeding_beside_foreign_sessions(runtime_id, &held, &completed)?;
-            meerkat_store::sqlite_store::check_runtime_seed_layout(&source.session)
+            let session = session_with_staged_media(runtime_id, source.session, media)?;
+            meerkat_store::sqlite_store::check_runtime_seed_layout(&session)
                 .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
         }
         Ok(())
@@ -7534,6 +7643,7 @@ ORDER BY runtime_id";
     fn activate_head_canonical_profiles(
         conn: &mut Connection,
         source: HeadCanonicalActivationSource,
+        media: Option<&StandaloneWholeBlobMediaStage>,
     ) -> Result<Vec<HeadCanonicalActivationOutcome>, RuntimeStoreError> {
         let candidates = head_canonical_activation_order(conn, source)?;
         let mut outcomes = Vec::new();
@@ -7586,6 +7696,7 @@ ORDER BY runtime_id";
                         conn,
                         &runtime_id,
                         source,
+                        media,
                     )?);
                 }
             }
@@ -11216,6 +11327,30 @@ ORDER BY runtime_id";
         CoLocatedSessionStore,
     }
 
+    /// The inline images a standalone conversion stored before it converts
+    /// ([`SqliteRuntimeStore::stage_standalone_whole_blob_media`]): every
+    /// image the WholeBlob bodies it would seed hold inline, put into the
+    /// realm blob store under its content address.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct StandaloneWholeBlobMediaStage {
+        /// The content address of every image this stage stored.
+        pub stored: std::collections::BTreeSet<meerkat_core::BlobId>,
+        /// The runtimes whose bodies hold inline images, in the order the
+        /// conversion takes them up.
+        pub runtimes: Vec<StandaloneWholeBlobMediaRuntime>,
+    }
+
+    /// One runtime whose WholeBlob body holds inline images.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct StandaloneWholeBlobMediaRuntime {
+        pub runtime_id: LogicalRuntimeId,
+        pub session_id: meerkat_core::types::SessionId,
+        /// Distinct images the body holds inline.
+        pub images: usize,
+    }
+
     /// SQLite-backed runtime store sharing the same sqlite file as `SqliteSessionStore`.
     pub struct SqliteRuntimeStore {
         path: PathBuf,
@@ -11504,6 +11639,7 @@ ORDER BY runtime_id";
             activate_head_canonical_profiles(
                 &mut conn,
                 HeadCanonicalActivationSource::CoTenantSession,
+                None,
             )?;
             repair_flat_physical_head_boundaries(&mut conn)?;
             drop(conn);
@@ -11588,6 +11724,47 @@ ORDER BY runtime_id";
         pub fn convert_standalone_whole_blob_in_place(
             path: impl Into<PathBuf>,
         ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
+            Self::convert_standalone_whole_blob(path.into(), None)
+        }
+
+        /// [`Self::convert_standalone_whole_blob_in_place`] for databases
+        /// whose WholeBlob bodies hold images inline (a 0.9.3 session that
+        /// compacted with images in its transcript): it stages the images
+        /// into `blob_store`, the realm blob store the converted runtimes
+        /// hydrate from, and then converts with them
+        /// ([`Self::stage_standalone_whole_blob_media`], then
+        /// [`Self::convert_standalone_whole_blob_in_place_with_staged_media`]).
+        /// A host that must make the store's writes durable itself (a sync
+        /// of the blob directory, say) calls the two steps with that in
+        /// between.
+        pub async fn convert_standalone_whole_blob_in_place_with_media(
+            path: impl Into<PathBuf>,
+            blob_store: &dyn meerkat_core::BlobStore,
+        ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
+            let path = path.into();
+            let stage = Self::stage_standalone_whole_blob_media(path.clone(), blob_store).await?;
+            Self::convert_standalone_whole_blob_in_place_with_staged_media(path, &stage)
+        }
+
+        /// The first step of
+        /// [`Self::convert_standalone_whole_blob_in_place_with_media`]: put
+        /// every image the WholeBlob bodies the conversion would seed hold
+        /// inline into `blob_store`, under its content address.
+        ///
+        /// It writes nothing to the database's sessions, bodies or
+        /// authorities (its open applies the runtime store's schema
+        /// migrations, as the conversion's own open does), so a crash here
+        /// or after it leaves the file as it was, and running it again puts
+        /// the same images again. A store that answers any address other
+        /// than the image's content address refuses typed. A runtime the
+        /// conversion already converted, or whose session the co-located
+        /// store holds, stages nothing; on a converted database this puts
+        /// nothing. The images must be durable in `blob_store` before the
+        /// conversion step commits: the converted rows reference them.
+        pub async fn stage_standalone_whole_blob_media(
+            path: impl Into<PathBuf>,
+            blob_store: &dyn meerkat_core::BlobStore,
+        ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
             let path = path.into();
             validate_runtime_database_file(&path)?;
             if !path.is_file() {
@@ -11597,12 +11774,83 @@ ORDER BY runtime_id";
                 )));
             }
             Self::require_co_located_session_schema_read_only(&path)?;
+            // Read every payload, and close the database, before the first
+            // store write.
+            let pending = {
+                let mut conn = open_head_canonical_runtime_connection(&path)?;
+                collect_standalone_whole_blob_media(&mut conn)?
+            };
+            let mut stage = StandaloneWholeBlobMediaStage::default();
+            for runtime in pending {
+                for payload in &runtime.payloads {
+                    let stored = blob_store
+                        .put_image(&payload.media_type, &payload.data)
+                        .await
+                        .map_err(|error| {
+                            RuntimeStoreError::WriteFailed(format!(
+                                "storing inline image {} of runtime {} failed: {error}",
+                                payload.blob_id.as_str(),
+                                runtime_id_text(&runtime.runtime_id)
+                            ))
+                        })?;
+                    if stored.blob_id != payload.blob_id {
+                        return Err(RuntimeStoreError::Unsupported(format!(
+                            "the blob store addressed inline image {} of runtime {} as {}; a conversion needs the image's content address",
+                            payload.blob_id.as_str(),
+                            runtime_id_text(&runtime.runtime_id),
+                            stored.blob_id.as_str()
+                        )));
+                    }
+                    stage.stored.insert(payload.blob_id.clone());
+                }
+                stage.runtimes.push(StandaloneWholeBlobMediaRuntime {
+                    runtime_id: runtime.runtime_id,
+                    session_id: runtime.session_id,
+                    images: runtime.payloads.len(),
+                });
+            }
+            Ok(stage)
+        }
+
+        /// The second step of
+        /// [`Self::convert_standalone_whole_blob_in_place_with_media`]: the
+        /// conversion of [`Self::convert_standalone_whole_blob_in_place`],
+        /// where each WholeBlob body it seeds has its inline images moved out
+        /// as blob references to the images `stage` stored.
+        ///
+        /// Every conversion transaction re-reads its body and moves its
+        /// images out again; a body that holds an image `stage` did not store
+        /// (it changed after the stage) refuses that runtime typed and
+        /// converts nothing for it. The WholeBlob body stays as it was, with
+        /// its inline images, beside the converted rows. A crash part way
+        /// leaves every runtime either converted or untouched, and calling
+        /// the two steps again finishes the rest.
+        pub fn convert_standalone_whole_blob_in_place_with_staged_media(
+            path: impl Into<PathBuf>,
+            stage: &StandaloneWholeBlobMediaStage,
+        ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
+            Self::convert_standalone_whole_blob(path.into(), Some(stage))
+        }
+
+        fn convert_standalone_whole_blob(
+            path: PathBuf,
+            media: Option<&StandaloneWholeBlobMediaStage>,
+        ) -> Result<StandaloneWholeBlobConversionReport, RuntimeStoreError> {
+            validate_runtime_database_file(&path)?;
+            if !path.is_file() {
+                return Err(RuntimeStoreError::NotFound(format!(
+                    "no runtime database to convert at {}",
+                    path.display()
+                )));
+            }
+            Self::require_co_located_session_schema_read_only(&path)?;
             let mut conn = open_head_canonical_runtime_connection(&path)?;
-            check_standalone_whole_blob_conversion(&mut conn)?;
+            check_standalone_whole_blob_conversion(&mut conn, media)?;
             pin_head_canonical_profile(&mut conn)?;
             let converted = activate_head_canonical_profiles(
                 &mut conn,
                 HeadCanonicalActivationSource::StandaloneWholeBlob,
+                media,
             )?
             .into_iter()
             .map(|outcome| StandaloneWholeBlobRuntimeConversion {
@@ -21423,7 +21671,8 @@ ORDER BY runtime_id";
             assert!(matches!(
                 activate_head_canonical_profiles(
                     &mut conn,
-                    HeadCanonicalActivationSource::CoTenantSession
+                    HeadCanonicalActivationSource::CoTenantSession,
+                    None,
                 ),
                 Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { detail, .. })
                     if detail.contains("has no exact message-row prefix authority")
@@ -21554,6 +21803,7 @@ ORDER BY runtime_id";
             activate_head_canonical_profiles(
                 &mut conn,
                 HeadCanonicalActivationSource::CoTenantSession,
+                None,
             )
             .unwrap();
         }
@@ -22890,6 +23140,7 @@ ORDER BY runtime_id";
                 match activate_head_canonical_profiles(
                     &mut conn,
                     HeadCanonicalActivationSource::StandaloneWholeBlob,
+                    None,
                 ) {
                     Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
                         runtime_id,
@@ -23039,6 +23290,67 @@ ORDER BY runtime_id";
             }
         }
 
+        fn inline_mp4_block(data: &str) -> meerkat_core::types::ContentBlock {
+            meerkat_core::types::ContentBlock::Video {
+                media_type: "video/mp4".into(),
+                duration_ms: 1_000,
+                data: meerkat_core::types::VideoData::Inline { data: data.into() },
+            }
+        }
+
+        fn inline_mp4(data: &str) -> Message {
+            Message::User(UserMessage::with_blocks(vec![inline_mp4_block(data)]))
+        }
+
+        /// A blob store that counts the images it is asked to keep.
+        struct CountingBlobStore {
+            inner: meerkat_store::MemoryBlobStore,
+            puts: std::sync::atomic::AtomicUsize,
+        }
+
+        impl CountingBlobStore {
+            fn new() -> Self {
+                Self {
+                    inner: meerkat_store::MemoryBlobStore::new(),
+                    puts: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn puts(&self) -> usize {
+                self.puts.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl meerkat_core::BlobStore for CountingBlobStore {
+            async fn put_image(
+                &self,
+                media_type: &str,
+                data: &str,
+            ) -> Result<meerkat_core::BlobRef, meerkat_core::BlobStoreError> {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                self.inner.put_image(media_type, data).await
+            }
+
+            async fn get(
+                &self,
+                blob_id: &meerkat_core::BlobId,
+            ) -> Result<meerkat_core::BlobPayload, meerkat_core::BlobStoreError> {
+                self.inner.get(blob_id).await
+            }
+
+            async fn delete(
+                &self,
+                blob_id: &meerkat_core::BlobId,
+            ) -> Result<(), meerkat_core::BlobStoreError> {
+                self.inner.delete(blob_id).await
+            }
+
+            fn is_persistent(&self) -> bool {
+                true
+            }
+        }
+
         fn inline_png(data: &str) -> meerkat_core::types::ContentBlock {
             meerkat_core::types::ContentBlock::Image {
                 media_type: "image/png".into(),
@@ -23055,16 +23367,567 @@ ORDER BY runtime_id";
             }
         }
 
-        fn inline_mp4_block(data: &str) -> meerkat_core::types::ContentBlock {
-            meerkat_core::types::ContentBlock::Video {
-                media_type: "video/mp4".into(),
-                duration_ms: 1_000,
-                data: meerkat_core::types::VideoData::Inline { data: data.into() },
+        /// The image blocks of `messages`, in transcript order.
+        fn image_blocks(messages: &[Message]) -> Vec<meerkat_core::types::ContentBlock> {
+            messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(user) => Some(user.content.iter()),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|block| matches!(block, meerkat_core::types::ContentBlock::Image { .. }))
+                .cloned()
+                .collect()
+        }
+
+        /// A compacted WholeBlob body whose transcript graph holds its images
+        /// inline, as the 0.9.3 gateway wrote them (in the anchor, in a
+        /// rewrite's replacement, in a later rewrite's parent advance and in
+        /// the live tail), converts once its images move into the realm blob
+        /// store. Every image of the converted session, live or historical,
+        /// is a blob that store holds with the original bytes; the transcript
+        /// revision and the rewrite commits are the body's; a second
+        /// conversion converts and puts nothing; and the converted runtime
+        /// commits a turn and reopens.
+        #[tokio::test]
+        async fn a_compacted_whole_blob_session_with_inline_images_converts_with_its_images_in_the_blob_store()
+         {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            // Base64 of five short distinct payloads.
+            let photos = ["UE5HIGE=", "UE5HIGI=", "UE5HIGM=", "UE5HIGQ=", "UE5HIGU="];
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::with_blocks(vec![
+                meerkat_core::types::ContentBlock::Text {
+                    text: "the first photo".into(),
+                },
+                inline_png(photos[0]),
+            ])));
+            session.push(Message::User(UserMessage::text("what is in it?")));
+            session.push(Message::User(UserMessage::with_blocks(vec![inline_png(
+                photos[1],
+            )])));
+            // The first compaction keeps a recent photo in its replacement.
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![
+                        Message::User(UserMessage::text("summary of the first photo")),
+                        Message::User(UserMessage::with_blocks(vec![inline_png(photos[2])])),
+                    ],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            // A photo sent between the compactions is the second one's parent
+            // advance.
+            session.push(Message::User(UserMessage::with_blocks(vec![inline_png(
+                photos[3],
+            )])));
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![Message::User(UserMessage::text("summary of both"))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            // A photo after the last compaction is in the live tail.
+            session.push(Message::User(UserMessage::with_blocks(vec![inline_png(
+                photos[4],
+            )])));
+            let runtime_id = LogicalRuntimeId::for_session(session.id());
+            let whole_blob = SqliteRuntimeStore::new_whole_blob(&path).unwrap();
+            whole_blob
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            drop(whole_blob);
+            let session_store = meta_093_co_located_session_store(&path);
+            let blobs = CountingBlobStore::new();
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a compacted body with inline images converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+            for data in photos {
+                let blob_id = meerkat_core::content_blob_id("image/png", data);
+                assert_eq!(
+                    meerkat_core::BlobStore::get(&blobs, &blob_id)
+                        .await
+                        .expect("the image is in the store")
+                        .data,
+                    data
+                );
+            }
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            let document = serde_json::to_string(&converted).unwrap();
+            for data in photos {
+                assert!(
+                    !document.contains(data),
+                    "the converted session still holds {data} inline"
+                );
+            }
+            assert_eq!(
+                image_blocks(converted.messages()),
+                [photos[1], photos[3], photos[4]].map(blob_png).to_vec()
+            );
+            assert_eq!(
+                converted.transcript_revision().unwrap(),
+                session.transcript_revision().unwrap()
+            );
+            let commits = |session: &Session| {
+                session
+                    .transcript_history_state()
+                    .unwrap()
+                    .expect("a compacted session has a graph")
+                    .commits()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let body_commits = commits(&session);
+            assert_eq!(commits(&converted), body_commits);
+            // The historical revisions materialize with their images as blobs.
+            for (revision, expected) in [
+                (&body_commits[0].parent_revision, vec![photos[0], photos[1]]),
+                (
+                    &body_commits[1].parent_revision,
+                    vec![photos[2], photos[1], photos[3]],
+                ),
+            ] {
+                let rows = converted
+                    .retained_transcript_revision_rows(revision)
+                    .unwrap()
+                    .expect("a retained revision");
+                assert_eq!(
+                    image_blocks(rows.messages()),
+                    expected.into_iter().map(blob_png).collect::<Vec<_>>(),
+                    "revision {revision}"
+                );
+            }
+
+            let puts = blobs.puts();
+            let rerun = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a converted file converts again");
+            assert_eq!((rerun.seeded_count(), rerun.derived_count()), (0, 0));
+            assert_eq!(blobs.puts(), puts, "a converted file puts nothing");
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            let observed_head = session_store
+                .load_head(session.id())
+                .await
+                .unwrap()
+                .expect("converted head");
+            let mut resumed = converted;
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the conversion",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on the converted runtime");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file reopens after the turn");
+            assert_eq!(
+                session_store
+                    .load(session.id())
+                    .await
+                    .unwrap()
+                    .expect("session after the turn")
+                    .messages(),
+                resumed.messages()
+            );
+        }
+
+        /// A blob store that answers every image with an address of its own.
+        struct MisaddressingBlobStore;
+
+        #[async_trait::async_trait]
+        impl meerkat_core::BlobStore for MisaddressingBlobStore {
+            async fn put_image(
+                &self,
+                media_type: &str,
+                data: &str,
+            ) -> Result<meerkat_core::BlobRef, meerkat_core::BlobStoreError> {
+                Ok(meerkat_core::BlobRef {
+                    blob_id: meerkat_core::content_blob_id(media_type, &format!("{data}-other")),
+                    media_type: media_type.to_string(),
+                })
+            }
+
+            async fn get(
+                &self,
+                blob_id: &meerkat_core::BlobId,
+            ) -> Result<meerkat_core::BlobPayload, meerkat_core::BlobStoreError> {
+                Err(meerkat_core::BlobStoreError::NotFound(blob_id.clone()))
+            }
+
+            async fn delete(
+                &self,
+                _blob_id: &meerkat_core::BlobId,
+            ) -> Result<(), meerkat_core::BlobStoreError> {
+                Ok(())
+            }
+
+            fn is_persistent(&self) -> bool {
+                true
             }
         }
 
-        fn inline_mp4(data: &str) -> Message {
-            Message::User(UserMessage::with_blocks(vec![inline_mp4_block(data)]))
+        /// A tool result carrying two inline images.
+        fn tool_result_images(first: &str, second: &str) -> Message {
+            Message::tool_results(vec![meerkat_core::types::ToolResult::with_blocks(
+                "call-image".to_string(),
+                vec![inline_png(first), inline_png(second)],
+                false,
+            )])
+        }
+
+        /// An inbound comms notice carrying an inline image.
+        fn comms_notice_image(data: &str) -> Message {
+            Message::SystemNotice(meerkat_core::types::SystemNoticeMessage::with_block(
+                meerkat_core::types::SystemNoticeKind::Comms,
+                None,
+                meerkat_core::types::SystemNoticeBlock::Comms {
+                    kind: meerkat_core::types::CommsNoticeKind::Message,
+                    direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                    peer: None,
+                    sender_taint: None,
+                    request_id: None,
+                    intent: None,
+                    status: None,
+                    summary: None,
+                    payload: None,
+                    content: vec![inline_png(data)],
+                    delivery_id: None,
+                    in_reply_to: None,
+                },
+            ))
+        }
+
+        /// Base64 of distinct short payloads, three per compaction round.
+        const ROUND_IMAGES: [&str; 21] = [
+            "UE5HIHIwYQ==",
+            "UE5HIHIwYg==",
+            "UE5HIHIwYw==",
+            "UE5HIHIxYQ==",
+            "UE5HIHIxYg==",
+            "UE5HIHIxYw==",
+            "UE5HIHIyYQ==",
+            "UE5HIHIyYg==",
+            "UE5HIHIyYw==",
+            "UE5HIHIzYQ==",
+            "UE5HIHIzYg==",
+            "UE5HIHIzYw==",
+            "UE5HIHI0YQ==",
+            "UE5HIHI0Yg==",
+            "UE5HIHI0Yw==",
+            "UE5HIHI1YQ==",
+            "UE5HIHI1Yg==",
+            "UE5HIHI1Yw==",
+            "UE5HIHI2YQ==",
+            "UE5HIHI2Yg==",
+            "UE5HIHI2Yw==",
+        ];
+
+        /// A session compacted seven times and retired to the default
+        /// retention (its graph re-anchors), whose every parent advance carries
+        /// a tool result with two inline images and an inbound comms notice
+        /// with one, as a 0.8.x-era host wrote them.
+        fn re_anchored_session_with_tool_result_and_notice_images() -> Session {
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("start")));
+            for round in ROUND_IMAGES.chunks(3) {
+                session.push(tool_result_images(round[0], round[1]));
+                session.push(comms_notice_image(round[2]));
+                let end = session.messages().len() - 1;
+                session
+                    .commit_transcript_rewrite(
+                        TranscriptRewriteSelection::MessageRange { start: 0, end },
+                        vec![Message::User(UserMessage::text("summary so far"))],
+                        TranscriptRewriteReason::new("compaction"),
+                        Some("test".to_string()),
+                        None,
+                    )
+                    .unwrap();
+            }
+            session.push(Message::User(UserMessage::text(
+                "after the last compaction",
+            )));
+            assert!(
+                session
+                    .retire_transcript_history(meerkat_core::TranscriptHistoryRetention::default())
+                    .unwrap()
+                    >= 1,
+                "the fixture retires its oldest occurrences"
+            );
+            session
+        }
+
+        /// The images `session`'s body holds inline, as the conversion stores
+        /// them.
+        fn inline_image_payloads(session: &Session) -> Vec<meerkat_core::InlineImagePayload> {
+            session
+                .with_inline_images_externalized()
+                .unwrap()
+                .expect("the body holds inline images")
+                .payloads
+        }
+
+        /// Write `session` as the only runtime of a standalone WholeBlob
+        /// database at `path` and open its co-located session store.
+        async fn standalone_whole_blob_database(
+            path: &Path,
+            session: &Session,
+        ) -> (
+            LogicalRuntimeId,
+            meerkat_store::sqlite_store::SqliteSessionStore,
+        ) {
+            let runtime_id = LogicalRuntimeId::for_session(session.id());
+            let whole_blob = SqliteRuntimeStore::new_whole_blob(path).unwrap();
+            whole_blob
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(session).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            drop(whole_blob);
+            (runtime_id, meta_093_co_located_session_store(path))
+        }
+
+        /// The shape a downstream host carries (images in tool results and in
+        /// comms notices, all inline, in the parent advances of a graph that
+        /// re-anchored) converts. Every image is stored once under its content
+        /// address; the converted session holds none inline and keeps the
+        /// body's transcript revision and commits; a second conversion puts
+        /// nothing; and the converted runtime commits a turn and reopens.
+        #[tokio::test]
+        async fn a_re_anchored_whole_blob_session_with_tool_result_and_notice_images_converts() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            assert!(
+                session
+                    .transcript_history_state()
+                    .unwrap()
+                    .expect("a compacted session has a graph")
+                    .retired_base()
+                    .is_some(),
+                "the fixture's graph re-anchored"
+            );
+            let (runtime_id, session_store) = standalone_whole_blob_database(&path, &session).await;
+            let blobs = CountingBlobStore::new();
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a re-anchored body with tool result and notice images converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+            let payloads = inline_image_payloads(&session);
+            assert!(
+                payloads.len() >= 3,
+                "the body still holds images: {}",
+                payloads.len()
+            );
+            for payload in &payloads {
+                assert_eq!(
+                    meerkat_core::BlobStore::get(&blobs, &payload.blob_id)
+                        .await
+                        .expect("the image is in the store")
+                        .data,
+                    payload.data
+                );
+            }
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            let document = serde_json::to_string(&converted).unwrap();
+            for data in ROUND_IMAGES {
+                assert!(
+                    !document.contains(data),
+                    "the converted session still holds {data} inline"
+                );
+            }
+            assert_eq!(
+                converted.transcript_revision().unwrap(),
+                session.transcript_revision().unwrap()
+            );
+            let commits = |session: &Session| {
+                session
+                    .transcript_history_state()
+                    .unwrap()
+                    .expect("a compacted session has a graph")
+                    .commits()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(commits(&converted), commits(&session));
+
+            let puts = blobs.puts();
+            let rerun = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("a converted file converts again");
+            assert_eq!((rerun.seeded_count(), rerun.derived_count()), (0, 0));
+            assert_eq!(blobs.puts(), puts, "a converted file puts nothing");
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            let observed_head = session_store
+                .load_head(session.id())
+                .await
+                .unwrap()
+                .expect("converted head");
+            let mut resumed = converted;
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the conversion",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on the converted runtime");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file reopens after the turn");
+        }
+
+        /// The media stage writes nothing to the database: after it (a crash
+        /// before the conversion, say) the file is the WholeBlob database it
+        /// was, and staging and converting again finishes the conversion with
+        /// the same images.
+        #[tokio::test]
+        async fn a_conversion_stopped_after_its_media_stage_finishes_when_run_again() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+            let blobs = CountingBlobStore::new();
+
+            let stage = SqliteRuntimeStore::stage_standalone_whole_blob_media(&path, &blobs)
+                .await
+                .expect("the images stage");
+            let payloads = inline_image_payloads(&session);
+            assert_eq!(stage.stored.len(), payloads.len());
+            assert_eq!(stage.runtimes.len(), 1);
+            assert_eq!(stage.runtimes[0].images, payloads.len());
+            // The process stops here. The file is still the WholeBlob database.
+            assert!(
+                session_store.load(session.id()).await.unwrap().is_none(),
+                "the stage seeds no session"
+            );
+            SqliteRuntimeStore::new_whole_blob(&path)
+                .expect("the staged file still opens as a WholeBlob database");
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path, &blobs,
+            )
+            .await
+            .expect("staging and converting again converts");
+            assert_eq!(report.seeded_count(), 1);
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            assert_eq!(
+                converted.transcript_revision().unwrap(),
+                session.transcript_revision().unwrap()
+            );
+        }
+
+        /// A blob store that answers an image with an address other than its
+        /// content address refuses the stage typed, and the database is not
+        /// written: it still opens as the WholeBlob database it was.
+        #[tokio::test]
+        async fn a_blob_store_that_misaddresses_an_image_refuses_the_conversion_unwritten() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+
+            let refused = SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media(
+                &path,
+                &MisaddressingBlobStore,
+            )
+            .await;
+            assert!(
+                matches!(&refused, Err(RuntimeStoreError::Unsupported(detail)) if detail.contains("content address")),
+                "a misaddressing store refuses typed: {refused:?}"
+            );
+            assert!(session_store.load(session.id()).await.unwrap().is_none());
+            SqliteRuntimeStore::new_whole_blob(&path)
+                .expect("the refused file still opens as a WholeBlob database");
+        }
+
+        /// A conversion with a stage that did not store the body's images
+        /// (the body changed after its stage) refuses that runtime typed and
+        /// writes nothing.
+        #[tokio::test]
+        async fn a_body_whose_images_the_stage_did_not_store_refuses_unwritten() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (_runtime_id, session_store) =
+                standalone_whole_blob_database(&path, &session).await;
+
+            let refused =
+                SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_staged_media(
+                    &path,
+                    &StandaloneWholeBlobMediaStage::default(),
+                );
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { detail, .. })
+                        if detail.contains("did not store")
+                ),
+                "an unstaged image refuses typed: {refused:?}"
+            );
+            assert!(session_store.load(session.id()).await.unwrap().is_none());
+            SqliteRuntimeStore::new_whole_blob(&path)
+                .expect("the refused file still opens as a WholeBlob database");
         }
 
         /// A compacted WholeBlob body whose transcript holds inline video
@@ -29817,6 +30680,7 @@ pub use inner::delivery_generation_test_hooks;
 #[cfg(feature = "sqlite-store")]
 pub use inner::{
     RUNTIME_STORE_DOMAIN, SqliteRuntimeStore, StandaloneWholeBlobConversionReport,
+    StandaloneWholeBlobMediaRuntime, StandaloneWholeBlobMediaStage,
     StandaloneWholeBlobRuntimeConversion, StandaloneWholeBlobSessionSource,
     prepare_pre_0_8_10_runtime_input_states,
 };
