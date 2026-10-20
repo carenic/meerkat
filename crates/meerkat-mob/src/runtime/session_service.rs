@@ -3683,19 +3683,12 @@ where
         &self,
         session_id: &SessionId,
     ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
-        // The committed body, read without reconciling or reviving anything.
-        let Some(session) = self.observe_authoritative_session_body(session_id).await? else {
-            return Err(SessionError::NotFound {
-                id: session_id.clone(),
-            });
-        };
-        meerkat_core::PredecessorToolRestrictions::from_committed_session(&session).map_err(
-            |error| {
-                SessionError::Unsupported(format!(
-                    "inherited tool restriction evidence for session {session_id}: {error}"
-                ))
-            },
+        // The committed record's restrictions, read without materializing the
+        // transcript or reconciling or reviving anything.
+        meerkat_session::PersistentSessionService::<B>::predecessor_tool_restrictions(
+            self, session_id,
         )
+        .await
     }
 
     async fn session_known_to_archive_authority(

@@ -3643,6 +3643,148 @@ async fn a_mob_whose_retiring_member_has_a_durable_tail_restarts() {
     let _ = handle_2.shutdown().await;
 }
 
+/// A member whose session has a durable tail ahead of its runtime boundary
+/// authority respawns. The power cut leaves the canonical head carrying a
+/// turn whose runtime boundary commit never became durable (the same window a
+/// turn between its checkpoint and its boundary commit shows). With power
+/// back, the respawn reads the restrictions the member was spawned under from
+/// its committed record before it retires anything; that read must not need
+/// the transcript at the boundary the head has moved past, or the respawn is
+/// refused and the member keeps its stale incarnation.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_whose_session_has_a_durable_tail_respawns() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let incarnation_before = handle
+        .get_member(&identity)
+        .await
+        .expect("read the roster")
+        .expect("the member is rostered")
+        .agent_runtime_id;
+
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "respawn-tail-turn",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_TAIL_TURN",
+        "respawn-tail-pre-cut-boundary",
+    )
+    .await;
+
+    // The next turn's durable row lands; its runtime boundary commit does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[respawn-tail] send during cut => {send_result:?}");
+    wait_for_row_contains(
+        store.as_ref(),
+        &w1_sid,
+        "POST_CUT_TAIL_TURN",
+        "respawn-tail-row",
+    )
+    .await;
+    {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while power_store.prepared_boundary_commit_rejections() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "[respawn-tail] prepared boundary commit was never rejected under the cut"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load runtime session authority")
+        .expect("runtime session authority present");
+    let authority = authority
+        .head_canonical()
+        .expect("head-canonical boundary authority");
+    let ahead_head = store
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    assert_ne!(
+        meerkat_core::session_store::session_head_cas_token(&ahead_head)
+            .expect("ahead physical head has a canonical token"),
+        authority.committed_head_token(),
+        "the physical head must be ahead of the retained runtime authority"
+    );
+    assert!(
+        ahead_head.message_count > authority.boundary_head().message_count,
+        "the physical head must carry a strict continuation past the boundary"
+    );
+
+    // Power is back; the member respawns with the tail in place.
+    power_store.set_cut(false);
+    let respawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.respawn(identity.clone(), None),
+    )
+    .await
+    .expect("the respawn ends within its bound");
+    assert!(
+        respawned.is_ok(),
+        "a member whose session has a durable tail must respawn: {respawned:?}"
+    );
+    let incarnation_after = handle
+        .get_member(&identity)
+        .await
+        .expect("read the roster")
+        .expect("the respawned member is rostered")
+        .agent_runtime_id;
+    assert_ne!(
+        incarnation_after, incarnation_before,
+        "the respawn installs a new incarnation"
+    );
+    let _ = handle.shutdown().await;
+}
+
 #[cfg(feature = "test-support")]
 const HELD_TURN_PROMPT: &str = "HELD_TURN token-sigma";
 

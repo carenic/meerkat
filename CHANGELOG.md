@@ -35,6 +35,31 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-core`: `PredecessorToolRestrictions::from_metadata_map` reads the
+  tool restrictions a session inherited from its spawner out of its committed
+  metadata map, with the same keys, checks and refusals as
+  `from_committed_session`, which now delegates to it.
+  `try_tool_visibility_state_from_map` is the canonical decoder of a session's
+  tool-visibility record from a metadata map.
+- `meerkat-session`: `PersistentSessionService::predecessor_tool_restrictions`
+  reads those restrictions from a session's committed record without
+  materializing its transcript.
+
+### Fixed
+
+- `meerkat-mob`: a member whose session's canonical head has moved past its
+  committed runtime boundary respawns. A respawn reads the tool restrictions
+  the member was spawned under before it retires anything; the persistent read
+  materialized the session's transcript at the committed boundary, and the
+  store refused it as a transcript revision conflict while a durable tail was
+  ahead of that boundary or a turn was between its checkpoint and its
+  boundary commit. The respawn, and the reset built on it, was refused and the
+  member kept its old incarnation. HeadCanonical sessions now read the
+  restrictions from the current boundary's metadata under one store snapshot,
+  without the transcript.
+
 ## [0.9.4] - 2026-10-20
 
 ### Breaking

@@ -3715,8 +3715,17 @@ impl PredecessorToolRestrictions {
     /// The restrictions recorded in a session's committed body. Missing
     /// evidence is an error, never "unrestricted".
     pub fn from_committed_session(session: &Session) -> Result<Self, PredecessorRestrictionsError> {
-        let metadata = session
-            .try_session_metadata()
+        Self::from_metadata_map(session.metadata())
+    }
+
+    /// The restrictions recorded in a session's committed metadata map, read
+    /// without its transcript: the same keys and checks as
+    /// [`Self::from_committed_session`]. Missing evidence is an error, never
+    /// "unrestricted".
+    pub fn from_metadata_map(
+        session_metadata: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, PredecessorRestrictionsError> {
+        let metadata = try_session_metadata_from_map(session_metadata)
             .map_err(|error| PredecessorRestrictionsError::Malformed(error.to_string()))?;
         let auth_binding = metadata
             .as_ref()
@@ -3725,8 +3734,7 @@ impl PredecessorToolRestrictions {
         let launch = metadata
             .and_then(|metadata| metadata.tooling.spawn_tool_access_policy)
             .ok_or(PredecessorRestrictionsError::MissingLaunchPolicy)?;
-        let state = session
-            .try_tool_visibility_state()
+        let state = try_tool_visibility_state_from_map(session_metadata)
             .map_err(|error| PredecessorRestrictionsError::Malformed(error.to_string()))?
             .ok_or(PredecessorRestrictionsError::MissingVisibilityRecord)?;
         let witnessed = |name: &str| {
@@ -7320,10 +7328,7 @@ impl Session {
     pub fn try_tool_visibility_state(
         &self,
     ) -> Result<Option<SessionToolVisibilityState>, serde_json::Error> {
-        self.metadata
-            .get(SESSION_TOOL_VISIBILITY_STATE_KEY)
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()
+        try_tool_visibility_state_from_map(&self.metadata)
     }
 
     /// Load typed transcript revision state from metadata.
@@ -9398,6 +9403,21 @@ pub fn try_session_metadata_from_map(
     session_durable_config_authority::restore_session_metadata(metadata)
         .map(Some)
         .map_err(<serde_json::Error as serde::de::Error>::custom)
+}
+
+/// Decode the durable tool-visibility control state from a session metadata
+/// map.
+///
+/// Canonical single decoder: [`Session::try_tool_visibility_state`] and the
+/// metadata-only restriction read delegate here. An absent key is `None`; a
+/// present-but-corrupt value fails closed.
+pub fn try_tool_visibility_state_from_map(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<SessionToolVisibilityState>, serde_json::Error> {
+    metadata
+        .get(SESSION_TOOL_VISIBILITY_STATE_KEY)
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
 }
 
 /// Decode the typed [`SESSION_LIFECYCLE_TERMINAL_KEY`] fact from a session
@@ -18333,6 +18353,70 @@ mod tests {
             .narrowed_with(&broader)
             .expect("no identity conflict");
         assert_eq!(kept.filter(), &state.inherited_base_filter);
+    }
+
+    /// The metadata-only read states exactly what the committed body states:
+    /// the same evidence, and the same refusal when evidence is missing or
+    /// malformed.
+    #[test]
+    fn restrictions_read_from_the_metadata_map_match_the_committed_body() {
+        let mut bound = session_with_recorded_restrictions(
+            Some(crate::ops::SpawnToolAccessPolicy::from_launch(Some(
+                shell_deny(),
+            ))),
+            Some(kept_ceiling_state()),
+        );
+        let mut metadata = bound
+            .try_session_metadata()
+            .expect("metadata decodes")
+            .expect("metadata present");
+        metadata.auth_binding = Some(crate::AuthBindingRef {
+            realm: crate::RealmId::parse("tenant_a").unwrap(),
+            binding: crate::BindingId::parse("scoped").unwrap(),
+            profile: None,
+            origin: crate::BindingOrigin::Configured,
+        });
+        bound.set_session_metadata(metadata).expect("metadata");
+        let mut malformed = session_with_recorded_restrictions(
+            Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+            Some(SessionToolVisibilityState::default()),
+        );
+        malformed.set_metadata_unchecked(
+            SESSION_TOOL_VISIBILITY_STATE_KEY,
+            serde_json::json!("not a tool visibility record"),
+        );
+        let unwitnessed = SessionToolVisibilityState {
+            inherited_base_filter: ToolFilter::Deny(["lost".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let sessions = [
+            bound,
+            session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                Some(SessionToolVisibilityState::default()),
+            ),
+            session_with_recorded_restrictions(None, Some(kept_ceiling_state())),
+            session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                None,
+            ),
+            session_with_recorded_restrictions(
+                Some(crate::ops::SpawnToolAccessPolicy::from_launch(None)),
+                Some(unwitnessed),
+            ),
+            malformed,
+            Session::new(),
+        ];
+        let mut stated = 0;
+        for session in &sessions {
+            let from_body = PredecessorToolRestrictions::from_committed_session(session);
+            stated += usize::from(from_body.is_ok());
+            assert_eq!(
+                PredecessorToolRestrictions::from_metadata_map(session.metadata()),
+                from_body
+            );
+        }
+        assert_eq!(stated, 2, "two sessions state their restrictions");
     }
 
     /// Missing evidence is never read as unrestricted.
