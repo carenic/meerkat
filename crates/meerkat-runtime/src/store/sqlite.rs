@@ -24372,8 +24372,9 @@ ORDER BY runtime_id";
 
         /// A realm whose session store holds a legacy blob row with realtime
         /// text opens on the head-canonical profile. Its activation crosses the
-        /// session, replaying the realtime projection's activation snapshot,
-        /// and the session keeps that projection.
+        /// session and writes the realtime projection as one activation
+        /// snapshot event; loading the session replays that event, and the
+        /// session keeps that projection.
         #[tokio::test]
         async fn a_realm_whose_blob_row_holds_realtime_text_opens() {
             let dir = TempDir::new().unwrap();

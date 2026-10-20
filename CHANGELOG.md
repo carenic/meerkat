@@ -2745,17 +2745,17 @@ them.
   live image reopens after a compaction or another transcript rewrite. The
   conversion of a 0.9.3 session (the session store's crossing, the store-wide
   activation, the realm open and the standalone conversion, and the Meta
-  storage migration that runs them) and every transcript rewrite or recovery
-  rebase write the realtime projection as one snapshot event, whose items key
-  their text, staged content and image fingerprints by content index. Reading
-  that event back refused every such key ("invalid type: string \"0\",
-  expected u32"). The session store's crossing and its store-wide activation
-  (and the Meta storage migration through them) refused such a session as
-  `Corrupted`; the realm open and the standalone conversion converted it but
-  left it unreadable (`Corrupted` on load); and a rewritten session with a
-  live image could not be loaded again. The items now read those keys;
-  the stored bytes are unchanged, and the reason a stored realtime sequence
-  does not replay is now logged.
+  storage migration that runs the first two) and every transcript rewrite or
+  recovery rebase write the realtime projection as one snapshot event, whose
+  items key their text, staged content and image fingerprints by content
+  index. Reading that event back refused every such key ("invalid type: string
+  \"0\", expected u32"). The session store's crossing and its store-wide
+  activation (and the Meta storage migration through them) refused such a
+  session as `Corrupted`; the realm open and the standalone conversion
+  converted it but left it unreadable (`Corrupted` on load); and a rewritten
+  session with a live image could not be loaded again. The items now read
+  those keys; the stored bytes are unchanged, and the reason a stored realtime
+  sequence does not replay is now logged.
 - `meerkat-session`: a session whose turns each add large images, such as a
   tool that returns camera snapshots, no longer compacts on every turn.
   Before compacting, the agent stores inline media as blob references, and
