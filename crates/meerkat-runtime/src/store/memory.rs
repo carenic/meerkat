@@ -583,6 +583,8 @@ pub struct InMemoryRuntimeStore {
     #[cfg(test)]
     atomic_input_persist_ack_loss: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
+    unregister_finalization_outcome_unknown: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
     input_state_batch_cas_before: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
     #[cfg(test)]
     input_state_batch_cas_after_commit: Arc<StdMutex<Option<InputStateBatchCasTestBlock>>>,
@@ -656,6 +658,15 @@ impl InMemoryRuntimeStore {
             .store(true, Ordering::Release);
     }
 
+    /// Answer the next unregister finalization with an unknown outcome,
+    /// committing nothing: its unregister keeps the final transition for a
+    /// retry, and the registration refuses lifecycle mutations until then.
+    #[cfg(test)]
+    pub(crate) fn report_next_unregister_finalization_outcome_unknown(&self) {
+        self.unregister_finalization_outcome_unknown
+            .store(true, Ordering::Release);
+    }
+
     /// Hold the store's shared state lock, as any store operation does while
     /// it runs. Test support for the persistence-wait deadlock shape (#1654).
     #[cfg(test)]
@@ -724,6 +735,10 @@ impl InMemoryRuntimeStore {
             atomic_input_persist_before: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             atomic_input_persist_ack_loss: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            unregister_finalization_outcome_unknown: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             #[cfg(test)]
             input_state_batch_cas_before: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -3971,6 +3986,15 @@ impl RuntimeStore for InMemoryRuntimeStore {
         runtime_id: &LogicalRuntimeId,
         finalization: crate::store::UnregisterFinalizationCommit,
     ) -> Result<(), RuntimeStoreError> {
+        #[cfg(test)]
+        if self
+            .unregister_finalization_outcome_unknown
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(RuntimeStoreError::UnregisterFinalizationOutcomeUnknown(
+                "injected unknown unregister finalization outcome".to_string(),
+            ));
+        }
         let (snapshot, input_states, retired_ops_epoch) = finalization.into_parts();
         let runtime_state = snapshot.runtime_state();
         let lifecycle_record = MachineLifecycleStoreRecord::from_snapshot(&snapshot).encode()?;

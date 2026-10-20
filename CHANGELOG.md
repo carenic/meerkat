@@ -1722,6 +1722,26 @@ them.
   through the store-owned recovery a restart runs (a proven continuation is
   adopted; a held or refused tail is left intact), and then reads again.
 
+- `meerkat-mob`: a mob Stop or Shutdown no longer fails with an internal error
+  when a member's runtime unregister is past its final transition, for
+  example when the member's own runtime loop unregisters it as the Stop
+  reaches it: its store finalization still in flight, its outcome unknown, or
+  a failed finalization left the registration for the next unregister. Such a
+  registration refuses every lifecycle mutation, and its runtime loop has
+  already exited. The stop now reports the member's run `NoRun` and its run
+  starts `Held`: the registration starts no run until the unregister removes
+  it, and the `MobStop` a Stop staged first holds any registration that
+  replaces it until Resume. A Resume's release of that member is answered the
+  same way, and a Shutdown's teardown joins or retries the unregister as for
+  any member. For a placed member, the member's host answers a supervisor's
+  bridged hold the same way (`RunStartsHeld` with no run) and its release
+  with `Ack`, and a restore of a Stopped mob in the same process stages the
+  member's hold without failing. `MeerkatMachine::hold_run_starts` and
+  `release_run_starts` refuse such a registration typed
+  (`UnregisterFinalizationOutcomeUnknown` while the final transition is
+  staged, `ValidationFailed` as the teardown-only anchor) instead of
+  `Internal`, and `MeerkatMachine::unregister_owed` reports the state.
+
 - `meerkat-mob-mcp`: after a restart, the session that created a mob with
   the agent mob tools manages it again. A session's persisted mob operator
   authority binds no mob, so the manage grant its create returned was gone
