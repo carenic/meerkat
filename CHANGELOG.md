@@ -1276,6 +1276,18 @@ them.
 - `meerkat_core::service::LiveMobIncarnation` (with `incarnation()`) and
   `meerkat_mob::MobHandle::live_incarnation`: the witness the mob operator
   grant functions take (see Breaking).
+- `meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob`
+  narrows the spawn-profile scope a mob operator authority context holds in
+  one mob to the profiles given that it already holds there. It takes no
+  `LiveMobIncarnation`, because it can only take rights away: it keeps the
+  incarnation the context binds for that mob and every other fact, never adds
+  a profile, and refuses a mob the context holds no spawn-profile scope for.
+  A host session hook uses it to narrow the default scope over every profile
+  of its own mob that a `tools.mob` member built without persisted authority
+  gets, which includes the members a mob restores while it is being built,
+  before the host holds their handle and so before it can call the grant
+  functions. Before this, such a restored member kept spawn rights over every
+  profile of its mob after each restart.
 - `meerkat_core::service::MobIncarnationId` implements `Display`,
   `FromStr` (error: `MobIncarnationIdParseError`), `PartialOrd` and `Ord`.
 - `meerkat_mob::MobProvenance`: who created a mob (`Member`, `Host`,

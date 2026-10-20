@@ -2369,6 +2369,63 @@ mod tests {
         );
     }
 
+    /// A `tools.mob` member built with no persisted authority, as the mob's
+    /// resume pass builds a restored member, gets the default spawn scope
+    /// over every profile of its mob. A host session hook sees that context
+    /// on the build request and narrows it without the incarnation witness:
+    /// the member then holds only the host's profiles, still bound to the
+    /// incarnation it was built for.
+    #[tokio::test]
+    async fn a_restored_mob_member_default_spawn_scope_narrows_to_the_host_profiles() {
+        let def = sample_definition();
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
+        let config = build_agent_config(BuildAgentConfigParams {
+            mob_id: &def.id,
+            profile_name: &ProfileName::from("lead"),
+            agent_identity: &AgentIdentity::from("lead-1"),
+            profile: lead,
+            definition: &def,
+            realm_profile_store: None,
+            external_tools: None,
+            compaction_curator_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            shell_env: None,
+            mob_tool_authority_context: None,
+            mob_incarnation: Some(crate::tests::fresh_live_incarnation()),
+            tool_access_policy: None,
+            inherited_tool_filter: None,
+            system_prompt_override: None,
+        })
+        .await
+        .expect("build_agent_config");
+        let default_authority = config
+            .mob_tool_authority_context
+            .as_ref()
+            .expect("a tools.mob member gets the default authority");
+        let incarnation = default_authority.mob_incarnations()["test-mob"];
+        assert!(default_authority.spawn_profile_scope_contains("test-mob", incarnation, "lead"));
+        assert!(default_authority.spawn_profile_scope_contains("test-mob", incarnation, "worker"));
+
+        let narrowed = meerkat_runtime::mob_operator_authority::restrict_spawn_profiles_in_mob(
+            default_authority,
+            "test-mob",
+            ["worker"],
+        )
+        .expect("the host narrows the default scope");
+        assert!(narrowed.spawn_profile_scope_contains("test-mob", incarnation, "worker"));
+        assert!(!narrowed.spawn_profile_scope_contains("test-mob", incarnation, "lead"));
+        assert_eq!(narrowed.mob_incarnations()["test-mob"], incarnation);
+        assert_eq!(
+            narrowed.can_create_mobs(),
+            default_authority.can_create_mobs()
+        );
+        assert!(!narrowed.can_manage_mob("test-mob", incarnation));
+    }
+
     #[tokio::test]
     async fn test_build_agent_config_tool_overrides() {
         let def = sample_definition();
