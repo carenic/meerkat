@@ -1254,6 +1254,14 @@ may temporarily backpressure another open. Hosts should surface that refusal
 and retry within their own bound, not infer a new channel or bypass the shared
 reservation.
 
+A process admits live opens one at a time and queues none. An open keeps that
+admission until its provider has acknowledged its seed: for a WebRTC channel,
+through the client's offer and the provider's answer. A second open during
+that setup is refused before anything opens, as the typed
+`RealtimeSessionOpenProjectionError::Backpressured` (`SessionBusy`, -32002, on
+`rkat-rpc` `live/open`; `MemberLiveError::Unavailable` from a member live
+host). The refusal is retryable: retry the open with backoff.
+
 The private ChatGPT-brokered path (`experimental-gpt-live`, `gpt-live-1-codex`)
 is deprecated and will be removed after the public path has shipped for at
 least one release.
