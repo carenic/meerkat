@@ -597,18 +597,23 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   anything; a new call is a new operation. A mob member upcall refusal with
   no known kind now reads as `operation_authorization_unavailable`, not
   `operation_refused` with `malformed_facts`.
-- **Governed realms and environment keys:** a governed realm no longer
-  refuses every input of a host whose model key comes from the environment
-  (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and the other provider and `RKAT_*`
-  keys, with no realm binding configured). 0.9.3 answered such input with
-  `controller credential is not currently usable` before any model request.
+- **Governed realms and environment keys:** in a governed realm, input of a
+  host whose model key comes from the environment (`OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY` and the other provider and `RKAT_*` keys, with no realm
+  binding configured, or none that resolves) now reaches controller
+  authorization. 0.9.3 refused every such input at admission, before any
+  model request, with `controller credential is not currently usable`.
   Governed admission holds no credential lease for that route, and every
-  other governed check still applies. The environment key is also the
-  fallback when a session names no binding and the configured one does not
-  resolve at build time (for example a logged-out OAuth binding). **Do:**
-  where a governed realm must never run on the host's environment key, grant
-  the controller only the configured binding's route keys: the environment
-  route has a route key of its own, so that grant refuses it.
+  other governed check still applies. The route has a route key of its own
+  (the key covers the binding and the credential), so a stock controller
+  grant admits it only if one of its `--route` keys names that route;
+  otherwise the input is refused with a typed policy refusal. That includes
+  the build-time fallback to the environment key when a session names no
+  binding and the configured one does not resolve (for example a logged-out
+  OAuth binding). **Do:** to run governed work on an environment key, grant
+  that route's key
+  (`rkat realm grant <REALM_ID> --controller --route <ROUTE_KEY>`); a host
+  with its own controller policy decides there.
 - **SQLite session store:** a whole-blob session compacted more often than
   `history_retained_rewrites` (default 4) is laid out instead of refused.
 - **Public GPT Live:** a delegation result held behind the user's unanswered
@@ -717,8 +722,8 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 8. Update custom compactors for the new `prepare_for_summarization`.
 9. Governed hosts: bind host-reported outcomes with `bind_host_outcome`, do
    not treat a review attempt retired as `ContextChanged` as the call's final
-   outcome, and grant controller route keys only for the routes a realm may
-   run on (the environment key's route is now admitted when granted).
+   outcome, and grant an environment key's controller route by its route key
+   if governed work should run on it.
 10. Read tool configuration changes by `settled` (accepting `persisted` on
     rows stored before 0.9.4).
 11. Realtime clients: handle the `turn_failed` observation, and add the new

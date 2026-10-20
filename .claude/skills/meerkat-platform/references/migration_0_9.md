@@ -422,14 +422,16 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Governed tool refusals: the `operation_refused` tool result carries
   `data` `{"kind", "tool_invoked"}` for the model; a mob member upcall
   refusal with no known kind reads as `operation_authorization_unavailable`.
-- Fixed: a governed realm no longer refuses every input whose model key comes
-  from the environment (`OPENAI_API_KEY` and the other provider and `RKAT_*`
-  keys, no realm binding); 0.9.3 answered it with
+- Fixed: in a governed realm, input whose model key comes from the
+  environment (`OPENAI_API_KEY` and the other provider and `RKAT_*` keys, no
+  realm binding or none that resolves) now reaches controller authorization;
+  0.9.3 refused it at admission with
   `controller credential is not currently usable`. Admission holds no
   credential lease for that route, and every other governed check applies.
-  The environment key is also the fallback when no binding is named and the
-  configured one does not resolve at build time; a controller grant that
-  lists only the configured binding's route keys refuses it.
+  The route has its own route key, so a stock controller grant admits it only
+  if one of its `--route` keys names it, the build-time fallback from an
+  unresolved configured binding included; otherwise the input is refused with
+  a typed policy refusal. A host with its own controller policy decides there.
 - Fixed: the SQLite session store lays out a whole-blob session compacted more
   than `history_retained_rewrites` times; `@rkat/sdk` `close()` no longer
   keeps Node alive for 5 seconds, and both SDK clients settle on the
@@ -468,8 +470,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 4. Read `content_filtered` failures by their typed reason.
 5. Use `hot_swap_llm_identity` for model changes; update custom compactors.
 6. Governed hosts: use `bind_host_outcome` for host-reported outcomes,
-   treat a `ContextChanged` review retirement as not final, and grant
-   controller route keys only for the routes a realm may run on.
+   treat a `ContextChanged` review retirement as not final, and grant an
+   environment key's controller route by its route key if governed work
+   should run on it.
 7. Realtime clients: handle `turn_failed`; Rust: add the new arms and
    `signal_turn_failed`.
 8. Forks: handle `FORK_INSTRUCTION_REFUSED`; upgrade member hosts before their
