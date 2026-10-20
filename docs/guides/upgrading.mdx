@@ -582,6 +582,14 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 - **Multiprocess hosting** no longer refuses a runtime store whose file
   notifications cannot be registered (an inotify watch limit, for example):
   the store watch's sweep is the cross-process wake.
+- **Fenced runtime-store writes under contention:** a fenced write whose
+  `RuntimeStoreWriteFence` answers `Backoff` while the writer holds an async
+  lock (the in-memory runtime store's fenced writes, and `MeerkatMachine`'s
+  publication of a registered session) is tried again for up to 2 seconds,
+  with the lock released between attempts, instead of reporting the first
+  `Backoff` at once. **Do:** a fence caller in your own crate that holds an
+  async lock retries a `Backoff` the same way; `execute_if_current` never
+  waits beyond its own I/O.
 - **Work that names an original its source owner has not settled yet** is
   reported not ready (`ControllerReadinessUnavailable` with
   `original_admission_pending`) and stays retryable, instead of being refused
