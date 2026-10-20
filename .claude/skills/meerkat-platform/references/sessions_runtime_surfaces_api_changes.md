@@ -402,6 +402,15 @@ Rust host API changes in 0.9.4 (hosts that embed the crates):
   it; a composed store adds the busy timeout of each lock-acquiring
   transaction of its own; default `DEFAULT_COMMIT_OUTCOME_DEADLINE` = two
   `COMMIT_BUSY_WINDOW`s of 60 s; `InMemoryRuntimeStore` declares none).
+- `RuntimeDriverError::InputTerminalNotYetReadable { input_id, reason }`
+  (retryable; the enum is `#[non_exhaustive]`):
+  `SessionServiceRuntimeExt::input_terminal_completion` on a session degraded
+  behind a commit past its deadline refuses with it instead of waiting for
+  the held driver; read again after the reload.
+- `ScheduleTargetDelivery::deliver_occurrence`: the completion of an exact
+  replay (a deduplicated redelivery) now decides the occurrence's terminal,
+  so it must resolve from the original input's own terminal outcome; the
+  driver never records a terminal at admission.
 - `MeerkatMachine::bind_scoped_context` refuses a destination whose
   `context_generation` does not advance with
   `RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested }`

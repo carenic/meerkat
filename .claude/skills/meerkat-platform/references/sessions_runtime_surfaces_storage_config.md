@@ -292,12 +292,27 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   keeps running and keeps the gate until the store answers. The run's
   completion waiters fail (`DurableOutcomeUnknown`; a rejected boundary commit
   gives `BoundaryRolledBack`), but the input stays durably admitted: read it
-  after the reload, never resubmit it. Until the store answers, a reload and
-  every live-work wait for the gate (admission, interrupts, stops, recover and
-  destroy, comms aborts, unregisters) refuse with the typed, retryable
-  `RecoveryRepairBlocked`; afterwards the reload replaces the registration
-  from durable truth. A mob member's tracked turn stays pending, and a
-  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+  after the reload instead of resubmitting it. The public error class is
+  still authority unavailable and only the message names the case, so
+  resubmit only with an idempotency key. Until the store answers, a reload
+  and every live-work wait for the gate (admission, interrupts, stops,
+  recover and destroy, comms aborts, unregisters) refuse with the typed,
+  retryable `RecoveryRepairBlocked`, and a read of an input's terminal
+  completion refuses with the retryable `InputTerminalNotYetReadable`;
+  afterwards the reload replaces the registration from durable truth. A mob
+  member's tracked turn stays pending, and a scheduled delivery waits for the
+  input's own terminal outcome (see Schedules below).
+- Admissions that never answer (since 0.9.4): an input admission whose store
+  write reports nothing within the same deadline refuses with the retryable
+  `RecoveryRepairBlocked`, naming the input, and marks the session
+  reload-required (`runtime_admission_deadline`). The write keeps the gate
+  until the store answers, so the input may still be admitted: resubmit it
+  with the same idempotency key, or read it after the reload. Sessions
+  without durable state and stores that declare no deadline (the in-memory
+  store) admit as before. Writes that no deadline covers still hold the gate
+  until the store answers: registration, unregister, control writes,
+  recovery, the runtime loop's other writes (a run's staging, for example)
+  and the live-boundary work after an admission.
 - SQLite lock profile (0.9.4): the bundled SQLite is built without its three
   process-wide locks (allocator statistics, one page cache shared by every
   connection, page-cache overflow statistics), which made concurrent sessions
@@ -415,6 +430,33 @@ JSONL-backed realms.
   `GET|POST /schedules`, `GET|PATCH|DELETE /schedules/{id}`,
   `POST /schedules/{id}/pause|resume`, `GET /schedules/{id}/occurrences`;
   unknown ids return `SCHEDULE_NOT_FOUND` (-32023, HTTP 404).
+- Delivery terminal (since 0.9.4): an occurrence ends only from its delivered
+  input's own terminal outcome. A reclaim whose redelivery the target
+  deduplicated stays `dispatching` and waits for the original input (its
+  receipt still records the admission as deduplicated). While the input is
+  live the occurrence waits and then ends with its outcome; a failed input
+  ends it `delivery_failed` with the input's failure class, and so does a mob
+  target's redelivery that finds its delivery already failed. While the
+  outcome cannot be read yet (no finalized receipt, an unreadable store, or a
+  session degraded behind a stalled commit), the occurrence keeps its lease
+  and re-reads it for up to 5 lease periods (5 minutes at the default 60
+  second lease), then ends `delivery_failed` with
+  `runtime_completion_authority_unavailable`. An input that ended without a
+  public completion or has left the runtime ends it the same way and is never
+  admitted a second time. Nothing reclaims a waiting occurrence, whatever its
+  misfire policy.
+- A runtime-backed delivery whose completion wait fails with
+  `BoundaryRolledBack` or `DurableOutcomeUnknown` (a commit with no durable
+  answer, see above) re-reads the input's terminal outcome under the same
+  bound: the input is durably admitted and runs again after its session
+  reloads, or its stalled commit lands. The occurrence then ends `completed`
+  or `delivery_failed` with the input's class; at the bound it ends
+  `delivery_failed` with `runtime_completion_authority_unavailable`, and the
+  detail names the bound and the last cause. The wait never reloads the
+  session: the reload comes from the session's own traffic (its next delivery
+  or input, or a mob's `reload_member_registration`). Any other wait failure
+  still ends the occurrence at once, and so does a dispatch built with
+  `AcceptedScheduledInput::with_runtime_handle`, which names no input to read.
 - Known issue in 0.9.0: in a governed realm, sessions a schedule materializes
   are not bound to an agent, so their configured MCP servers are unavailable.
 
