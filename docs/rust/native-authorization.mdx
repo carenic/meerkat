@@ -597,6 +597,11 @@ actor with `live_session_actor_witness` and its real client with
 submission. A copied model name is not a pinned client.
 The selected credential must be usable in this machine's generated auth owner;
 use the normal credential lifecycle, not a fabricated Ready flag.
+Since 0.9.4 a controller on the environment's default key (no recorded auth
+binding, the `env_default` credential;
+`ControllerModelSelection::uses_synthetic_env_default_credential`) holds no
+credential lease under governed admission, as for an authless route. Its live
+client must still report exactly the pinned selection.
 
 ## Remove a permission without removing the controller
 
