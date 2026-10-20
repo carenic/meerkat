@@ -189,7 +189,10 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   every member's run starts and reports the first failure in roster order.
   Known limitation: in a multi-host mob, a remote member that needs a reload
   still makes a Stop fail with `MobError::BridgeCommandRejected` (cause
-  `internal`); reload the member on its host, then retry.
+  `internal`), and a Shutdown too when that member is `AutonomousHost`; a
+  failed Stop rolls back and the mob stays Running, and a failed Shutdown
+  keeps every member and can be retried. Reload the member on its host, then
+  retry.
 - **A runtime that did not install the destination its host selected** now
   answers `MobError::MemberDestinationNotInstalled` (RPC data kind
   `mob_member_destination_not_installed`, not retryable), where it answered
@@ -524,8 +527,9 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   that setting: **Do:** set `LIBSQLITE3_FLAGS` to the value in
   [SQLite Lock Profile](/guides/deploying#sqlite-lock-profile) for that
   build, and in an embedding application call
-  `meerkat_sqlite::disable_memory_statistics_at_process_start()` as the first
-  statement of `main`. `rkat storage doctor` reports the profile and warns
+  `meerkat_sqlite::disable_memory_statistics_at_process_start()` (an
+  `unsafe fn`) in an `unsafe` block as the first statement of `main`, before
+  any other thread or SQLite connection exists. `rkat storage doctor` reports the profile and warns
   with `sqlite-lock-profile` when a lock is on.
 - **Presence locks:** a connection a store keeps open between operations
   holds a presence lock (`<file>.mpresence` next to the database), and

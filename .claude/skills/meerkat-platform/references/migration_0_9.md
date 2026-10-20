@@ -388,8 +388,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   process-wide locks; a build outside the repository (`cargo install rkat`,
   an embedding application) sets `LIBSQLITE3_FLAGS` itself (value in
   `docs/guides/deploying.mdx`, "SQLite Lock Profile"), and an embedding
-  application calls `meerkat_sqlite::disable_memory_statistics_at_process_start()`
-  first in `main`. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
+  application calls the `unsafe fn`
+  `meerkat_sqlite::disable_memory_statistics_at_process_start()` first in
+  `main`, before any other thread or SQLite connection exists. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
   store connections hold `<file>.mpresence` presence locks, which maintenance
   waits for.
 - Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
