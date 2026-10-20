@@ -178,10 +178,69 @@ fn completed_is_entered_only_from_the_inputs_own_terminal_outcome() {
          or not, proves the input was admitted, not what it did. A new entry into \
          Completed is a reviewed machine-authority change, never a silent one"
     );
+    // The per-phase classification arms (transition failure, terminality
+    // and stale completion arrival) each keep one arm in Completed that
+    // only classifies.
     assert_eq!(
         self_loops,
         pinned(&[
             ("ClassifyDueCompletedNoAction", "input ClassifyDue"),
+            (
+                "ClassifyOccurrenceTerminalityTerminalCompleted",
+                "input ClassifyOccurrenceTerminality",
+            ),
+            (
+                "ClassifyStaleCompletionArrivalObservedCompleted",
+                "input ClassifyStaleCompletionArrival",
+            ),
+            (
+                "ClassifyTransitionFailureClaimedDispatchDispositionRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureCompletionSupersessionRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureDueClassificationRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureNotClaimedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureNotDispatchingCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureNotLeaseHoldingCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureNotLiveForTerminalCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureNotPendingForClaimCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailurePlanRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureReceiptRecordRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureStaleCompletionArrivalRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
+            (
+                "ClassifyTransitionFailureTargetSyncRejectedCompleted",
+                "input ClassifyTransitionFailure",
+            ),
             ("RecordReceiptCompleted", "input RecordReceipt"),
         ]),
         "the arcs that stay in Completed changed; each one must admit only \
