@@ -1082,6 +1082,7 @@ rust_test(
         "//crates/meerkat:meerkat_providers_agent_factory_build",
         "//crates/meerkat:meerkat_runtime_agent_factory_build_test_support",
         "//crates/meerkat:meerkat_session_agent_factory_build_with_runtime_test_support",
+        "//crates/meerkat:meerkat_sqlite_agent_factory_build",
         "//crates/meerkat:meerkat_store_agent_factory_build",
         "//crates/meerkat:meerkat_tools_agent_factory_build_with_runtime_test_support",
         "//crates/meerkat:meerkat_with_runtime_test_support",
