@@ -342,7 +342,11 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   input after the reload instead of resubmitting it (resubmit only with an
   idempotency key); a scheduled delivery waits for the input's own outcome
   for up to 5 lease periods. A custom `ScheduleTargetDelivery` resolves a
-  deduplicated replay's completion from the original input's outcome. An
+  deduplicated replay's completion from the original input's outcome. A
+  delivery whose executor crashed is reclaimed only inside its misfire window
+  (known limitation: under the default `skip` grace and the 60 s lease it
+  ends `misfired`; keep crash recovery with a `catch_up_within`
+  `window_seconds` comfortably longer than the lease). An
   input admission whose write never answers is bounded by the same deadline
   (then `RecoveryRepairBlocked`, `runtime_admission_deadline`; resubmit with
   the same idempotency key); registration, unregister, control writes and
@@ -418,6 +422,16 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Governed tool refusals: the `operation_refused` tool result carries
   `data` `{"kind", "tool_invoked"}` for the model; a mob member upcall
   refusal with no known kind reads as `operation_authorization_unavailable`.
+- Fixed: in a governed realm, input whose model key comes from the
+  environment (`OPENAI_API_KEY` and the other provider and `RKAT_*` keys, no
+  realm binding or none that resolves) now reaches controller authorization;
+  0.9.3 refused it at admission with
+  `controller credential is not currently usable`. Admission holds no
+  credential lease for that route, and every other governed check applies.
+  The route has its own route key, so a stock controller grant admits it only
+  if one of its `--route` keys names it, the build-time fallback from an
+  unresolved configured binding included; otherwise the input is refused with
+  a typed policy refusal. A host with its own controller policy decides there.
 - Fixed: the SQLite session store lays out a whole-blob session compacted more
   than `history_retained_rewrites` times; `@rkat/sdk` `close()` no longer
   keeps Node alive for 5 seconds, and both SDK clients settle on the
@@ -455,8 +469,10 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 3. Handle `AdmissionClosed` and `ShutdownInProgress`; add wildcard arms.
 4. Read `content_filtered` failures by their typed reason.
 5. Use `hot_swap_llm_identity` for model changes; update custom compactors.
-6. Governed hosts: use `bind_host_outcome` for host-reported outcomes, and
-   treat a `ContextChanged` review retirement as not final.
+6. Governed hosts: use `bind_host_outcome` for host-reported outcomes,
+   treat a `ContextChanged` review retirement as not final, and grant an
+   environment key's controller route by its route key if governed work
+   should run on it.
 7. Realtime clients: handle `turn_failed`; Rust: add the new arms and
    `signal_turn_failed`.
 8. Forks: handle `FORK_INSTRUCTION_REFUSED`; upgrade member hosts before their

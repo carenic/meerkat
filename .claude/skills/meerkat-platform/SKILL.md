@@ -341,7 +341,9 @@ surface, not the old live-adapter/docs-refresh snapshot:
     running session with `hot_swap_llm_identity` /
     `hot_swap_session_llm_identity`.
   - Governed realms: `bind_prompt` binds only operator prompts; host-reported
-    outcomes use `bind_host_outcome`.
+    outcomes use `bind_host_outcome`; an environment model key's route now
+    reaches the controller grant, which admits it only when a `--route` key
+    names it (0.9.3 refused it as an unusable controller credential).
   - The tool configuration change bit is `settled`, not `persisted` (rows
     stored before 0.9.4 keep `persisted`); a 0.9.3 SDK against a 0.9.4
     `rkat-rpc` fails on `tool_config_changed`, so upgrade SDKs together.
