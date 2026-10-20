@@ -302,7 +302,10 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   boot recreates on a fresh session) removes the registration and leaves only
   that member Broken with `MobError::MemberRegistrationRefused` until a
   repair; Stop and Shutdown report a member needing a durability reload as
-  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing;
+  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing,
+  and a Resume refuses with `MemberReloadRequired` while a member needs a
+  durability reload (reload it, then Resume; a reload while Stopped answers
+  `Discarded` and the Resume revives the member);
   an uninstalled destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
   `force_cancel_member` / `cancel_all_work` on a member needing a durability

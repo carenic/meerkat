@@ -34,9 +34,11 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   A spawn that finishes into a stopped mob leaves it stopped. Since 0.9.4 a
   local member whose registration needs a durability reload is reported with
   `run` and `starts` `reload_required` instead of failing the Stop; a remote
-  one still fails it (reload it on its host, then retry). Since 0.9.4 a
-  member reloaded while the mob is stopped stays held until Resume, as does
-  one spawned into a stopped mob or held again after a failed Resume;
+  one still fails it (reload it on its host, then retry). A Resume refuses
+  with `MEMBER_RELOAD_REQUIRED` while a member needs a durability reload;
+  reload it (a reload while Stopped answers `discarded`), then Resume. Since
+  0.9.4 a member reloaded while the mob is stopped stays held until Resume,
+  as does one spawned into a stopped mob or held again after a failed Resume;
   retire, Shutdown and destroy release the hold for the members they dispose
   of, so a later registration of the same session is not held, and a mob
   reopened in the same process holds its members only if it is restored
