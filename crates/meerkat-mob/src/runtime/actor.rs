@@ -62867,7 +62867,7 @@ mod bridge_rejection_tests {
             .find("fn supervisor_activation_error")
             .expect("supervisor_activation_error exists");
         let end = source[start..]
-            .find("\n    /// Cancel checkpointers and transition to Stopped.")
+            .find("\n    /// Transition to Stopped.")
             .expect("rollback classifier precedes fail_reset_to_stopped");
         let body = &source[start..start + end];
 
