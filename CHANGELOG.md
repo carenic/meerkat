@@ -1296,7 +1296,8 @@ them.
   a realm whose runtimes or legacy session blob rows hold inline images, with
   the realm blob store. Its two steps are public as well:
   `stage_realm_whole_blob_media` stores the images and writes nothing to the
-  database, and `new_head_canonical_with_staged_media` opens with them.
+  database's sessions, bodies or authorities, and
+  `new_head_canonical_with_staged_media` opens with them.
 
 ### Changed
 
