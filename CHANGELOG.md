@@ -1301,12 +1301,12 @@ them.
   for an authless route, the live selected client must still report exactly
   that selection. Every other governed check still applies, and ungoverned
   hosts, which never held a lease, are unchanged. In a governed realm, the
-  factory's env-key fallback now applies as in an ungoverned one: when a
-  configured binding cannot be resolved (for example a logged-out OAuth
-  binding), work runs on the host's environment key instead of being
-  refused. To forbid that, give the controller a grant that names only the
-  configured credentials; the env-key route is then refused with a typed
-  policy refusal.
+  env-key route, including the factory's fallback to it when a configured
+  binding cannot be resolved (for example a logged-out OAuth binding), now
+  reaches controller authorization instead of being refused at admission: a
+  stock controller grant admits it only if one of its `--route` keys is that
+  route, and a grant that names only the configured routes refuses it with a
+  typed policy refusal.
 - A command sent to a mob while its actor is exiting after a shutdown now
   settles instead of going unanswered (`meerkat-mob`). The actor dropped its
   command channel without waiting for a send that had already reserved
