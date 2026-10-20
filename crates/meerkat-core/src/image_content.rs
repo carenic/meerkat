@@ -732,18 +732,18 @@ pub async fn externalize_messages_from(
         .map(|_| ())
 }
 
-fn content_blocks_have_inline_media(blocks: &[ContentBlock]) -> bool {
+fn content_blocks_have_inline_images(blocks: &[ContentBlock]) -> bool {
     blocks
         .iter()
-        .any(|block| block.image_inline_data().is_some() || block.video_inline_data().is_some())
+        .any(|block| block.image_inline_data().is_some())
 }
 
-fn system_notice_block_has_inline_media(block: &crate::types::SystemNoticeBlock) -> bool {
+fn system_notice_block_has_inline_images(block: &crate::types::SystemNoticeBlock) -> bool {
     match block {
         crate::types::SystemNoticeBlock::Comms { content, .. }
         | crate::types::SystemNoticeBlock::ExternalEvent { content, .. }
         | crate::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
-            content_blocks_have_inline_media(content)
+            content_blocks_have_inline_images(content)
         }
         crate::types::SystemNoticeBlock::ToolConfig { .. }
         | crate::types::SystemNoticeBlock::Mcp { .. }
@@ -754,22 +754,27 @@ fn system_notice_block_has_inline_media(block: &crate::types::SystemNoticeBlock)
     }
 }
 
-/// Whether a row delta still contains media bytes that must cross the blob
+/// Whether a row delta still contains image bytes that must cross the blob
 /// boundary before it can become a HeadCanonical durable row.
+///
+/// Only images have a blob form. Video does not (its bytes are inline or it
+/// is a provider URI), so the persistence paths keep inline video as row
+/// content, as ordinary appends always did, and this classifier does not
+/// count it.
 ///
 /// This is intentionally a pure classifier. A rewrite carrier cannot mutate
 /// retained graph bodies without invalidating their content-addressed
 /// revisions, so it must reject rather than silently externalize such a body.
-pub(crate) fn messages_have_inline_media(messages: &[Message]) -> bool {
+pub(crate) fn messages_have_inline_images(messages: &[Message]) -> bool {
     messages.iter().any(|message| match message {
-        Message::User(user) => content_blocks_have_inline_media(&user.content),
+        Message::User(user) => content_blocks_have_inline_images(&user.content),
         Message::ToolResults { results, .. } => results
             .iter()
-            .any(|result| content_blocks_have_inline_media(&result.content)),
+            .any(|result| content_blocks_have_inline_images(&result.content)),
         Message::SystemNotice(notice) => notice
             .blocks
             .iter()
-            .any(system_notice_block_has_inline_media),
+            .any(system_notice_block_has_inline_images),
         Message::System(_) | Message::BlockAssistant(_) => false,
     })
 }
@@ -1127,11 +1132,11 @@ mod tests {
                 content: vec![inline.clone()],
             },
         ))];
-        assert!(messages_have_inline_media(&messages));
+        assert!(messages_have_inline_images(&messages));
 
         externalize_messages_from(&store, &mut messages, 0).await?;
         assert!(
-            !messages_have_inline_media(&messages),
+            !messages_have_inline_images(&messages),
             "the notice image is stored once, by reference"
         );
         assert_eq!(collect_blob_ids_from_messages(&messages).len(), 1);

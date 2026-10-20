@@ -2555,6 +2555,20 @@ them.
   head, and opening a store that an earlier build converted repairs each
   affected runtime record in place. Pre-existing in 0.9.3.
 
+- `meerkat-core`: a session that holds inline video compacts, and a
+  compacted 0.9.3 session that holds inline video converts to the
+  head-canonical profile. Video has no blob form, so ordinary appends always
+  kept its bytes in the session's rows, but a transcript rewrite refused
+  rows with inline video as if they were images that had to move to the blob
+  store first. A live head-canonical session that had received an inline
+  video could never compact again ("post-rewrite live tail carries inline
+  media"), and the conversion of a compacted 0.9.3 session with inline video
+  (`SqliteRuntimeStore::convert_standalone_whole_blob_in_place`, and the Meta
+  storage migration that runs it) was refused ("compact rewrite delta carries
+  inline media"). Rewrites and the conversion now keep inline video as row
+  content, byte for byte; inline images still move to the blob store before
+  they become rows.
+
 ### Known limitations
 
 - A store that stops answering during registration, unregister or a control
