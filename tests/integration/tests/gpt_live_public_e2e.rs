@@ -4818,11 +4818,26 @@ struct ClockAlignment {
     pairs: usize,
 }
 
+/// How far a sideband frame read just after the disconnect marker may sit
+/// from the median offset of the pairs before it and still pair with the
+/// browser's surplus: the late read itself is a few tens of milliseconds, and
+/// one 200 ms model frame plus scheduling stays well inside it.
+const LATE_READ_PAIR_TOLERANCE_MS: i64 = 1000;
+
 /// Align the sideband with the browser clock through the commentary.appended
 /// events both saw: the provider sends each on both channels, in the same
-/// order. The k-th on one is the k-th on the other only when both saw the
-/// same number, so unequal counts are an error, never a guess; the median
-/// offset is robust to one late stamp.
+/// order, and the k-th on one is the k-th on the other. The browser sees
+/// nothing after its peer disconnects, while the sideband reads on until the
+/// provider ends its stream, so the two must hold the same events before the
+/// disconnect marker. After it the sideband may hold acks the browser never
+/// saw (soak c43aa3db S105 run 1: a result acknowledged 400 ms after the
+/// graceful disconnect), but also an event the browser received just before
+/// it disconnected: a sideband frame is stamped when meerkat reads it, which
+/// can follow the marker (a live gate S102 run: the browser saw 3, the
+/// sideband 2 before the marker and the third just after it). So a browser
+/// surplus over the sideband's frames before the marker pairs with the
+/// sideband's first frames after it, in order, and any other mismatch is an
+/// error, never a guess; the median offset is robust to one late stamp.
 fn sideband_clock_alignment(
     timeline: &[TimelineEntry],
     lines: &[provider_recording::Line],
@@ -4833,21 +4848,47 @@ fn sideband_clock_alignment(
         .filter(|e| e.kind == TimelineKind::CommentaryAppended)
         .map(|e| e.t_ms as i64)
         .collect();
-    // The browser sees nothing after its peer disconnects; the sideband may
-    // still receive acks (soak c43aa3db S105 run 1: a result acknowledged
-    // 400 ms after the graceful disconnect). Pair only what both could see.
     let disconnected = sideband_disconnect_elapsed(lines, channel);
-    let sideband: Vec<i64> = sideband_server_frames(lines, channel, "session.commentary.appended")
-        .map(|(elapsed_ms, _)| elapsed_ms)
-        .filter(|elapsed_ms| disconnected.is_none_or(|at| *elapsed_ms < at))
-        .map(|elapsed_ms| elapsed_ms as i64)
-        .collect();
-    if browser.is_empty() || browser.len() != sideband.len() {
-        return Err(format!(
-            "cannot pair commentary.appended events to align the clocks: the browser saw {} and the sideband {}",
+    let (before, after): (Vec<u64>, Vec<u64>) =
+        sideband_server_frames(lines, channel, "session.commentary.appended")
+            .map(|(elapsed_ms, _)| elapsed_ms)
+            .partition(|elapsed_ms| disconnected.is_none_or(|at| *elapsed_ms < at));
+    let mismatch = || {
+        format!(
+            "cannot pair commentary.appended events to align the clocks: the browser saw {} and the sideband {} before the disconnect marker and {} after it",
             browser.len(),
-            sideband.len()
-        ));
+            before.len(),
+            after.len()
+        )
+    };
+    let surplus = browser
+        .len()
+        .checked_sub(before.len())
+        .filter(|surplus| !browser.is_empty() && *surplus <= after.len())
+        .ok_or_else(mismatch)?;
+    let mut sideband: Vec<i64> = before.iter().map(|elapsed_ms| *elapsed_ms as i64).collect();
+    if surplus > 0 {
+        // A frame read after the marker pairs only when its offset agrees
+        // with the pairs both channels saw before it, so a browser
+        // duplicate cannot hide behind an ack the browser never saw.
+        let mut settled: Vec<i64> = sideband.iter().zip(&browser).map(|(s, b)| s - b).collect();
+        settled.sort_unstable();
+        let median = settled
+            .get(settled.len() / 2)
+            .copied()
+            .ok_or_else(mismatch)?;
+        for (elapsed_ms, browser_ms) in after.iter().take(surplus).zip(&browser[before.len()..]) {
+            let offset = *elapsed_ms as i64 - browser_ms;
+            if (offset - median).abs() > LATE_READ_PAIR_TOLERANCE_MS {
+                return Err(format!(
+                    "{}: a frame read after it is {} ms off the median offset of {} ms",
+                    mismatch(),
+                    offset - median,
+                    median
+                ));
+            }
+            sideband.push(*elapsed_ms as i64);
+        }
     }
     let mut offsets: Vec<i64> = sideband.iter().zip(&browser).map(|(s, b)| s - b).collect();
     offsets.sort_unstable();
@@ -14259,6 +14300,115 @@ mod config_tests {
         assert_eq!((alignment.offset_ms, alignment.pairs), (500, 1));
         assert_eq!(super::sideband_disconnect_elapsed(&lines, 1), Some(5000));
         assert_eq!(super::sideband_disconnect_elapsed(&lines, 2), None);
+    }
+
+    fn commentary_lines(
+        stamps: &[u64],
+        disconnect_at: Option<u64>,
+    ) -> Vec<super::provider_recording::Line> {
+        let mut lines: Vec<super::provider_recording::Line> = stamps
+            .iter()
+            .zip(1_u64..)
+            .map(|(elapsed_ms, seq)| {
+                server_frame(
+                    seq,
+                    *elapsed_ms,
+                    serde_json::json!({"type": "session.commentary.appended"}),
+                )
+            })
+            .collect();
+        if let Some(at) = disconnect_at {
+            lines.push(super::provider_recording::Line {
+                seq: 100,
+                channel_ordinal: 1,
+                elapsed_ms: at,
+                entry: super::provider_recording::Entry::Marker {
+                    step: "disconnect:graceful".to_owned(),
+                },
+            });
+            lines.sort_by_key(|line| line.elapsed_ms);
+        }
+        lines
+    }
+
+    fn commentary_timeline(t_ms: &[u64]) -> Vec<super::TimelineEntry> {
+        let entries: Vec<(u64, &str, serde_json::Value)> = t_ms
+            .iter()
+            .map(|t| (*t, "commentary_appended", serde_json::json!({})))
+            .collect();
+        timeline(&entries)
+    }
+
+    /// The browser saw the last commentary.appended just before it
+    /// disconnected, and the sideband read the same event just after the
+    /// disconnect marker (a live gate S102 run): all three pair.
+    #[test]
+    fn a_commentary_the_sideband_read_after_the_disconnect_still_pairs() {
+        let entries = commentary_timeline(&[1000, 9000, 13_000]);
+        let lines = commentary_lines(&[1500, 9500, 13_520], Some(13_510));
+        let alignment = super::sideband_clock_alignment(&entries, &lines, 1).unwrap();
+        assert_eq!(
+            (alignment.offset_ms, alignment.spread_ms, alignment.pairs),
+            (500, 20, 3)
+        );
+    }
+
+    /// The sideband read one more ack than the browser, after it
+    /// disconnected (soak c43aa3db S105 run 1): the extra trails and is
+    /// left unpaired.
+    #[test]
+    fn a_sideband_ack_after_the_browser_left_trails_unpaired() {
+        let entries = commentary_timeline(&[1000, 9000]);
+        let lines = commentary_lines(&[1500, 9500, 14_000], Some(13_600));
+        let alignment = super::sideband_clock_alignment(&entries, &lines, 1).unwrap();
+        assert_eq!(
+            (alignment.offset_ms, alignment.spread_ms, alignment.pairs),
+            (500, 0, 2)
+        );
+    }
+
+    /// A browser that saw one event twice holds more than the sideband read,
+    /// before the marker or after it: no guess is made.
+    #[test]
+    fn a_browser_duplicate_in_the_middle_still_cannot_pair() {
+        let entries = commentary_timeline(&[1000, 9000, 9010, 13_000]);
+        let lines = commentary_lines(&[1500, 9500, 13_520], Some(13_600));
+        assert_eq!(
+            super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
+            "cannot pair commentary.appended events to align the clocks: the browser saw 4 and the sideband 3 before the disconnect marker and 0 after it"
+        );
+    }
+
+    /// A browser duplicate in the middle cannot hide behind a sideband ack
+    /// the browser never saw after it disconnected: the late frame's offset
+    /// disagrees with the pairs before it.
+    #[test]
+    fn a_browser_duplicate_cannot_hide_behind_a_trailing_sideband_ack() {
+        let entries = commentary_timeline(&[1000, 1010, 9000, 13_000]);
+        let lines = commentary_lines(&[1500, 9500, 13_520, 14_000], Some(13_600));
+        assert_eq!(
+            super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
+            "cannot pair commentary.appended events to align the clocks: the browser saw 4 and the sideband 3 before the disconnect marker and 1 after it: a frame read after it is -3520 ms off the median offset of 4520 ms"
+        );
+    }
+
+    /// An extra event on either side while both were connected cannot pair:
+    /// a sideband that never read one the browser saw, or a sideband that
+    /// read one before the disconnect marker that the browser never saw.
+    #[test]
+    fn a_browser_with_more_events_than_the_sideband_cannot_pair() {
+        let entries = commentary_timeline(&[1000, 9000, 13_000]);
+        let lines = commentary_lines(&[1500, 9500], None);
+        assert_eq!(
+            super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
+            "cannot pair commentary.appended events to align the clocks: the browser saw 3 and the sideband 2 before the disconnect marker and 0 after it"
+        );
+        let entries = commentary_timeline(&[1000, 9000]);
+        let lines = commentary_lines(&[1500, 5000, 9500, 14_000], Some(13_600));
+        assert_eq!(
+            super::sideband_clock_alignment(&entries, &lines, 1).unwrap_err(),
+            "cannot pair commentary.appended events to align the clocks: the browser saw 2 and the sideband 3 before the disconnect marker and 1 after it"
+        );
     }
 
     /// A typed row split across thinking fragments under one token is
