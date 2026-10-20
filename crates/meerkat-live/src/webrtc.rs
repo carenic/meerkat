@@ -2544,14 +2544,16 @@ async fn pump_observations_to_data_channel(
 }
 
 /// Whether an observation stops the assistant's queued output: an
-/// interruption, or a truncation of what was played.
+/// interruption, a truncation of what was played, or a response that ended
+/// without completing (#1883), which commits nothing.
 fn observation_interrupts_output(observation: &LiveAdapterObservation) -> bool {
     match observation {
         LiveAdapterObservation::WithContextObservation { observation, .. } => {
             observation_interrupts_output(observation)
         }
         LiveAdapterObservation::TurnInterrupted { .. }
-        | LiveAdapterObservation::AssistantTranscriptTruncated { .. } => true,
+        | LiveAdapterObservation::AssistantTranscriptTruncated { .. }
+        | LiveAdapterObservation::TurnFailed { .. } => true,
         _ => false,
     }
 }
@@ -3648,6 +3650,33 @@ mod tests {
         let next_generation = control.discard_queued();
         assert!(next_generation > generation);
         assert_eq!(control.queued_packets(), 0);
+    }
+
+    /// A failed response queued on the projection task never returns its
+    /// apply outcome (`TurnFailureProjected`) to the frame loop, so the frame
+    /// loop must stop the response's queued output audio itself, as for an
+    /// interruption: queued means it interrupts output.
+    #[test]
+    fn a_queued_failed_response_still_discards_the_queued_output_audio() {
+        let failed = LiveAdapterObservation::TurnFailed {
+            response_id: Some("resp_failed".to_string()),
+            failure: meerkat_core::live_adapter::LiveResponseFailure {
+                status: meerkat_core::live_adapter::LiveResponseFailureStatus::Failed,
+                reason: None,
+                code: Some("server_error".to_string()),
+                message: Some("provider failed".to_string()),
+            },
+            accounting: meerkat_core::live_adapter::LiveResponseAccounting::Unmeasured {
+                unmeasured: meerkat_core::UnmeasuredTurnUsageAccounting::new(
+                    meerkat_core::Provider::Other,
+                    "webrtc-test",
+                ),
+            },
+        };
+        assert!(
+            !observation_writes_session(&failed) || observation_interrupts_output(&failed),
+            "a queued failure must discard the queued output audio on the frame loop"
+        );
     }
 
     #[test]
