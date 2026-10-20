@@ -1318,6 +1318,106 @@ mod tests {
         );
     }
 
+    /// A realtime projection with a staged spoken assistant transcript: its
+    /// item keys the text by content index.
+    fn state_with_staged_text(session_id: &SessionId) -> SessionRealtimeTranscriptState {
+        let mut live = SessionRealtimeTranscriptProjection::empty(session_id);
+        let _ = live
+            .apply_event(RealtimeTranscriptEvent::UserTranscriptFinal {
+                item_id: "user".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                text: "hello".to_string(),
+            })
+            .expect("user turn");
+        let _ = live
+            .apply_event(RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp".to_string(),
+                delta_id: "delta-1".to_string(),
+                item_id: "assistant".to_string(),
+                previous_item_id: Some("user".to_string()),
+                content_index: 0,
+                delta: "partial answer".to_string(),
+            })
+            .expect("staged assistant text");
+        let state = live.state().clone();
+        assert_eq!(
+            realtime_transcript_revision::realtime_assistant_segment_text(
+                &state,
+                "resp",
+                "assistant",
+                0
+            )
+            .as_deref(),
+            Some("partial answer")
+        );
+        state
+    }
+
+    /// A snapshot record carries the whole projection, whose items key their
+    /// content segments by `u32`. The record is an internally tagged enum, so
+    /// replay decodes it through serde's buffered content, where JSON object
+    /// keys stay strings. An activation snapshot and a rewrite rebase that
+    /// carry staged text both replay, and the text survives.
+    #[test]
+    fn snapshots_with_text_segments_survive_verified_replay() {
+        let session_id = SessionId::new();
+        let state = state_with_staged_text(&session_id);
+        let mut producer =
+            SessionRealtimeTranscriptProjection::from_inline_snapshot(&session_id, state.clone())
+                .expect("activation");
+        let rebase = producer
+            .prepare_rebase_snapshot(state, RealtimeTranscriptSnapshotReasonV1::TranscriptRewrite)
+            .expect("rewrite rebase");
+        producer.apply_prepared_rebase(rebase);
+        let suffix = producer.prepare_suffix().expect("prepare").expect("suffix");
+        assert_eq!(suffix.events().len(), 2, "the activation and the rebase");
+        let verified = verified_sequence(suffix.successor().clone(), suffix.events());
+        let restored =
+            SessionRealtimeTranscriptProjection::from_verified_sequence(&session_id, &verified)
+                .expect("replay both snapshots");
+        assert_eq!(
+            realtime_transcript_revision::realtime_assistant_segment_text(
+                restored.state(),
+                "resp",
+                "assistant",
+                0
+            )
+            .as_deref(),
+            Some("partial answer")
+        );
+    }
+
+    /// A snapshot's segment keys decode only in the exact decimal form the
+    /// writer produces, so a decoded projection serializes back to the same
+    /// bytes.
+    #[test]
+    fn snapshot_segment_keys_decode_only_in_their_written_form() {
+        let session_id = SessionId::new();
+        let record = RealtimeTranscriptSidecarRecord::SnapshotV1 {
+            reason: RealtimeTranscriptSnapshotReasonV1::TranscriptRewrite,
+            base_event_count: 0,
+            state: state_with_staged_text(&session_id),
+        };
+        let written = serde_json::to_value(&record).expect("serialize the record");
+        let decoded: RealtimeTranscriptSidecarRecord =
+            serde_json::from_value(written.clone()).expect("the written keys decode");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize again"),
+            written
+        );
+        let mut renamed = written.clone();
+        let segments = renamed["state"]["items"]["assistant"]["content_segments"]
+            .as_object_mut()
+            .expect("the item's content segments");
+        let text = segments.remove("0").expect("segment 0");
+        segments.insert("00".to_string(), text);
+        assert!(
+            serde_json::from_value::<RealtimeTranscriptSidecarRecord>(renamed).is_err(),
+            "a key in any other form is refused"
+        );
+    }
+
     #[test]
     fn activation_snapshot_moved_from_sequence_zero_is_rejected() {
         let session_id = SessionId::new();
