@@ -1394,8 +1394,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - ``
   - `admission_deduplicated`
-- Emits: `DispatchAccepted`, `Completed`
-- To: `Completed`
+- Emits: `DispatchAccepted`
+- To: `Dispatching`
 
 ### `AwaitCompletionFromDispatching`
 - From: `Dispatching`

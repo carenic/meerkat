@@ -3945,7 +3945,7 @@ mod tests {
     }
 
     #[test]
-    fn deduplicated_admission_terminalizes_completed_from_machine_authority() {
+    fn deduplicated_admission_waits_in_dispatching() {
         let now = Utc::now();
         let dispatching = sample_claimed_occurrence()
             .apply(OccurrenceLifecycleInput::DispatchStarted {
@@ -3955,25 +3955,32 @@ mod tests {
             .expect("dispatch start should pass generated authority")
             .into_occurrence();
 
+        // A deduplicated admission proves that the target admitted this
+        // identity once, not what the existing input did: no terminal yet.
         let mutator = dispatching
             .apply(OccurrenceLifecycleInput::DispatchAccepted {
                 admission_outcome: DeliveryAdmissionOutcome::Deduplicated,
                 at_utc: now + Duration::milliseconds(1),
             })
             .expect("deduplicated admission should pass generated authority");
-        assert!(
-            mutator
-                .effects
-                .contains(&OccurrenceLifecycleEffect::Completed)
+        assert_eq!(
+            mutator.effects(),
+            &[OccurrenceLifecycleEffect::DispatchAccepted],
+            "a deduplicated admission emits only DispatchAccepted, never Completed"
         );
-        let completed = mutator.into_occurrence();
-        assert_eq!(completed.phase, OccurrencePhase::Completed);
-        assert_eq!(completed.failure_class, None);
+        let waiting = mutator.into_occurrence();
+        assert_eq!(waiting.phase, OccurrencePhase::Dispatching);
+        assert_eq!(waiting.completed_at_utc, None);
+        assert_eq!(waiting.failure_class, None);
 
-        let receipt = completed
+        let receipt = waiting
             .delivery_receipt_from_authority(Some(RuntimeDeliveryOutcome::AdmissionDeduplicated))
-            .expect("deduplicated admission should project a completed receipt");
-        assert_eq!(receipt.stage, DeliveryReceiptStage::Completed);
+            .expect("deduplicated admission should project a dispatch-accepted receipt");
+        assert_eq!(receipt.stage, DeliveryReceiptStage::DispatchAccepted);
+        assert_eq!(
+            receipt.runtime_outcome,
+            Some(RuntimeDeliveryOutcome::AdmissionDeduplicated)
+        );
         assert_eq!(
             receipt.correlation_id.as_deref(),
             Some("stable-occurrence-correlation")

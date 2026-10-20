@@ -6259,6 +6259,21 @@ impl MeerkatMachine {
             if entry.require_durability_ready().is_ok() {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotDegraded);
             }
+            // An input admission past its commit outcome deadline holds M
+            // until its store answers; the discard would wait for it.
+            if entry
+                .durability_health
+                .as_ref()
+                .is_some_and(DurabilityHealthHandle::has_owned_write_past_deadline)
+            {
+                return Err(RuntimeDriverError::RecoveryRepairBlocked {
+                    evidence_digest: None,
+                    reason: format!(
+                        "an input admission of session {} has not reported its durable outcome; retry the reload after it does",
+                        witness.session_id()
+                    ),
+                });
+            }
             if let Some(coordinator) = entry.reload_required_discard_coordinator.as_ref() {
                 (coordinator.result_rx.clone(), None)
             } else {

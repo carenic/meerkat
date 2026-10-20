@@ -1513,11 +1513,58 @@ them.
   commit is rejected fails them with `CompletionWaitError::BoundaryRolledBack`
   where they got `AuthorityUnavailable` with a message. In both cases the
   input stays durably admitted: read it after the reload instead of
-  resubmitting it. A reload refuses with the retryable
+  resubmitting it. The public error class is unchanged (authority
+  unavailable); the message names the case, so resubmit only with an
+  idempotency key. A reload refuses with the retryable
   `RuntimeDriverError::RecoveryRepairBlocked` until the store answers, then
   replaces the registration from durable truth. A mob member's tracked turn
   stays pending on either failure, as on `AuthorityUnavailable`, and a
-  scheduled delivery records `RuntimeCompletionAuthorityUnavailable`.
+  scheduled delivery waits for the input's own terminal outcome (below).
+- `meerkat-schedule`, `meerkat`: a scheduled occurrence's terminal now comes
+  only from its delivered input's own terminal outcome. A reclaim whose
+  redelivery the target deduplicated (it had admitted the same stable
+  delivery identity before) recorded the occurrence `completed` at admission
+  without reading that input. The occurrence now stays `dispatching` and
+  waits as for an accepted delivery; its receipt still records the admission
+  as deduplicated. A `ScheduleTargetDelivery` implementation's completion for
+  a deduplicated replay now decides the occurrence's terminal; it must
+  resolve from the original input's outcome. After such a reclaim:
+  - the existing input is still live: the occurrence waits for it and ends
+    with its outcome;
+  - it failed: `delivery_failed` with its failure class;
+  - its receipt is not finalized yet, the store cannot be read, or the
+    input's session degraded while a stalled commit holds its runtime
+    driver (`RuntimeDriverError::InputTerminalNotYetReadable`): the
+    occurrence keeps its lease and re-reads the outcome for up to 5 lease
+    periods (5 minutes at the default 60 s lease), then ends
+    `delivery_failed` with `runtime_completion_authority_unavailable`;
+  - it ended without a public completion, its receipt cannot be read, or it
+    has left the runtime (a row that recovery discarded, a store-less
+    runtime's archived input): `delivery_failed` with
+    `runtime_completion_authority_unavailable`, at the bound above where the
+    read only says not yet. Such an input is not admitted a second time;
+  - the same read serves an accepted input that is already terminal at
+    admission: when its outcome read answered that no receipt was finalized
+    yet, the occurrence ended `delivery_failed` at once; it now waits under
+    the same bound. Nothing reclaims an occurrence while it waits, so the
+    wait does not depend on the misfire policy.
+- `meerkat`: a runtime-backed scheduled delivery whose completion wait fails
+  with `CompletionWaitError::BoundaryRolledBack` or
+  `CompletionWaitError::DurableOutcomeUnknown` no longer ends
+  `delivery_failed` with `runtime_completion_authority_unavailable` from
+  that wait failure. Either failure leaves the input durably admitted with
+  its outcome still to come: it runs again after its session reloads, or its
+  stalled commit lands. The occurrence keeps its lease and re-reads the
+  input's own terminal outcome under the bound above (5 lease periods), then
+  ends with that outcome: `completed`, or `delivery_failed` with the input's
+  failure class. At the bound it ends `delivery_failed` with
+  `runtime_completion_authority_unavailable`, and the detail names the bound
+  and the last cause. Nothing in the wait reloads the session: a reload comes
+  from the session's own traffic (the next delivery or input through its
+  host, or a mob's `reload_member_registration`). Every other wait failure
+  still ends the occurrence at once, and so does a dispatch built with
+  `AcceptedScheduledInput::with_runtime_handle`, which names no input to
+  read.
 - The bundled SQLite is built without its three process-wide locks:
   allocator statistics, one page cache shared by every connection, and
   page-cache overflow statistics. Each put a mutex in front of every
@@ -2198,15 +2245,43 @@ them.
   tracked-input cancel waited behind a boundary commit or run
   terminalization that holds the session's driver. Past its deadline such a
   commit holds the driver until the store answers, so once the session
-  degrades they answer without it: the active-input read answers busy, the
-  contributor terminal is unknown, and the others refuse with the typed,
-  retryable `RecoveryRepairBlocked`.
+  degrades they answer without it: the active-input read answers busy, an
+  input's terminal completion refuses with the new, retryable
+  `RuntimeDriverError::InputTerminalNotYetReadable` (the enum is
+  `#[non_exhaustive]`), the contributor terminal is unknown, and the others
+  refuse with the typed, retryable `RecoveryRepairBlocked`.
 - A boundary commit whose store never answered (a stalled disk or a hung
   network filesystem, for example) kept the session's mutation gate for
   good, so every later wait for the gate waited for it, a mob destroy's
   retirement of the member and a force cancel of it included. The commit's
   declared deadline now degrades the session (see Changed), those waits end
   typed, and a reload replaces the registration once the store has answered.
+- An input admission whose store write never answered kept the session's
+  mutation gate and driver until it did, so every later wait for the gate
+  waited for the store: the session's next admission, its next run and a
+  reload of it. The admission now waits for its write only as long as the
+  store's declared commit outcome deadline (120 s for the SQLite store).
+  Past it, the admission refuses with the retryable
+  `RuntimeDriverError::RecoveryRepairBlocked`, naming the input, and the
+  session needs a reload (`runtime_admission_deadline`), so those waits end
+  typed. The write keeps running and keeps the gate until the store answers,
+  so the input may still be admitted: resubmit it with the same idempotency
+  key, or read it after the reload. A reload refuses with the same
+  retryable error until the store answers, then replaces the registration
+  from durable truth. Sessions without durable state, and stores that
+  declare no deadline (the in-memory store), admit as before.
+- A scheduled mob delivery whose redelivery found the delivery already failed
+  (`meerkat-mob-mcp`) recorded the occurrence `completed`. It now records
+  `delivery_failed` with the delivery's failure class.
+
+### Known limitations
+
+- A store that stops answering during registration, unregister or a control
+  write still holds the session's gate until it answers. So does one that
+  stops answering during the session's other writes under the gate that no
+  deadline covers: recovery, the runtime loop's writes other than a run's
+  boundary commit and terminalization (a run's staging, for example), and
+  the live-boundary work that follows an admission.
 - A fork child of a member or session with activated host instructions no
   longer commits only to fail its first turn ("forked session must explicitly
   activate inherited instruction keys"). `fork_off`, council participants, the

@@ -152,6 +152,16 @@ pub enum RuntimeDriverError {
         reason: String,
     },
 
+    /// An input's terminal is not readable yet: its session's durability
+    /// degraded while a commit past its deadline still holds the session's
+    /// runtime driver. Retryable: the reload settles that commit, and a
+    /// later read resolves the terminal.
+    #[error("{reason}")]
+    InputTerminalNotYetReadable {
+        input_id: meerkat_core::lifecycle::InputId,
+        reason: String,
+    },
+
     /// Atomic unregister persistence may already be durable. The live retry
     /// anchor is retained, but no compensating durable rollback may run.
     #[error("Unregister finalization outcome is unknown: {reason}")]

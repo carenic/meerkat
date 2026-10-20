@@ -111,7 +111,141 @@ enum RetryableLiveBoundaryPreparation {
     Stale { reason: String },
 }
 
+/// The durability reload cause of an input admission whose store write
+/// reported no durable outcome within the store's commit outcome deadline.
+const RUNTIME_ADMISSION_DEADLINE: &str = "runtime_admission_deadline";
+
+/// An input admission's store write that answered: the session's mutation
+/// gate (M) and driver guard it held, handed back with the write's outcome.
+/// Dropped whole (a write past its deadline whose store answered late), it
+/// releases the driver before M, the reverse of the order they were taken.
+struct AnsweredAdmissionWrite {
+    driver: crate::tokio::sync::OwnedMutexGuard<super::driver::DriverEntry>,
+    held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
+    result: Result<AcceptOutcome, RuntimeDriverError>,
+}
+
+/// The typed, retryable refusal of an input admission whose store write
+/// passed its commit outcome deadline without an answer. The write may still
+/// land, so the input may be admitted once the store answers.
+fn admission_outcome_unknown_refusal(input_id: &InputId) -> RuntimeDriverError {
+    RuntimeDriverError::RecoveryRepairBlocked {
+        evidence_digest: None,
+        reason: format!(
+            "input {input_id}: its admission has not reported its durable outcome; resubmit it with the same idempotency key, or read the input after the session reloads"
+        ),
+    }
+}
+
 impl MeerkatMachine {
+    /// Write an input admission through the session driver, owning M and the
+    /// driver guard, within the store's declared commit outcome deadline.
+    ///
+    /// A driver whose store declares a deadline, with durability health,
+    /// writes in an owned child task that owns `held_mutation_gate` and
+    /// `driver` (taken in that order) and hands both back with the outcome.
+    /// The caller waits for it as long as the store declares a commit may
+    /// take, and warns at half of it. Past the deadline the write counts as
+    /// past it until the store answers (the reload-required discard refuses
+    /// typed meanwhile), the session needs a reload
+    /// (`runtime_admission_deadline`), its degraded gate settlement is handed
+    /// off as a waiter that left on the degradation would, and the caller
+    /// answers a typed, retryable refusal. The child is never aborted: it
+    /// keeps M and the driver until the store answers, since a store may
+    /// commit on a blocking worker that dropping an await cannot stop, and
+    /// the reload reads the durable truth once it has. Other drivers write
+    /// inline, as before.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_admission_within_commit_deadline(
+        &self,
+        session_id: &SessionId,
+        gate: &SessionMutationGate,
+        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
+        mut driver: crate::tokio::sync::OwnedMutexGuard<super::driver::DriverEntry>,
+        input: Input,
+        resolved: crate::accept::ResolvedAdmission,
+        credential_custody: &Arc<super::credential_custody::NativeCredentialCustody>,
+    ) -> Result<AnsweredAdmissionWrite, RuntimeDriverError> {
+        let commit_deadline = driver.runtime_loop_commit_deadline();
+        #[cfg(any(test, feature = "test-support"))]
+        let commit_deadline = commit_deadline
+            .map(|commit_deadline| self.runtime_commit_deadline_for_test(commit_deadline));
+        let Some(commit_deadline) = commit_deadline else {
+            let result = driver
+                .accept_resolved_input_with_credential(input, resolved, credential_custody)
+                .await;
+            return Ok(AnsweredAdmissionWrite {
+                held_mutation_gate,
+                driver,
+                result,
+            });
+        };
+        let input_id = input.id().clone();
+        let write = commit_deadline
+            .durability_health()
+            .begin_owned_store_write();
+        let child_write = write.clone();
+        let child_custody = Arc::clone(credential_custody);
+        let task = crate::tokio::spawn(async move {
+            let answered = child_write.answer_on_drop();
+            let result = driver
+                .accept_resolved_input_with_credential(input, resolved, &child_custody)
+                .await;
+            // Settled before M and the driver go back (or, past the
+            // deadline, are released).
+            drop(answered);
+            AnsweredAdmissionWrite {
+                held_mutation_gate,
+                driver,
+                result,
+            }
+        });
+        let mut task = std::pin::pin!(task);
+        let deadline = commit_deadline.deadline();
+        let warn_after = deadline / 2;
+        let joined = match crate::tokio::time::timeout(warn_after, task.as_mut()).await {
+            Ok(joined) => Some(joined),
+            Err(_) => {
+                tracing::warn!(
+                    %session_id,
+                    %input_id,
+                    waited = ?warn_after,
+                    deadline = ?deadline,
+                    "runtime input admission has not reported its durable outcome yet"
+                );
+                crate::tokio::time::timeout(deadline.saturating_sub(warn_after), task.as_mut())
+                    .await
+                    .ok()
+            }
+        };
+        let joined = match joined {
+            Some(joined) => joined,
+            None => {
+                if !write.mark_past_deadline(
+                    RUNTIME_ADMISSION_DEADLINE,
+                    format!(
+                        "input {input_id}: the store reported no durable outcome for its admission within {deadline:?}; the admission may still land"
+                    ),
+                ) {
+                    // The store answered as the deadline passed: the write
+                    // is about to hand M and the driver back.
+                    task.as_mut().await
+                } else {
+                    self.hand_off_degraded_gate_settlement(session_id, gate.clone());
+                    // Returning drops the join handle, which detaches the
+                    // write: it keeps M and the driver until the store
+                    // answers.
+                    return Err(admission_outcome_unknown_refusal(&input_id));
+                }
+            }
+        };
+        joined.map_err(|error| {
+            RuntimeDriverError::Internal(format!(
+                "owned runtime input admission write ended without a result: {error}"
+            ))
+        })
+    }
+
     /// Select whether generated admission should attempt exact live-boundary
     /// staging. The machine-owned current run plus the exact captured
     /// attachment capabilities are sufficient to select the plan; the
@@ -1672,6 +1806,9 @@ impl MeerkatMachine {
         credential_custody: super::credential_custody::NativeCredentialCustody,
         mut admission_custody: Option<crate::input_admission_custody::NativeInputAdmissionGuard>,
     ) -> Result<MeerkatMachineCommandResult, RuntimeDriverError> {
+        // Shared with the owned admission write, which keeps its copy until
+        // the store answers.
+        let credential_custody = Arc::new(credential_custody);
         match command {
             MeerkatMachineCommand::AcceptWithCompletion {
                 session_id,
@@ -1911,7 +2048,7 @@ impl MeerkatMachine {
                     signal,
                     mut fallback_wake,
                 ) = {
-                    let mut driver = driver.lock().await;
+                    let driver = Arc::clone(&driver).lock_owned().await;
                     // origin/main observability: surface the idle/running
                     // disposition (idle, attached non-steer, or attached peer)
                     // for ingress-admission diagnostics, including the
@@ -1986,11 +2123,29 @@ impl MeerkatMachine {
                     if let Some(custody) = admission_custody.as_mut() {
                         custody.begin_admission_attempt();
                     }
-                    let result = match driver
-                        .accept_resolved_input_with_credential(input, resolved, &credential_custody)
-                        .await
-                        .map_err(Self::normalize_destroyed_error)
-                    {
+                    let held_mutation_gate = gate_guard.take().ok_or_else(|| {
+                        RuntimeDriverError::Internal(
+                            "AcceptWithCompletion lost its held session mutation gate before its admission write"
+                                .to_string(),
+                        )
+                    })?;
+                    // A refusal past the store's commit outcome deadline
+                    // leaves the admission custody unsettled, as any error
+                    // that may follow a committed write does.
+                    let answered = self
+                        .write_admission_within_commit_deadline(
+                            &session_id,
+                            &gate,
+                            held_mutation_gate,
+                            driver,
+                            input,
+                            resolved,
+                            &credential_custody,
+                        )
+                        .await?;
+                    gate_guard = Some(answered.held_mutation_gate);
+                    let _driver_guard = answered.driver;
+                    let result = match answered.result.map_err(Self::normalize_destroyed_error) {
                         Ok(r) => r,
                         Err(err) => {
                             // These typed failures are defined before acceptance.
@@ -2353,8 +2508,8 @@ impl MeerkatMachine {
                     );
                     return Err(error);
                 }
-                let (outcome, accepted_input_id) = {
-                    let mut driver = driver.lock().await;
+                let (outcome, accepted_input_id, gate_guard) = {
+                    let driver = Arc::clone(&driver).lock_owned().await;
                     driver.authenticate_work_with_credential(&input, &credential_custody)?;
                     let resolved = match driver
                         .resolve_admission_without_wake_with_active_turn_boundary(&input, false)
@@ -2390,11 +2545,20 @@ impl MeerkatMachine {
                         return Err(error);
                     }
                     let displaced_input_id = resolved.displaced_queued_input_id().cloned();
-                    let result = match driver
-                        .accept_resolved_input_with_credential(input, resolved, &credential_custody)
-                        .await
-                        .map_err(Self::normalize_destroyed_error)
-                    {
+                    let answered = self
+                        .write_admission_within_commit_deadline(
+                            &session_id,
+                            &mutation_gate,
+                            gate_guard,
+                            driver,
+                            input,
+                            resolved,
+                            &credential_custody,
+                        )
+                        .await?;
+                    let gate_guard = answered.held_mutation_gate;
+                    let _driver_guard = answered.driver;
+                    let result = match answered.result.map_err(Self::normalize_destroyed_error) {
                         Ok(r) => r,
                         Err(err) => return Err(err),
                     };
@@ -2420,7 +2584,7 @@ impl MeerkatMachine {
                         AcceptOutcome::Deduplicated { .. } => None,
                         AcceptOutcome::Rejected { .. } => unreachable!("handled above"),
                     };
-                    (result, accepted_input_id)
+                    (result, accepted_input_id, gate_guard)
                 };
                 if let Some(input_id) = accepted_input_id {
                     let effects = match self

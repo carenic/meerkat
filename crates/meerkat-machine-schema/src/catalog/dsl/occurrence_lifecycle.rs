@@ -1443,11 +1443,13 @@ machine! {
             emit DispatchAccepted
         }
 
-        // A deduplicated admission is the target's durable proof that this
-        // occurrence's stable exactly-once identity already took effect. A
-        // reclaim after the original deliverer crashed must therefore
-        // terminalize successfully even when no live completion channel
-        // survived that crash.
+        // A deduplicated admission proves that the target admitted this
+        // occurrence's stable delivery identity once, not what that input
+        // then did. The occurrence waits for that input's outcome exactly as
+        // an accepted admission does: it stays Dispatching, and its terminal
+        // comes only from the existing input's own terminal outcome. The
+        // receipt keeps the dedup, through the admission outcome the driver
+        // records with this transition.
         transition DispatchDeduplicatedFromDispatching {
             on input DispatchAccepted { admission_outcome, at_utc_ms }
             guard {
@@ -1458,15 +1460,13 @@ machine! {
                 admission_outcome == DeliveryAdmissionOutcome::Deduplicated
             }
             update {
-                self.completed_at_utc_ms = Some(at_utc_ms);
                 self.receipt_recorded_at_utc_ms = Some(at_utc_ms);
-                self.receipt_stage = Some(DeliveryReceiptStage::Completed);
+                self.receipt_stage = Some(DeliveryReceiptStage::DispatchAccepted);
                 self.receipt_failure_class = None;
                 self.receipt_detail = None;
             }
-            to Completed
+            to Dispatching
             emit DispatchAccepted
-            emit Completed
         }
 
         // --- Await completion ---

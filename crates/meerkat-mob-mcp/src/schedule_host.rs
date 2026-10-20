@@ -1263,8 +1263,9 @@ mod tests {
     use std::sync::Mutex;
 
     use meerkat::{
-        CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy,
-        OccurrenceOrdinal, OverlapPolicy, ResolvedSpawnSnapshot, Schedule, TargetBinding,
+        CreateScheduleRequest, IntervalTriggerSpec, MemoryScheduleStore, MisfirePolicy,
+        MissingTargetPolicy, OccurrenceOrdinal, OverlapPolicy, ResolvedSpawnSnapshot, Schedule,
+        ScheduleDriver, ScheduleDriverConfig, ScheduleService, ScheduleStore, TargetBinding,
         TriggerSpec,
     };
     use meerkat_core::tool_scope::ToolFilter;
@@ -1915,6 +1916,338 @@ mod tests {
             Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
         );
         assert_eq!(runtime.run_flows.lock().expect("run lock").len(), 1);
+    }
+
+    /// Routes mob-target occurrences through the real schedule driver to the
+    /// mob host, as the surface's shared adapter does for a mob binding.
+    ///
+    /// While `crashed_terminal` holds a terminal, the next delivery stands in
+    /// for a delivering process that dies after the mob durably recorded the
+    /// delivery's own terminal and before the schedule observed it: that
+    /// terminal is committed on the delivery's durable record, and the
+    /// driver's waiter gets none, so the occurrence stays reclaimable.
+    struct MobHostScheduleDriverAdapter {
+        host: MobMcpScheduleHost,
+        runtime: Arc<RecordingMobRuntime>,
+        crashed_terminal: Mutex<Option<MobExternalDeliveryTerminal>>,
+        admissions: Mutex<Vec<(u32, Option<meerkat_schedule::RuntimeDeliveryOutcome>)>>,
+    }
+
+    impl MobHostScheduleDriverAdapter {
+        fn new(
+            runtime: Arc<RecordingMobRuntime>,
+            crashed_terminal: MobExternalDeliveryTerminal,
+        ) -> Self {
+            Self {
+                host: MobMcpScheduleHost::from_runtime(runtime.clone()),
+                runtime,
+                crashed_terminal: Mutex::new(Some(crashed_terminal)),
+                admissions: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn scheduled_mob_target(
+        occurrence: &Occurrence,
+    ) -> Result<&MobTargetBinding, ScheduleDomainError> {
+        match &occurrence.target_snapshot {
+            TargetBinding::Mob(binding) => Ok(binding.as_ref()),
+            _ => Err(ScheduleDomainError::Internal(
+                "the mob driver adapter received a non-mob target".to_string(),
+            )),
+        }
+    }
+
+    #[async_trait]
+    impl meerkat::ScheduleTargetProbe for MobHostScheduleDriverAdapter {
+        async fn probe_target(
+            &self,
+            occurrence: &Occurrence,
+        ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+            self.host
+                .probe_mob_target(scheduled_mob_target(occurrence)?)
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl meerkat::ScheduleTargetDelivery for MobHostScheduleDriverAdapter {
+        async fn deliver_occurrence(
+            &self,
+            occurrence: &Occurrence,
+            identity: &ScheduleDeliveryIdentity,
+        ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+            let binding = scheduled_mob_target(occurrence)?;
+            let mut dispatch = self
+                .host
+                .deliver_mob_target(occurrence, identity, binding)
+                .await?;
+            self.admissions.lock().expect("admissions lock").push((
+                occurrence.attempt_count,
+                dispatch.receipt.runtime_outcome.clone(),
+            ));
+            let crashed_terminal = self
+                .crashed_terminal
+                .lock()
+                .expect("crashed terminal lock")
+                .take();
+            if let Some(terminal) = crashed_terminal {
+                let (_, intent) = mob_delivery_intent(
+                    MobId::from(mob_binding_mob_id(binding)),
+                    identity,
+                    MobExternalDeliveryTargetKind::MemberSend,
+                    binding
+                        .stable_key()
+                        .map_err(ScheduleDomainError::InvalidSchedule)?,
+                )?;
+                self.runtime
+                    .complete_external_delivery(&intent, &terminal)
+                    .await
+                    .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
+                let lost: DeliveryCompletion = Box::pin(async {
+                    Err::<DeliveryTerminal, ScheduleDomainError>(
+                        ScheduleDomainError::DeliveryRepairDeferred {
+                            detail: "the delivering process died before it observed the mob delivery terminal"
+                                .to_string(),
+                        },
+                    )
+                });
+                dispatch.completion = lost;
+            }
+            Ok(dispatch)
+        }
+    }
+
+    async fn wait_for_terminal_mob_occurrence(
+        service: &ScheduleService,
+        schedule_id: &meerkat::ScheduleId,
+    ) -> Occurrence {
+        for _ in 0..300 {
+            let occurrences = service
+                .list_occurrences(schedule_id)
+                .await
+                .expect("list scheduled mob occurrences");
+            if let Some(occurrence) = occurrences.into_iter().find(|occurrence| {
+                matches!(
+                    occurrence.phase,
+                    meerkat::OccurrencePhase::Completed
+                        | meerkat::OccurrencePhase::DeliveryFailed
+                        | meerkat::OccurrencePhase::Misfired
+                        | meerkat::OccurrencePhase::Skipped
+                        | meerkat::OccurrencePhase::Superseded
+                )
+            }) {
+                return occurrence;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the scheduled mob delivery never reached a terminal phase");
+    }
+
+    /// Drive one scheduled member send through the real schedule driver: the
+    /// first attempt's process records `external_terminal` as the delivery's
+    /// durable terminal and dies before the schedule observes it, the lease
+    /// lapses well inside the skip policy's 30 s grace, and the next tick
+    /// reclaims the occurrence and redelivers it under the same stable
+    /// identity, where the mob host answers from that durable record.
+    /// Returns the reclaimed occurrence once it is terminal, with the
+    /// schedule store and the adapter's recorded admissions.
+    async fn reclaimed_member_delivery_meeting_external_terminal(
+        external_terminal: MobExternalDeliveryTerminal,
+    ) -> (
+        Occurrence,
+        Arc<dyn ScheduleStore>,
+        Arc<MobHostScheduleDriverAdapter>,
+        Arc<RecordingMobRuntime>,
+    ) {
+        let runtime = Arc::new(RecordingMobRuntime::default());
+        runtime.with_member("deploy-monitor");
+        let adapter = Arc::new(MobHostScheduleDriverAdapter::new(
+            Arc::clone(&runtime),
+            external_terminal,
+        ));
+        let store: Arc<dyn ScheduleStore> = Arc::new(MemoryScheduleStore::new());
+        let service = ScheduleService::new(Arc::clone(&store));
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("mob-reclaim-external-terminal".to_string()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - chrono::Duration::seconds(1),
+                },
+                target: TargetBinding::Mob(Box::new(MobTargetBinding::Member {
+                    mob_id: "ops".to_string(),
+                    member_id: "deploy-monitor".to_string(),
+                    action: ScheduledMobAction::Send {
+                        content: ContentInput::Text("Check deploy state.".to_string()),
+                        render_metadata: None,
+                    },
+                })),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::SkipIfRunning,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("create the scheduled mob send");
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            Arc::clone(&store),
+            adapter.clone(),
+            adapter.clone(),
+            "mob-delivery-owner",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: chrono::Duration::milliseconds(50),
+            },
+        );
+
+        driver.tick_once().await.expect("first delivery tick");
+        let first = service
+            .list_occurrences(&schedule.schedule_id)
+            .await
+            .expect("list scheduled mob occurrences")
+            .into_iter()
+            .next()
+            .expect("the first tick planned the occurrence");
+        assert_eq!(first.attempt_count, 1);
+        assert_eq!(
+            first.phase,
+            meerkat::OccurrencePhase::AwaitingCompletion,
+            "the lost first attempt leaves the occurrence awaiting its outcome"
+        );
+
+        sleep(Duration::from_millis(120)).await;
+        driver.tick_once().await.expect("reclaim tick");
+        let reclaimed = wait_for_terminal_mob_occurrence(&service, &schedule.schedule_id).await;
+        assert_eq!(reclaimed.occurrence_id, first.occurrence_id);
+        assert_eq!(
+            reclaimed.attempt_count, 2,
+            "the terminal comes from the reclaimed attempt"
+        );
+        assert_eq!(
+            adapter
+                .admissions
+                .lock()
+                .expect("admissions lock")
+                .as_slice(),
+            &[
+                (
+                    1,
+                    Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionAccepted)
+                ),
+                (
+                    2,
+                    Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
+                ),
+            ],
+            "the reclaim must meet the durable delivery record as a deduplicated admission"
+        );
+        assert!(
+            runtime.sent_members.lock().expect("sent lock").is_empty(),
+            "the redelivery answers from the durable record and never repeats the send"
+        );
+        (reclaimed, store, adapter, runtime)
+    }
+
+    /// A reclaimed scheduled mob delivery whose durable record already holds
+    /// a failed terminal ends the occurrence DeliveryFailed with the failure
+    /// reason the mob's failure class maps to, never Completed. The
+    /// deduplicated admission proves only that the delivery was admitted
+    /// once; the occurrence waits for that delivery's own outcome. Before a
+    /// deduplicated admission waited, this occurrence recorded Completed at
+    /// the admission.
+    #[tokio::test]
+    async fn reclaimed_delivery_with_failed_external_terminal_records_delivery_failed() {
+        let failure_class = MobFailureClass::TargetBusy;
+        let (occurrence, store, _adapter, _runtime) =
+            reclaimed_member_delivery_meeting_external_terminal(
+                MobExternalDeliveryTerminal::failed_with_class(
+                    failure_class,
+                    "member refused the scheduled send while busy",
+                ),
+            )
+            .await;
+
+        assert_eq!(
+            delivery_failure_reason_for_class(failure_class),
+            DeliveryFailureReason::TargetBusy,
+            "the mob failure class maps to the schedule's target-busy delivery failure"
+        );
+        assert_eq!(
+            occurrence.phase,
+            meerkat::OccurrencePhase::DeliveryFailed,
+            "a deduplicated redelivery of a failed mob delivery must record that failure"
+        );
+        assert_eq!(
+            occurrence.failure_class,
+            Some(meerkat::OccurrenceFailureClass::TargetBusy),
+            "the occurrence records the class of the reason the mob failure maps to"
+        );
+        assert!(
+            occurrence
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("member refused the scheduled send")),
+            "the occurrence keeps the delivery's own failure detail: {:?}",
+            occurrence.failure_detail
+        );
+        let receipts = store
+            .list_receipts(&occurrence.occurrence_id)
+            .await
+            .expect("list occurrence receipts");
+        assert!(
+            receipts.iter().any(|receipt| {
+                receipt.attempt == 2
+                    && receipt.stage == meerkat::DeliveryReceiptStage::DispatchAccepted
+                    && receipt.runtime_outcome
+                        == Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
+            }),
+            "the receipt history keeps the deduplicated admission: {receipts:?}"
+        );
+        assert!(
+            !receipts
+                .iter()
+                .any(|receipt| receipt.stage == meerkat::DeliveryReceiptStage::Completed),
+            "no Completed receipt may be recorded for a failed delivery: {receipts:?}"
+        );
+    }
+
+    /// Control for the failed case: a reclaimed scheduled mob delivery whose
+    /// durable record holds a completed terminal ends the occurrence
+    /// Completed, as it did before a deduplicated admission waited for the
+    /// delivery's outcome.
+    #[tokio::test]
+    async fn reclaimed_delivery_with_completed_external_terminal_records_completed() {
+        let (occurrence, store, _adapter, _runtime) =
+            reclaimed_member_delivery_meeting_external_terminal(
+                MobExternalDeliveryTerminal::Completed,
+            )
+            .await;
+
+        assert_eq!(occurrence.phase, meerkat::OccurrencePhase::Completed);
+        assert_eq!(occurrence.failure_class, None);
+        let receipts = store
+            .list_receipts(&occurrence.occurrence_id)
+            .await
+            .expect("list occurrence receipts");
+        assert!(
+            receipts.iter().any(|receipt| {
+                receipt.attempt == 2
+                    && receipt.stage == meerkat::DeliveryReceiptStage::DispatchAccepted
+                    && receipt.runtime_outcome
+                        == Some(meerkat_schedule::RuntimeDeliveryOutcome::AdmissionDeduplicated)
+            }),
+            "the receipt history keeps the deduplicated admission: {receipts:?}"
+        );
+        assert!(
+            receipts.iter().any(|receipt| {
+                receipt.attempt == 2 && receipt.stage == meerkat::DeliveryReceiptStage::Completed
+            }),
+            "the completed delivery records its Completed receipt: {receipts:?}"
+        );
     }
 
     #[tokio::test]

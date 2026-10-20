@@ -35045,6 +35045,12 @@ pub(super) struct RuntimeCommitAtomicityStore {
     machine_lifecycle_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
     /// How long every success boundary commit takes before it commits.
     success_boundary_delay: std::sync::Mutex<Option<Duration>>,
+    /// Holds the next input-state batch write that persists its input (the
+    /// input's admission) before it commits.
+    admission_hold: std::sync::Mutex<Option<HeldStoreCommit>>,
+    /// How long the next input-state batch write that persists the input
+    /// takes before it commits.
+    admission_delay: std::sync::Mutex<Option<(InputId, Duration)>>,
     fail_atomic_apply: AtomicBool,
     unsupported_atomic_machine_lifecycle: AtomicBool,
     fail_commit_machine_lifecycle: AtomicBool,
@@ -35081,6 +35087,8 @@ impl RuntimeCommitAtomicityStore {
             success_boundary_hold: std::sync::Mutex::new(None),
             machine_lifecycle_hold: std::sync::Mutex::new(None),
             success_boundary_delay: std::sync::Mutex::new(None),
+            admission_hold: std::sync::Mutex::new(None),
+            admission_delay: std::sync::Mutex::new(None),
             fail_atomic_apply: AtomicBool::new(false),
             unsupported_atomic_machine_lifecycle: AtomicBool::new(false),
             fail_commit_machine_lifecycle: AtomicBool::new(false),
@@ -35246,6 +35254,26 @@ impl RuntimeCommitAtomicityStore {
             .success_boundary_delay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(delay);
+    }
+
+    /// Hold the next input-state batch write that persists `input_id` (its
+    /// admission) until the returned control releases it.
+    pub(super) fn hold_next_admission_commit(&self, input_id: &InputId) -> HeldStoreCommitControl {
+        let (hold, control) = HeldStoreCommit::armed(input_id);
+        *self
+            .admission_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        control
+    }
+
+    /// Make the next input-state batch write that persists `input_id` (its
+    /// admission) take `delay` before it commits.
+    pub(super) fn delay_next_admission_commit(&self, input_id: &InputId, delay: Duration) {
+        *self
+            .admission_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((input_id.clone(), delay));
     }
 
     fn arm_block_initialize_ops_after_selection(&self, entered: Arc<Notify>, release: Arc<Notify>) {
@@ -35624,6 +35652,46 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         runtime_id: &LogicalRuntimeId,
         states: &[crate::input_state::InputStatePersistenceRecord],
     ) -> Result<(), crate::store::RuntimeStoreError> {
+        let persists = |input_id: &InputId| {
+            states
+                .iter()
+                .any(|state| &state.as_stored().state.input_id == input_id)
+        };
+        let delay = {
+            let mut slot = self
+                .admission_delay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|(input_id, _)| persists(input_id))
+            {
+                slot.take().map(|(_, delay)| delay)
+            } else {
+                None
+            }
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let hold = {
+            let mut slot = self
+                .admission_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.as_ref().is_some_and(|hold| persists(&hold.input_id)) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hold) = hold
+            && hold.wait().await == HeldStoreCommitRelease::Fail
+        {
+            return Err(crate::store::RuntimeStoreError::WriteFailed(
+                "synthetic held admission write failure".into(),
+            ));
+        }
         self.inner
             .persist_input_states_atomically(runtime_id, states)
             .await
@@ -50194,6 +50262,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         }
         RuntimeDriverError::RecoveryBackoff { reason } => {
             format!("recovery_backoff:{reason}")
+        }
+        RuntimeDriverError::InputTerminalNotYetReadable { input_id, reason } => {
+            format!("input_terminal_not_yet_readable:{input_id}:{reason}")
         }
         RuntimeDriverError::RecoveryRepairBlocked {
             evidence_digest,
