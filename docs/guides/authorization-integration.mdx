@@ -329,9 +329,10 @@ changes while they are read. The refusal is
 error code in 0.9.4, and on the wire its message reads
 `respawn of member <id> refused: <reason>`. This includes a member whose
 session was lost, for example a Broken member after a cold restart whose
-session store no longer has it: respawn no longer repairs it. Preserve usable
-siblings and give the calling agent local feedback. A surviving profile name
-or session reference cannot reconstruct lost restrictions.
+session store no longer has it: respawn no longer repairs it. A host that
+meets this refusal keeps the other members working and returns local feedback
+to the agent that asked for the respawn. A surviving profile name or session
+reference cannot reconstruct lost restrictions.
 
 Current limits:
 
