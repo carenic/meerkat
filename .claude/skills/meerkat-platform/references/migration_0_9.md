@@ -320,9 +320,15 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   in a creation record; pre-0.9.4 mobs get one at their first resume as
   `Unrecorded`), so operator grants survive a resume and a creating session
   manages its mob again after a restart. Member delivery scopes are version 2
-  and name the incarnation (`MobError::IncarnationMismatch`,
-  `ScopedRecoveryUnresolved::IncarnationNotHosted`). Stores whose creation
-  record and log disagree are not resumed (`IncarnationInconsistent`;
+  and name the incarnation (`MobError::IncarnationMismatch`, also from
+  `retire_at_scope`; `ScopedRecoveryUnresolved::IncarnationNotHosted`), and
+  so do member delivery addresses (`rt:mob-member:...`, which 0.9.3 does not
+  read): a delivery owed to a destroyed mob's member strands instead of
+  reaching the same identity in a mob created again, and
+  `meerkat::member_delivery_address` takes the incarnation (in-memory mob
+  storage strands deliveries owed to the previous start's incarnation).
+  Stores whose creation record and log disagree are not resumed
+  (`IncarnationInconsistent`;
   `IncarnationDestroyed` for a finished destroy) and stay unrestored without
   failing the others (`MobMcpState::unrestored_mobs`). Session creates record
   provenance and answer `ProvenanceUnavailable` until the mob set is restored
@@ -333,7 +339,10 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   deadline (120 s for SQLite) marks the session reload-required; waiters get
   `CompletionWaitError::DurableOutcomeUnknown` (a rejected commit
   `BoundaryRolledBack`), and `CompletionWaitError` is non-exhaustive. Read the
-  input after the reload instead of resubmitting it.
+  input after the reload instead of resubmitting it (resubmit only with an
+  idempotency key); a scheduled delivery waits for the input's own outcome
+  for up to 5 lease periods. A custom `ScheduleTargetDelivery` resolves a
+  deduplicated replay's completion from the original input's outcome.
 - Realtime: a response the provider ends without completing it arrives as the
   non-terminal `turn_failed` live observation (route on `failure.status`;
   nothing of it is committed, the transcript records `assistant_turn_failed`,
