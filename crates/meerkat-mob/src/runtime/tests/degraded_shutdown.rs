@@ -1020,59 +1020,17 @@ async fn a_stop_reports_reload_required_for_a_member_degraded_between_its_hold_a
 }
 
 /// The same window under a whole Shutdown, whose cancel is the immediate
-/// exact hard cancel: the member reports its run `ReloadRequired` with its
-/// run starts `Held`, and the teardown still discards the degraded
-/// registration and unregisters the cold successor. Without that mapping the
-/// refusal failed the Shutdown as an internal error; before the hard cancel's
-/// gate wait ended on a degradation, it waited behind the commit.
+/// exact hard cancel, with the registration degraded by the failed boundary
+/// commit itself. (A registration marked degraded while that commit is still
+/// in flight leaves its carrier in a state no production path reaches, which
+/// the teardown's discard refuses, so this test lets the commit fail.) The
+/// cancel either ends on the degradation (`ReloadRequired`) or takes the gate
+/// the failed commit gave back and finds the run ended
+/// (`RunEndedBeforeCancel`). Either way the member's stop leaves the degraded
+/// registration to the teardown, its run starts stay `Held`, and the
+/// teardown discards the registration and unregisters the cold successor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_whole_shutdown_settles_a_member_degraded_between_its_hold_and_its_cancel() {
-    let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
-    let handle = mob.handle.clone();
-    let report = degrade_between_hold_and_cancel(&mob, true, async move {
-        handle
-            .shutdown_with_report(
-                ShutdownOptions::default().with_deadline(Instant::now() + Duration::from_secs(20)),
-            )
-            .await
-    })
-    .await
-    .expect("the shutdown succeeds");
-    assert_eq!(
-        report.runs.get(mob.member(0)),
-        Some(&MemberStopRun::ReloadRequired),
-        "member 0's run: {report:?}"
-    );
-    assert_eq!(
-        report.run_starts.get(mob.member(0)),
-        Some(&MemberRunStarts::Held),
-        "member 0's run starts: {report:?}"
-    );
-    assert!(
-        matches!(
-            report.members.get(mob.member(0)),
-            Some(MemberShutdownOutcome::Unregistered)
-        ),
-        "member 0: {report:?}"
-    );
-    assert!(
-        mob.adapter
-            .current_session_registration_witness(mob.session(0))
-            .await
-            .is_none(),
-        "member 0's session has no registration left"
-    );
-}
-
-/// The same window when the store fails the parked boundary commit during
-/// the cancel's wait, so the registration degrades by the failed commit
-/// alone. The cancel either ends on the degradation or takes the gate the
-/// failed commit gave back, and then finds the run ended. Either way the
-/// member's stop leaves the degraded registration to the teardown: its drain
-/// abort must not fail the Shutdown when the registration degraded after the
-/// cancel answered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_whole_shutdown_settles_a_member_whose_boundary_commit_fails_around_its_cancel() {
     let mob = create_isolation_mob_with_definition(1, autonomous_isolation_definition()).await;
     let handle = mob.handle.clone();
     let report = degrade_between_hold_and_cancel(&mob, false, async move {
