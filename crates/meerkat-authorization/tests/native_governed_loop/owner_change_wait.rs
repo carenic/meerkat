@@ -47,6 +47,12 @@ impl RefusalLog {
     }
 }
 
+/// Starts the hold of a change [`ChurnProvider::hold_change`] began when it
+/// is dropped; until then the change stays in progress.
+struct HoldStart {
+    _start: std::sync::mpsc::Sender<()>,
+}
+
 /// One request the transport received.
 struct Request {
     operation: OperationId,
@@ -79,15 +85,21 @@ impl ChurnProvider {
     }
 
     /// Begin an owner change on another thread and return once it is in
-    /// progress; the thread completes it after `hold`.
-    fn hold_change(&self, hold: Duration) {
+    /// progress. The thread keeps the change in progress until the returned
+    /// start is dropped, however late the caller runs, then holds it for
+    /// `hold` and completes it.
+    fn hold_change(&self, hold: Duration) -> HoldStart {
         let (held, in_progress) = std::sync::mpsc::channel();
+        let (start, started) = std::sync::mpsc::channel::<()>();
         let publication = self.publication.clone();
         let holder = std::thread::spawn(move || {
             let change = publication
                 .begin_owner_change()
                 .expect("fixture owner change");
             held.send(()).expect("held change reported");
+            started
+                .recv()
+                .expect_err("nothing is sent: dropping the start starts the hold");
             std::thread::sleep(hold);
             drop(change);
         });
@@ -97,6 +109,7 @@ impl ChurnProvider {
             *first_held = self.publication.change_in_progress();
         }
         self.holders.lock().expect("holders").push(holder);
+        HoldStart { _start: start }
     }
 
     /// Wait for every held change to complete.
@@ -149,19 +162,25 @@ impl LlmClient for ChurnProvider {
             .expect("requests")
             .first()
             .map(|first| first.operation.clone());
-        match self.churn {
-            Churn::HeldOnce { hold } if first_operation.is_none() => self.hold_change(hold),
+        // A change begun here stays in progress until the run takes this
+        // request's refusal, so the check below meets it however late this
+        // thread runs; its hold starts only then.
+        let hold_start = match self.churn {
+            Churn::HeldOnce { hold } if first_operation.is_none() => Some(self.hold_change(hold)),
             Churn::EveryRequestOfFirstOperation { hold }
                 if first_operation
                     .as_ref()
                     .is_none_or(|first| *first == operation) =>
             {
-                self.hold_change(hold);
+                Some(self.hold_change(hold))
             }
             // Another operation finds the last change completed.
-            Churn::EveryRequestOfFirstOperation { .. } => self.join_holders(),
-            Churn::HeldOnce { .. } | Churn::HeldOverToolCall { .. } => {}
-        }
+            Churn::EveryRequestOfFirstOperation { .. } => {
+                self.join_holders();
+                None
+            }
+            Churn::HeldOnce { .. } | Churn::HeldOverToolCall { .. } => None,
+        };
         // The physical transport's own exact target, checked immediately
         // before entry, as the real adapter does.
         let checked = authorization
@@ -176,11 +195,14 @@ impl LlmClient for ChurnProvider {
                     messages: request.request().messages.clone(),
                     observed: None,
                 });
-                return Box::pin(futures::stream::iter([Err(
-                    LlmError::from_operation_authorization(error),
-                )]));
+                return Box::pin(futures::stream::once(async move {
+                    // The run takes the refusal: the held change's hold starts.
+                    drop(hold_start);
+                    Err(LlmError::from_operation_authorization(error))
+                }));
             }
         };
+        drop(hold_start);
         check
             .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
             .expect("native audit stages actual transport entry");
@@ -198,7 +220,9 @@ impl LlmClient for ChurnProvider {
             return Box::pin(
                 futures::stream::once(async move {
                     if self.first_held.lock().expect("held token").is_none() {
-                        self.hold_change(hold);
+                        // The tool's dispatch meets this change: its hold
+                        // starts at once.
+                        drop(self.hold_change(hold));
                     }
                     Ok(LlmEvent::ToolCallComplete {
                         id: TOOL_CALL.into(),
