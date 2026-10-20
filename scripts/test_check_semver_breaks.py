@@ -1619,8 +1619,10 @@ else:
             for build in builds:
                 args = build["args"]
                 self.assertEqual(args[:4], ["doc", "--no-deps", "--lib", "--target-dir"])
-                self.assertEqual(args[5:], ["-p", "meerkat-core", "--features", "meerkat-core/public",
-                                           "-p", "meerkat-models", "--features", "meerkat-models/public"])
+                # Bare names: Cargo gives `crate/feature` to a dependency named
+                # `crate` first, such as a crate's own path dev-dependency.
+                self.assertEqual(args[5:], ["-p", "meerkat-core", "--features", "public",
+                                           "-p", "meerkat-models", "--features", "public"])
                 self.assertEqual(build["bootstrap"], "1")
                 self.assertEqual(build["flags"], "-Z unstable-options --output-format json "
                                  "--document-private-items --document-hidden-items --cap-lints allow")

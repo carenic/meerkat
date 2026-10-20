@@ -481,6 +481,11 @@ them.
   `wait_failure_observation()` maps both new variants to
   `AuthorityUnavailable`, as it maps `AuthorityUnavailable(_)`, and
   `is_boundary_rolled_back()` and `is_durable_outcome_unknown()` name them.
+- `meerkat`: `AcceptedScheduledInput` is no longer `Sync`. It holds the
+  admitted input's completion wait as a boxed `Send` future, so that a wait
+  that fails with `BoundaryRolledBack` or `DurableOutcomeUnknown` can read the
+  input's own terminal outcome (see Changed). It is still `Send`: move it
+  between threads instead of sharing a reference to it.
 - `meerkat-core`: `SessionError` gains `ForkInstructionRefused`: a durable
   fork refused before commit by the host's fork instruction policy (see
   Added). Exhaustive matches handle it; on the wire it is
@@ -495,7 +500,10 @@ them.
   `meerkat-mob`: `PlannedForkRequest` gains `inherited_instructions`, and
   `MobError` gains `ForkInstructionRefused { source_member_id, refusal }`.
   `meerkat-contracts`: `BridgeCreateForkedParticipantPayload` gains
-  `inherited_instructions`, `BridgeRejectionCause` gains
+  `inherited_instructions`, as do `ForkSessionAtParams` and
+  `ForkSessionReplaceParams`, the `session/fork_at` and `session/fork_replace`
+  params (an `Option<meerkat_core::ForkInstructionPolicy>`, absent by
+  default; struct literals set it); `BridgeRejectionCause` gains
   `ForkInstructionRefused`, and `ErrorCode` gains `ForkInstructionRefused`.
   Every `MobSessionService` decorator that forwards planned forks forwards the
   field.
@@ -669,6 +677,11 @@ them.
   (`handle.incarnation()`). A 0.9.3 build does not read an
   `rt:mob-member:` address as a member address and does not deliver the
   rows addressed to one.
+- `meerkat-mob`: `MobStoreError` gains the variant
+  `IncarnationInconsistent { mob_id, inconsistency }`, appended last; its
+  `inconsistency` is a `meerkat_mob::IncarnationInconsistency`. `MobStoreError`
+  is not `#[non_exhaustive]`, so an exhaustive match adds the arm. Security
+  describes when a store answers it.
 
 ### Security
 
