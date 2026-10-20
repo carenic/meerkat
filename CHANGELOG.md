@@ -2374,6 +2374,13 @@ them.
   mob database's write lock when the SQLite runtime store calls it, and the
   in-memory runtime store and the session publication retry it for up to 2
   seconds with their locks released.
+- An intent-managed identity (`meerkat-mob`) whose lease the previous process
+  still held when the mob restarted converges once that lease expires, at
+  most 30 s after the previous process last renewed it. Nothing woke the
+  identity when the lease expired, so it stayed in `AwaitLease` until the
+  slow safety scan, about five minutes later. Reconciliation now schedules
+  its next attempt for the observed expiry, or re-checks after a second when
+  no expiry can be read.
 
 ### Known limitations
 

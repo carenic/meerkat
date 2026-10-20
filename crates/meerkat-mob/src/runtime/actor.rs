@@ -312,6 +312,12 @@ const IDENTITY_RECONCILE_SAFETY_PAGE_INTERVAL: Duration = Duration::from_secs(5 
 /// visited over successive keyset pages; no timer wake materializes all
 /// identities.
 const IDENTITY_RECONCILE_SAFETY_PAGE_LIMIT: usize = 64;
+/// Margin past another incarnation's observed lease expiry, so the wake that
+/// re-observes the identity lands after the store-sealed expiry instant.
+const IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN: Duration = Duration::from_millis(100);
+/// Re-check interval while another incarnation holds the lease and no expiry
+/// can be read from it.
+const IDENTITY_RECONCILE_LEASE_RECHECK: Duration = Duration::from_secs(1);
 /// Exponential actuation-backoff schedule for identities whose member
 /// actuation keeps failing. Before this existed, the "Backoff" disposition
 /// was a status label over an immediate requeue: the terminal-completion
@@ -1377,6 +1383,21 @@ fn identity_reconcile_backoff_delay(consecutive_failures: u32) -> Duration {
         .min(IDENTITY_RECONCILE_BACKOFF_CAP)
 }
 
+/// Delay before re-observing an identity whose lease another incarnation
+/// holds: the observed expiry plus a small margin, bounded by the longest
+/// lease lifetime so a skewed expiry cannot strand the identity, or a
+/// one-second re-check when no expiry is observable.
+fn identity_lease_wait_delay(expires_at_ms: Option<u64>, now_ms: u64) -> Duration {
+    expires_at_ms.map_or(IDENTITY_RECONCILE_LEASE_RECHECK, |expires_at_ms| {
+        Duration::from_millis(
+            expires_at_ms
+                .saturating_sub(now_ms)
+                .min(IDENTITY_RECONCILE_LEASE_TTL_MS),
+        )
+        .saturating_add(IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN)
+    })
+}
+
 /// Bound repeated retry diagnostics without making a persistent incident
 /// silent. Attempt one is visible immediately; identical retries then report
 /// only at power-of-two checkpoints while durable convergence status retains
@@ -1437,7 +1458,9 @@ fn identity_member_actuation_disposition(
 mod identity_recovery_slice_tests {
     use super::{
         IDENTITY_RECONCILE_BACKOFF_BASE, IDENTITY_RECONCILE_BACKOFF_CAP,
-        IdentityMemberActuationDisposition, identity_actuation_error_disposition,
+        IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN, IDENTITY_RECONCILE_LEASE_RECHECK,
+        IDENTITY_RECONCILE_LEASE_TTL_MS, IdentityMemberActuationDisposition,
+        identity_actuation_error_disposition, identity_lease_wait_delay,
         identity_member_actuation_disposition, identity_reconcile_backoff_delay,
         identity_reconcile_failure_should_log,
         identity_reconciliation_slice_unsupported_obligation,
@@ -1529,6 +1552,24 @@ mod identity_recovery_slice_tests {
         assert_eq!(logged, vec![1, 2, 4, 8, 16]);
         assert!(!identity_reconcile_failure_should_log(0));
         assert!(!identity_reconcile_failure_should_log(u32::MAX));
+    }
+
+    #[test]
+    fn a_lease_wait_ends_just_after_the_observed_expiry_within_one_lease_lifetime() {
+        let margin = IDENTITY_RECONCILE_LEASE_EXPIRY_MARGIN;
+        assert_eq!(
+            identity_lease_wait_delay(Some(12_000), 10_000),
+            std::time::Duration::from_secs(2) + margin
+        );
+        assert_eq!(identity_lease_wait_delay(Some(9_000), 10_000), margin);
+        assert_eq!(
+            identity_lease_wait_delay(Some(u64::MAX), 10_000),
+            std::time::Duration::from_millis(IDENTITY_RECONCILE_LEASE_TTL_MS) + margin
+        );
+        assert_eq!(
+            identity_lease_wait_delay(None, 10_000),
+            IDENTITY_RECONCILE_LEASE_RECHECK
+        );
     }
 }
 
@@ -25286,6 +25327,25 @@ impl MobActor {
                     None,
                 )
                 .await;
+                if preliminary == IdentityReconcileDecision::AwaitLease {
+                    // Another incarnation holds the lease. A holder that
+                    // crashed or stopped never releases it, and nothing else
+                    // wakes this identity when it expires (only the slow
+                    // safety scan would), so wait for that expiry.
+                    let expires_at_ms = match &lease_observation {
+                        IdentityStoredObservation::Valid(record) => {
+                            record.active.as_ref().map(|active| active.expires_at_ms)
+                        }
+                        IdentityStoredObservation::Missing
+                        | IdentityStoredObservation::Unsupported { .. }
+                        | IdentityStoredObservation::Malformed { .. } => None,
+                    };
+                    self.schedule_identity_reconcile_wait(
+                        identity,
+                        IdentityReconcileAuthorityKey::from_observation(&intent_observation),
+                        identity_lease_wait_delay(expires_at_ms, now_ms),
+                    );
+                }
             }
             return Ok(IdentityReconcilePassDisposition::Outcome(false));
         }
