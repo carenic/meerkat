@@ -426,7 +426,9 @@ them.
   session owner's own evidence; a custom session service that wraps one of
   them delegates it, or the respawns of its members are refused (see Fixed).
   `meerkat_mob::MobError` gains `RespawnPredecessorRestrictionsUnavailable`,
-  appended last. Core gains `PredecessorToolRestrictions`,
+  appended last. It has no dedicated wire error code in 0.9.4: on the wire it
+  is identified by its message, `respawn of member <id> refused: <reason>`.
+  Core gains `PredecessorToolRestrictions`,
   `InheritedVisibilityEvidence`, `PredecessorRestrictionsError`,
   `InheritedVisibilityConflict` and
   `InheritedToolVisibilityAuthority::narrowed_with`. A missing recorded
@@ -1502,11 +1504,15 @@ them.
   spawner's tool ceiling, deny list or launch policy came back without them.
   The successor now keeps the predecessor's launch tool access policy and
   inherited visibility ceiling, as its session recorded them, intersected with
-  the successor's own and never widened, and resolves its credentials through
-  the auth binding the predecessor's session recorded unless its own spec
-  names one. A respawn whose predecessor's restrictions cannot be established,
-  or whose member changes while they are read, is refused before anything is
-  retired, and the member is kept. A peer-only member whose generation was
+  the successor's own and never widened. It keeps the auth binding the
+  predecessor's session recorded only when its own spec names none and its
+  profile resolves to the provider that binding was recorded for; a successor
+  re-profiled to another provider (or to one that cannot be told) selects its
+  own binding, as a fresh spawn does. The successor's profile and provider are
+  resolved before anything is retired. A respawn whose predecessor's
+  restrictions cannot be established, whose successor profile cannot be
+  resolved, or whose member changes while they are read, is refused before
+  anything is retired, and the member is kept. A peer-only member whose generation was
   never bound to a local session carries no session restrictions; its
   successor keeps the launch policy and ceiling its own spec inherits. Placed
   members are unchanged.

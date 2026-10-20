@@ -1722,6 +1722,8 @@ struct CreateSessionRecord {
     /// binding (`ResumeOverrideMask::application_tool_policy`).
     has_policy_registry: bool,
     application_tool_policy_masked: bool,
+    /// The auth binding the build names.
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4072,6 +4074,10 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .is_some_and(|build| build.resume_override_mask.application_tool_policy),
+                auth_binding: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.auth_binding.clone()),
             });
 
         let mcp_server_names: Vec<String> = req
@@ -24639,6 +24645,130 @@ async fn respawn_without_predecessor_restriction_evidence_is_refused_before_reti
         .expect("the member was not retired");
     assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
     assert_eq!(still.member_ref.bridge_session_id(), Some(&session_id));
+}
+
+/// A worker profile on a declared provider, so a respawn can tell which
+/// provider its successor's build resolves to.
+fn bound_respawn_definition(id: &str) -> MobDefinition {
+    let mut definition = sample_definition();
+    definition.id = MobId::from(id);
+    if let Some(ProfileBinding::Inline(profile)) =
+        definition.profiles.get_mut(&ProfileName::from("worker"))
+    {
+        profile.provider = Some(meerkat_core::Provider::Anthropic);
+    }
+    definition
+}
+
+fn scoped_auth_binding() -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("tenant_a").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+async fn spawn_bound_worker(handle: &MobHandle, member: &AgentIdentity) {
+    let mut spec = SpawnMemberSpec::new("worker", member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec.auth_binding = Some(scoped_auth_binding());
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the bound worker");
+}
+
+/// A default respawn keeps the auth binding its predecessor's credentials
+/// resolved through when the successor builds on the same provider.
+#[tokio::test]
+async fn a_respawned_member_keeps_its_binding_on_the_same_provider() {
+    let (handle, service) = create_test_mob(bound_respawn_definition("respawn-binding-kept")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the predecessor builds through its binding"
+    );
+
+    handle
+        .respawn(member.clone(), None)
+        .await
+        .expect("respawn the bound worker");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the successor on the same provider keeps the binding"
+    );
+}
+
+/// A successor re-profiled to another provider does not receive the
+/// predecessor's binding, which serves only the provider it was recorded for:
+/// it respawns on its own provider's selection rather than failing its build
+/// after the predecessor's retirement.
+#[tokio::test]
+async fn a_successor_re_profiled_to_another_provider_selects_its_own_binding() {
+    let definition = bound_respawn_definition("respawn-binding-reprofiled");
+    let mut other_provider = definition
+        .resolve_inline_profile(&ProfileName::from("worker"))
+        .cloned()
+        .expect("an inline worker profile");
+    other_provider.provider = Some(meerkat_core::Provider::OpenAI);
+    let (handle, service) = create_test_mob(definition).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+
+    let mut successor = SpawnMemberSpec::new("worker", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    successor.override_profile = Some(other_provider);
+    handle
+        .respawn_with_successor_spec(successor)
+        .await
+        .expect("the re-profiled successor respawns");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        None,
+        "the successor on another provider selects its own binding"
+    );
+}
+
+/// A successor whose profile cannot be resolved is refused, typed, before the
+/// predecessor is retired: the member keeps its runtime and session.
+#[tokio::test]
+async fn a_successor_whose_profile_cannot_be_resolved_is_refused_before_retirement() {
+    let (handle, _service) =
+        create_test_mob(bound_respawn_definition("respawn-unresolved-successor")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    let original = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member exists");
+
+    let mut successor = SpawnMemberSpec::new("no-such-profile", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let refused = handle.respawn_with_successor_spec(successor).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a typed refusal before retirement: {refused:?}"
+    );
+    let still = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
+    assert_eq!(
+        still.member_ref.bridge_session_id(),
+        original.member_ref.bridge_session_id()
+    );
 }
 
 #[tokio::test]

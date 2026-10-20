@@ -3575,6 +3575,9 @@ pub struct PredecessorToolRestrictions {
     launch: crate::ops::SpawnToolAccessPolicy,
     visibility: InheritedVisibilityEvidence,
     auth_binding: Option<crate::AuthBindingRef>,
+    /// The provider the session's build resolved its credentials for through
+    /// `auth_binding`; `None` when the owner does not know it.
+    auth_provider: Option<crate::Provider>,
 }
 
 /// Why a session owner cannot state a session's inherited restrictions.
@@ -3610,13 +3613,20 @@ impl PredecessorToolRestrictions {
                 InheritedVisibilityEvidence::Ceiling,
             ),
             auth_binding: None,
+            auth_provider: None,
         }
     }
 
     /// The same restrictions, with the auth binding the session's build
-    /// resolved its credentials through.
-    pub fn with_auth_binding(mut self, auth_binding: Option<crate::AuthBindingRef>) -> Self {
+    /// resolved its credentials through and the provider it resolved them
+    /// for (`None` when unknown).
+    pub fn with_auth_binding(
+        mut self,
+        auth_binding: Option<crate::AuthBindingRef>,
+        auth_provider: Option<crate::Provider>,
+    ) -> Self {
         self.auth_binding = auth_binding;
+        self.auth_provider = auth_provider;
         self
     }
 
@@ -3635,6 +3645,7 @@ impl PredecessorToolRestrictions {
             .filter(|policy| !matches!(policy, crate::ops::ToolAccessPolicy::Inherit));
         let explicit_ceiling = build.and_then(|build| build.initial_tool_visibility_state.clone());
         let explicit_auth_binding = build.and_then(|build| build.auth_binding.clone());
+        let explicit_provider = build.and_then(|build| build.provider);
         // Only a build that continues a session has recorded restrictions; a
         // minted session's carrier holds a pre-assigned id and nothing else.
         let resumed = build.and_then(|build| match build.session_build_intent() {
@@ -3643,7 +3654,7 @@ impl PredecessorToolRestrictions {
         });
         let Some(resumed) = resumed else {
             return Ok(Self::from_build_handoff(explicit_launch, explicit_ceiling)
-                .with_auth_binding(explicit_auth_binding));
+                .with_auth_binding(explicit_auth_binding, explicit_provider));
         };
         let recorded = Self::from_committed_session(resumed)?;
         let launch = match explicit_launch {
@@ -3666,10 +3677,12 @@ impl PredecessorToolRestrictions {
         // A resume re-resolves the session's recorded binding unless the
         // build names one, as the factory does.
         let auth_binding = explicit_auth_binding.or(recorded.auth_binding);
+        let auth_provider = explicit_provider.or(recorded.auth_provider);
         Ok(Self {
             launch,
             visibility,
             auth_binding,
+            auth_provider,
         })
     }
 
@@ -3682,6 +3695,7 @@ impl PredecessorToolRestrictions {
         let auth_binding = metadata
             .as_ref()
             .and_then(|metadata| metadata.auth_binding.clone());
+        let auth_provider = metadata.as_ref().map(|metadata| metadata.provider);
         let launch = metadata
             .and_then(|metadata| metadata.tooling.spawn_tool_access_policy)
             .ok_or(PredecessorRestrictionsError::MissingLaunchPolicy)?;
@@ -3735,6 +3749,7 @@ impl PredecessorToolRestrictions {
             launch,
             visibility,
             auth_binding,
+            auth_provider,
         })
     }
 
@@ -3755,6 +3770,18 @@ impl PredecessorToolRestrictions {
     /// when its build named none).
     pub fn auth_binding(&self) -> Option<&crate::AuthBindingRef> {
         self.auth_binding.as_ref()
+    }
+
+    /// The recorded auth binding, only for a build on the provider it was
+    /// recorded for. A binding serves one provider, so a successor on another
+    /// provider (or an unknown one) gets none and selects its own.
+    pub fn auth_binding_for_provider(
+        &self,
+        provider: crate::Provider,
+    ) -> Option<&crate::AuthBindingRef> {
+        self.auth_binding
+            .as_ref()
+            .filter(|_| self.auth_provider == Some(provider))
     }
 }
 
@@ -18064,6 +18091,26 @@ mod tests {
         let restrictions = PredecessorToolRestrictions::from_committed_session(&session)
             .expect("the session states its restrictions");
         assert_eq!(restrictions.auth_binding(), Some(&recorded));
+        let recorded_provider = session
+            .try_session_metadata()
+            .expect("metadata decodes")
+            .expect("metadata present")
+            .provider;
+        assert_eq!(
+            restrictions.auth_binding_for_provider(recorded_provider),
+            Some(&recorded),
+            "a successor on the recorded provider keeps the binding"
+        );
+        let other_provider = if recorded_provider == crate::Provider::OpenAI {
+            crate::Provider::Anthropic
+        } else {
+            crate::Provider::OpenAI
+        };
+        assert_eq!(
+            restrictions.auth_binding_for_provider(other_provider),
+            None,
+            "a successor on another provider selects its own binding"
+        );
         assert_eq!(restrictions.launch_policy(), None);
         assert!(restrictions.inherited_visibility().is_none());
     }
