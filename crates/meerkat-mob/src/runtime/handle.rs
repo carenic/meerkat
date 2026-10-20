@@ -12265,6 +12265,24 @@ impl MobHandle {
             .await
     }
 
+    /// Observe `identity`'s retirement settlement: its progress while owned,
+    /// then its terminal outcome. `None` when no retirement was ever
+    /// published for the identity in this actor's lifetime.
+    pub fn retirement_settlement(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<super::RetirementSettlementWatch> {
+        self.lifecycle_observations.subscribe(identity)
+    }
+
+    /// Drive a stuck retirement again (typed re-drive): the member's durably
+    /// started retirement resumes from its durable `Retiring` state. Bounded
+    /// like [`Self::retire`]: a re-drive still running when the budget
+    /// elapses answers `MemberRetirementInProgress` and stays owned.
+    pub async fn redrive_retirement(&self, identity: AgentIdentity) -> Result<(), MobError> {
+        self.retire_exact_incarnation(identity, true).await
+    }
+
     /// Retire a member, archiving its session and removing trust, together
     /// with every member it transitively spawned (its `spawned_by`
     /// descendants, such as fork_off children), deepest first.
@@ -12293,24 +12311,6 @@ impl MobHandle {
     /// admission or start-marker failures can return before such an anchor
     /// exists. This guarantee does not cover callers that hold and invoke the
     /// session store independently of the mob/session runtime.
-    /// Observe `identity`'s retirement settlement: its progress while owned,
-    /// then its terminal outcome. `None` when no retirement was ever
-    /// published for the identity in this actor's lifetime.
-    pub fn retirement_settlement(
-        &self,
-        identity: &AgentIdentity,
-    ) -> Option<super::RetirementSettlementWatch> {
-        self.lifecycle_observations.subscribe(identity)
-    }
-
-    /// Drive a stuck retirement again (typed re-drive): the member's durably
-    /// started retirement resumes from its durable `Retiring` state. Bounded
-    /// like [`Self::retire`]: a re-drive still running when the budget
-    /// elapses answers `MemberRetirementInProgress` and stays owned.
-    pub async fn redrive_retirement(&self, identity: AgentIdentity) -> Result<(), MobError> {
-        self.retire_exact_incarnation(identity, true).await
-    }
-
     pub async fn retire(&self, identity: AgentIdentity) -> Result<(), MobError> {
         match self
             .execute_machine_command(MobMachineCommand::Retire {
