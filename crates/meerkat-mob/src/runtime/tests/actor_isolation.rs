@@ -54,6 +54,27 @@ pub(super) struct FaultInjectingRuntimeStore {
     failed_commits: AtomicU64,
     failed_ops_loads: AtomicU64,
     fail_ops_load: std::sync::Mutex<HashSet<LogicalRuntimeId>>,
+    /// Sessions whose unregister finalization (the store transaction that
+    /// ends a runtime unregister) parks, and then commits.
+    parked_unregister_finalizations: std::sync::Mutex<HashSet<LogicalRuntimeId>>,
+    release_unregister_finalizations: Notify,
+    parked_unregister_finalization_arrivals: std::sync::Mutex<HashMap<LogicalRuntimeId, usize>>,
+    /// Sessions whose unregister finalization fails, and how.
+    failed_unregister_finalizations:
+        std::sync::Mutex<HashMap<LogicalRuntimeId, UnregisterFinalizationFault>>,
+}
+
+/// How [`FaultInjectingRuntimeStore`] fails a session's unregister
+/// finalization. Neither commits anything.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum UnregisterFinalizationFault {
+    /// The outcome is unknown: an acknowledgement lost after a commit that
+    /// may or may not have landed. The runtime keeps the unregister's final
+    /// transition for a retry.
+    OutcomeUnknown,
+    /// A definite failure. The runtime rolls the unregister back to the
+    /// anchor the next unregister retries from.
+    WriteFailed,
 }
 
 impl FaultInjectingRuntimeStore {
@@ -77,6 +98,10 @@ impl FaultInjectingRuntimeStore {
             failed_commits: AtomicU64::new(0),
             failed_ops_loads: AtomicU64::new(0),
             fail_ops_load: std::sync::Mutex::new(HashSet::new()),
+            parked_unregister_finalizations: std::sync::Mutex::new(HashSet::new()),
+            release_unregister_finalizations: Notify::new(),
+            parked_unregister_finalization_arrivals: std::sync::Mutex::new(HashMap::new()),
+            failed_unregister_finalizations: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -149,6 +174,82 @@ impl FaultInjectingRuntimeStore {
 
     fn failed_commits(&self) -> u64 {
         self.failed_commits.load(Ordering::Relaxed)
+    }
+
+    /// Park the unregister finalization for `session_id` (the store
+    /// transaction that ends a runtime unregister, after its final
+    /// transition) until [`Self::release_unregister_finalizations`], then
+    /// let it commit.
+    pub(super) fn park_unregister_finalizations(&self, session_id: &SessionId) {
+        self.parked_unregister_finalizations
+            .lock()
+            .expect("parked_unregister_finalizations mutex")
+            .insert(LogicalRuntimeId::for_session(session_id));
+    }
+
+    pub(super) fn release_unregister_finalizations(&self) {
+        self.parked_unregister_finalizations
+            .lock()
+            .expect("parked_unregister_finalizations mutex")
+            .clear();
+        self.release_unregister_finalizations.notify_waiters();
+    }
+
+    /// Unregister finalizations that entered the park for `session_id`.
+    pub(super) fn parked_unregister_finalization_arrivals(&self, session_id: &SessionId) -> usize {
+        self.parked_unregister_finalization_arrivals
+            .lock()
+            .expect("parked_unregister_finalization_arrivals mutex")
+            .get(&LogicalRuntimeId::for_session(session_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Make every unregister finalization for `session_id` fail with
+    /// `fault`, or commit again with `None`.
+    pub(super) fn fail_unregister_finalizations(
+        &self,
+        session_id: &SessionId,
+        fault: Option<UnregisterFinalizationFault>,
+    ) {
+        let runtime_id = LogicalRuntimeId::for_session(session_id);
+        let mut failed = self
+            .failed_unregister_finalizations
+            .lock()
+            .expect("failed_unregister_finalizations mutex");
+        match fault {
+            Some(fault) => {
+                failed.insert(runtime_id, fault);
+            }
+            None => {
+                failed.remove(&runtime_id);
+            }
+        }
+    }
+
+    async fn park_unregister_finalization_if_flagged(&self, runtime_id: &LogicalRuntimeId) {
+        let mut arrived = false;
+        loop {
+            let released = self.release_unregister_finalizations.notified();
+            let parked = self
+                .parked_unregister_finalizations
+                .lock()
+                .expect("parked_unregister_finalizations mutex")
+                .contains(runtime_id);
+            if !parked {
+                break;
+            }
+            if !arrived {
+                arrived = true;
+                *self
+                    .parked_unregister_finalization_arrivals
+                    .lock()
+                    .expect("parked_unregister_finalization_arrivals mutex")
+                    .entry(runtime_id.clone())
+                    .or_default() += 1;
+            }
+            released.await;
+        }
     }
 
     /// Block the durable admission write for `session_id` until
@@ -610,6 +711,31 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
         runtime_id: &LogicalRuntimeId,
         finalization: meerkat_runtime::store::UnregisterFinalizationCommit,
     ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+        let fault = self
+            .failed_unregister_finalizations
+            .lock()
+            .expect("failed_unregister_finalizations mutex")
+            .get(runtime_id)
+            .copied();
+        match fault {
+            Some(UnregisterFinalizationFault::OutcomeUnknown) => {
+                return Err(
+                    meerkat_runtime::store::RuntimeStoreError::UnregisterFinalizationOutcomeUnknown(
+                        format!(
+                            "injected unknown unregister finalization outcome for {runtime_id}"
+                        ),
+                    ),
+                );
+            }
+            Some(UnregisterFinalizationFault::WriteFailed) => {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    format!("injected unregister finalization failure for {runtime_id}"),
+                ));
+            }
+            None => {}
+        }
+        self.park_unregister_finalization_if_flagged(runtime_id)
+            .await;
         self.inner
             .commit_unregister_finalization(runtime_id, finalization)
             .await
