@@ -3785,6 +3785,80 @@ async fn a_member_whose_session_has_a_durable_tail_respawns() {
     let _ = handle.shutdown().await;
 }
 
+/// The restrictions a respawn reads from a HeadCanonical session's current
+/// boundary metadata are the ones its committed body states. The member is
+/// spawned under a launch policy, so an answer that loses or widens it
+/// differs from the body read.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_metadata_restriction_read_matches_the_committed_body() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(&paths.realm_db_path)
+            .expect("open HeadCanonical runtime store"),
+    );
+    let (service, store) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let storage = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    let launch =
+        meerkat_core::ops::ToolAccessPolicy::DenyList(["shell".to_string()].into_iter().collect());
+    handle
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", AgentIdentity::from("w-1"))
+                .with_tool_access_policy(launch.clone()),
+        )
+        .await
+        .expect("spawn worker");
+    let w1_sid = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+        .await
+        .expect("w1 session id");
+    send_and_wait(
+        &handle,
+        service.as_ref(),
+        "w-1",
+        "RESTRICTION_TURN token-alpha",
+        "restriction-read-turn",
+    )
+    .await;
+    wait_for_head_canonical_authority_convergence(
+        store.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "RESTRICTION_TURN",
+        "restriction-read-boundary",
+    )
+    .await;
+
+    let from_metadata = service
+        .predecessor_tool_restrictions(&w1_sid)
+        .await
+        .expect("the metadata read states the restrictions");
+    let body = service
+        .observe_authoritative_session_body(&w1_sid)
+        .await
+        .expect("read the committed body")
+        .expect("the committed body exists");
+    let from_body = meerkat_core::PredecessorToolRestrictions::from_committed_session(&body)
+        .expect("the committed body states the restrictions");
+    assert_eq!(
+        from_metadata, from_body,
+        "the metadata read and the committed body state the same restrictions"
+    );
+    assert_eq!(
+        from_metadata.launch_policy(),
+        Some(launch),
+        "the member's launch policy is part of what both reads state"
+    );
+    let _ = handle.shutdown().await;
+}
+
 #[cfg(feature = "test-support")]
 const HELD_TURN_PROMPT: &str = "HELD_TURN token-sigma";
 

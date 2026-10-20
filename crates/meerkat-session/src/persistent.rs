@@ -16889,9 +16889,34 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         if self.runtime_store.session_persistence_profile()
             == RuntimeSessionPersistenceProfile::HeadCanonicalV1
         {
+            let role = "inherited tool restriction read";
+            let runtime_id = Self::runtime_id_for_session(id);
+            let Some(authority) = self
+                .runtime_store
+                .load_session_boundary_authority(&runtime_id)
+                .await
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "failed to load {role} HeadCanonical authority for session {id}: {error}"
+                    )))
+                })?
+            else {
+                return Err(SessionError::NotFound { id: id.clone() });
+            };
+            let head_authority = authority.head_canonical().ok_or_else(|| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "{role} loaded non-HeadCanonical authority for session {id}"
+                )))
+            })?;
+            if head_authority.session_id() != id {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "{role} HeadCanonical authority identifies session {}, not {id}",
+                    head_authority.session_id()
+                ))));
+            }
             let metadata = self
                 .runtime_store
-                .load_current_head_canonical_metadata(&Self::runtime_id_for_session(id))
+                .load_current_head_canonical_metadata(&runtime_id)
                 .await
                 .map_err(|error| {
                     SessionError::Agent(AgentError::InternalError(format!(
