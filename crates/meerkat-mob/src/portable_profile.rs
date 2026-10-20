@@ -15,6 +15,21 @@ use meerkat_contracts::wire::{
 
 use crate::profile::{Profile, ResumeOverrideField, ToolConfig};
 
+/// The provider a profile's build resolves to: its declared provider, else the
+/// mob's own entry for its model, else the model catalog. `None` when none of
+/// them names one.
+pub(crate) fn resolved_profile_provider(
+    profile: &Profile,
+    models: &BTreeMap<String, meerkat_core::config::CustomModelConfig>,
+) -> Option<meerkat_core::Provider> {
+    profile.provider.or_else(|| {
+        models
+            .get(&profile.model)
+            .map(|custom| custom.provider)
+            .or_else(|| meerkat_models::canonical().infer_provider(&profile.model))
+    })
+}
+
 pub(crate) fn project_portable_profile(
     profile: &Profile,
     runtime_mode: crate::MobRuntimeMode,
@@ -23,19 +38,12 @@ pub(crate) fn project_portable_profile(
     profile_name: &str,
     non_portable_disabled: Vec<WireNonPortableResourceKind>,
 ) -> Result<PortableProfile, String> {
-    let provider = match profile.provider {
-        Some(provider) => provider,
-        None => models
-            .get(&profile.model)
-            .map(|custom| custom.provider)
-            .or_else(|| meerkat_models::canonical().infer_provider(&profile.model))
-            .ok_or_else(|| {
-                format!(
-                    "model '{}' has no resolvable provider for remote placement of '{agent_identity}' (set provider on profile '{profile_name}' or define models.{})",
-                    profile.model, profile.model
-                )
-            })?,
-    };
+    let provider = resolved_profile_provider(profile, models).ok_or_else(|| {
+        format!(
+            "model '{}' has no resolvable provider for remote placement of '{agent_identity}' (set provider on profile '{profile_name}' or define models.{})",
+            profile.model, profile.model
+        )
+    })?;
 
     let mut mcp_servers = BTreeMap::new();
     for server in &profile.tools.mcp_servers {

@@ -866,6 +866,14 @@ impl meerkat_core::service::SessionServiceHistoryExt for FailingOnceSessionServi
 
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for FailingOnceSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, meerkat_core::service::SessionError>
+    {
+        self.inner.predecessor_tool_restrictions(session_id).await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &meerkat_core::SessionId,

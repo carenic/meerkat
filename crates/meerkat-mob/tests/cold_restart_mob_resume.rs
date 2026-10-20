@@ -1689,15 +1689,37 @@ async fn mob_destroy_session_children_stack_budget_scenario() {
     );
 }
 
-/// A broken wired member still needs its exact old-generation endpoint after
-/// a full service restart. The endpoint is required to retire reciprocal trust
-/// safely before spawning and wiring the replacement generation.
+/// A wired member whose session was lost in a full service restart cannot be
+/// respawned: its inherited restrictions can no longer be established, so the
+/// respawn is refused before anything is retired, the Broken member is kept,
+/// no trust is installed for it and its siblings keep working.
 #[test]
-fn mob_cold_restart_partial_resume_respawns_wired_member() {
-    run_partial_resume_respawn_with_stack(2 * 1024 * 1024, "production-stack");
+fn mob_cold_restart_partial_resume_refuses_respawn_of_a_member_whose_session_was_lost() {
+    run_cold_resume_scenario_with_stack(
+        2 * 1024 * 1024,
+        "production-stack",
+        mob_cold_restart_partial_resume_lost_member_scenario(),
+    );
 }
 
-fn run_partial_resume_respawn_with_stack(stack_size: usize, label: &str) {
+/// The 2 MiB worker-stack canary for the full cold-resume respawn chain: a
+/// wired member whose session survives the service restart is respawned,
+/// retiring its old generation's reciprocal trust before spawning and wiring
+/// the replacement generation.
+#[test]
+fn mob_cold_restart_resume_respawns_a_wired_member_whose_session_survived() {
+    run_cold_resume_scenario_with_stack(
+        2 * 1024 * 1024,
+        "production-stack",
+        mob_cold_restart_resume_surviving_member_respawn_scenario(),
+    );
+}
+
+fn run_cold_resume_scenario_with_stack(
+    stack_size: usize,
+    label: &str,
+    scenario: impl std::future::Future<Output = ()>,
+) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         // Pin the requested stack explicitly. The production selector uses
@@ -1706,10 +1728,10 @@ fn run_partial_resume_respawn_with_stack(stack_size: usize, label: &str) {
         .thread_stack_size(stack_size)
         .build()
         .unwrap_or_else(|error| panic!("build {label} cold-resume runtime: {error}"));
-    runtime.block_on(mob_cold_restart_partial_resume_respawns_wired_member_scenario());
+    runtime.block_on(scenario);
 }
 
-async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
+async fn mob_cold_restart_resume_surviving_member_respawn_scenario() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
@@ -1719,6 +1741,122 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
     let definition = mob_definition(MobRuntimeMode::TurnDriven);
     let replacement_w2_comms_name = format!("{}/worker/w-2", definition.id);
     let lead_comms_name = format!("{}/lead/lead-1", definition.id);
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+    for (profile, identity) in [("lead", "lead-1"), ("worker", "w-1"), ("worker", "w-2")] {
+        handle_1
+            .spawn_spec(SpawnMemberSpec::new(profile, AgentIdentity::from(identity)))
+            .await
+            .unwrap_or_else(|error| panic!("spawn {identity}: {error}"));
+    }
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+        .await
+        .expect("w1 session id");
+    let w2_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .await
+        .expect("w2 session id");
+    let old_w2_peer_id = service_1
+        .comms_runtime(&w2_sid)
+        .await
+        .expect("w2 comms runtime")
+        .peer_id()
+        .expect("w2 peer id");
+
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    for session_id in [&lead_sid, &w1_sid, &w2_sid] {
+        service_1
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session before cold restart");
+    }
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_1);
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume after cold restart");
+    for identity in ["lead-1", "w-1", "w-2"] {
+        assert_member_active(&member_entry(&handle_2, identity).await, "cold resume");
+    }
+    let lead_runtime = service_2
+        .comms_runtime(&lead_sid)
+        .await
+        .expect("resumed lead comms runtime");
+
+    let respawned = handle_2
+        .respawn(AgentIdentity::from("w-2"), None)
+        .await
+        .expect("respawn the surviving w2");
+    assert_eq!(respawned.identity, AgentIdentity::from("w-2"));
+    let new_w2_sid = handle_2
+        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .await
+        .expect("replacement w2 session id");
+    assert_ne!(new_w2_sid, w2_sid);
+    assert_member_active(&member_entry(&handle_2, "w-2").await, "after respawn");
+
+    let new_w2_runtime = service_2
+        .comms_runtime(&new_w2_sid)
+        .await
+        .expect("replacement w2 comms runtime");
+    let new_w2_peer_id = new_w2_runtime.peer_id().expect("replacement w2 peer id");
+    assert_ne!(
+        new_w2_peer_id, old_w2_peer_id,
+        "replacement generation must rotate its exact comms endpoint"
+    );
+    let lead_peers = lead_runtime.peers().await;
+    assert!(
+        lead_peers.iter().all(|peer| peer.peer_id != old_w2_peer_id),
+        "lead must not retain trust for the retired w2 generation"
+    );
+    assert!(
+        lead_peers.iter().any(|peer| {
+            peer.peer_id == new_w2_peer_id
+                && peer.name.as_str() == replacement_w2_comms_name.as_str()
+        }),
+        "lead must trust the exact replacement w2 endpoint"
+    );
+    assert!(
+        new_w2_runtime
+            .peers()
+            .await
+            .iter()
+            .any(|peer| peer.name.as_str() == lead_comms_name.as_str()),
+        "replacement w2 must trust the resumed lead"
+    );
+
+    handle_2.shutdown().await.expect("final shutdown");
+}
+
+async fn mob_cold_restart_partial_resume_lost_member_scenario() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let (service_1, store_1) = persistent_service(&paths, runtime_store_1.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let definition = mob_definition(MobRuntimeMode::TurnDriven);
+    let replacement_w2_comms_name = format!("{}/worker/w-2", definition.id);
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
         .with_default_llm_client(openai_test_client())
@@ -1802,49 +1940,70 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
         "cold resume must not retain live trust for the missing old generation"
     );
 
-    let repair = handle_2
-        .respawn(AgentIdentity::from("w-2"), None)
+    // w-2's session, and with it the owner's evidence of the restrictions
+    // it inherited, is gone. Respawn refuses before retiring anything and
+    // keeps the exact Broken member; retiring it and spawning a fresh member
+    // are separate, ordinary operations.
+    let w2 = AgentIdentity::from("w-2");
+    let before = handle_2
+        .get_member(&w2)
         .await
-        .expect("respawn broken wired w2");
-    assert_eq!(repair.identity, AgentIdentity::from("w-2"));
-    let new_w2_sid = handle_2
-        .resolve_bridge_session_id(&AgentIdentity::from("w-2"))
+        .expect("roster query")
+        .expect("broken w2 in the roster");
+    let refused = handle_2.respawn(w2.clone(), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(meerkat_mob::MobRespawnError::Mob(
+                meerkat_mob::MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a lost predecessor session refuses the respawn, typed: {refused:?}"
+    );
+    let after = handle_2
+        .get_member(&w2)
         .await
-        .expect("replacement w2 session id");
-    assert_ne!(new_w2_sid, w2_sid);
-    assert_member_active(&member_entry(&handle_2, "w-2").await, "after repair");
+        .expect("roster query")
+        .expect("the member was not retired");
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agent_runtime_id, before.agent_runtime_id);
+    assert_eq!(after.fence_token, before.fence_token);
+    assert_eq!(after.bridge_session_id(), Some(&w2_sid));
+    assert_eq!(
+        member_entry(&handle_2, "w-2").await.status,
+        MobMemberStatus::Broken,
+        "the refused respawn keeps the Broken member"
+    );
 
-    let new_w2_runtime = service_2
-        .comms_runtime(&new_w2_sid)
-        .await
-        .expect("replacement w2 comms runtime");
-    let new_w2_peer_id = new_w2_runtime.peer_id().expect("replacement w2 peer id");
-    assert_ne!(
-        new_w2_peer_id, old_w2_peer_id,
-        "replacement generation must rotate its exact comms endpoint"
-    );
-    let lead_peers_after_repair = lead_before_repair.peers().await;
+    // No successor endpoint was trusted, and the old one stays untrusted.
+    let lead_peers_after_refusal = lead_before_repair.peers().await;
     assert!(
-        lead_peers_after_repair
+        lead_peers_after_refusal
             .iter()
-            .all(|peer| peer.peer_id != old_w2_peer_id),
-        "lead must not retain trust for the retired w2 generation"
+            .all(|peer| peer.peer_id != old_w2_peer_id
+                && peer.name.as_str() != replacement_w2_comms_name.as_str()),
+        "a refused respawn installs no trust for w2: {lead_peers_after_refusal:?}"
     );
-    assert!(
-        lead_peers_after_repair.iter().any(|peer| {
-            peer.peer_id == new_w2_peer_id
-                && peer.name.as_str() == replacement_w2_comms_name.as_str()
-        }),
-        "lead must trust the exact replacement w2 endpoint"
-    );
-    assert!(
-        new_w2_runtime
-            .peers()
-            .await
-            .iter()
-            .any(|peer| peer.name.as_str() == lead_comms_name.as_str()),
-        "replacement w2 must trust the resumed lead"
-    );
+
+    // The siblings stay usable after the refusal.
+    assert_member_active(&member_entry(&handle_2, "lead-1").await, "after refusal");
+    assert_member_active(&member_entry(&handle_2, "w-1").await, "after refusal");
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "lead-1",
+        "AFTER_REFUSAL_LEAD_TURN token-lead",
+        "after refusal",
+    )
+    .await;
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "AFTER_REFUSAL_W1_TURN token-w1",
+        "after refusal",
+    )
+    .await;
 
     handle_2.shutdown().await.expect("final shutdown");
 }

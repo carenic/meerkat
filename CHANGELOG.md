@@ -631,6 +631,29 @@ them.
   session. Consumers that persist scopes keep their
   version-1 scopes; a 0.9.3 build refuses a version-2 scope as an
   unsupported version.
+- `meerkat_mob::MobSessionService` gains `predecessor_tool_restrictions`. Its
+  default reports `Unsupported`. The persistent and ephemeral session
+  services, and the CLI, RPC and in-memory mob services, answer it from the
+  session owner's own evidence; a custom session service that wraps one of
+  them delegates it, or the respawns of its members are refused (see Fixed).
+  `meerkat_mob::MobError` gains `RespawnPredecessorRestrictionsUnavailable`,
+  appended last. It has no dedicated wire error code in 0.9.4: on the wire it
+  is identified by its message, `respawn of member <id> refused: <reason>`.
+  Core gains `PredecessorToolRestrictions`,
+  `InheritedVisibilityEvidence`, `PredecessorRestrictionsError`,
+  `InheritedVisibilityConflict` and
+  `InheritedToolVisibilityAuthority::narrowed_with`. A missing recorded
+  witness is reported as
+  `PredecessorRestrictionsError::MissingInheritedWitnesses`.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: respawn no longer
+  repairs a member whose session was lost (for example, a Broken member after
+  a cold restart whose session store no longer has it): its spawn-time
+  restrictions can no longer be established, so the respawn is refused with
+  `RespawnPredecessorRestrictionsUnavailable` before anything is retired, and
+  the Broken member is kept. Retiring it and spawning a fresh member are
+  separate, ordinary operations under the current authorization, policy and
+  inherited ceilings; they do not recover the lost restrictions and do not
+  acknowledge the member as unrestricted.
 
 ### Security
 
@@ -2267,6 +2290,29 @@ them.
   ends (a Stop held on a member or on a placed completion), goes on in the
   background as before; a host that must see the phase such a slow Stop
   leaves waits for its `MobStopped` itself.
+- `meerkat-mob`: a respawned local member keeps the restrictions it was
+  spawned under. `MobHandle::respawn` and the `mob_respawn` tool built the
+  successor from the member's profile alone, so a member spawned under its
+  spawner's tool ceiling, deny list or launch policy came back without them.
+  The successor now keeps the predecessor's launch tool access policy and
+  inherited visibility ceiling, as its session recorded them, intersected with
+  the successor's own and never widened. It keeps the auth binding the
+  predecessor's session recorded only when its own spec names none and its
+  profile resolves to the provider that binding was recorded for; a successor
+  re-profiled to another provider (or to one that cannot be told) selects its
+  own binding, as a fresh spawn does. For a member with a local session, the
+  successor's profile and provider are resolved before anything is retired. A
+  respawn whose predecessor's restrictions cannot be established, whose
+  successor profile cannot be resolved, or whose member changes while they are
+  read, is refused before anything is retired, and the member is kept. A
+  recorded binding that has since been removed from the realm configuration,
+  or re-pointed to another provider, is not validated before retirement: the
+  successor's build then fails after the predecessor is retired
+  (`MobRespawnError::SpawnAfterRetireWithCause`). Name a binding in a spawn
+  customizer, or retire and spawn. A peer-only member whose generation was
+  never bound to a local session carries no session restrictions; its
+  successor keeps the launch policy and ceiling its own spec inherits. Placed
+  members are unchanged.
 
 ### Known limitations
 

@@ -2543,7 +2543,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::MemberReloadTimedOut { .. }
         | MobError::HeldSpawnUnsupported { .. }
         | MobError::HeldSpawnAborted { .. }
-        | MobError::HeldSpawnExpired { .. } => {
+        | MobError::HeldSpawnExpired { .. }
+        | MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         MobError::RuntimeEffectRefused { kind, .. } => match kind {
@@ -12374,6 +12375,16 @@ impl MobHandle {
 
     /// Retire a member and respawn with the same profile, labels, wiring, and mode.
     ///
+    /// The successor keeps the restrictions the member was spawned under: its
+    /// launch tool access policy and inherited visibility ceiling, as the
+    /// member's session recorded them, and its auth binding when the
+    /// successor resolves to the provider that binding was recorded for. A
+    /// spawn customizer can narrow them, never widen them; a host that means
+    /// to widen retires the member and spawns a new one. When the
+    /// restrictions cannot be established, the respawn is refused with
+    /// [`MobError::RespawnPredecessorRestrictionsUnavailable`] before
+    /// anything is retired, and the member keeps running.
+    ///
     /// This is a helper convenience over primitive mob behavior, not a
     /// machine-owned primitive. Returns a receipt on full success, or a
     /// structured error on failure. No rollback is attempted after retire.
@@ -12407,6 +12418,16 @@ impl MobHandle {
     /// generation and fence minting, fresh session creation, and topology
     /// restoration. Resume and fork launch modes are rejected because a
     /// successor always receives a newly minted session.
+    ///
+    /// The successor keeps the predecessor's spawn-time restrictions, as
+    /// [`Self::respawn`] does: the spec's own tool access policy and inherited
+    /// filter narrow the predecessor's and never widen them, and the
+    /// predecessor's auth binding is kept only when the spec names none and
+    /// its profile resolves to the provider that binding was recorded for (a
+    /// spec re-profiled to another provider selects its own binding). A host
+    /// that means to widen retires the member and spawns a new one. A refusal
+    /// ([`MobError::RespawnPredecessorRestrictionsUnavailable`]) comes before
+    /// anything is retired and keeps the member.
     pub async fn respawn_with_successor_spec(
         &self,
         successor_spec: SpawnMemberSpec,

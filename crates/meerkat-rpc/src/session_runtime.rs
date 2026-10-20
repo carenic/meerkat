@@ -1710,6 +1710,18 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, meerkat_core::service::SessionError>
+    {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::predecessor_tool_restrictions(
+            &self.service,
+            session_id,
+        )
+        .await
+    }
+
     async fn fork_persisted_session(
         &self,
         source_session_id: &SessionId,

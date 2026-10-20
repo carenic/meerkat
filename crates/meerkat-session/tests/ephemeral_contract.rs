@@ -913,6 +913,62 @@ fn runtime_content_turn_req(prompt: &str) -> StartTurnRequest {
 /// The paused clock makes the check deterministic: the runtime advances time
 /// only when every task is idle, so a create blocked behind the parent's turn
 /// trips the deadline at once instead of hanging the test.
+/// The spawner restrictions an ephemeral session's build resolved are read
+/// from the built agent's own session, never from the request's fresh
+/// overrides. A built session without a recorded launch policy and
+/// visibility record (as these test agents build) is fail closed: never
+/// "unrestricted", even when the request named no restriction. The answer
+/// never waits for the session's running turn and survives archive.
+#[tokio::test(start_paused = true)]
+async fn predecessor_restrictions_fail_closed_without_a_record_and_never_wait_on_a_turn() {
+    let gate = Arc::new(TurnGate::default());
+    let service = make_service(MockAgentBuilder::with_turn_gate(Arc::clone(&gate)));
+    let worker = service
+        .create_session(create_req_deferred("worker"))
+        .await
+        .expect("create worker")
+        .session_id;
+
+    let turn = tokio::spawn({
+        let service = Arc::clone(&service);
+        let worker = worker.clone();
+        async move { service.start_turn(&worker, turn_req("busy")).await }
+    });
+    gate.started.notified().await;
+
+    let unrecorded = tokio::time::timeout(
+        std::time::Duration::from_secs(3600),
+        service.predecessor_tool_restrictions(&worker),
+    )
+    .await
+    .expect("reading restrictions never waits for the running turn");
+    assert!(
+        matches!(
+            unrecorded,
+            Err(meerkat_core::service::SessionError::Unsupported(_))
+        ),
+        "no record is never unrestricted: {unrecorded:?}"
+    );
+    assert!(!turn.is_finished(), "the turn is still in flight");
+
+    gate.release.notify_one();
+    turn.await.expect("turn task").expect("turn");
+    service.archive(&worker).await.expect("archive worker");
+    assert!(
+        matches!(
+            service.predecessor_tool_restrictions(&worker).await,
+            Err(meerkat_core::service::SessionError::Unsupported(_))
+        ),
+        "the archived session keeps its owner verdict"
+    );
+    assert!(matches!(
+        service
+            .predecessor_tool_restrictions(&meerkat_core::types::SessionId::new())
+            .await,
+        Err(meerkat_core::service::SessionError::NotFound { .. })
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn session_map_is_not_held_across_a_command_parked_on_a_busy_turn() {
     let gate = Arc::new(TurnGate::default());

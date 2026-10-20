@@ -13265,6 +13265,18 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, meerkat_core::service::SessionError>
+    {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::predecessor_tool_restrictions(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
     async fn execution_snapshot(
         &self,
         session_id: &SessionId,
@@ -17132,6 +17144,18 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         meerkat_core::service::SessionError,
     > {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::load_retained_session_metadata(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, meerkat_core::service::SessionError>
+    {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::predecessor_tool_restrictions(
             &self.inner,
             session_id,
         )

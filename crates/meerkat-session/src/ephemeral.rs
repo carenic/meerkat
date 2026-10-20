@@ -2638,6 +2638,12 @@ struct SessionHandle {
     /// Exact incarnation identity for this registry entry.  Logical-session
     /// recovery creates a new witness even when it reuses the same SessionId.
     actor_witness: LiveSessionActorWitness,
+    /// The spawner restrictions (launch policy and visibility ceiling) the
+    /// session's build actually resolved, read from the built agent's own
+    /// session (so a resumed session's restored restrictions count), kept so
+    /// a successor that replaces the session can keep them. `Err` names why
+    /// the build left no usable record.
+    tool_restrictions: Result<meerkat_core::PredecessorToolRestrictions, String>,
     #[cfg(not(target_arch = "wasm32"))]
     // Read by the durable-convergence fatalization (`session-store`) and the
     // test-only abort helper; other builds keep the handle alive without
@@ -4318,6 +4324,11 @@ pub struct EphemeralSessionService<B: SessionAgentBuilder> {
     /// after archive keeps counting up instead of reusing sequences a
     /// subscriber already observed.
     session_event_lines: std::sync::Mutex<HashMap<SessionId, Arc<SessionEventLine>>>,
+    /// The build-handoff restrictions of archived sessions, kept beside their
+    /// archived views so a retried successor still finds them.
+    archived_tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     /// Bounds of each actor incarnation's replay window.
     session_event_replay_limits: std::sync::RwLock<meerkat_core::comms::SessionEventReplayLimits>,
     /// Durable stream tail a new sequence space starts above (installed by
@@ -4669,6 +4680,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             archived_views: RwLock::new(IndexMap::new()),
             turn_finalization_gates: Mutex::new(HashMap::new()),
             session_event_lines: std::sync::Mutex::new(HashMap::new()),
+            archived_tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             session_event_replay_limits: std::sync::RwLock::new(
                 meerkat_core::comms::SessionEventReplayLimits::default(),
             ),
@@ -5180,6 +5192,37 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
     ///
     /// Returns the complete `Session` including message history. Used by
     /// `PersistentSessionService` to save full snapshots after each turn.
+    /// The spawner restrictions this service handed to the session's build
+    /// (live or archived). Never waits on the session's running turn.
+    pub async fn predecessor_tool_restrictions(
+        &self,
+        id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        let recorded = match self
+            .sessions
+            .read(|sessions| {
+                sessions
+                    .get(id)
+                    .map(|handle| handle.tool_restrictions.clone())
+            })
+            .await
+        {
+            Some(recorded) => recorded,
+            None => self
+                .archived_tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .cloned()
+                .ok_or_else(|| SessionError::NotFound { id: id.clone() })?,
+        };
+        recorded.map_err(|reason| {
+            SessionError::Unsupported(format!(
+                "inherited tool restriction evidence for session {id}: {reason}"
+            ))
+        })
+    }
+
     pub async fn export_session(
         &self,
         id: &SessionId,
@@ -8273,6 +8316,16 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .builder
             .build_agent_taking_tools(&mut req, agent_event_tx.clone())
             .await?;
+        // The restrictions the build actually resolved (a resumed session's
+        // restored launch policy and ceiling included), from the agent's own
+        // session before it moves into its task.
+        let tool_restrictions = agent
+            .session_clone()
+            .map_err(|error| error.to_string())
+            .and_then(|session| {
+                meerkat_core::PredecessorToolRestrictions::from_committed_session(&session)
+                    .map_err(|error| error.to_string())
+            });
         let llm_identity = agent
             .durable_llm_identity()
             .ok_or_else(|| Self::missing_durable_llm_identity_error("session creation"))?;
@@ -8427,6 +8480,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         // Store the handle
         let handle = SessionHandle {
             actor_witness: actor_witness.clone(),
+            tool_restrictions,
             #[cfg(not(target_arch = "wasm32"))]
             task_handle,
             command_tx: command_tx.clone(),
@@ -9068,6 +9122,10 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             .await?;
         let archived_view = Self::archived_view_from_handle(id, &handle);
         archived_views.insert(id.clone(), archived_view);
+        self.archived_tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), handle.tool_restrictions.clone());
 
         drop(archived_views);
         self.shutdown_removed_live_session_handle(id, handle, projection);

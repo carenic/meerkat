@@ -6380,6 +6380,78 @@ enum SpawnEnqueueOrigin {
     },
 }
 
+/// Compose the predecessor's spawner restrictions into its successor's spec,
+/// after customization: the successor keeps every inherited restriction and
+/// narrows it with its own, never widening. It keeps the predecessor's auth
+/// binding only when its own spec names none and its build resolves to the
+/// provider the binding was recorded for (`successor_provider`); a binding
+/// serves one provider, so a successor re-profiled to another provider, or to
+/// one that cannot be told, selects its own as a fresh spawn does.
+fn keep_predecessor_restrictions(
+    agent_identity: &AgentIdentity,
+    spec: &mut super::handle::SpawnMemberSpec,
+    retained: &meerkat_core::PredecessorToolRestrictions,
+    successor_provider: Option<meerkat_core::Provider>,
+) -> Result<(), MobError> {
+    let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+        agent_identity: agent_identity.to_string(),
+        reason,
+    };
+    // `Inherit` at this seam is host authority, so it adds no restriction.
+    let own_policy = spec
+        .tool_access_policy
+        .take()
+        .filter(|policy| !matches!(policy, meerkat_core::ops::ToolAccessPolicy::Inherit));
+    spec.tool_access_policy = match (own_policy, retained.launch_policy()) {
+        (None, retained) => retained,
+        (own, None) => own,
+        // A customizer that re-applies the retained policy adds nothing.
+        (Some(own), Some(retained)) if own == retained => Some(retained),
+        (Some(own), Some(retained)) => Some(without_repeated_constraints(
+            own.conjoin(retained)
+                .map_err(|error| refuse(error.to_string()))?,
+        )),
+    };
+    spec.inherited_tool_filter = match (
+        spec.inherited_tool_filter.take(),
+        retained.inherited_visibility(),
+    ) {
+        (None, retained) => retained.cloned(),
+        (own, None) => own,
+        (Some(own), Some(retained)) => Some(
+            retained
+                .narrowed_with(&own)
+                .map_err(|error| refuse(error.to_string()))?,
+        ),
+    };
+    if spec.auth_binding.is_none() {
+        spec.auth_binding = successor_provider
+            .and_then(|provider| retained.auth_binding_for_provider(provider))
+            .cloned();
+    }
+    Ok(())
+}
+
+/// A conjunction keeps each constraint once, so a policy re-applied at every
+/// respawn does not grow with each generation.
+fn without_repeated_constraints(
+    policy: meerkat_core::ops::ToolAccessPolicy,
+) -> meerkat_core::ops::ToolAccessPolicy {
+    match policy {
+        meerkat_core::ops::ToolAccessPolicy::Constraints(constraints) => {
+            let mut kept: Vec<meerkat_core::ops::ToolAccessConstraint> =
+                Vec::with_capacity(constraints.len());
+            for constraint in constraints {
+                if !kept.contains(&constraint) {
+                    kept.push(constraint);
+                }
+            }
+            meerkat_core::ops::ToolAccessPolicy::Constraints(kept)
+        }
+        other => other,
+    }
+}
+
 struct RespawnSnapshot {
     profile_name: ProfileName,
     runtime_mode: crate::MobRuntimeMode,
@@ -30376,9 +30448,9 @@ impl MobActor {
         // MeerkatMachine) carries large debug poll frames. Run it on its own
         // task so those frames start at the worker loop rather than beneath
         // the actor run loop and restore frames: inline, the sum overflowed
-        // the 2 MiB worker-stack canary
-        // `mob_cold_restart_partial_resume_respawns_wired_member` once #1416
-        // widened the generated machine types. Binding preparation is
+        // the 2 MiB worker-stack canary (now
+        // `mob_cold_restart_resume_respawns_a_wired_member_whose_session_survived`)
+        // once #1416 widened the generated machine types. Binding preparation is
         // idempotent, so a late completion after a cancelled restore is
         // harmless (see `relieve_caller_stack`). Do not move this back inline:
         // that re-stacks the registration chain beneath the actor frames.
@@ -45183,6 +45255,88 @@ impl MobActor {
         }
     }
 
+    /// The provider a respawn successor's build resolves to, read before the
+    /// predecessor is retired, exactly as the spawn resolves it: the spec's
+    /// profile override or its role's profile, with its model override, then
+    /// the profile's declared provider, the mob's model entry or the catalog.
+    /// A profile that cannot be resolved refuses the respawn.
+    async fn successor_build_provider(
+        &self,
+        agent_identity: &AgentIdentity,
+        spec: &super::handle::SpawnMemberSpec,
+    ) -> Result<Option<meerkat_core::Provider>, MobError> {
+        let mut profile = match &spec.override_profile {
+            Some(profile) => profile.clone(),
+            None => self
+                .definition
+                .resolve_profile(&spec.role_name, self.realm_profile_store.as_ref())
+                .await
+                .map_err(
+                    |error| MobError::RespawnPredecessorRestrictionsUnavailable {
+                        agent_identity: agent_identity.to_string(),
+                        reason: format!("the successor's profile cannot be resolved: {error}"),
+                    },
+                )?,
+        };
+        if let Some(model) = &spec.model_override {
+            profile.model.clone_from(model);
+        }
+        Ok(crate::portable_profile::resolved_profile_provider(
+            &profile,
+            &self.definition.models,
+        ))
+    }
+
+    /// The spawner restrictions of the member being respawned, as its
+    /// session's owner states them, or `None` when the member's journaled
+    /// record proves it never had local session authority in this
+    /// generation. Missing, unsupported or changed evidence refuses the
+    /// respawn before anything is retired, keeping the member.
+    async fn retained_predecessor_restrictions(
+        &self,
+        agent_identity: &AgentIdentity,
+        snapshot: &RespawnSnapshot,
+    ) -> Result<Option<meerkat_core::PredecessorToolRestrictions>, MobError> {
+        let refuse = |reason: String| MobError::RespawnPredecessorRestrictionsUnavailable {
+            agent_identity: agent_identity.to_string(),
+            reason,
+        };
+        let current_local_session = |entry: Option<&RosterEntry>| {
+            entry
+                .filter(|entry| {
+                    entry.agent_runtime_id == snapshot.old_runtime_id
+                        && entry.fence_token == snapshot.old_fence_token
+                })
+                .map(RosterEntry::local_session)
+        };
+        let Some(local_session) =
+            current_local_session(self.roster.read().await.get(agent_identity))
+        else {
+            return Err(refuse(
+                "the member changed before its restrictions were read".to_string(),
+            ));
+        };
+        let session_id = match local_session {
+            crate::roster::MemberLocalSession::NeverBound => return Ok(None),
+            crate::roster::MemberLocalSession::Bound(session_id) => session_id,
+        };
+        let restrictions = self
+            .session_service
+            .predecessor_tool_restrictions(&session_id)
+            .await
+            .map_err(|error| refuse(error.to_string()))?;
+        // The read awaited: the member must still be the same incarnation,
+        // bound to the same session.
+        if current_local_session(self.roster.read().await.get(agent_identity))
+            != Some(crate::roster::MemberLocalSession::Bound(session_id))
+        {
+            return Err(refuse(
+                "the member changed while its restrictions were read".to_string(),
+            ));
+        }
+        Ok(Some(restrictions))
+    }
+
     async fn handle_respawn(
         &mut self,
         agent_identity: AgentIdentity,
@@ -45296,6 +45450,19 @@ impl MobActor {
             cleanup_retry = snapshot.cleanup_retry,
             "MobActor::handle_respawn captured snapshot"
         );
+                // The spawner restrictions the successor must keep, pinned
+                // before anything is retired. Placed members are owned by
+                // their hosting member and are not read here; a member that
+                // never had a local session carries no session restrictions,
+                // and its successor keeps the launch policy its own spec
+                // inherits.
+                let retained_restrictions = match placed_host {
+                    Some(_) => None,
+                    None => self
+                        .retained_predecessor_restrictions(&agent_identity, &snapshot)
+                        .await
+                        .map_err(MobRespawnError::from)?,
+                };
 
                 let original_identity = AgentIdentity::from(agent_identity.as_str());
                 let mut replacement_spec = match successor_spec {
@@ -45396,6 +45563,23 @@ impl MobActor {
             return Err(MobRespawnError::from(MobError::Internal(format!(
                 "spawn customizer cannot re-place respawn of '{original_identity}'"
             ))));
+                }
+
+                if let Some(retained) = &retained_restrictions {
+                    // Resolved here, before anything is retired: a successor
+                    // whose build cannot be resolved is refused with the
+                    // member kept, never lost after its retirement.
+                    let successor_provider = self
+                        .successor_build_provider(&agent_identity, &replacement_spec)
+                        .await
+                        .map_err(MobRespawnError::from)?;
+                    keep_predecessor_restrictions(
+                        &agent_identity,
+                        &mut replacement_spec,
+                        retained,
+                        successor_provider,
+                    )
+                    .map_err(MobRespawnError::from)?;
                 }
 
                 Ok::<_, MobRespawnError>((
@@ -63367,5 +63551,124 @@ impl SupervisorTrustInstaller {
                 "unknown supervisor binding variant during rollback".to_string(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod respawn_restriction_tests {
+    use super::*;
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    fn deny(name: &str) -> ToolAccessPolicy {
+        ToolAccessPolicy::DenyList([name].into_iter().collect())
+    }
+
+    fn recorded_binding() -> meerkat_core::AuthBindingRef {
+        meerkat_core::AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("tenant_a").expect("realm id"),
+            binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+            profile: None,
+            origin: meerkat_core::BindingOrigin::Configured,
+        }
+    }
+
+    /// The predecessor's record: `launch`, no ceiling, and a binding recorded
+    /// for Anthropic.
+    fn retained(launch: Option<ToolAccessPolicy>) -> meerkat_core::PredecessorToolRestrictions {
+        meerkat_core::PredecessorToolRestrictions::from_build_handoff(launch, None)
+            .with_auth_binding(
+                Some(recorded_binding()),
+                Some(meerkat_core::Provider::Anthropic),
+            )
+    }
+
+    fn successor() -> super::super::handle::SpawnMemberSpec {
+        super::super::handle::SpawnMemberSpec::new("worker", AgentIdentity::from("w"))
+    }
+
+    fn composed(
+        own: Option<ToolAccessPolicy>,
+        retained: &meerkat_core::PredecessorToolRestrictions,
+    ) -> Option<ToolAccessPolicy> {
+        let mut spec = successor();
+        spec.tool_access_policy = own;
+        keep_predecessor_restrictions(&AgentIdentity::from("w"), &mut spec, retained, None)
+            .expect("the restrictions compose");
+        spec.tool_access_policy
+    }
+
+    /// A successor keeps the predecessor's launch policy: no policy of its own
+    /// (or `Inherit`) leaves it as it is, a policy of its own is conjoined with
+    /// it and never replaces it, and a policy re-applied at every respawn
+    /// does not grow the conjunction.
+    #[test]
+    fn a_successor_keeps_the_predecessor_launch_policy_and_never_widens_it() {
+        let shell = retained(Some(deny("shell")));
+        assert_eq!(composed(None, &shell), Some(deny("shell")));
+        assert_eq!(
+            composed(Some(ToolAccessPolicy::Inherit), &shell),
+            Some(deny("shell"))
+        );
+        let both = deny("other").conjoin(deny("shell")).expect("conjoin");
+        assert_eq!(composed(Some(deny("other")), &shell), Some(both.clone()));
+        assert_eq!(
+            composed(Some(deny("shell")), &shell),
+            Some(deny("shell")),
+            "re-applying the retained policy adds nothing"
+        );
+        assert_eq!(
+            composed(Some(deny("other")), &retained(Some(both.clone()))),
+            Some(both),
+            "a constraint already in the conjunction is kept once"
+        );
+        assert_eq!(
+            composed(Some(deny("other")), &retained(None)),
+            Some(deny("other")),
+            "an unrestricted predecessor leaves the successor's own policy"
+        );
+    }
+
+    /// The predecessor's binding is kept only for a successor that builds on
+    /// the provider it was recorded for, and never over the successor's own.
+    #[test]
+    fn a_successor_keeps_the_predecessor_binding_only_on_its_provider() {
+        let retained = retained(None);
+        let with_provider = |provider: Option<meerkat_core::Provider>| {
+            let mut spec = successor();
+            keep_predecessor_restrictions(
+                &AgentIdentity::from("w"),
+                &mut spec,
+                &retained,
+                provider,
+            )
+            .expect("the restrictions compose");
+            spec.auth_binding
+        };
+        assert_eq!(
+            with_provider(Some(meerkat_core::Provider::Anthropic)),
+            Some(recorded_binding())
+        );
+        assert_eq!(with_provider(Some(meerkat_core::Provider::OpenAI)), None);
+        assert_eq!(with_provider(None), None);
+
+        let own = meerkat_core::AuthBindingRef {
+            binding: meerkat_core::BindingId::parse("own").expect("binding id"),
+            ..recorded_binding()
+        };
+        let mut spec = successor();
+        spec.auth_binding = Some(own.clone());
+        keep_predecessor_restrictions(
+            &AgentIdentity::from("w"),
+            &mut spec,
+            &retained,
+            Some(meerkat_core::Provider::Anthropic),
+        )
+        .expect("the restrictions compose");
+        assert_eq!(
+            spec.auth_binding,
+            Some(own),
+            "the successor's own binding stands"
+        );
     }
 }

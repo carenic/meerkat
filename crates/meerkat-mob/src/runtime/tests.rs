@@ -577,6 +577,47 @@ fn factory_policy_session(mut session: Session, model: String, max_tokens: u32) 
     session
 }
 
+/// Record a build's restrictions in the session body as the factory does: the
+/// launch policy (an explicit one, else the restored one, else the legacy
+/// effective policy) and a canonical visibility record when none exists.
+fn factory_recorded_restrictions(
+    mut session: Session,
+    build: Option<&meerkat_core::service::SessionBuildOptions>,
+) -> Session {
+    if let Ok(Some(mut metadata)) = session.try_session_metadata() {
+        let launch = build
+            .and_then(|build| build.tool_access_policy.clone())
+            .or_else(|| {
+                metadata
+                    .tooling
+                    .spawn_tool_access_policy
+                    .clone()
+                    .map_or_else(
+                        || metadata.tooling.tool_access_policy.clone(),
+                        meerkat_core::ops::SpawnToolAccessPolicy::into_launch,
+                    )
+            });
+        metadata.tooling.spawn_tool_access_policy = Some(
+            meerkat_core::ops::SpawnToolAccessPolicy::from_launch(launch),
+        );
+        session
+            .set_session_metadata(metadata)
+            .expect("test metadata serializes");
+    }
+    if matches!(session.try_tool_visibility_state(), Ok(None)) {
+        let mut raw = serde_json::to_value(&session).expect("test session serializes");
+        raw.get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("test session metadata is an object")
+            .insert(
+                meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+                serde_json::json!({}),
+            );
+        session = serde_json::from_value(raw).expect("test session deserializes");
+    }
+    session
+}
+
 fn test_llm_identity(model: impl Into<String>) -> SessionLlmIdentity {
     SessionLlmIdentity {
         model: model.into(),
@@ -1681,6 +1722,8 @@ struct CreateSessionRecord {
     /// binding (`ResumeOverrideMask::application_tool_policy`).
     has_policy_registry: bool,
     application_tool_policy_masked: bool,
+    /// The auth binding the build names.
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1929,6 +1972,11 @@ impl TestRuntimeControlBarrier {
 
 struct MockSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<MockCommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// mock created, as a session owner records them.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     live_session_data: RwLock<HashMap<SessionId, Session>>,
     persisted_sessions: RwLock<HashMap<SessionId, Session>>,
@@ -2214,11 +2262,21 @@ struct MockSessionService {
 }
 
 impl MockSessionService {
+    /// Drop this owner's record of a session's spawner restrictions, as a
+    /// session whose evidence is missing or unknown.
+    fn forget_tool_restrictions(&self, session_id: &SessionId) {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             live_session_data: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
             resume_authority_gate: tokio::sync::Mutex::new(()),
             persisted_session_revisions: RwLock::new(HashMap::new()),
@@ -2473,6 +2531,19 @@ impl MockSessionService {
             .iter()
             .filter(|(session_id, _)| persisted_ids.contains(*session_id))
             .map(|(session_id, name)| (session_id.clone(), name.clone()))
+            .collect();
+        // A persisted session's restriction record is part of its committed
+        // body, so it survives the restart with it.
+        *restarted
+            .tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self
+            .tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(session_id, _)| persisted_ids.contains(*session_id))
+            .map(|(session_id, record)| (session_id.clone(), record.clone()))
             .collect();
         restarted
     }
@@ -3784,7 +3855,12 @@ impl MockSessionService {
                         .map(|b| b.override_web_search)
                         .unwrap_or(ToolCategoryOverride::Inherit),
                     tool_access_policy: build.and_then(|b| b.tool_access_policy.clone()),
-                    spawn_tool_access_policy: None,
+                    // Recorded as the factory records it on every build.
+                    spawn_tool_access_policy: Some(
+                        meerkat_core::ops::SpawnToolAccessPolicy::from_launch(
+                            build.and_then(|b| b.tool_access_policy.clone()),
+                        ),
+                    ),
                     application_tool_policy: build
                         .map(|b| b.application_tool_policy.clone())
                         .unwrap_or(meerkat_core::ApplicationToolPolicyBinding::Unmanaged),
@@ -3820,6 +3896,64 @@ impl MockSessionService {
             session
                 .set_build_state(build_state)
                 .expect("mock session build state should serialize");
+        }
+        {
+            // This owner keeps its own record for a session it created and
+            // now resumes; a session it never recorded resolves from the
+            // request (a resumed body without a record is refused).
+            let mut records = self
+                .tool_restrictions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(records.get(&session_id), Some(Ok(_))) {
+                // Mirror the factory's launch-policy restore: a resumed body
+                // recorded before the launch part was kept separately
+                // restores its effective policy as the launch policy, and
+                // the build records it.
+                let mut build = req.build.clone();
+                if let Some(resumed) = build
+                    .as_mut()
+                    .and_then(|build| build.resume_session.as_mut())
+                    && let Ok(Some(mut metadata)) = resumed.try_session_metadata()
+                    && metadata.tooling.spawn_tool_access_policy.is_none()
+                {
+                    metadata.tooling.spawn_tool_access_policy =
+                        Some(meerkat_core::ops::SpawnToolAccessPolicy::from_launch(
+                            metadata.tooling.tool_access_policy.clone(),
+                        ));
+                    resumed
+                        .set_session_metadata(metadata)
+                        .expect("mock resumed metadata should serialize");
+                }
+                // A resumed body without a canonical visibility record (and no
+                // legacy inherited filter) builds with the default state.
+                if let Some(resumed) = build
+                    .as_mut()
+                    .and_then(|build| build.resume_session.as_mut())
+                    && matches!(resumed.try_tool_visibility_state(), Ok(None))
+                    && resumed
+                        .metadata()
+                        .get(meerkat_core::tool_scope::INHERITED_TOOL_FILTER_METADATA_KEY)
+                        .is_none()
+                {
+                    let mut raw = serde_json::to_value(&*resumed)
+                        .expect("mock resumed session should serialize");
+                    raw.get_mut("metadata")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("mock resumed session metadata is an object")
+                        .insert(
+                            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+                            serde_json::json!({}),
+                        );
+                    *resumed = serde_json::from_value(raw)
+                        .expect("mock resumed session should deserialize");
+                }
+                records.insert(
+                    session_id.clone(),
+                    meerkat_core::PredecessorToolRestrictions::from_build_request(build.as_ref())
+                        .map_err(|error| error.to_string()),
+                );
+            }
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
         self.live_session_data
@@ -3949,6 +4083,10 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .is_some_and(|build| build.resume_override_mask.application_tool_policy),
+                auth_binding: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.auth_binding.clone()),
             });
 
         let mcp_server_names: Vec<String> = req
@@ -4938,6 +5076,27 @@ impl MobSessionService for MockSessionService {
         _session_id: &SessionId,
     ) -> Result<Option<Vec<meerkat_core::ToolDef>>, SessionError> {
         Ok(Some(Vec::new()))
+    }
+
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| {
+                SessionError::Unsupported(format!(
+                    "no inherited tool restriction evidence for session {session_id}"
+                ))
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
     }
 
     async fn subscribe_session_activity(
@@ -13678,6 +13837,13 @@ impl SessionServiceControlExt for PersistedListingSessionService {
 
 #[async_trait]
 impl MobSessionService for PersistedListingSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.inner.predecessor_tool_restrictions(session_id).await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &SessionId,
@@ -14114,6 +14280,13 @@ impl SessionServiceControlExt for InactiveReadSessionService {
 
 #[async_trait]
 impl MobSessionService for InactiveReadSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.inner.predecessor_tool_restrictions(session_id).await
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
@@ -14938,6 +15111,7 @@ impl SessionAgentBuilder for OverlayProbeSessionAgentBuilder {
             .unwrap_or_default();
         let session =
             factory_policy_session(session, req.model.clone(), req.max_tokens.unwrap_or(1024));
+        let session = factory_recorded_restrictions(session, req.build.as_ref());
         Ok(OverlayProbeSessionAgent {
             session,
             provider_visible_tools: Arc::clone(&self.provider_visible_tools),
@@ -24960,6 +25134,178 @@ async fn test_stopped_missing_member_wire_is_rejected_by_machine_admission() {
             })
         ),
         "WireMembers must surface the MobMachine stopped-phase admission before shell member lookup: {result:?}"
+    );
+}
+
+/// A respawn whose predecessor's spawner restrictions cannot be stated is
+/// refused locally, typed, before anything is retired: the member keeps its
+/// runtime and session.
+#[tokio::test]
+async fn respawn_without_predecessor_restriction_evidence_is_refused_before_retirement() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("w-1");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            AgentIdentity::from(member_id.as_str()),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn original member");
+    let original = handle
+        .get_member(&member_id)
+        .await
+        .unwrap()
+        .expect("original member exists");
+    let session_id = original
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("a session-backed member");
+    service.forget_tool_restrictions(&session_id);
+
+    let refused = handle.respawn(member_id.clone(), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a typed local refusal: {refused:?}"
+    );
+    let still = handle
+        .get_member(&member_id)
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
+    assert_eq!(still.member_ref.bridge_session_id(), Some(&session_id));
+}
+
+/// A worker profile on a declared provider, so a respawn can tell which
+/// provider its successor's build resolves to.
+fn bound_respawn_definition(id: &str) -> MobDefinition {
+    let mut definition = sample_definition();
+    definition.id = MobId::from(id);
+    if let Some(ProfileBinding::Inline(profile)) =
+        definition.profiles.get_mut(&ProfileName::from("worker"))
+    {
+        profile.provider = Some(meerkat_core::Provider::Anthropic);
+    }
+    definition
+}
+
+fn scoped_auth_binding() -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("tenant_a").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+async fn spawn_bound_worker(handle: &MobHandle, member: &AgentIdentity) {
+    let mut spec = SpawnMemberSpec::new("worker", member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec.auth_binding = Some(scoped_auth_binding());
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the bound worker");
+}
+
+/// A default respawn keeps the auth binding its predecessor's credentials
+/// resolved through when the successor builds on the same provider.
+#[tokio::test]
+async fn a_respawned_member_keeps_its_binding_on_the_same_provider() {
+    let (handle, service) = create_test_mob(bound_respawn_definition("respawn-binding-kept")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the predecessor builds through its binding"
+    );
+
+    handle
+        .respawn(member.clone(), None)
+        .await
+        .expect("respawn the bound worker");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the successor on the same provider keeps the binding"
+    );
+}
+
+/// A successor re-profiled to another provider does not receive the
+/// predecessor's binding, which serves only the provider it was recorded for:
+/// it respawns on its own provider's selection rather than failing its build
+/// after the predecessor's retirement.
+#[tokio::test]
+async fn a_successor_re_profiled_to_another_provider_selects_its_own_binding() {
+    let definition = bound_respawn_definition("respawn-binding-reprofiled");
+    let mut other_provider = definition
+        .resolve_inline_profile(&ProfileName::from("worker"))
+        .cloned()
+        .expect("an inline worker profile");
+    other_provider.provider = Some(meerkat_core::Provider::OpenAI);
+    let (handle, service) = create_test_mob(definition).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+
+    let mut successor = SpawnMemberSpec::new("worker", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    successor.override_profile = Some(other_provider);
+    handle
+        .respawn_with_successor_spec(successor)
+        .await
+        .expect("the re-profiled successor respawns");
+    assert_eq!(
+        last_member_build(&service, &member).await.auth_binding,
+        None,
+        "the successor on another provider selects its own binding"
+    );
+}
+
+/// A successor whose profile cannot be resolved is refused, typed, before the
+/// predecessor is retired: the member keeps its runtime and session.
+#[tokio::test]
+async fn a_successor_whose_profile_cannot_be_resolved_is_refused_before_retirement() {
+    let (handle, _service) =
+        create_test_mob(bound_respawn_definition("respawn-unresolved-successor")).await;
+    let member = AgentIdentity::from("bound-worker");
+    spawn_bound_worker(&handle, &member).await;
+    let original = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member exists");
+
+    let mut successor = SpawnMemberSpec::new("no-such-profile", member.clone());
+    successor.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let refused = handle.respawn_with_successor_spec(successor).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a typed refusal before retirement: {refused:?}"
+    );
+    let still = handle
+        .get_member(&member)
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(still.agent_runtime_id, original.agent_runtime_id);
+    assert_eq!(
+        still.member_ref.bridge_session_id(),
+        original.member_ref.bridge_session_id()
     );
 }
 
@@ -36263,7 +36609,7 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
 }
 
 #[tokio::test]
-async fn test_respawn_broken_wired_member_replays_peer_endpoint_after_cold_service_restart() {
+async fn test_respawn_refuses_a_broken_member_whose_session_was_lost_after_cold_service_restart() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let mut definition = sample_definition();
@@ -36361,44 +36707,73 @@ async fn test_respawn_broken_wired_member_replays_peer_endpoint_after_cold_servi
         "resume must retain the broken member's generated peer endpoint before pruning stale trust"
     );
 
-    let receipt = resumed
-        .respawn(AgentIdentity::from("w-2"), None)
+    // The predecessor's session, and with it the owner's evidence of its
+    // inherited restrictions, is gone: respawn refuses before retiring
+    // anything and keeps the exact Broken member.
+    let before = resumed
+        .get_member(&AgentIdentity::from("w-2"))
         .await
-        .expect("respawn should repair broken wired member");
-    let repaired = resumed
+        .unwrap()
+        .expect("broken member in the roster");
+    let trusted_by_w1_before = restarted_service.trusted_peer_names(&sid_w1).await;
+    let refused = resumed.respawn(AgentIdentity::from("w-2"), None).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(super::handle::MobRespawnError::Mob(
+                MobError::RespawnPredecessorRestrictionsUnavailable { .. }
+            ))
+        ),
+        "a lost predecessor session refuses the respawn, typed: {refused:?}"
+    );
+    let after = resumed
+        .get_member(&AgentIdentity::from("w-2"))
+        .await
+        .unwrap()
+        .expect("the member was not retired");
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agent_runtime_id, before.agent_runtime_id);
+    assert_eq!(after.fence_token, before.fence_token);
+    assert_eq!(after.bridge_session_id(), Some(&sid_w2));
+    let still_broken = resumed
         .member_status(&AgentIdentity::from("w-2"))
         .await
-        .expect("repaired member status");
-    let new_sid = repaired
-        .current_bridge_session_id
-        .clone()
-        .expect("respawned worker should have new session");
-    assert_ne!(new_sid, sid_w2);
+        .expect("broken member status");
     assert_eq!(
-        repaired.status,
-        crate::runtime::handle::MobMemberStatus::Active
+        still_broken.status,
+        crate::runtime::handle::MobMemberStatus::Broken
     );
-    let (runtime_id, fence_token) = repaired
-        .runtime_identity_fields()
-        .expect("repaired member should have runtime identity");
-    assert_eq!(runtime_id, &receipt.agent_runtime_id);
-    assert_eq!(fence_token, receipt.fence_token);
-    assert!(repaired.error.is_none());
     assert!(
-        !restarted_adapter.contains_session(&sid_w2).await,
-        "respawn must unregister the exact retired operation-owner registration"
+        still_broken
+            .current_bridge_session_id
+            .as_ref()
+            .is_none_or(|session| session == &sid_w2),
+        "no successor session was published"
     );
 
+    // No trust was installed for a successor, and the healthy sibling keeps
+    // working.
     let trusted_by_w1 = restarted_service.trusted_peer_names(&sid_w1).await;
+    assert_eq!(trusted_by_w1, trusted_by_w1_before);
     assert!(
-        trusted_by_w1.contains(&test_comms_name("worker", "w-2")),
-        "respawn should restore trust from healthy peer to repaired member"
+        !trusted_by_w1.contains(&test_comms_name("worker", "w-2")),
+        "the healthy peer holds no trust for the lost member"
     );
-    let trusted_by_w2 = restarted_service.trusted_peer_names(&new_sid).await;
-    assert!(
-        trusted_by_w2.contains(&test_comms_name("worker", "w-1")),
-        "respawn should restore trust from repaired member to healthy peer"
+    let sibling = resumed
+        .member_status(&AgentIdentity::from("w-1"))
+        .await
+        .expect("sibling status");
+    assert_eq!(
+        sibling.status,
+        crate::runtime::handle::MobMemberStatus::Active
     );
+    resumed
+        .member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("sibling member handle")
+        .internal_turn(ContentInput::from("still working".to_string()))
+        .await
+        .expect("the sibling accepts work after the refusal");
 }
 
 #[tokio::test]
@@ -61906,6 +62281,11 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
 /// actual PeerRequest delivery between wired meerkats.
 struct RealCommsSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<meerkat_comms::CommsRuntime>>>,
+    /// The spawner restrictions handed to the build of each session this
+    /// service created.
+    tool_restrictions: std::sync::Mutex<
+        HashMap<SessionId, Result<meerkat_core::PredecessorToolRestrictions, String>>,
+    >,
     /// Durable documents are separate from the live comms/actor map. This
     /// test service advertises persistent-session support, so exact attachment
     /// replacement must be able to discard a live actor and rebuild it from
@@ -61935,6 +62315,7 @@ impl RealCommsSessionService {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            tool_restrictions: std::sync::Mutex::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
             archived_session_ids: RwLock::new(HashSet::new()),
             resume_authority_gate: tokio::sync::Mutex::new(()),
@@ -62178,6 +62559,14 @@ impl RealCommsSessionService {
                     )))
                 })?;
         }
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.clone(),
+                meerkat_core::PredecessorToolRestrictions::from_build_request(req.build.as_ref())
+                    .map_err(|error| error.to_string()),
+            );
         let _authority_guard = self.resume_authority_gate.lock().await;
         self.archived_session_ids.write().await.remove(&session_id);
         self.persisted_sessions
@@ -62413,6 +62802,25 @@ impl SessionServiceControlExt for RealCommsSessionService {
 
 #[async_trait]
 impl MobSessionService for RealCommsSessionService {
+    async fn predecessor_tool_restrictions(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_core::PredecessorToolRestrictions, SessionError> {
+        self.tool_restrictions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| SessionError::NotFound {
+                id: session_id.clone(),
+            })?
+            .map_err(|reason| {
+                SessionError::Unsupported(format!(
+                    "inherited tool restriction evidence for session {session_id}: {reason}"
+                ))
+            })
+    }
+
     async fn subscribe_session_activity(
         &self,
         _session_id: &SessionId,
@@ -83273,6 +83681,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::ActorCommandTimedOut { .. } => "actor_command_timed_out".to_string(),
         MobError::MemberReloadRefused { .. } => "member_reload_refused".to_string(),
         MobError::HeldProvisionUnsupported { .. } => "held_provision_unsupported".to_string(),
+        MobError::RespawnPredecessorRestrictionsUnavailable { .. } => {
+            "respawn_predecessor_restrictions_unavailable".to_string()
+        }
         MobError::MemberReloadTimedOut { .. } => "member_reload_timed_out".to_string(),
         MobError::HeldSpawnUnsupported { .. } => "held_spawn_unsupported".to_string(),
         MobError::HeldSpawnAborted { .. } => "held_spawn_aborted".to_string(),
