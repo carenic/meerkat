@@ -7235,14 +7235,28 @@ ORDER BY runtime_id";
                 source_message_count,
             );
             let co_tenant_physical =
-                meerkat_store::sqlite_store::ensure_head_canonical_for_runtime_in_txn(
+                meerkat_store::sqlite_store::ensure_head_canonical_for_runtime_with_staged_images_in_txn(
                     &tx,
                     &current_source.session_id,
+                    media.map(|media| &media.stored),
                 )
                 .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
             let (physical_head, physical_head_token, seeded_from_whole_blob) =
                 match (co_tenant_physical, source) {
-                    (Some((head, token)), _) => (head, token, false),
+                    (Some((head, token)), _) => {
+                        // With a media stage, a legacy blob row this migrated
+                        // laid its inline images out as blob references; the
+                        // boundary derives from the body moved out the same
+                        // way, so the two row lineages agree.
+                        if media.is_some() {
+                            current_source.session = session_with_staged_media(
+                                runtime_id,
+                                current_source.session.clone(),
+                                media,
+                            )?;
+                        }
+                        (head, token, false)
+                    }
                     // The caller asserted a standalone WholeBlob database:
                     // its co-tenant store never held this session, so the
                     // verified body seeds it here, in the transaction that
@@ -7589,6 +7603,140 @@ ORDER BY runtime_id";
             }
         }
         Ok(pending)
+    }
+
+    /// The inline images a realm's activation would lay out, read over one
+    /// snapshot that is rolled back: for each runtime it would activate,
+    /// those of its WholeBlob body and of its co-tenant session's legacy
+    /// blob row while that has no head row. A runtime already activated has
+    /// nothing to stage.
+    fn collect_realm_whole_blob_media(
+        conn: &mut Connection,
+    ) -> Result<Vec<PendingStandaloneMedia>, RuntimeStoreError> {
+        let order =
+            head_canonical_activation_order(conn, HeadCanonicalActivationSource::CoTenantSession)?;
+        // Rolled back when it drops: this reads one snapshot and writes
+        // nothing.
+        let tx = begin_runtime_transaction(conn)?;
+        let mut pending = Vec::new();
+        for runtime_id in &order {
+            let authority = load_head_canonical_authority(&tx, runtime_id)?;
+            match (
+                authority.as_ref(),
+                load_head_canonical_activation_marker(&tx, runtime_id)?.map(|marker| marker.state),
+            ) {
+                (Some(_), None | Some(HeadCanonicalActivationState::Complete))
+                | (None, Some(HeadCanonicalActivationState::Complete)) => continue,
+                (Some(_), Some(HeadCanonicalActivationState::InProgress)) | (None, _) => {}
+            }
+            let source = load_store_owned_head_canonical_activation_source_in_txn(&tx, runtime_id)?;
+            let legacy = meerkat_store::sqlite_store::unmigrated_legacy_blob_session_in_txn(
+                &tx,
+                &source.session_id,
+            )
+            .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut payloads = Vec::new();
+            for session in std::iter::once(&source.session).chain(legacy.as_ref()) {
+                if let Some(externalized) = externalize_inline_images(runtime_id, session)? {
+                    payloads.extend(
+                        externalized
+                            .payloads
+                            .into_iter()
+                            .filter(|payload| seen.insert(payload.blob_id.clone())),
+                    );
+                }
+            }
+            if !payloads.is_empty() {
+                pending.push(PendingStandaloneMedia {
+                    runtime_id: runtime_id.clone(),
+                    session_id: source.session_id,
+                    payloads,
+                });
+            }
+        }
+        Ok(pending)
+    }
+
+    /// A media open's read-only check, before it pins the file: every
+    /// runtime the activation would take up has a WholeBlob body whose inline
+    /// images `media` stored, and its session's legacy blob row, while that
+    /// has no head row, holds only images `media` stored and lays out with
+    /// them as blob references. A refusal here writes nothing, so the file
+    /// stays a realm the plain open and earlier builds open as before. The
+    /// activation transactions repeat every check and stay authoritative.
+    fn check_realm_activation_with_media(
+        conn: &mut Connection,
+        media: &StandaloneWholeBlobMediaStage,
+    ) -> Result<(), RuntimeStoreError> {
+        let order =
+            head_canonical_activation_order(conn, HeadCanonicalActivationSource::CoTenantSession)?;
+        // Rolled back when it drops: the check reads one snapshot and
+        // writes nothing.
+        let tx = begin_runtime_transaction(conn)?;
+        for runtime_id in &order {
+            let authority = load_head_canonical_authority(&tx, runtime_id)?;
+            match (
+                authority.as_ref(),
+                load_head_canonical_activation_marker(&tx, runtime_id)?.map(|marker| marker.state),
+            ) {
+                (Some(_), None | Some(HeadCanonicalActivationState::Complete))
+                | (None, Some(HeadCanonicalActivationState::Complete)) => continue,
+                (Some(_), Some(HeadCanonicalActivationState::InProgress)) | (None, _) => {}
+            }
+            let source = load_store_owned_head_canonical_activation_source_in_txn(&tx, runtime_id)?;
+            session_with_staged_media(runtime_id, source.session, Some(media))?;
+            if let Some(legacy) =
+                meerkat_store::sqlite_store::unmigrated_legacy_blob_session_in_txn(
+                    &tx,
+                    &source.session_id,
+                )
+                .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?
+            {
+                let legacy = session_with_staged_media(runtime_id, legacy, Some(media))?;
+                meerkat_store::sqlite_store::check_runtime_seed_layout(&legacy)
+                    .map_err(|error| map_head_canonical_session_store_error(runtime_id, error))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Put every pending image into `blob_store` under its content address,
+    /// refusing typed when the store answers any other address.
+    async fn put_pending_media(
+        blob_store: &dyn meerkat_core::BlobStore,
+        pending: Vec<PendingStandaloneMedia>,
+    ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
+        let mut stage = StandaloneWholeBlobMediaStage::default();
+        for runtime in pending {
+            for payload in &runtime.payloads {
+                let stored = blob_store
+                    .put_image(&payload.media_type, &payload.data)
+                    .await
+                    .map_err(|error| {
+                        RuntimeStoreError::WriteFailed(format!(
+                            "storing inline image {} of runtime {} failed: {error}",
+                            payload.blob_id.as_str(),
+                            runtime_id_text(&runtime.runtime_id)
+                        ))
+                    })?;
+                if stored.blob_id != payload.blob_id {
+                    return Err(RuntimeStoreError::Unsupported(format!(
+                        "the blob store addressed inline image {} of runtime {} as {}; a conversion needs the image's content address",
+                        payload.blob_id.as_str(),
+                        runtime_id_text(&runtime.runtime_id),
+                        stored.blob_id.as_str()
+                    )));
+                }
+                stage.stored.insert(payload.blob_id.clone());
+            }
+            stage.runtimes.push(StandaloneWholeBlobMediaRuntime {
+                runtime_id: runtime.runtime_id,
+                session_id: runtime.session_id,
+                images: runtime.payloads.len(),
+            });
+        }
+        Ok(stage)
     }
 
     /// The standalone conversion's read-only check, before it pins the
@@ -11664,14 +11812,88 @@ ORDER BY runtime_id";
         /// converts through [`Self::convert_standalone_whole_blob_in_place`]
         /// first.
         pub fn new_head_canonical(path: impl Into<PathBuf>) -> Result<Self, RuntimeStoreError> {
+            Self::open_head_canonical(path.into(), None)
+        }
+
+        /// [`Self::new_head_canonical`] for a realm whose WholeBlob runtimes
+        /// or legacy session blob rows hold images inline (a session a
+        /// 0.8.x-era host compacted with images in its transcript): it
+        /// stages those images into `blob_store`, the realm blob store its
+        /// sessions hydrate from ([`Self::stage_realm_whole_blob_media`]),
+        /// then opens with them
+        /// ([`Self::new_head_canonical_with_staged_media`]).
+        pub async fn new_head_canonical_with_media(
+            path: impl Into<PathBuf>,
+            blob_store: &dyn meerkat_core::BlobStore,
+        ) -> Result<Self, RuntimeStoreError> {
+            let path = path.into();
+            let stage = Self::stage_realm_whole_blob_media(path.clone(), blob_store).await?;
+            Self::new_head_canonical_with_staged_media(path, &stage)
+        }
+
+        /// The first step of [`Self::new_head_canonical_with_media`]: put
+        /// every image the realm's activation would lay out inline (each
+        /// runtime's WholeBlob body, and its session's legacy blob row while
+        /// that has no head row) into `blob_store`, under its content
+        /// address.
+        ///
+        /// It writes nothing to the database's sessions, bodies or
+        /// authorities, so a crash here or after it leaves the file as it
+        /// was, and running it again puts the same images again. A store that
+        /// answers any address other than the image's content address
+        /// refuses typed. An activated realm, or a path with no file yet,
+        /// stages nothing. The images must be durable in `blob_store` before
+        /// the open activates: the activated rows reference them.
+        pub async fn stage_realm_whole_blob_media(
+            path: impl Into<PathBuf>,
+            blob_store: &dyn meerkat_core::BlobStore,
+        ) -> Result<StandaloneWholeBlobMediaStage, RuntimeStoreError> {
             let path = path.into();
             validate_runtime_database_file(&path)?;
+            if !path.is_file() {
+                return Ok(StandaloneWholeBlobMediaStage::default());
+            }
+            // Read every payload, and close the database, before the first
+            // store write.
+            let pending = {
+                let mut conn = open_head_canonical_runtime_connection(&path)?;
+                collect_realm_whole_blob_media(&mut conn)?
+            };
+            put_pending_media(blob_store, pending).await
+        }
+
+        /// The second step of [`Self::new_head_canonical_with_media`]:
+        /// [`Self::new_head_canonical`], where each runtime it activates has
+        /// the images its WholeBlob body and its session's legacy blob row
+        /// hold inline moved out as blob references to the images `stage`
+        /// stored.
+        ///
+        /// Every activation transaction re-reads its sources and moves their
+        /// images out again. A source that holds an image `stage` did not
+        /// store (it changed after the stage) refuses that runtime typed and
+        /// writes no head for it. The body and the blob row stay as they
+        /// were, with their inline images, beside the activated rows.
+        pub fn new_head_canonical_with_staged_media(
+            path: impl Into<PathBuf>,
+            stage: &StandaloneWholeBlobMediaStage,
+        ) -> Result<Self, RuntimeStoreError> {
+            Self::open_head_canonical(path.into(), Some(stage))
+        }
+
+        fn open_head_canonical(
+            path: PathBuf,
+            media: Option<&StandaloneWholeBlobMediaStage>,
+        ) -> Result<Self, RuntimeStoreError> {
+            validate_runtime_database_file(&path)?;
             let mut conn = open_head_canonical_runtime_connection(&path)?;
+            if let Some(media) = media {
+                check_realm_activation_with_media(&mut conn, media)?;
+            }
             pin_head_canonical_profile(&mut conn)?;
             activate_head_canonical_profiles(
                 &mut conn,
                 HeadCanonicalActivationSource::CoTenantSession,
-                None,
+                media,
             )?;
             repair_flat_physical_head_boundaries(&mut conn)?;
             drop(conn);
@@ -11812,36 +12034,7 @@ ORDER BY runtime_id";
                 let mut conn = open_head_canonical_runtime_connection(&path)?;
                 collect_standalone_whole_blob_media(&mut conn)?
             };
-            let mut stage = StandaloneWholeBlobMediaStage::default();
-            for runtime in pending {
-                for payload in &runtime.payloads {
-                    let stored = blob_store
-                        .put_image(&payload.media_type, &payload.data)
-                        .await
-                        .map_err(|error| {
-                            RuntimeStoreError::WriteFailed(format!(
-                                "storing inline image {} of runtime {} failed: {error}",
-                                payload.blob_id.as_str(),
-                                runtime_id_text(&runtime.runtime_id)
-                            ))
-                        })?;
-                    if stored.blob_id != payload.blob_id {
-                        return Err(RuntimeStoreError::Unsupported(format!(
-                            "the blob store addressed inline image {} of runtime {} as {}; a conversion needs the image's content address",
-                            payload.blob_id.as_str(),
-                            runtime_id_text(&runtime.runtime_id),
-                            stored.blob_id.as_str()
-                        )));
-                    }
-                    stage.stored.insert(payload.blob_id.clone());
-                }
-                stage.runtimes.push(StandaloneWholeBlobMediaRuntime {
-                    runtime_id: runtime.runtime_id,
-                    session_id: runtime.session_id,
-                    images: runtime.payloads.len(),
-                });
-            }
-            Ok(stage)
+            put_pending_media(blob_store, pending).await
         }
 
         /// The second step of
@@ -24029,6 +24222,278 @@ ORDER BY runtime_id";
             assert!(session_store.load(session.id()).await.unwrap().is_none());
             SqliteRuntimeStore::new_whole_blob(&path)
                 .expect("the refused file still opens as a WholeBlob database");
+        }
+
+        /// A SQLite realm at `path` as a 0.9.3 host left it: `session`'s
+        /// runtime committed as a WholeBlob body, and its co-tenant session
+        /// store keeping the same document as a released blob row.
+        async fn realm_with_blob_row(
+            path: &Path,
+            session: &Session,
+        ) -> (
+            LogicalRuntimeId,
+            meerkat_store::sqlite_store::SqliteSessionStore,
+        ) {
+            let (runtime_id, session_store) = standalone_whole_blob_database(path, session).await;
+            let millis = |at: std::time::SystemTime| {
+                i64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
+            };
+            Connection::open(path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO sessions (
+                         session_id, created_at_ms, updated_at_ms, message_count,
+                         total_tokens, metadata_json, session_json
+                     ) VALUES (?1, ?2, ?3, ?4, 0, '{}', ?5)",
+                    params![
+                        session.id().to_string(),
+                        millis(session.created_at()),
+                        millis(session.updated_at()),
+                        i64::try_from(session.messages().len()).unwrap(),
+                        serde_json::to_vec(session).unwrap(),
+                    ],
+                )
+                .unwrap();
+            (runtime_id, session_store)
+        }
+
+        /// Whether `path` holds a head row for `session_id`.
+        fn has_head_row(path: &Path, session_id: &meerkat_core::types::SessionId) -> bool {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_heads WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        }
+
+        /// A realm whose released blob row holds images inline (tool results
+        /// and comms notices in the parent advances of a re-anchored graph,
+        /// as a 0.8.x-era host wrote them) refuses to open without a blob
+        /// store, and opens with the realm blob store: each image stored once
+        /// under its content address with the original bytes, the session's
+        /// transcript revision and commits the body's, the runtime authority
+        /// the physical head, nothing inline, and a turn and a compaction
+        /// commit after it.
+        #[tokio::test]
+        async fn a_realm_whose_blob_row_holds_inline_images_opens_with_its_images_in_the_blob_store()
+         {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (runtime_id, session_store) = realm_with_blob_row(&path, &session).await;
+            let payloads = inline_image_payloads(&session);
+
+            let blobs = CountingBlobStore::new();
+            let store = SqliteRuntimeStore::new_head_canonical_with_media(&path, &blobs)
+                .await
+                .expect("the realm opens with its images moved to the blob store");
+            for payload in &payloads {
+                assert_eq!(
+                    meerkat_core::BlobStore::get(&blobs, &payload.blob_id)
+                        .await
+                        .expect("the image is in the store")
+                        .data,
+                    payload.data
+                );
+            }
+            let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+            assert_eq!(authority, physical, "the authority names the physical head");
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("the activated session");
+            let document = serde_json::to_string(&converted).unwrap();
+            for payload in &payloads {
+                assert!(
+                    !document.contains(payload.data.as_str()),
+                    "the activated session still holds an image inline"
+                );
+            }
+            assert_eq!(
+                converted.transcript_revision().unwrap(),
+                session.transcript_revision().unwrap()
+            );
+            let commits = |session: &Session| {
+                session
+                    .transcript_history_state()
+                    .unwrap()
+                    .expect("a compacted session has a graph")
+                    .commits()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(commits(&converted), commits(&session));
+
+            let observed_head = session_store
+                .load_head(session.id())
+                .await
+                .unwrap()
+                .expect("activated head");
+            let mut resumed = converted;
+            resumed.push(Message::User(UserMessage::text(
+                "the first turn after the realm opened",
+            )));
+            let mutation =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let boundary =
+                BoundSessionCommit::head_canonical_from_session(&resumed, mutation).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("a turn commits on the activated runtime");
+            commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session.id())
+                .await
+                .expect("a compaction commits on the activated runtime");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the activated realm reopens without a blob store");
+            let puts = blobs.puts();
+            SqliteRuntimeStore::new_head_canonical_with_media(&path, &blobs)
+                .await
+                .expect("the activated realm reopens with its blob store");
+            assert_eq!(
+                blobs.puts(),
+                puts,
+                "an activated realm stores nothing again"
+            );
+        }
+
+        /// A realm open that stopped after its media stage (the images are
+        /// stored, nothing in the file changed) finishes on the next open.
+        #[tokio::test]
+        async fn a_realm_open_stopped_after_its_media_stage_finishes_on_the_next_open() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (_runtime_id, session_store) = realm_with_blob_row(&path, &session).await;
+            let blobs = CountingBlobStore::new();
+            let stage = SqliteRuntimeStore::stage_realm_whole_blob_media(&path, &blobs)
+                .await
+                .expect("the stage stores the images");
+            assert!(blobs.puts() > 0);
+            drop(stage);
+            assert!(
+                !has_head_row(&path, session.id()),
+                "the stage writes nothing to the file"
+            );
+
+            SqliteRuntimeStore::new_head_canonical_with_media(&path, &blobs)
+                .await
+                .expect("the next open finishes");
+            let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+            assert_eq!(authority, physical);
+            assert_eq!(
+                session_store
+                    .load(session.id())
+                    .await
+                    .unwrap()
+                    .expect("the activated session")
+                    .transcript_revision()
+                    .unwrap(),
+                session.transcript_revision().unwrap()
+            );
+        }
+
+        /// A realm open whose stage did not store a blob row's images (the
+        /// file changed after its stage) refuses typed before it pins the
+        /// file: no head row is written and the realm still opens as a
+        /// WholeBlob realm. Without a blob store it refuses as before; an
+        /// open with its images stored then activates it.
+        #[tokio::test]
+        async fn a_realm_open_without_its_staged_images_refuses_and_writes_no_head() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let session = re_anchored_session_with_tool_result_and_notice_images();
+            let (_runtime_id, _session_store) = realm_with_blob_row(&path, &session).await;
+
+            let refused = SqliteRuntimeStore::new_head_canonical_with_staged_media(
+                &path,
+                &StandaloneWholeBlobMediaStage::default(),
+            );
+            assert!(
+                matches!(
+                    &refused,
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { detail, .. })
+                        if detail.contains("did not store")
+                ),
+                "an unstaged image refuses typed: {:?}",
+                refused.as_ref().err()
+            );
+            drop(refused);
+            assert!(!has_head_row(&path, session.id()));
+            SqliteRuntimeStore::new_whole_blob(&path)
+                .expect("the refused realm is not pinned: it still opens as a WholeBlob realm");
+            // Without a blob store the realm refuses as a 0.9.3 realm with
+            // such a session refuses today.
+            let refused_plain = SqliteRuntimeStore::new_head_canonical(&path);
+            assert!(
+                matches!(
+                    &refused_plain,
+                    Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { detail, .. })
+                        if detail.contains("compact rewrite delta carries inline media")
+                ),
+                "{:?}",
+                refused_plain.as_ref().err()
+            );
+            drop(refused_plain);
+            assert!(!has_head_row(&path, session.id()));
+
+            SqliteRuntimeStore::new_head_canonical_with_media(&path, &CountingBlobStore::new())
+                .await
+                .expect("an open with its images stored activates the realm");
+            assert!(has_head_row(&path, session.id()));
+        }
+
+        /// A realm whose blob rows hold no inline image opens through the
+        /// media path exactly as it opens without it, storing nothing.
+        #[tokio::test]
+        async fn a_realm_without_inline_images_opens_unchanged_through_the_media_path() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("realm.sqlite3");
+            let mut session = Session::new();
+            for turn in 0..3 {
+                session.push(Message::User(UserMessage::text(format!("turn {turn}"))));
+                let end = session.messages().len();
+                session
+                    .commit_transcript_rewrite(
+                        TranscriptRewriteSelection::MessageRange { start: 0, end },
+                        vec![Message::User(UserMessage::text(format!("summary {turn}")))],
+                        TranscriptRewriteReason::new("compaction"),
+                        Some("test".to_string()),
+                        None,
+                    )
+                    .unwrap();
+            }
+            session.push(Message::User(UserMessage::text("after the compactions")));
+            let (_runtime_id, session_store) = realm_with_blob_row(&path, &session).await;
+
+            let blobs = CountingBlobStore::new();
+            SqliteRuntimeStore::new_head_canonical_with_media(&path, &blobs)
+                .await
+                .expect("a realm without inline images opens");
+            assert_eq!(blobs.puts(), 0);
+            let (authority, physical) = authority_and_physical_head_tokens(&path, session.id());
+            assert_eq!(authority, physical);
+            assert_eq!(
+                serde_json::to_value(
+                    session_store
+                        .load(session.id())
+                        .await
+                        .unwrap()
+                        .expect("the activated session")
+                )
+                .unwrap(),
+                serde_json::to_value(&session).unwrap(),
+                "the session is the blob row's document"
+            );
         }
 
         /// A compacted WholeBlob body whose transcript holds inline video

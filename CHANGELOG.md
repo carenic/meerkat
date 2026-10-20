@@ -1298,6 +1298,16 @@ them.
   tasks. A fence implementation or decorator outside Meerkat needs nothing
   new; one that forwards fenced calls may forward this entry as well.
 
+- `meerkat-core`: `Session::with_inline_images_externalized` returns a copy
+  of a session in which every image held inline, in its live rows and in
+  every body its transcript graph retains (user content, tool results and
+  notice content), is a blob reference named by `content_blob_id` of the
+  block's own media type and data, together with the distinct payloads a
+  blob store must hold first (`InlineImageExternalization`,
+  `InlineImagePayload`). The transcript revision, the rewrite commits and
+  the rewrite prefix are unchanged; it writes nothing. The conversions below
+  use it before they lay out head-canonical rows.
+
 - `meerkat-runtime`: `SqliteRuntimeStore::convert_standalone_whole_blob_in_place_with_media`
   converts a standalone WholeBlob database whose bodies hold inline images,
   with the realm blob store the converted runtimes hydrate from. Its two steps
@@ -1307,6 +1317,13 @@ them.
   `StandaloneWholeBlobMediaStage`), and
   `convert_standalone_whole_blob_in_place_with_staged_media` converts with
   them.
+
+- `meerkat-runtime`: `SqliteRuntimeStore::new_head_canonical_with_media` opens
+  a realm whose runtimes or legacy session blob rows hold inline images, with
+  the realm blob store. Its two steps are public as well:
+  `stage_realm_whole_blob_media` stores the images and writes nothing to the
+  database's sessions, bodies or authorities, and
+  `new_head_canonical_with_staged_media` opens with them.
 
 ### Changed
 
@@ -2650,6 +2667,13 @@ them.
   leaves each runtime converted or untouched, and running the conversion again
   finishes the rest.
 
+- `meerkat-runtime`: a SQLite realm that holds such a session, in a runtime's
+  WholeBlob body or as the session store's legacy blob row, opens on the
+  head-canonical profile. Its activation refused the session the same way,
+  so the realm did not open. `SqliteRuntimeStore::new_head_canonical_with_media`
+  first stores the images in the realm blob store, then lays the session out
+  with them as blob references; the body and the blob row are kept as they
+  were, and an open stopped after storing the images finishes on the next one.
 - `meerkat-session`: a session whose turns each add large images, such as a
   tool that returns camera snapshots, no longer compacts on every turn.
   Before compacting, the agent stores inline media as blob references, and
