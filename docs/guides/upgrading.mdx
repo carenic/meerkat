@@ -582,14 +582,21 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 - **Multiprocess hosting** no longer refuses a runtime store whose file
   notifications cannot be registered (an inotify watch limit, for example):
   the store watch's sweep is the cross-process wake.
-- **Fenced runtime-store writes under contention:** a fenced write whose
-  `RuntimeStoreWriteFence` answers `Backoff` while the writer holds an async
+- **Fenced runtime-store writes under contention:** an intent-managed
+  identity on SQLite mob storage no longer stays in `Backoff` on a host with
+  slow disk writes. The SQLite runtime store now waits up to 2 seconds for
+  the mob database's write lock inside the identity fence, through the new
+  defaulted `RuntimeStoreWriteFence::execute_if_current_blocking` (for a
+  caller on a blocking thread; the default calls `execute_if_current`). A
+  fenced write whose fence answers `Backoff` while the writer holds an async
   lock (the in-memory runtime store's fenced writes, and `MeerkatMachine`'s
   publication of a registered session) is tried again for up to 2 seconds,
   with the lock released between attempts, instead of reporting the first
   `Backoff` at once. **Do:** a fence caller in your own crate that holds an
-  async lock retries a `Backoff` the same way; `execute_if_current` never
-  waits beyond its own I/O.
+  async lock retries a `Backoff` the same way, since `execute_if_current`
+  never waits beyond its own I/O; a fence decorator that forwards fenced
+  calls may forward `execute_if_current_blocking` as well. A fence
+  implementation needs nothing new.
 - **Work that names an original its source owner has not settled yet** is
   reported not ready (`ControllerReadinessUnavailable` with
   `original_admission_pending`) and stays retryable, instead of being refused
