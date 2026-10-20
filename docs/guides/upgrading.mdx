@@ -385,7 +385,8 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
 - **Stores that disagree:** a mob store whose creation record and event log
   disagree is not resumed (`MobError::IncarnationInconsistent`), and one that
   holds a finished destroy whose files are not removed yet answers
-  `MobError::IncarnationDestroyed` (both were `Internal`). Such a mob no longer
+  `MobError::IncarnationDestroyed` (the finished destroy failed as
+  `Internal`). Such a mob no longer
   fails the whole restore of `MobMcpState`: it is left unrestored, listed by
   `MobMcpState::unrestored_mobs`, and a lookup of its id answers the refusal;
   the other mobs restore.
@@ -608,7 +609,8 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 - **A resume finishes an interrupted Stop or Complete** (waiting up to 5 s
   for its first attempt) before it hands the mob back, so the handle reads
   Stopped or Completed; 0.9.3 resumed it as Running and finished the Stop in
-  the background.
+  the background. An attempt still running after 5 s (held on a member or a
+  placed completion) goes on in the background; wait for `MobStopped`.
 - **Sessions stuck at a compaction in 0.9.2 or 0.9.3:** a session whose last
   turn an earlier release committed but never finalized now finalizes it at
   its next start and accepts work again, where every start failed with
