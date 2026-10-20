@@ -350,8 +350,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # generated a state, its five state witnesses and three step witnesses
 # violated, and with --mutants its unguarded mutant's property violated, its
 # plain-ordering mutant's evaluation error, its two replay mutants' generated
-# invariants violated, and its two RetireAtScope mutants' invariants
-# violated.
+# invariants violated, its two RetireAtScope mutants' invariants violated,
+# and its mint mutant's action property violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -446,6 +446,7 @@ printf '%s\n' \
   'echo "Error: Invariant pending_session_ingress_detach_has_session_correlation is violated."' \
   'echo "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated."' \
   'echo "Error: Action property AuditObservationMonotonic is violated."' \
+  'echo "Error: Action property AuditMintClearsExecutionHealth is violated."' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \
