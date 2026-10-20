@@ -1475,6 +1475,21 @@ them.
 
 ### Fixed
 
+- `meerkat-mob-mcp`: after a restart, the session that created a mob with
+  the agent mob tools manages it again. A session's persisted mob operator
+  authority binds no mob, so the manage grant its create returned was gone
+  after a restart; the agent mob tools now re-derive it, for the incarnation
+  the mob runs at, from the mob's creation record, while the session may
+  still create mobs. The record proves it for
+  `MobProvenance::Session` naming the session, and for
+  `MobProvenance::Member` only while the session is still the bridge session
+  of the recorded member at the recorded generation in the recorded parent
+  incarnation. Nothing else is granted: `Host`, `Ambiguous` and `Unrecorded`
+  records, another session, a later generation of the creating member, and a
+  session whose operator removed its create capability get no grant. A
+  session that a host passes as the owner session of a create
+  (`MobMcpState::mob_create_definition_with_owner_bridge_session`) is that
+  mob's recorded creator too.
 - `meerkat-store`: the SQLite session store lays out a whole-blob session
   whose transcript graph retired its oldest occurrences, which every session
   compacted more often than `history_retained_rewrites` (default 4) has. It
@@ -2184,6 +2199,16 @@ them.
   the run-start hold. A failed Stop rolls back and the mob stays Running; a
   failed Shutdown keeps every member and can be retried. Reload that member
   on its host, then retry.
+
+### Known limitations
+
+- `meerkat-mob-mcp`: a member that created a mob with the agent mob tools and
+  was then reset to its next generation, over the same session, no longer
+  manages that mob after a restart: the mob's creation record names the
+  member's earlier generation, and the grant is re-derived only for the
+  member generation the record names. Before the restart the session keeps
+  the grant its create returned. An operator grant over the mob restores
+  manage.
 
 ## [0.9.3] - 2026-10-18
 
