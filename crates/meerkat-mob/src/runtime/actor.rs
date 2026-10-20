@@ -17364,7 +17364,7 @@ impl MobActor {
                     other => return Ok(outcome(other.disposition())),
                 };
                 set_stage("live_session_revival");
-                let revival = Self::request_member_live_revival(
+                let revival = match Self::request_member_live_revival(
                     command_tx,
                     &entry.agent_identity,
                     &bridge_session_id,
@@ -17373,7 +17373,21 @@ impl MobActor {
                         publication: prior_publication,
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(revival) => revival,
+                    // A reload while the mob is Stopped: the degraded
+                    // registration is discarded and the successor published,
+                    // held by the MobStop the Stop staged. Only its revival
+                    // waits for Running, and the Resume completes it: its
+                    // explicit resume preparation materializes the member
+                    // over the published successor.
+                    Err(MobError::InvalidTransition {
+                        from: MobState::Stopped,
+                        to: MobState::Running,
+                    }) => return Ok(outcome(super::handle::MemberReloadDisposition::Discarded)),
+                    Err(error) => return Err(error),
+                };
                 let publication = match revival {
                     MemberLiveRevivalOutcome::Materialized(Some(publication)) => publication,
                     MemberLiveRevivalOutcome::Materialized(None) => {

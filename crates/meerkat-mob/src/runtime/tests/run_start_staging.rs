@@ -130,8 +130,8 @@ async fn executed_prompts(service: &MockSessionService, session_id: &SessionId) 
 }
 
 /// A Stop stages `MobStop` before it holds a member, so the registration a
-/// reload publishes while the mob is Stopped is held as well. The reload's
-/// revival waits for Running (it is refused typed), so the successor it
+/// reload publishes while the mob is Stopped is held as well. The reload
+/// answers `Discarded` and its revival waits for Running, so the successor it
 /// published stays a cold registration until Resume; input admitted to it
 /// runs only once Resume released the member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -154,16 +154,12 @@ async fn a_member_reloaded_while_stopped_registers_its_successor_held() {
     );
     let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
         .await
-        .expect("the reload answers");
-    assert!(
-        matches!(
-            reload,
-            Err(MobError::InvalidTransition {
-                from: MobState::Stopped,
-                to: MobState::Running,
-            })
-        ),
-        "the reload's revival waits for Running: {reload:?}"
+        .expect("the reload answers")
+        .expect("the reload succeeds while the mob is Stopped");
+    assert_eq!(
+        reload.disposition,
+        crate::runtime::handle::MemberReloadDisposition::Discarded,
+        "the reload discards the degraded registration; its revival waits for Running"
     );
     assert!(
         mob.adapter
@@ -377,19 +373,15 @@ async fn a_stop_reports_a_degraded_member_reload_required_and_holds_its_reload()
     );
 
     // A reload while Stopped publishes a successor that applies the staged
-    // MobStop; its revival waits for Running.
+    // MobStop and answers Discarded; its revival waits for Running.
     let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
         .await
-        .expect("the reload answers");
-    assert!(
-        matches!(
-            reload,
-            Err(MobError::InvalidTransition {
-                from: MobState::Stopped,
-                to: MobState::Running,
-            })
-        ),
-        "the reload's revival waits for Running: {reload:?}"
+        .expect("the reload answers")
+        .expect("the reload succeeds while the mob is Stopped");
+    assert_eq!(
+        reload.disposition,
+        crate::runtime::handle::MemberReloadDisposition::Discarded,
+        "the reload discards the degraded registration; its revival waits for Running"
     );
     assert_eq!(
         mob.adapter.run_starts_held_for_test(mob.session(0)).await,
@@ -496,19 +488,15 @@ async fn a_resume_refuses_typed_while_a_member_needs_a_reload() {
     assert_eq!(mob.handle.status().await.expect("phase"), MobState::Stopped);
 
     // The reload while Stopped publishes a successor that applies the staged
-    // MobStop; its revival waits for Running.
+    // MobStop and answers Discarded; its revival waits for Running.
     let reload = tokio::time::timeout(STEP, mob.handle.reload_member_registration(mob.member(0)))
         .await
-        .expect("the reload answers");
-    assert!(
-        matches!(
-            reload,
-            Err(MobError::InvalidTransition {
-                from: MobState::Stopped,
-                to: MobState::Running,
-            })
-        ),
-        "the reload's revival waits for Running: {reload:?}"
+        .expect("the reload answers")
+        .expect("the reload succeeds while the mob is Stopped");
+    assert_eq!(
+        reload.disposition,
+        crate::runtime::handle::MemberReloadDisposition::Discarded,
+        "the reload discards the degraded registration; its revival waits for Running"
     );
     assert_eq!(
         mob.adapter.run_starts_held_for_test(mob.session(0)).await,

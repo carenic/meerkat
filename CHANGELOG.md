@@ -290,12 +290,14 @@ them.
   settlement for such a registration (the discard aborts and joins the drain
   itself). A Resume refuses typed (`MemberReloadRequired`, naming the member)
   while a member needs a durability reload, before anything moves; reload that
-  member, then Resume. Until its reload such a member starts no run, requests
-  to it are refused typed the same way, and its member status and member list
-  entry carry an error naming the reload. A Shutdown now holds every member's
-  run starts and reports the first failure in roster order instead of stopping
-  at it. On the wire, `stop_report` reports such a member with `run` and
-  `starts` `reload_required`.
+  member, then Resume. A reload while the mob is Stopped answers `Discarded`:
+  its successor stays held, and the Resume completes its revival. Until its
+  reload such a member starts no run, requests to it are refused typed the
+  same way, and its member status and member list entry carry an error naming
+  the reload. A Shutdown now holds every member's run starts and reports the
+  first failure in roster order instead of stopping at it. On the wire,
+  `stop_report` reports such a member with `run` and `starts`
+  `reload_required`.
 
 - `meerkat-mob`: a Stop now stages `MobStop` for every local member before it
   holds the member, so a member reloaded while the mob is Stopped stays held
