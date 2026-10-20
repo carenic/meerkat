@@ -265,9 +265,10 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
 - Child tool bundle opt-in (Rust hosts): a child mob's inline profile mounts
   a bundle the host offers with the new
   `ChildToolBundleAvailability::ChildOffered` by naming it in `tools.bundles`
-  (an unoffered name is refused with `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
-  gain `bundles`; `ChildToolBundleAvailability` and
-  `ChildMcpServerRegistrationError` are non-exhaustive.
+  (an unoffered name is refused with `MobError::ToolBundleNotOffered`).
+  `ToolConfig` and `MobToolConfigInput` gain `bundles`;
+  `ChildToolBundleAvailability` and `ChildMcpServerRegistrationError` are
+  non-exhaustive.
 - Mob Shutdown: `MemberShutdownOutcome::UnregisterPending` carries a
   `settlement` (`MemberUnregisterSettlement`: `try_state()`,
   `settle_within(deadline)`; states `Settled`, `Pending`, `Failed`,
