@@ -63,6 +63,11 @@ pub(in crate::runtime) struct StuckRetirement {
     pub(in crate::runtime) entry: RosterEntry,
     pub(in crate::runtime) stage: super::super::RetirementStage,
     pub(in crate::runtime) cause: Arc<MobError>,
+    /// Whether the retirement started for a member whose host refused its
+    /// registration. The member's Retire transition cleared MobMachine's
+    /// record of the refusal, so a re-drive starts on the refused path
+    /// from this.
+    pub(in crate::runtime) registration_refused: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3795,6 +3800,7 @@ impl MobActor {
             }
             return;
         }
+        let mut redriven_refused = false;
         if let Some(stuck) = self.stuck_retirements.get(&identity) {
             if redrive || matches!(reply, RetirementReply::Owned) {
                 tracing::info!(
@@ -3804,6 +3810,7 @@ impl MobActor {
                     cause = %stuck.cause,
                     "re-driving stuck member retirement"
                 );
+                redriven_refused = stuck.registration_refused;
                 self.stuck_retirements.remove(&identity);
             } else {
                 let error = MobError::MemberRetirementStuck {
@@ -3869,7 +3876,9 @@ impl MobActor {
         let placed =
             super::super::member_runtime_is_host_owned(self.dsl_authority.state(), &identity);
         let placement = self.retirement_placement_fence(&identity);
-        let registration_refused = self.member_registration_refused(&identity);
+        // A re-drive keeps the refusal its retirement started with: the
+        // member's Retire transition cleared MobMachine's record of it.
+        let registration_refused = redriven_refused || self.member_registration_refused(&identity);
         let mut continuation = Box::new(RetirementState {
             ticket: 0,
             entry,
@@ -4645,6 +4654,7 @@ impl MobActor {
                         entry: continuation.entry.clone(),
                         stage,
                         cause: Arc::clone(&cause),
+                        registration_refused: continuation.registration_refused,
                     },
                 );
                 self.lifecycle_observations.publish(
