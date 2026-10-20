@@ -30,7 +30,7 @@ router or the adapter's shutdown.
 
 | Public API | Use |
 | --- | --- |
-| `NativeSetup::new` | Retain the existing Reading Forge recipe with the selected HomeCore frontend binding, terminal connectors and local approvals |
+| `NativeSetup::new` | Retain the existing Reading Forge recipe with the selected home-automation host frontend binding, terminal connectors and local approvals |
 | `NativeSetup::with_forge` | Supply the application's loaded Forge binding and its matching protected presenter |
 | `SessionStartup::open_native_setup` | Open the selected governed standalone setup with protected approval and the existing cancellation listener |
 | `session::ResumedStandalone::open_native_setup` | Continue the retained standalone startup using its native owners |
@@ -49,7 +49,7 @@ and await active input before awaiting `ConnectSession::close`; preserve a
 returned cleanup failure instead of treating a drop as completed shutdown.
 If installation enters finalization, retain that future until it settles as
 required by [service-secret setup](/connect/guides/host-composition#standalone-service-secret-setup).
-The selected HomeCore binding can expose its frontend setup operations; this
+The selected home-automation host binding can expose its frontend setup operations; this
 standalone composer does not turn the session into a persistent frontend host.
 
 See [host composition](/connect/guides/host-composition#native-application-lifecycle) for application restore, preparation and replacement.

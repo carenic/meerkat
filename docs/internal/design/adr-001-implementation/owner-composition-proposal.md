@@ -68,10 +68,10 @@ cannot invent non-entry. The actual effect owner attempts cancellation where
 supported and records its real outcome. The final tool gate follows consequence
 preparation; a second late snapshot read does not implement this fence.
 
-For an independently owned authority such as Elephant resource policy, a
+For an independently owned authority such as knowledge-service resource policy, a
 separately authenticated protocol declares exact audience, request binding,
-lease/freshness, revocation and replay limits. Elephant performs its own local
-entry fence. A co-hosted Elephant remains independent for its own state.
+lease/freshness, revocation and replay limits. The knowledge service performs its own local
+entry fence. A co-hosted knowledge service remains independent for its own state.
 A handle exposing Meerkat grant state remains a same-domain participant even
 when transported elsewhere. No host- or adapter-chosen label bypasses the fence.
 
@@ -148,7 +148,7 @@ The governed factory must validate the durable profile and participant identity.
 | MobKit agent memory | Protected retrieval, hydration and mutation need current source dependency/envelope custody and durable evidence under an owner-prepared join. The initial separate memory database refuses governed memory operations until that join is proven. Disabling memory must be explicit in the declared operation catalog, never a silent fallback. |
 | MobKit detached jobs | The actual job owner retains the causing association, launch/settlement identity and protected output through a proven prepared handoff into canonical runtime custody. A standalone job row or completion event does not authorize continuation. Governed detached work refuses until this handoff is implemented. |
 | MobKit console and event stores | Event projection stays advisory and cannot attest entry. Protected console materialization, history/replay and delivery need current audience and source dependencies plus release evidence from their actual owner. Existing ungoverned console rows cannot be served by assuming the event database is a security receipt store; affected projections/refetches refuse until their governed read/release contract is installed. |
-| Elephant resources | Independent resource authority, its own durable entry and current policy, with authenticated cross-domain request/evidence and declared lease bounds. No relocation-based ownership change. |
+| Knowledge-service resources | Independent resource authority, its own durable entry and current policy, with authenticated cross-domain request/evidence and declared lease bounds. No relocation-based ownership change. |
 | Custom runtime/session/approval stores | Must implement and pass the same declared join/handoff contract before becoming governed-capable. Existing trait implementation alone does not qualify. Initial memory/JSONL/file stores refuse this profile. |
 
 Browser/wasm remains trusted-embedded initially. The native governed feature
@@ -197,11 +197,11 @@ tests. Every governed owner uses its fencing proof; a copied local state
 directory cannot register a concurrent owner with historical authority.
 
 This task does not deploy a new service or select production credentials.
-Homecore's owner identified an existing separate household host with separate
+The home-automation host's owner identified an existing separate household host with separate
 backup/restore custody as a viable deployment candidate. That is a topology
 recommendation, not evidence that a witness is installed or accepted. Until a
-supported authority is configured outside its restore/clone domain, Homecore
-cannot activate governed mode. A same-host Elephant or separate local
+supported authority is configured outside its restore/clone domain, the home-automation host
+cannot activate governed mode. A same-host knowledge service or separate local
 directory is not sufficient merely because it has another process or path.
 The implementation must include explicit refused bootstrap and outage tests.
 
@@ -245,7 +245,7 @@ review. They must not create a second effect ticket/lifecycle.
 
 ### Product review: durable custody and recovery
 
-The first Homecore and OB3 implementation reviews reject governed activation
+The first home-automation host and console application implementation reviews reject governed activation
 on their current storage topologies. These are concrete compatibility limits
 that bootstrap must detect before protected preparation. Existing trusted
 embedded operation remains available under its explicit profile.
@@ -258,7 +258,7 @@ separate durable analytics store does not meet this requirement. A custom
 remote backend must prove the complete owner join and recovery contract; an
 existing session/event-store implementation is insufficient.
 
-Homecore currently rebuilds runtime state from a separate continuity store.
+The home-automation host currently rebuilds runtime state from a separate continuity store.
 Governed rebuilding requires an owner-authorized migration that preserves the
 exact admission associations, entry/settlement obligations, idempotency
 conflicts and witness continuity. It must never silently reconstruct them
@@ -334,7 +334,7 @@ post-effect evidence to masquerade as pre-entry durability.
 
 ### Status after review
 
-O1-O7 dispositions have directional lead acceptance. Homecore H1-H6 and OB3
+O1-O7 dispositions have directional lead acceptance. Home-automation host H1-H6 and console application
 M1-M2/S1/N1-N2 are incorporated here for renewed review. This document is still
 an implementation proposal. None of these dispositions is runtime acceptance,
 a deployment authorization, a passing race test or an advertised capability.
@@ -374,7 +374,7 @@ without their own proven join and witness composition. Add a two-hour soak
 with a long-lived console-style reader, recording WAL growth, checkpoint
 progress, quota backpressure and latency on the minimum advertised hardware.
 
-### Second Homecore review: offline carry-forward
+### Second home-automation host review: offline carry-forward
 
 Carry-forward is an offline operation that needs no successful runtime boot.
 It first fences the old owner incarnation, opens the old store read-only under
@@ -446,7 +446,7 @@ cannot by itself fence a process still writing to another database copy.
 The realm database and its stable maintenance-custody identity live outside
 restorable application-generation directories. Deployment generation flips
 carry the current canonical state forward; they do not select an older realm
-file. Homecore's separate persistent shared directory is a possible location
+file. The home-automation host's separate persistent shared directory is a possible location
 for the complete realm database. Putting only an incarnation row in a second
 SQLite database is insufficient: it would break the required atomic join.
 

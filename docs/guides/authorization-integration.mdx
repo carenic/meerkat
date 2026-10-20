@@ -41,7 +41,7 @@ each choice.
 | OS confinement | Required confinement covers shell launches (foreground, background and recovered monitors), command hooks and local MCP stdio servers, with backends on macOS and Linux; on other platforms a required launch refuses. Containers count only for the isolation they really provide. |
 | Console access administration | The Access panel edits Meta console ABAC, not native tool, source or account grants. Console projection does not activate native governance. |
 | Publication and overhead | The explicit native and fixed-host JSONL profiles have normal publication and recorded CI qualification. Completed measurements have not met the cheap-default target: the representative study's six conditional mean comparisons missed their threshold. Full-platform and per-operation p99 acceptance remain open; the implementation checkpoint retains the exact measurements and their limits. |
-| Full application coverage | Tool/source access, peers, schedules, memory/history/export, Elephant, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
+| Full application coverage | Tool/source access, peers, schedules, memory/history/export, knowledge services, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
 
 Do not label a deployment fully governed while it has an unguarded path that can
 perform one of its declared protected operations. An unsupported required
@@ -113,10 +113,10 @@ or destination through trusted owner data. If an adapter knows only that an
 opaque server operation is requested, authorize that conservative whole capability
 or leave it unavailable. Do not pretend a model-supplied label proves a finer rule.
 
-For Elephant, keep query and fetch enforcement in Elephant as well as the
+For a knowledge service, keep query and fetch enforcement in that service as well as the
 Meerkat invocation check. Agree on qualified identities and action/resource
 vocabulary; test allowed reads, denied writes, wrong represented subjects, and
-cross-domain identity collisions. Do not copy Elephant's policy database into
+cross-domain identity collisions. Do not copy the knowledge service's policy database into
 Meerkat or treat a document citation as permission.
 
 ## 3. Bind the actual operation at its execution owner

@@ -221,10 +221,10 @@ Common dependency patterns:
 Prefer crate-level commands over filter-based:
 ```bash
 # Good - runs all tests in crate
-cargo test -p elephant-storage
+cargo test -p meerkat-store
 
 # Bad - may return 0 results if filter doesn't match
-cargo test -p elephant-storage -- roundtrip
+cargo test -p meerkat-store -- roundtrip
 ```
 
 ## Reference Files

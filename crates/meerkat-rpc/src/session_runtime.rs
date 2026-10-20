@@ -19520,7 +19520,7 @@ mod tests {
 
     /// A text `turn/start` that arrives while another run on the session
     /// is between its apply and its boundary acknowledgement keeps that run
-    /// and the session (turbo-live combined3 S99: an ExistingMember live
+    /// and the session (seen in live scenario S99: an ExistingMember live
     /// delegation worker on its source session, raced by the user typing).
     ///
     /// Before the fix, `turn/start`'s pre-admission staleness check saw the

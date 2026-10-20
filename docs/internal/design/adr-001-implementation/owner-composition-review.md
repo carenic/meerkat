@@ -1,6 +1,6 @@
 # Owner composition review record
 
-The four requested bus reviewers accepted revision 7 as a protocol/source
+The four requested project reviewers accepted revision 7 as a protocol/source
 design. The exact candidate is `owner-composition-proposal.md`, SHA-256
 `751503730f93c57ac5a08446034d92ea153db52c3f5b1c2684e00832faac8515`.
 The candidate's historical pending-review status is preserved with its bytes.
@@ -14,7 +14,7 @@ This record supplies the subsequent disposition.
 | Meerkat Toolkit | 2026-09-30 23:35:57 | No remaining protocol blocker; source-contract findings closed, with all runtime and adoption requirements retained. |
 
 The [operational addendum](owner-composition-operational-addendum.md) records
-the resulting availability, batching and deferred-extension decisions. Raw bus
+the resulting availability, batching and deferred-extension decisions. Raw review
 messages are retained in the local evidence archive, outside the repository,
 because they contain deployment-specific information. This public record is a
 sanitized disposition, not a substitute for exact implementation review.

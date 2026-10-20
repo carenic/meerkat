@@ -484,7 +484,7 @@ async fn relink_mob_fork_children_where(
     // One roster read lists the children and, before anything can retire a
     // child, resolves each job's owner among the mob's members.
     //
-    // Known gap (#1497 B.5, owned by the event-replay stack): only seated
+    // Known gap (#1497 B.5, owned by the event replay work): only seated
     // children are scanned. A child the previous process's supervisor
     // retired (failed or timed out) before its outcome was committed is not
     // seated, so its job is not found here; the fix scans fork spawn events
