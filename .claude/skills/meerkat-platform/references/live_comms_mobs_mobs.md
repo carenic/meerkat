@@ -42,7 +42,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   retire, Shutdown and destroy release the hold for the members they dispose
   of, so a later registration of the same session is not held, and a mob
   reopened in the same process holds its members only if it is restored
-  stopped.
+  stopped. A resume finishes a Stop an earlier process left half done
+  before it returns the mob (waiting up to 5 s), so the mob reads Stopped.
 - Rust `MobHandle::stop()` returns a `MobStopReport`.
   `shutdown_with_report(ShutdownOptions)` cancels in-flight runs immediately
   and reports each member. Since 0.9.4 an admitted Shutdown closes admission
@@ -66,6 +67,16 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   destroy keeps it closed while the retry stays available, and a mob restored
   with an unfinished destroy starts with admission closed, so nothing is
   spawned into it.
+- Since 0.9.4 a mob keeps its incarnation across resume (only destroy plus
+  create starts a new one), and opening a mob store migrates it to schema 12,
+  which 0.9.3 refuses: back up mob stores before upgrading. A store whose
+  creation record disagrees with its log, or that holds a finished destroy,
+  refuses resume (`IncarnationInconsistent`, `IncarnationDestroyed`), and a
+  delivery scope from an earlier incarnation gets `IncarnationMismatch`. Such
+  a store no longer stops a server's other mobs from restoring. After a
+  restart, the session that created a mob with the agent mob tools manages
+  it again (not a creating member reset to a later generation since; an
+  operator grant restores manage).
 
 ## Admission close (Rust hosts)
 

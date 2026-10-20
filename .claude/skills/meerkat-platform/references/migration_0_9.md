@@ -215,6 +215,9 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   that recorded a failed realtime response (realtime sidecar event schema 4),
   or restore a grant owner whose journal holds an owner-scoped
   resource-domain restriction (`RestartRequired`).
+- Mob stores: 0.9.4 migrates each mob's SQLite store to schema 12 (the
+  creation record) on open and 0.9.3 refuses it, so keep a copy of the mob
+  stores to roll back; 0.9.3 also refuses a version-2 member delivery scope.
 - Mixed versions: a 0.9.3 peer that checks signatures drops a 0.9.4
   `reply_to_peer` reply (the sender sees an ambiguous outcome; other message
   kinds still reach it), and mob member hosts must be upgraded before their
@@ -263,11 +266,12 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   `SystemNoticeBlock::lifecycle_settled()`. The `persisted` result of
   `mcp/add`, `mcp/remove` and `mcp/reload` is unchanged.
 - Child tool bundle opt-in (Rust hosts): a child mob's inline profile mounts
-  a bundle the host offers with the new `ChildToolBundleAvailability::ChildOffered`
-  by naming it in `tools.bundles` (an unoffered name is refused with
-  `MobError::ToolBundleNotOffered`). `ToolConfig` and `MobToolConfigInput`
-  gain `bundles`; `ChildToolBundleAvailability` and
-  `ChildMcpServerRegistrationError` are non-exhaustive.
+  a bundle the host offers with the new
+  `ChildToolBundleAvailability::ChildOffered` by naming it in `tools.bundles`
+  (an unoffered name is refused with `MobError::ToolBundleNotOffered`).
+  `ToolConfig` and `MobToolConfigInput` gain `bundles`;
+  `ChildToolBundleAvailability` and `ChildMcpServerRegistrationError` are
+  non-exhaustive.
 - Mob Shutdown: `MemberShutdownOutcome::UnregisterPending` carries a
   `settlement` (`MemberUnregisterSettlement`: `try_state()`,
   `settle_within(deadline)`; states `Settled`, `Pending`, `Failed`,
@@ -279,7 +283,8 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   council participants) and the RPC forks `session/fork_at` /
   `session/fork_replace` are refused before commit with
   `FORK_INSTRUCTION_REFUSED` (-32037, HTTP 422, exit 57); set
-  `reactivate_inherited` (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
+  `reactivate_inherited`
+  (`MobBuilder` / `MobMcpState::with_fork_instruction_policy`),
   or pass `inherited_instructions: "reactivate_inherited"` on the RPC fork, to
   carry the activations. Rust:
   `SessionError::ForkInstructionRefused`, `MobError::ForkInstructionRefused`,
@@ -297,12 +302,33 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   boot recreates on a fresh session) removes the registration and leaves only
   that member Broken with `MobError::MemberRegistrationRefused` until a
   repair; Stop and Shutdown report a member needing a durability reload as
-  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing; an uninstalled
-  destination is `MobError::MemberDestinationNotInstalled` (was
+  `ReloadRequired` (`MemberStopRun` / `MemberRunStarts`) instead of failing;
+  an uninstalled destination is `MobError::MemberDestinationNotInstalled` (was
   `WiringError`; schedule delivery records `runtime_rejected`);
   `force_cancel_member` / `cancel_all_work` on a member needing a durability
   reload answer `MemberReloadRequired` (-32029, HTTP 409, exit 49): reload it
   with `reload_member_registration`, then cancel again.
+- Respawn: a respawned local member keeps its predecessor's launch tool access
+  policy and inherited visibility ceiling (never widened) and its recorded
+  auth binding when its profile stays on that provider; a respawn whose
+  restrictions cannot be established (a lost session included) is refused
+  before anything is retired with
+  `MobError::RespawnPredecessorRestrictionsUnavailable`; retire and spawn
+  instead. A custom `MobSessionService` delegates
+  `predecessor_tool_restrictions` (default `Unsupported` refuses respawns).
+- Mob incarnations: a mob keeps its `MobIncarnationId` across resume (stored
+  in a creation record; pre-0.9.4 mobs get one at their first resume as
+  `Unrecorded`), so operator grants survive a resume and a creating session
+  manages its mob again after a restart. Member delivery scopes are version 2
+  and name the incarnation (`MobError::IncarnationMismatch`,
+  `ScopedRecoveryUnresolved::IncarnationNotHosted`). Stores whose creation
+  record and log disagree are not resumed (`IncarnationInconsistent`;
+  `IncarnationDestroyed` for a finished destroy) and stay unrestored without
+  failing the others (`MobMcpState::unrestored_mobs`). Session creates record
+  provenance and answer `ProvenanceUnavailable` until the mob set is restored
+  (`declare_mob_set_restored`). Rust: the operator grant functions take
+  `LiveMobIncarnation` (`handle.live_incarnation()`); `MobIncarnationId`
+  serializes as its UUID; new `MobError` / `MobStoreError` variants.
 - Runtime: a boundary commit with no durable outcome within the store's
   deadline (120 s for SQLite) marks the session reload-required; waiters get
   `CompletionWaitError::DurableOutcomeUnknown` (a rejected commit
@@ -384,15 +410,19 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
   keeps Node alive for 5 seconds, and both SDK clients settle on the
   `rkat-rpc` child's exit; public GPT Live sends a finished notice for a
   delegation result held behind the user's question.
+- Fixed: a resume finishes an interrupted Stop or Complete before it hands
+  the mob back; a session 0.9.2 or 0.9.3 left stuck at a compaction
+  finalizes its last turn at its next start; WebSocket and WebRTC voice keeps
+  flowing while another turn runs (rows queue off the media path).
 - SQLite: release binaries build the bundled SQLite without its three
   process-wide locks; a build outside the repository (`cargo install rkat`,
   an embedding application) sets `LIBSQLITE3_FLAGS` itself (value in
   `docs/guides/deploying.mdx`, "SQLite Lock Profile"), and an embedding
   application calls the `unsafe fn`
   `meerkat_sqlite::disable_memory_statistics_at_process_start()` first in
-  `main`, before any other thread or SQLite connection exists. `rkat storage doctor` reports `sqlite-lock-profile`. Kept
-  store connections hold `<file>.mpresence` presence locks, which maintenance
-  waits for.
+  `main`, before any other thread or SQLite connection exists.
+  `rkat storage doctor` reports `sqlite-lock-profile`. Kept store connections
+  hold `<file>.mpresence` presence locks, which maintenance waits for.
 - Fixed: a child of `session/fork_at` or `session/fork_replace` can run a turn:
   it gets a build state derived from its source's, with the source's session
   configuration but without its `shell_env`, MCP attachments or mob operator
@@ -416,3 +446,6 @@ are in `docs/guides/upgrading.mdx` ("Upgrading to 0.9.4").
    `signal_turn_failed`.
 8. Forks: handle `FORK_INSTRUCTION_REFUSED`; upgrade member hosts before their
    controller and comms peers together.
+9. Mobs: back up the mob stores (schema 12), pass `live_incarnation()` to the
+   operator grant functions, and call `declare_mob_set_restored` when the host
+   restores mobs by inserting handles.

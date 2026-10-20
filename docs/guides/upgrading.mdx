@@ -82,7 +82,12 @@ the CHANGELOG under `## [0.9.4]`. This guide has no sections for 0.9.0 to
     4"; see [Realtime responses that fail](#realtime-responses-that-fail));
   - a temporary council record that holds a participant refused by the fork
     instruction policy (see
-    [Forks and activated host instructions](#forks-and-activated-host-instructions)).
+    [Forks and activated host instructions](#forks-and-activated-host-instructions));
+  - a mob store: 0.9.4 migrates each mob's SQLite store to schema version 12
+    (its creation record) when it opens it, and 0.9.3 refuses that version.
+    Keep a copy of the mob stores from before the upgrade to roll back;
+  - a persisted member delivery scope written at version 2 (see
+    [Mob incarnations](#mob-incarnations)).
 - **Upgrade the SDKs with `rkat-rpc`.** The 0.9.3 Python and TypeScript SDKs
   fail on every `tool_config_changed` event a 0.9.4 `rkat-rpc` builds. An SDK
   downloads its own matching `rkat-rpc` only when you supply none, so this
@@ -182,6 +187,24 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   A member `MobBuilder::resume` recreates on a fresh session is isolated the
   same way when its host refuses it, and the other members resume; 0.9.3
   failed the whole resume.
+- **A respawned member keeps the restrictions it was spawned under:**
+  `MobHandle::respawn` and the `mob_respawn` tool give the successor the
+  predecessor's launch tool access policy and inherited visibility ceiling, as
+  its session recorded them, intersected with the successor's own and never
+  widened. It keeps the recorded auth binding only when its own spec names
+  none and its profile resolves to that binding's provider. 0.9.3 built the
+  successor from the profile alone, so a member spawned under its spawner's
+  tool ceiling came back without it. A respawn whose predecessor's
+  restrictions cannot be established (including a Broken member whose session
+  was lost, which 0.9.3 respawned), whose successor profile cannot be resolved
+  or whose member changes meanwhile is refused before anything is retired,
+  with the new `MobError::RespawnPredecessorRestrictionsUnavailable` (no
+  dedicated wire code; its message is
+  `respawn of member <id> refused: <reason>`). **Do:** retire such a member
+  and spawn a fresh one; a custom `MobSessionService` that wraps a Meerkat
+  session service delegates the new `predecessor_tool_restrictions` (its
+  default, `Unsupported`, refuses the respawns of its members). See
+  [Preserve restrictions across respawn](/guides/authorization-integration#preserve-restrictions-across-respawn).
 - **Stop and Shutdown of a member whose registration needs a durability
   reload** report its run and run starts as `ReloadRequired` (the new
   `MemberStopRun::ReloadRequired` and `MemberRunStarts::ReloadRequired`, wire
@@ -332,11 +355,57 @@ mode with leading zeros (`'0755'`; unquoted it reads as `755.0`).
   sender sees an ambiguous delivery outcome. `send_message` and every other
   message kind still reach a 0.9.3 peer. Upgrade peers together.
 - **Do (Rust):** `SystemNoticeBlock::Comms` and
-  `AgentEvent::PeerContentIngested` gain `delivery_id`; `CommsCommand::PeerMessage`,
-  `InteractionContent::Message` and `SystemNoticeBlock::Comms` gain
+  `AgentEvent::PeerContentIngested` gain `delivery_id`;
+  `CommsCommand::PeerMessage`, `InteractionContent::Message` and
+  `SystemNoticeBlock::Comms` gain
   `in_reply_to`, as do `meerkat-comms`'s `MessageKind::Message` and
   `meerkat-runtime`'s `PeerInput`. Struct literals and exhaustive patterns
   name them.
+
+#### Mob incarnations
+
+- **A mob keeps its incarnation across resume.** Its create mints the
+  `MobIncarnationId` once and stores it in a creation record; every resume
+  reads it back, where 0.9.3 minted a new one at each runtime start. Only a
+  destroy and a create under the same id start a new incarnation, so a mob
+  operator grant bound to a mob still reaches it after a resume. A mob created
+  before 0.9.4 gets its incarnation at its first resume (provenance
+  `Unrecorded`). After a restart, the session that created a mob with the
+  agent mob tools manages it again (the grant is re-derived from the creation
+  record); a member that created a mob and was then reset to a later
+  generation over the same session does not (known limitation; an operator
+  grant restores manage).
+- **Member delivery scopes name the incarnation** and are written at version
+  2. A version-1 scope still decodes and is honoured only by a mob whose
+  incarnation was assigned to a store from before 0.9.4; 0.9.3 refuses a
+  version-2 scope. A scoped submit with a scope from another incarnation is
+  refused first, with the new `MobError::IncarnationMismatch`, where it
+  failed as `StaleDeliveryScope`, and `recover_bounded_work_at_scope` answers
+  `ScopedRecoveryUnresolved::IncarnationNotHosted`.
+- **Stores that disagree:** a mob store whose creation record and event log
+  disagree is not resumed (`MobError::IncarnationInconsistent`), and one that
+  holds a finished destroy whose files are not removed yet answers
+  `MobError::IncarnationDestroyed` (both were `Internal`). Such a mob no longer
+  fails the whole restore of `MobMcpState`: it is left unrestored, listed by
+  `MobMcpState::unrestored_mobs`, and a lookup of its id answers the refusal;
+  the other mobs restore.
+- **Creates record their provenance:** a `MobMcpState` create for a caller
+  session (the agent mob tools, temporary council seating,
+  `mob_create_definition_with_owner_bridge_session`) is refused with
+  `MobError::ProvenanceUnavailable` while the state's mob set is not
+  restored. **Do:** a host that restores mobs by inserting handles calls
+  `declare_mob_set_restored`, and inserts a mob's handle before its members
+  run turns.
+- **Do (Rust):** the mob operator grant functions
+  (`grant_manage_mob`, `grant_spawn_profile_in_mob`,
+  `grant_spawn_profiles_in_mob`, `mint_mob_operator_authority_from_facts`)
+  take a `LiveMobIncarnation` witness: pass `handle.live_incarnation()` where
+  you passed `handle.incarnation()`. The scope readers still take a
+  `MobIncarnationId`: pass the live mob's `handle.incarnation()`, never an id
+  decoded from input. `MobIncarnationId` now serializes as its UUID.
+  `MobError` gains `IncarnationMismatch`, `IncarnationInconsistent`,
+  `IncarnationDestroyed` and `ProvenanceUnavailable`, and `MobStoreError`
+  gains `IncarnationInconsistent` (exhaustive matches need the arms).
 
 #### Changing the model of a running session
 
@@ -469,10 +538,10 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
 - **Compaction is sized for the model that writes the summary.** The summary
   source may take two bytes per token of that model's context window left
   after `max_summary_tokens` (capped by a declared input ceiling, at least
-  4 KiB), instead of a quarter of the compaction threshold. With the default threshold that is about ten times
-  more, so a summary call can cost more input tokens on a large window; it
-  never costs more than the history being compacted plus the compaction
-  prompt.
+  4 KiB), instead of a quarter of the compaction threshold. With the default
+  threshold that is about ten times more, so a summary call can cost more
+  input tokens on a large window; it never costs more than the history being
+  compacted plus the compaction prompt.
 - **Compaction no longer pays for a summary at every boundary** when no
   rewrite can get the history under the threshold (for example when the
   System rows alone exceed an explicit `auto_compact_threshold`). It waits for
@@ -529,13 +598,26 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
   build, and in an embedding application call
   `meerkat_sqlite::disable_memory_statistics_at_process_start()` (an
   `unsafe fn`) in an `unsafe` block as the first statement of `main`, before
-  any other thread or SQLite connection exists. `rkat storage doctor` reports the profile and warns
-  with `sqlite-lock-profile` when a lock is on.
+  any other thread or SQLite connection exists. `rkat storage doctor` reports
+  the profile and warns with `sqlite-lock-profile` when a lock is on.
 - **Presence locks:** a connection a store keeps open between operations
   holds a presence lock (`<file>.mpresence` next to the database), and
   maintenance such as `rkat storage migrate --apply` waits for kept
   connections to close; `rkat storage doctor` lists the files as
   `maintenance-fence-lock` findings.
+- **A resume finishes an interrupted Stop or Complete** (waiting up to 5 s
+  for its first attempt) before it hands the mob back, so the handle reads
+  Stopped or Completed; 0.9.3 resumed it as Running and finished the Stop in
+  the background.
+- **Sessions stuck at a compaction in 0.9.2 or 0.9.3:** a session whose last
+  turn an earlier release committed but never finalized now finalizes it at
+  its next start and accepts work again, where every start failed with
+  "terminal completion finalization lost the exact durable CAS".
+- **WebSocket and WebRTC voice** no longer pauses while another turn runs on
+  the session: transcript rows wait in an ordered queue off the media path,
+  observations are forwarded as they arrive (a transcript frame can reach the
+  client before its row commits), and a refused row closes the channel with
+  `projection_error` (see the [realtime guide](/guides/realtime)).
 - **GPT Live transcript rows** the transport holds when a member turn ends
   all commit at that turn's boundary, before the next queued member turn, so
   the stored transcript no longer falls behind while member turns run back to
@@ -573,6 +655,10 @@ mob machine inputs, effects and transition ids gain `RetireAtScope` and
     instructions; upgrade member hosts before their controller.
 13. Comms: upgrade peers together (a 0.9.3 peer drops `reply_to_peer`
     replies), and expect in-turn steers in history.
+14. Mobs: back up the mob stores (schema 12 has no downgrade), pass
+    `live_incarnation()` to the operator grant functions, and call
+    `declare_mob_set_restored` if your host restores mobs by inserting
+    handles.
 
 ## Upgrading to 0.8.51
 

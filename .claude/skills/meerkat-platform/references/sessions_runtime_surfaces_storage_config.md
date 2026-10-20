@@ -161,6 +161,10 @@ written any input row there is no downgrade to 0.9.3. Upgrade every process
 that shares a runtime store together. Likewise a HeadCanonical session that
 records a failed realtime response writes realtime sidecar event schema 4,
 which 0.9.3 and earlier refuse ("unsupported realtime event schema 4").
+A session whose last turn 0.9.2 or 0.9.3 committed but never finalized (for
+example a mob member stopped at a compaction) finalizes that turn at its first
+0.9.4 start and accepts work again: the store compares a row an earlier
+release wrote by its typed content rather than its bytes.
 
 A database whose ledger is newer than the binary is refused as
 `SchemaFromTheFuture` before any write. SQLite files must be regular files with
@@ -205,8 +209,8 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
   kept connections to close. The only kept connection is a runtime delivery
   owner's reader of a shared store's delivery generation, which closes at its
   next read or after `KEPT_DELIVERY_READER_IDLE` (1 second) idle, well inside
-  the default 10-second `--fence-wait-secs`; a fence wait under a second can
-  meet an idle reader and refuse. Maintenance from a binary older than 0.9.4
+  the default 10-second `--fence-wait-secs`; a fence wait of a second or less
+  can meet an idle reader and refuse. Maintenance from a binary older than 0.9.4
   takes only the fence lock and does not wait for kept connections: run
   maintenance with the same release as the hosts. Windows keeps a fresh,
   verified open per store tick instead of a kept reader.
@@ -311,8 +315,9 @@ rkat storage prune [--apply] [--older-than-days 30] [--json] [--root PATH]...
 - Since 0.9.4 a runtime delivery owner on a store other processes share reads
   the delivery generation through one kept connection (about 19 microseconds
   per read instead of about 500 for a verified open, measured on a shared
-  192-core host; store ticks come up to one per 10 ms). It still takes the shared fence guard for each read and opens
-  again, verified, when the file, schema or delivery ledger row changed.
+  192-core host; store ticks come up to one per 10 ms). It still takes the
+  shared fence guard for each read and opens again, verified, when the file,
+  schema or delivery ledger row changed.
 - Since 0.9.4 creating a persistent runtime over one store no longer waits for
   another store's OAuth flow rehydration: each store has its own slot in the
   process-wide provider-auth cache, and runtimes over one store still share

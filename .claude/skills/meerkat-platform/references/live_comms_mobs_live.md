@@ -201,9 +201,16 @@ channel commits all the rows it already holds when a member turn ends at that
 boundary (up to 64 rows or about a second at a time), before a member turn
 queued behind them starts; before, they drained one row per turn, so speech
 said before a typed message could land after its answer. A WebSocket or
-WebRTC channel still takes the boundary once per row and forwards nothing
-behind a waiting row, so its voice and events stop while a member turn runs
-and arrive in a burst when it ends.
+WebRTC channel queues its waiting rows in arrival order off the media path, so
+its voice, its other observations and the client's input keep flowing while a
+member turn runs. It holds the boundary the same way across consecutive
+transcript rows, and a turn completion or interruption row takes it on its
+own. A transcript frame can reach the client before its row commits. If the
+session refuses a row, the channel sends an error frame
+(`reason: "projection_error"`, with `row`, `item_id` and `unapplied_rows`) and
+closes; once 16 MiB of rows wait, it closes with
+`reason: "projection_backlog_full"`, and every queued row still commits. Rows
+still queued when the channel closes commit after the close, in order.
 
 ### SDK calls
 

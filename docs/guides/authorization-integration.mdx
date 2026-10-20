@@ -308,15 +308,46 @@ TypeScript and Python validators.
 
 ### Preserve restrictions across respawn
 
-`MobHandle::respawn` retires a member and spawns its successor in a fresh
-session with the same profile, labels, wiring, binding (or placement), profile
-and model overrides and runtime mode. It does not copy restrictions the
-predecessor received at spawn time, such as its `SpawnMemberSpec`
-`tool_access_policy` or `inherited_tool_filter` (the inherited tool visibility
-ceiling). To keep them, respawn with `respawn_with_successor_spec` and a spec
-that carries them again, or re-apply them in a `SpawnMemberCustomizer`, which
-also runs for respawns (`SpawnSource::Respawn`). A surviving profile name or
-session reference cannot reconstruct lost restrictions.
+Since 0.9.4 a respawned local member keeps the restrictions it was spawned
+under. `MobHandle::respawn`, `respawn_with_successor_spec` and the
+`mob_respawn` tool give the successor the predecessor's launch tool access
+policy and inherited tool visibility ceiling, as the predecessor's session
+recorded them, intersected with the successor's own. A successor spec or a
+`SpawnMemberCustomizer` can narrow them, never widen them; a host that means
+to widen them retires the member and spawns a new one. The successor keeps the
+auth binding the predecessor's session recorded only when its own spec names
+none and its profile resolves to the provider that binding was recorded for. A
+successor re-profiled to another provider, or to one that cannot be told,
+selects its own binding as a fresh spawn does.
+
+For a member with a local session, the successor's profile and provider are
+resolved before anything is retired. The respawn is refused before
+retirement, and the member is kept, when the predecessor's restrictions cannot
+be established, the successor's profile cannot be resolved, or the member
+changes while they are read. The refusal is
+`MobError::RespawnPredecessorRestrictionsUnavailable`; it has no dedicated wire
+error code in 0.9.4, and on the wire its message reads
+`respawn of member <id> refused: <reason>`. This includes a member whose
+session was lost, for example a Broken member after a cold restart whose
+session store no longer has it: respawn no longer repairs it. A host that
+meets this refusal keeps the other members working and returns local feedback
+to the agent that asked for the respawn. A surviving profile name or session
+reference cannot reconstruct lost restrictions.
+
+Current limits:
+
+- A recorded binding that has since been removed from the realm
+  configuration, or re-pointed to another provider, is not checked before
+  retirement: the successor's build then fails after the predecessor is
+  retired (`MobRespawnError::SpawnAfterRetireWithCause`). Name a binding in a
+  spawn customizer, or retire and spawn.
+- A peer-only member whose generation was never bound to a local session
+  carries no session restrictions; its successor keeps the launch policy and
+  ceiling its own spec inherits. The respawn of a placed (remote) member is
+  unchanged.
+- A custom session service that wraps a built-in one must delegate
+  `MobSessionService::predecessor_tool_restrictions`. Its default reports
+  `Unsupported`, which refuses the respawns of that service's members.
 
 Explicit retirement and a fresh spawn are separate governed operations under
 current authorization and inherited restrictions. They do not recover lost

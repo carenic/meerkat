@@ -357,6 +357,9 @@ surface, not the old live-adapter/docs-refresh snapshot:
   - In-turn steers are written into the running turn's transcript (or one
     follow-up turn), and a 0.9.3 peer that checks signatures drops a 0.9.4
     `reply_to_peer` reply, so upgrade comms peers together.
+  - Mobs keep their incarnation across resume (operator grants survive it);
+    mob stores migrate to schema 12, which 0.9.3 refuses, so back them up;
+    the operator grant functions take `MobHandle::live_incarnation()`.
   - Release binaries build SQLite without its process-wide locks; a
     `cargo install rkat` or embedding build sets `LIBSQLITE3_FLAGS` itself
     (see the deploying guide, "SQLite Lock Profile"); `rkat storage doctor`
