@@ -122,6 +122,8 @@ pub mod context_control;
 mod digest_accumulator;
 mod head_metadata;
 mod import_0810;
+#[cfg(test)]
+mod inline_image_externalization_tests;
 mod instruction_activation;
 pub mod model_routing_control;
 pub mod model_routing_handoff_staging;
