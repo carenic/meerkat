@@ -1406,7 +1406,7 @@ mod tests {
             serde_json::to_value(&decoded).expect("serialize again"),
             written
         );
-        let mut renamed = written.clone();
+        let mut renamed = written;
         let segments = renamed["state"]["items"]["assistant"]["content_segments"]
             .as_object_mut()
             .expect("the item's content segments");
