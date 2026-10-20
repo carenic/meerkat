@@ -1945,6 +1945,18 @@ them.
   kickoff where that incarnation's spawn event sits; the incarnation's own
   kickoff updates follow it and still replay. Pre-existing in 0.9.3.
 
+### Known limitations
+
+- Identity reconciliation (`meerkat-mob`) under storage stalls longer than
+  the 30 s member-retirement deadline: an identity whose adoption, retire,
+  reset or respawn retires a member that cannot finish within that deadline
+  reports `Backoff` with "member retirement remains in progress ... the owner
+  deadline was reached". Reconciliation retries it with exponential backoff,
+  at most every 60 s, and each retry starts the retirement again with a fresh
+  deadline, so the identity converges once one retirement finishes in time.
+  Resuming the mob after a restart also drives a durably started retirement
+  again.
+
 ## [0.9.3] - 2026-10-18
 
 ### Breaking
