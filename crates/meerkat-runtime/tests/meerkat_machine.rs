@@ -4632,13 +4632,25 @@ async fn completed_boundary_commit_failure_marks_completion_authority_unavailabl
         .await
         .expect("completion waiter should resolve when the runtime loop exits")
         .expect_err("an uncertain durable boundary cannot mint a completion outcome");
+    // A rejected boundary commit rolled back, so the waiter fails as a
+    // rolled-back boundary carrying the commit's rejection; its public
+    // observation stays unavailable completion authority.
     assert!(
         matches!(
             error,
-            CompletionWaitError::AuthorityUnavailable(ref reason)
-                if reason.contains("synthetic atomic service-turn commit failure")
+            CompletionWaitError::BoundaryRolledBack { ref detail, .. }
+                if detail.contains("synthetic atomic service-turn commit failure")
         ),
-        "boundary commit failure should fail closed with unavailable completion authority, got {error:?}"
+        "boundary commit failure should fail the waiter as a rolled-back boundary, got {error:?}"
+    );
+    assert!(
+        matches!(
+            error.wait_failure_observation(),
+            Some(
+                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable
+            )
+        ),
+        "a rolled-back boundary is observed as unavailable completion authority, got {error:?}"
     );
 }
 

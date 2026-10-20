@@ -1222,8 +1222,12 @@ mod visibility;
 
 pub(crate) use durability_health::{DurabilityHealthHandle, DurabilityReloadRequired};
 pub(crate) use session_mutation_gate::{
-    SessionMutationGate, SessionMutationGateWait, SettledGateWait, WeakSessionMutationGate,
+    SessionMutationGate, SettledGateWait, WeakSessionMutationGate,
 };
+
+// Live-only: the live lifecycle lease's gate helper is its one user.
+#[cfg(feature = "live")]
+pub(crate) use session_mutation_gate::SessionMutationGateWait;
 
 pub(crate) use session_management::{
     DeleteOpsFinalizationAuthority, RetainOpsFinalizationAuthority,
@@ -6950,6 +6954,7 @@ impl MeerkatMachine {
     /// Take `gate`, a copy of `session_id`'s mutation gate, as `wait` says:
     /// live (see [`Self::lock_live_session_mutation_gate`]) or settled for its
     /// reason, which always takes it.
+    #[cfg(feature = "live")]
     async fn lock_session_mutation_gate_as(
         &self,
         session_id: &SessionId,
