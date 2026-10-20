@@ -23039,6 +23039,268 @@ ORDER BY runtime_id";
             }
         }
 
+        fn inline_png(data: &str) -> meerkat_core::types::ContentBlock {
+            meerkat_core::types::ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: meerkat_core::types::ImageData::Inline { data: data.into() },
+            }
+        }
+
+        fn blob_png(data: &str) -> meerkat_core::types::ContentBlock {
+            meerkat_core::types::ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: meerkat_core::types::ImageData::Blob {
+                    blob_id: meerkat_core::content_blob_id("image/png", data),
+                },
+            }
+        }
+
+        fn inline_mp4_block(data: &str) -> meerkat_core::types::ContentBlock {
+            meerkat_core::types::ContentBlock::Video {
+                media_type: "video/mp4".into(),
+                duration_ms: 1_000,
+                data: meerkat_core::types::VideoData::Inline { data: data.into() },
+            }
+        }
+
+        fn inline_mp4(data: &str) -> Message {
+            Message::User(UserMessage::with_blocks(vec![inline_mp4_block(data)]))
+        }
+
+        /// A compacted WholeBlob body whose transcript holds inline video
+        /// (in the anchor, a rewrite's replacement, a later rewrite's parent
+        /// advance and the live tail, beside a blob-stored image) converts
+        /// byte-exact. Video has no blob form, so the 0.9.3 gateway never
+        /// externalized it, and the conversion keeps it as row content: the
+        /// converted session is the body's document, its cold-loaded graph
+        /// materializes each pre-compaction revision with its clips, a second
+        /// conversion converts nothing, and the next compaction, whose parent
+        /// advance carries a clip, commits on the converted runtime.
+        #[tokio::test]
+        async fn a_compacted_whole_blob_session_with_inline_video_converts_byte_exact() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("runtime.sqlite");
+            // Base64 of five short distinct payloads.
+            let clips = ["TVA0IGE=", "TVA0IGI=", "TVA0IGM=", "TVA0IGQ=", "TVA0IGU="];
+            let mut session = Session::new();
+            session.push(inline_mp4(clips[0]));
+            session.push(Message::User(UserMessage::text("what happens in it?")));
+            session.push(inline_mp4(clips[1]));
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![
+                        Message::User(UserMessage::text("summary of the first clip")),
+                        inline_mp4(clips[2]),
+                    ],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            session.push(inline_mp4(clips[3]));
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![Message::User(UserMessage::text("summary of both"))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            // The last clip arrives beside an image stored as a blob, as 0.9.x
+            // stored every image.
+            session.push(Message::User(UserMessage::with_blocks(vec![
+                inline_mp4_block(clips[4]),
+                blob_png("UE5HIGE="),
+            ])));
+            let runtime_id = LogicalRuntimeId::for_session(session.id());
+            let whole_blob = SqliteRuntimeStore::new_whole_blob(&path).unwrap();
+            whole_blob
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            drop(whole_blob);
+            let session_store = meta_093_co_located_session_store(&path);
+
+            let report = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("a compacted body with inline video converts");
+            assert_eq!((report.seeded_count(), report.derived_count()), (1, 0));
+            let converted = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("converted session");
+            assert_eq!(
+                serde_json::to_value(&converted).unwrap(),
+                serde_json::to_value(&session).unwrap(),
+                "the converted session is the body's document"
+            );
+            // The cold-loaded graph materializes each pre-compaction revision
+            // with its clips.
+            let body_commits = session
+                .transcript_history_state()
+                .unwrap()
+                .expect("a compacted session has a graph")
+                .commits()
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(body_commits.len(), 2);
+            for commit in &body_commits {
+                let rows = |session: &Session| {
+                    session
+                        .retained_transcript_revision_rows(&commit.parent_revision)
+                        .unwrap()
+                        .expect("a retained revision")
+                        .messages()
+                        .to_vec()
+                };
+                assert_eq!(
+                    rows(&converted),
+                    rows(&session),
+                    "revision {}",
+                    commit.parent_revision
+                );
+            }
+            let rerun = SqliteRuntimeStore::convert_standalone_whole_blob_in_place(&path)
+                .expect("a converted file converts again");
+            assert_eq!((rerun.seeded_count(), rerun.derived_count()), (0, 0));
+
+            let store = SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file opens head-canonical");
+            commit_a_rewrite_from_the_runtime_authority(&store, &session_store, session.id())
+                .await
+                .expect("the next compaction, whose parent advance carries a clip, commits");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(&path)
+                .expect("the converted file reopens after the compaction");
+        }
+
+        /// Commit `durable` as a new session on a fresh HeadCanonical runtime
+        /// at `path`; then, on the committed session, append `pending`,
+        /// compact the first two rows into a summary, append `tail`, and
+        /// prepare that rewrite from the runtime authority. A rewrite that prepares commits, the store reopens, and
+        /// the session reloads as the live transcript. Returns the prepare
+        /// refusal's text, if any.
+        async fn compact_a_live_session(
+            path: &Path,
+            durable: Vec<Message>,
+            pending: Vec<Message>,
+            tail: Vec<Message>,
+        ) -> Result<(), String> {
+            let store = SqliteRuntimeStore::new_head_canonical(path).unwrap();
+            let session_store = SqliteSessionStore::open(path.to_path_buf()).unwrap();
+            let mut session = Session::new();
+            session.push_batch(durable);
+            let runtime_id = LogicalRuntimeId::for_session(session.id());
+            let first = PreparedHeadCanonicalMutation::prepare(&session, None).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(
+                        BoundSessionCommit::head_canonical_from_session(&session, first).unwrap(),
+                    ),
+                )
+                .await
+                .expect("the first rows append");
+            let observed = head_canonical_authority(&store, &runtime_id)
+                .await
+                .boundary_head()
+                .clone();
+            // Continue from the committed rows, as a restarted runtime does.
+            let mut session = session_store
+                .load(session.id())
+                .await
+                .unwrap()
+                .expect("committed session");
+            session.push_batch(pending);
+            session
+                .commit_transcript_rewrite(
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                    vec![Message::User(UserMessage::text(
+                        "summary of the first rows",
+                    ))],
+                    TranscriptRewriteReason::new("compaction"),
+                    Some("test".to_string()),
+                    None,
+                )
+                .unwrap();
+            session.push_batch(tail);
+            let rewrite =
+                meerkat_core::session_store::PreparedHeadCanonicalRewriteMutation::prepare(
+                    &session, observed,
+                )
+                .map_err(|error| error.to_string())?;
+            let boundary =
+                BoundSessionCommit::head_canonical_rewrite_from_session(&session, rewrite).unwrap();
+            store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(boundary),
+                )
+                .await
+                .expect("the compaction commits");
+            drop(store);
+            SqliteRuntimeStore::new_head_canonical(path)
+                .expect("the store reopens after the compaction");
+            assert_eq!(
+                session_store
+                    .load(session.id())
+                    .await
+                    .unwrap()
+                    .expect("session after the compaction")
+                    .messages(),
+                session.messages()
+            );
+            Ok(())
+        }
+
+        /// A live HeadCanonical session whose rows hold inline video
+        /// compacts, whichever rows of the rewrite hold the clips: only the
+        /// post-rewrite tail, or an uncheckpointed parent row the rewrite
+        /// bridges, a kept row and the tail. Ordinary appends always kept
+        /// inline video as row content, since video has no blob form. An
+        /// inline image in the tail still refuses: images cross the blob
+        /// boundary before they become rows.
+        #[tokio::test]
+        async fn a_head_canonical_session_with_inline_video_compacts() {
+            let dir = TempDir::new().unwrap();
+            let clips = ["TVA0IGE=", "TVA0IGI=", "TVA0IGM="];
+            let text = |text: &str| Message::User(UserMessage::text(text));
+            compact_a_live_session(
+                &dir.path().join("tail.sqlite"),
+                vec![text("first"), text("second")],
+                Vec::new(),
+                vec![inline_mp4(clips[2])],
+            )
+            .await
+            .expect("a compaction followed by a clip commits");
+            compact_a_live_session(
+                &dir.path().join("bridged.sqlite"),
+                vec![inline_mp4(clips[0]), text("what happens in it?")],
+                vec![inline_mp4(clips[1])],
+                vec![inline_mp4(clips[2])],
+            )
+            .await
+            .expect("a compaction that bridges, keeps and follows clips commits");
+            let refusal = compact_a_live_session(
+                &dir.path().join("image.sqlite"),
+                vec![text("first"), text("second")],
+                Vec::new(),
+                vec![Message::User(UserMessage::with_blocks(vec![inline_png(
+                    "UE5HIGE=",
+                )]))],
+            )
+            .await
+            .expect_err("an inline image in the live tail refuses");
+            assert!(refusal.contains("carries inline media"), "{refusal}");
+        }
+
         /// A standalone WholeBlob runtime database at `path` holding two
         /// runtimes: first by runtime id, a session compacted five times and
         /// retired to the default retention, so that its transcript graph is
