@@ -1272,6 +1272,18 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a session with compaction history no longer refuses its
+  next transcript rewrite after its runtime moves to the head-canonical
+  profile (a SQLite realm opened with `SqliteRuntimeStore::new_head_canonical`,
+  or a standalone WholeBlob database converted with
+  `SqliteRuntimeStore::convert_standalone_whole_blob_in_place`). The
+  conversion recorded the runtime's boundary with a different row commitment
+  from the session's stored head, so the first rewrite after a restart, such
+  as the next compaction, was refused ("previous transcript revision ... did
+  not match commit parent ..."), and a converted Meta gateway with a
+  compacted member failed to start. A conversion now records the stored
+  head, and opening a store that an earlier build converted repairs each
+  affected runtime record in place. Pre-existing in 0.9.3.
 - `meerkat-store`: the SQLite session store lays out a whole-blob session
   whose transcript graph retired its oldest occurrences, which every session
   compacted more often than `history_retained_rewrites` (default 4) has. It
