@@ -659,7 +659,7 @@ mod tests {
             !route(
                 Some(crate::AuthBindingRef {
                     origin: crate::BindingOrigin::Configured,
-                    ..env_default.clone()
+                    ..env_default
                 }),
                 env_credential,
             )
